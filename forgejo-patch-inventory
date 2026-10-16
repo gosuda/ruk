@@ -141,13 +141,20 @@
       "required_patch": "Exclude merge-policy fields from ordinary whole-row repository updates. Delete repository-owned branch projection records with the repository. Preserve ancestor-query exit-status semantics for both subprocess and IPC commands.",
       "source": "local://ruk-forgejo-contract-plan.md, 'Forgejo patch points' (revised table, row order preserved)",
       "approval": "Approve three-file revision (auto-selected after timeout, 2026-10-17, per local://ruk-forgejo-inventory-resolution.md). Adds no product capability beyond the already-specified merge-policy, merge-result, command-error, and branch-projection requirements."
+    },
+    {
+      "id": "R17",
+      "existing_surface": "Native repository initialization: `modules/git/repo.go::InitRepository`",
+      "required_patch": "Preserve stock Git initialization. In Ruk mode, delegate repository-root creation to the backend rather than creating it with Go `MkdirAll`. On Windows, require provisioned durable shared parents, publish the new owned root exclusively, and refuse uncertain existing initialization without deleting or adopting it. Preserve object-format selection and `<root>/<owner>/<repo>.git` paths.",
+      "source": "local://ruk-forgejo-contract-plan.md, 'Forgejo patch points' (revised table, row order preserved)",
+      "approval": "Require durable parent directories (auto-selected after timeout, 2026-10-17, per local://ruk-windows-initialization-contract.md). Preserves strict acknowledged durability on Windows without introducing alternate storage engine, TCP fallback, or custom WAL."
     }
   ],
   "gates": [
     {
       "id": "G01",
       "name": "stock-git-regression",
-      "requirement": "With setting.Git.Backend=git every patched path behaves exactly as at the pinned revision.",
+      "requirement": "With setting.Git.Backend=git every patched path behaves exactly as at the pinned revision (including stock Git InitRepository preserving os.MkdirAll, template, object-format, and bare flags).",
       "verify_with": "make test-sqlite and make test-e2e-sqlite on the Git backend; make test-backend for modules/git, services/pull, models unit packages."
     },
     {
@@ -281,6 +288,12 @@
       "name": "capability-consumer-completeness",
       "requirement": "No production code outside modules/git/git.go derives behavior from GitVersion/CheckGitVersion*/RequiredVersion; flag consumers (fetch.go, grep.go, repo.go, repo_attribute.go) read only the capability-assigned vars.",
       "verify_with": "grep gate over the pinned tree (consumers listed in reviewed_not_patched)."
+    },
+    {
+      "id": "G24",
+      "name": "native-repository-initialization",
+      "requirement": "Stock Git initialization unchanged (preserves os.MkdirAll, template, objectformat, bare, and path). In Ruk mode, backend owns repository-root creation instead of Go os.MkdirAll. On Windows, require provisioned durable shared parents, publish the new owned root exclusively, and fail closed on missing parent or existing/uncertain root without deleting or adopting incomplete state; concurrent initialization has exactly one winner; interrupted or failed creation leaves no adopted or deleted incomplete root. POSIX preserves canonical ancestor-chain flush through mount root.",
+      "verify_with": "modules/git/backend_test.go and platform fault-injection harness (Windows missing parent, existing root, concurrent race, and crash-before-publish scenarios)."
     }
   ],
   "rebase_gate": {
@@ -2871,6 +2884,40 @@
       "notes": [
         "Approved three-file revision (auto-selected after timeout, 2026-10-17); resolves blocked_candidates B3. Gates are requirements, not executed evidence."
       ]
+    },
+    {
+      "path": "modules/git/repo.go",
+      "status": "existing",
+      "edit": "modify",
+      "rows": [
+        "R17"
+      ],
+      "grounding": "table_row_named",
+      "also_serves_rows": [
+        "R01"
+      ],
+      "gates": [
+        "G01",
+        "G02",
+        "G03",
+        "G05",
+        "G23",
+        "G24"
+      ],
+      "replaced": [
+        {
+          "name": "InitRepository",
+          "kind": "func",
+          "line": 74,
+          "declaration": "func InitRepository(ctx context.Context, repoPath string, bare bool, objectFormatName string) error {",
+          "change": "Preserve stock Git initialization (Go os.MkdirAll, git init --template \"\", --bare, and optional --object-format). In Ruk mode, delegate repository-root creation to the native backend rather than creating it with Go os.MkdirAll. On Windows, require provisioned durable shared parents, publish the new owned root exclusively, and refuse uncertain existing initialization without deleting or adopting it. Preserve object-format selection and <root>/<owner>/<repo>.git paths."
+        }
+      ],
+      "extended": [],
+      "new_symbols": [],
+      "notes": [
+        "Approved bounded revision for Windows durable-parent prerequisite (auto-selected after timeout, 2026-10-17, per local://ruk-windows-initialization-contract.md). Stock Git path and object-format flags unchanged; native backend owns root creation exclusively without Go os.MkdirAll. On Windows, missing parent or existing/uncertain root fails closed without deleting or adopting unknown state. Gates are requirements, not executed evidence."
+      ]
     }
   ],
   "reviewed_not_patched": [
@@ -2887,13 +2934,6 @@
       "line": 106,
       "declaration": "if SupportGrepMaxCount {",
       "reason": "Same."
-    },
-    {
-      "path": "modules/git/repo.go",
-      "symbol": "InitRepository (SupportHashSha256)",
-      "line": 74,
-      "declaration": "func InitRepository(ctx context.Context, repoPath string, bare bool, objectFormatName string) error {",
-      "reason": "Same; --object-format emitted from capability-assigned var."
     },
     {
       "path": "modules/git/repo.go",
@@ -3215,18 +3255,18 @@
     }
   ],
   "counts": {
-    "files_total": 80,
-    "existing_modified": 48,
+    "files_total": 81,
+    "existing_modified": 49,
     "existing_deleted": 1,
     "existing_no_edit_named_by_row": 1,
     "generated": 1,
     "new": 29,
     "new_non_test": 12,
     "new_test": 17,
-    "reviewed_not_patched": 37,
+    "reviewed_not_patched": 36,
     "blocked_candidates": 4,
     "open_decisions": 3,
-    "replaced_symbols": 39,
+    "replaced_symbols": 40,
     "extended_symbols": 98
   }
 }
