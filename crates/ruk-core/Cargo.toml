@@ -14,8 +14,14 @@ schemars.workspace = true
 thiserror.workspace = true
 smallvec.workspace = true
 postcard.workspace = true
+redb.workspace = true
+zstd.workspace = true
+crc32c.workspace = true
 jiff.workspace = true
 uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+atomicwrites.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

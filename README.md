@@ -132,6 +132,19 @@ Pipes and standard I/O roundtrips function identically:
 cat conflict.json | cargo run -p ruk --locked -- encode-conflict --object-format sha1 | cargo run -p ruk --locked -- decode-conflict --object-format sha1
 ```
 
+## Object and Fact Store
+
+`ruk_core::store::Store` provides the storage library. Repository commands such as commit, checkout, branch, merge, push, and fetch are not yet implemented.
+
+- **Prepare:** stream object bytes into bounded memory or disk spools. Use a committed local predecessor for delta compression when the delta meets the size threshold.
+- **Publish:** append prepared objects to segments, flush their bytes and new entries, then commit object locators and conditional metadata facts together in redb. A stale condition rejects the whole batch before append. A failure after append begins closes the writer until recovery.
+- **Read:** verify record checksums, decode content, and verify object identity. Release metadata transactions before payload I/O.
+- **Recover:** verify committed extents and object identities on open. Truncate only an open segment's uncommitted tail. Refuse service on committed corruption rather than roll back acknowledged state.
+
+The store preserves exact object bytes for both SHA-1 and SHA-256. Native conflicts remain distinct from Git objects. Resource reservations bound preparation and release with the prepared objects.
+
+On POSIX, initialization synchronizes the existing ancestor chain before creating missing directories. On Windows, you must provide an already durable parent and an absent store root; merely creating the parent directory is not enough. Ruk publishes the owned root exclusively and refuses to adopt an existing or interrupted layout. Opening a store flushes its validated format marker before recovery. A reported filesystem flush failure may require operator storage recovery; reopening alone does not repair failed writeback.
+
 ## I/O and Framing Rules
 
 * **Data on stdout, diagnostics on stderr**: Successful commands emit raw bytes to stdout (binary payload for `encode-conflict`, JSON text for `model` and `decode-conflict`). Diagnostics, error descriptions, and hints are written exclusively to stderr in the format `ruk: <message>`, followed by optional `hint: <text>` lines.
@@ -151,6 +164,8 @@ cargo nextest run --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-Formatting, strict Clippy, and all workspace tests passed on Linux. The CLI smoke covered both hash kinds, byte-preserving round trips, malformed input, and bounded file/FIFO reads. The [CI workflow](.github/workflows/ci.yml) also defines macOS and Windows jobs; those jobs were not executed during local verification.
+Formatting, strict Clippy, and workspace tests passed on Linux. The CLI smoke covered both hash kinds, byte-preserving round trips, malformed input, and bounded file/FIFO reads. An external Rust consumer exercised the store's public APIs with independent byte and object-ID oracles, concurrent readers and writers, resource limits, and reopen cycles. Process-kill tests cover atomic publication and recovery at segment-sealing boundaries; they do not prove hardware power-loss durability.
+
+The workspace, including Windows-only code and tests, also passed cross-compilation checks for `x86_64-pc-windows-gnu`. The [CI workflow](.github/workflows/ci.yml) defines macOS and Windows jobs. Those jobs were not executed during local verification, so runtime behavior on those platforms remains unverified.
 
 See the [changelog](CHANGELOG.md) for implemented functionality. Repository operations remain outside this executable's current scope.

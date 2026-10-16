@@ -12,6 +12,10 @@ license = "Apache-2.0"
 gix-hash = { version = "=0.28.0", default-features = false, features = ["sha1", "sha256"] }
 # Internal typed values (core contract).
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
+redb = { version = "=4.4.0", default-features = false }
+zstd = { version = "=0.14.2", default-features = false }
+crc32c = { version = "=0.6.8", default-features = false }
+atomicwrites = { version = "=0.4.4", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
 schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }
 thiserror = { version = "=2.0.21", default-features = false, features = ["std"] }

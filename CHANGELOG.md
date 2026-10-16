@@ -15,3 +15,8 @@ Entries describe implemented, unreleased functionality.
 - Timezone offset representation (`TzOffset`) in author and committer signatures, preserving exact `[+-]DDDD` strings and maintaining the distinction between `-0000` and `+0000`.
 - Discriminated JSON serialization for `Head` references using the `type` tag (`{"type": "git", "oid": "..."}` for Git commits and `{"type": "conflicted", "key": "..."}` for native conflict keys).
 - Stream separation directing output data to stdout and diagnostics (`ruk: <error>` and `hint: <hint>`) to stderr, returning process exit codes derived from `ErrorCode`.
+- `ruk_core::store::Store` library with append-only object segments and transactional redb metadata. POSIX initialization synchronizes ancestor directories; Windows initialization requires an already durable parent and an absent root, which Ruk publishes exclusively.
+- Streaming object preparation with bounded memory and disk spools, zstd compression, and deltas against committed local predecessors.
+- Atomic publication of prepared objects and conditional metadata facts. Stale conditions reject the batch before append; failures after append begins close the writer until recovery.
+- Startup verification of committed extents and object identities, truncation of uncommitted open tails, and refusal of service on committed corruption.
+- Checksum- and identity-verified object reads that release metadata transactions before payload I/O.

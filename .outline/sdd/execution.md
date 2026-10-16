@@ -34,3 +34,28 @@ Write full implementation report to local://ruk-slice-1-report.md. Return DONE, 
 ### Stance limits
 
 Offense stays inside the surface the request touches. A half-rebuilt state never ships: finish it or revert it. Formal rigor goes where a plausible defect breaks an invariant: trust boundaries, state lifecycles, concurrency, money, parsers, protocols. Minimalism keeps each useful part. One shallow level, never two layers between the same caller and the same operation. Reject a seal that costs more than half the complexity it hides.
+
+## Task 2: Durable store
+Anchor: Tony Hoare, John Carmack
+
+Implement segments, serialized append, redb tables, immutable raw imports, bounded preparation spools, exact fsync ordering, manifest recovery, and fail-closed corruption. Fault-inject publication boundaries; no acknowledged operation may roll back.
+
+### Inputs and scope
+
+The model phase is verified at commit `8e91086`. Work only in the new `crates/ruk-core/src/store/` module, required core/root dependency and module declarations, and storage-specific test/harness files assigned by the parent. Reference clones stay read-only. Parent integration decisions live in `local://ruk-store-design.md`; the implementation handoff will freeze shared interfaces after dependency evidence is available.
+
+Read the core contract sections On-disk layout and tables, Segments/durability/recovery, and Read leases/collection/graph. Read the reference profile's memory/disk budgets. Preserve all mandatory companion contracts. Repository operations, coordination transport, and collection are later slices; do not advertise them as working from a storage-only implementation.
+
+### Contracts
+
+Use redb 4.4.0 and postcard. Keep exact imported bytes immutable. Use one repository hash kind and verify decoded identities. Frame segments with the specified little-endian fields, CRC32C, raw/zstd/delta forms, and checked length limits. Bound preparation memory and disk before mutation. Prepare workers never assign offsets. Keep only known-predecessor deltas below half raw size; otherwise use zstd level 3.
+
+Append complete records; sync touched segments; sync new segment directory entries; commit metadata with Immediate durability; acknowledge. Publish object locators, committed ends, and supplied metadata facts in one transaction. Recovery trusts committed extents, removes only uncommitted active tails, and refuses missing/corrupt committed bytes. Do not undo acknowledged operations or perform automatic forensic repair. Do not delete unknown spool/journal paths by filename.
+
+### Verification and ownership
+
+Use disjoint worker scopes and one integration owner. Workers do not build, test, lint, format, or commit. Parent runs union gates and actual store smoke after the batch. Add adversarial byte, limit, corruption, publication, and reopening tests plus real subprocess crash points. A passing in-process test alone does not prove filesystem durability. Each worker reports exact paths and unverified assumptions.
+
+### Stance limits
+
+Offense stays inside the surface the request touches. A half-rebuilt state never ships: finish it or revert it. Formal rigor goes where a plausible defect breaks an invariant. Minimalism keeps each useful part. One shallow level, never two layers between the same caller and the same operation. Reject a seal that costs more than half the complexity it hides.
