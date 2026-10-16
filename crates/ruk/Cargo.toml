@@ -1,0 +1,22 @@
+[package]
+name = "ruk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ruk agent-native version control CLI"
+
+[[bin]]
+name = "ruk"
+path = "src/main.rs"
+
+[dependencies]
+ruk-core = { path = "../ruk-core", version = "0.1.0" }
+# Dependency direction ruk -> ruk-git -> ruk-core; commands use the git
+# error boundary from the slice that introduces Git commands.
+ruk-git = { path = "../ruk-git", version = "0.1.0" }
+clap.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

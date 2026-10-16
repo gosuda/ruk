@@ -1,0 +1,6 @@
+/target
+*.rs.bk
+# Reference checkouts used as development oracles only; never part of this repository.
+git/
+jj/
+forgejo/
