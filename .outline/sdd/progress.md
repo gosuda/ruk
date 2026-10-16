@@ -41,3 +41,14 @@ Parent verification passed: formatting, strict Clippy, all 289 nextest tests, ca
 The fresh repair-closure review found no remaining actionable defect. LSP was unavailable because its server exited; compiler diagnostics passed. macOS and Windows jobs are configured but were not executed locally. No hosting parity or performance claim follows from this model gate.
 
 The frozen inventory contains 80 files and 138 exact declaration anchors. Parent checked each against the pinned Forgejo tree. The required compatibility gates remain unexecuted until their implementation slices.
+
+## Slice two storage checkpoint
+Anchor: Tony Hoare, Richard Feynman
+
+Commit `dd0127a` adds the durable object and fact store. Commit `7b290f1` adds the bounded Forgejo initialization inventory revision. The required JSON-policy migration remains open, so slice two is not yet complete.
+
+Parent verification passed: formatting, strict Clippy, all 449 nextest tests, cargo test, workspace build, and the external public-API consumer for both hash kinds. The consumer verified exact object bytes, conditional publication, resource admission, concurrent reads and writes, and reopen cycles. Publication and recovery crash tests passed, including real segment-sealing boundaries.
+
+The workspace and Windows-only tests compiled for `x86_64-pc-windows-gnu`. No Windows or macOS runtime or hardware power-loss proof is claimed. Windows initialization requires a caller-provisioned durable parent and an absent root. Opening flushes the validated format after metadata ownership is acquired. A reported flush failure is not repaired by reopening.
+
+Fresh bounded reviews found no remaining actionable storage defect. Full evidence and failed-before corrections are in `local://ruk-store-gate-evidence.md`. The revised inventory has 81 files and 24 compatibility gates. Parent verified its counts, references, and pinned initialization declaration. Forgejo behavior remains unimplemented.
