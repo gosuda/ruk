@@ -13,7 +13,7 @@ The user authorized verified phase commits and normal branch-only pushes to `htt
 
 - [x] 1. Workspace and model [Tony Hoare, David Parnas]
 - [x] 2. Durable store [Tony Hoare, John Carmack]
-- [x] 3. Coordinator and leases [Tony Hoare, Edsger W. Dijkstra] — PARTIAL: ownership locks, sessions, receipts, CAS, bounded execution, cancellation, claim/attestation policy landed (05a1025..d60deab); OPEN: LeaseRegistry on HostedCoordinator + continuation cursors (task resumed below)
+- [x] 3. Coordinator and leases [Tony Hoare, Edsger W. Dijkstra] — lease registry + lease-bound continuations landed d26bd97+69ae4b6 (review: spec PASS, fix verified)
 - [x] 4. Native workspaces [Tony Hoare, John Carmack] — landed in earlier wave (workspace state, snapshots, materialization journal); watcher/token + damaged-marker details partially verified
 - [x] 5. Graph and refs [Claude Shannon, John Carmack] — graph segments, generation/Bloom, revsets, ref CAS, reflogs landed (432e850..)
 - [x] 6. Native changes and merge [Tony Hoare, David Parnas] — new/edit/split/squash/rebase/abandon/resolve/revert + composed merge engines + syntax dispatch landed (a4bf29d..b12070a); ops now split prepare/publish (0648676)
