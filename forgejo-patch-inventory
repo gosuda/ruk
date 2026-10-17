@@ -48,19 +48,19 @@
     {
       "id": "R01",
       "existing_surface": "`modules/git/git.go`, backend setting",
-      "required_patch": "Add explicit backend selection and Ruk capability handshake. Keep stock Git mode for reference deployments. Replace all production version-derived feature decisions with capabilities. Ruk reports its real identity, not a fabricated Git version.",
+      "required_patch": "Add explicit backend selection and a Ruk capability handshake carrying the backend's real identity, object formats, supported operation set, and merge modes. Keep stock Git mode for reference deployments. Replace all production version-derived feature decisions with capabilities. Ruk reports its real identity, not a fabricated Git version.",
       "source": "local://ruk-forgejo-contract-plan.md, 'Forgejo patch points' (revised table, row order preserved)"
     },
     {
       "id": "R02",
-      "existing_surface": "`modules/git/command.go`",
-      "required_patch": "Select existing subprocess execution for Git or pooled streaming IPC for Ruk. Preserve the caller API and errors.",
+      "existing_surface": "`modules/git/command.go`; new `modules/git/backend` package",
+      "required_patch": "Define one `Backend` interface in `modules/git/backend` with one method per typed operation, and two implementations: `Stock` keeps the existing subprocess builder and parsing for reference deployments, `Ruk` sends versioned JSON operation requests over a pooled connection and returns typed results. `modules/git` call sites call the interface, never argv. Errors are `*BackendError` with one closed code. Never parse text on the Ruk path.",
       "source": "local://ruk-forgejo-contract-plan.md, 'Forgejo patch points' (revised table, row order preserved)"
     },
     {
       "id": "R03",
       "existing_surface": "`cmd/serv.go`",
-      "required_patch": "Ruk mode always uses the configured Ruk service entry point, never adjacent git-upload-pack binaries. Preserve authentication and pusher environment.",
+      "required_patch": "Ruk mode always uses the configured Ruk service entry point and the `ServeUploadPack`/`ServeReceivePack` operations from the backend, never adjacent git-upload-pack binaries. Preserve authentication and pusher environment.",
       "source": "local://ruk-forgejo-contract-plan.md, 'Forgejo patch points' (revised table, row order preserved)"
     },
     {
@@ -138,7 +138,7 @@
     {
       "id": "R16",
       "existing_surface": "Repository update and deletion: `modules/repository/create.go`, `services/repository/delete.go`; command exit consumer: `modules/git/commit.go`",
-      "required_patch": "Exclude merge-policy fields from ordinary whole-row repository updates. Delete repository-owned branch projection records with the repository. Preserve ancestor-query exit-status semantics for both subprocess and IPC commands.",
+      "required_patch": "Exclude merge-policy fields from ordinary whole-row repository updates. Delete repository-owned branch projection records with the repository. Preserve ancestor-query error semantics for both backends: the stock implementation keeps the subprocess exit status, the Ruk implementation returns the closed outcome code.",
       "source": "local://ruk-forgejo-contract-plan.md, 'Forgejo patch points' (revised table, row order preserved)",
       "approval": "Approve three-file revision (auto-selected after timeout, 2026-10-17, per local://ruk-forgejo-inventory-resolution.md). Adds no product capability beyond the already-specified merge-policy, merge-result, command-error, and branch-projection requirements."
     },
@@ -3268,5 +3268,18 @@
     "open_decisions": 3,
     "replaced_symbols": 40,
     "extended_symbols": 98
-  }
+  },
+  "revisions": [
+    {
+      "date": "2026-10-18",
+      "decision": "local://ruk-forgejo-native-seam-decision.md",
+      "summary": "Forgejo reaches Ruk through typed operations over the IPC framing, not argv. Rows R01, R02, R03 and R16 were rewritten to name operations and the `modules/git/backend` interface; no file outside the frozen set was added and no gate was dropped.",
+      "changed_rows": [
+        "R01",
+        "R02",
+        "R03",
+        "R16"
+      ]
+    }
+  ]
 }
