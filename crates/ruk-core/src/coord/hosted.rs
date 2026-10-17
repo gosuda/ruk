@@ -18,10 +18,13 @@
 //! until it exists a bare request has no honest lane path and callers refuse
 //! it with [`ErrorCode::EHosted`] at their own boundary.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant as StdInstant;
 
+use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -36,6 +39,9 @@ use super::lane::{
     InternalCandidate, InternalPayload, MutationCandidate, PublicationLane, PublicationLaneRunner,
     WorkspaceFence, create_publication_lane,
 };
+use super::leases::{
+    AcquireArgs, CursorWant, INTERACTIVE_TTL, LeaseKind, LeaseRegistry, OwnerGuard,
+};
 use super::oplog::read_header;
 use super::policy::PolicySource;
 pub use super::policy::Principal;
@@ -45,13 +51,15 @@ use super::rows::{
     session_key,
 };
 use super::session::{Authority, ResumeOutcome, SessionTable, prepare_open};
+use crate::ByteString;
 use crate::capability::{Capabilities, ReadAccess};
-use crate::change::{OperationId, RequestId, SessionId, WorkspaceId};
+use crate::change::{LeaseId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
-    AttestListArgs, AttestListReply, ClaimListArgs, ClaimListReply, MAX_PAGE_SIZE, Method,
-    OpLogArgs, OpLogReply, Page, PageLimit, ReconnectSecret, Reply, Request, SessionAuthority,
-    SessionOpenArgs, SessionResumeArgs, SessionResumeReply, Timestamp, ViewInfo,
+    AttestListArgs, AttestListReply, ClaimHolderFilter, ClaimListArgs, ClaimListReply,
+    MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor, PageLimit, QueryDigest,
+    ReconnectSecret, Reply, Request, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
+    SessionResumeReply, Timestamp, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::store::FactPageBudget;
@@ -125,6 +133,8 @@ pub struct HostedCoordinator {
     retention_clock: RetentionClock,
     shutdown_handle: CancelHandle,
     shutdown: Cancel,
+    leases: Arc<LeaseRegistry>,
+    page_guards: Mutex<HashMap<LeaseId, (OwnerGuard, StdInstant)>>,
 }
 
 impl HostedCoordinator {
@@ -159,6 +169,11 @@ impl HostedCoordinator {
         // A restart samples a fresh anchor; monotonic time never crosses it.
         let retention_clock = RetentionClock::new(clock.sample()?);
         let (shutdown_handle, shutdown) = cancellation();
+        // Read leases live in memory only: the registry pairs a bounded lease
+        // table with the collection barrier, spilling condemned scratch under
+        // the repository root. Interactive read leases carry no object roots,
+        // so the scratch directory is only a path until collection runs.
+        let leases = LeaseRegistry::new(clock.clone(), store_root.join("leases-scratch"));
         Ok(Self {
             store,
             sessions,
@@ -171,6 +186,8 @@ impl HostedCoordinator {
             retention_clock,
             shutdown_handle,
             shutdown,
+            leases,
+            page_guards: Mutex::new(HashMap::new()),
         })
     }
 
@@ -430,14 +447,34 @@ impl HostedCoordinator {
     /// authority is uniformly forbidden here instead of inventing a
     /// receipts-only read.
     ///
-    /// `claim.list` and `attest.list` serve cursor-free first pages only.
-    /// Page continuations arrive as lease-bound cursor values whose binding
-    /// the coordinator cannot verify without a lease registry, and the
-    /// coordinator holds none, so a presented cursor refuses with
-    /// [`ErrorCode::EHosted`] naming the lease gap instead of inventing
-    /// lease internals. A first page that does not exhaust its listing
-    /// refuses with [`ErrorCode::ELimit`] rather than truncating, mirroring
-    /// the single-page bound of [`read_oplog`].
+    /// Loads the session, requires active authority, holds an in-flight guard
+    /// across the read, admits it under the interactive class with compute
+    /// resources, authorizes it against the session's negotiated capabilities,
+    /// and runs the read implementation. `op.log`, `claim.list`, and
+    /// `attest.list` have implementations; every other read runs the same
+    /// session checks and then names its missing implementation with
+    /// [`ErrorCode::EHosted`], so an unknown session still reports
+    /// `E_FORBIDDEN` rather than a missing-impl error.
+    ///
+    /// Capability mapping follows the existing handlers rather than a
+    /// blanket table: ordinary reads authorize as [`ReadAccess::Objects`],
+    /// which always succeeds. `claim.list` additionally uses the claims
+    /// module's listing authorization (a session always reads its own
+    /// claims; anything wider needs `read_intents.claims`), and the
+    /// attestation queries carry no capability gate of their own. Receipts
+    /// of an expired session have no read path either: without one, expired
+    /// authority is uniformly forbidden here instead of inventing a
+    /// receipts-only read.
+    ///
+    /// `claim.list`, `attest.list`, and `op.log` page through interactive
+    /// read leases. A first page that does not exhaust its listing mints a
+    /// 30-second lease-bound cursor instead of truncating; a presented
+    /// cursor resumes at its opaque position only when the lease exists, is
+    /// held by the requesting session, and matches the store, the current
+    /// view, and the query digest. Binding mismatch is `E_FORBIDDEN`;
+    /// unknown, retired, or expired authority is `E_LEASE_LOST`. A head that
+    /// advanced since the first page makes the continuation stale
+    /// (`E_FORBIDDEN`): the client restarts from a fresh first page.
     ///
     /// The caller principal must match the session holder, mirroring the
     /// resume path: `op.log` entries name session identities, so the
@@ -446,12 +483,17 @@ impl HostedCoordinator {
     /// enforces the same holder check at publication.
     ///
     /// # Errors
+    /// - [`ErrorCode::EInvalid`] when the request shape is invalid; checked
+    ///   before any session or lease work so malformed paging beats
+    ///   `E_FORBIDDEN` and `E_LEASE_LOST`.
     /// - [`ErrorCode::ECancelled`] when `cancel` or shutdown fired.
     /// - [`ErrorCode::EForbidden`] on unknown session, expired authority,
-    ///   or a caller principal that is not the session holder.
+    ///   a caller principal that is not the session holder, a cursor binding
+    ///   mismatch, or a stale view.
+    /// - [`ErrorCode::ELeaseLost`] when the cursor names an unknown,
+    ///   retired, or expired lease.
     /// - [`ErrorCode::EHosted`] when the method has no read implementation.
-    /// - [`ErrorCode::ELimit`] when admission sheds the read or the log
-    ///   exceeds its single-page bound.
+    /// - [`ErrorCode::ELimit`] when admission sheds the read.
     pub async fn read(
         &self,
         principal: &Principal,
@@ -461,6 +503,9 @@ impl HostedCoordinator {
     ) -> Result<Reply, CoreError> {
         cancel.check()?;
         self.shutdown.check()?;
+        // Protocol shape first: an oversized cursor position or an illegal
+        // limit reports E_INVALID before any session or lease verdict.
+        request.validate()?;
         let policy = self.policies.load()?;
         let idle = policy.session_idle();
         let times = self.clock.sample()?;
@@ -496,18 +541,25 @@ impl HostedCoordinator {
             )
             .await?;
         bound.authorize_read(ReadAccess::Objects)?;
+        // Expire read leases at entry: fire cancellation on lapsed authority
+        // and drop the guards whose 30-second interactive lifetime ended so
+        // the bounded table cannot fill with dead slots.
+        self.leases.sweep_expiry()?;
+        self.prune_expired_read_leases(times.mono)?;
         match request {
-            Request::OpLog(args) => Ok(Reply::OpLog(Box::new(read_oplog(&self.store, &args)?))),
+            Request::OpLog(args) => {
+                let reply = self.read_oplog_page(session, &args, times.mono)?;
+                Ok(Reply::OpLog(Box::new(reply)))
+            }
             Request::ClaimList(args) => {
                 let row = bound.row();
-                let reply =
-                    read_claims(&self.store, &self.clock, session, &row.capabilities, &args)?;
+                let reply = self.read_claims_page(session, &row.capabilities, &args, times.mono)?;
                 Ok(Reply::ClaimList(Box::new(reply)))
             }
-            Request::AttestList(args) => Ok(Reply::AttestList(Box::new(read_attestations(
-                &self.store,
-                &args,
-            )?))),
+            Request::AttestList(args) => {
+                let reply = self.read_attestations_page(session, &args, times.mono)?;
+                Ok(Reply::AttestList(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -519,6 +571,421 @@ impl HostedCoordinator {
         }
     }
 
+    /// Mints one interactive read lease and retains its owner guard.
+    ///
+    /// The guard lives in `page_guards` until its 30-second authority lapses
+    /// and a read entry or retention sweep prunes it. Dropping the guard
+    /// retires the slot, so continuations stay usable across requests until
+    /// expiry instead of dying with the first reply.
+    fn mint_read_lease(
+        &self,
+        session: SessionId,
+        view: OperationId,
+        query: QueryDigest,
+        position: &[u8],
+        now: StdInstant,
+    ) -> Result<PageCursor, CoreError> {
+        let store_id = self.store.store_id();
+        let op_floor = (view.0 != 0).then_some(view);
+        let args = AcquireArgs {
+            kind: LeaseKind::Interactive,
+            store: store_id,
+            session,
+            view,
+            query,
+            roots: Vec::new(),
+            op_floor,
+            position_bytes: position.len(),
+            view_retained: true,
+        };
+        let (lease, _cancel, guard) = self.leases.acquire(args, now)?;
+        let cursor = PageCursor {
+            store: store_id,
+            view,
+            query,
+            lease,
+            position: ByteString::from(position.to_vec()),
+        };
+        self.page_guards
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "read lease guard lock poisoned"))?
+            .insert(lease, (guard, now));
+        Ok(cursor)
+    }
+
+    /// Drops read guards whose interactive authority lapsed.
+    ///
+    /// Returns live guards inspected and guards dropped. The registry sweep
+    /// fires cancellation first; this only retires the slots so the bounded
+    /// table cannot fill with dead entries. There is no durable leases
+    /// table to publish through.
+    fn prune_expired_read_leases(&self, now: StdInstant) -> Result<(usize, usize), CoreError> {
+        let mut guards = self
+            .page_guards
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "read lease guard lock poisoned"))?;
+        let examined = guards.len();
+        if examined == 0 {
+            return Ok((0, 0));
+        }
+        let mut lapsed = Vec::new();
+        for (id, (_, created)) in guards.iter() {
+            let elapsed = now.checked_duration_since(*created);
+            if elapsed.is_some_and(|held| held >= INTERACTIVE_TTL) {
+                lapsed.push(*id);
+            }
+        }
+        let count = lapsed.len();
+        for id in lapsed {
+            guards.remove(&id);
+        }
+        Ok((examined, count))
+    }
+
+    /// Reads one claim page, minting a lease-bound cursor when more remains.
+    fn read_claims_page(
+        &self,
+        viewer: SessionId,
+        caps: &Capabilities,
+        args: &ClaimListArgs,
+        now: StdInstant,
+    ) -> Result<ClaimListReply, CoreError> {
+        let listing = authorize_claim_list_args(caps, viewer, args)?;
+        let query = claim_query_digest(args.holder);
+        let limit = args.page.effective_limit();
+        let budget = FactPageBudget::new(limit, 1024 * 1024);
+        let Some(cursor) = args.page.cursor.as_ref() else {
+            let claim_clock = ClaimClock::open(&self.store, self.clock.clone())?;
+            let page = list_page_raw(&self.store, &claim_clock, listing, None, budget)?;
+            let view = current_view(&self.store)?;
+            let Some(position) = page.next else {
+                return Ok(ClaimListReply {
+                    view,
+                    claims: Page::new(page.records, None)?,
+                });
+            };
+            let next = self.mint_read_lease(viewer, view.view, query, &position, now)?;
+            return Ok(ClaimListReply {
+                view,
+                claims: Page::new(page.records, Some(next))?,
+            });
+        };
+        let view_before = current_view(&self.store)?;
+        let want = CursorWant {
+            store: self.store.store_id(),
+            session: viewer,
+            view: view_before.view,
+            query,
+        };
+        self.leases.check_cursor(cursor, &want, now)?;
+        let after = cursor.position.as_bytes();
+        let after = (!after.is_empty()).then_some(after);
+        let claim_clock = ClaimClock::open(&self.store, self.clock.clone())?;
+        let page = list_page_raw(&self.store, &claim_clock, listing, after, budget)?;
+        let view_after = current_view(&self.store)?;
+        if view_after.view != cursor.view {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "claim.list cursor names a stale view: open a fresh first page",
+            ));
+        }
+        let Some(position) = page.next else {
+            return Ok(ClaimListReply {
+                view: view_after,
+                claims: Page::new(page.records, None)?,
+            });
+        };
+        let next = PageCursor {
+            store: cursor.store,
+            view: cursor.view,
+            query: cursor.query,
+            lease: cursor.lease,
+            position: ByteString::from(position),
+        };
+        Ok(ClaimListReply {
+            view: view_after,
+            claims: Page::new(page.records, Some(next))?,
+        })
+    }
+
+    /// Reads one attestation page, minting a lease-bound cursor when more remains.
+    fn read_attestations_page(
+        &self,
+        viewer: SessionId,
+        args: &AttestListArgs,
+        now: StdInstant,
+    ) -> Result<AttestListReply, CoreError> {
+        let query = attest_query_digest(args);
+        let limit = args.page.effective_limit();
+        let limit_rows = u32::try_from(limit)
+            .map_err(|_| CoreError::new(ErrorCode::EInvalid, "page limit exceeds its bound"))?;
+        let limit_page = PageLimit::new(limit_rows).map_err(CoreError::from)?;
+        let filter = crate::attestation::StatementFilter {
+            subject: args.subject,
+            kind: args.kind.clone(),
+            signer: args.signer.clone(),
+            include_superseded: args.include_superseded,
+        };
+        let open = |_: crate::attestation::Progress| Ok::<(), CoreError>(());
+        let Some(cursor) = args.page.cursor.as_ref() else {
+            let page = crate::attestation::list(&self.store, &filter, limit_page, None, &open)?;
+            let view = current_view(&self.store)?;
+            let Some(position) = page.next else {
+                return Ok(AttestListReply {
+                    view,
+                    records: Page::new(page.records, None)?,
+                });
+            };
+            let next = self.mint_read_lease(viewer, view.view, query, &position, now)?;
+            return Ok(AttestListReply {
+                view,
+                records: Page::new(page.records, Some(next))?,
+            });
+        };
+        let view_before = current_view(&self.store)?;
+        let want = CursorWant {
+            store: self.store.store_id(),
+            session: viewer,
+            view: view_before.view,
+            query,
+        };
+        self.leases.check_cursor(cursor, &want, now)?;
+        let page = crate::attestation::list(
+            &self.store,
+            &filter,
+            limit_page,
+            Some(cursor.position.as_bytes()),
+            &open,
+        )?;
+        let view_after = current_view(&self.store)?;
+        if view_after.view != cursor.view {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "attest.list cursor names a stale view: open a fresh first page",
+            ));
+        }
+        let Some(position) = page.next else {
+            return Ok(AttestListReply {
+                view: view_after,
+                records: Page::new(page.records, None)?,
+            });
+        };
+        let next = PageCursor {
+            store: cursor.store,
+            view: cursor.view,
+            query: cursor.query,
+            lease: cursor.lease,
+            position: ByteString::from(position),
+        };
+        Ok(AttestListReply {
+            view: view_after,
+            records: Page::new(page.records, Some(next))?,
+        })
+    }
+
+    /// Reads one operation-log page newest-first, paging through a lease.
+    fn read_oplog_page(
+        &self,
+        viewer: SessionId,
+        args: &OpLogArgs,
+        now: StdInstant,
+    ) -> Result<OpLogReply, CoreError> {
+        let query = oplog_query_digest(args.session);
+        let limit = args.page.effective_limit();
+        let Some(cursor) = args.page.cursor.as_ref() else {
+            let head = match self.store.fact(FactTable::OpHead, OP_HEAD_KEY)? {
+                Some(bytes) => decode_head(&self.store, &bytes)?,
+                None => CoordinatorHead::default(),
+            };
+            let view = ViewInfo {
+                store: self.store.store_id(),
+                view: head.last_op.unwrap_or(OperationId(0)),
+            };
+            let (entries, next_id, oldest, exhausted) =
+                walk_oplog_page(&self.store, head.last_op, args.session, limit)?;
+            if exhausted {
+                return Ok(OpLogReply {
+                    view,
+                    oldest_retained: oldest,
+                    entries: Page::new(entries, None)?,
+                });
+            }
+            let position =
+                encode_oplog_position(next_id.expect("non-exhausted page has a resume id"));
+            let next = self.mint_read_lease(viewer, view.view, query, &position, now)?;
+            return Ok(OpLogReply {
+                view,
+                oldest_retained: None,
+                entries: Page::new(entries, Some(next))?,
+            });
+        };
+        // Malformed positions stay E_INVALID even against a dead lease.
+        if cursor.position.len() != 8 {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "op.log continuation position must be 8 bytes",
+            ));
+        }
+        let start = decode_oplog_position(cursor.position.as_bytes())?;
+        let view_before = current_view(&self.store)?;
+        let want = CursorWant {
+            store: self.store.store_id(),
+            session: viewer,
+            view: view_before.view,
+            query,
+        };
+        self.leases.check_cursor(cursor, &want, now)?;
+        let (entries, next_id, oldest, exhausted) =
+            walk_oplog_page(&self.store, Some(start), args.session, limit)?;
+        if exhausted && entries.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "op.log continuation position was pruned: open a fresh first page",
+            ));
+        }
+        let view_after = current_view(&self.store)?;
+        if view_after.view != cursor.view {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "op.log cursor names a stale view: open a fresh first page",
+            ));
+        }
+        if exhausted {
+            return Ok(OpLogReply {
+                view: view_after,
+                oldest_retained: oldest,
+                entries: Page::new(entries, None)?,
+            });
+        }
+        let position = encode_oplog_position(next_id.expect("non-exhausted page has a resume id"));
+        let next = PageCursor {
+            store: cursor.store,
+            view: cursor.view,
+            query: cursor.query,
+            lease: cursor.lease,
+            position: ByteString::from(position),
+        };
+        Ok(OpLogReply {
+            view: view_after,
+            oldest_retained: None,
+            entries: Page::new(entries, Some(next))?,
+        })
+    }
+}
+
+fn claim_query_digest(holder: ClaimHolderFilter) -> QueryDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ruk.claim.list/v1\x00");
+    match holder {
+        ClaimHolderFilter::Mine => hasher.update([0x00]),
+        ClaimHolderFilter::Any => hasher.update([0x01]),
+    }
+    QueryDigest::from_bytes(hasher.finalize().into())
+}
+
+fn attest_query_digest(args: &AttestListArgs) -> QueryDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ruk.attest.list/v1\x00");
+    match args.subject {
+        None => hasher.update([0x00]),
+        Some(oid) => {
+            hasher.update([0x01]);
+            let width = u8::try_from(oid.as_bytes().len()).unwrap_or(0xFF);
+            hasher.update([width]);
+            hasher.update(oid.as_bytes());
+        }
+    }
+    match args.kind.as_ref() {
+        None => hasher.update([0x00]),
+        Some(kind) => {
+            hasher.update([0x01]);
+            hasher.update(kind.as_str().as_bytes());
+            hasher.update([0x00]);
+        }
+    }
+    match args.signer.as_ref() {
+        None => hasher.update([0x00]),
+        Some(signer) => {
+            hasher.update([0x01]);
+            hasher.update(signer.as_str().as_bytes());
+            hasher.update([0x00]);
+        }
+    }
+    hasher.update([u8::from(args.include_superseded)]);
+    QueryDigest::from_bytes(hasher.finalize().into())
+}
+
+fn oplog_query_digest(session: Option<SessionId>) -> QueryDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ruk.op.log/v1\x00");
+    match session {
+        None => hasher.update([0x00]),
+        Some(id) => {
+            hasher.update([0x01]);
+            hasher.update(id.as_bytes());
+        }
+    }
+    QueryDigest::from_bytes(hasher.finalize().into())
+}
+
+fn encode_oplog_position(id: OperationId) -> Vec<u8> {
+    id.0.to_be_bytes().to_vec()
+}
+
+fn decode_oplog_position(bytes: &[u8]) -> Result<OperationId, CoreError> {
+    let raw: [u8; 8] = bytes.try_into().map_err(|_| {
+        CoreError::new(
+            ErrorCode::EInvalid,
+            "op.log continuation position must be 8 bytes",
+        )
+    })?;
+    Ok(OperationId(u64::from_be_bytes(raw)))
+}
+
+/// Walks one bounded `op.log` page from `start` newest-first.
+///
+/// Collects at most `limit` matching entries while visiting at most
+/// `MAX_PAGE_SIZE` headers, so a heavily filtered page stays bounded and
+/// returns short with a resume id. Returns the entries, the next operation
+/// to visit, the oldest retained id when the chain is exhausted, and whether
+/// the chain ended at the retention boundary.
+fn walk_oplog_page(
+    store: &Store,
+    start: Option<OperationId>,
+    filter: Option<SessionId>,
+    limit: usize,
+) -> Result<
+    (
+        Vec<crate::protocol::OperationEntry>,
+        Option<OperationId>,
+        Option<OperationId>,
+        bool,
+    ),
+    CoreError,
+> {
+    let mut entries = Vec::new();
+    let mut cursor = start;
+    let mut oldest = None;
+    let mut visited = 0usize;
+    while let Some(id) = cursor {
+        if entries.len() >= limit || visited >= MAX_PAGE_SIZE {
+            return Ok((entries, Some(id), None, false));
+        }
+        visited += 1;
+        let Some(header) = read_header(store, id)? else {
+            return Ok((entries, None, oldest, true));
+        };
+        let entry = header.entry;
+        oldest = Some(id);
+        cursor = entry.parent;
+        if filter.is_none_or(|want| entry.session == Some(want)) {
+            entries.push(entry);
+        }
+    }
+    Ok((entries, None, oldest, true))
+}
+
+impl HostedCoordinator {
     /// Verifies one session for a caller before unauthenticated work.
     ///
     /// Loads the session, requires active authority, and requires the
@@ -662,7 +1129,10 @@ impl HostedCoordinator {
 }
 
 /// Rows examined and rows deleted per sweepable table by one
-/// [`HostedCoordinator::retention_sweep`] pass.
+/// [`HostedCoordinator::retention_sweep`] pass, plus in-memory read-lease
+/// expiry. Leases hold no durable rows: `leases_examined` counts live read
+/// guards inspected and `leases_expired` counts guards dropped after their
+/// 30-second interactive authority lapsed. There is no leases fact table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetentionReport {
     /// Receipt rows scanned in this pass.
@@ -673,13 +1143,17 @@ pub struct RetentionReport {
     pub sessions_examined: usize,
     /// Expired session rows deleted through the lane in this pass.
     pub sessions_deleted: usize,
+    /// Live read leases inspected for expiry in this pass.
+    pub leases_examined: usize,
+    /// Expired read leases dropped in this pass.
+    pub leases_expired: usize,
 }
 
 impl RetentionReport {
-    /// True when the pass deleted nothing.
+    /// True when the pass deleted nothing durable and expired no leases.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.receipts_deleted == 0 && self.sessions_deleted == 0
+        self.receipts_deleted == 0 && self.sessions_deleted == 0 && self.leases_expired == 0
     }
 }
 
@@ -721,13 +1195,23 @@ impl HostedCoordinator {
             receipts_page.cursors,
             now,
         )?;
+        // In-memory read leases expire here as well as at read entry. The
+        // sweep fires cancellation on lapsed authority; dropping the expired
+        // owner guards retires the slots without touching any fact table.
+        self.leases.sweep_expiry()?;
+        let (leases_examined, leases_expired) = self.prune_expired_read_leases(current.mono)?;
         let report = RetentionReport {
             receipts_examined: receipts_page.examined_rows,
             receipts_deleted: receipts_page.deletions.len(),
             sessions_examined: sessions_page.examined_rows,
             sessions_deleted: sessions_page.deletions.len(),
+            leases_examined,
+            leases_expired,
         };
-        if report.is_empty() && sessions_page.cursors == loaded.sweep {
+        // Lease expiry never publishes: it frees in-memory guards only. The
+        // lane commit runs only when durable receipts/sessions need it.
+        let durable_empty = report.receipts_deleted == 0 && report.sessions_deleted == 0;
+        if durable_empty && sessions_page.cursors == loaded.sweep {
             return Ok(report);
         }
         let mut facts = receipts_page.deletions;
@@ -766,7 +1250,7 @@ fn read_gap(method: Method) -> &'static str {
         Method::Diff | Method::Show | Method::File | Method::Blame => {
             "diff, show, file, and blame need tree and object readers over resolved revisions with no pure producer on the coordinator"
         }
-        _ => "only `op.log`, `claim.list`, and `attest.list` first pages are served",
+        _ => "only `op.log`, `claim.list`, and `attest.list` are served, with lease-bound paging",
     }
 }
 
@@ -788,149 +1272,6 @@ fn current_view(store: &Store) -> Result<ViewInfo, CoreError> {
     })
 }
 
-/// Reads the first page of one authorized claim listing.
-///
-/// The caller authorizes `args` first with [`authorize_claim_list_args`];
-/// this runs the raw store scan without minting or verifying any
-/// lease-bound cursor. A presented cursor refuses with `E_HOSTED`
-/// naming the lease gap, and a first page that does not exhaust its listing
-/// refuses with `E_LIMIT` rather than truncating.
-///
-/// # Errors
-/// `E_HOSTED` for a presented cursor (no lease registry verifies its
-/// binding); `E_LIMIT` past the single-page bound; `E_CORRUPT` for a claim
-/// row disagreeing with its index.
-fn read_claims(
-    store: &Store,
-    clock: &Clock,
-    viewer: SessionId,
-    caps: &Capabilities,
-    args: &ClaimListArgs,
-) -> Result<ClaimListReply, CoreError> {
-    if args.page.cursor.is_some() {
-        return Err(CoreError::new(
-            ErrorCode::EHosted,
-            "claim.list continuation needs a lease-bound cursor and the hosted coordinator holds no lease registry: open a fresh first page instead",
-        ));
-    }
-    let listing = authorize_claim_list_args(caps, viewer, args)?;
-    let claim_clock = ClaimClock::open(store, clock.clone())?;
-    let limit = args.page.effective_limit();
-    let page = list_page_raw(
-        store,
-        &claim_clock,
-        listing,
-        None,
-        FactPageBudget::new(limit, 1024 * 1024),
-    )?;
-    if page.next.is_some() {
-        return Err(CoreError::new(
-            ErrorCode::ELimit,
-            "claim.list exceeds its single-page bound and continuations need a lease-bound cursor the hosted coordinator does not mint",
-        ));
-    }
-    // The view loads after the scan, never before: a concurrent publication
-    // may then date the reply newer than its rows (ordinary staleness), but
-    // the rows can never come from a snapshot newer than the reported view.
-    let view = current_view(store)?;
-    Ok(ClaimListReply {
-        view,
-        claims: Page::new(page.records, None)?,
-    })
-}
-
-/// Reads the first page of attestation statements matching `args`.
-///
-/// Runs the bounded attestation query with an open checkpoint: the read
-/// already passed admission, so no progress gate applies. Cursor and
-/// exhaustion handling mirror [`read_claims`]: no lease registry verifies a
-/// presented cursor, and a non-exhausting first page refuses rather than
-/// truncating.
-///
-/// # Errors
-/// `E_HOSTED` for a presented cursor (no lease registry verifies its
-/// binding); `E_LIMIT` past the single-page bound or the verification
-/// budget; `E_CORRUPT` for a row that fails re-verification.
-fn read_attestations(store: &Store, args: &AttestListArgs) -> Result<AttestListReply, CoreError> {
-    if args.page.cursor.is_some() {
-        return Err(CoreError::new(
-            ErrorCode::EHosted,
-            "attest.list continuation needs a lease-bound cursor and the hosted coordinator holds no lease registry: open a fresh first page instead",
-        ));
-    }
-    let filter = crate::attestation::StatementFilter {
-        subject: args.subject,
-        kind: args.kind.clone(),
-        signer: args.signer.clone(),
-        include_superseded: args.include_superseded,
-    };
-    let limit_rows = u32::try_from(args.page.effective_limit())
-        .map_err(|_| CoreError::new(ErrorCode::EInvalid, "page limit exceeds its bound"))?;
-    let limit = PageLimit::new(limit_rows).map_err(CoreError::from)?;
-    let open = |_: crate::attestation::Progress| Ok::<(), CoreError>(());
-    let page = crate::attestation::list(store, &filter, limit, None, &open)?;
-    if page.next.is_some() {
-        return Err(CoreError::new(
-            ErrorCode::ELimit,
-            "attest.list exceeds its single-page bound and continuations need a lease-bound cursor the hosted coordinator does not mint",
-        ));
-    }
-    // The view loads after the scan, never before: see `read_claims` for why
-    // this order keeps rows committed at or before the reported view.
-    let view = current_view(store)?;
-    Ok(AttestListReply {
-        view,
-        records: Page::new(page.records, None)?,
-    })
-}
-
-/// Reads the operation log newest-first from the coordinator head.
-///
-/// Walks the parent chain from the last operation, keeping every entry whose
-/// session matches the filter. The walk ends at a missing header, which
-/// marks the retention boundary. There is no paging on this path, so a log
-/// longer than one page is refused rather than truncated.
-///
-/// # Errors
-/// `E_CORRUPT` for a damaged head or header row; `E_LIMIT` past the
-/// single-page bound.
-fn read_oplog(store: &Store, args: &OpLogArgs) -> Result<OpLogReply, CoreError> {
-    let head = match store.fact(FactTable::OpHead, OP_HEAD_KEY)? {
-        Some(bytes) => decode_head(store, &bytes)?,
-        None => CoordinatorHead::default(),
-    };
-    let mut entries = Vec::new();
-    let mut oldest = None;
-    let mut cursor = head.last_op;
-    let mut visited = 0usize;
-    while let Some(id) = cursor {
-        visited += 1;
-        if visited > MAX_PAGE_SIZE {
-            return Err(CoreError::new(
-                ErrorCode::ELimit,
-                "operation log exceeds its single-page bound and has no paging on this path",
-            ));
-        }
-        let Some(header) = read_header(store, id)? else {
-            break;
-        };
-        let entry = header.entry;
-        oldest = Some(id);
-        cursor = entry.parent;
-        if args.session.is_none_or(|want| entry.session == Some(want)) {
-            entries.push(entry);
-        }
-    }
-    Ok(OpLogReply {
-        view: ViewInfo {
-            store: store.store_id(),
-            view: head.last_op.unwrap_or(OperationId(0)),
-        },
-        oldest_retained: oldest,
-        entries: Page::new(entries, None)?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -939,18 +1280,24 @@ mod tests {
 
     use super::*;
     use crate::ByteString;
-    use crate::change::{LeaseId, RequestId, StoreId};
+    use crate::capability::{AttestKind, AttestResult};
+    use crate::change::{ClaimId, LeaseId, RequestId, StoreId};
     use crate::commit::ProvenanceClaims;
+    use crate::coord::claims::{ClaimClock, seal_acquire};
     use crate::coord::rows::{Retained, SweepCursors, Usage, encode};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
+    use crate::index::RepoPath;
     use crate::protocol::{
-        AttestListArgs, ClaimHolderFilter, ClaimListArgs, Method, Mutation as WireMutation,
-        OpLogArgs, PageCursor, PageRequest, PinArgs, QueryDigest, StatusArgs, TagSetArgs,
+        AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement, ClaimHolderFilter,
+        ClaimListArgs, ClaimMode, ClaimTtl, Method, Mutation as WireMutation, OpLogArgs,
+        PageCursor, PageLimit, PageRequest, PinArgs, QueryDigest, StatusArgs, TagSetArgs,
+        Timestamp,
     };
     use crate::refdata::{RefExpect, RefName};
     use crate::store::PreparationBudget;
     use crate::store::types::FactExpectation;
+    use crate::store::{ObjectKind, Store};
 
     static SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1163,13 +1510,8 @@ mod tests {
                 &cancel,
             )
             .await
-            .expect_err("claim.list continuation names the lease gap");
-        assert_eq!(err.code, ErrorCode::EHosted);
-        assert!(
-            err.message.contains("lease"),
-            "unexpected message: {}",
-            err.message
-        );
+            .expect_err("unknown claim.list lease is lost");
+        assert_eq!(err.code, ErrorCode::ELeaseLost);
 
         let err = coord
             .read(
@@ -1185,13 +1527,8 @@ mod tests {
                 &cancel,
             )
             .await
-            .expect_err("attest.list continuation names the lease gap");
-        assert_eq!(err.code, ErrorCode::EHosted);
-        assert!(
-            err.message.contains("lease"),
-            "unexpected message: {}",
-            err.message
-        );
+            .expect_err("unknown attest.list lease is lost");
+        assert_eq!(err.code, ErrorCode::ELeaseLost);
 
         let err = coord
             .read(
@@ -1404,6 +1741,723 @@ mod tests {
         assert_eq!(page.entries.items[0].method, Method::TagSet);
         assert_eq!(page.oldest_retained, Some(page.entries.items[0].id));
 
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    fn seed_claims(coord: &HostedCoordinator, holder: SessionId, specs: &[(u8, &str)]) {
+        let clock = ClaimClock::open(coord.store(), coord.clock.clone()).expect("claim clock");
+        for (id_byte, path_text) in specs {
+            let id = ClaimId::from_bytes([*id_byte; 16]);
+            let path = RepoPath::new(path_text.as_bytes()).expect("valid path");
+            let change = seal_acquire(
+                coord.store(),
+                &clock,
+                holder,
+                id,
+                crate::protocol::ClaimAcquireArgs {
+                    paths: vec![path],
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                    mode: ClaimMode::Enforce,
+                },
+            )
+            .expect("acquire claim");
+            coord
+                .store()
+                .publish(Vec::new(), &change.facts)
+                .expect("publish claim");
+        }
+    }
+
+    fn attest_key() -> ssh_key::PrivateKey {
+        ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[0x11; 32]))
+    }
+
+    fn sign_statement(key: &ssh_key::PrivateKey, statement: AttestStatement) -> AttestAddArgs {
+        let payload = statement
+            .canonical_payload_v1(HashKind::Sha1)
+            .expect("canonical payload");
+        let signature = key
+            .sign(
+                crate::attestation::ATTEST_NAMESPACE,
+                ssh_key::HashAlg::Sha256,
+                &payload,
+            )
+            .expect("sign");
+        let armor = signature.to_pem(ssh_key::LineEnding::LF).expect("armor");
+        AttestAddArgs {
+            statement,
+            signature: AttestSignature::new(armor).expect("armored signature"),
+        }
+    }
+
+    fn publish_commit(store: &Store, body: &[u8]) -> Oid {
+        let length = u64::try_from(body.len()).expect("object length");
+        let prepared = store
+            .prepare(ObjectKind::Commit, length, body, None)
+            .expect("prepare commit");
+        let oid = prepared.oid();
+        store.publish(vec![prepared], &[]).expect("publish commit");
+        oid
+    }
+
+    fn seed_attestations(coord: &HostedCoordinator, count: u8) {
+        let key = attest_key();
+        for index in 0..count {
+            let body = format!(
+                "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nattest subject {index}\n"
+            );
+            let subject = publish_commit(coord.store(), body.as_bytes());
+            let statement = AttestStatement {
+                subject,
+                kind: AttestKind::new("review").expect("kind"),
+                result: AttestResult::new("pass").expect("result"),
+                signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
+                supersedes: None,
+            };
+            let args = sign_statement(&key, statement);
+            let open = |_: crate::attestation::Progress| Ok::<(), CoreError>(());
+            let prepared =
+                crate::attestation::prepare_add(coord.store(), &args, &open).expect("prepare");
+            if !prepared.mutations.is_empty() {
+                coord
+                    .store()
+                    .publish(Vec::new(), &prepared.mutations)
+                    .expect("publish attestation");
+            }
+        }
+    }
+
+    async fn publish_tag(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        name: &str,
+        cancel: &Cancel,
+    ) {
+        let prepared = super::super::prepare_mutation(
+            coord.store(),
+            session,
+            Request::TagSet(Box::new(WireMutation {
+                request_id: RequestId::generate(),
+                args: TagSetArgs {
+                    name: RefName::new(name).expect("tag name"),
+                    target: Oid::from_bytes(&[0x11; 20]).expect("tag target"),
+                    annotation: None,
+                    expected: RefExpect::Absent,
+                },
+            })),
+        )
+        .expect("tag prepares");
+        coord
+            .submit_prepared(owner, prepared, cancel)
+            .await
+            .expect("tag publishes");
+    }
+
+    fn page_limit_1() -> PageLimit {
+        PageLimit::new(1).expect("page limit 1")
+    }
+
+    #[tokio::test]
+    async fn claim_list_pages_through_its_lease() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        seed_claims(&coord, session, &[(1, "alpha"), (2, "beta"), (3, "gamma")]);
+        let limit = page_limit_1();
+        let args = ClaimListArgs {
+            holder: ClaimHolderFilter::Mine,
+            page: PageRequest {
+                limit: Some(limit),
+                cursor: None,
+            },
+        };
+        let reply = coord
+            .read(&owner, session, Request::ClaimList(Box::new(args)), &cancel)
+            .await
+            .expect("first page");
+        let Reply::ClaimList(first) = reply else {
+            panic!("claim.list must answer its own reply");
+        };
+        assert_eq!(first.claims.items.len(), 1);
+        let cursor1 = first.claims.next.clone().expect("first page continues");
+        let args = ClaimListArgs {
+            holder: ClaimHolderFilter::Mine,
+            page: PageRequest {
+                limit: Some(limit),
+                cursor: Some(cursor1.clone()),
+            },
+        };
+        let reply = coord
+            .read(&owner, session, Request::ClaimList(Box::new(args)), &cancel)
+            .await
+            .expect("second page");
+        let Reply::ClaimList(second) = reply else {
+            panic!("claim.list must answer its own reply");
+        };
+        assert_eq!(second.claims.items.len(), 1);
+        assert_ne!(first.claims.items, second.claims.items);
+        assert_eq!(second.view, first.view);
+        let cursor2 = second.claims.next.clone().expect("second page continues");
+        assert_eq!(cursor2.lease, cursor1.lease);
+        assert_eq!(cursor2.view, cursor1.view);
+        assert_eq!(cursor2.query, cursor1.query);
+        let args = ClaimListArgs {
+            holder: ClaimHolderFilter::Mine,
+            page: PageRequest {
+                limit: Some(limit),
+                cursor: Some(cursor2),
+            },
+        };
+        let reply = coord
+            .read(&owner, session, Request::ClaimList(Box::new(args)), &cancel)
+            .await
+            .expect("third page");
+        let Reply::ClaimList(third) = reply else {
+            panic!("claim.list must answer its own reply");
+        };
+        assert_eq!(third.claims.items.len(), 1);
+        assert!(third.claims.next.is_none());
+        assert_eq!(third.view, first.view);
+        assert_ne!(third.claims.items, first.claims.items);
+        assert_ne!(third.claims.items, second.claims.items);
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn attest_list_pages_through_its_lease() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        seed_attestations(&coord, 3);
+        let limit = page_limit_1();
+        // Attestation pages may return short with a continuation when the
+        // scan ends exactly at the limit, so follow `next` until it ends
+        // like any client must, including a possible empty tail page.
+        let mut collected = Vec::new();
+        let mut cursor: Option<PageCursor> = None;
+        let mut leases = Vec::new();
+        let mut views = Vec::new();
+        loop {
+            let args = AttestListArgs {
+                page: PageRequest {
+                    limit: Some(limit),
+                    cursor: cursor.clone(),
+                },
+                ..Default::default()
+            };
+            let reply = coord
+                .read(
+                    &owner,
+                    session,
+                    Request::AttestList(Box::new(args)),
+                    &cancel,
+                )
+                .await
+                .expect("attest page");
+            let Reply::AttestList(page) = reply else {
+                panic!("attest.list must answer its own reply");
+            };
+            views.push(page.view);
+            collected.extend(page.records.items);
+            match page.records.next {
+                Some(next) => {
+                    leases.push(next.lease);
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(collected.len(), 3);
+        assert!(views.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(leases.windows(2).all(|pair| pair[0] == pair[1]));
+        let mut subjects: Vec<_> = collected.iter().map(|record| record.subject).collect();
+        subjects.sort();
+        subjects.dedup();
+        assert_eq!(subjects.len(), 3);
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn oplog_pages_through_its_lease_newest_first() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        publish_tag(&coord, &owner, session, "refs/tags/p1", &cancel).await;
+        publish_tag(&coord, &owner, session, "refs/tags/p2", &cancel).await;
+        publish_tag(&coord, &owner, session, "refs/tags/p3", &cancel).await;
+        let limit = PageLimit::new(2).expect("page limit 2");
+        let args = OpLogArgs {
+            session: None,
+            page: PageRequest {
+                limit: Some(limit),
+                cursor: None,
+            },
+        };
+        let reply = coord
+            .read(&owner, session, Request::OpLog(Box::new(args)), &cancel)
+            .await
+            .expect("first page");
+        let Reply::OpLog(first) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        assert_eq!(first.entries.items.len(), 2);
+        assert!(first.entries.next.is_some());
+        assert_eq!(first.oldest_retained, None);
+        let cursor = first.entries.next.clone().expect("first page continues");
+        let args = OpLogArgs {
+            session: None,
+            page: PageRequest {
+                limit: Some(limit),
+                cursor: Some(cursor),
+            },
+        };
+        let reply = coord
+            .read(&owner, session, Request::OpLog(Box::new(args)), &cancel)
+            .await
+            .expect("second page");
+        let Reply::OpLog(second) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        assert_eq!(second.entries.items.len(), 1);
+        assert!(second.entries.next.is_none());
+        assert!(second.oldest_retained.is_some());
+        assert_ne!(second.entries.items[0].id, first.entries.items[0].id);
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn continuations_refuse_wrong_session_leases() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (first, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open first session");
+        let (second, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open second session");
+        seed_claims(&coord, first, &[(11, "one"), (12, "two")]);
+        seed_attestations(&coord, 2);
+        publish_tag(&coord, &owner, first, "refs/tags/w1", &cancel).await;
+        publish_tag(&coord, &owner, first, "refs/tags/w2", &cancel).await;
+        let limit = page_limit_1();
+        let reply = coord
+            .read(
+                &owner,
+                first,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: None,
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect("claim first page");
+        let Reply::ClaimList(list) = reply else {
+            panic!("claim.list must answer its own reply");
+        };
+        let claim_cursor = list.claims.next.clone().expect("claim continues");
+        let err = coord
+            .read(
+                &owner,
+                second,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: Some(claim_cursor),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("foreign session lease is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        let reply = coord
+            .read(
+                &owner,
+                first,
+                Request::AttestList(Box::new(AttestListArgs {
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: None,
+                    },
+                    ..Default::default()
+                })),
+                &cancel,
+            )
+            .await
+            .expect("attest first page");
+        let Reply::AttestList(list) = reply else {
+            panic!("attest.list must answer its own reply");
+        };
+        let attest_cursor = list.records.next.clone().expect("attest continues");
+        let err = coord
+            .read(
+                &owner,
+                second,
+                Request::AttestList(Box::new(AttestListArgs {
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: Some(attest_cursor),
+                    },
+                    ..Default::default()
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("foreign session lease is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        let reply = coord
+            .read(
+                &owner,
+                first,
+                Request::OpLog(Box::new(OpLogArgs {
+                    session: None,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: None,
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect("op.log first page");
+        let Reply::OpLog(log) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        let log_cursor = log.entries.next.clone().expect("op.log continues");
+        let err = coord
+            .read(
+                &owner,
+                second,
+                Request::OpLog(Box::new(OpLogArgs {
+                    session: None,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: Some(log_cursor),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("foreign session lease is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn continuations_refuse_stale_views() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        seed_claims(&coord, session, &[(21, "red"), (22, "blue")]);
+        seed_attestations(&coord, 2);
+        publish_tag(&coord, &owner, session, "refs/tags/s1", &cancel).await;
+        publish_tag(&coord, &owner, session, "refs/tags/s2", &cancel).await;
+        let limit = page_limit_1();
+        let reply = coord
+            .read(
+                &owner,
+                session,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: None,
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect("claim first page");
+        let Reply::ClaimList(list) = reply else {
+            panic!("claim.list must answer its own reply");
+        };
+        let claim_cursor = list.claims.next.clone().expect("claim continues");
+        let reply = coord
+            .read(
+                &owner,
+                session,
+                Request::AttestList(Box::new(AttestListArgs {
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: None,
+                    },
+                    ..Default::default()
+                })),
+                &cancel,
+            )
+            .await
+            .expect("attest first page");
+        let Reply::AttestList(list) = reply else {
+            panic!("attest.list must answer its own reply");
+        };
+        let attest_cursor = list.records.next.clone().expect("attest continues");
+        let reply = coord
+            .read(
+                &owner,
+                session,
+                Request::OpLog(Box::new(OpLogArgs {
+                    session: None,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: None,
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect("op.log first page");
+        let Reply::OpLog(log) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        let log_cursor = log.entries.next.clone().expect("op.log continues");
+        publish_tag(&coord, &owner, session, "refs/tags/s3", &cancel).await;
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: Some(claim_cursor),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("stale claim view is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::AttestList(Box::new(AttestListArgs {
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: Some(attest_cursor),
+                    },
+                    ..Default::default()
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("stale attest view is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::OpLog(Box::new(OpLogArgs {
+                    session: None,
+                    page: PageRequest {
+                        limit: Some(limit),
+                        cursor: Some(log_cursor),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("stale op.log view is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_read_leases_are_lost_and_swept() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let view = current_view(coord.store()).expect("current view");
+        let query = claim_query_digest(ClaimHolderFilter::Mine);
+        let old = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(31))
+            .expect("old instant");
+        let store_id = coord.store().store_id();
+        let (lease, _cancel, guard) = coord
+            .leases
+            .acquire(
+                AcquireArgs {
+                    kind: LeaseKind::Interactive,
+                    store: store_id,
+                    session,
+                    view: view.view,
+                    query,
+                    roots: Vec::new(),
+                    op_floor: None,
+                    position_bytes: 0,
+                    view_retained: true,
+                },
+                old,
+            )
+            .expect("acquire aged lease");
+        coord
+            .page_guards
+            .lock()
+            .expect("guard lock")
+            .insert(lease, (guard, old));
+        let report = coord
+            .retention_sweep(&cancel)
+            .await
+            .expect("sweep expires the aged lease");
+        assert_eq!(report.leases_examined, 1);
+        assert_eq!(report.leases_expired, 1);
+        let cursor = PageCursor {
+            store: store_id,
+            view: view.view,
+            query,
+            lease,
+            position: ByteString::from(Vec::new()),
+        };
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: None,
+                        cursor: Some(cursor),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("expired lease is lost");
+        assert_eq!(err.code, ErrorCode::ELeaseLost);
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_paging_beats_lease_verdicts() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let oversized = ByteString::from(vec![0x61; 5000]);
+        let bad = PageCursor {
+            store: StoreId::generate(),
+            view: OperationId(0),
+            query: QueryDigest::from_bytes([0x77; 32]),
+            lease: LeaseId::generate(),
+            position: oversized,
+        };
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: None,
+                        cursor: Some(bad.clone()),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("oversized claim cursor is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::AttestList(Box::new(AttestListArgs {
+                    page: PageRequest {
+                        limit: None,
+                        cursor: Some(bad.clone()),
+                    },
+                    ..Default::default()
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("oversized attest cursor is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::OpLog(Box::new(OpLogArgs {
+                    session: None,
+                    page: PageRequest {
+                        limit: None,
+                        cursor: Some(bad),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("oversized op.log cursor is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = coord
+            .read(
+                &owner,
+                SessionId::generate(),
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: None,
+                        cursor: Some(presented_cursor()),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown session with valid shape stays forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
         coord.shutdown();
         let _ = runner.abort();
     }

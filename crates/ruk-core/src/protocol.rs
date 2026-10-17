@@ -2064,11 +2064,14 @@ pub struct UndoReply {
 }
 
 /// `op.log`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpLogArgs {
     /// Only operations by this session.
     #[serde(default)]
     pub session: Option<SessionId>,
+    /// Paging state; absent starts at the newest operation.
+    #[serde(default)]
+    pub page: PageRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2548,7 +2551,6 @@ no_invariants!(
     LandPrepareArgs,
     LandExecuteArgs,
     UndoArgs,
-    OpLogArgs,
     OpPruneArgs,
     PinArgs,
     UnpinArgs,
@@ -2887,6 +2889,12 @@ impl Validate for ClaimListArgs {
 }
 
 impl Validate for AttestListArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        self.page.validate()
+    }
+}
+
+impl Validate for OpLogArgs {
     fn validate(&self) -> Result<(), CoreError> {
         self.page.validate()
     }

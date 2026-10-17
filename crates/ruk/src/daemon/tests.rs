@@ -23,8 +23,8 @@ use ruk_core::change::{LeaseId, OperationId, RequestId, SessionId, StoreId};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
 use ruk_core::protocol::{
-    BookmarkSetArgs, BookmarkTarget, Method, NewArgs, PageCursor, PageRequest, PinArgs,
-    QueryDigest, Reply, ReplyBody, ReplyEnvelope, StatusArgs, TagSetArgs,
+    BookmarkSetArgs, BookmarkTarget, Method, NewArgs, OpLogArgs, PageCursor, PageLimit,
+    PageRequest, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope, StatusArgs, TagSetArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName};
 
@@ -787,6 +787,116 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
     );
     let (report, _) = driver.expect_typed_refused(29, &payload).await;
     assert_eq!(report.code, "E_FORBIDDEN");
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `op.log` pages through its lease: a bounded first
+/// page mints a cursor and the presented cursor resumes to exhaustion.
+#[tokio::test]
+async fn typed_oplog_continuation_pages_through_its_lease() {
+    let root = temp_root("oplog-pages");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-oplog-pages",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-oplog-pages",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let repo = store_repo;
+
+    let payload = Driver::typed_open(&repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    for (stream, name) in [(5, "refs/tags/c1"), (7, "refs/tags/c2")] {
+        let tag_args = TagSetArgs {
+            name: RefName::new(name).expect("tag name"),
+            target: Oid::from_bytes(&[0x11; 20]).expect("tag target"),
+            annotation: None,
+            expected: RefExpect::Absent,
+        };
+        let args_json = sonic_rs::to_string(&tag_args).expect("tag args encode");
+        let payload = Driver::typed_open(
+            &repo,
+            "tag.set",
+            Some(&RequestId::generate().to_string()),
+            Some(args_json),
+            Some(&session),
+        );
+        let (stdout, _) = driver.run_typed(stream, &payload).await;
+        let envelope = typed_success(&stdout);
+        let ReplyBody::Success(Reply::TagSet(_)) = envelope.body else {
+            panic!("tag.set must answer its own reply");
+        };
+    }
+
+    let first_args = OpLogArgs {
+        session: None,
+        page: PageRequest {
+            limit: Some(PageLimit::new(1).expect("page limit 1")),
+            cursor: None,
+        },
+    };
+    let payload = Driver::typed_open(
+        &repo,
+        "op.log",
+        None,
+        Some(sonic_rs::to_string(&first_args).expect("op.log args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(9, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(first)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(first.entries.items.len(), 1);
+    let cursor = first.entries.next.clone().expect("first page continues");
+
+    let second_args = OpLogArgs {
+        session: None,
+        page: PageRequest {
+            limit: Some(PageLimit::new(1).expect("page limit 1")),
+            cursor: Some(cursor),
+        },
+    };
+    let payload = Driver::typed_open(
+        &repo,
+        "op.log",
+        None,
+        Some(sonic_rs::to_string(&second_args).expect("op.log args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(11, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(second)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(second.entries.items.len(), 1);
+    assert!(second.entries.next.is_none());
+    assert_ne!(second.entries.items[0].id, first.entries.items[0].id);
+    assert!(first.entries.items[0].id.0 > second.entries.items[0].id.0);
+    assert_eq!(second.view, first.view);
+    assert_eq!(second.oldest_retained, Some(second.entries.items[0].id));
 
     drop(driver);
     task.abort();
