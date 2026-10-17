@@ -1433,4 +1433,33 @@ mod tests {
     }
 }
 
+/// Routes one server-side command to its serve half (protocol v0).
+///
+/// `name` is the bare command (`upload-pack`, `receive-pack`,
+/// `upload-archive`); the per-command grammars stay with their owners.
+/// The `upload-archive` arm serves `git archive --remote` through
+/// [`super::archive::serve_upload_archive`].
+///
+/// # Errors
+/// [`GitError::Unsupported`] for an unknown command, plus each half's own
+/// failures.
+pub fn serve_command<R: Read, W: Write>(
+    name: &str,
+    reader: R,
+    writer: W,
+    store: &Store,
+    kind: HashKind,
+    head: &HeadAdvertisement,
+    interrupt: &Interrupt,
+) -> Result<(), GitError> {
+    match name {
+        "upload-pack" => serve_upload_pack(reader, writer, store, kind, head, interrupt),
+        "receive-pack" => serve_receive_pack(reader, writer, store, kind, head, interrupt),
+        "upload-archive" => {
+            super::archive::serve_upload_archive(reader, writer, store, kind, head, interrupt)
+        }
+        other => Err(GitError::Unsupported {
+            command: format!("unknown serve command {other:?}"),
+        }),
+    }
 }
