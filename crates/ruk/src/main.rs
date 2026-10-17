@@ -3,6 +3,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod daemon;
+
 use ruk_core::MAX_CONTROL_FRAME_BYTES;
 use ruk_core::conflict::{ConflictRecord, ConflictRecordInput};
 use ruk_core::error::{CoreError, ErrorCode};
@@ -21,6 +23,16 @@ use ruk_core::store::{PreparationBudget, Store};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum ForgejoCommand {
+    /// Serve the daemon until interrupted.
+    Serve {
+        /// Daemon configuration document path (TOML).
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -46,6 +58,15 @@ enum Command {
         /// Input path, or `-` for stdin.
         #[arg(long, default_value = "-")]
         input: String,
+    },
+    /// Serve Forgejo as a hosted multi-repository daemon.
+    ///
+    /// Loads a TOML config naming the socket path, repository roots, and
+    /// the runtime bounds, then serves the pooled IPC surface until
+    /// interrupted.
+    Forgejo {
+        #[command(subcommand)]
+        command: ForgejoCommand,
     },
     /// Decode a native conflict-v1 record to its canonical JSON form.
     ///
@@ -138,6 +159,25 @@ fn run(cli: Cli) -> Result<Vec<u8>, CoreError> {
             let store = open_store(&repo)?;
             let description = ruk_core::ops::describe(&store, request)?;
             render(&description)
+        }
+        Command::Forgejo {
+            command: ForgejoCommand::Serve { config },
+        } => {
+            let doc = std::fs::read(&config).map_err(|err| {
+                CoreError::new(
+                    ErrorCode::EIo,
+                    format!("daemon config {}: {err}", config.display()),
+                )
+            })?;
+            let cfg = daemon::DaemonConfig::from_toml(&doc).map_err(|err| match err {
+                daemon::Error::Core(err) => err,
+                other => CoreError::new(ErrorCode::EHosted, other.to_string()),
+            })?;
+            daemon::serve(cfg).map_err(|err| match err {
+                daemon::Error::Core(err) => err,
+                other => CoreError::new(ErrorCode::EHosted, other.to_string()),
+            })?;
+            Ok(Vec::new())
         }
     }
 }

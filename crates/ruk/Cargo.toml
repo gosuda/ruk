@@ -19,5 +19,8 @@ clap.workspace = true
 serde.workspace = true
 sonic-rs.workspace = true
 
+tokio.workspace = true
+toml.workspace = true
+
 [lints]
 workspace = true

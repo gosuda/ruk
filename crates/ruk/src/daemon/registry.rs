@@ -1,0 +1,553 @@
+//! Hosted multi-repository registry: authorized open plus coordinators.
+//!
+//! The registry owns the canonicalized repository roots of one daemon
+//! process. Every open resolves a caller-supplied path or opaque handle to
+//! a canonical repository path beneath those roots, then hands out the one
+//! hosted coordinator of that repository. Coordinators open lazily on first
+//! open: the store opens on the canonical path, the publication lane runner
+//! spawns once on the daemon runtime bound through `set_runtime`, and idle
+//! eviction or registry drop retires the coordinator through `shutdown`.
+//! Eviction skips entries with invocations still in flight, so retiring
+//! never cancels a live submission.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ruk_core::coord::{HostedCoordinator, Principal};
+use ruk_core::error::{CoreError, ErrorCode};
+use ruk_core::store::{PreparationBudget, Store};
+
+/// One registered repository: its canonical path, its hosted coordinator
+/// once opened, and its last-use instant for idle eviction.
+struct RepoEntry {
+    /// The canonical repository path beneath a configured root.
+    path: PathBuf,
+    /// The one hosted coordinator of this repository; `None` until first open.
+    coordinator: Option<Arc<HostedCoordinator>>,
+    /// The last instant this entry served an open.
+    last_used: Instant,
+}
+
+/// The mutable handle table behind [`Registry`].
+struct RegistryInner {
+    /// Opaque handle to repository entry.
+    entries: HashMap<String, RepoEntry>,
+}
+
+/// The hosted repository registry of one daemon process.
+pub struct Registry {
+    /// Canonicalized repository roots; every open must land beneath one.
+    roots: Vec<PathBuf>,
+    /// Handle and path bindings.
+    inner: Mutex<RegistryInner>,
+    /// Counter for fresh opaque handles.
+    next_handle: AtomicU64,
+    /// The daemon runtime hosting every lane runner; bound before serving.
+    runtime: Mutex<Option<tokio::runtime::Handle>>,
+}
+
+impl fmt::Debug for Registry {
+    /// Formats the roots and the entry count without exposing coordinators.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let entries = self
+            .inner
+            .lock()
+            .map(|inner| inner.entries.len())
+            .unwrap_or(0);
+        f.debug_struct("Registry")
+            .field("roots", &self.roots)
+            .field("entries", &entries)
+            .finish()
+    }
+}
+
+impl Registry {
+    /// Builds one registry over `roots`, canonicalizing every root.
+    ///
+    /// # Errors
+    /// `E_INVALID` for an empty root set, `E_IO` when a root is missing or
+    /// inaccessible.
+    pub fn new(roots: Vec<PathBuf>) -> Result<Self, CoreError> {
+        if roots.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "daemon needs at least one repository root",
+            ));
+        }
+        let mut canonical = Vec::with_capacity(roots.len());
+        for root in &roots {
+            let resolved = std::fs::canonicalize(root).map_err(|err| {
+                CoreError::new(
+                    ErrorCode::EIo,
+                    format!("repository root is not accessible: {err}"),
+                )
+            })?;
+            if !canonical.contains(&resolved) {
+                canonical.push(resolved);
+            }
+        }
+        Ok(Self {
+            roots: canonical,
+            inner: Mutex::new(RegistryInner {
+                entries: HashMap::new(),
+            }),
+            next_handle: AtomicU64::new(1),
+            runtime: Mutex::new(None),
+        })
+    }
+
+    /// Binds the daemon runtime hosting every lane runner.
+    ///
+    /// `serve` calls this once before accepting; [`Registry::open`] refuses
+    /// with `E_HOSTED` until it runs.
+    pub fn set_runtime(&self, handle: tokio::runtime::Handle) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            *runtime = Some(handle);
+        }
+    }
+
+    /// Returns the canonicalized repository roots.
+    #[must_use]
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots.clone()
+    }
+
+    /// Resolves `requested` to a canonical path beneath a configured root.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for a missing path, `E_IO` when the path is
+    /// inaccessible, `E_FORBIDDEN` outside the configured roots.
+    pub fn resolve(&self, requested: &Path) -> Result<PathBuf, CoreError> {
+        let canonical = match std::fs::canonicalize(requested) {
+            Ok(path) => path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CoreError::new(
+                    ErrorCode::ENotFound,
+                    "repository path is unknown",
+                ));
+            }
+            Err(err) => {
+                return Err(CoreError::new(
+                    ErrorCode::EIo,
+                    format!("repository path is not accessible: {err}"),
+                ));
+            }
+        };
+        if self.roots.iter().any(|root| canonical.starts_with(root)) {
+            Ok(canonical)
+        } else {
+            Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "repository path is outside the configured roots",
+            ))
+        }
+    }
+
+    /// Opens `repo_ref` by path or handle, returning its handle, path, and coordinator.
+    ///
+    /// A reference starting with `/` is an absolute repository path;
+    /// anything else is an opaque handle from a previous open. The first
+    /// open of a repository opens its store and spawns its lane runner;
+    /// later opens share the one coordinator. Callers run this on the
+    /// blocking pool: resolution canonicalizes paths, the store opens, and
+    /// the registry lock is held throughout, none of which belongs on the
+    /// async runtime.
+    ///
+    /// # Errors
+    /// As for [`Registry::resolve`] for paths, `E_NOT_FOUND` for unknown
+    /// handles, `E_FORBIDDEN` outside the configured roots, `E_HOSTED` when
+    /// the daemon runtime is not bound yet.
+    pub fn open(
+        &self,
+        repo_ref: &str,
+    ) -> Result<(String, PathBuf, Arc<HostedCoordinator>), CoreError> {
+        let (handle, path) = if repo_ref.starts_with('/') {
+            let path = self.resolve(Path::new(repo_ref))?;
+            let handle = self.handle_for_path(&path)?;
+            (handle, path)
+        } else {
+            let path = self.open_by_handle(repo_ref)?;
+            (repo_ref.to_string(), path)
+        };
+        let coordinator = self.coordinator_for(&handle, &path)?;
+        Ok((handle, path, coordinator))
+    }
+
+    /// Returns the hosted coordinator of `handle`, opening it on first use.
+    ///
+    /// The store opens on the canonical path, the coordinator binds the
+    /// repository owner's policy file, and the lane runner spawns once on
+    /// the bound runtime. The registry lock is held throughout so two
+    /// racing first opens cannot spawn two runners.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for an unknown handle, `E_HOSTED` when the daemon
+    /// runtime is not bound yet, store and coordinator failures otherwise.
+    fn coordinator_for(
+        &self,
+        handle: &str,
+        canonical: &Path,
+    ) -> Result<Arc<HostedCoordinator>, CoreError> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| CoreError::new(ErrorCode::EHosted, "daemon runtime is not bound yet"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        let entry = inner
+            .entries
+            .get_mut(handle)
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository handle is unknown"))?;
+        if let Some(coordinator) = entry.coordinator.as_ref() {
+            entry.last_used = Instant::now();
+            return Ok(Arc::clone(coordinator));
+        }
+        let store = Store::open(canonical, Arc::new(PreparationBudget::reference_defaults()))
+            .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+        let owner = Self::repository_owner(canonical)?;
+        let coordinator = Arc::new(HostedCoordinator::open(
+            Arc::new(store),
+            owner,
+            canonical.to_path_buf(),
+        )?);
+        let _ = coordinator.spawn_on(&runtime)?;
+        entry.coordinator = Some(Arc::clone(&coordinator));
+        entry.last_used = Instant::now();
+        Ok(coordinator)
+    }
+
+    /// Reads the owner principal of one canonical repository path.
+    ///
+    /// The coordinator policy source resolves its `owner` alias against
+    /// this principal, so the on-disk owner of the repository root is the
+    /// honest choice without new platform dependencies: in normal
+    /// deployments the daemon user owns its roots, and explicit
+    /// `policy.toml` files govern every other layout.
+    ///
+    /// # Errors
+    /// `E_IO` when the path metadata is unreadable, `E_HOSTED` where no
+    /// Unix owner identity exists.
+    #[cfg(unix)]
+    fn repository_owner(canonical: &Path) -> Result<Principal, CoreError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let uid = std::fs::metadata(canonical)
+            .map_err(|err| {
+                CoreError::new(
+                    ErrorCode::EIo,
+                    format!("repository owner is not readable: {err}"),
+                )
+            })?
+            .uid();
+        Ok(Principal::from_peer_uid(uid))
+    }
+
+    /// Reads the owner principal of one canonical repository path.
+    ///
+    /// # Errors
+    /// Always `E_HOSTED`: coordinator hosting needs a Unix owner identity.
+    #[cfg(not(unix))]
+    fn repository_owner(canonical: &Path) -> Result<Principal, CoreError> {
+        let _ = canonical;
+        Err(CoreError::new(
+            ErrorCode::EHosted,
+            "coordinator hosting needs a Unix owner identity",
+        ))
+    }
+
+    /// Opens `requested` by path, returning its opaque handle.
+    ///
+    /// # Errors
+    /// As for [`Registry::resolve`].
+    pub fn open_by_path(&self, requested: &Path) -> Result<String, CoreError> {
+        let canonical = self.resolve(requested)?;
+        self.handle_for_path(&canonical)
+    }
+
+    /// Opens `handle`, returning its canonical repository path.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for an unknown handle, `E_FORBIDDEN` when the bound
+    /// path no longer sits beneath a configured root.
+    pub fn open_by_handle(&self, handle: &str) -> Result<PathBuf, CoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        let entry = inner
+            .entries
+            .get_mut(handle)
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository handle is unknown"))?;
+        if !self.roots.iter().any(|root| entry.path.starts_with(root)) {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "repository handle escapes the configured roots",
+            ));
+        }
+        entry.last_used = Instant::now();
+        Ok(entry.path.clone())
+    }
+
+    /// Returns the handle bound to `canonical`, registering it when new.
+    ///
+    /// # Errors
+    /// `E_IO` when the registry lock is poisoned.
+    fn handle_for_path(&self, canonical: &Path) -> Result<String, CoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        for (handle, entry) in inner.entries.iter_mut() {
+            if entry.path == canonical {
+                entry.last_used = Instant::now();
+                return Ok(handle.clone());
+            }
+        }
+        let handle = format!("repo-{}", self.next_handle.fetch_add(1, Ordering::Relaxed));
+        inner.entries.insert(
+            handle.clone(),
+            RepoEntry {
+                path: canonical.to_path_buf(),
+                coordinator: None,
+                last_used: Instant::now(),
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Drops entries idle longer than `max_idle`, returning the count.
+    ///
+    /// An entry holding more than the registry's own coordinator reference
+    /// still serves an invocation, so eviction keeps it. Retired
+    /// coordinators shut down after the lock releases: the lane closes to
+    /// new submissions and the runner drains.
+    ///
+    /// # Errors
+    /// `E_IO` when the registry lock is poisoned.
+    pub fn evict_idle(&self, max_idle: Duration) -> Result<usize, CoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        let before = inner.entries.len();
+        let mut retired = Vec::new();
+        inner.entries.retain(|_, entry| {
+            if entry.last_used.elapsed() < max_idle {
+                return true;
+            }
+            let busy = entry
+                .coordinator
+                .as_ref()
+                .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
+            if busy {
+                return true;
+            }
+            if let Some(coordinator) = entry.coordinator.take() {
+                retired.push(coordinator);
+            }
+            false
+        });
+        let evicted = before - inner.entries.len();
+        drop(inner);
+        for coordinator in retired {
+            coordinator.shutdown();
+        }
+        Ok(evicted)
+    }
+
+    /// Returns the count of registered handles.
+    ///
+    /// # Errors
+    /// `E_IO` when the registry lock is poisoned.
+    pub fn len(&self) -> Result<usize, CoreError> {
+        self.inner
+            .lock()
+            .map(|inner| inner.entries.len())
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))
+    }
+
+    /// True when no handle is registered.
+    ///
+    /// # Errors
+    /// `E_IO` when the registry lock is poisoned.
+    pub fn is_empty(&self) -> Result<bool, CoreError> {
+        self.len().map(|len| len == 0)
+    }
+}
+
+impl Drop for Registry {
+    /// Retires every hosted coordinator through `shutdown`.
+    fn drop(&mut self) {
+        let retired: Vec<Arc<HostedCoordinator>> = self
+            .inner
+            .lock()
+            .map(|inner| {
+                inner
+                    .entries
+                    .values()
+                    .filter_map(|entry| entry.coordinator.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for coordinator in retired {
+            coordinator.shutdown();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Registry;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static SIBLING: AtomicU64 = AtomicU64::new(1);
+
+    fn scratch_root() -> std::path::PathBuf {
+        let tag = SIBLING.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ruk-daemon-registry-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(root.join("repo-a")).expect("scratch repository fits on disk");
+        root
+    }
+
+    #[test]
+    fn empty_roots_are_rejected() {
+        assert!(Registry::new(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn missing_root_is_rejected() {
+        let missing =
+            std::env::temp_dir().join(format!("ruk-daemon-missing-{}", std::process::id()));
+        assert!(Registry::new(vec![missing]).is_err());
+    }
+
+    #[test]
+    fn paths_outside_roots_are_forbidden() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let outside = std::env::temp_dir();
+        assert_ne!(
+            std::fs::canonicalize(&outside).expect("temp dir exists"),
+            std::fs::canonicalize(&root).expect("scratch root exists")
+        );
+        let denied = registry.resolve(&outside);
+        assert!(denied.is_err());
+        assert!(registry.open_by_path(&outside).is_err());
+    }
+
+    #[test]
+    fn dotdot_escape_is_forbidden() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let escape = root.join("repo-a").join("..").join("..");
+        assert!(registry.resolve(&escape).is_err());
+    }
+
+    #[test]
+    fn missing_path_is_not_found() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let missing = root.join("no-such-repo");
+        assert!(registry.resolve(&missing).is_err());
+    }
+
+    #[test]
+    fn open_by_path_is_stable() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let first = registry
+            .open_by_path(&root.join("repo-a"))
+            .expect("inside path opens");
+        let second = registry
+            .open_by_path(&root.join("repo-a"))
+            .expect("repeat open reuses the handle");
+        assert_eq!(first, second);
+        let path = registry
+            .open_by_handle(&first)
+            .expect("known handle resolves");
+        assert_eq!(
+            path,
+            std::fs::canonicalize(root.join("repo-a")).expect("scratch repo exists")
+        );
+        assert!(registry.open_by_handle("repo-unknown").is_err());
+        assert!(registry.open("repo-unknown").is_err());
+        assert_eq!(registry.len().expect("registry lock holds"), 1);
+        assert!(!registry.is_empty().expect("registry lock holds"));
+    }
+
+    #[test]
+    fn open_shares_one_coordinator_and_evicts_it_idle() {
+        use ruk_core::HashKind;
+        use ruk_core::store::{PreparationBudget, Store};
+        use std::sync::Arc;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        Store::create(
+            &root.join("repo-a"),
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("scratch store initializes");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+        let path = root.join("repo-a");
+        let handle = registry.open_by_path(&path).expect("inside path opens");
+        let (first, _, first_coord) = registry.open(&handle).expect("first open coordinates");
+        assert_eq!(first, handle);
+        let (second, resolved, second_coord) = registry
+            .open(path.to_str().expect("scratch path is UTF-8"))
+            .expect("path open reuses the coordinator");
+        assert_eq!(second, handle);
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&path).expect("scratch repo exists")
+        );
+        assert!(Arc::ptr_eq(&first_coord, &second_coord));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            registry
+                .evict_idle(Duration::from_millis(1))
+                .expect("registry lock holds"),
+            0
+        );
+        drop(first_coord);
+        drop(second_coord);
+        assert_eq!(
+            registry
+                .evict_idle(Duration::from_millis(1))
+                .expect("registry lock holds"),
+            1
+        );
+        assert!(registry.is_empty().expect("registry lock holds"));
+    }
+
+    #[test]
+    fn idle_entries_evict() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        registry
+            .open_by_path(&root.join("repo-a"))
+            .expect("inside path opens");
+        assert_eq!(registry.len().expect("registry lock holds"), 1);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            registry
+                .evict_idle(Duration::from_millis(1))
+                .expect("registry lock holds"),
+            1
+        );
+        assert!(registry.is_empty().expect("registry lock holds"));
+    }
+}
