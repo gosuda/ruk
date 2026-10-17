@@ -15,8 +15,16 @@ use std::time::Duration;
 use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
 use super::{
     BoundedExecutor, CommandAccepted, CommandExitReport, ConnectionRefs, ControlReply, ErrorReport,
-    ExitReport, OutcomeLedger, Registry, serve_connection,
+    ExitReport, InvocationAccepted, InvocationOpen, OutcomeLedger, Registry, SessionOpened,
+    serve_connection,
 };
+use ruk_core::change::{RequestId, SessionId};
+use ruk_core::heads::Head;
+use ruk_core::ids::Oid;
+use ruk_core::protocol::{
+    BookmarkSetArgs, BookmarkTarget, Method, PinArgs, Reply, ReplyBody, ReplyEnvelope, TagSetArgs,
+};
+use ruk_core::refdata::{RefExpect, RefName};
 
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +189,83 @@ impl Driver {
         let exit: ExitReport = ipc::decode_control(&exit_frame.payload).expect("exit decodes");
         (report, exit)
     }
+
+    /// Builds one typed invocation open document.
+    fn typed_open(
+        repo: &str,
+        method: &str,
+        request_id: Option<&str>,
+        args_json: Option<String>,
+        session_id: Option<&str>,
+    ) -> Vec<u8> {
+        let open = InvocationOpen {
+            repo: repo.to_string(),
+            method: method.to_string(),
+            request_id: request_id.map(str::to_string),
+            args_json,
+            session_id: session_id.map(str::to_string),
+        };
+        sonic_rs::to_string(&open)
+            .expect("typed open encodes")
+            .into_bytes()
+    }
+
+    /// Runs one typed invocation to its terminal `Exit`, returning stdout.
+    async fn run_typed(&mut self, stream_id: u64, payload: &[u8]) -> (Vec<u8>, ExitReport) {
+        self.send(FrameKind::Open, stream_id, payload).await;
+        let accepted = self.recv().await;
+        assert_eq!(
+            accepted.kind,
+            FrameKind::Accepted,
+            "typed open refused: {}",
+            String::from_utf8_lossy(&accepted.payload)
+        );
+        let reply: InvocationAccepted =
+            ipc::decode_control(&accepted.payload).expect("typed accepted decodes");
+        assert_eq!(reply.stream_id, stream_id);
+        let mut stdout = Vec::new();
+        loop {
+            let frame = self.recv().await;
+            assert_eq!(frame.stream_id, stream_id);
+            match frame.kind {
+                FrameKind::Stdout => stdout.extend_from_slice(&frame.payload),
+                FrameKind::Exit => {
+                    let exit: ExitReport =
+                        ipc::decode_control(&frame.payload).expect("typed exit decodes");
+                    assert_eq!(exit.status, 0);
+                    assert_eq!(exit.code, "OK");
+                    return (stdout, exit);
+                }
+                FrameKind::Error => panic!(
+                    "typed stream {stream_id} refused: {}",
+                    String::from_utf8_lossy(&frame.payload)
+                ),
+                other => panic!("unexpected frame {other:?} on typed stream {stream_id}"),
+            }
+        }
+    }
+
+    /// Runs one typed invocation expecting refusal: an `Error` then a
+    /// nonzero `Exit`.
+    async fn expect_typed_refused(
+        &mut self,
+        stream_id: u64,
+        payload: &[u8],
+    ) -> (ErrorReport, ExitReport) {
+        self.send(FrameKind::Open, stream_id, payload).await;
+        let accepted = self.recv().await;
+        assert_eq!(accepted.kind, FrameKind::Accepted);
+        let err_frame = self.recv().await;
+        assert_eq!(err_frame.kind, FrameKind::Error);
+        assert_eq!(err_frame.stream_id, stream_id);
+        let report: ErrorReport = ipc::decode_control(&err_frame.payload).expect("error decodes");
+        let exit_frame = self.recv().await;
+        assert_eq!(exit_frame.kind, FrameKind::Exit);
+        assert_eq!(exit_frame.stream_id, stream_id);
+        let exit: ExitReport = ipc::decode_control(&exit_frame.payload).expect("exit decodes");
+        assert_eq!(exit.status, 1);
+        (report, exit)
+    }
 }
 
 /// Completes the stream-zero handshake with the Go client's shape: no
@@ -201,6 +286,7 @@ async fn handshake(driver: &mut Driver) {
 /// Spawns `serve_connection` on a socket pair, returning the driver end.
 fn spawn_pair(root: &PathBuf) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
     let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry"));
+    registry.set_runtime(tokio::runtime::Handle::current());
     let refs = ConnectionRefs {
         registry,
         executor: BoundedExecutor::new(4).expect("executor"),
@@ -396,6 +482,228 @@ async fn command_stream_cancel_reports_cancelled() {
     assert!(reply.found);
     let recorded = reply.exit.expect("recorded exit");
     assert!(recorded.cancelled);
+
+    drop(driver);
+    task.abort();
+}
+
+/// Decodes typed stdout as a success [`ReplyEnvelope`].
+fn typed_success(stdout: &[u8]) -> ReplyEnvelope {
+    let envelope: ReplyEnvelope = ipc::decode_control(stdout).expect("reply envelope decodes");
+    let ReplyBody::Success(_) = &envelope.body else {
+        panic!("expected a success envelope, got {envelope:?}");
+    };
+    envelope
+}
+
+#[tokio::test]
+async fn typed_dispatch_serves_covered_read_and_mutation() {
+    let root = temp_root("typed");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    // Typed invocations name the store directory itself, where the format
+    // file lives — not the worktree root around it.
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let repo = store_repo;
+
+    // `session.open` answers the session the later calls run under.
+    let payload = Driver::typed_open(&repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    assert!(!opened.principal.is_empty());
+    let session = opened.session.to_string();
+
+    // A covered read with a live session succeeds; the fresh log is empty.
+    let payload = Driver::typed_open(
+        &repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    assert_eq!(envelope.request_id, None);
+    let ReplyBody::Success(Reply::OpLog(reply)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert!(reply.entries.items.is_empty());
+    assert_eq!(reply.oldest_retained, None);
+
+    // An unknown session is forbidden, not refused as sessionless.
+    let unknown = SessionId::generate().to_string();
+    let payload = Driver::typed_open(
+        &repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&unknown),
+    );
+    let (report, _) = driver.expect_typed_refused(7, &payload).await;
+    assert_eq!(report.code, "E_FORBIDDEN");
+
+    // A missing session keeps the sessionless refusal.
+    let payload = Driver::typed_open(&repo, "op.log", None, Some("{}".to_string()), None);
+    let (report, _) = driver.expect_typed_refused(9, &payload).await;
+    assert_eq!(report.code, "E_INVALID");
+
+    // A malformed session id is invalid, never forbidden.
+    let payload = Driver::typed_open(&repo, "op.log", None, Some("{}".to_string()), Some("nope"));
+    let (report, _) = driver.expect_typed_refused(11, &payload).await;
+    assert_eq!(report.code, "E_INVALID");
+
+    // A covered mutation prepares, publishes, and names its request id.
+    let tag_args = TagSetArgs {
+        name: RefName::new("refs/tags/v1").expect("tag name"),
+        target: Oid::from_bytes(&[0x11; 20]).expect("tag target"),
+        annotation: None,
+        expected: RefExpect::Absent,
+    };
+    let args_json = sonic_rs::to_string(&tag_args).expect("tag args encode");
+    let mutation_id = RequestId::generate().to_string();
+    let payload = Driver::typed_open(
+        &repo,
+        "tag.set",
+        Some(&mutation_id),
+        Some(args_json),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(13, &payload).await;
+    let envelope = typed_success(&stdout);
+    assert_eq!(
+        envelope.request_id.map(|id| id.to_string()),
+        Some(mutation_id.clone())
+    );
+    let ReplyBody::Success(Reply::TagSet(_)) = envelope.body else {
+        panic!("tag.set must answer its own reply");
+    };
+
+    // The effect landed: the log now records the mutation.
+    let payload = Driver::typed_open(
+        &repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(15, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(reply)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(reply.entries.items.len(), 1);
+    assert_eq!(reply.entries.items[0].method, Method::TagSet);
+    assert!(reply.oldest_retained.is_some());
+
+    // A second covered mutation lets the log prove newest-first order and
+    // that oldest names the first operation, not the latest.
+    let bookmark_args = BookmarkSetArgs {
+        name: RefName::new("refs/heads/main").expect("bookmark name"),
+        target: BookmarkTarget::Commit {
+            oid: Oid::from_bytes(&[0x22; 20]).expect("bookmark target"),
+        },
+        expected: RefExpect::Absent,
+    };
+    let args_json = sonic_rs::to_string(&bookmark_args).expect("bookmark args encode");
+    let payload = Driver::typed_open(
+        &repo,
+        "bookmark.set",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(16, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::BookmarkSet(_)) = envelope.body else {
+        panic!("bookmark.set must answer its own reply");
+    };
+    let payload = Driver::typed_open(
+        &repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(18, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(reply)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(reply.entries.items.len(), 2);
+    assert_eq!(reply.entries.items[0].method, Method::BookmarkSet);
+    assert_eq!(reply.entries.items[1].method, Method::TagSet);
+    assert_eq!(reply.oldest_retained, Some(reply.entries.items[1].id));
+
+    // A read outside the covered subset names its missing implementation.
+    let payload = Driver::typed_open(
+        &repo,
+        "claim.list",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(17, &payload).await;
+    assert_eq!(report.code, "E_HOSTED");
+    assert!(
+        report.message.contains("no read implementation"),
+        "unexpected message: {}",
+        report.message
+    );
+
+    // A mutation outside the covered subset names its missing preparation.
+    let pin_args = PinArgs {
+        head: Head::Git {
+            oid: Oid::from_bytes(&[0x11; 20]).expect("pin target"),
+        },
+    };
+    let args_json = sonic_rs::to_string(&pin_args).expect("pin args encode");
+    let payload = Driver::typed_open(
+        &repo,
+        "pin",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(19, &payload).await;
+    assert_eq!(report.code, "E_HOSTED");
+    assert!(
+        report.message.contains("does not cover preparation"),
+        "unexpected message: {}",
+        report.message
+    );
+
+    // The session check runs before preparation: an uncovered method with
+    // an unknown session reports forbidden, never the missing preparation.
+    let payload = Driver::typed_open(
+        &repo,
+        "pin",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&pin_args).expect("pin args encode")),
+        Some(&SessionId::generate().to_string()),
+    );
+    let (report, _) = driver.expect_typed_refused(21, &payload).await;
+    assert_eq!(report.code, "E_FORBIDDEN");
 
     drop(driver);
     task.abort();

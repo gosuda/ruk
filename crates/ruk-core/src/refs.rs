@@ -352,6 +352,43 @@ pub fn prepare_clear_ref_conflict(
     })
 }
 
+/// Checks the stored conflict against `expected` and lowers its clearing to
+/// an exact fact in a single read.
+///
+/// The one read keeps the terms check and the clear expectation on the same
+/// bytes; the lane's point compare-and-swap on the returned fact covers the
+/// gap between preparation and publication.
+///
+/// # Errors
+/// `E_STALE` when no conflict exists or its terms differ from `expected`;
+/// `E_CORRUPT` for a damaged row.
+pub fn prepare_clear_ref_conflict_checked(
+    store: &Store,
+    name: &RefName,
+    expected: &Merge<Option<Oid>>,
+) -> Result<FactMutation, CoreError> {
+    let key = name.as_bytes().to_vec();
+    let Some(bytes) = store.fact(FactTable::RefConflicts, name.as_bytes())? else {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            format!("ref `{name}` has no conflict to resolve"),
+        ));
+    };
+    let conflict = decode_stored_conflict(store, name, &bytes)?;
+    if &conflict != expected {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            format!("ref `{name}` conflict terms changed since the caller read them"),
+        ));
+    }
+    Ok(FactMutation {
+        table: FactTable::RefConflicts,
+        key,
+        expected: FactExpectation::Value(bytes),
+        value: None,
+    })
+}
+
 pub fn page_ref_conflicts(
     store: &Store,
     after: Option<&[u8]>,

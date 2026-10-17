@@ -287,6 +287,10 @@ pub struct InvocationOpen {
     /// The raw JSON document of the method arguments, if any.
     #[serde(default)]
     pub args_json: Option<String>,
+    /// The session reads and mutations run under, if any. Go command
+    /// streams never send it; typed clients do.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// The `Accepted` payload answering one `Open`.
@@ -578,9 +582,10 @@ pub struct SessionOpened {
 /// Names the coordinator call site one method needs.
 ///
 /// `schema` answers locally and the bootstrap methods run on the
-/// repository coordinator. Reads still need a session-bound read path the
-/// coordinator does not expose, and mutations still need the per-method
-/// preparation layer translating bare arguments into lane parts.
+/// repository coordinator. Session-bound reads run through
+/// `HostedCoordinator::read` (`op.log` is served; every other read names
+/// its missing implementation), and covered mutations run through the
+/// per-method preparation layer plus `submit_prepared`.
 #[must_use]
 pub fn coord_call_site(method: Method) -> &'static str {
     match method.kind() {
@@ -589,10 +594,10 @@ pub fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::open_session/resume_session"
         }
         ruk_core::protocol::MethodKind::Read => {
-            "a session-bound read path: BoundSession plus admission, neither exposed on HostedCoordinator"
+            "HostedCoordinator::read (op.log served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
-            "a per-method preparation layer: prepared objects, exact-expectation facts, a precomputed typed reply, and ref transactions for lane publication"
+            "ruk_core::coord::prepare_mutation plus HostedCoordinator::submit_prepared (ref mutations covered; the rest name their missing preparation)"
         }
     }
 }
@@ -1995,12 +2000,31 @@ async fn open_inner(
     {
         return Err(());
     }
+    let session = match open.session_id.as_deref() {
+        None => None,
+        Some(text) => match text.parse::<SessionId>() {
+            Ok(id) => Some(id),
+            Err(err) => {
+                let _ = fail(
+                    stream,
+                    Error::Core(CoreError::new(
+                        ErrorCode::EInvalid,
+                        format!("invocation carries a malformed session id: {err}"),
+                    )),
+                    refs,
+                )
+                .await;
+                return Err(());
+            }
+        },
+    };
     match dispatch_method(
         &coordinator,
         &principal,
         method,
         open.args_json.as_deref(),
         open.request_id.as_deref(),
+        session,
         &cancel,
     )
     .await
@@ -2033,9 +2057,10 @@ async fn open_inner(
 ///
 /// `schema` answers locally. `session.open` opens a real session for the
 /// peer principal and answers the honest subset the coordinator returns;
-/// `session.resume` answers the full negotiated reply. Reads and mutations
-/// decode and validate, then refuse: the frame carries no session, and no
-/// read or preparation path exists yet.
+/// `session.resume` answers the full negotiated reply. Reads run through
+/// `HostedCoordinator::read` and mutations through `prepare_mutation` plus
+/// `submit_prepared`, both under the invocation's session; a missing
+/// session refuses, and uncovered methods name their missing path.
 ///
 /// # Errors
 /// `E_INVALID` for an unknown shape or a session-bound method without a
@@ -2047,6 +2072,7 @@ pub async fn dispatch_method(
     method: Method,
     args_json: Option<&str>,
     request_id: Option<&str>,
+    session: Option<SessionId>,
     cancel: &Cancel,
 ) -> Result<Vec<u8>, CoreError> {
     match method {
@@ -2100,17 +2126,40 @@ pub async fn dispatch_method(
         _ => {
             let request = decode_request_args(method, args_json, request_id)?;
             request.validate()?;
-            Err(refuse_sessionless(method, None))
+            let Some(session) = session else {
+                return Err(refuse_sessionless(method, None));
+            };
+            match method.kind() {
+                ruk_core::protocol::MethodKind::Read => {
+                    let reply = coordinator
+                        .read(principal, session, request, cancel)
+                        .await?;
+                    ipc::encode_control(&ReplyEnvelope::success(None, reply))
+                }
+                ruk_core::protocol::MethodKind::Mutation => {
+                    coordinator
+                        .check_session(principal, session, cancel)
+                        .await?;
+                    let prepared =
+                        ruk_core::coord::prepare_mutation(coordinator.store(), session, request)?;
+                    let request_id = prepared.request_id;
+                    let reply = coordinator
+                        .submit_prepared(principal, prepared, cancel)
+                        .await?;
+                    ipc::encode_control(&ReplyEnvelope::success(Some(request_id), reply))
+                }
+                _ => Err(refuse_sessionless(method, Some(session))),
+            }
         }
     }
 }
 
 /// Builds the refusal for one read or mutation arriving without a session.
 ///
-/// The invocation frame carries no session today, so the first arm always
-/// fires. The second arm stays for the day the frame gains one: even with
-/// a session, reads lack a coordinator read path and mutations lack their
-/// per-method preparation, so both refuse through [`method_error`].
+/// A missing session is the current refusal. A present session never
+/// reaches here through dispatch: reads run on the coordinator and
+/// uncovered ones name their missing implementation there, while mutations
+/// prepare or name their missing preparation.
 fn refuse_sessionless(method: Method, session: Option<SessionId>) -> CoreError {
     match session {
         None => CoreError::new(
@@ -2120,17 +2169,7 @@ fn refuse_sessionless(method: Method, session: Option<SessionId>) -> CoreError {
                 method.as_str()
             ),
         ),
-        Some(_) => method_error(
-            method,
-            match method.kind() {
-                ruk_core::protocol::MethodKind::Read => {
-                    "no read path exists on the coordinator: reads need BoundSession plus admission, both crate-private to ruk-core"
-                }
-                _ => {
-                    "no per-method preparation layer exists: bare arguments cannot supply prepared objects, exact-expectation facts, a precomputed typed reply, ref transactions, or workspace fences"
-                }
-            },
-        ),
+        Some(_) => method_error(method, "no dispatch path serves this method with a session"),
     }
 }
 

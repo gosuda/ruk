@@ -24,6 +24,7 @@
 //!
 //! `policy.toml` inside the store directory is TOML, format version 1:
 //!
+//! ```toml
 //! version = 1
 //! session_idle = "24h"        # optional; fixed units up to hours; > 0
 //! lfs = "deny"                # optional; "deny" (the default) refuses Git

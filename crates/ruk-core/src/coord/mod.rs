@@ -16,6 +16,8 @@ mod leases;
 mod lock;
 mod oplog;
 mod policy;
+mod prepare;
+pub use prepare::prepare_mutation;
 mod receipt;
 mod retention;
 mod rows;

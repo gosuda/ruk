@@ -35,16 +35,20 @@ use super::lane::{
     InternalCandidate, InternalPayload, MutationCandidate, PublicationLane, PublicationLaneRunner,
     WorkspaceFence, create_publication_lane,
 };
+use super::oplog::read_header;
 use super::policy::PolicySource;
 pub use super::policy::Principal;
-use super::rows::{RECEIPT_HORIZON, SessionRow, decode_session, session_key};
+use super::rows::{
+    CoordinatorHead, OP_HEAD_KEY, RECEIPT_HORIZON, SessionRow, decode_head, decode_session,
+    session_key,
+};
 use super::session::{Authority, ResumeOutcome, SessionTable, prepare_open};
-use crate::capability::Capabilities;
-use crate::change::{RequestId, SessionId, WorkspaceId};
+use crate::capability::{Capabilities, ReadAccess};
+use crate::change::{OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
-    ReconnectSecret, Reply, Request, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
-    SessionResumeReply, Timestamp,
+    MAX_PAGE_SIZE, OpLogArgs, OpLogReply, Page, ReconnectSecret, Reply, Request, SessionAuthority,
+    SessionOpenArgs, SessionResumeArgs, SessionResumeReply, Timestamp, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::store::Store;
@@ -320,11 +324,13 @@ impl HostedCoordinator {
     /// - [`ErrorCode::ECancelled`] when `cancel` or shutdown fired.
     /// - [`ErrorCode::EInvalid`] when the method is not a mutation or the
     ///   reply header mismatches the request.
-    /// - [`ErrorCode::EForbidden`] on unknown session or expired authority.
+    /// - [`ErrorCode::EForbidden`] on unknown session, expired authority,
+    ///   or a caller principal that is not the session holder.
     /// - [`ErrorCode::ELimit`] when admission sheds the submission or a fact
     ///   row exceeds the row bound.
     pub async fn submit_prepared(
         &self,
+        caller: &Principal,
         prepared: PreparedMutation,
         cancel: &Cancel,
     ) -> Result<Reply, CoreError> {
@@ -350,6 +356,12 @@ impl HostedCoordinator {
             return Err(CoreError::new(
                 ErrorCode::EForbidden,
                 "session lacks active authority",
+            ));
+        }
+        if live.row().principal != *caller {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "caller is not the session holder",
             ));
         }
         let bound = self.sessions.bind(&live)?;
@@ -385,6 +397,140 @@ impl HostedCoordinator {
             Some(admitted),
         )?;
         self.lane.submit_mutation(candidate).await
+    }
+
+    /// Serves one session-bound read without publishing anything.
+    ///
+    /// Loads the session, requires active authority, holds an in-flight guard
+    /// across the read, admits it under the interactive class with compute
+    /// resources, authorizes it against the session's negotiated capabilities,
+    /// and runs the read implementation. Only `op.log` has an implementation
+    /// today; every other read runs the same session checks and then names
+    /// its missing implementation with [`ErrorCode::EHosted`], so an unknown
+    /// session still reports `E_FORBIDDEN` rather than a missingimpl error.
+    ///
+    /// Capability mapping follows the existing handlers rather than a
+    /// blanket table: ordinary reads authorize as [`ReadAccess::Objects`],
+    /// which always succeeds. A future `claim.list` implementation must use
+    /// the claims module's listing authorization (a session always reads its
+    /// own claims; anything wider needs `read_intents.claims`), and the
+    /// attestation queries carry no capability gate of their own. Receipts
+    /// of an expired session have no read path either: without one, expired
+    /// authority is uniformly forbidden here instead of inventing a
+    /// receipts-only read.
+    ///
+    /// The caller principal must match the session holder, mirroring the
+    /// resume path: `op.log` entries name session identities, so the
+    /// session identity alone cannot be the credential or any reader could
+    /// step into another holder's session. [`HostedCoordinator::submit_prepared`]
+    /// enforces the same holder check at publication.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ECancelled`] when `cancel` or shutdown fired.
+    /// - [`ErrorCode::EForbidden`] on unknown session, expired authority,
+    ///   or a caller principal that is not the session holder.
+    /// - [`ErrorCode::EHosted`] when the method has no read implementation.
+    /// - [`ErrorCode::ELimit`] when admission sheds the read or the log
+    ///   exceeds its single-page bound.
+    pub async fn read(
+        &self,
+        principal: &Principal,
+        session: SessionId,
+        request: Request,
+        cancel: &Cancel,
+    ) -> Result<Reply, CoreError> {
+        cancel.check()?;
+        self.shutdown.check()?;
+        let policy = self.policies.load()?;
+        let idle = policy.session_idle();
+        let times = self.clock.sample()?;
+        let live = self
+            .sessions
+            .get_or_load(&self.store, session, idle, times)?
+            .ok_or_else(|| CoreError::new(ErrorCode::EForbidden, "unknown session"))?;
+        if live.current_authority(&times) != Authority::Active {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "session lacks active authority",
+            ));
+        }
+        if live.row().principal != *principal {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "caller is not the session holder",
+            ));
+        }
+        let bound = self.sessions.bind(&live)?;
+        let _in_flight = bound.start_in_flight()?;
+        let _admitted = self
+            .admission
+            .admit(
+                &self.repo,
+                AdmissionRequest {
+                    class: RequestClass::Interactive,
+                    resources: WorkResources::Compute,
+                    payload_bytes: 0,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+                cancel,
+            )
+            .await?;
+        bound.authorize_read(ReadAccess::Objects)?;
+        match request {
+            Request::OpLog(args) => Ok(Reply::OpLog(Box::new(read_oplog(&self.store, &args)?))),
+            other => Err(CoreError::new(
+                ErrorCode::EHosted,
+                format!(
+                    "method `{}` has no read implementation on the coordinator: only `op.log` is served",
+                    other.method().as_str(),
+                ),
+            )),
+        }
+    }
+
+    /// Verifies one session for a caller before unauthenticated work.
+    ///
+    /// Loads the session, requires active authority, and requires the
+    /// caller to hold it. The typed mutation path runs this before
+    /// preparation so store-dependent preparation errors cannot answer
+    /// callers with no session standing — any session-looking string
+    /// parses, so preparation must not run on unknown or foreign
+    /// sessions. [`HostedCoordinator::submit_prepared`] re-checks
+    /// authoritatively at publication, so expiry between the two checks
+    /// fails closed there.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ECancelled`] when `cancel` or shutdown fired.
+    /// - [`ErrorCode::EForbidden`] on unknown session, expired authority,
+    ///   or a caller principal that is not the session holder.
+    pub async fn check_session(
+        &self,
+        caller: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+    ) -> Result<(), CoreError> {
+        cancel.check()?;
+        self.shutdown.check()?;
+        let policy = self.policies.load()?;
+        let idle = policy.session_idle();
+        let times = self.clock.sample()?;
+        let live = self
+            .sessions
+            .get_or_load(&self.store, session, idle, times)?
+            .ok_or_else(|| CoreError::new(ErrorCode::EForbidden, "unknown session"))?;
+        if live.current_authority(&times) != Authority::Active {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "session lacks active authority",
+            ));
+        }
+        if live.row().principal != *caller {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "caller is not the session holder",
+            ));
+        }
+        Ok(())
     }
 
     /// Closes one session by latching it to receipts-only authority.
@@ -462,5 +608,278 @@ impl HostedCoordinator {
                 cancel,
             )
             .await
+    }
+}
+
+/// Reads the operation log newest-first from the coordinator head.
+///
+/// Walks the parent chain from the last operation, keeping every entry whose
+/// session matches the filter. The walk ends at a missing header, which
+/// marks the retention boundary. There is no paging on this path, so a log
+/// longer than one page is refused rather than truncated.
+///
+/// # Errors
+/// `E_CORRUPT` for a damaged head or header row; `E_LIMIT` past the
+/// single-page bound.
+fn read_oplog(store: &Store, args: &OpLogArgs) -> Result<OpLogReply, CoreError> {
+    let head = match store.fact(FactTable::OpHead, OP_HEAD_KEY)? {
+        Some(bytes) => decode_head(store, &bytes)?,
+        None => CoordinatorHead::default(),
+    };
+    let mut entries = Vec::new();
+    let mut oldest = None;
+    let mut cursor = head.last_op;
+    let mut visited = 0usize;
+    while let Some(id) = cursor {
+        visited += 1;
+        if visited > MAX_PAGE_SIZE {
+            return Err(CoreError::new(
+                ErrorCode::ELimit,
+                "operation log exceeds its single-page bound and has no paging on this path",
+            ));
+        }
+        let Some(header) = read_header(store, id)? else {
+            break;
+        };
+        let entry = header.entry;
+        oldest = Some(id);
+        cursor = entry.parent;
+        if args.session.is_none_or(|want| entry.session == Some(want)) {
+            entries.push(entry);
+        }
+    }
+    Ok(OpLogReply {
+        view: ViewInfo {
+            store: store.store_id(),
+            view: head.last_op.unwrap_or(OperationId(0)),
+        },
+        oldest_retained: oldest,
+        entries: Page::new(entries, None)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::change::RequestId;
+    use crate::heads::Head;
+    use crate::ids::{HashKind, Oid};
+    use crate::protocol::{
+        ClaimListArgs, Method, Mutation as WireMutation, OpLogArgs, PinArgs, TagSetArgs,
+    };
+    use crate::refdata::{RefExpect, RefName};
+    use crate::store::PreparationBudget;
+
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |e| e.as_nanos());
+            let dir = std::env::temp_dir().join(format!(
+                "ruk-hosted-test-{tag}-{}-{}-{nanos}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn coordinator() -> (TempRoot, HostedCoordinator, Principal) {
+        let temp = TempRoot::new("read");
+        let store = Arc::new(
+            Store::create(
+                &temp.0,
+                HashKind::Sha1,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create store"),
+        );
+        let owner = Principal::from_peer_uid(1000);
+        let coord = HostedCoordinator::open(store, owner.clone(), temp.0.clone())
+            .expect("open coordinator");
+        (temp, coord, owner)
+    }
+
+    fn stranger() -> Principal {
+        Principal::from_peer_uid(2000)
+    }
+
+    #[tokio::test]
+    async fn session_bound_read_serves_oplog_and_refuses_the_rest() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+
+        let reply = coord
+            .read(
+                &owner,
+                session,
+                Request::OpLog(Box::new(OpLogArgs::default())),
+                &cancel,
+            )
+            .await
+            .expect("op.log reads");
+        let Reply::OpLog(page) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        assert!(page.entries.items.is_empty());
+
+        let err = coord
+            .read(
+                &owner,
+                SessionId::generate(),
+                Request::OpLog(Box::new(OpLogArgs::default())),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown session is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        let err = coord
+            .read(
+                &stranger(),
+                session,
+                Request::OpLog(Box::new(OpLogArgs::default())),
+                &cancel,
+            )
+            .await
+            .expect_err("foreign principal is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        coord
+            .check_session(&owner, session, &cancel)
+            .await
+            .expect("holder session verifies");
+        let err = coord
+            .check_session(&stranger(), session, &cancel)
+            .await
+            .expect_err("foreign holder fails verification");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        let err = coord
+            .check_session(&owner, SessionId::generate(), &cancel)
+            .await
+            .expect_err("unknown session fails verification");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::ClaimList(Box::new(ClaimListArgs::default())),
+                &cancel,
+            )
+            .await
+            .expect_err("claim.list names its missing implementation");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(err.message.contains("no read implementation"));
+
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn prepared_ref_mutation_publishes_and_logs() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+
+        let request_id = RequestId::generate();
+        let prepared = super::super::prepare_mutation(
+            coord.store(),
+            session,
+            Request::TagSet(Box::new(WireMutation {
+                request_id,
+                args: TagSetArgs {
+                    name: RefName::new("refs/tags/v1").expect("tag name"),
+                    target: Oid::from_bytes(&[0x11; 20]).expect("tag target"),
+                    annotation: None,
+                    expected: RefExpect::Absent,
+                },
+            })),
+        )
+        .expect("tag.set prepares");
+        let reply = coord
+            .submit_prepared(&owner, prepared, &cancel)
+            .await
+            .expect("tag.set publishes");
+        assert_eq!(reply.method(), Method::TagSet);
+
+        let pin = Request::Pin(Box::new(WireMutation {
+            request_id: RequestId::generate(),
+            args: PinArgs {
+                head: Head::Git {
+                    oid: Oid::from_bytes(&[0x11; 20]).expect("pin target"),
+                },
+            },
+        }));
+        let err = super::super::prepare_mutation(coord.store(), session, pin)
+            .expect_err("pin stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+
+        let foreign = super::super::prepare_mutation(
+            coord.store(),
+            session,
+            Request::TagSet(Box::new(WireMutation {
+                request_id: RequestId::generate(),
+                args: TagSetArgs {
+                    name: RefName::new("refs/tags/v2").expect("tag name"),
+                    target: Oid::from_bytes(&[0x11; 20]).expect("tag target"),
+                    annotation: None,
+                    expected: RefExpect::Absent,
+                },
+            })),
+        )
+        .expect("second tag prepares");
+        let err = coord
+            .submit_prepared(&stranger(), foreign, &cancel)
+            .await
+            .expect_err("foreign submitter is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        let reply = coord
+            .read(
+                &owner,
+                session,
+                Request::OpLog(Box::new(OpLogArgs::default())),
+                &cancel,
+            )
+            .await
+            .expect("op.log reads after mutation");
+        let Reply::OpLog(page) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        assert_eq!(page.entries.items.len(), 1);
+        assert_eq!(page.entries.items[0].method, Method::TagSet);
+        assert_eq!(page.oldest_retained, Some(page.entries.items[0].id));
+
+        coord.shutdown();
+        let _ = runner.abort();
     }
 }
