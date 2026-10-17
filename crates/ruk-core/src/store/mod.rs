@@ -44,6 +44,7 @@ mod prepare;
 mod recovery;
 mod segment;
 mod spool;
+mod stream;
 
 #[cfg(test)]
 mod crash_tests;
@@ -66,6 +67,7 @@ pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, Objec
 pub use metadata::{FactPage, FactPageBudget, FactRow};
 pub(crate) use metadata::{MAX_FACT_ROW_BYTES, decode, encode};
 pub use spool::{BudgetLimits, PreparationBudget, Spool};
+pub use stream::{ChunkDecision, StreamMeta};
 pub use types::{
     Encoding, FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
     Publication, ReadObject, SegmentManifest, StoreFormat,
