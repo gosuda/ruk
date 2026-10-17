@@ -302,13 +302,16 @@ pub fn local_fetch(
 }
 
 /// The packed closure of a local fetch with its shallow cutoffs.
-struct LocalClosure {
-    objects: Vec<(Oid, ObjectKind, Vec<u8>)>,
-    shallow: Vec<Oid>,
+///
+/// Shared with the `upload-pack` serve half, which negotiates the same
+/// wants-minus-haves walk over the wire.
+pub(crate) struct LocalClosure {
+    pub(crate) objects: Vec<(Oid, ObjectKind, Vec<u8>)>,
+    pub(crate) shallow: Vec<Oid>,
 }
 
 /// Computes wants-minus-haves in `src`, depth-bounded when asked.
-fn local_closure(
+pub(crate) fn local_closure(
     src: &Store,
     kind: HashKind,
     req: &LocalFetchRequest,
@@ -538,7 +541,11 @@ fn local_push_inner(
 /// Applies ref updates to `dest`: one checked transaction for atomic
 /// pushes, per-ref transactions otherwise. CAS failures become per-ref
 /// rejections.
-fn apply_refs(
+///
+/// Shared with the `receive-pack` serve half, which applies wire commands
+/// through the same CAS path. Callers pre-validate ref names: a malformed
+/// name fails the whole batch here.
+pub(crate) fn apply_refs(
     dest: &Store,
     kind: HashKind,
     live: &[&PushUpdate],

@@ -7,8 +7,8 @@
 //! | `fetch` | `session::local_fetch` + refspec expansion | implemented for local paths; network is `Offline` |
 //! | `pull` | fetch + fast-forward | implemented for local paths (fast-forward only) |
 //! | `push` | `session::local_push` with a persisted plan | implemented for local paths |
-//! | `receive-pack` | no serve half in `ruk-git` | unsupported |
-//! | `upload-pack` | no serve half in `ruk-git` | unsupported |
+//! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
+//! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
 //! | `archive` | no archive writer | unsupported |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
@@ -29,7 +29,10 @@ use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
 use ruk_git::GitError;
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::push::{PushUpdate, PushWireRequest};
-use ruk_git::transport::session::{LocalFetchRequest, advertise, local_fetch, local_push};
+use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
+use ruk_git::transport::session::{
+    LocalFetchRequest, advertise, local_fetch, local_push, open_local_store,
+};
 use ruk_git::transport::{Interrupt, has_object};
 
 use super::state::{
@@ -590,24 +593,176 @@ fn peel_dest_oid(dest: &Store, name: &RefName) -> Result<Option<Oid>, GitError> 
     }
 }
 
-/// Serves `receive-pack`. Unsupported: `ruk-git` holds the client half.
+/// Serves `receive-pack`: advertises refs, ingests the client's pack, and
+/// reports per-ref outcomes.
 ///
 /// Oracle: `git/builtin/receive-pack.c`.
-pub(crate) fn receive_pack(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "receive-pack: serving pushes is absent; see push".to_owned(),
+pub(crate) fn receive_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let store = serve_store(ctx, args)?;
+    let kind = store.hash_kind();
+    let head = serve_head(&store)?;
+    match ctx.env.stdin.as_deref() {
+        Some(input) => {
+            let mut out = Vec::new();
+            serve_receive_pack(input, &mut out, &store, kind, &head, &Interrupt::none())?;
+            Ok(out)
+        }
+        // Live pipes stream the advertisement and report straight to
+        // stdout. Buffering through the return value would withhold the
+        // advertisement until the session ends and deadlock a real client,
+        // so live runs return no bytes (`run` then writes nothing).
+        // `super::read_stdin_bytes` is deliberately unused here: it drains
+        // stdin to EOF, but the protocol is frame-delimited.
+        None => {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            serve_receive_pack(
+                &mut input,
+                &mut output,
+                &store,
+                kind,
+                &head,
+                &Interrupt::none(),
+            )?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Serves `upload-pack`: advertises refs, negotiates wants/haves, and emits
+/// a pack.
+///
+/// Oracle: `git/builtin/upload-pack.c`.
+pub(crate) fn upload_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let store = serve_store(ctx, args)?;
+    let kind = store.hash_kind();
+    let head = serve_head(&store)?;
+    match ctx.env.stdin.as_deref() {
+        Some(input) => {
+            let mut out = Vec::new();
+            serve_upload_pack(input, &mut out, &store, kind, &head, &Interrupt::none())?;
+            Ok(out)
+        }
+        // Live pipes stream the advertisement and pack straight to stdout;
+        // see `receive_pack` for why the return value stays empty here.
+        None => {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            serve_upload_pack(
+                &mut input,
+                &mut output,
+                &store,
+                kind,
+                &head,
+                &Interrupt::none(),
+            )?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The store one serve verb runs against: borrowed from the context when it
+/// is already open, owned when `<dir>` names another root.
+enum ServeStore<'a> {
+    /// The context store, borrowed.
+    Open(&'a Store),
+    /// A store opened from `<dir>` for this invocation.
+    Owned(Store),
+}
+
+impl std::ops::Deref for ServeStore<'_> {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        match self {
+            Self::Open(store) => store,
+            Self::Owned(store) => store,
+        }
+    }
+}
+
+/// Resolves the repository one serve verb runs against: the `<dir>`
+/// positional when given (a repository root holding `.ruk`, the way Git's
+/// daemons take it), else the context store, else the context root for a
+/// daemon invoked with its working directory inside the repository.
+fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitError> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut dashdash = false;
+    for arg in args {
+        if dashdash {
+            positionals.push(arg);
+        } else if arg == "--" {
+            dashdash = true;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            // Server-side transport flags (e.g. `--strict`) carry no
+            // protocol meaning here; ignoring them keeps serving instead of
+            // failing on an unfamiliar spelling.
+        } else {
+            positionals.push(arg);
+        }
+    }
+    if positionals.len() > 1 {
+        return Err(GitError::Invalid {
+            detail: format!("too many arguments: {}", positionals.join(" ")),
+        });
+    }
+    if let Some(dir) = positionals.first() {
+        let path = std::path::Path::new(dir);
+        return match open_store_at(path) {
+            Ok(store) => Ok(ServeStore::Owned(store)),
+            Err(first) => match open_local_store(path) {
+                Ok(store) => Ok(ServeStore::Owned(store)),
+                Err(_) => Err(first),
+            },
+        };
+    }
+    if let Some(store) = ctx.store.as_ref() {
+        return Ok(ServeStore::Open(store));
+    }
+    // No `<dir>` and no `--git-dir`: walk up for a repository the way
+    // discovery does for the other verbs.
+    let mut dir = ctx.root.as_path();
+    loop {
+        if let Ok(store) = open_store_at(dir) {
+            return Ok(ServeStore::Owned(store));
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+    Err(GitError::Invalid {
+        detail: "not a ruk repository".to_owned(),
     })
 }
 
-/// Serves `upload-pack`. Unsupported: `ruk-git` holds the client half.
-///
-/// Oracle: `git/builtin/upload-pack.c`.
-pub(crate) fn upload_pack(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "upload-pack: serving fetches is absent; see fetch".to_owned(),
-    })
+/// Reads the `HEAD` advertisement for a serve verb: the symbolic target for
+/// the `symref` capability and the OID for the `HEAD` line (zero unborn).
+fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
+    let (workspace, _) = load_or_default(store)?;
+    match &workspace.head {
+        ruk_core::workspace::HeadRef::Symbolic(name) => {
+            let oid = StoreRefs::new(store)
+                .get(name)?
+                .and_then(|target| match target {
+                    RefTarget::Direct(oid) => Some(oid),
+                    RefTarget::Symbolic(_) => None,
+                })
+                .unwrap_or_else(|| store.hash_kind().zero_oid());
+            Ok(HeadAdvertisement {
+                oid,
+                symref: Some(name.as_bytes().to_vec()),
+            })
+        }
+        ruk_core::workspace::HeadRef::Detached(oid) => Ok(HeadAdvertisement {
+            oid: *oid,
+            symref: None,
+        }),
+    }
 }
 
 /// Writes an archive. Unsupported: no archive writer exists.

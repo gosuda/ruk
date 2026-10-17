@@ -273,7 +273,7 @@ pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "receive-pack",
         oracle: "git/builtin/receive-pack.c",
-        needs_repo: true,
+        needs_repo: false,
         summary: "Receive what is pushed into the repository",
         run: verbs_transport::receive_pack,
     },
@@ -392,7 +392,7 @@ pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "upload-pack",
         oracle: "git/builtin/upload-pack.c",
-        needs_repo: true,
+        needs_repo: false,
         summary: "Send objects packed back to git-fetch-pack",
         run: verbs_transport::upload_pack,
     },

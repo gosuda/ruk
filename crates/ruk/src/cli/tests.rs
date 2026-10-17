@@ -47,6 +47,7 @@ fn test_env(cwd: &PathBuf) -> CliEnv {
     CliEnv {
         vars,
         cwd: cwd.clone(),
+        stdin: None,
     }
 }
 
@@ -480,4 +481,87 @@ fn sequencer_absent_reads_clean() {
     let err = run(verbs_history::rebase, &mut ctx, &["--abort"]).expect_err("abort");
     assert!(err.to_string().contains("no rebase in progress"));
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn serve_verbs_round_trip_scripted_stdin() {
+    use ruk_git::transport::pktline::{Packet, decode_frame, encode_data, encode_flush};
+
+    fn framed(line: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_data(&mut out, line).expect("frame");
+        out
+    }
+
+    /// Splits data payloads up to the first flush from the raw rest.
+    fn split_at_flush(mut bytes: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut lines = Vec::new();
+        loop {
+            let (packet, consumed) = decode_frame(bytes).expect("frame").expect("complete");
+            bytes = &bytes[consumed..];
+            match packet {
+                Packet::Flush => return (lines, bytes.to_vec()),
+                Packet::Data(payload) => lines.push(payload.to_vec()),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    let (root_a, _) = seeded_repo("serve-a", "a.txt", b"a\n");
+    let mut ctx_a = repo_ctx(&root_a, test_env(&root_a));
+    let tip = super::state::head_oid(ctx_a.store().expect("store")).expect("tip");
+    let mut input =
+        framed(format!("want {} multi_ack_detailed agent=test\n", tip.to_hex()).as_bytes());
+    input.extend_from_slice(b"0000");
+    input.extend_from_slice(b"0000");
+    input.extend_from_slice(&framed(b"done\n"));
+    ctx_a.env.stdin = Some(input);
+    let out = run(verbs_transport::upload_pack, &mut ctx_a, &[]).expect("upload");
+    let (adv, rest) = split_at_flush(&out);
+    let needle = b"refs/heads/main";
+    assert!(
+        adv.iter()
+            .any(|line| line.windows(needle.len()).any(|w| w == needle))
+    );
+    // Two NAK verdicts, then the raw pack with no closing flush.
+    let (packet, consumed) = decode_frame(&rest).expect("frame").expect("complete");
+    assert!(matches!(packet, Packet::Data(payload) if payload == b"NAK\n"));
+    let rest = &rest[consumed..];
+    let (packet, consumed) = decode_frame(rest).expect("frame").expect("complete");
+    assert!(matches!(packet, Packet::Data(payload) if payload == b"NAK\n"));
+    let pack = &rest[consumed..];
+    assert!(pack.starts_with(b"PACK"), "pack magic");
+
+    let (root_b, _) = seeded_repo("serve-b", "b.txt", b"b\n");
+    let mut ctx_b = repo_ctx(&root_b, test_env(&root_b));
+    let zero = tip.kind().zero_oid().to_hex();
+    let mut push = framed(
+        format!(
+            "{zero} {} refs/heads/from-upload\0report-status\n",
+            tip.to_hex()
+        )
+        .as_bytes(),
+    );
+    push.extend_from_slice(b"0000");
+    push.extend_from_slice(&pack);
+    ctx_b.env.stdin = Some(push);
+    let report = run(verbs_transport::receive_pack, &mut ctx_b, &[]).expect("receive");
+    let (_, after_adv) = split_at_flush(&report);
+    let (lines, rest) = split_at_flush(&after_adv);
+    assert!(rest.is_empty());
+    assert_eq!(
+        lines,
+        vec![
+            b"unpack ok\n".to_vec(),
+            b"ok refs/heads/from-upload\n".to_vec(),
+        ]
+    );
+    let refs = super::state::list_refs(ctx_b.store().expect("store")).expect("refs");
+    assert!(refs.iter().any(
+        |(name, target)| name.as_bytes() == b"refs/heads/from-upload"
+            && matches!(target, ruk_core::refdata::RefTarget::Direct(oid) if *oid == tip)
+    ));
+
+    let _ = std::fs::remove_dir_all(root_a.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(root_b.parent().expect("parent"));
 }

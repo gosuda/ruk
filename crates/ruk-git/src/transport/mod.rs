@@ -28,6 +28,7 @@
 //! - [`pack`]: pack ingest into staging, pack emission, delta codecs.
 //! - [`fetch`]: fetch negotiation, verification, publication, prefetch.
 //! - [`push`]: send-pack client, report-status, push plans.
+//! - [`serve`]: the `upload-pack`/`receive-pack` server halves (protocol v0).
 //! - [`session`]: the network transport seam and the local native transport.
 //!
 //! Network adapters (HTTPS, SSH) implement [`session::Transport`] in a
@@ -39,6 +40,7 @@ pub mod pktline;
 pub mod private;
 pub mod push;
 pub mod refadv;
+pub mod serve;
 pub mod session;
 
 #[cfg(test)]
