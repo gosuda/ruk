@@ -21,10 +21,13 @@
 //! - `receive-pack` advertises refs with `report-status delete-refs
 //!   ofs-delta object-format agent`, reads update commands, ingests the
 //!   pack (skipped for delete-only pushes, mirroring the oracle's
-//!   `delete_only` gate), verifies the closure, records commit rows, and
-//!   applies refs through the shared
+//!   `delete_only` gate), verifies the closure, stages the objects in
+//!   quarantine (see [`super::hooks`]), runs the `pre-receive`/`update`
+//!   phases, publishes objects plus commit rows only when those pass, and
+//!   applies surviving refs through the shared
 //!   [`apply_refs`](super::session::apply_refs) CAS path, reporting
-//!   per-ref `ok`/`ng` lines. `atomic`, `push-cert` and `push-options` are
+//!   per-ref `ok`/`ng` lines, before the `post-receive` phase. `atomic`,
+//!   `push-cert` and `push-options` are
 //!   not advertised; an `atomic` request that arrives anyway rejects every
 //!   ref instead of desynchronizing the stream.
 //!
@@ -42,10 +45,11 @@ use std::io::{Read, Write};
 
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
-use ruk_core::store::Store;
+use ruk_core::store::{FactMutation, Store};
 
 use super::fetch::{commit_record_facts, verify_closure};
-use super::pack::{IngestLimits, PackEntry, ingest_pack, write_pack};
+use super::hooks::{ReceiveHooks, run_hook, stage_quarantine};
+use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, write_pack};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush, send};
 use super::push::{PushUpdate, RefResult};
 use super::session::{LocalFetchRequest, advertise, apply_refs, local_closure};
@@ -358,20 +362,32 @@ fn all_ng(commands: &[Command], reason: &str) -> Vec<(Vec<u8>, Result<(), String
 }
 
 /// Ingests the pack that follows the update commands, verifies the new tips
-/// over staged plus committed objects, records commit rows, and publishes
-/// everything in one transaction.
-fn ingest_verify_publish<R: Read>(
+/// over staged plus committed objects, and compiles the commit-record facts.
+///
+/// Publication deliberately waits until the hook phases pass, so hooks
+/// observe staged objects through the quarantine directory and a refusal
+/// drops the staging without ever publishing it.
+fn ingest_and_verify<R: Read>(
     reader: R,
     store: &Store,
     kind: HashKind,
     news: &[Oid],
     interrupt: &Interrupt,
-) -> Result<(), GitError> {
+) -> Result<(StagedPack, Vec<FactMutation>), GitError> {
     let staged = ingest_pack(reader, kind, store, IngestLimits::default(), interrupt)?;
     verify_closure(store, &staged, news, None, &[], interrupt)?;
     let facts = commit_record_facts(store, &staged)?;
-    store.publish(staged.into_objects(), &facts)?;
-    Ok(())
+    Ok((staged, facts))
+}
+
+/// One `<old> <new> <ref>` line of hook stdin.
+fn hook_line(cmd: &Command) -> String {
+    format!(
+        "{} {} {}\n",
+        cmd.old.to_hex(),
+        cmd.new.to_hex(),
+        String::from_utf8_lossy(&cmd.name),
+    )
 }
 
 /// Serves one `receive-pack` session: writes the advertisement, reads update
@@ -381,17 +397,58 @@ fn ingest_verify_publish<R: Read>(
 /// <err>` with every ref `ng`) before returning the error, so the client
 /// stays in sync; per-ref CAS rejections are outcomes, not errors.
 ///
+/// Hook phases are disabled: this is the historical entry point preserved
+/// for callers without a repository directory. Pass [`ReceiveHooks`] to
+/// [`serve_receive_pack_with`] to enable quarantine staging with
+/// `pre-receive`/`update`/`post-receive` execution.
+///
 /// # Errors
 /// [`GitError::Corrupt`] for grammar violations, [`GitError::ObjectFormat`]
 /// for store/kind mismatch or foreign OIDs, plus ingest, verification,
 /// store and transport failures.
 pub fn serve_receive_pack<R: Read, W: Write>(
     reader: R,
+    writer: W,
+    store: &Store,
+    kind: HashKind,
+    head: &HeadAdvertisement,
+    interrupt: &Interrupt,
+) -> Result<(), GitError> {
+    serve_receive_pack_with(
+        reader,
+        writer,
+        store,
+        kind,
+        head,
+        interrupt,
+        &ReceiveHooks::disabled(),
+    )
+}
+
+/// Serves one `receive-pack` session with quarantine staging and hook
+/// phases (see [`super::hooks`]): the pack stages unpublished, hooks
+/// observe it through the quarantine directory, staged objects publish
+/// only after the refusing phases pass, surviving refs apply through the
+/// shared CAS path, and `post-receive` runs after refs land.
+///
+/// A `pre-receive` refusal marks every live ref `ng` and drops the staging
+/// without publishing; an `update` refusal marks only its own ref; a
+/// `post-receive` failure is relayed to the server's stderr and never
+/// fails the push. Refusals complete the protocol with `unpack ok` plus
+/// `ng` lines and return `Ok`, exactly like CAS rejections.
+///
+/// # Errors
+/// [`GitError::Corrupt`] for grammar violations, [`GitError::ObjectFormat`]
+/// for store/kind mismatch or foreign OIDs, plus ingest, verification,
+/// store and transport failures.
+pub fn serve_receive_pack_with<R: Read, W: Write>(
+    reader: R,
     mut writer: W,
     store: &Store,
     kind: HashKind,
     head: &HeadAdvertisement,
     interrupt: &Interrupt,
+    hooks: &ReceiveHooks,
 ) -> Result<(), GitError> {
     if store.hash_kind() != kind {
         return Err(GitError::ObjectFormat {
@@ -452,26 +509,101 @@ pub fn serve_receive_pack<R: Read, W: Write>(
         }
     }
     // The pack follows only when some ref gains objects; delete-only pushes
-    // send none, mirroring the oracle's `delete_only` gate.
+    // send none, mirroring the oracle's `delete_only` gate. Staging stays
+    // unpublished: hooks observe it through quarantine, and publication
+    // waits until the refusing phases pass.
+    let mut staged: Option<StagedPack> = None;
+    let mut facts: Vec<FactMutation> = Vec::new();
     if commands.iter().any(|cmd| cmd.new != zero) {
         let news: Vec<Oid> = commands
             .iter()
             .filter(|cmd| cmd.new != zero)
             .map(|cmd| cmd.new)
             .collect();
-        if let Err(err) = ingest_verify_publish(pkt.get_mut(), store, kind, &news, interrupt) {
+        match ingest_and_verify(pkt.get_mut(), store, kind, &news, interrupt) {
+            Ok((pack, commit_facts)) => {
+                staged = Some(pack);
+                facts = commit_facts;
+            }
+            Err(err) => {
+                let reason = sanitize(&err.to_string());
+                send_report(&mut writer, Some(&reason), &all_ng(&commands, &reason))?;
+                return Err(err);
+            }
+        }
+    }
+    // Quarantine staging for hook inspection. A materialization failure is
+    // infrastructure, not a hook verdict: every ref reports `ng` and the
+    // error propagates, with the unpack line still `ok`.
+    let quarantine = match stage_quarantine(hooks, staged.as_ref()) {
+        Ok(quarantine) => quarantine,
+        Err(err) => {
+            let reason = sanitize(&err.to_string());
+            send_report(&mut writer, None, &all_ng(&commands, &reason))?;
+            return Err(err);
+        }
+    };
+    interrupt.check("running receive hooks")?;
+    // `pre-receive` over every command: a refusal fails the whole push and
+    // drops the staging unpublished, mirroring the oracle's quarantine
+    // removal. The verdicts travel in-band with `unpack ok`; only the
+    // return stays `Ok`, exactly like CAS rejections below.
+    let all_lines: String = commands.iter().map(hook_line).collect();
+    if let Some(reason) = run_hook(
+        hooks,
+        quarantine.as_ref(),
+        "pre-receive",
+        &[],
+        Some(all_lines.as_bytes()),
+    ) {
+        for (index, _) in &live {
+            results[*index] = Some(Err(reason.clone()));
+        }
+        send_report(&mut writer, None, &report_rows(&commands, &results))?;
+        return Ok(());
+    }
+    // `update` per live ref over argv (`<ref> <old> <new>`, mirroring the
+    // oracle and Forgejo's dispatcher): a refusal marks only its own ref.
+    for (index, update) in &live {
+        interrupt.check("running update hooks")?;
+        let args = [
+            String::from_utf8_lossy(&update.name).into_owned(),
+            update.old.to_hex(),
+            update.new.to_hex(),
+        ];
+        if let Some(reason) = run_hook(hooks, quarantine.as_ref(), "update", &args, None) {
+            results[*index] = Some(Err(reason));
+        }
+    }
+    // Promote staged objects plus their commit rows in one publication.
+    // This runs even when every ref was refused: the oracle migrates the
+    // quarantine directory regardless of per-ref outcomes, and unreferenced
+    // objects simply stay unreachable.
+    if let Some(pack) = staged {
+        if let Err(err) = store.publish(pack.into_objects(), &facts) {
+            let err = GitError::from(err);
             let reason = sanitize(&err.to_string());
             send_report(&mut writer, Some(&reason), &all_ng(&commands, &reason))?;
             return Err(err);
         }
     }
+    // Only hook-surviving refs reach the CAS path; hook verdicts already
+    // recorded above are never overwritten.
+    let survivors: Vec<&PushUpdate> = live
+        .iter()
+        .filter(|(index, _)| results[*index].is_none())
+        .map(|(_, update)| update)
+        .collect();
     if atomic {
-        for (index, _) in &live {
+        for survivor in &survivors {
+            let (index, _) = live
+                .iter()
+                .find(|(_, update)| update.name == survivor.name)
+                .expect("survivor names a live command");
             results[*index] = Some(Err("atomic pushes are not supported".to_owned()));
         }
-    } else {
-        let refs: Vec<&PushUpdate> = live.iter().map(|(_, update)| update).collect();
-        match apply_refs(store, kind, &refs, false) {
+    } else if !survivors.is_empty() {
+        match apply_refs(store, kind, &survivors, false) {
             Ok(outcomes) => {
                 for outcome in &outcomes {
                     if let Some((index, _)) =
@@ -489,22 +621,47 @@ pub fn serve_receive_pack<R: Read, W: Write>(
                 for result in results.iter_mut().filter(|result| result.is_none()) {
                     *result = Some(Err(format!("ref update failed: {reason}")));
                 }
-                let rows = commands
-                    .iter()
-                    .zip(results.iter())
-                    .map(|(cmd, result)| {
-                        (
-                            cmd.name.clone(),
-                            result.clone().expect("every command has a verdict"),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                send_report(&mut writer, None, &rows)?;
+                send_report(&mut writer, None, &report_rows(&commands, &results))?;
                 return Err(err);
             }
         }
     }
-    let rows = commands
+    // `post-receive` over the landed refs, after refs are updated. Its
+    // failure relays to server diagnostics and never fails the push:
+    // protocol v0's report has no sideband slot for it.
+    let landed: String = live
+        .iter()
+        .filter(|(index, _)| matches!(results[*index], Some(Ok(()))))
+        .map(|(_, update)| {
+            let cmd = commands
+                .iter()
+                .find(|cmd| cmd.name == update.name)
+                .expect("live update names a command");
+            hook_line(cmd)
+        })
+        .collect();
+    if !landed.is_empty() && interrupt.check("running post-receive hook").is_ok() {
+        if let Some(reason) = run_hook(
+            hooks,
+            quarantine.as_ref(),
+            "post-receive",
+            &[],
+            Some(landed.as_bytes()),
+        ) {
+            tracing::warn!("post-receive hook failed: {reason}");
+        }
+    }
+    send_report(&mut writer, None, &report_rows(&commands, &results))?;
+    Ok(())
+}
+
+/// Collects per-ref verdicts in command order; every command has one by the
+/// time any report sends.
+fn report_rows(
+    commands: &[Command],
+    results: &[Option<Result<(), String>>],
+) -> Vec<(Vec<u8>, Result<(), String>)> {
+    commands
         .iter()
         .zip(results.iter())
         .map(|(cmd, result)| {
@@ -513,18 +670,17 @@ pub fn serve_receive_pack<R: Read, W: Write>(
                 result.clone().expect("every command has a verdict"),
             )
         })
-        .collect::<Vec<_>>();
-    send_report(&mut writer, None, &rows)?;
-    Ok(())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::hooks::ReceiveHooks;
     use super::super::refadv::{Initial, read_initial};
     use super::super::session::test_support::{store_with_pack, test_store};
     use super::*;
-    use ruk_core::refdata::{RefChange, RefExpect, RefTransaction, RefUpdate};
-    use ruk_core::refs::prepare_checked_transaction;
+    use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTransaction, RefUpdate};
+    use ruk_core::refs::{StoreRefs, prepare_checked_transaction};
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
     const THREE: &str = "7a4943e466a7ce4f4c56d9eeb89c8909b1c43d22";
@@ -922,4 +1078,359 @@ mod tests {
             lines[1]
         );
     }
+
+    static HOOK_TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A fresh repository directory holding `hooks/`, unique per test.
+    fn hook_repo() -> std::path::PathBuf {
+        use std::sync::atomic::Ordering;
+        let id = HOOK_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ruk-hook-test-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(dir.join("hooks")).expect("hooks dir");
+        dir
+    }
+
+    /// Writes an executable `hooks/<name>` shell script.
+    fn write_hook(repo: &std::path::Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = repo.join("hooks").join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("hook script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("hook executable");
+    }
+
+    /// Serves one branch-create push through `hooks`, returning the report
+    /// lines.
+    fn serve_push_with_hooks(
+        dest: &Store,
+        kind: HashKind,
+        updates: &[(Oid, Oid, &[u8])],
+        pack: &[u8],
+        hooks: &ReceiveHooks,
+    ) -> Vec<Vec<u8>> {
+        let mut input = Vec::new();
+        for (index, (old, new, name)) in updates.iter().enumerate() {
+            let caps = (index == 0).then_some("report-status delete-refs ofs-delta agent=test");
+            input.extend_from_slice(&command(*old, *new, name, caps));
+        }
+        input.extend_from_slice(b"0000");
+        input.extend_from_slice(pack);
+        let mut out = Vec::new();
+        serve_receive_pack_with(
+            &input[..],
+            &mut out,
+            dest,
+            kind,
+            &head(),
+            &Interrupt::none(),
+            hooks,
+        )
+        .expect("serve completes refused pushes in-band");
+        report_lines(&out)
+    }
+
+    fn ref_oid(dest: &Store, name: &[u8]) -> Option<Oid> {
+        let target = StoreRefs::new(dest)
+            .get(&RefName::new(name.to_vec()).expect("ref name"))
+            .expect("ref read");
+        match target {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn hook_prereceive_refusal_leaves_store_untouched() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let marker = repo.join("pre-receive-ran");
+        write_hook(
+            &repo,
+            "pre-receive",
+            &format!("echo refused > \"{}\"\nexit 1\n", marker.display()),
+        );
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"unpack ok");
+        assert!(
+            lines[1].starts_with(b"ng refs/heads/main pre-receive hook declined"),
+            "got {:?}",
+            lines[1]
+        );
+        // The hook ran, but nothing promoted: the object never published
+        // and the ref never moved.
+        assert!(marker.is_file(), "pre-receive hook did not run");
+        assert!(
+            !super::super::has_object(&dest, oid(FOUR)).expect("probe"),
+            "refused object published"
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), None);
+    }
+
+    #[test]
+    fn hook_prereceive_pass_publishes_and_exposes_quarantine() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let scratch = repo.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let marker = repo.join("pre-receive-ran");
+        write_hook(
+            &repo,
+            "pre-receive",
+            &format!(
+                concat!(
+                    "test -n \"$GIT_QUARANTINE_PATH\" || exit 10\n",
+                    "test -f \"$GIT_QUARANTINE_PATH/manifest\" || exit 11\n",
+                    "test -d \"$GIT_DIR\" || exit 12\n",
+                    "test -n \"$(find \"$GIT_QUARANTINE_PATH/objects\" -type f)\" || exit 13\n",
+                    "echo passed > \"{}\"\n",
+                    "exit 0\n",
+                ),
+                marker.display()
+            ),
+        );
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo.clone()).with_quarantine_parent(scratch.clone()),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert!(marker.is_file(), "passing hook did not run: {lines:?}");
+        assert!(super::super::has_object(&dest, oid(FOUR)).expect("probe"));
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+        // The per-push quarantine directory is removed after the session.
+        let leftovers: Vec<_> = std::fs::read_dir(&scratch)
+            .expect("scratch")
+            .collect::<Result<_, _>>()
+            .expect("entries");
+        assert!(leftovers.is_empty(), "quarantine leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn hook_update_refusal_is_per_ref() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        write_hook(
+            &repo,
+            "update",
+            concat!(
+                "if [ \"$1\" = \"refs/heads/feature\" ]; then\n",
+                "  echo \"feature frozen\"\n",
+                "  exit 1\n",
+                "fi\n",
+                "exit 0\n",
+            ),
+        );
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let main = PushUpdateForTest {
+            name: b"refs/heads/main".to_vec(),
+            old: kind.zero_oid(),
+            new: oid(FOUR),
+        };
+        let feature = PushUpdateForTest {
+            name: b"refs/heads/feature".to_vec(),
+            old: kind.zero_oid(),
+            new: oid(THREE),
+        };
+        let pack = push_pack_for(&src, kind, &[&main, &feature]);
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[
+                (kind.zero_oid(), oid(FOUR), b"refs/heads/main"),
+                (kind.zero_oid(), oid(THREE), b"refs/heads/feature"),
+            ],
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], b"unpack ok");
+        assert_eq!(lines[1], b"ok refs/heads/main");
+        assert!(
+            lines[2].starts_with(b"ng refs/heads/feature update hook declined"),
+            "got {:?}",
+            lines[2]
+        );
+        // The surviving ref lands; the refused one stays absent. Staged
+        // objects still promote, mirroring quarantine migration.
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+        assert_eq!(ref_oid(&dest, b"refs/heads/feature"), None);
+        assert!(super::super::has_object(&dest, oid(FOUR)).expect("probe"));
+        assert!(super::super::has_object(&dest, oid(THREE)).expect("probe"));
+    }
+
+    /// Minimal update triple for multi-ref pack construction in tests.
+    struct PushUpdateForTest {
+        name: Vec<u8>,
+        old: Oid,
+        new: Oid,
+    }
+
+    /// Builds one pack covering every given update's closure.
+    fn push_pack_for(src: &Store, kind: HashKind, updates: &[&PushUpdateForTest]) -> Vec<u8> {
+        use super::super::push::{PushUpdate, push_closure};
+        let owned: Vec<PushUpdate> = updates
+            .iter()
+            .map(|update| PushUpdate {
+                name: update.name.clone(),
+                old: update.old,
+                new: update.new,
+            })
+            .collect();
+        let live: Vec<&PushUpdate> = owned.iter().collect();
+        let entries = push_closure(src, kind, &live, &Interrupt::none()).expect("closure");
+        let pack_entries = entries
+            .iter()
+            .map(super::super::push::ClosureObject::as_entry)
+            .collect::<Vec<_>>();
+        let mut pack = Vec::new();
+        write_pack(&mut pack, kind, &pack_entries, &Interrupt::none()).expect("pack");
+        pack
+    }
+
+    #[test]
+    fn hook_prereceive_timeout_survives_grandchildren() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        // A backgrounded sleep outlives the killed hook holding stderr
+        // open; the push must still fail fast on the timeout instead of
+        // hanging on the pipe.
+        write_hook(&repo, "pre-receive", "sleep 30 &\nexec sleep 30\n");
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let started = std::time::Instant::now();
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo).with_timeout(std::time::Duration::from_secs(1)),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "hook timeout did not bound the push"
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"unpack ok");
+        assert!(
+            lines[1].starts_with(b"ng refs/heads/main pre-receive hook failed: io: timed out"),
+            "got {:?}",
+            lines[1]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), None);
+    }
+
+    #[test]
+    fn hook_postreceive_runs_after_refs_land() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let seen = repo.join("post-receive-stdin");
+        let marker = repo.join("post-receive-ran");
+        write_hook(
+            &repo,
+            "post-receive",
+            &format!(
+                "cat > \"{}\"\necho ran > \"{}\"\nexit 0\n",
+                seen.display(),
+                marker.display()
+            ),
+        );
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+        assert!(marker.is_file(), "post-receive hook did not run");
+        let stdin = std::fs::read_to_string(&seen).expect("hook stdin");
+        assert!(
+            stdin.contains("refs/heads/main"),
+            "post-receive saw no update line: {stdin:?}"
+        );
+    }
+
+    #[test]
+    fn hook_postreceive_failure_is_not_fatal() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        write_hook(
+            &repo,
+            "post-receive",
+            "echo \"backend exploded\" >&2\nexit 1\n",
+        );
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+    }
+
+    #[test]
+    fn hook_missing_scripts_pass() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        // No scripts under `hooks/`: every phase passes through.
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+    }
+}
+
 }

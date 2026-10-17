@@ -26,6 +26,7 @@
 //! - [`pktline`]: pkt-line framing and side-band demultiplexing.
 //! - [`refadv`]: protocol v0/v1 advertisements and v2 `ls-refs`.
 //! - [`pack`]: pack ingest into staging, pack emission, delta codecs.
+//! - [`hooks`]: receive-pack hook phases over quarantine staging.
 //! - [`fetch`]: fetch negotiation, verification, publication, prefetch.
 //! - [`push`]: send-pack client, report-status, push plans.
 //! - [`serve`]: the `upload-pack`/`receive-pack` server halves (protocol v0).
@@ -35,6 +36,7 @@
 //! later slice; this module contains none.
 
 pub mod fetch;
+pub mod hooks;
 pub mod pack;
 pub mod pktline;
 pub mod private;
