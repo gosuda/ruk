@@ -24,15 +24,16 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::change::WorkspaceId;
 use crate::error::{CoreError, ErrorCode};
-use crate::index::RepoPath;
+use crate::index::{FileMode, RepoPath};
 use crate::store::{
     FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject, Store, StoreError,
 };
+use crate::workcopy::lfs::{self, LfsMode, MAX_POINTER_BYTES};
 use crate::workspace::{Scope, WorkspaceStamp};
 
 use super::capture::{self, PlanEntry, lossy};
@@ -135,6 +136,9 @@ pub(crate) struct MaterializePlan {
     /// Target blobs not yet committed (rendered conflict markers, new
     /// content); published atomically with the journal row.
     pub(crate) target_objects: Vec<PreparedObject>,
+    /// How this store treats Git LFS pointer blobs. [`LfsMode::Deny`]
+    /// rejects a pointer target before the journal is published.
+    pub(crate) lfs: LfsMode,
 }
 
 /// What a completed materialization changed.
@@ -178,6 +182,9 @@ pub(crate) fn begin_apply(
         return Err(applying_error());
     }
     fence.check(store, ErrorCode::EStale)?;
+    if plan.lfs == LfsMode::Deny {
+        check_lfs_targets(store, &plan.entries, &plan.target_objects)?;
+    }
     let root = WorkRoot::open(&plan.root)?;
     let captured = capture::capture(store, &root, plan.entries, &plan.discard, &plan.scope)?;
     let journal = ApplyJournal {
@@ -816,6 +823,89 @@ pub(crate) fn recovery_error(paths: &[RepoPath]) -> CoreError {
         ),
     )
     .with_hint("ws.recover abort keeps these edits; ws.recover discard with the paths overwrites them")
+}
+
+/// Under [`LfsMode::Deny`], no file target may hold a Git LFS pointer.
+/// Committed blobs are checked by locator length first, then decoded only
+/// when they can be pointers; prepared target objects decode through the
+/// store. A missing target fails before the journal publishes.
+///
+/// # Errors
+/// `E_UNSUPPORTED_LFS` naming the path; `E_INVALID` when a file target is
+/// not a blob; `E_NOT_FOUND` for a target neither committed nor prepared;
+/// store read errors.
+fn check_lfs_targets(
+    store: &Store,
+    entries: &[PlanEntry],
+    prepared: &[PreparedObject],
+) -> Result<(), CoreError> {
+    let mut checked = BTreeSet::new();
+    for entry in entries {
+        let Some(target) = entry.target.as_ref() else {
+            continue;
+        };
+        if !matches!(target.mode, FileMode::Regular | FileMode::Executable)
+            || !checked.insert(target.oid)
+        {
+            continue;
+        }
+        let bytes = target_bytes(store, prepared, target.oid)?;
+        if lfs::is_pointer(&bytes) {
+            return Err(lfs::unsupported(entry.path.as_bytes()));
+        }
+    }
+    Ok(())
+}
+
+/// The decoded bytes of a file target small enough to be a pointer, from
+/// the plan's prepared objects or the committed store. Larger or non-file
+/// content never reaches [`lfs::is_pointer`].
+fn target_bytes(
+    store: &Store,
+    prepared: &[PreparedObject],
+    oid: crate::ids::Oid,
+) -> Result<Vec<u8>, CoreError> {
+    if let Some(object) = prepared.iter().find(|object| object.oid() == oid) {
+        if object.kind() != ObjectKind::Blob {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                format!("materialization target {oid} is not a blob"),
+            ));
+        }
+        if object.decoded_len() >= MAX_POINTER_BYTES {
+            return Ok(Vec::new());
+        }
+        let mut bytes = Vec::new();
+        store
+            .decode_prepared(object)?
+            .read_to_end(&mut bytes)
+            .map_err(|err| {
+                CoreError::new(ErrorCode::EIo, format!("read prepared blob {oid}: {err}"))
+            })?;
+        return Ok(bytes);
+    }
+    let Some(len) = store.object_len(oid)? else {
+        return Err(CoreError::new(
+            ErrorCode::ENotFound,
+            format!("materialization target {oid} is not committed"),
+        ));
+    };
+    if len >= MAX_POINTER_BYTES {
+        return Ok(Vec::new());
+    }
+    let mut object = store.read(oid)?;
+    if object.kind != ObjectKind::Blob {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!("materialization target {oid} is not a blob"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    object
+        .bytes
+        .read_to_end(&mut bytes)
+        .map_err(|err| CoreError::new(ErrorCode::EIo, format!("read blob {oid}: {err}")))?;
+    Ok(bytes)
 }
 
 /// Test-only crash injection: fails the N-th physical step on this thread

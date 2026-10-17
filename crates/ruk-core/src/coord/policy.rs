@@ -24,9 +24,11 @@
 //!
 //! `policy.toml` inside the store directory is TOML, format version 1:
 //!
-//! ```toml
 //! version = 1
 //! session_idle = "24h"        # optional; fixed units up to hours; > 0
+//! lfs = "deny"                # optional; "deny" (the default) refuses Git
+//!                             # LFS pointer blobs with E_UNSUPPORTED_LFS,
+//!                             # "pointers" records the bytes plainly
 //!
 //! [[principal]]
 //! name = "owner"              # the coordinator's own principal, or an
@@ -71,6 +73,7 @@ use crate::capability::{Capabilities, PathPattern, ReadIntents, RefPattern, Undo
 use crate::commit::ProvenanceClaims;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{IdentityClaim, Validate};
+use crate::workcopy::lfs::LfsMode;
 
 /// File name of the policy inside the store directory.
 const POLICY_FILE_NAME: &str = "policy.toml";
@@ -410,23 +413,25 @@ impl PrincipalPolicy {
     }
 }
 
-/// A parsed, validated policy: the principals the coordinator admits and the
-/// session idle lifetime.
+/// A parsed, validated policy: the principals the coordinator admits, the
+/// session idle bound, and the LFS pointer mode the store enforces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Policy {
     session_idle: SignedDuration,
+    lfs: LfsMode,
     entries: HashMap<Principal, PrincipalPolicy>,
 }
 
 impl Policy {
     /// The policy of a store with no policy file: only `owner`, with the
-    /// full ceiling.
+    /// full ceiling, and pointer blobs refused.
     ///
     /// # Errors
     /// Never in practice; the fixed patterns are valid.
     pub(crate) fn default_for_owner(owner: &Principal) -> Result<Self, CoreError> {
         Ok(Self {
             session_idle: DEFAULT_SESSION_IDLE,
+            lfs: LfsMode::default(),
             entries: HashMap::from([(owner.clone(), PrincipalPolicy::owner_default()?)]),
         })
     }
@@ -462,6 +467,7 @@ impl Policy {
         }
         Ok(Self {
             session_idle,
+            lfs: raw.lfs.unwrap_or_default(),
             entries,
         })
     }
@@ -485,6 +491,13 @@ impl Policy {
     pub(crate) const fn session_idle(&self) -> SignedDuration {
         self.session_idle
     }
+
+    /// How this store treats Git LFS pointer blobs: refused by default,
+    /// recorded plainly only under `lfs = "pointers"`.
+    #[must_use]
+    pub(crate) const fn lfs(&self) -> LfsMode {
+        self.lfs
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +509,7 @@ impl Policy {
 struct RawPolicy {
     version: i64,
     session_idle: Option<String>,
+    lfs: Option<LfsMode>,
     #[serde(default, rename = "principal")]
     principals: Vec<RawPrincipal>,
 }
@@ -1063,11 +1077,32 @@ mod tests {
     fn a_policy_without_principals_admits_nobody_and_never_adds_the_owner() {
         let policy = parsed("version = 1\n");
         assert_eq!(policy.session_idle(), SignedDuration::from_hours(24));
+        assert_eq!(policy.lfs(), LfsMode::Deny);
         for who in [owner(), other()] {
             assert_eq!(
                 policy.lookup(&who).expect_err("unlisted").code,
                 ErrorCode::EForbidden
             );
+        }
+    }
+
+    #[test]
+    fn lfs_mode_defaults_to_deny_and_only_known_modes_are_accepted() {
+        assert_eq!(parsed("version = 1\n").lfs(), LfsMode::Deny);
+        assert_eq!(
+            parsed("version = 1\nlfs = \"deny\"\n").lfs(),
+            LfsMode::Deny
+        );
+        assert_eq!(
+            parsed("version = 1\nlfs = \"pointers\"\n").lfs(),
+            LfsMode::Pointers
+        );
+        for text in [
+            "version = 1\nlfs = \"fetch\"\n",
+            "version = 1\nlfs = \"full\"\n",
+            "version = 1\nlfs = true\n",
+        ] {
+            assert_eq!(code_of(text), ErrorCode::EPolicy, "{text:?}");
         }
     }
 

@@ -32,6 +32,7 @@
 //! [`write::write`] hashes bytes and is the remedy.
 
 pub(crate) mod crawl;
+pub(crate) mod lfs;
 pub(crate) mod ingest;
 pub(crate) mod journal_state;
 pub(crate) mod snapshot;

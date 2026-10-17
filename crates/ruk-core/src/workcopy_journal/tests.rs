@@ -10,6 +10,7 @@ use crate::ids::{HashKind, Oid};
 use crate::index::{FileMode, RepoPath};
 use crate::store::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparationBudget, Store};
 use crate::workcopy::journal_state::{ApplyPhase, JournalState, ensure_idle};
+use crate::workcopy::lfs::LfsMode;
 use crate::workspace::{Scope, WorkspaceStamp};
 use crate::{CoreError, ErrorCode, WorkspaceId};
 
@@ -133,6 +134,7 @@ fn plan(fx: &Fixture, entries: Vec<PlanEntry>, discard: &[&str]) -> MaterializeP
         entries,
         discard: discard.iter().map(|text| path(text)).collect(),
         target_objects: Vec::new(),
+        lfs: LfsMode::Deny,
     }
 }
 
@@ -519,7 +521,7 @@ fn symlink_target_bytes_must_hash_to_the_target_oid() {
 
 #[test]
 fn lease_epoch_fences_begin_steps_finish_and_recovery() {
-    let mut fx = Fixture::new();
+    let fx = Fixture::new();
     let entries = seed(&fx);
     let stale = fx.fence();
     fx.take();
@@ -551,7 +553,7 @@ fn lease_epoch_fences_begin_steps_finish_and_recovery() {
 
 #[test]
 fn finish_is_fenced_by_the_lease_epoch() {
-    let mut fx = Fixture::new();
+    let fx = Fixture::new();
     let entries = seed(&fx);
     let mut session = begin_apply(fx.store(), plan(&fx, entries, &[]), fx.fence(), Vec::new()).expect("begin");
     session.execute().expect("execute");
@@ -565,4 +567,43 @@ fn finish_is_fenced_by_the_lease_epoch() {
     assert_eq!(rebound_before.lease_epoch, 0);
     recover(fx.store(), &fx.dir, fx.fence(), RecoveryAction::Resume, FinishBatch::default()).expect("recover");
     assert_target(&fx);
+}
+
+#[test]
+fn deny_mode_refuses_pointer_targets_before_the_journal() {
+    let fx = Fixture::new();
+    let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d0b46e9c\nsize 14\n";
+    let oid = fx.blob(pointer);
+    let entries = vec![plan_entry("asset.bin", None, Some(entry(FileMode::Regular, oid)))];
+    let error = code(begin_apply(
+        fx.store(),
+        plan(&fx, entries, &[]),
+        fx.fence(),
+        Vec::new(),
+    ));
+    assert_eq!(error.code, ErrorCode::EUnsupportedLfs);
+    assert!(
+        !is_applying(fx.store(), fx.ws).expect("no journal"),
+        "a refused target leaves no Applying journal"
+    );
+    assert!(fx.get("asset.bin").is_none(), "the worktree is untouched");
+}
+
+#[test]
+fn pointer_mode_materializes_pointer_bytes_plainly() {
+    let fx = Fixture::new();
+    let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d0b46e9c\nsize 14\n";
+    let oid = fx.blob(pointer);
+    let entries = vec![plan_entry("asset.bin", None, Some(entry(FileMode::Regular, oid)))];
+    let mut request = plan(&fx, entries, &[]);
+    request.lfs = LfsMode::Pointers;
+    materialize(
+        fx.store(),
+        request,
+        fx.fence(),
+        Vec::new(),
+        FinishBatch::default(),
+    )
+    .expect("pointer bytes materialize under pointer mode");
+    assert_eq!(fx.get("asset.bin").as_deref(), Some(pointer.as_slice()));
 }
