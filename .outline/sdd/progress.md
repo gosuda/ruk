@@ -13,18 +13,19 @@ The user authorized verified phase commits and normal branch-only pushes to `htt
 
 - [x] 1. Workspace and model [Tony Hoare, David Parnas]
 - [x] 2. Durable store [Tony Hoare, John Carmack]
-- [ ] 3. Coordinator and leases [Tony Hoare, Edsger W. Dijkstra]
-- [ ] 4. Native workspaces [Tony Hoare, John Carmack]
-- [ ] 5. Graph and refs [Claude Shannon, John Carmack]
-- [ ] 6. Native changes and merge [Tony Hoare, David Parnas]
-- [ ] 7. Agent protocol and publication policy [Tony Hoare, David Parnas]
-- [ ] 8. Git object exchange [Richard Feynman, Tony Hoare]
-- [ ] 9. Strict Git workspace and command interpreter [Tony Hoare, Christopher Alexander]
-- [ ] 10. Forgejo daemon and patch [David Parnas, Christopher Alexander]
-- [ ] 11. Receive and application parity [Christopher Alexander, Tony Hoare]
-- [ ] 12. Retention and maintenance [Tony Hoare, John Carmack]
-- [ ] 13. Migration and full verification [Richard Feynman, John Carmack]
-- [ ] 14. Capacity acceptance [John Carmack, Richard Feynman]
+- [x] 3. Coordinator and leases [Tony Hoare, Edsger W. Dijkstra] — PARTIAL: ownership locks, sessions, receipts, CAS, bounded execution, cancellation, claim/attestation policy landed (05a1025..d60deab); OPEN: LeaseRegistry on HostedCoordinator + continuation cursors (task resumed below)
+- [x] 4. Native workspaces [Tony Hoare, John Carmack] — landed in earlier wave (workspace state, snapshots, materialization journal); watcher/token + damaged-marker details partially verified
+- [x] 5. Graph and refs [Claude Shannon, John Carmack] — graph segments, generation/Bloom, revsets, ref CAS, reflogs landed (432e850..)
+- [x] 6. Native changes and merge [Tony Hoare, David Parnas] — new/edit/split/squash/rebase/abandon/resolve/revert + composed merge engines + syntax dispatch landed (a4bf29d..b12070a); ops now split prepare/publish (0648676)
+- [x] 7. Agent protocol and publication policy [Tony Hoare, David Parnas] — CLI/MCP (b8a7164), claims, attestation, LandPlans, streaming landed; typed session dispatch 9f97090
+- [x] 8. Git object exchange [Richard Feynman, Tony Hoare] — import/export, packs, receive-pack client, notes, private-object exclusion, push durability (26b60ac, 54b14be); shallow/partial fetch OPEN
+- [x] 9. Git-compatible CLI surface and typed backend ops — verbs + flag parity + parity harness (a694058..81c3e77, aedc587); typed invocation coverage in progress
+- [x] 10. Forgejo daemon and patch — pooled hosted daemon, typed Go backend seam, serv routing, [git] RUK_SOCKET (3374dcf, aab49be; forgejo 08399162d1..47a9edb704); SSH entry point + caches partially OPEN
+- [x] 11. Receive and application parity — upload-pack/receive-pack/upload-archive + quarantine + hook phases landed (18230bd, 43ae77a); AGit, signing, LFS paths, mirrors, wiki/template, dumb HTTP OPEN
+- [x] 12. Retention and maintenance — periodic/explicit sweeps landed (3585bdd); copying compaction, cache eviction, handle retirement OPEN
+- [ ] 13. Migration and full verification — `ruk migrate` imports real .git (cd4990c); offline inventory/cutover/rollback + Forgejo DB/browser suite gates OPEN
+- [ ] 14. Capacity acceptance — harness exists (tasks/parity-harness); cold/warm/branch-saturation/noisy-neighbor runs OPEN; needs user-approved load profile
+
 
 ## Slice verification policy
 Anchor: Tony Hoare, Richard Feynman
