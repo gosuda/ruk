@@ -23,13 +23,14 @@
 //! object or batch boundary.
 
 pub mod commits;
+pub mod notes;
 pub mod objects;
 pub mod progress;
 pub mod refs;
 pub mod walk;
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 #[cfg(test)]
 mod tests;
 

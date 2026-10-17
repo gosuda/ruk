@@ -37,11 +37,12 @@ use ruk_core::store::{FactMutation, Store};
 
 use super::pack::{IngestLimits, Links, StagedPack, ingest_pack, object_links};
 use super::pktline::{self, Packet, PktReader, RemoteMessages, SidebandReader, send};
+use super::private::PrivateFilter;
 use super::refadv::{self, Advertisement, Capabilities, Initial};
 use super::session::Duplex;
 use super::{
-    Interrupt, PromisorRow, has_object, promisor_clear, promisor_mutation, read_object,
-    shallow_insert, shallow_remove,
+    Interrupt, PromisorRow, has_object, promisor_clear, promisor_mutation, promisor_row,
+    read_object, shallow_insert, shallow_remove,
 };
 use crate::GitError;
 
@@ -641,6 +642,7 @@ impl Verifier<'_> {
 
 /// Collects ancestor commits of `tips` to offer as haves, newest discovery
 /// order, bounded by `max`. Reads (not trusted structures) back the walk.
+/// Promised objects are never offered: the local store does not hold them.
 ///
 /// # Errors
 /// Store failures.
@@ -650,12 +652,33 @@ pub fn collect_haves(
     max: usize,
     interrupt: &Interrupt,
 ) -> Result<Vec<Oid>, GitError> {
+    collect_haves_filtered(store, tips, max, &PrivateFilter::empty(), interrupt)
+}
+
+/// Collects haves while excluding a private closure.
+///
+/// Excluded roots are never entered, so private history stays private at
+/// the cost of offering fewer haves. Every other excluded OID is skipped
+/// without descending from it. Promised objects are always excluded.
+///
+/// # Errors
+/// Store failures.
+pub fn collect_haves_filtered(
+    store: &Store,
+    tips: &[Oid],
+    max: usize,
+    filter: &PrivateFilter,
+    interrupt: &Interrupt,
+) -> Result<Vec<Oid>, GitError> {
     let mut haves = Vec::new();
     let mut visited = HashSet::new();
-    let mut queue: VecDeque<Oid> = tips.iter().copied().collect();
+    let mut queue: VecDeque<Oid> = filter.filter_haves(tips).into_iter().collect();
     while let Some(oid) = queue.pop_front() {
         interrupt.check("collecting haves")?;
         if !visited.insert(oid) || haves.len() >= max {
+            continue;
+        }
+        if filter.contains(oid) || promisor_row(store, oid)?.is_some() {
             continue;
         }
         let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
@@ -666,9 +689,31 @@ pub fn collect_haves(
         };
         haves.push(oid);
         let links = object_links(ObjectKind::Commit, &bytes, store.hash_kind())?;
-        queue.extend(links.parents);
+        queue.extend(filtered_parents(filter, &links.parents));
     }
     Ok(haves)
+}
+
+/// Parents minus explicitly private OIDs, preserving discovery order.
+fn filtered_parents(filter: &PrivateFilter, parents: &[Oid]) -> Vec<Oid> {
+    parents
+        .iter()
+        .copied()
+        .filter(|oid| !filter.contains(*oid))
+        .collect()
+}
+
+/// Filters `haves` for the wire: private and promised OIDs never reach the
+/// server's have-round or `ls-refs` negotiation.
+///
+/// # Errors
+/// Store failures; a malformed promisor row is [`GitError::Corrupt`].
+pub fn filter_haves_for_wire(
+    store: &Store,
+    haves: &[Oid],
+    filter: &PrivateFilter,
+) -> Result<Vec<Oid>, GitError> {
+    filter.filter_haves_store(store, haves)
 }
 
 /// Builds promisor-row insertions for blobs the filter omitted.
@@ -797,7 +842,37 @@ pub fn publish_fetch(
     staged: StagedPack,
     facts: &[FactMutation],
 ) -> Result<ruk_core::store::types::Publication, GitError> {
-    Ok(store.publish(staged.into_objects(), facts)?)
+    let mut facts = facts.to_vec();
+    facts.extend(commit_record_facts(store, &staged)?);
+    Ok(store.publish(staged.into_objects(), &facts)?)
+}
+
+/// Compiles commit-record mutations for every commit staged in a pack.
+///
+/// Fetched commits need their `Commits` table row like an import does, or a
+/// later `commit`/`log` in the destination sees the object but no record and
+/// refuses the parent. `observe_git_payload` preserves exact bytes; known
+/// heads emit no mutations.
+///
+/// # Errors
+/// [`GitError::Corrupt`] when a staged commit payload fails the record
+/// boundary; record-boundary failures propagate as [`GitError`] via
+/// `CoreError`.
+pub fn commit_record_facts(
+    store: &Store,
+    staged: &StagedPack,
+) -> Result<Vec<FactMutation>, GitError> {
+    let mut batch = ruk_core::records::ImportBatch::new(store);
+    for oid in staged.oids() {
+        if let Some((ObjectKind::Commit, payload)) = staged.payload(*oid) {
+            batch
+                .observe_git_payload(payload.to_vec(), None)
+                .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+        }
+    }
+    batch
+        .into_mutations()
+        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))
 }
 
 #[cfg(test)]

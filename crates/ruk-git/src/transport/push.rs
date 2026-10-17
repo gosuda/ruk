@@ -34,7 +34,8 @@ use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
 
 use super::pack::{PackEntry, object_links, write_pack, write_thin_pack};
 use super::pktline::{self, Packet, PktReader, SidebandReader, send};
-use super::{Interrupt, has_object, read_object};
+use super::private::PrivateFilter;
+use super::{Interrupt, has_object, promisor_row, read_object};
 use crate::GitError;
 
 /// Largest object pulled through the push closure walk.
@@ -488,7 +489,15 @@ pub fn push_over<R: Read + Write>(
         }
     }
     persist(store, plan, kind, None)?;
-    let outcome = push_over_inner(stream, store, kind, plan, req, interrupt);
+    let outcome = push_over_inner(
+        stream,
+        store,
+        kind,
+        plan,
+        req,
+        &PrivateFilter::empty(),
+        interrupt,
+    );
     match outcome {
         Ok(outcomes) => Ok(outcomes),
         Err(err) => {
@@ -520,12 +529,118 @@ fn persist_best_effort(store: &Store, plan: &PushPlanRecord, kind: HashKind) {
     }
 }
 
+/// Pushes over `stream` while refusing private tips locally.
+///
+/// Updates whose new tip is private or promised are never sent: they join
+/// the returned outcomes as rejections and the plan persists `Rejected`
+/// without transmitting a byte for them. Every other update follows the
+/// exact [`push_over`] framing with a privately filtered closure.
+///
+/// # Errors
+/// As [`push_over`].
+pub fn push_over_with_private<R: Read + Write>(
+    stream: R,
+    store: &Store,
+    kind: HashKind,
+    plan: &mut PushPlanRecord,
+    req: &PushWireRequest,
+    filter: &PrivateFilter,
+    interrupt: &Interrupt,
+) -> Result<Vec<RefOutcome>, GitError> {
+    if req.updates.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "push needs at least one update".to_owned(),
+        });
+    }
+    if plan.updates != req.updates || plan.atomic != req.atomic {
+        return Err(GitError::Invalid {
+            detail: "push plan does not match the push request".to_owned(),
+        });
+    }
+    for update in &req.updates {
+        if update.name.is_empty() || update.name.iter().any(|b| *b == 0 || *b == b'\n') {
+            return Err(GitError::Invalid {
+                detail: "push update carries a malformed ref name".to_owned(),
+            });
+        }
+    }
+    persist(store, plan, kind, None)?;
+    let outcome = push_over_inner(stream, store, kind, plan, req, filter, interrupt);
+    match outcome {
+        Ok(outcomes) => Ok(outcomes),
+        Err(err) => {
+            plan.mark_uncertain();
+            persist_best_effort(store, plan, kind);
+            Err(err)
+        }
+    }
+}
+
+/// Refuses updates whose new tip must not leave the store.
+fn refuse_private_tips<'a>(
+    store: &Store,
+    live: Vec<&'a PushUpdate>,
+    filter: &PrivateFilter,
+) -> Result<(Vec<&'a PushUpdate>, Vec<RefOutcome>), GitError> {
+    let mut allowed = Vec::with_capacity(live.len());
+    let mut refused = Vec::new();
+    for update in live {
+        if filter.is_excluded(store, update.new)? {
+            refused.push(RefOutcome {
+                name: update.name.clone(),
+                result: RefResult::Rejected {
+                    reason: "refusing to push a private object".to_owned(),
+                },
+            });
+            continue;
+        }
+        allowed.push(update);
+    }
+    Ok((allowed, refused))
+}
+
+/// Every server outcome names exactly one live update exactly once.
+///
+/// A truncated or padded report is [`GitError::Corrupt`], never a partial
+/// success: the caller persists `Uncertain` instead of recording outcomes
+/// the server never acknowledged.
+fn check_report_covers_live(live: &[&PushUpdate], server: &[RefOutcome]) -> Result<(), GitError> {
+    let mut wanted: HashMap<&[u8], usize> = HashMap::with_capacity(live.len());
+    for update in live {
+        if wanted.insert(update.name.as_slice(), 1).is_some() {
+            return Err(GitError::Corrupt {
+                detail: "push request names one ref twice".to_owned(),
+            });
+        }
+    }
+    let mut seen: HashMap<&[u8], usize> = HashMap::with_capacity(server.len());
+    for outcome in server {
+        if wanted.get(outcome.name.as_slice()).is_none() {
+            return Err(GitError::Corrupt {
+                detail: "push report names a ref the client did not send".to_owned(),
+            });
+        }
+        if seen.insert(outcome.name.as_slice(), 1).is_some() {
+            return Err(GitError::Corrupt {
+                detail: "push report answers one ref twice".to_owned(),
+            });
+        }
+    }
+    if seen.len() != wanted.len() {
+        return Err(GitError::Corrupt {
+            detail: "push report omits a ref the client sent".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn push_over_inner<R: Read + Write>(
     stream: R,
     store: &Store,
     kind: HashKind,
     plan: &mut PushPlanRecord,
     req: &PushWireRequest,
+    filter: &PrivateFilter,
     interrupt: &Interrupt,
 ) -> Result<Vec<RefOutcome>, GitError> {
     let mut pkt = PktReader::new(stream, interrupt.clone());
@@ -585,6 +700,9 @@ fn push_over_inner<R: Read + Write>(
             _ => live.push(update),
         }
     }
+    let (allowed, refused) = refuse_private_tips(store, live, filter)?;
+    live = allowed;
+    outcomes.extend(refused);
     if !outcomes.is_empty() && req.atomic {
         for update in live {
             outcomes.push(RefOutcome {
@@ -652,8 +770,8 @@ fn push_over_inner<R: Read + Write>(
     plan.begin_send()?;
     persist(store, plan, kind, current_encoding(store, plan)?)?;
     send(pkt.get_mut(), &out)?;
-    let mut entries = push_closure(store, kind, &live, interrupt)?;
-    pair_thin_bases(store, kind, &live, &mut entries, interrupt)?;
+    let mut entries = push_closure_filtered(store, kind, &live, filter, interrupt)?;
+    pair_thin_bases_filtered(store, kind, &live, filter, &mut entries, interrupt)?;
     if !entries.is_empty() {
         let pack_entries: Vec<PackEntry<'_>> =
             entries.iter().map(ClosureObject::as_entry).collect();
@@ -664,7 +782,9 @@ fn push_over_inner<R: Read + Write>(
             write_pack(pkt.get_mut(), kind, &pack_entries, interrupt)?;
         }
     }
-    let mut report = read_report(&mut pkt, sideband)?;
+    let server = read_report(&mut pkt, sideband)?;
+    check_report_covers_live(&live, &server)?;
+    let mut report = server;
     report.extend(outcomes);
     plan.finalize(report.clone())?;
     persist(store, plan, kind, current_encoding(store, plan)?)?;
@@ -703,13 +823,30 @@ impl ClosureObject {
 }
 
 /// Computes wants-minus-haves: objects reachable from the new tips minus
-/// objects reachable from the advertised remote tips. Private closures
-/// never enter the walk because they are never roots. Local transports
-/// reuse this; the wire path pairs thin bases on top.
+/// objects reachable from the advertised remote tips. Promised objects are
+/// never emitted. Callers with private state use
+/// [`push_closure_filtered`]; this entry point filters nothing explicitly.
+/// Local transports reuse this; the wire path pairs thin bases on top.
 pub(crate) fn push_closure(
     store: &Store,
     kind: HashKind,
     live: &[&PushUpdate],
+    interrupt: &Interrupt,
+) -> Result<Vec<ClosureObject>, GitError> {
+    push_closure_filtered(store, kind, live, &PrivateFilter::empty(), interrupt)
+}
+
+/// Computes wants-minus-haves while excluding a private closure.
+///
+/// Excluded new tips are never queued and excluded objects are never
+/// emitted or traversed, so private history stays private; public history
+/// reachable only through an excluded object is omitted rather than leaked.
+/// Promised objects are always skipped: the local store does not hold them.
+pub(crate) fn push_closure_filtered(
+    store: &Store,
+    kind: HashKind,
+    live: &[&PushUpdate],
+    filter: &PrivateFilter,
     interrupt: &Interrupt,
 ) -> Result<Vec<ClosureObject>, GitError> {
     let zero = kind.zero_oid();
@@ -746,7 +883,10 @@ pub(crate) fn push_closure(
     }
     while let Some(oid) = queue.pop_front() {
         interrupt.check("computing the push closure")?;
-        if !visited.insert(oid) || uninteresting.contains(&oid) {
+        if !visited.insert(oid) || uninteresting.contains(&oid) || filter.contains(oid) {
+            continue;
+        }
+        if promisor_row(store, oid)?.is_some() {
             continue;
         }
         let (kind, bytes) = match read_object(store, oid, WALK_OBJECT_BYTES) {
@@ -781,11 +921,34 @@ pub(crate) fn push_closure(
 /// Pairs same-path blobs between each updated ref's old and new trees so
 /// thin deltas name only permitted bases (reachable from advertised tips).
 /// A missing or non-commit side disables pairing for that ref; the pack
-/// stays complete either way.
+/// stays complete either way. Callers with private state use
+/// [`pair_thin_bases_filtered`].
 pub(crate) fn pair_thin_bases(
     store: &Store,
     kind: HashKind,
     live: &[&PushUpdate],
+    entries: &mut [ClosureObject],
+    interrupt: &Interrupt,
+) -> Result<(), GitError> {
+    pair_thin_bases_filtered(
+        store,
+        kind,
+        live,
+        &PrivateFilter::empty(),
+        entries,
+        interrupt,
+    )
+}
+
+/// Pairs thin bases while never naming a private or promised base.
+///
+/// An excluded base disables pairing for that blob only; the pack carries
+/// the complete object instead, so privacy never corrupts the transfer.
+pub(crate) fn pair_thin_bases_filtered(
+    store: &Store,
+    kind: HashKind,
+    live: &[&PushUpdate],
+    filter: &PrivateFilter,
     entries: &mut [ClosureObject],
     interrupt: &Interrupt,
 ) -> Result<(), GitError> {
@@ -808,6 +971,9 @@ pub(crate) fn pair_thin_bases(
         };
         for (new_oid, base_oid) in pair_trees(store, kind, old_tree, new_tree, interrupt)? {
             if let Some(&index) = by_oid.get(&new_oid) {
+                if filter.is_excluded(store, base_oid)? {
+                    continue;
+                }
                 if has_object(store, base_oid)? {
                     let (_, base_bytes) = read_object(store, base_oid, WALK_OBJECT_BYTES)?;
                     entries[index].base = Some((base_oid, base_bytes));

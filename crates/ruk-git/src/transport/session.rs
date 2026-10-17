@@ -291,6 +291,7 @@ pub fn local_fetch(
     facts.extend(shallow_facts(&closure.shallow, &[]));
     facts.extend(observation_mutations(remote, tracking));
     facts.extend(ref_mutations.iter().cloned());
+    facts.extend(super::fetch::commit_record_facts(dest, &staged)?);
     let publication = dest.publish(staged.into_objects(), &facts)?;
     Ok(FetchReport {
         publication,
@@ -524,7 +525,8 @@ fn local_push_inner(
         write_pack(&mut pack, kind, &pack_entries, interrupt)?;
         let staged: StagedPack =
             ingest_pack(&pack[..], kind, dest, IngestLimits::default(), interrupt)?;
-        dest.publish(staged.into_objects(), &[])?;
+        let facts = super::fetch::commit_record_facts(dest, &staged)?;
+        dest.publish(staged.into_objects(), &facts)?;
     }
     let mut report = apply_refs(dest, kind, &live, req.atomic)?;
     report.extend(outcomes);

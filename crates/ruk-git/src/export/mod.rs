@@ -25,6 +25,7 @@
 //! [`Store::read`].
 
 pub mod layout;
+pub mod notes;
 pub mod objects;
 pub mod pack;
 pub mod refs;

@@ -36,9 +36,20 @@
 pub mod fetch;
 pub mod pack;
 pub mod pktline;
+pub mod private;
 pub mod push;
 pub mod refadv;
 pub mod session;
+
+#[cfg(test)]
+#[path = "tests/notes_roundtrip.rs"]
+mod notes_roundtrip_tests;
+#[cfg(test)]
+#[path = "tests/private_exclusion.rs"]
+mod private_exclusion_tests;
+#[cfg(test)]
+#[path = "tests/push_persistence.rs"]
+mod push_persistence_tests;
 
 use std::io::Read;
 use std::sync::Arc;
