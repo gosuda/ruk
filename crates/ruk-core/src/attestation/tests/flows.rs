@@ -2,6 +2,7 @@
 //! requirements, paging, export and reload, cancellation, and quarantine.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 
 use crate::attestation::{
     Disposition, ExportSummary, Gap, Progress, RequirementOutcome, StatementFilter, attested,
@@ -24,7 +25,9 @@ use super::fixtures::{
 const T0: &str = "2026-10-17T12:00:00Z";
 const T1: &str = "2026-10-17T12:05:00Z";
 const T2: &str = "2026-10-17T12:10:00Z";
-const FAR_FUTURE: &str = "9999-12-31T23:59:59Z";
+/// Far in the future, and inside the range `Timestamp` parses: the representable
+/// maximum is 9999-12-30T22:00:00Z.
+const FAR_FUTURE: &str = "9999-12-30T21:00:00Z";
 
 /// Two commits, `a` and `b`, in a fresh store.
 struct Lab {
@@ -86,6 +89,18 @@ fn requirement(kind_text: &str, result_text: &str) -> AttestRequirement {
 fn fingerprint(seed: u8) -> SignerFingerprint {
     let public = public_bytes(&key(seed));
     SignerFingerprint::new(independent_fingerprint(&public)).expect("fingerprint")
+}
+
+/// The record of the statement signed by `seed` with `result_text`.
+fn find_record<'r>(
+    records: &'r [AttestationRecord],
+    seed: u8,
+    result_text: &str,
+) -> &'r AttestationRecord {
+    records
+        .iter()
+        .find(|record| record.signer == fingerprint(seed) && record.result == result(result_text))
+        .expect("record is present")
 }
 
 /// Five retained statements across two subjects, two kinds, and two signers:
@@ -614,6 +629,133 @@ fn a_stored_row_that_fails_reverification_is_corruption_and_latches_quarantine()
         .expect("plant the unverifiable row");
 
     let refused = subject_statements(lab.store(), &lab.a, None, &open).expect_err("corrupt");
+    assert_eq!(refused.code, ErrorCode::ECorrupt);
+    assert!(lab.store().quarantine(), "committed damage latches quarantine");
+}
+
+#[test]
+fn one_payload_signed_by_two_signers_keeps_two_live_rows() {
+    let lab = Lab::new("two-signers");
+    let payload = statement(lab.a, "review", "pass", T0, None);
+    let owner = sign(&key(0x11), payload.clone());
+    let other = sign(&key(0x22), payload);
+    assert_eq!(
+        digest_of(&owner),
+        digest_of(&other),
+        "the signed payload does not name its signer"
+    );
+
+    let prepared = prepare_batch(lab.store(), &[owner, other], &open).expect("batch");
+    assert_eq!(prepared.mutations.len(), 4, "two rows for each signer");
+    assert!(prepared.records.iter().all(|record| {
+        record.disposition == Disposition::Added && record.record.status == AttestationStatus::Live
+    }));
+    apply(lab.store(), &prepared);
+
+    let signers: BTreeSet<SignerFingerprint> = everything(lab.store())
+        .into_iter()
+        .map(|record| record.signer)
+        .collect();
+    assert_eq!(signers, BTreeSet::from([fingerprint(0x11), fingerprint(0x22)]));
+
+    let mut exported = Vec::new();
+    let summary = export(lab.store(), &mut exported, &open).expect("export");
+    assert_eq!(summary.statements, 2);
+    assert_eq!(parse_export(&exported).expect("parse").len(), 2);
+}
+
+#[test]
+fn a_batch_supersession_names_only_its_own_signers_copy_of_a_shared_payload() {
+    let lab = Lab::new("shared-batch");
+    let payload = statement(lab.a, "review", "fail", T0, None);
+    let owner = sign(&key(0x11), payload.clone());
+    let other = sign(&key(0x22), payload);
+    let other_digest = digest_of(&other);
+    let retire = sign(
+        &key(0x22),
+        statement(lab.a, "review", "pass", T1, Some(other_digest)),
+    );
+
+    // The owner's copy comes first. A lookup by digest alone would find that row
+    // for the other signer's supersession.
+    let prepared = prepare_batch(lab.store(), &[owner, other, retire], &open)
+        .expect("the supersession resolves within the superseding signer's group");
+    apply(lab.store(), &prepared);
+
+    let records = everything(lab.store());
+    assert_eq!(
+        find_record(&records, 0x11, "fail").status,
+        AttestationStatus::Live
+    );
+    assert_eq!(
+        find_record(&records, 0x22, "fail").status,
+        AttestationStatus::Superseded
+    );
+    let retiring = find_record(&records, 0x22, "pass");
+    assert_eq!(retiring.status, AttestationStatus::Live);
+    assert_eq!(retiring.supersedes, Some(other_digest));
+}
+
+#[test]
+fn a_stored_supersession_guards_the_supersedors_own_copy() {
+    use crate::attestation::layout::statement_key;
+
+    let lab = Lab::new("shared-stored");
+    let payload = statement(lab.a, "review", "fail", T0, None);
+    let owner = sign(&key(0x11), payload.clone());
+    let other = sign(&key(0x22), payload);
+    let other_digest = digest_of(&other);
+    let shared = prepare_batch(lab.store(), &[owner, other], &open).expect("shared payload");
+    apply(lab.store(), &shared);
+
+    let retire = sign(
+        &key(0x22),
+        statement(lab.a, "review", "pass", T1, Some(other_digest)),
+    );
+    let prepared = prepare_add(lab.store(), &retire, &open).expect("supersede the stored copy");
+    let guards: Vec<&FactMutation> = prepared
+        .mutations
+        .iter()
+        .filter(|mutation| matches!(mutation.expected, FactExpectation::Value(_)))
+        .collect();
+    let own_copy = statement_key(
+        &lab.a,
+        "review",
+        fingerprint(0x22).as_str(),
+        other_digest.as_bytes(),
+    );
+    assert_eq!(guards.len(), 1);
+    assert_eq!(guards[0].key, own_copy);
+}
+
+#[test]
+fn a_stored_statement_without_its_order_row_is_corruption() {
+    use crate::attestation::layout::statement_key;
+    use crate::attestation::rows::encode_row;
+
+    let lab = Lab::new("missing-order");
+    let args = sign(&key(0x11), statement(lab.a, "review", "pass", T0, None));
+    let verified = verify_statement(HashKind::Sha1, &args).expect("genuine statement");
+    let row_key = statement_key(
+        &lab.a,
+        "review",
+        verified.signer().as_str(),
+        verified.digest().as_bytes(),
+    );
+    let row = encode_row(&verified).expect("encode row");
+    lab.store()
+        .publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::Attestations,
+                key: row_key,
+                expected: FactExpectation::Absent,
+                value: Some(row),
+            }],
+        )
+        .expect("plant the statement row without its order row");
+
+    let refused = prepare_add(lab.store(), &args, &open).expect_err("the order row is missing");
     assert_eq!(refused.code, ErrorCode::ECorrupt);
     assert!(lab.store().quarantine(), "committed damage latches quarantine");
 }

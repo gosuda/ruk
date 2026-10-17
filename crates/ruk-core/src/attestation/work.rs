@@ -33,6 +33,16 @@ impl<'a> Work<'a> {
         }
     }
 
+    /// A budget for a full-table walk that holds one row at a time. The checkpoint
+    /// bounds such a walk, not a row count.
+    pub(super) fn streaming(gate: &'a Checkpoint<'a>) -> Self {
+        Self {
+            gate,
+            progress: Progress::default(),
+            verify_left: usize::MAX,
+        }
+    }
+
     /// Counts one examined unit and lets the checkpoint stop the call.
     pub(super) fn step(&mut self) -> Result<(), CoreError> {
         self.progress.examined = self.progress.examined.saturating_add(1);

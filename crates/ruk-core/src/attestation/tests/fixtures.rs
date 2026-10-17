@@ -206,7 +206,8 @@ pub(super) fn rsa_key_blob() -> Vec<u8> {
     blob
 }
 
-/// The wire blob of an ECDSA P-256 public key with a placeholder point.
+/// The wire blob of an ECDSA P-256 public key whose point is all zeros. Only the
+/// key type matters here: the policy must refuse the key before any point check.
 pub(super) fn ecdsa_key_blob() -> Vec<u8> {
     let mut point = vec![0x04];
     point.extend_from_slice(&[0_u8; 64]);

@@ -34,6 +34,10 @@ pub struct ExportSummary {
 /// The sink receives output as it is produced. On error it holds a partial array,
 /// which the caller discards. The store is never modified.
 ///
+/// No row count refuses an export: each statement is verified once as it is
+/// written, and the checkpoint bounds the whole call. A reload is one import, so
+/// [`parse_export`] refuses more than [`MAX_IMPORT_STATEMENTS`] elements.
+///
 /// # Errors
 /// `E_IO` for a failed write; `E_CANCELLED` from the checkpoint; `E_CORRUPT` for an
 /// index row without a valid statement (latches quarantine); `E_INVALID` if an
@@ -43,7 +47,7 @@ pub fn export(
     out: &mut dyn Write,
     checkpoint: &Checkpoint<'_>,
 ) -> Result<ExportSummary, CoreError> {
-    let mut work = Work::new(checkpoint);
+    let mut work = Work::streaming(checkpoint);
     write_all(out, b"[")?;
     let mut scan = RowScan::new(store, ORDER_PREFIX, None);
     let mut statements = 0_u64;

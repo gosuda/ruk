@@ -36,8 +36,10 @@
 //! # Storage
 //!
 //! Rows live in the attestations fact table in two key families (see the
-//! `layout` module): one subject-major statement row per digest, and one
-//! `(kind, signer, digest)`-major order index that makes export streaming.
+//! `layout` module): one subject-major statement row per `(subject, kind, signer,
+//! digest)`, and one `(kind, signer, digest)`-major order index that makes export
+//! streaming. The signed payload does not name its signer, so two signers may sign
+//! one canonical payload; each signer's copy is its own row and group member.
 
 mod export;
 mod layout;

@@ -45,6 +45,7 @@ pub struct PreparedRecord {
 
 /// Fact mutations and per-input records from one preparation.
 #[derive(Debug)]
+#[must_use]
 pub struct PreparedAttestations {
     /// Mutations for the attestations table, with exact `Absent` or `Value`
     /// expectations. Empty when every input is already stored.
@@ -68,8 +69,9 @@ pub fn prepare_add(
 /// Prepares a batch of signed statements for one atomic publication.
 ///
 /// Batch statements may name each other as supersession targets in any order.
-/// Identical canonical statements deduplicate, and the first occurrence keeps its
-/// signature.
+/// A statement is identified by its row key: subject, kind, signer, and payload
+/// digest. A signer's identical statement deduplicates, and the first occurrence
+/// keeps its signature. Two signers' copies of one payload are two statements.
 ///
 /// # Errors
 /// - `E_LIMIT`: more than [`MAX_IMPORT_STATEMENTS`] inputs, a group over
@@ -162,23 +164,22 @@ fn commit_subject(store: &Store, subject: &Oid) -> Result<(), CoreError> {
 
 /// The distinct statements of one batch and how each input maps onto them.
 struct Batch {
-    /// One entry per distinct canonical statement, in first-occurrence order.
+    /// One entry per distinct statement row, in first-occurrence order.
     unique: Vec<VerifiedStatement>,
     /// For each input, the `unique` slot it names.
     slot_of: Vec<usize>,
-    /// The `unique` slot of each digest.
-    slot_by_digest: HashMap<[u8; 32], usize>,
+    /// The `unique` slot of each statement row key.
+    slot_by_key: HashMap<Vec<u8>, usize>,
 }
 
 impl Batch {
     fn new(verified: Vec<VerifiedStatement>) -> Self {
         let mut unique = Vec::with_capacity(verified.len());
         let mut slot_of = Vec::with_capacity(verified.len());
-        let mut slot_by_digest = HashMap::with_capacity(verified.len());
+        let mut slot_by_key = HashMap::with_capacity(verified.len());
         for item in verified {
-            let digest = *item.digest().as_bytes();
             let candidate = unique.len();
-            let slot = *slot_by_digest.entry(digest).or_insert(candidate);
+            let slot = *slot_by_key.entry(row_key(&item)).or_insert(candidate);
             if slot == candidate {
                 unique.push(item);
             }
@@ -187,13 +188,13 @@ impl Batch {
         Self {
             unique,
             slot_of,
-            slot_by_digest,
+            slot_by_key,
         }
     }
 }
 
-/// Whether each distinct statement is already stored. A statement that is not
-/// stored must also find its order index row free.
+/// Whether each distinct statement is already stored. A stored statement must
+/// still have its order index row; a new one must find that row free.
 fn stored_flags(
     store: &Store,
     unique: &[VerifiedStatement],
@@ -211,7 +212,9 @@ fn stored_flags(
             item.digest().as_bytes(),
             work,
         )?;
-        if found.is_none() {
+        if found.is_some() {
+            order_names_subject(store, item)?;
+        } else {
             order_slot_is_free(store, item)?;
         }
         existed.push(found.is_some());
@@ -231,6 +234,23 @@ fn order_slot_is_free(store: &Store, item: &VerifiedStatement) -> Result<(), Cor
             store,
             "an order index row exists for a statement that is not stored",
         );
+    }
+    Ok(())
+}
+
+/// A statement row and its order index row are published together. A stored
+/// statement whose index row is missing, or names another subject, is committed
+/// damage.
+fn order_names_subject(store: &Store, item: &VerifiedStatement) -> Result<(), CoreError> {
+    let statement = item.statement();
+    let key = order_key(
+        statement.kind.as_str(),
+        item.signer().as_str(),
+        item.digest().as_bytes(),
+    );
+    let named = store.fact(FactTable::Attestations, &key)?;
+    if named.as_deref() != Some(statement.subject.as_bytes()) {
+        return corrupt(store, "a stored statement lacks its order index row");
     }
     Ok(())
 }
@@ -279,12 +299,10 @@ impl Links {
         work: &mut Work<'_>,
     ) -> Result<(), CoreError> {
         let item = &batch.unique[slot];
-        let Some(&target_slot) = batch.slot_by_digest.get(target.as_bytes()) else {
+        let key = group_row_key(item, target.as_bytes());
+        let Some(&target_slot) = batch.slot_by_key.get(&key) else {
             return guard_stored(store, item, target.as_bytes(), &mut self.guards, work);
         };
-        if !same_group(item, &batch.unique[target_slot]) {
-            return Err(not_in_group());
-        }
         self.next[slot] = Some(target_slot);
         if existed[target_slot] {
             guard_stored(store, item, target.as_bytes(), &mut self.guards, work)?;
@@ -302,13 +320,7 @@ fn guard_stored(
     guards: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     work: &mut Work<'_>,
 ) -> Result<(), CoreError> {
-    let statement = item.statement();
-    let key = statement_key(
-        &statement.subject,
-        statement.kind.as_str(),
-        item.signer().as_str(),
-        target,
-    );
+    let key = group_row_key(item, target);
     let Some(bytes) = store.fact(FactTable::Attestations, &key)? else {
         return Err(not_in_group());
     };
@@ -318,10 +330,22 @@ fn guard_stored(
     Ok(())
 }
 
-fn same_group(left: &VerifiedStatement, right: &VerifiedStatement) -> bool {
-    left.statement().subject == right.statement().subject
-        && left.statement().kind == right.statement().kind
-        && left.signer() == right.signer()
+/// The statement row key of one verified statement. The signed payload does not
+/// name its signer, so the row key, not the digest alone, identifies a statement.
+fn row_key(item: &VerifiedStatement) -> Vec<u8> {
+    group_row_key(item, item.digest().as_bytes())
+}
+
+/// The row key of the statement with `digest` in the group of `item`: the same
+/// subject, kind, and signer. A supersession target is found under this key.
+fn group_row_key(item: &VerifiedStatement, digest: &[u8; 32]) -> Vec<u8> {
+    let statement = item.statement();
+    statement_key(
+        &statement.subject,
+        statement.kind.as_str(),
+        item.signer().as_str(),
+        digest,
+    )
 }
 
 fn not_in_group() -> CoreError {
@@ -363,7 +387,10 @@ fn group_statuses(
     slots: &[usize],
     work: &mut Work<'_>,
 ) -> Result<Vec<(usize, AttestationStatus)>, CoreError> {
-    let first = &batch.unique[slots[0]];
+    let Some(&first_slot) = slots.first() else {
+        return Ok(Vec::new());
+    };
+    let first = &batch.unique[first_slot];
     let statement = first.statement();
     let stored = load_group(
         store,
@@ -392,10 +419,15 @@ fn group_statuses(
         .zip(statuses)
         .map(|(member, status)| (*member.digest().as_bytes(), status))
         .collect();
-    Ok(slots
-        .iter()
-        .map(|&slot| (slot, by_digest[batch.unique[slot].digest().as_bytes()]))
-        .collect())
+    let mut resolved = Vec::with_capacity(slots.len());
+    for &slot in slots {
+        let digest = batch.unique[slot].digest();
+        let Some(status) = by_digest.get(digest.as_bytes()).copied() else {
+            return corrupt(store, "statement is missing from its own group");
+        };
+        resolved.push((slot, status));
+    }
+    Ok(resolved)
 }
 
 fn build_records(

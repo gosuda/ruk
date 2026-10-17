@@ -95,6 +95,7 @@ pub struct RequirementEvaluation {
 }
 
 /// The evaluation of every requirement against one exact subject.
+#[must_use]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LandEvaluation {
     /// The exact object every requirement applies to.
@@ -437,9 +438,6 @@ fn resolve_order_row(
     };
     if subject.kind() != store.hash_kind() {
         return corrupt(store, "order index subject has the wrong object format");
-    }
-    if filter.subject.is_some_and(|wanted| wanted != subject) {
-        return Ok(None);
     }
     match read_statement(
         store,
