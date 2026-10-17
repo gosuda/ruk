@@ -181,6 +181,12 @@ impl<'a> RecordBatchPreparer<'a> {
         Ok(head)
     }
 
+    fn is_pending_object(&self, oid: &Oid) -> bool {
+        self.prepared_objects
+            .iter()
+            .any(|prepared| prepared.oid() == *oid)
+    }
+
     /// Stages a commit object (Git commit or native conflict) through Store preparation.
     fn stage_commit_object(
         &self,
@@ -192,7 +198,7 @@ impl<'a> RecordBatchPreparer<'a> {
                 CoreError::new(ErrorCode::EInvalid, "exportable record missing git payload")
             })?;
             let delta_base = match predecessor {
-                Some(Head::Git { oid }) => Some(*oid),
+                Some(Head::Git { oid }) if !self.is_pending_object(oid) => Some(*oid),
                 _ => None,
             };
             let payload_len = u64::try_from(payload.len()).map_err(|_| {
@@ -477,5 +483,104 @@ impl<'a> Records<'a> {
             prepared_object,
             mutations: batch.mutations,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::bytes::ByteString;
+    use crate::change::ChangeId;
+    use crate::conflict::{Signature, TzOffset};
+    use crate::ids::HashKind;
+    use crate::merge::Merge;
+    use crate::records::Records;
+    use crate::store::PreparationBudget;
+
+    fn sample_signature(name: &str, stamp: i64) -> Signature {
+        Signature {
+            name: ByteString::from(name),
+            email: ByteString::from(format!("{name}@example.com")),
+            timestamp: stamp,
+            offset: TzOffset::new(false, 0).expect("canonical +0000 tz offset"),
+        }
+    }
+
+    fn sample_oid(kind: HashKind, seed: &[u8]) -> Oid {
+        kind.hash_git_object("blob", seed).expect("valid oid")
+    }
+
+    #[test]
+    fn test_batch_chained_native_commits_skip_pending_delta_base() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ruk-preparer-test-{}-{}-chained",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let store = Store::create(&root, HashKind::Sha1, budget).expect("create test store");
+
+        let change_id = ChangeId::generate();
+        let tree_1 = sample_oid(HashKind::Sha1, b"tree-chain-1");
+        let tree_2 = sample_oid(HashKind::Sha1, b"tree-chain-2");
+
+        let records = Records::new(&store);
+        let mut preparer = records.batch_preparer();
+
+        let input_1 = NativeCommitInput {
+            change_id,
+            tree: Merge::resolved(tree_1),
+            parents: Vec::new(),
+            predecessor: None,
+            author: sample_signature("Alice", 1700000000),
+            committer: sample_signature("Alice", 1700000000),
+            extra_headers: Vec::new(),
+            message: ByteString::from("First commit in chain"),
+            provenance: None,
+        };
+        let head_1 = preparer
+            .add_native_commit(input_1)
+            .expect("prepare first commit");
+
+        let input_2 = NativeCommitInput {
+            change_id,
+            tree: Merge::resolved(tree_2),
+            parents: vec![head_1],
+            predecessor: Some(head_1),
+            author: sample_signature("Alice", 1700000001),
+            committer: sample_signature("Alice", 1700000001),
+            extra_headers: Vec::new(),
+            message: ByteString::from("Second commit in chain"),
+            provenance: None,
+        };
+        let head_2 = preparer
+            .add_native_commit(input_2)
+            .expect("prepare second chained commit with pending predecessor");
+
+        let batch = preparer.finish().expect("finish batch");
+        store
+            .publish(batch.prepared_objects, &batch.mutations)
+            .expect("atomic publish");
+
+        let rec_1 = records
+            .get_commit(&head_1)
+            .expect("read commit 1")
+            .expect("commit 1 exists");
+        let rec_2 = records
+            .get_commit(&head_2)
+            .expect("read commit 2")
+            .expect("commit 2 exists");
+
+        assert_eq!(rec_1.change_id(), change_id);
+        assert_eq!(rec_2.change_id(), change_id);
+        assert_eq!(rec_2.parents(), &[head_1]);
+        assert_eq!(rec_2.predecessor(), Some(head_1));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
