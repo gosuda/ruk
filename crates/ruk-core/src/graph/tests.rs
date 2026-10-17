@@ -526,3 +526,217 @@ fn test_graph_installed_file_reopen() {
     let _ = std::fs::remove_file(&file_path);
     let _ = std::fs::remove_dir(&temp_dir);
 }
+
+/// Slice-5 acceptance measurement: object and row work on a large synthetic
+/// history and a large branch set. Run on demand; excluded from the suite
+/// because it builds 100k commits and writes a throwaway store.
+///
+/// `cargo test -p ruk-core --lib -- --ignored measure_object_and_row_work --nocapture`
+#[test]
+#[ignore = "measurement; run on demand"]
+fn measure_object_and_row_work() {
+    use std::time::Instant;
+
+    use crate::store::{FactMutation, FactPageBudget, FactTable, PreparationBudget, Store};
+
+    let kind = HashKind::Sha1;
+    let budget = Arc::new(ByteBudget::new(256 * 1024 * 1024));
+
+    fn seq_head(i: u32, kind: HashKind) -> Head {
+        let mut bytes = vec![0u8; kind.oid_len()];
+        bytes[..4].copy_from_slice(&i.to_be_bytes());
+        for (off, b) in bytes.iter_mut().enumerate().skip(4) {
+            *b = ((i as usize).wrapping_add(off * 53) % 256) as u8;
+        }
+        Head::Git { oid: Oid::from_bytes(&bytes).expect("oid") }
+    }
+
+    // --- history: 100k linear commits, one changed path each ---
+    const N: u32 = 100_000;
+    let t = Instant::now();
+    let mut builder = GraphIndexBuilder::new(GraphIndex::empty(kind));
+    let mut positions = Vec::with_capacity(N as usize);
+    let mut prev: Option<Head> = None;
+    for i in 0..N {
+        let parents: &[Head] = prev.as_slice();
+        let pos = builder
+            .add_commit(
+                seq_head(i, kind),
+                make_change_id((i % 251) as u8),
+                parents,
+                vec![format!("src/mod_{}.rs", i % 4096).into_bytes()],
+            )
+            .expect("add");
+        positions.push(pos);
+        prev = Some(seq_head(i, kind));
+    }
+    let index = builder.finish(&budget).expect("index");
+    println!("MEASURE index_build commits={N} ms={}", t.elapsed().as_millis());
+    assert_eq!(index.num_total_commits(), N);
+
+    // --- full-depth ancestor walk from the tip ---
+    let t = Instant::now();
+    let mut stepper = AncestorStepper::new(&index, &[*positions.last().expect("tip")], None).expect("stepper");
+    let mut walked = 0usize;
+    loop {
+        let page = stepper
+            .step_batch(&index, 1000, &|| false, usize::MAX)
+            .expect("walk");
+        if page.positions.is_empty() {
+            break;
+        }
+        walked += page.positions.len();
+    }
+    println!("MEASURE ancestor_walk depth={N} visited={walked} ms={}", t.elapsed().as_millis());
+    assert_eq!(walked, N as usize);
+
+    // --- ancestry probes: 1k distant pairs (generation short-circuit) ---
+    let t = Instant::now();
+    let mut proven = 0usize;
+    for i in 0..1000u32 {
+        let a = positions[i as usize];
+        let d = positions[(N - 1 - i) as usize];
+        if is_ancestor(&index, a, d, None, &|| false, usize::MAX).expect("probe")
+            == ShallowAncestry::ProvenYes
+        {
+            proven += 1;
+        }
+    }
+    println!("MEASURE ancestor_probe pairs=1000 proven={proven} us={}", t.elapsed().as_micros());
+    assert_eq!(proven, 1000);
+
+    // --- prefix resolution over 100k heads ---
+    let tip = seq_head(N - 1, kind);
+    let t = Instant::now();
+    let mut misses = 0usize;
+    for i in 0..1000u32 {
+        let h = seq_head(i * 97, kind);
+        let oid_hex = match &h {
+            Head::Git { oid } => oid.to_hex(),
+            Head::Conflicted { .. } => unreachable!(),
+        };
+        if index.resolve_head_prefix(&oid_hex[..12]).is_err() {
+            misses += 1;
+        }
+    }
+    println!("MEASURE head_prefix hits=1000 misses={misses} us={}", t.elapsed().as_micros());
+    assert_eq!(misses, 0);
+
+    // --- changed-path Bloom: 10k checks against one dense filter ---
+    let paths: Vec<&[u8]> = (0..4096u32)
+        .map(|i| format!("src/mod_{}.rs", i).into_bytes())
+        .collect::<Vec<_>>()
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
+    let owned: Vec<Vec<u8>> = (0..4096u32)
+        .map(|i| format!("src/mod_{}.rs", i).into_bytes())
+        .collect();
+    let paths: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+    let filter = build_bloom_filter(&paths);
+    let t = Instant::now();
+    let mut hits = 0usize;
+    for i in 0..10_000u32 {
+        let probe = format!("src/mod_{}.rs", i % 8192);
+        if check_bloom_filter(&filter, probe.as_bytes()) != BloomMatch::DefinitelyNo {
+            hits += 1;
+        }
+    }
+    println!(
+        "MEASURE bloom_check paths={} probes=10000 hits={hits} us={}",
+        paths.len(),
+        t.elapsed().as_micros()
+    );
+
+    // --- store row work: publish then page a 10k-ref fact set ---
+    let dir = std::env::temp_dir().join(format!("ruk-measure-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("measure dir");
+    let store = Store::create(
+        &dir.join("store"),
+        kind,
+        Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .expect("create store");
+
+    let t = Instant::now();
+    let mut facts = Vec::with_capacity(10_000);
+    for i in 0..10_000u32 {
+        facts.push(FactMutation {
+            table: FactTable::Refs,
+            key: format!("refs/heads/branch-{i:06}").into_bytes(),
+            expected: crate::store::FactExpectation::Absent,
+            value: Some(b"target".to_vec()),
+        });
+    }
+    store.publish(Vec::new(), &facts).expect("publish refs");
+    println!("MEASURE ref_publish rows=10000 ms={}", t.elapsed().as_millis());
+
+    let base = store.io_stats();
+    let t = Instant::now();
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut rows = 0usize;
+    let budget_rows = FactPageBudget::new(1000, 1024 * 1024);
+    loop {
+        let page = store
+            .fact_page(FactTable::Refs, cursor.as_deref(), budget_rows)
+            .expect("page");
+        rows += page.rows.len();
+        cursor = page.rows.last().map(|row| row.key.clone());
+        if !page.more {
+            break;
+        }
+    }
+    let stats = store.io_stats();
+    println!(
+        "MEASURE ref_scan rows={rows} lookups={} pages={} rows_read={} ms={}",
+        stats.fact_lookups - base.fact_lookups,
+        stats.fact_page_calls - base.fact_page_calls,
+        stats.fact_rows - base.fact_rows,
+        t.elapsed().as_millis()
+    );
+    assert_eq!(rows, 10_000);
+    assert_eq!(stats.fact_rows - base.fact_rows, 10_000);
+
+    // --- object work: 1000 blobs prepare+publish, read back ---
+    let t = Instant::now();
+    let mut prepared = Vec::with_capacity(1000);
+    for i in 0..1000u32 {
+        let body = format!("blob-body-{i}").into_bytes();
+        prepared.push(
+            store
+                .prepare(
+                    crate::store::ObjectKind::Blob,
+                    body.len() as u64,
+                    body.as_slice(),
+                    None,
+                )
+                .expect("prepare"),
+        );
+    }
+    store.publish(prepared, &[]).expect("publish blobs");
+    println!("MEASURE blob_publish objects=1000 ms={}", t.elapsed().as_millis());
+
+    let base = store.io_stats();
+    let t = Instant::now();
+    for i in 0..1000u32 {
+        let expected = format!("blob-body-{i}").into_bytes();
+        let oid = kind
+            .hash_git_object("blob", &expected)
+            .expect("hash");
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut store.read(oid).expect("read").bytes, &mut got)
+            .expect("drain");
+        assert_eq!(got, expected);
+    }
+    let stats = store.io_stats();
+    println!(
+        "MEASURE blob_read objects=1000 decoded_bytes={} reads={} ms={}",
+        stats.object_decoded_bytes - base.object_decoded_bytes,
+        stats.object_reads - base.object_reads,
+        t.elapsed().as_millis()
+    );
+    assert_eq!(stats.object_reads - base.object_reads, 1000);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
