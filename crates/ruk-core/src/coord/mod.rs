@@ -8,6 +8,8 @@ mod clock;
 mod connection;
 mod endpoint;
 mod handshake;
+mod hosted;
+pub use hosted::*;
 mod land;
 mod lane;
 mod leases;

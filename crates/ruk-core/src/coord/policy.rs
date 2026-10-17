@@ -211,7 +211,7 @@ fn lowercase_hex_authority(text: &str) -> std::borrow::Cow<'_, str> {
 /// A Windows security identifier in canonical string form. Constructed only
 /// through [`Principal`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Sid(String);
+pub struct Sid(String);
 
 impl Sid {
     /// The canonical `S-1-...` spelling.
@@ -257,7 +257,7 @@ impl Sid {
 /// principal.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub(crate) enum Principal {
+pub enum Principal {
     /// A Unix user, by numeric uid.
     Unix(u32),
     /// A Windows user, by SID.
@@ -268,7 +268,7 @@ impl Principal {
     /// The peer uid read from kernel credentials by the Unix endpoint (and
     /// the process's own uid for the owner).
     #[must_use]
-    pub(crate) const fn from_peer_uid(uid: u32) -> Self {
+    pub const fn from_peer_uid(uid: u32) -> Self {
         Self::Unix(uid)
     }
 
@@ -277,7 +277,7 @@ impl Principal {
     ///
     /// # Errors
     /// `E_INVALID` for text outside the SID grammar in the module docs.
-    pub(crate) fn from_verified_sid(sid: &str) -> Result<Self, CoreError> {
+    pub fn from_verified_sid(sid: &str) -> Result<Self, CoreError> {
         if sid.len() > MAX_PRINCIPAL_BYTES - WINDOWS_PREFIX.len() {
             return Err(invalid(format!("malformed SID {}", shown(sid))));
         }
@@ -289,7 +289,7 @@ impl Principal {
     ///
     /// # Errors
     /// `E_INVALID` for anything but the exact canonical spelling.
-    pub(crate) fn parse(text: &str) -> Result<Self, CoreError> {
+    pub fn parse(text: &str) -> Result<Self, CoreError> {
         let malformed = || {
             invalid(format!(
                 "a principal is `unix:<uid>` or `windows:<SID>` in canonical form, got {}",

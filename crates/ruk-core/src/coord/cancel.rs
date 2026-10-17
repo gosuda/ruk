@@ -21,7 +21,7 @@ use crate::error::{CoreError, ErrorCode};
 /// on owner disconnect or abnormal termination. This handle cannot be cloned.
 #[must_use = "dropping a CancelHandle cancels the operation"]
 #[derive(Debug)]
-pub(crate) struct CancelHandle {
+pub struct CancelHandle {
     sender: watch::Sender<bool>,
 }
 
@@ -31,13 +31,13 @@ pub(crate) struct CancelHandle {
 /// cancelled, the token remains permanently cancelled. Cloned instances share
 /// the same underlying channel state.
 #[derive(Clone, Debug)]
-pub(crate) struct Cancel {
+pub struct Cancel {
     receiver: watch::Receiver<bool>,
 }
 
 /// Creates a new cancellation pair starting in the uncancelled state.
 #[must_use]
-pub(crate) fn cancellation() -> (CancelHandle, Cancel) {
+pub fn cancellation() -> (CancelHandle, Cancel) {
     let (sender, receiver) = watch::channel(false);
     (CancelHandle { sender }, Cancel { receiver })
 }
@@ -46,7 +46,7 @@ impl CancelHandle {
     /// Explicitly cancels the channel, notifying all current and future observers.
     ///
     /// This operation is level-triggered, irreversible, and idempotent.
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         let _ = self.sender.send_if_modified(|cancelled| {
             if *cancelled {
                 return false;
@@ -69,7 +69,7 @@ impl Cancel {
     }
 
     /// Returns `Ok(())` if uncancelled, or [`ErrorCode::ECancelled`] once cancelled.
-    pub(crate) fn check(&self) -> Result<(), CoreError> {
+    pub fn check(&self) -> Result<(), CoreError> {
         if self.is_cancelled() {
             return Err(CoreError::new(ErrorCode::ECancelled, "operation cancelled"));
         }
