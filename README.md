@@ -143,6 +143,10 @@ cat conflict.json | cargo run -p ruk --locked -- encode-conflict --object-format
 
 The store preserves exact object bytes for both SHA-1 and SHA-256. Native conflicts remain distinct from Git objects. Resource reservations bound preparation and release with the prepared objects.
 
+Each store has a persistent `StoreId`, available through `Store::store_id()`. Reopening or moving the store preserves that identity. Creating an independent store generates a new identity. The identity is not an authorization token.
+
+The `format` file has exactly three LF-terminated lines: `ruk-store 1`, `object-format sha1` (or `sha256`), and `store-id <uuid>`. The UUID must be non-nil and use lowercase hyphenated form. Ruk rejects the earlier two-line marker with `E_VERSION` before opening metadata or starting recovery. It does not modify or automatically migrate the rejected store.
+
 On POSIX, initialization synchronizes the existing ancestor chain before creating missing directories. On Windows, you must provide an already durable parent and an absent store root; merely creating the parent directory is not enough. Ruk publishes the owned root exclusively and refuses to adopt an existing or interrupted layout. Opening a store flushes its validated format marker before recovery. A reported filesystem flush failure may require operator storage recovery; reopening alone does not repair failed writeback.
 
 ## I/O and Framing Rules

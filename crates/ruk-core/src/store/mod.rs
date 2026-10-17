@@ -67,6 +67,7 @@ pub use types::{
     Publication, ReadObject, SegmentManifest, StoreFormat,
 };
 
+use crate::change::StoreId;
 use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
 use metadata::{Metadata, PublicationTxn};
@@ -79,7 +80,7 @@ pub(crate) const MAX_DELTA_DEPTH: u8 = 50;
 const FORMAT_FILE: &str = "format";
 const META_FILE: &str = "meta.redb";
 const SEGMENTS_DIR: &str = "segments";
-/// The format file is two short lines; anything longer is foreign.
+/// The format file is three short lines; anything longer is foreign.
 const MAX_FORMAT_BYTES: u64 = 128;
 
 /// A durable object store rooted at a `.ruk/store` directory.
@@ -89,7 +90,7 @@ const MAX_FORMAT_BYTES: u64 = 128;
 /// Reads release every metadata transaction before payload I/O.
 pub struct Store {
     root: PathBuf,
-    kind: HashKind,
+    format: StoreFormat,
     meta: Metadata,
     budget: Arc<PreparationBudget>,
     writer: Mutex<WriterState>,
@@ -138,7 +139,7 @@ impl core::fmt::Debug for Store {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Store")
             .field("root", &self.root)
-            .field("kind", &self.kind)
+            .field("kind", &self.format.kind)
             .field("quarantined", &self.quarantined.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
@@ -157,9 +158,13 @@ impl Store {
     /// `segments`, `meta.redb` and its first commit) has returned before the
     /// first format byte is written, and the format is flushed before this
     /// call returns. A valid format proves that the earlier publications
-    /// completed. An opener flushes that format before recovery. An absent
-    /// or incomplete format prevents opening; creation never adopts or
-    /// deletes an incomplete store.
+    /// completed. An opener flushes that format before recovery. An absent,
+    /// incomplete, or rejected format prevents opening; creation never
+    /// adopts or deletes an incomplete store.
+    ///
+    /// The store identity is fixed once, before any filesystem change, and
+    /// recorded in the format file: reopening or moving the same store keeps
+    /// it, and every new store has a distinct identity.
     ///
     /// # Platforms
     /// POSIX creates `root` and any missing ancestors, flushing the existing
@@ -193,6 +198,10 @@ impl Store {
         kind: HashKind,
         budget: Arc<PreparationBudget>,
     ) -> Result<Self, StoreError> {
+        let format = StoreFormat {
+            kind,
+            id: StoreId::generate(),
+        };
         let root = std::path::absolute(root)?;
         let root = root.as_path();
         create_root(root)?;
@@ -206,13 +215,13 @@ impl Store {
         sync_entries(root)?;
 
         let mut format_file = durability::create_file_published(&root.join(FORMAT_FILE))?;
-        format_file.write_all(&StoreFormat { kind }.to_bytes())?;
+        format_file.write_all(&format.to_bytes())?;
         durability::sync_file(&format_file)?;
         sync_entries(root)?;
 
         Ok(Self::assemble(
             root,
-            kind,
+            format,
             meta,
             budget,
             Recovered {
@@ -245,7 +254,8 @@ impl Store {
     /// # Errors
     /// [`StoreError::NotFound`] without a format file;
     /// [`StoreError::Version`] for an unknown format, including an empty or
-    /// partly written one left by an interrupted creation;
+    /// partly written one left by an interrupted creation and the rejected
+    /// earlier two-line marker;
     /// [`StoreError::Corrupt`] for committed damage; I/O and database
     /// failures propagate, including a `root` that cannot be made absolute.
     pub fn open(root: &Path, budget: Arc<PreparationBudget>) -> Result<Self, StoreError> {
@@ -275,19 +285,19 @@ impl Store {
                 return Err(err);
             }
         };
-        Ok(Self::assemble(root, format.kind, meta, budget, recovered))
+        Ok(Self::assemble(root, format, meta, budget, recovered))
     }
 
     fn assemble(
         root: &Path,
-        kind: HashKind,
+        format: StoreFormat,
         meta: Metadata,
         budget: Arc<PreparationBudget>,
         recovered: Recovered,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
-            kind,
+            format,
             meta,
             budget,
             writer: Mutex::new(WriterState {
@@ -304,7 +314,14 @@ impl Store {
     /// The fixed hash kind of this store.
     #[must_use]
     pub fn hash_kind(&self) -> HashKind {
-        self.kind
+        self.format.kind
+    }
+
+    /// The immutable identity of this store, fixed by the format file at
+    /// creation and preserved by reopen and rename.
+    #[must_use]
+    pub fn store_id(&self) -> StoreId {
+        self.format.id
     }
 
     /// Whether committed corruption latched quarantine in this session.
@@ -322,7 +339,7 @@ impl Store {
     fn committed(&self) -> Committed<'_> {
         Committed {
             root: &self.root,
-            kind: self.kind,
+            kind: self.format.kind,
             meta: &self.meta,
             budget: &self.budget,
         }
@@ -388,7 +405,7 @@ impl Store {
             None => None,
         };
         prepare::prepare_object(
-            self.kind,
+            self.format.kind,
             kind,
             decoded_len,
             input,
@@ -524,10 +541,10 @@ impl Store {
     /// hash width, or encoding, base and depth that disagree.
     fn check_prepared(&self, object: &PreparedObject) -> Result<(), StoreError> {
         let oid = object.oid();
-        if oid.kind() != self.kind {
+        if oid.kind() != self.format.kind {
             return Err(StoreError::ObjectFormat(format!(
                 "prepared object {oid} is not a {} digest",
-                self.kind
+                self.format.kind
             )));
         }
         let (delta, base) = (object.encoding() == Encoding::Delta, object.base());
@@ -539,10 +556,10 @@ impl Store {
             }
             return Ok(());
         };
-        if base.kind() != self.kind {
+        if base.kind() != self.format.kind {
             return Err(StoreError::ObjectFormat(format!(
                 "delta base {base} of {oid} is not a {} digest",
-                self.kind
+                self.format.kind
             )));
         }
         if object.depth() == 0 || object.depth() > MAX_DELTA_DEPTH {
@@ -1117,7 +1134,7 @@ mod tests {
         };
         damage(&meta_file(temp));
         let meta = Metadata::open(&meta_file(temp)).expect("metadata census");
-        Store::assemble(&root, format.kind, meta, shared, recovered)
+        Store::assemble(&root, format, meta, shared, recovered)
     }
 
     /// A refusal is typed corruption from a call whose ordinary execution
@@ -1166,6 +1183,8 @@ mod tests {
         for kind in [HashKind::Sha1, HashKind::Sha256] {
             let temp = TempRoot::new("roundtrip");
             let store = create(&temp, kind);
+            let identity = store.store_id();
+            assert_ne!(identity, StoreId::nil(), "creation fixes a real identity");
             let payload = pseudo(5000, 1);
             let prepared = blob(&store, &payload);
             let oid = prepared.oid();
@@ -1183,6 +1202,7 @@ mod tests {
 
             let store = reopen(&temp);
             assert_eq!(store.hash_kind(), kind);
+            assert_eq!(store.store_id(), identity, "reopen keeps the identity");
             assert_eq!(read_all(&store, oid), payload);
             assert_eq!(
                 store
@@ -1191,6 +1211,34 @@ mod tests {
                 Some(oid.as_bytes().to_vec())
             );
         }
+    }
+
+    /// Renaming a store directory changes no identity: reopening the moved
+    /// store reports the identity fixed at creation, for both kinds.
+    #[test]
+    fn renaming_a_store_keeps_its_identity_for_both_hash_kinds() {
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let temp = TempRoot::new("identity-rename");
+            let identity = create(&temp, kind).store_id();
+            let moved = temp.0.join("moved-store");
+            std::fs::rename(temp.store_dir(), &moved).expect("rename the store directory");
+            let store = Store::open(&moved, budget()).expect("open the renamed store");
+            assert_eq!(store.store_id(), identity, "{kind:?}: rename");
+            assert_eq!(store.hash_kind(), kind);
+        }
+    }
+
+    /// Independently created stores have distinct identities, across both
+    /// object formats.
+    #[test]
+    fn independently_created_stores_have_distinct_identities() {
+        let first = TempRoot::new("distinct-a");
+        let second = TempRoot::new("distinct-b");
+        let sha1 = create(&first, HashKind::Sha1).store_id();
+        let sha256 = create(&second, HashKind::Sha256).store_id();
+        assert_ne!(sha1, StoreId::nil());
+        assert_ne!(sha256, StoreId::nil());
+        assert_ne!(sha1, sha256);
     }
 
     #[test]
@@ -1255,28 +1303,64 @@ mod tests {
 
             // The one store that came out is whole and serves.
             let store = reopen(&temp);
+            let winner = store.store_id();
             let payload = pseudo(2000, 61);
             let oid = store
                 .publish(vec![blob(&store, &payload)], &[])
                 .expect("the winner's store publishes")
                 .objects[0];
             drop(store);
-            assert_eq!(read_all(&reopen(&temp), oid), payload, "round {round}");
+            let store = reopen(&temp);
+            assert_eq!(store.store_id(), winner, "round {round}");
+            assert_eq!(read_all(&store, oid), payload, "round {round}");
         }
     }
 
     /// A creation that stopped before the format was complete is neither
     /// opened nor completed by a later call, and its files are untouched.
+    /// Every rejected marker shape, including the earlier two-line marker,
+    /// leaves the marker and the metadata bytes unchanged.
     #[test]
     fn an_incomplete_format_is_neither_opened_nor_adopted() {
+        let identity = StoreId::generate();
         let canonical = StoreFormat {
             kind: HashKind::Sha1,
+            id: identity,
         }
         .to_bytes();
-        let torn: [(&str, Vec<u8>); 3] = [
+        let canonical_text = String::from_utf8(canonical.clone()).expect("marker is UTF-8");
+        let mut with_extra = canonical.clone();
+        with_extra.extend_from_slice(b"extra fourth line\n");
+        let upper = identity.to_string().to_ascii_uppercase();
+        let torn: [(&str, Vec<u8>); 9] = [
             ("empty", Vec::new()),
             ("prefix", canonical[..canonical.len() / 2].to_vec()),
             ("zeros", vec![0; canonical.len()]),
+            (
+                "earlier two-line marker",
+                b"ruk-store 1\nobject-format sha1\n".to_vec(),
+            ),
+            (
+                "nil identity",
+                format!(
+                    "ruk-store 1\nobject-format sha1\nstore-id {}\n",
+                    StoreId::nil()
+                )
+                .into_bytes(),
+            ),
+            (
+                "carriage return",
+                canonical_text.replace('\n', "\r\n").into_bytes(),
+            ),
+            (
+                "missing final newline",
+                canonical[..canonical.len() - 1].to_vec(),
+            ),
+            (
+                "uppercase identity",
+                format!("ruk-store 1\nobject-format sha1\nstore-id {upper}\n").into_bytes(),
+            ),
+            ("extra line", with_extra),
         ];
         for (name, bytes) in torn {
             let temp = TempRoot::new("incomplete-format");

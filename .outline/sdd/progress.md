@@ -12,7 +12,7 @@ The user authorized verified phase commits and normal branch-only pushes to `htt
 ## Ordered slices
 
 - [x] 1. Workspace and model [Tony Hoare, David Parnas]
-- [ ] 2. Durable store [Tony Hoare, John Carmack]
+- [x] 2. Durable store [Tony Hoare, John Carmack]
 - [ ] 3. Coordinator and leases [Tony Hoare, Edsger W. Dijkstra]
 - [ ] 4. Native workspaces [Tony Hoare, John Carmack]
 - [ ] 5. Graph and refs [Claude Shannon, John Carmack]
@@ -45,7 +45,7 @@ The frozen inventory contains 80 files and 138 exact declaration anchors. Parent
 ## Slice two storage checkpoint
 Anchor: Tony Hoare, Richard Feynman
 
-Commit `dd0127a` adds the durable object and fact store. Commit `7b290f1` adds the bounded Forgejo initialization inventory revision. The JSON-policy migration passed its product gates and runtime checks. Its publication remains pending. The requested schema and store-format replacement still requires explicit approval of the breaking boundaries, so slice two is not complete.
+Commit `dd0127a` adds the durable object and fact store. Commit `7b290f1` adds the bounded Forgejo initialization inventory revision. Commit `1970e84` contains the verified JSON-policy migration and is published on main. The user approved the exact schema and store-format replacements through a direct do-it-now instruction. Both replacements are implemented and verified below.
 
 Parent verification passed: formatting, strict Clippy, all 449 nextest tests, cargo test, workspace build, and the external public-API consumer for both hash kinds. The consumer verified exact object bytes, conditional publication, resource admission, concurrent reads and writes, and reopen cycles. Publication and recovery crash tests passed, including real segment-sealing boundaries.
 
@@ -56,10 +56,23 @@ Fresh bounded reviews found no remaining actionable storage defect. Full evidenc
 ## JSON migration verification
 Anchor: Tony Hoare, Richard Feynman
 
-Authored JSON paths use `sonic-rs`; `schemars` retains its transitive JSON dependency. Public value APIs use `sonic_rs::Value`. `SchemaDocument` keeps arbitrary JSON roots, portable Serde replay, and postcard JSON text. Parsing normalizes negative zero. Ruk's JSON entry points reject nesting above 128 containers and add parser stack space when needed.
+The evidence in this section applies to commit `1970e84`, before the approved schema replacement. Authored JSON paths use `sonic-rs`; `schemars` retains its transitive JSON dependency. That commit used `SchemaDocument` for arbitrary JSON roots, Serde replay, and postcard JSON text. The current replacement removes that type. Parsing normalizes negative zero. Ruk's JSON entry points reject nesting above 128 containers and add parser stack space when needed.
 
 Formatting, strict Clippy, all 456 nextest tests, cargo test, and workspace build passed on Linux. Three skipped tests are subprocess dispatchers exercised by their parent tests. Both original stack-overflow regressions now pass without enlarged test stacks. Windows cross-compilation passed after the stack repair; Windows and macOS runtime behavior remains unverified.
 
 The rebuilt CLI matched the saved model and conflict bytes for both hash kinds. It accepted depth 128 and rejected depths 129 and 1000000. An external consumer passed in debug and release builds on a standard worker thread, including arbitrary roots, buffered Serde replay, numeric boundaries, binary round trips, and deep-input rejection. Separate probes passed all 66 operation/shape/stack combinations on requested 1 MiB and 2 MiB workers. Shallow stack samples support in-place parsing; deep samples demonstrate stack switching.
 
 Supply-chain checks passed. Cargo audit reported no vulnerabilities or advisory warnings. Cargo deny passed advisories, bans, licenses, and sources, with disclosed duplicate-version and unused-policy warnings. Fresh bounded source review found no actionable defect. Full evidence: `local://ruk-json-migration-gate.md`.
+
+## Schema and persistent store identity replacement
+Anchor: Tony Hoare, Richard Feynman
+
+Schema replies now use `schemars::Schema` and JSON frames. Only object and boolean roots are accepted. Request and non-schema receipt binary encodings remain unchanged. The model stays at v1. Its semantic changes are limited to the schema document definition and reference. Both hash-kind conflict outputs match the saved bytes.
+
+The v1 store marker now carries a persistent non-nil `StoreId`. Reopening, relocation, and a byte-copy backup retain that identity. Independent creation generates a new identity. Old two-line markers fail with `E_VERSION` before metadata opens. No store was migrated or deleted.
+
+Parent verification passed: formatting, strict Clippy, all 466 nextest tests, cargo test, and workspace build. Three skipped tests are subprocess dispatchers exercised by parent tests. Windows cross-compilation passed; Windows and macOS runtime behavior remains unverified.
+
+A separate consumer passed all 11 schema checks on an ordinary worker thread with `RUST_MIN_STACK` unset. It exercised every method schema, buffered Serde replay, numeric boundaries, duplicate keys, depth 128 operations, depth 129 refusal, and retained non-schema postcard paths. All seven store checks passed. They covered both hash kinds, byte oracles, stable identities, six competing creators, 44 malformed markers, 156 strict prefixes, and rejection without changing marker or metadata bytes.
+
+The first consumer run incorrectly classified the other supported hash kind as malformed. The parent removed that invalid oracle and reran store checks. No product code changed to satisfy it. Fresh bounded source reviews found no remaining actionable defect. Evidence: `local://ruk-breaking-gate-evidence.md`. Later product slices and all capacity claims remain unverified.

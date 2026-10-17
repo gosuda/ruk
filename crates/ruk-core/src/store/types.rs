@@ -16,6 +16,7 @@
 //! - [`FactTable`] enumerates every approved mutable fact table except the
 //!   publication-owned objects/segments/generation tables.
 
+use crate::change::StoreId;
 use crate::ids::{HashKind, Oid};
 use crate::store::spool::Spool;
 use serde::de::{self, Deserialize, Deserializer};
@@ -350,20 +351,39 @@ pub struct FactMutation {
     pub value: Option<Vec<u8>>,
 }
 
-/// The store format record.
+/// The store format record: the object format and the store's immutable
+/// identity. One copy lives in [`crate::store::Store`]; there is no legacy
+/// reader and no implicit upgrade: only this canonical three-line v1 marker
+/// is accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreFormat {
     pub kind: HashKind,
+    pub id: StoreId,
 }
 
 impl StoreFormat {
-    /// Exact format-file bytes: `ruk-store 1\nobject-format <kind>\n`.
+    /// Exact format-file bytes:
+    /// `ruk-store 1\nobject-format <kind>\nstore-id <id>\n`.
+    ///
+    /// The identity renders in its canonical lowercase hyphenated form.
+    ///
+    /// # Preconditions
+    /// The caller supplies a non-nil identity: [`StoreFormat::from_bytes`]
+    /// and [`crate::store::Store::create`] enforce that at their
+    /// boundaries, while this method renders the value it is given.
     #[must_use]
     pub fn to_bytes(self) -> Vec<u8> {
-        format!("ruk-store 1\nobject-format {}\n", self.kind.format_name()).into_bytes()
+        format!(
+            "ruk-store 1\nobject-format {}\nstore-id {}\n",
+            self.kind.format_name(),
+            self.id
+        )
+        .into_bytes()
     }
 
-    /// Parses exact format-file bytes. Only the canonical spelling.
+    /// Parses exact format-file bytes. Only the canonical three-line v1
+    /// spelling with a non-nil canonical store identity is accepted. The
+    /// earlier two-line v1 marker is rejected, never upgraded.
     ///
     /// # Errors
     /// [`crate::store::StoreError::Version`] on any other content.
@@ -374,12 +394,28 @@ impl StoreFormat {
     }
 }
 
-/// Parses the two canonical lines; rejects trailing content.
+/// Parses the three exact LF-terminated lines, rejecting every other shape:
+/// a non-UTF-8 precheck runs in [`StoreFormat::from_bytes`], then any CR
+/// byte, a missing final newline, a wrong store line, unknown kind, a
+/// missing or malformed store identity, and any extra line.
 fn parse_format_text(text: &str) -> Result<StoreFormat, crate::store::StoreError> {
-    let mut lines = text.lines();
-    let store_line = lines
-        .next()
-        .ok_or_else(|| crate::store::StoreError::Version("empty format file".into()))?;
+    if text.is_empty() {
+        return Err(crate::store::StoreError::Version(
+            "empty format file".into(),
+        ));
+    }
+    if text.contains('\r') {
+        return Err(crate::store::StoreError::Version(
+            "format file contains a carriage return".into(),
+        ));
+    }
+    let Some(body) = text.strip_suffix('\n') else {
+        return Err(crate::store::StoreError::Version(
+            "format file does not end with a newline".into(),
+        ));
+    };
+    let mut lines = body.split('\n');
+    let store_line = lines.next().unwrap_or_default();
     if store_line != "ruk-store 1" {
         return Err(crate::store::StoreError::Version(format!(
             "unsupported store line: {store_line}"
@@ -394,10 +430,175 @@ fn parse_format_text(text: &str) -> Result<StoreFormat, crate::store::StoreError
     let kind: HashKind = kind_text
         .parse()
         .map_err(|_| crate::store::StoreError::Version(format!("unknown kind {kind_text}")))?;
+    let id_line = lines
+        .next()
+        .ok_or_else(|| crate::store::StoreError::Version("missing store-id line".into()))?;
+    let id_text = id_line.strip_prefix("store-id ").ok_or_else(|| {
+        crate::store::StoreError::Version(format!("bad store-id line: {id_line}"))
+    })?;
+    let id = parse_store_identity(id_text)?;
     if lines.next().is_some() {
         return Err(crate::store::StoreError::Version(
             "trailing content in format file".into(),
         ));
     }
-    Ok(StoreFormat { kind })
+    Ok(StoreFormat { kind, id })
+}
+
+/// Parses one store identity: the canonical [`StoreId`] spelling only, and
+/// never the nil identity. [`StoreId`]'s `FromStr` accepts only the exact
+/// 36-character lowercase hyphenated form, so a successful parse is already
+/// canonical.
+fn parse_store_identity(text: &str) -> Result<StoreId, crate::store::StoreError> {
+    let id: StoreId = text
+        .parse()
+        .map_err(|_| crate::store::StoreError::Version(format!("malformed store id: {text}")))?;
+    if id == StoreId::nil() {
+        return Err(crate::store::StoreError::Version("nil store id".into()));
+    }
+    Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::StoreError;
+
+    /// A fixed canonical identity for pure parser fixtures.
+    fn fixed_id() -> StoreId {
+        StoreId::from_bytes([
+            0x2f, 0x9c, 0x32, 0x11, 0xa4, 0x5b, 0x4c, 0x7d, 0x9e, 0x01, 0x55, 0xaa, 0x0b, 0x33,
+            0xcc, 0xdd,
+        ])
+    }
+
+    fn marker(kind: HashKind) -> Vec<u8> {
+        StoreFormat {
+            kind,
+            id: fixed_id(),
+        }
+        .to_bytes()
+    }
+
+    fn assert_version(what: &str, bytes: &[u8]) {
+        match StoreFormat::from_bytes(bytes) {
+            Err(StoreError::Version(_)) => {}
+            other => panic!("{what}: expected a Version refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writes_and_parses_the_exact_three_line_marker() {
+        let sha1 = StoreFormat {
+            kind: HashKind::Sha1,
+            id: fixed_id(),
+        };
+        assert_eq!(
+            sha1.to_bytes(),
+            b"ruk-store 1\nobject-format sha1\nstore-id 2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd\n"
+        );
+        assert_eq!(
+            StoreFormat::from_bytes(&sha1.to_bytes()).expect("sha1"),
+            sha1
+        );
+        let sha256 = StoreFormat {
+            kind: HashKind::Sha256,
+            id: fixed_id(),
+        };
+        assert_eq!(
+            sha256.to_bytes(),
+            b"ruk-store 1\nobject-format sha256\nstore-id 2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd\n"
+        );
+        assert_eq!(
+            StoreFormat::from_bytes(&sha256.to_bytes()).expect("sha256"),
+            sha256
+        );
+    }
+
+    #[test]
+    fn rejects_the_earlier_two_line_marker() {
+        assert_version("two-line sha1", b"ruk-store 1\nobject-format sha1\n");
+        assert_version("two-line sha256", b"ruk-store 1\nobject-format sha256\n");
+    }
+
+    #[test]
+    fn rejects_missing_and_mistyped_lines() {
+        assert_version("empty", b"");
+        assert_version(
+            "wrong store line",
+            b"ruk-store 2\nobject-format sha1\nstore-id 2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd\n",
+        );
+        assert_version(
+            "unknown kind",
+            b"ruk-store 1\nobject-format md5\nstore-id 2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd\n",
+        );
+        assert_version(
+            "kind with extra words",
+            b"ruk-store 1\nobject-format sha1 extra\nstore-id 2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd\n",
+        );
+        assert_version("no store-id line", b"ruk-store 1\nobject-format sha1");
+        assert_version("bare prefix", b"ruk-store");
+    }
+
+    #[test]
+    fn rejects_carriage_returns_and_a_missing_final_newline() {
+        assert_version(
+            "CRLF endings",
+            b"ruk-store 1\r\nobject-format sha1\r\nstore-id 2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd\r\n",
+        );
+        let mut with_cr = marker(HashKind::Sha1);
+        with_cr.push(b'\r');
+        assert_version("lone CR after the marker", &with_cr);
+        let full = marker(HashKind::Sha1);
+        assert_version("missing final newline", &full[..full.len() - 1]);
+    }
+
+    #[test]
+    fn rejects_extra_lines_and_trailing_content() {
+        let mut extra = marker(HashKind::Sha1);
+        extra.extend_from_slice(b"extra fourth line\n");
+        assert_version("a fourth line", &extra);
+        let mut blank = marker(HashKind::Sha1);
+        blank.push(b'\n');
+        assert_version("a trailing blank line", &blank);
+    }
+
+    #[test]
+    fn rejects_nil_and_noncanonical_identities() {
+        let nil =
+            b"ruk-store 1\nobject-format sha1\nstore-id 00000000-0000-0000-0000-000000000000\n";
+        assert_version("nil identity", nil);
+        assert_version(
+            "uppercase identity",
+            b"ruk-store 1\nobject-format sha1\nstore-id 2F9C3211-A45B-4C7D-9E01-55AA0B33CCDD\n",
+        );
+        assert_version(
+            "unhyphenated identity",
+            b"ruk-store 1\nobject-format sha1\nstore-id 2f9c3211a45b4c7d9e0155aa0b33ccdd\n",
+        );
+        assert_version(
+            "braced identity",
+            b"ruk-store 1\nobject-format sha1\nstore-id {2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd}\n",
+        );
+        assert_version(
+            "empty identity",
+            b"ruk-store 1\nobject-format sha1\nstore-id \n",
+        );
+        assert_version(
+            "truncated identity",
+            b"ruk-store 1\nobject-format sha1\nstore-id 2f9c3211-a45b\n",
+        );
+        assert_version(
+            "identity with extra words",
+            b"ruk-store 1\nobject-format sha1\nstore-id 2f9c3211-a45b-4c7d-9e01-55aa0b33ccdd extra\n",
+        );
+    }
+
+    #[test]
+    fn rejects_non_utf8_and_foreign_content() {
+        let mut bad = marker(HashKind::Sha1);
+        bad[3] = 0xFF;
+        assert_version("non-UTF-8 byte", &bad);
+        assert_version("foreign content", b"not a store marker\n");
+    }
 }
