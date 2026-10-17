@@ -17,19 +17,28 @@
 /// attestation text field are limited by it and by nothing narrower.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+mod budget;
 pub mod bytes;
 pub mod capability;
 pub mod change;
 pub mod commit;
 pub mod conflict;
+mod coord;
 pub mod error;
+mod graph;
 pub mod heads;
 pub mod ids;
 pub mod index;
 pub mod merge;
+mod physical;
 pub mod protocol;
 pub mod refdata;
+pub mod records;
+pub mod refs;
+mod revset;
 pub mod store;
+mod workcopy;
+mod workcopy_journal;
 pub mod workspace;
 
 pub use bytes::ByteString;

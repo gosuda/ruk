@@ -37,7 +37,8 @@ pub mod error;
 pub mod types;
 
 mod delta;
-mod durability;
+pub mod durability;
+mod guards;
 mod metadata;
 mod prepare;
 mod recovery;
@@ -61,6 +62,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use error::StoreError;
+pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
+pub(crate) use metadata::{decode, encode, MAX_FACT_ROW_BYTES};
+pub use metadata::{FactPage, FactPageBudget, FactRow};
 pub use spool::{BudgetLimits, PreparationBudget, Spool};
 pub use types::{
     Encoding, FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
@@ -93,6 +97,7 @@ pub struct Store {
     format: StoreFormat,
     meta: Metadata,
     budget: Arc<PreparationBudget>,
+    guards: Arc<GenerationRegistry>,
     writer: Mutex<WriterState>,
     quarantine: Mutex<Option<String>>,
     quarantined: AtomicBool,
@@ -219,11 +224,13 @@ impl Store {
         durability::sync_file(&format_file)?;
         sync_entries(root)?;
 
+        let guards = Arc::new(GenerationRegistry::new(0));
         Ok(Self::assemble(
             root,
             format,
             meta,
             budget,
+            guards,
             Recovered {
                 next_segment_id: 0,
                 open: None,
@@ -267,11 +274,14 @@ impl Store {
         sync_entries(root)?;
         drop(format_file);
         budget.register_scratch(root)?;
+        let generation = meta.generation()?;
+        let guards = Arc::new(GenerationRegistry::new(generation));
         let committed = Committed {
             root,
             kind: format.kind,
             meta: &meta,
             budget: &budget,
+            guards: &guards,
         };
         let recovered = match recovery::run(&committed) {
             Ok(recovered) => recovered,
@@ -285,7 +295,7 @@ impl Store {
                 return Err(err);
             }
         };
-        Ok(Self::assemble(root, format, meta, budget, recovered))
+        Ok(Self::assemble(root, format, meta, budget, guards, recovered))
     }
 
     fn assemble(
@@ -293,6 +303,7 @@ impl Store {
         format: StoreFormat,
         meta: Metadata,
         budget: Arc<PreparationBudget>,
+        guards: Arc<GenerationRegistry>,
         recovered: Recovered,
     ) -> Self {
         Self {
@@ -300,6 +311,7 @@ impl Store {
             format,
             meta,
             budget,
+            guards,
             writer: Mutex::new(WriterState {
                 active: None,
                 resume: recovered.open,
@@ -342,7 +354,26 @@ impl Store {
             kind: self.format.kind,
             meta: &self.meta,
             budget: &self.budget,
+            guards: &self.guards,
         }
+    }
+
+    /// Checks whether a segment retired at or before `retired_generation` is ready for physical unlink.
+    ///
+    /// # Precondition
+    /// The caller MUST have already durably removed every locator referencing this segment
+    /// and committed the retirement manifest at or before `retired_generation`.
+    ///
+    /// No filesystem I/O is performed under this registry mutex.
+    #[must_use]
+    pub(crate) fn is_segment_retired_ready_for_unlink(&self, retired_generation: u64) -> bool {
+        self.guards.is_segment_retired_ready_for_unlink(retired_generation)
+    }
+
+    /// Accessor for the store's generation registry.
+    #[must_use]
+    pub(crate) fn generation_registry(&self) -> &Arc<GenerationRegistry> {
+        &self.guards
     }
 
     /// Latches quarantine. The first reason stays.
@@ -366,7 +397,7 @@ impl Store {
     }
 
     /// Latches quarantine when a read of committed state reports corruption.
-    fn observe<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
+    pub(crate) fn observe<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
         if let Err(err) = &result
             && err.code() == ErrorCode::ECorrupt
         {
@@ -424,6 +455,23 @@ impl Store {
     pub fn read(&self, oid: Oid) -> Result<ReadObject, StoreError> {
         self.refuse_if_quarantined()?;
         self.observe(self.committed().read(oid))
+    }
+
+    /// A bounded page of raw fact rows strictly after `after` in key order.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for zero rows or bytes in `budget`;
+    /// [`StoreError::Limit`] if the first row alone exceeds the byte budget;
+    /// [`StoreError::Corrupt`] for storage damage, which also latches quarantine;
+    /// quarantine refuses.
+    pub fn fact_page(
+        &self,
+        table: FactTable,
+        after: Option<&[u8]>,
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.observe(self.meta.fact_page(table, after, budget))
     }
 
     /// Reads one fact value.
@@ -665,6 +713,8 @@ impl Store {
         #[cfg(test)]
         crash_tests::crash_at("after_metadata_commit");
 
+        self.guards.advance_published_generation(generation);
+
         #[cfg(test)]
         crash_tests::crash_at("before_ack");
         Ok(Publication {
@@ -905,7 +955,7 @@ fn require_absent(path: &Path) -> Result<(), StoreError> {
 /// Reads and parses the bounded format file, returning the handle it was
 /// read through. The handle can write because flushing a file needs a
 /// write-capable handle on Windows; it is never written.
-fn read_format(root: &Path) -> Result<(StoreFormat, File), StoreError> {
+pub(crate) fn read_format(root: &Path) -> Result<(StoreFormat, File), StoreError> {
     let mut file = match durability::open_existing(&root.join(FORMAT_FILE)) {
         Ok(file) => file,
         Err(StoreError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
@@ -1123,18 +1173,23 @@ mod tests {
         let shared = budget();
         let recovered = {
             let meta = Metadata::open(&meta_file(temp)).expect("healthy metadata");
+            let generation = meta.generation().expect("healthy generation");
+            let guards = Arc::new(GenerationRegistry::new(generation));
             shared.register_scratch(&root).expect("scratch accounting");
             let committed = Committed {
                 root: &root,
                 kind: format.kind,
                 meta: &meta,
                 budget: &shared,
+                guards: &guards,
             };
             recovery::run(&committed).expect("healthy store recovers")
         };
         damage(&meta_file(temp));
         let meta = Metadata::open(&meta_file(temp)).expect("metadata census");
-        Store::assemble(&root, format, meta, shared, recovered)
+        let generation = meta.generation().unwrap_or(0);
+        let guards = Arc::new(GenerationRegistry::new(generation));
+        Store::assemble(&root, format, meta, shared, guards, recovered)
     }
 
     /// A refusal is typed corruption from a call whose ordinary execution
@@ -1753,6 +1808,10 @@ mod tests {
         )];
         assert!(matches!(
             store.publish(vec![], &facts),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            store.fact_page(FactTable::Refs, None, FactPageBudget::new(10, 1024)),
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(

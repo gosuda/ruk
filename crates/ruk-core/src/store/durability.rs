@@ -89,6 +89,51 @@ pub(crate) fn create_file_published(path: &Path) -> Result<File, StoreError> {
         .map_err(StoreError::from)
 }
 
+/// Writes and syncs a new file before publishing its final name.
+///
+/// An existing final name fails without replacement. A failed write leaves
+/// no final entry. Failure after publication may leave the completed final
+/// file in place. The parent directory must already satisfy this module's
+/// platform-specific durability requirements.
+pub fn install_file(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let path = resolve(path)?;
+    #[cfg(windows)]
+    let path = canonical_join(parent_of(&path)?, child_of(&path)?)?;
+    let parent = parent_of(&path)?;
+    let temporary = parent.join(format!(".tmp-file-{}", uuid::Uuid::new_v4().simple()));
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        write(&mut file)?;
+        sync_file(&file)?;
+        publish_completed_file(&temporary, &path)?;
+        Ok(())
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn publish_completed_file(temporary: &Path, target: &Path) -> io::Result<()> {
+    std::fs::hard_link(temporary, target)?;
+    std::fs::remove_file(temporary)?;
+    sync_dir_path(parent_of(target)?)
+}
+
+#[cfg(windows)]
+fn publish_completed_file(temporary: &Path, target: &Path) -> io::Result<()> {
+    atomicwrites::move_atomic(temporary, target)
+}
+
 /// Creates exactly one new directory at `path` as a durable namespace entry.
 ///
 /// Exclusive: any existing name (directory, file, symlink) fails with
@@ -105,7 +150,7 @@ pub(crate) fn create_file_published(path: &Path) -> Result<File, StoreError> {
 /// `MoveFileExW(MOVEFILE_WRITE_THROUGH)` (no overwrite); a loser removes only
 /// its own temporary directory. The parent's durability is a precondition
 /// (see the module docs).
-pub(crate) fn create_dir_published(path: &Path) -> Result<(), StoreError> {
+pub fn create_dir_published(path: &Path) -> Result<(), StoreError> {
     resolve(path)
         .and_then(|path| create_dir_published_inner(&path))
         .map_err(StoreError::from)
@@ -138,7 +183,7 @@ pub(crate) fn sync_file(file: &File) -> Result<(), StoreError> {
 /// delivered by [`create_file_published`] and [`create_dir_published`] at
 /// publication time.
 #[cfg(unix)]
-pub(crate) fn sync_dir(path: &Path) -> Result<(), StoreError> {
+pub fn sync_dir(path: &Path) -> Result<(), StoreError> {
     sync_dir_path(path).map_err(StoreError::from)
 }
 
@@ -162,7 +207,7 @@ pub(crate) fn create_dir_all_synced(path: &Path) -> Result<(), StoreError> {
 }
 
 #[cfg(unix)]
-fn sync_dir_path(path: &Path) -> io::Result<()> {
+pub fn sync_dir_path(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     fault::check(path)?;
     let dir = File::open(path)?;
@@ -444,6 +489,50 @@ mod tests {
         names
     }
 
+    #[test]
+    fn completed_file_is_invisible_until_sealed_and_never_replaced() {
+        use std::io::Write;
+
+        let root = temp_root("complete-install");
+        let target = root.join("graph");
+        install_file(&target, |file| {
+            file.write_all(b"immutable graph")?;
+            assert!(!target.exists());
+            Ok(())
+        })
+        .expect("install completed file");
+        assert_eq!(std::fs::read(&target).expect("read installed file"), b"immutable graph");
+        let error = install_file(&target, |file| {
+            file.write_all(b"replacement")?;
+            Ok(())
+        })
+        .expect_err("existing file must not be replaced");
+        assert!(matches!(
+            &error,
+            StoreError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&target).expect("read original file"), b"immutable graph");
+        assert_eq!(entry_names(&root), vec!["graph"]);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_content_write_never_publishes_partial_file() {
+        use std::io::Write;
+
+        let root = temp_root("failed-install");
+        let target = root.join("graph");
+        let error = install_file(&target, |file| {
+            file.write_all(b"partial")?;
+            Err(StoreError::Io(io::Error::other("content producer failed")))
+        })
+        .expect_err("producer failure must propagate");
+        assert!(matches!(error, StoreError::Io(_)));
+        assert!(!target.exists());
+        assert!(entry_names(&root).is_empty());
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
     #[cfg(unix)]
     #[test]
     fn creates_nested_dirs_and_is_idempotent() {
@@ -479,7 +568,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sync_dir_makes_namespace_changes_durable_api() {
+    pub fn sync_dir_makes_namespace_changes_durable_api() {
         let root = temp_root("syncdir");
         let gone = root.join("missing.bin");
         let file = File::create(&gone).expect("create file");

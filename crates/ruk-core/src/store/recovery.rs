@@ -29,12 +29,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::durability;
+use super::guards::{CapturedLink, GenerationRegistry, ObjectSnapshot};
 use super::metadata::Metadata;
 use super::prepare;
 use super::segment::{self, RecordPayload};
 use super::spool::{PreparationBudget, Spool};
 use super::types::{ObjectLocation, ReadObject, SegmentManifest};
-use super::{MAX_DELTA_DEPTH, SEGMENTS_DIR, StoreError};
+use super::{SEGMENTS_DIR, StoreError};
 use crate::ids::{HashKind, Oid};
 
 /// Locators verified per metadata page during recovery.
@@ -49,6 +50,7 @@ pub(super) struct Committed<'a> {
     pub(super) kind: HashKind,
     pub(super) meta: &'a Metadata,
     pub(super) budget: &'a Arc<PreparationBudget>,
+    pub(super) guards: &'a Arc<GenerationRegistry>,
 }
 
 /// The open (unsealed) segment recovery verified, ready to resume appends.
@@ -95,112 +97,54 @@ impl Committed<'_> {
         )))
     }
 
-    /// Reads one committed object: locator lookup, then verified decode of
-    /// its delta chain.
+    /// Reads one committed object: registers a physical reader guard, captures
+    /// a complete delta chain and required manifests in ONE metadata transaction,
+    /// drops the transaction, and decodes the payload while holding the guard.
     pub(super) fn read(&self, oid: Oid) -> Result<ReadObject, StoreError> {
         self.check_width(oid)?;
-        let location = self
-            .meta
-            .get_object(&oid)?
-            .ok_or_else(|| StoreError::NotFound(oid.to_hex()))?;
-        let bytes = self.load(oid, &location)?;
+        let guard = self.guards.register();
+        let snapshot = self.meta.snapshot_object_chain(self.kind, &oid)?;
+        let bytes = self.load_snapshot(&snapshot)?;
+        drop(guard);
         Ok(ReadObject {
-            kind: location.kind,
+            kind: snapshot.target_kind(),
             bytes,
-            depth: location.depth,
+            depth: snapshot.target_depth(),
         })
     }
 
-    /// Resolves the base chain of `location`, target first, root last.
-    ///
-    /// Each base must exist, share the kind, and sit exactly one level
-    /// shallower; depth therefore strictly decreases, which rules out cycles
-    /// and bounds the walk by [`MAX_DELTA_DEPTH`].
-    fn chain(
-        &self,
-        oid: Oid,
-        location: &ObjectLocation,
-    ) -> Result<Vec<(Oid, ObjectLocation)>, StoreError> {
-        let mut chain = vec![(oid, location.clone())];
-        let mut cursor = (oid, location.base, location.depth, location.kind);
-        loop {
-            let (child, base, depth, kind) = cursor;
-            let Some(base_oid) = base else {
-                if depth != 0 {
-                    return Err(corrupt(format!(
-                        "non-delta object {child} records chain depth {depth}"
-                    )));
-                }
-                return Ok(chain);
-            };
-            if depth == 0 || depth > MAX_DELTA_DEPTH {
-                return Err(corrupt(format!(
-                    "delta object {child} records chain depth {depth} outside 1..={MAX_DELTA_DEPTH}"
-                )));
-            }
-            let base_location = self.meta.get_object(&base_oid)?.ok_or_else(|| {
-                corrupt(format!(
-                    "committed delta {child} references missing base {base_oid}"
-                ))
-            })?;
-            if base_location.kind != kind || base_location.depth.checked_add(1) != Some(depth) {
-                return Err(corrupt(format!(
-                    "delta {child} (depth {depth}) disagrees with its base {base_oid} (depth {}, kind {:?})",
-                    base_location.depth, base_location.kind
-                )));
-            }
-            cursor = (
-                base_oid,
-                base_location.base,
-                base_location.depth,
-                base_location.kind,
-            );
-            chain.push((base_oid, base_location));
-        }
-    }
-
-    /// Decodes and verifies the whole chain, root first, and returns the
-    /// target's decoded bytes.
-    fn load(&self, oid: Oid, location: &ObjectLocation) -> Result<Spool, StoreError> {
-        let chain = self.chain(oid, location)?;
+    /// Decodes the whole chain of a captured snapshot, root first, and returns
+    /// the target's decoded bytes.
+    pub(super) fn load_snapshot(&self, snapshot: &ObjectSnapshot) -> Result<Spool, StoreError> {
         let mut previous: Option<Spool> = None;
-        for (link_oid, link) in chain.iter().rev() {
-            let base = match (previous.as_ref(), link.base) {
+        for link in snapshot.links.iter().rev() {
+            let base = match (previous.as_ref(), link.location.base) {
                 (Some(spool), Some(base_oid)) => Some((base_oid, spool.view())),
                 (None, None) => None,
                 _ => {
                     return Err(corrupt(format!(
-                        "delta chain of {link_oid} is inconsistent with its base"
+                        "delta chain of {} is inconsistent with its base",
+                        link.oid
                     )));
                 }
             };
-            let decoded = self.decode_link(link_oid, link, base)?;
+            let decoded = self.decode_link_from_snapshot(link, base)?;
             previous = Some(decoded);
         }
-        previous.ok_or_else(|| corrupt(format!("delta chain of {oid} is empty")))
+        previous.ok_or_else(|| corrupt(format!("delta chain of {} is empty", snapshot.target_oid)))
     }
 
-    /// Streams one record, verifies its framing and checksum, and decodes
-    /// it. The decoder verifies the identity; the full-record checksum is
-    /// verified last because a decoder may stop before the payload ends.
-    fn decode_link(
+    /// Streams one record, verifies its framing and checksum against the captured
+    /// manifest, and decodes it.
+    fn decode_link_from_snapshot(
         &self,
-        oid: &Oid,
-        location: &ObjectLocation,
+        link: &CapturedLink,
         base: Option<(Oid, super::spool::SpoolView<'_>)>,
     ) -> Result<Spool, StoreError> {
-        let manifest = self.meta.manifest(location.segment)?.ok_or_else(|| {
-            corrupt(format!(
-                "object {oid} locates unmanifested segment {}",
-                location.segment
-            ))
-        })?;
-        if manifest.retired {
-            return Err(corrupt(format!(
-                "object {oid} locates retired segment {}",
-                manifest.id
-            )));
-        }
+        let location = &link.location;
+        let manifest = &link.manifest;
+        let oid = &link.oid;
+
         let end = location
             .offset
             .checked_add(location.record_len)
@@ -258,7 +202,7 @@ impl Committed<'_> {
                 location.generation
             )));
         }
-        self.load(oid, location).map(drop)
+        self.read(oid).map(drop)
     }
 }
 

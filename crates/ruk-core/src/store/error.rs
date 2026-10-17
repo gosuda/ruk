@@ -7,8 +7,7 @@
 //! `begin_write`/`begin_read`, `set_durability`, table open/insert/get/
 //! remove, `commit`).
 
-use crate::error::CoreModelError;
-use crate::error::ErrorCode;
+use crate::error::{CoreError, CoreModelError, ErrorCode};
 use crate::store::segment::SegmentError;
 use thiserror::Error;
 
@@ -74,6 +73,12 @@ pub enum StoreError {
     /// Model-layer failure passed through unchanged.
     #[error(transparent)]
     Model(#[from] CoreModelError),
+}
+
+impl From<StoreError> for CoreError {
+    fn from(error: StoreError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
 }
 
 impl From<SegmentError> for StoreError {

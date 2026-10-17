@@ -53,13 +53,18 @@ use redb::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::ids::Oid;
+use crate::ids::{HashKind, Oid};
 use crate::store::MAX_DELTA_DEPTH;
 use crate::store::error::StoreError;
+use crate::store::guards::{CapturedLink, ObjectSnapshot};
 use crate::store::segment;
 use crate::store::types::{
     FactExpectation, FactMutation, FactTable, ObjectLocation, SegmentManifest,
 };
+
+/// Maximum persisted byte length of a single fact row's key plus value (16 MiB).
+/// Persisted rows exceeding this cap are committed corruption.
+pub(crate) const MAX_FACT_ROW_BYTES: usize = 16 * 1024 * 1024;
 
 /// Length of a segment record header; no stored record is shorter. The one
 /// layout value lives in `segment`; this is its lossless `u64` view
@@ -94,6 +99,34 @@ const GENERATION: TableDefinition<'static, (), u64> = TableDefinition::new("gene
 
 const fn fact_definition(table: FactTable) -> BytesTable {
     TableDefinition::new(table.table_name())
+}
+
+/// Bounded resource limits for a fact table page request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactPageBudget {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
+impl FactPageBudget {
+    #[must_use]
+    pub const fn new(rows: usize, bytes: usize) -> Self {
+        Self { rows, bytes }
+    }
+}
+
+/// One raw key and value pair from a fact table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FactRow {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// A bounded page of fact rows with continuation state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FactPage {
+    pub rows: Vec<FactRow>,
+    pub more: bool,
 }
 
 fn is_census_name(name: &str) -> bool {
@@ -172,6 +205,151 @@ impl Metadata {
         lookup_object(&txn.open_table(OBJECTS).map_err(table_error)?, oid)
     }
 
+    /// Resolves the complete bounded delta chain and all required segment manifests
+    /// for `oid` within ONE single read transaction.
+    ///
+    /// The read transaction is dropped before this method returns.
+    /// Validates hash width, chain depth bounds (1..=MAX_DELTA_DEPTH for deltas, 0
+    /// for non-deltas), kind consistency, strict base depth (`base.depth + 1 == child.depth`),
+    /// manifest existence, non-retired manifest state, and record extents.
+    ///
+    /// # Errors
+    /// - [`StoreError::ObjectFormat`] if `oid` or any base in the chain does not match `expected_kind`.
+    /// - [`StoreError::NotFound`] if `oid` is not committed.
+    /// - [`StoreError::Corrupt`] if a base is missing, depth or kind is inconsistent,
+    ///   a manifest is missing or retired, record extents exceed manifest records_end,
+    ///   or locator generation exceeds store generation.
+    pub(crate) fn snapshot_object_chain(
+        &self,
+        expected_kind: HashKind,
+        oid: &Oid,
+    ) -> Result<ObjectSnapshot, StoreError> {
+        if oid.kind() != expected_kind {
+            return Err(StoreError::ObjectFormat(format!(
+                "object id {oid} is not a {expected_kind} digest"
+            )));
+        }
+
+        let txn = self.db.begin_read().map_err(txn_error)?;
+        let objects_table = txn.open_table(OBJECTS).map_err(table_error)?;
+        let segments_table = txn.open_table(SEGMENTS).map_err(table_error)?;
+        let generation_table = txn.open_table(GENERATION).map_err(table_error)?;
+        let current_generation = lookup_generation(&generation_table)?;
+
+        let target_location = lookup_object(&objects_table, oid)?
+            .ok_or_else(|| StoreError::NotFound(oid.to_hex()))?;
+
+        let target_kind = target_location.kind;
+        let target_depth = target_location.depth;
+
+        let mut links = Vec::new();
+        let mut cursor_oid = *oid;
+        let mut cursor_location = target_location;
+
+        loop {
+            if cursor_oid.kind() != expected_kind {
+                return Err(StoreError::ObjectFormat(format!(
+                    "object id {cursor_oid} is not a {expected_kind} digest"
+                )));
+            }
+
+            if cursor_location.generation > current_generation {
+                return Err(StoreError::Corrupt(format!(
+                    "object {cursor_oid} was published at generation {} above the store generation {current_generation}",
+                    cursor_location.generation
+                )));
+            }
+
+            let manifest = lookup_manifest(&segments_table, cursor_location.segment)?
+                .ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "object {cursor_oid} locates unmanifested segment {}",
+                        cursor_location.segment
+                    ))
+                })?;
+
+            if manifest.retired {
+                return Err(StoreError::Corrupt(format!(
+                    "object {cursor_oid} locates retired segment {}",
+                    manifest.id
+                )));
+            }
+
+            let _end = cursor_location
+                .offset
+                .checked_add(cursor_location.record_len)
+                .filter(|end| *end <= manifest.records_end)
+                .ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "object {cursor_oid} record [{}, +{}) leaves segment {} record extent {}",
+                        cursor_location.offset,
+                        cursor_location.record_len,
+                        manifest.id,
+                        manifest.records_end
+                    ))
+                })?;
+
+            let (child_oid, base_opt, depth, kind) = (
+                cursor_oid,
+                cursor_location.base,
+                cursor_location.depth,
+                cursor_location.kind,
+            );
+
+            links.push(CapturedLink {
+                oid: cursor_oid,
+                location: cursor_location,
+                manifest,
+            });
+
+            let Some(base_oid) = base_opt else {
+                if depth != 0 {
+                    return Err(StoreError::Corrupt(format!(
+                        "non-delta object {child_oid} records chain depth {depth}"
+                    )));
+                }
+                break;
+            };
+
+            if depth == 0 || depth > MAX_DELTA_DEPTH {
+                return Err(StoreError::Corrupt(format!(
+                    "delta object {child_oid} records chain depth {depth} outside 1..={MAX_DELTA_DEPTH}"
+                )));
+            }
+
+            if base_oid.kind() != expected_kind {
+                return Err(StoreError::ObjectFormat(format!(
+                    "delta base {base_oid} of {child_oid} is not a {expected_kind} digest"
+                )));
+            }
+
+            let base_location = lookup_object(&objects_table, &base_oid)?.ok_or_else(|| {
+                StoreError::Corrupt(format!(
+                    "committed delta {child_oid} references missing base {base_oid}"
+                ))
+            })?;
+
+            if base_location.kind != kind || base_location.depth.checked_add(1) != Some(depth) {
+                return Err(StoreError::Corrupt(format!(
+                    "delta {child_oid} (depth {depth}) disagrees with its base {base_oid} (depth {}, kind {:?})",
+                    base_location.depth, base_location.kind
+                )));
+            }
+
+            cursor_oid = base_oid;
+            cursor_location = base_location;
+        }
+
+        drop(txn);
+
+        Ok(ObjectSnapshot {
+            target_oid: *oid,
+            target_kind,
+            target_depth,
+            links,
+        })
+    }
+
     /// At most `limit` object rows in raw-digest order whose key is
     /// strictly greater than `after`. Each call is its own read
     /// transaction, so a recovery pass pages through the table without
@@ -233,14 +411,114 @@ impl Metadata {
         Ok(manifests)
     }
 
+    /// Returns at most `budget.rows` (clamped to 1024) fact rows strictly
+    /// after `after` in raw key order, totaling at most `budget.bytes` of
+    /// copied key and value bytes.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for zero rows or bytes in `budget`;
+    /// [`StoreError::Limit`] if the first row alone exceeds `budget.bytes`;
+    /// [`StoreError::Corrupt`] or [`StoreError::Storage`] for redb failures.
+    pub(crate) fn fact_page(
+        &self,
+        table: FactTable,
+        after: Option<&[u8]>,
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
+        if budget.rows == 0 || budget.bytes == 0 {
+            return Err(StoreError::Invalid(format!(
+                "fact page budget must specify non-zero rows and bytes, found rows={} bytes={}",
+                budget.rows, budget.bytes
+            )));
+        }
+
+        let max_rows = budget.rows.min(1024);
+        let mut rows = Vec::with_capacity(max_rows.min(64));
+        let mut accumulated_bytes: usize = 0;
+        let mut more = false;
+
+        let txn = self.db.begin_read().map_err(txn_error)?;
+        let fact_table = txn
+            .open_table(fact_definition(table))
+            .map_err(table_error)?;
+        let lower: Bound<&[u8]> = after.map_or(Bound::Unbounded, |key| Bound::Excluded(key));
+        let mut iter = fact_table
+            .range::<&[u8]>((lower, Bound::Unbounded))
+            .map_err(storage)?;
+
+        while let Some(item) = iter.next() {
+            let (key_guard, value_guard) = item.map_err(storage)?;
+            let key = key_guard.value();
+            let value = value_guard.value();
+
+            let row_bytes = key
+                .len()
+                .checked_add(value.len())
+                .ok_or_else(|| {
+                    StoreError::Capacity("fact row key + value bytes overflow usize".to_owned())
+                })?;
+
+            let new_total = accumulated_bytes
+                .checked_add(row_bytes)
+                .ok_or_else(|| {
+                    StoreError::Capacity("fact page accumulated bytes overflow usize".to_owned())
+                })?;
+
+            if new_total > budget.bytes {
+                if rows.is_empty() {
+                    return Err(StoreError::Limit(format!(
+                        "first fact row in table {} requires {row_bytes} bytes, exceeding budget {}",
+                        table.table_name(),
+                        budget.bytes
+                    )));
+                }
+                more = true;
+                break;
+            }
+
+            rows.push(FactRow {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            });
+            accumulated_bytes = new_total;
+
+            if rows.len() == max_rows || accumulated_bytes == budget.bytes {
+                if iter.next().transpose().map_err(storage)?.is_some() {
+                    more = true;
+                }
+                break;
+            }
+        }
+
+        Ok(FactPage { rows, more })
+    }
+
     /// The exact value stored under `key` in `table`, if any.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] if the stored row's key + value bytes exceed
+    /// [`MAX_FACT_ROW_BYTES`] (16 MiB).
     pub(crate) fn fact(&self, table: FactTable, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         let txn = self.db.begin_read().map_err(txn_error)?;
         let rows = txn
             .open_table(fact_definition(table))
             .map_err(table_error)?;
         let found = rows.get(key).map_err(storage)?;
-        Ok(found.map(|guard| guard.value().to_vec()))
+        let Some(guard) = found else {
+            return Ok(None);
+        };
+        let value = guard.value();
+        let total_bytes = key
+            .len()
+            .checked_add(value.len())
+            .ok_or_else(|| StoreError::Capacity("fact row key + value bytes overflow usize".to_owned()))?;
+        if total_bytes > MAX_FACT_ROW_BYTES {
+            return Err(StoreError::Corrupt(format!(
+                "fact row in table {} has key + value size {total_bytes} bytes exceeding maximum {MAX_FACT_ROW_BYTES}",
+                table.table_name()
+            )));
+        }
+        Ok(Some(value.to_vec()))
     }
 
     /// Begins the one write transaction of a publication, and inside it
@@ -510,7 +788,7 @@ fn decode_manifest(id: u64, bytes: &[u8]) -> Result<SegmentManifest, StoreError>
 
 /// Decodes exactly one postcard value: truncation, an out-of-range
 /// discriminant or length, and bytes left over are all corruption.
-fn decode<T: DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T, StoreError> {
+pub(crate) fn decode<T: DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T, StoreError> {
     let (value, rest) = postcard::take_from_bytes::<T>(bytes)
         .map_err(|err| StoreError::Corrupt(format!("{what}: malformed postcard row: {err}")))?;
     if !rest.is_empty() {
@@ -522,7 +800,7 @@ fn decode<T: DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T, StoreError
     Ok(value)
 }
 
-fn encode<T: Serialize>(what: &str, value: &T) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn encode<T: Serialize>(what: &str, value: &T) -> Result<Vec<u8>, StoreError> {
     postcard::to_allocvec(value)
         .map_err(|err| StoreError::Invalid(format!("{what} cannot be encoded: {err}")))
 }

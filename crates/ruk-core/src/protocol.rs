@@ -1045,8 +1045,8 @@ pub struct PathProvenance {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MutationOutcome {
     pub receipt: ReceiptRef,
-    /// The operation that recorded the mutation. Absent when nothing changed
-    /// (an empty snapshot records no operation).
+    /// The operation that recorded the mutation. Absent when no operation-tracked
+    /// state changed.
     pub operation: Option<OperationId>,
     pub heads: BoundedList<ChangeHead>,
     pub stamps: BoundedList<ResultingStamp>,
@@ -3013,9 +3013,55 @@ macro_rules! request_id_of {
     }};
 }
 
+/// The outcome of a mutation reply.
+macro_rules! outcome_of {
+    (Mutation, $result:expr) => {
+        Some(&$result.outcome)
+    };
+    (Anonymous, $result:expr) => {{
+        let _ = &$result;
+        None
+    }};
+    (Bootstrap, $result:expr) => {{
+        let _ = &$result;
+        None
+    }};
+    (Read, $result:expr) => {{
+        let _ = &$result;
+        None
+    }};
+}
+
+/// Mutable access to the outcome of a mutation reply.
+macro_rules! outcome_of_mut {
+    (Mutation, $result:expr) => {
+        Some(&mut $result.outcome)
+    };
+    (Anonymous, $result:expr) => {{
+        let _ = $result;
+        None
+    }};
+    (Bootstrap, $result:expr) => {{
+        let _ = $result;
+        None
+    }};
+    (Read, $result:expr) => {{
+        let _ = $result;
+        None
+    }};
+}
+
 /// One table of `(variant, wire name, kind, parameters, result)` generates the
 /// method enum, the request and reply enums, and the schema entries, so the
 /// four can never disagree about which methods exist.
+///
+/// # Append-only order within v1
+/// Within v1, `method_table!` entries must only be appended to the end of the
+/// table. Durable v1 formats (such as receipt rows and operation headers)
+/// serialize enum variants using postcard, which encodes enum discriminants
+/// as their positional declaration index (varint). Reordering, removing, or
+/// inserting variants before the end alters discriminant indices and breaks
+/// durable v1 storage compatibility.
 macro_rules! method_table {
     ($($variant:ident, $name:literal, $kind:ident, $params:ty, $result:ty;)+) => {
         /// Every native method.
@@ -3126,6 +3172,22 @@ macro_rules! method_table {
             pub const fn method(&self) -> Method {
                 match self {
                     $(Self::$variant(_) => Method::$variant,)+
+                }
+            }
+
+            /// The outcome of a mutation reply, or `None` for reads and bootstrap methods.
+            #[must_use]
+            pub fn outcome(&self) -> Option<&MutationOutcome> {
+                match self {
+                    $(Self::$variant(result) => outcome_of!($kind, result),)+
+                }
+            }
+
+            /// Mutable access to the outcome of a mutation reply, or `None` for reads and bootstrap methods.
+            #[must_use]
+            pub fn outcome_mut(&mut self) -> Option<&mut MutationOutcome> {
+                match self {
+                    $(Self::$variant(result) => outcome_of_mut!($kind, result),)+
                 }
             }
         }

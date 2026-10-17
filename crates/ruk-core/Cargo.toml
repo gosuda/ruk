@@ -11,6 +11,14 @@ gix-hash.workspace = true
 serde.workspace = true
 sonic-rs.workspace = true
 stacker.workspace = true
+tokio.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+ssh-key.workspace = true
+roaring.workspace = true
+logos.workspace = true
+toml.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 smallvec.workspace = true
@@ -21,8 +29,12 @@ crc32c.workspace = true
 jiff.workspace = true
 uuid.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 atomicwrites.workspace = true
+windows-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

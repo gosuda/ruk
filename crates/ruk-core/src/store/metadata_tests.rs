@@ -9,12 +9,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, MultimapTableDefinition, ReadableDatabase, TableDefinition, TableHandle};
 
+use std::sync::Arc;
+
 use super::error::StoreError;
-use super::metadata::{Metadata, PublicationTxn};
+use super::metadata::{FactPage, FactPageBudget, FactRow, Metadata, PublicationTxn};
 use super::types::{
     FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, SegmentManifest,
 };
-use crate::ids::Oid;
+use super::{PreparationBudget, Store};
+use crate::ids::{HashKind, Oid};
 
 const RAW_OBJECTS: TableDefinition<'static, &'static [u8], &'static [u8]> =
     TableDefinition::new("objects");
@@ -1218,4 +1221,378 @@ fn generation_must_strictly_advance() {
     txn.set_generation(7).expect("advance");
     txn.commit().expect("commit");
     assert_eq!(meta.generation().expect("generation"), 7);
+}
+
+// ---------------------------------------------------------------------
+// Fact paging
+// ---------------------------------------------------------------------
+
+#[test]
+fn fact_page_rejects_zero_budget_as_invalid() {
+    let dir = TestDir::new("fact-page-zero-budget");
+    let meta = create(&dir);
+
+    for (rows, bytes) in [(0, 100), (10, 0), (0, 0)] {
+        let result = meta.fact_page(FactTable::Refs, None, FactPageBudget::new(rows, bytes));
+        assert!(
+            matches!(result, Err(StoreError::Invalid(_))),
+            "rows={rows}, bytes={bytes}: expected Invalid, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn fact_page_empty_table_returns_empty_and_not_more() {
+    let dir = TestDir::new("fact-page-empty");
+    let meta = create(&dir);
+
+    let page = meta
+        .fact_page(FactTable::Refs, None, FactPageBudget::new(10, 1024))
+        .expect("empty page");
+    assert!(page.rows.is_empty());
+    assert!(!page.more);
+
+    let after_page = meta
+        .fact_page(
+            FactTable::Refs,
+            Some(b"nonexistent"),
+            FactPageBudget::new(10, 1024),
+        )
+        .expect("after page");
+    assert!(after_page.rows.is_empty());
+    assert!(!after_page.more);
+}
+
+#[test]
+fn fact_page_first_oversized_row_returns_limit_never_empty_eof() {
+    let dir = TestDir::new("fact-page-oversized-first");
+    let meta = create(&dir);
+
+    // key: 8 bytes, value: 12 bytes => 20 bytes total
+    publish(
+        &meta,
+        &[
+            put(FactTable::Refs, b"refs/h/1", b"target-one-!"),
+            put(FactTable::Refs, b"refs/h/2", b"target-two-!"),
+        ],
+    );
+
+    // First row alone (20 bytes) exceeds budget of 19 bytes.
+    let result = meta.fact_page(FactTable::Refs, None, FactPageBudget::new(10, 19));
+    assert!(
+        matches!(result, Err(StoreError::Limit(_))),
+        "expected Limit, got {result:?}"
+    );
+
+    // First row fits in 20 bytes.
+    let page1 = meta
+        .fact_page(FactTable::Refs, None, FactPageBudget::new(10, 20))
+        .expect("page1");
+    assert_eq!(page1.rows.len(), 1);
+    assert_eq!(page1.rows[0].key, b"refs/h/1");
+    assert!(page1.more);
+
+    // Second row as first row of the continuation page exceeds budget of 19 bytes.
+    let after_key = &page1.rows[0].key;
+    let result2 = meta.fact_page(FactTable::Refs, Some(after_key), FactPageBudget::new(10, 19));
+    assert!(
+        matches!(result2, Err(StoreError::Limit(_))),
+        "expected Limit on resumed first row, got {result2:?}"
+    );
+}
+
+#[test]
+fn fact_page_exact_budget_eof_versus_another_row() {
+    let dir = TestDir::new("fact-page-exact-budget");
+    let meta = create(&dir);
+
+    // Each row is 4 bytes key + 6 bytes value = 10 bytes total.
+    publish(
+        &meta,
+        &[
+            put(FactTable::Refs, b"ref1", b"val001"),
+            put(FactTable::Refs, b"ref2", b"val002"),
+        ],
+    );
+
+    // Page 1 with budget 10 bytes: exactly fits row 1 (10 bytes).
+    // Because row 2 exists in the table, more MUST be true.
+    let page1 = meta
+        .fact_page(FactTable::Refs, None, FactPageBudget::new(10, 10))
+        .expect("page 1");
+    assert_eq!(page1.rows.len(), 1);
+    assert_eq!(page1.rows[0].key, b"ref1");
+    assert_eq!(page1.rows[0].value, b"val001");
+    assert!(page1.more, "more must be true when another row exists");
+
+    // Page 2 with budget 10 bytes: exactly fits row 2 (10 bytes).
+    // Because no more rows exist (iterator exhausted), more MUST be false.
+    let page2 = meta
+        .fact_page(FactTable::Refs, Some(b"ref1"), FactPageBudget::new(10, 10))
+        .expect("page 2");
+    assert_eq!(page2.rows.len(), 1);
+    assert_eq!(page2.rows[0].key, b"ref2");
+    assert_eq!(page2.rows[0].value, b"val002");
+    assert!(
+        !page2.more,
+        "more must be false when iterator is exhausted at exact budget"
+    );
+
+    // Case B: Table with only ONE row. Budget is exact match (10 bytes).
+    let dir_single = TestDir::new("fact-page-exact-single");
+    let meta_single = create(&dir_single);
+    publish(&meta_single, &[put(FactTable::Refs, b"ref1", b"val001")]);
+
+    let single_page = meta_single
+        .fact_page(FactTable::Refs, None, FactPageBudget::new(10, 10))
+        .expect("single page");
+    assert_eq!(single_page.rows.len(), 1);
+    assert_eq!(single_page.rows[0].key, b"ref1");
+    assert_eq!(single_page.rows[0].value, b"val001");
+    assert!(!single_page.more, "more must be false on EOF at exact budget");
+}
+
+#[test]
+fn fact_page_counts_both_key_and_value_bytes() {
+    let dir = TestDir::new("fact-page-key-bytes");
+    let meta = create(&dir);
+
+    // key is 40 bytes, value is 10 bytes => 50 bytes total.
+    let long_key = vec![b'k'; 40];
+    let value = vec![b'v'; 10];
+    publish(&meta, &[put(FactTable::Changes, &long_key, &value)]);
+
+    // If only value bytes (10) were counted, budget of 25 would mistakenly accept it.
+    // Key byte accounting requires 50 bytes, so 49 must return Limit.
+    let err = meta
+        .fact_page(FactTable::Changes, None, FactPageBudget::new(10, 49))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Limit(_)),
+        "expected Limit, got {err:?}"
+    );
+
+    // Budget of 50 bytes accepts it exactly.
+    let page = meta
+        .fact_page(FactTable::Changes, None, FactPageBudget::new(10, 50))
+        .expect("exact page");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].key, long_key);
+    assert_eq!(page.rows[0].value, value);
+    assert!(!page.more);
+}
+
+#[test]
+fn fact_page_exact_sequence_across_row_boundaries() {
+    let dir = TestDir::new("fact-page-row-boundaries");
+    let meta = create(&dir);
+
+    // Insert 20 rows in unordered sequence.
+    let mut expected = Vec::new();
+    let mut mutations = Vec::new();
+    for i in [
+        13_u8, 5, 19, 2, 8, 1, 17, 10, 4, 16, 7, 0, 14, 6, 18, 3, 9, 11, 15, 12,
+    ] {
+        let key = format!("ref/{i:02}").into_bytes();
+        let value = format!("target-for-{i:02}").into_bytes();
+        expected.push((key.clone(), value.clone()));
+        mutations.push(put(FactTable::Refs, &key, &value));
+    }
+    expected.sort();
+    publish(&meta, &mutations);
+
+    // Page with row limit 3 and large byte budget.
+    let mut seen = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let page = meta
+            .fact_page(
+                FactTable::Refs,
+                cursor.as_deref(),
+                FactPageBudget::new(3, 100_000),
+            )
+            .expect("page");
+        assert!(page.rows.len() <= 3);
+        assert_eq!(
+            page.more,
+            seen.len() + page.rows.len() < expected.len(),
+            "more must match remaining rows"
+        );
+        for row in &page.rows {
+            seen.push((row.key.clone(), row.value.clone()));
+        }
+        match page.rows.last() {
+            Some(last) => cursor = Some(last.key.clone()),
+            None => break,
+        }
+        if !page.more {
+            break;
+        }
+    }
+
+    assert_eq!(seen.len(), expected.len());
+    assert_eq!(
+        seen, expected,
+        "every record must appear exactly once in raw key order"
+    );
+
+    // Reading again after the last key returns empty and more=false.
+    let final_page = meta
+        .fact_page(
+            FactTable::Refs,
+            cursor.as_deref(),
+            FactPageBudget::new(3, 100_000),
+        )
+        .expect("final page");
+    assert!(final_page.rows.is_empty());
+    assert!(!final_page.more);
+}
+
+#[test]
+fn fact_page_exact_sequence_across_byte_boundaries() {
+    let dir = TestDir::new("fact-page-byte-boundaries");
+    let meta = create(&dir);
+
+    // 15 rows with varied key and value lengths.
+    let mut expected = Vec::new();
+    let mut mutations = Vec::new();
+    for i in 0..15_u8 {
+        let key = format!("k{:02}_{}", i, "x".repeat(usize::from(i % 5))).into_bytes();
+        let value = format!("v{:02}_{}", i, "y".repeat(usize::from(i % 7))).into_bytes();
+        expected.push((key.clone(), value.clone()));
+        mutations.push(put(FactTable::Changes, &key, &value));
+    }
+    expected.sort();
+    publish(&meta, &mutations);
+
+    // Page with tight byte budget: 35 bytes (each row is ~10-25 bytes).
+    let byte_budget = 35;
+    let mut seen = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut page_count = 0;
+
+    loop {
+        page_count += 1;
+        let page = meta
+            .fact_page(
+                FactTable::Changes,
+                cursor.as_deref(),
+                FactPageBudget::new(100, byte_budget),
+            )
+            .expect("byte page");
+
+        let page_bytes: usize = page.rows.iter().map(|r| r.key.len() + r.value.len()).sum();
+        assert!(
+            page_bytes <= byte_budget,
+            "page bytes {page_bytes} exceeded budget {byte_budget}"
+        );
+        assert!(!page.rows.is_empty(), "non-empty table should yield rows");
+
+        for row in &page.rows {
+            seen.push((row.key.clone(), row.value.clone()));
+        }
+
+        assert_eq!(
+            page.more,
+            seen.len() < expected.len(),
+            "more must be true iff there are remaining records"
+        );
+
+        cursor = Some(page.rows.last().unwrap().key.clone());
+        if !page.more {
+            break;
+        }
+    }
+
+    assert!(
+        page_count > 1,
+        "must require multiple pages to exercise byte boundaries"
+    );
+    assert_eq!(seen.len(), expected.len());
+    assert_eq!(
+        seen, expected,
+        "no skipped or duplicated records across byte splits"
+    );
+}
+
+#[test]
+fn fact_page_clamps_rows_at_1024() {
+    let dir = TestDir::new("fact-page-clamp-1024");
+    let meta = create(&dir);
+
+    let total = 1100_usize;
+    let mut expected = Vec::with_capacity(total);
+    let mut mutations = Vec::with_capacity(total);
+    for i in 0..total {
+        let key = format!("ref/{i:04}").into_bytes();
+        let value = format!("val/{i:04}").into_bytes();
+        expected.push((key.clone(), value.clone()));
+        mutations.push(put(FactTable::Refs, &key, &value));
+    }
+    expected.sort();
+    publish(&meta, &mutations);
+
+    // Request 2000 rows (exceeds clamp of 1024) with generous byte budget.
+    let page1 = meta
+        .fact_page(FactTable::Refs, None, FactPageBudget::new(2000, 10_000_000))
+        .expect("page 1");
+    assert_eq!(page1.rows.len(), 1024, "page must be clamped to 1024 rows");
+    assert!(page1.more, "more must be true when rows remain");
+
+    let page2 = meta
+        .fact_page(
+            FactTable::Refs,
+            Some(&page1.rows.last().unwrap().key),
+            FactPageBudget::new(2000, 10_000_000),
+        )
+        .expect("page 2");
+    assert_eq!(page2.rows.len(), total - 1024);
+    assert!(!page2.more);
+
+    let mut combined = page1.rows;
+    combined.extend(page2.rows);
+    let seen: Vec<(Vec<u8>, Vec<u8>)> = combined.into_iter().map(|r| (r.key, r.value)).collect();
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn fact_page_refuses_when_store_is_quarantined() {
+    let dir = TestDir::new("fact-page-quarantine");
+    let store_root = dir.0.join("store");
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::create(&store_root, HashKind::Sha1, budget).expect("create store");
+
+    // Publish one fact.
+    let facts = [cas(
+        FactTable::Refs,
+        b"refs/heads/main",
+        FactExpectation::Absent,
+        some(b"hash1"),
+    )];
+    store.publish(vec![], &facts).expect("publish fact");
+
+    // Verify healthy fact_page works through Store.
+    let page = store
+        .fact_page(FactTable::Refs, None, FactPageBudget::new(10, 1024))
+        .expect("healthy fact page");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].key, b"refs/heads/main");
+    assert!(!store.quarantine());
+
+    // Inject corruption observation into store to latch quarantine.
+    let observed_err = StoreError::Corrupt("metadata sector damaged".to_owned());
+    let _ = store.observe(Err::<(), _>(observed_err));
+    assert!(
+        store.quarantine(),
+        "store must be quarantined after observing Corrupt"
+    );
+
+    // Store::fact_page must now refuse due to quarantine.
+    let err = store
+        .fact_page(FactTable::Refs, None, FactPageBudget::new(10, 1024))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(_)),
+        "quarantined store must return Corrupt, got {err:?}"
+    );
 }
