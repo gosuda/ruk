@@ -12,9 +12,10 @@
 //! # Wire discipline
 //!
 //! * Every enum uses serde's default external tagging, and no type uses
-//!   `flatten`, `untagged`, or `skip_serializing_if`. A typed reply is
+//!   `flatten`, `untagged`, or `skip_serializing_if`. Non-schema replies are
 //!   stored durably in receipts through postcard, which cannot decode
-//!   self-describing shapes; the digest input is postcard too.
+//!   self-describing shapes; the digest input is postcard too. Schema reply
+//!   documents have no binary postcard form: they travel in JSON frames.
 //! * Only a major-version mismatch is rejected on version grounds: once a
 //!   frame passes the size, JSON syntax, and nesting checks and carries a
 //!   readable `schema_version`, [`decode_request`] fails `E_VERSION` before
@@ -38,7 +39,7 @@ use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, DeserializeOwned, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sonic_rs::{Array, Number, Object, Value, from_slice, json, to_string, to_vec};
+use sonic_rs::{from_slice, to_vec};
 use thiserror::Error;
 
 use crate::MAX_CONTROL_FRAME_BYTES;
@@ -1142,163 +1143,17 @@ pub struct SchemaArgs {
     pub method: Option<Method>,
 }
 
-/// A JSON Schema document: any JSON value, backed by [`sonic_rs::Value`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SchemaDocument(sonic_rs::Value);
-
-impl SchemaDocument {
-    /// Wraps a schema document.
-    #[must_use]
-    pub const fn new(document: sonic_rs::Value) -> Self {
-        Self(document)
-    }
-
-    /// The document.
-    #[must_use]
-    pub const fn value(&self) -> &sonic_rs::Value {
-        &self.0
-    }
-}
-
-impl Serialize for SchemaDocument {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if serializer.is_human_readable() {
-            return self.0.serialize(serializer);
-        }
-        let text = to_string(&self.0).map_err(<S::Error as serde::ser::Error>::custom)?;
-        serializer.serialize_str(&text)
-    }
-}
-
-impl<'de> Deserialize<'de> for SchemaDocument {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        if deserializer.is_human_readable() {
-            return deserialize_sonic_value(deserializer).map(Self);
-        }
-        let text = String::deserialize(deserializer)?;
-        decode_json::<Self>(text.as_bytes()).map_err(de::Error::custom)
-    }
-}
-
-/// Deserializes any JSON value into a [`sonic_rs::Value`] through the
-/// portable visitor protocol.
-///
-/// `Value`'s own `Deserialize` rides a sonic-private token channel that
-/// foreign deserializers (serde's buffered `Content` behind internally
-/// tagged, untagged, and flatten containers, or postcard) do not implement,
-/// so those replays must go through this standard visitor instead.
-///
-/// Every nested value re-enters this function, which runs the deserializer on
-/// a fresh stack segment when less than [`VISITOR_RED_ZONE`] bytes remain.
-/// The recursion therefore has no depth cap of its own.
-fn deserialize_sonic_value<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<sonic_rs::Value, D::Error> {
-    #[derive(Debug)]
-    struct PortableValue(sonic_rs::Value);
-
-    impl<'de> Deserialize<'de> for PortableValue {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            deserialize_sonic_value(deserializer).map(PortableValue)
-        }
-    }
-
-    struct SonicValueVisitor;
-
-    impl<'de> Visitor<'de> for SonicValueVisitor {
-        type Value = sonic_rs::Value;
-
-        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            f.write_str("any JSON value")
-        }
-
-        fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
-            Ok(Value::from(v))
-        }
-
-        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(Value::from(v))
-        }
-
-        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Value::from(v))
-        }
-
-        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
-            let number = Number::from_f64(v)
-                .map(Value::from)
-                .unwrap_or_else(Value::new_null);
-            Ok(number)
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
-            Ok(Value::from(v))
-        }
-
-        fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
-            Ok(Value::from(&v))
-        }
-
-        fn visit_unit<E>(self) -> Result<Self::Value, E> {
-            Ok(Value::new_null())
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E> {
-            Ok(Value::new_null())
-        }
-
-        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            deserialize_sonic_value(d)
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut array = Array::new();
-            while let Some(PortableValue(value)) = seq.next_element::<PortableValue>()? {
-                array.push(value);
-            }
-            Ok(array.into_value())
-        }
-
-        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut object = Object::new();
-            while let Some((key, PortableValue(value))) =
-                map.next_entry::<String, PortableValue>()?
-            {
-                object.insert(&key, value);
-            }
-            Ok(object.into_value())
-        }
-    }
-
-    stacker::maybe_grow(VISITOR_RED_ZONE, VISITOR_STACK_SEGMENT, || {
-        deserializer.deserialize_any(SonicValueVisitor)
-    })
-}
-
-impl JsonSchema for SchemaDocument {
-    fn schema_name() -> Cow<'static, str> {
-        Cow::Borrowed("SchemaDocument")
-    }
-
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        json_schema!({
-            "type": "object",
-            "description": "A JSON Schema document (draft 2020-12) produced by `model_schema_json`."
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MethodDescriptor {
     pub method: Method,
     pub kind: MethodKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaReply {
     pub schema_version: SchemaVersion,
     pub methods: Vec<MethodDescriptor>,
-    pub document: SchemaDocument,
+    pub document: Schema,
 }
 
 // ---------------------------------------------------------------------------
@@ -3260,7 +3115,7 @@ macro_rules! method_table {
         }
 
         /// A successful method result.
-        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
         pub enum Reply {
             $(#[serde(rename = $name)] $variant(Box<$result>),)+
         }
@@ -3275,13 +3130,13 @@ macro_rules! method_table {
             }
         }
 
-        fn method_entries(generator: &mut SchemaGenerator) -> Vec<Value> {
+        fn method_entries(generator: &mut SchemaGenerator) -> Vec<Schema> {
             vec![$(
-                json!({
+                json_schema!({
                     "method": $name,
                     "kind": MethodKind::$kind,
-                    "params": generator.subschema_for::<$params>().to_value(),
-                    "result": generator.subschema_for::<$result>().to_value(),
+                    "params": generator.subschema_for::<$params>(),
+                    "result": generator.subschema_for::<$result>(),
                 }),
             )+]
         }
@@ -3289,11 +3144,11 @@ macro_rules! method_table {
         fn method_params_result(
             method: Method,
             generator: &mut SchemaGenerator,
-        ) -> (Value, Value) {
+        ) -> (Schema, Schema) {
             match method {
                 $(Method::$variant => (
-                    json!(generator.subschema_for::<$params>().to_value()),
-                    json!(generator.subschema_for::<$result>().to_value()),
+                    generator.subschema_for::<$params>(),
+                    generator.subschema_for::<$result>(),
                 ),)+
             }
         }
@@ -3388,7 +3243,7 @@ impl RequestEnvelope {
 }
 
 /// A reply on the wire.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReplyEnvelope {
     pub schema_version: SchemaVersion,
     /// The request this answers, when the request was readable far enough to
@@ -3399,7 +3254,7 @@ pub struct ReplyEnvelope {
 }
 
 /// A reply is a result or an error, never both.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplyBody {
     Success(Reply),
@@ -3499,9 +3354,8 @@ fn scan_json_depth(bytes: &[u8]) -> Result<usize, CoreError> {
 /// applies and no protocol version is inspected.
 ///
 /// # Preconditions
-/// The stack provision covers sonic's parser and the [`SchemaDocument`]
-/// visitor. Recursion inside a custom `Deserialize` implementation of `T` is
-/// outside it.
+/// The stack provision covers sonic's parser. Recursion inside a custom
+/// `Deserialize` implementation of `T` is outside it.
 ///
 /// # Errors
 /// `E_INVALID` when the input nests more than [`MAX_JSON_NESTING`] levels, is
@@ -3516,8 +3370,6 @@ pub fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
 
 const PARSE_STACK_BASE: usize = 128 * 1024;
 const PARSE_STACK_PER_CONTAINER: usize = 128 * 1024;
-const VISITOR_RED_ZONE: usize = 128 * 1024;
-const VISITOR_STACK_SEGMENT: usize = 1024 * 1024;
 
 /// Runs `parse` with stack room for `depth` open containers, which
 /// `scan_json_depth` bounds by [`MAX_JSON_NESTING`]. The reserve is a policy
@@ -3696,19 +3548,23 @@ const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema"
 /// The model document `ruk model` prints: limits, framing, the error
 /// registry, the root request and reply types, every method's parameter and
 /// result schema, and the shared definitions they reference.
+///
+/// The `schema` method result carries one document with an object or
+/// boolean root; schema documents decode from JSON frames only and have no
+/// binary postcard form.
 #[must_use]
-pub fn model_schema_json() -> Value {
+pub fn model_schema_json() -> Schema {
     let mut generator = SchemaSettings::draft2020_12().into_generator();
-    let request = generator.subschema_for::<RequestEnvelope>().to_value();
-    let reply = generator.subschema_for::<ReplyEnvelope>().to_value();
-    let capabilities = generator.subschema_for::<Capabilities>().to_value();
+    let request = generator.subschema_for::<RequestEnvelope>();
+    let reply = generator.subschema_for::<ReplyEnvelope>();
+    let capabilities = generator.subschema_for::<Capabilities>();
     let methods = method_entries(&mut generator);
     let definitions = generator.take_definitions(true);
-    let error_codes: Vec<Value> = ErrorCode::ALL
+    let error_codes: Vec<Schema> = ErrorCode::ALL
         .iter()
-        .map(|code| json!({ "code": code.as_str(), "exit_status": code.exit_code() }))
+        .map(|code| json_schema!({ "code": code.as_str(), "exit_status": code.exit_code() }))
         .collect();
-    json!({
+    json_schema!({
         "$schema": JSON_SCHEMA_DIALECT,
         "title": "Ruk core protocol",
         "schema_version": SchemaVersion::current(),
@@ -3740,11 +3596,11 @@ pub fn model_schema_json() -> Value {
 /// The schema document restricted to one method: its parameter and result
 /// schemas and the definitions they reference.
 #[must_use]
-pub fn method_schema_json(method: Method) -> Value {
+pub fn method_schema_json(method: Method) -> Schema {
     let mut generator = SchemaSettings::draft2020_12().into_generator();
     let (params, result) = method_params_result(method, &mut generator);
     let definitions = generator.take_definitions(true);
-    json!({
+    json_schema!({
         "$schema": JSON_SCHEMA_DIALECT,
         "schema_version": SchemaVersion::current(),
         "method": method.as_str(),
@@ -3761,6 +3617,7 @@ mod tests {
 
     use super::*;
     use crate::commit::Provenance;
+    use sonic_rs::Value;
     use sonic_rs::json;
     use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait as _};
 
@@ -3873,6 +3730,16 @@ mod tests {
 
     fn to_frame(value: &Value) -> Vec<u8> {
         sonic_rs::to_vec(value).expect("json")
+    }
+
+    fn model_value() -> Value {
+        let bytes = sonic_rs::to_vec(&model_schema_json()).expect("render model");
+        sonic_rs::from_slice(&bytes).expect("parse model")
+    }
+
+    fn single_method_value() -> Value {
+        let bytes = sonic_rs::to_vec(&method_schema_json(Method::Write)).expect("render method");
+        sonic_rs::from_slice(&bytes).expect("parse method")
     }
 
     fn fails(bytes: &[u8]) -> ErrorCode {
@@ -4917,81 +4784,133 @@ mod tests {
         }
     }
 
+    fn schema_success(document: Schema) -> ReplyEnvelope {
+        ReplyEnvelope::success(
+            Some(request_id(1)),
+            Reply::Schema(Box::new(SchemaReply {
+                schema_version: SchemaVersion::current(),
+                methods: Vec::new(),
+                document,
+            })),
+        )
+    }
+
+    #[test]
+    fn schema_documents_accept_object_and_boolean_roots() {
+        for text in [r#"{"type":"object"}"#, "true", "false"] {
+            let document: Schema = decode_json(text.as_bytes()).expect("schema root");
+            let envelope = schema_success(document);
+            let bytes = encode_reply(&envelope).expect("encode");
+            assert_eq!(decode_reply(&bytes).expect("decode"), envelope);
+        }
+    }
+
+    #[test]
+    fn schema_documents_reject_scalar_roots() {
+        for text in [b"[]" as &[u8], b"\"x\"", b"1", b"null"] {
+            assert!(
+                decode_json::<Schema>(text).is_err(),
+                "{}",
+                text.escape_ascii()
+            );
+        }
+        let template = sonic_rs::to_value(&schema_success(json_schema!(true))).expect("template");
+        for root in [json!([]), json!("x"), json!(1), json!(null)] {
+            let mut frame = template.clone();
+            frame["body"]["success"]["schema"]["document"] = root;
+            assert_eq!(
+                decode_reply(&to_frame(&frame))
+                    .expect_err("scalar root")
+                    .code,
+                ErrorCode::EInvalid
+            );
+        }
+    }
+
     /// Internally tagged, so serde buffers `document` through its private
-    /// `Content` and replays it into [`SchemaDocument`]. The real externally
-    /// tagged `Reply` does not buffer; this carrier stands in for containers
-    /// that do (internally tagged, untagged, flatten).
+    /// `Content` and replays it into [`Schema`]. The real externally
+    /// tagged `Reply` does not buffer; these carriers stand in for
+    /// containers that do (internally tagged, untagged, flatten).
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
-    enum BufferedCarry {
-        Document { document: SchemaDocument },
+    enum TaggedSchema {
+        Schema { document: Schema },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum UntaggedSchema {
+        Schema { document: Schema },
+        Other { count: u32 },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct FlattenedSchema {
+        name: String,
+        #[serde(flatten)]
+        document: Schema,
     }
 
     #[test]
-    fn schema_document_replays_through_buffered_content_and_json_bytes() {
-        let doc = SchemaDocument::new(json!({
-            "z": [true, null, -1, 1.5],
-            "a": { "nested": [1, 2, 3] },
-        }));
-        let carry = BufferedCarry::Document {
-            document: doc.clone(),
+    fn schema_replays_through_tagged_untagged_and_flattened_carriers() {
+        let object: Schema =
+            decode_json(br#"{"type":"object","properties":{"path":{"type":"string"}}}"#)
+                .expect("object schema");
+        let tagged = TaggedSchema::Schema {
+            document: object.clone(),
         };
-        let wire = sonic_rs::to_vec(&carry).expect("encode carry");
-        let decoded: BufferedCarry = sonic_rs::from_slice(&wire).expect("buffered replay");
-        assert_eq!(decoded, carry);
-        let flattened = sonic_rs::to_value(&doc).expect("flatten document");
+        let wire = sonic_rs::to_vec(&tagged).expect("encode tagged");
         assert_eq!(
-            decoded,
-            BufferedCarry::Document {
-                document: SchemaDocument::new(flattened),
-            }
+            sonic_rs::from_slice::<TaggedSchema>(&wire).expect("tagged replay"),
+            tagged
+        );
+        assert_eq!(
+            decode_json::<TaggedSchema>(&wire).expect("checked tagged"),
+            tagged
         );
 
-        let bytes = sonic_rs::to_vec(&doc).expect("encode document");
-        let back: SchemaDocument = sonic_rs::from_slice(&bytes).expect("decode document");
-        assert_eq!(back, doc);
-    }
-
-    #[test]
-    fn schema_document_postcard_text_survives_a_binary_round_trip() {
-        let doc = SchemaDocument::new(json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" } },
-        }));
-        let packed = postcard::to_allocvec(&doc).expect("postcard");
-        let unpacked: SchemaDocument = postcard::from_bytes(&packed).expect("unpack");
-        assert_eq!(unpacked, doc);
-        // The binary form carries the document as JSON text, so the text is
-        // recoverable and stable across encodes.
-        let text = sonic_rs::to_string(&unpacked.value()).expect("render");
-        let rendered: SchemaDocument = sonic_rs::from_str(&text).expect("reparse");
-        assert_eq!(rendered, doc);
-
-        // Binary postcard deserialization applies the nesting bound:
-        // 128 open brackets succeed and decode through the portable visitor.
-        let valid_128 = format!(
-            "{}{}",
-            "[".repeat(MAX_JSON_NESTING),
-            "]".repeat(MAX_JSON_NESTING)
+        let untagged = UntaggedSchema::Schema {
+            document: object.clone(),
+        };
+        let wire = sonic_rs::to_vec(&untagged).expect("encode untagged");
+        assert_eq!(
+            sonic_rs::from_slice::<UntaggedSchema>(&wire).expect("untagged replay"),
+            untagged
         );
-        let packed_128 = postcard::to_allocvec(&valid_128).expect("postcard 128");
-        let unpacked_128: SchemaDocument = postcard::from_bytes(&packed_128).expect("unpack 128");
-        let rendered_128 = sonic_rs::to_string(&unpacked_128.value()).expect("render 128");
-        assert_eq!(rendered_128, valid_128);
-        let repacked_128 = postcard::to_allocvec(&unpacked_128).expect("repack 128");
-        assert_eq!(repacked_128, packed_128);
-        let roundtrip_128: SchemaDocument =
-            postcard::from_bytes(&repacked_128).expect("roundtrip unpack 128");
-        assert_eq!(roundtrip_128, unpacked_128);
-
-        // 129 open brackets exceed the bound and fail before reaching the parser.
-        let over_129 = format!(
-            "{}{}",
-            "[".repeat(MAX_JSON_NESTING + 1),
-            "]".repeat(MAX_JSON_NESTING + 1)
+        assert_eq!(
+            decode_json::<UntaggedSchema>(&wire).expect("checked untagged"),
+            untagged
         );
-        let packed_129 = postcard::to_allocvec(&over_129).expect("postcard 129");
-        assert!(postcard::from_bytes::<SchemaDocument>(&packed_129).is_err());
+        let other = UntaggedSchema::Other { count: 7 };
+        let wire = sonic_rs::to_vec(&other).expect("encode other");
+        assert_eq!(
+            decode_json::<UntaggedSchema>(&wire).expect("checked other"),
+            other
+        );
+
+        let flat = FlattenedSchema {
+            name: "write".to_owned(),
+            document: object.clone(),
+        };
+        let wire = sonic_rs::to_vec(&flat).expect("encode flattened");
+        assert_eq!(
+            sonic_rs::from_slice::<FlattenedSchema>(&wire).expect("flattened replay"),
+            flat
+        );
+        assert_eq!(
+            decode_json::<FlattenedSchema>(&wire).expect("checked flattened"),
+            flat
+        );
+
+        let boolean: Schema = decode_json(b"true").expect("boolean schema");
+        let wire = sonic_rs::to_vec(&TaggedSchema::Schema {
+            document: boolean.clone(),
+        })
+        .expect("encode tagged bool");
+        assert_eq!(
+            decode_json::<TaggedSchema>(&wire).expect("tagged bool"),
+            TaggedSchema::Schema { document: boolean }
+        );
     }
 
     #[test]
@@ -5081,22 +5000,16 @@ mod tests {
     #[test]
     fn object_nesting_holds_the_bound_through_every_decoder() {
         let at_bound = nested_objects(MAX_JSON_NESTING, "{}");
-        let document: SchemaDocument = decode_json(at_bound.as_bytes()).expect("128 objects");
-        assert_eq!(
-            sonic_rs::to_string(document.value()).expect("render"),
-            at_bound
-        );
-        let packed = postcard::to_allocvec(&at_bound).expect("postcard");
-        let unpacked: SchemaDocument = postcard::from_bytes(&packed).expect("binary 128 objects");
-        assert_eq!(unpacked, document);
+        let document: Schema = decode_json(at_bound.as_bytes()).expect("128 objects");
+        let rendered = sonic_rs::to_vec(&document).expect("render");
+        assert_eq!(rendered, at_bound.into_bytes());
+        assert_eq!(decode_json::<Schema>(&rendered).expect("reparse"), document);
 
         let over = nested_objects(MAX_JSON_NESTING + 1, "{}");
         assert_eq!(
-            invalid_code(decode_json::<SchemaDocument>(over.as_bytes()).map(drop)),
+            invalid_code(decode_json::<Schema>(over.as_bytes()).map(drop)),
             ErrorCode::EInvalid
         );
-        let packed_over = postcard::to_allocvec(&over).expect("postcard over");
-        assert!(postcard::from_bytes::<SchemaDocument>(&packed_over).is_err());
 
         let original = envelope(pin_request());
         let mut base = sonic_rs::to_string(&original).expect("json");
@@ -5112,21 +5025,28 @@ mod tests {
 
     #[test]
     fn deep_duplicate_keys_collapse_identically_through_every_decoder() {
-        let duplicated = nested_objects(MAX_JSON_NESTING - 1, r#"{"k":1,"z":0,"k":2}"#);
-        let collapsed = nested_objects(MAX_JSON_NESTING - 1, r#"{"k":2,"z":0}"#);
+        // The envelope holds four containers around the document
+        // (root/body/success/schema), so a depth-124 payload totals 128.
+        let duplicated = nested_objects(MAX_JSON_NESTING - 4, r#"{"k":1,"z":0,"k":2}"#);
+        let collapsed = nested_objects(MAX_JSON_NESTING - 4, r#"{"k":2,"z":0}"#);
 
-        let direct: SchemaDocument = decode_json(duplicated.as_bytes()).expect("direct");
-        assert_eq!(
-            sonic_rs::to_string(direct.value()).expect("render"),
-            collapsed
+        let direct: Schema = decode_json(duplicated.as_bytes()).expect("direct");
+        let wanted: Schema = decode_json(collapsed.as_bytes()).expect("collapsed");
+        assert_eq!(direct, wanted);
+
+        let template = sonic_rs::to_string(&schema_success(json_schema!(true))).expect("template");
+        let marker = r#""document":true"#;
+        let at = template.find(marker).expect("document slot");
+        let mut frame = template;
+        frame.replace_range(
+            at..at + marker.len(),
+            &format!(r#""document":{duplicated}"#),
         );
-        let packed = postcard::to_allocvec(&duplicated).expect("postcard");
-        let binary: SchemaDocument = postcard::from_bytes(&packed).expect("binary");
-        assert_eq!(binary, direct);
-
-        let carried = format!(r#"{{"kind":"document","document":{duplicated}}}"#);
-        let buffered: BufferedCarry = decode_json(carried.as_bytes()).expect("buffered");
-        assert_eq!(buffered, BufferedCarry::Document { document: direct });
+        let decoded = decode_reply(frame.as_bytes()).expect("envelope");
+        let ReplyBody::Success(Reply::Schema(reply)) = decoded.body else {
+            panic!("expected a schema reply");
+        };
+        assert_eq!(reply.document, wanted);
     }
 
     #[test]
@@ -5245,7 +5165,7 @@ mod tests {
 
     #[test]
     fn model_document_references_resolve_and_describe_every_method() {
-        let doc = model_schema_json();
+        let doc = model_value();
         let defs = doc["$defs"].as_object().expect("definitions");
         let mut references = Vec::new();
         collect_refs(&doc, &mut references);
@@ -5277,7 +5197,7 @@ mod tests {
 
     #[test]
     fn model_document_publishes_the_limits_and_the_closed_error_registry() {
-        let doc = model_schema_json();
+        let doc = model_value();
         assert_eq!(doc["limits"]["control_frame_bytes"], 16 * 1024 * 1024);
         assert_eq!(doc["limits"]["inline_edit_bytes"], 1024 * 1024);
         assert_eq!(doc["limits"]["page_default"], 100);
@@ -5308,7 +5228,7 @@ mod tests {
 
     #[test]
     fn mutation_methods_carry_request_ids_and_outcomes_and_reads_carry_views() {
-        let doc = model_schema_json();
+        let doc = model_value();
         let defs = &doc["$defs"];
         for entry in doc["methods"].as_array().expect("methods") {
             let method: Method =
@@ -5338,11 +5258,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_admits_no_untyped_json_except_the_schema_document_itself() {
-        let doc = model_schema_json();
+    fn schema_admits_no_untyped_json_except_the_schema_itself() {
+        let doc = model_value();
         let defs = doc["$defs"].as_object().expect("definitions");
         for (name, schema) in defs {
-            if name == "SchemaDocument" {
+            if name == "Schema" {
                 continue;
             }
             assert_eq!(find_untyped(schema), None, "{name}");
@@ -5351,7 +5271,7 @@ mod tests {
 
     #[test]
     fn single_method_document_is_self_contained() {
-        let doc = method_schema_json(Method::Write);
+        let doc = single_method_value();
         assert_eq!(doc["method"], "write");
         assert_eq!(doc["kind"], "mutation");
         let defs = doc["$defs"].as_object().expect("definitions");

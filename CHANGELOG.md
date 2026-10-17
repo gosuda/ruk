@@ -23,7 +23,9 @@ Entries describe implemented, unreleased functionality.
 
 ### Changed
 
-- Migrated authored JSON parsing and serialization to `sonic-rs`. Public Rust JSON value APIs now expose `sonic_rs::Value`; `serde` and `schemars` remain in use.
-- Limited CLI conflict input, protocol envelope decoding, `protocol::decode_json`, and JSON text inside binary `SchemaDocument` values to 128 open arrays or objects. Deeper input returns `E_INVALID`. Bounded parsing adds stack space when needed; existing CLI and control-frame byte limits are unchanged.
-- Normalized parsed `-0` and `-0.0` to positive zero, including JSON text embedded in binary `SchemaDocument` values.
-- Preserved arbitrary JSON roots and the postcard JSON-string representation of `SchemaDocument`, with the stated negative-zero normalization. Generated model and conflict output bytes remain unchanged.
+- Migrated authored JSON parsing and serialization to `sonic-rs`; `serde` and `schemars` remain in use.
+- Limited CLI conflict input, protocol envelope decoding, and `protocol::decode_json` to 128 open arrays or objects. Deeper input returns `E_INVALID`. Bounded parsing adds stack space when needed; existing CLI and control-frame byte limits are unchanged.
+- Normalized parsed `-0` and `-0.0` to positive zero.
+- **Breaking:** replaced `SchemaDocument` with `schemars::Schema`. `SchemaReply.document`, `model_schema_json`, and `method_schema_json` now use the typed schema representation, which accepts only object and boolean roots. Removed `Eq` from schema-containing reply types; `PartialEq` remains.
+- **Breaking:** schema documents no longer decode from postcard JSON strings. Schema replies use JSON frames; non-schema receipt and request binary encodings remain unchanged.
+- Kept protocol v1 while replacing the generated `SchemaDocument` definition and reference with `Schema`. Model output uses standard schema serialization and remains deterministic. Conflict output bytes remain unchanged.
