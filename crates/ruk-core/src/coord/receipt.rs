@@ -9,11 +9,11 @@
 use sha2::{Digest, Sha256};
 
 use crate::change::{RequestId, SessionId};
-use crate::coord::rows::{decode_receipt, receipt_key, ReceiptRow};
+use crate::coord::rows::{ReceiptRow, decode_receipt, receipt_key};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Reply, Request, RequestDigest};
-use crate::store::types::FactTable;
 use crate::store::Store;
+use crate::store::types::FactTable;
 
 /// Computes the v1 idempotency digest for a request using SHA-256.
 ///
@@ -108,8 +108,8 @@ pub(crate) fn settle_rejection(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::change::{ChangeId, OperationId, WorkspaceId};
@@ -119,8 +119,8 @@ mod tests {
     use crate::protocol::{
         BoundedList, Method, MutationOutcome, ReceiptRef, Timestamp, WsTakeArgs, WsTakeReply,
     };
-    use crate::store::types::{FactExpectation, FactMutation};
     use crate::store::PreparationBudget;
+    use crate::store::types::{FactExpectation, FactMutation};
     use crate::workspace::{NativeWorkspace, Scope, WorkspaceState};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -155,8 +155,8 @@ mod tests {
     fn test_store(tag: &str) -> (TempRoot, Store) {
         let temp = TempRoot::new(tag);
         let budget = Arc::new(PreparationBudget::reference_defaults());
-        let store = Store::create(&temp.store_dir(), HashKind::Sha1, budget)
-            .expect("create test store");
+        let store =
+            Store::create(&temp.store_dir(), HashKind::Sha1, budget).expect("create test store");
         (temp, store)
     }
 
@@ -164,8 +164,7 @@ mod tests {
         WorkspaceState::Native(NativeWorkspace::new(
             ChangeId::from_bytes([7; 16]),
             Head::Git {
-                oid: Oid::from_hex("0123456789abcdef0123456789abcdef01234567")
-                    .expect("valid oid"),
+                oid: Oid::from_hex("0123456789abcdef0123456789abcdef01234567").expect("valid oid"),
             },
             Scope::Full,
         ))
@@ -226,9 +225,7 @@ mod tests {
         assert_eq!(digest.as_bytes(), expected_hash.as_slice());
 
         // Anonymous / read requests return None
-        let schema_req = Request::Schema(Box::new(crate::protocol::SchemaArgs {
-            method: None,
-        }));
+        let schema_req = Request::Schema(Box::new(crate::protocol::SchemaArgs { method: None }));
         assert_eq!(digest_v1(&schema_req).expect("schema digest"), None);
     }
 

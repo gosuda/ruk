@@ -1,4 +1,3 @@
-
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
@@ -107,5 +106,8 @@ fn deadline_expired() -> CoreError {
 }
 
 fn io_error(error: std::io::Error) -> CoreError {
-    CoreError::new(ErrorCode::EIo, format!("coordinator control frame: {error}"))
+    CoreError::new(
+        ErrorCode::EIo,
+        format!("coordinator control frame: {error}"),
+    )
 }

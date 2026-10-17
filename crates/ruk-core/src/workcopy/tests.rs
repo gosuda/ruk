@@ -77,7 +77,8 @@ fn batch(since: WatchToken, until: WatchToken, events: Vec<WatchEvent>) -> Watch
 
 impl Fixture {
     fn new(scope: Scope) -> Self {
-        let root = std::env::temp_dir().join(format!("ruk-workcopy-test-{}", WorkspaceId::generate()));
+        let root =
+            std::env::temp_dir().join(format!("ruk-workcopy-test-{}", WorkspaceId::generate()));
         std::fs::create_dir_all(root.join(".ruk")).expect("internal dir");
         let store = Store::create(
             &root.join(".ruk").join("store"),
@@ -141,7 +142,9 @@ impl Fixture {
     fn commit(&self, base: Oid, watch: Option<&WatchBatch>) -> Oid {
         match self.snapshot(base, watch) {
             SnapshotOutcome::NoChange { cache } => {
-                self.store.publish(Vec::new(), &cache).expect("publish cache");
+                self.store
+                    .publish(Vec::new(), &cache)
+                    .expect("publish cache");
                 base
             }
             SnapshotOutcome::Changed(prepared) => {
@@ -213,7 +216,9 @@ fn row(stat: FileStat, racy: bool) -> StatusRow {
     StatusRow {
         stat,
         mode: FileMode::Regular,
-        blob: HashKind::Sha1.hash_git_object("blob", b"bytes").expect("hash"),
+        blob: HashKind::Sha1
+            .hash_git_object("blob", b"bytes")
+            .expect("hash"),
         racy,
         conflict: None,
     }
@@ -221,14 +226,33 @@ fn row(stat: FileStat, racy: bool) -> StatusRow {
 
 #[test]
 fn racy_and_future_timestamps_are_never_trusted() {
-    let clock = StatClock::new(StatTime { secs: 100, nanos: 0 }, 1_000_000_000).expect("clock");
-    assert!(clock.is_racy(&stat_at(99, 500_000_000)), "within one tick of now");
-    assert!(clock.is_racy(&stat_at(99, 0)), "exactly one tick before now");
+    let clock = StatClock::new(
+        StatTime {
+            secs: 100,
+            nanos: 0,
+        },
+        1_000_000_000,
+    )
+    .expect("clock");
+    assert!(
+        clock.is_racy(&stat_at(99, 500_000_000)),
+        "within one tick of now"
+    );
+    assert!(
+        clock.is_racy(&stat_at(99, 0)),
+        "exactly one tick before now"
+    );
     assert!(!clock.is_racy(&stat_at(98, 999_999_999)));
-    assert!(clock.is_racy(&stat_at(101, 0)), "future timestamps are racy");
+    assert!(
+        clock.is_racy(&stat_at(101, 0)),
+        "future timestamps are racy"
+    );
 
     let old = stat_at(50, 0);
-    assert!(matches!(trust(Some(&row(old, false)), &old, &clock), Trust::Clean { .. }));
+    assert!(matches!(
+        trust(Some(&row(old, false)), &old, &clock),
+        Trust::Clean { .. }
+    ));
     assert_eq!(trust(Some(&row(old, true)), &old, &clock), Trust::Rehash);
     assert_eq!(trust(None, &old, &clock), Trust::Rehash);
     let mut grown = old;
@@ -241,10 +265,26 @@ fn racy_and_future_timestamps_are_never_trusted() {
         "a future tuple stays untrusted even when a row claims it is clean"
     );
 
-    let coarse = StatClock::new(StatTime { secs: 100, nanos: 0 }, StatClock::COARSE_RESOLUTION_NS)
-        .expect("clock");
-    assert!(coarse.is_racy(&stat_at(98, 0)), "two-second filesystems widen the window");
-    let recorded = StatusRow::observed(stat_at(99, 0), FileMode::Regular, row(old, false).blob, true, &clock, None);
+    let coarse = StatClock::new(
+        StatTime {
+            secs: 100,
+            nanos: 0,
+        },
+        StatClock::COARSE_RESOLUTION_NS,
+    )
+    .expect("clock");
+    assert!(
+        coarse.is_racy(&stat_at(98, 0)),
+        "two-second filesystems widen the window"
+    );
+    let recorded = StatusRow::observed(
+        stat_at(99, 0),
+        FileMode::Regular,
+        row(old, false).blob,
+        true,
+        &clock,
+        None,
+    );
     assert!(recorded.racy);
     let unstable = StatusRow::observed(old, FileMode::Regular, recorded.blob, false, &clock, None);
     assert!(unstable.racy, "bytes read while the tuple moved are racy");
@@ -275,7 +315,10 @@ fn reducer_excludes_internal_out_of_scope_and_invalid_paths() {
         dirty.paths.into_iter().collect::<Vec<_>>(),
         vec![path("a/f"), path("a/gone"), path("top")]
     );
-    assert_eq!(dirty.subtrees.into_iter().collect::<Vec<_>>(), vec![path("a/sub")]);
+    assert_eq!(
+        dirty.subtrees.into_iter().collect::<Vec<_>>(),
+        vec![path("a/sub")]
+    );
 }
 
 #[test]
@@ -284,22 +327,38 @@ fn reducer_requires_crawl_on_overflow_gap_or_new_instance() {
     let mut overflowed = batch(at(1), at(2), vec![changed("f")]);
     overflowed.overflowed = true;
     assert_eq!(reduce(at(1), &overflowed, &scope), DirtySet::crawl());
-    assert_eq!(reduce(at(0), &batch(at(1), at(2), Vec::new()), &scope), DirtySet::crawl());
-    assert_eq!(reduce(at(3), &batch(at(3), at(2), Vec::new()), &scope), DirtySet::crawl());
+    assert_eq!(
+        reduce(at(0), &batch(at(1), at(2), Vec::new()), &scope),
+        DirtySet::crawl()
+    );
+    assert_eq!(
+        reduce(at(3), &batch(at(3), at(2), Vec::new()), &scope),
+        DirtySet::crawl()
+    );
     let other = WatchToken::At {
         instance: [9; 16],
         cursor: 2,
     };
-    assert_eq!(reduce(at(1), &batch(at(1), other, Vec::new()), &scope), DirtySet::crawl());
     assert_eq!(
-        reduce(WatchToken::Invalid, &batch(WatchToken::Invalid, at(1), Vec::new()), &scope),
+        reduce(at(1), &batch(at(1), other, Vec::new()), &scope),
+        DirtySet::crawl()
+    );
+    assert_eq!(
+        reduce(
+            WatchToken::Invalid,
+            &batch(WatchToken::Invalid, at(1), Vec::new()),
+            &scope
+        ),
         DirtySet::crawl()
     );
     let root_rescan = WatchEvent {
         path: Vec::new(),
         kind: WatchEventKind::Rescan,
     };
-    assert_eq!(reduce(at(1), &batch(at(1), at(2), vec![root_rescan]), &scope), DirtySet::crawl());
+    assert_eq!(
+        reduce(at(1), &batch(at(1), at(2), vec![root_rescan]), &scope),
+        DirtySet::crawl()
+    );
     assert!(reduce(at(1), &batch(at(1), at(2), Vec::new()), &scope).is_clean());
     assert!(at(1).precedes(at(5)));
     assert!(!at(1).precedes(at(0)));
@@ -314,11 +373,15 @@ fn first_snapshot_crawls_and_never_records_the_internal_directory() {
     fixture.put("d/b.txt", b"beta\n");
     fixture.put(".ruk/scratch", b"internal\n");
     let first = batch(WatchToken::Invalid, at(1), Vec::new());
-    let SnapshotOutcome::Changed(prepared) = fixture.snapshot(fixture.empty_tree, Some(&first)) else {
+    let SnapshotOutcome::Changed(prepared) = fixture.snapshot(fixture.empty_tree, Some(&first))
+    else {
         panic!("a populated worktree must change the empty tree");
     };
     assert_eq!(prepared.descriptor.source, DirtySource::Crawl);
-    assert_eq!(prepared.descriptor.changed, vec![path("a.txt"), path("d/b.txt")]);
+    assert_eq!(
+        prepared.descriptor.changed,
+        vec![path("a.txt"), path("d/b.txt")]
+    );
     assert!(prepared.descriptor.removed.is_empty());
     assert!(prepared.descriptor.conflict_edits.is_empty());
     assert_eq!(prepared.descriptor.base_tree, fixture.empty_tree);
@@ -340,7 +403,10 @@ fn first_snapshot_crawls_and_never_records_the_internal_directory() {
     assert!(
         fixture
             .store
-            .fact(FactTable::WsStatus, &cache_key(fixture.workspace, b".ruk/scratch"))
+            .fact(
+                FactTable::WsStatus,
+                &cache_key(fixture.workspace, b".ruk/scratch")
+            )
             .expect("lookup")
             .is_none()
     );
@@ -350,7 +416,10 @@ fn first_snapshot_crawls_and_never_records_the_internal_directory() {
 fn an_empty_dirty_set_produces_no_mutations() {
     let fixture = Fixture::new(Scope::Full);
     fixture.put("f", b"one\n");
-    let tree = fixture.commit(fixture.empty_tree, Some(&batch(WatchToken::Invalid, at(1), Vec::new())));
+    let tree = fixture.commit(
+        fixture.empty_tree,
+        Some(&batch(WatchToken::Invalid, at(1), Vec::new())),
+    );
     let quiet = batch(at(1), at(2), Vec::new());
     let SnapshotOutcome::NoChange { cache } = fixture.snapshot(tree, Some(&quiet)) else {
         panic!("no events must not change the tree");
@@ -366,7 +435,10 @@ fn an_empty_dirty_set_produces_no_mutations() {
 fn watcher_overflow_falls_back_to_a_crawl_that_finds_unreported_edits() {
     let fixture = Fixture::new(Scope::Full);
     fixture.put("d/b.txt", b"beta\n");
-    let tree = fixture.commit(fixture.empty_tree, Some(&batch(WatchToken::Invalid, at(1), Vec::new())));
+    let tree = fixture.commit(
+        fixture.empty_tree,
+        Some(&batch(WatchToken::Invalid, at(1), Vec::new())),
+    );
     fixture.put("d/b.txt", b"BETA, longer\n");
     let mut lost = batch(at(1), at(2), Vec::new());
     lost.overflowed = true;
@@ -396,7 +468,10 @@ fn rebuild_touches_only_dirty_ancestors_and_reuses_untouched_subtrees() {
     let fixture = Fixture::new(Scope::Full);
     fixture.put("x/f", b"x one\n");
     fixture.put("y/g", b"y one\n");
-    let tree = fixture.commit(fixture.empty_tree, Some(&batch(WatchToken::Invalid, at(1), Vec::new())));
+    let tree = fixture.commit(
+        fixture.empty_tree,
+        Some(&batch(WatchToken::Invalid, at(1), Vec::new())),
+    );
     let y_before = fixture.subtree(tree, "y");
     fixture.put("x/f", b"x two, different length\n");
     let events = batch(at(1), at(2), vec![changed("x/f")]);
@@ -404,20 +479,36 @@ fn rebuild_touches_only_dirty_ancestors_and_reuses_untouched_subtrees() {
         panic!("the reported edit must change the tree");
     };
     assert_eq!(prepared.descriptor.source, DirtySource::Watcher);
-    let kinds: Vec<ObjectKind> = prepared.objects.iter().map(|object| object.kind()).collect();
+    let kinds: Vec<ObjectKind> = prepared
+        .objects
+        .iter()
+        .map(|object| object.kind())
+        .collect();
     assert_eq!(
-        kinds.iter().filter(|kind| **kind == ObjectKind::Tree).count(),
+        kinds
+            .iter()
+            .filter(|kind| **kind == ObjectKind::Tree)
+            .count(),
         2,
         "only x and the root are re-encoded"
     );
-    assert_eq!(kinds.iter().filter(|kind| **kind == ObjectKind::Blob).count(), 1);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == ObjectKind::Blob)
+            .count(),
+        1
+    );
     let next = prepared.descriptor.tree;
     fixture
         .store
         .publish(prepared.objects, &prepared.facts)
         .expect("publish");
     assert_eq!(fixture.subtree(next, "y"), y_before);
-    assert_eq!(fixture.files(next)["x/f"], fixture.blob(b"x two, different length\n"));
+    assert_eq!(
+        fixture.files(next)["x/f"],
+        fixture.blob(b"x two, different length\n")
+    );
 
     std::fs::remove_file(fixture.root.join("x/f")).expect("remove");
     std::fs::remove_dir(fixture.root.join("x")).expect("remove dir");
@@ -486,7 +577,13 @@ fn a_journal_opened_after_the_check_fails_the_snapshot_publication() {
         .store
         .publish(prepared.objects, &prepared.facts)
         .expect_err("the guard must fence the journal");
-    assert!(matches!(error, StoreError::StaleFact { table: "ws_apply", .. }));
+    assert!(matches!(
+        error,
+        StoreError::StaleFact {
+            table: "ws_apply",
+            ..
+        }
+    ));
 }
 
 #[derive(Debug)]
@@ -500,7 +597,10 @@ impl JournalState for Recovering {
     ) -> Result<ApplyObservation, crate::CoreError> {
         Ok(ApplyObservation {
             phase: ApplyPhase::Recovery,
-            guard: guard_for(workspace, store.fact(FactTable::WsApply, &ws_apply_key(workspace))?),
+            guard: guard_for(
+                workspace,
+                store.fact(FactTable::WsApply, &ws_apply_key(workspace))?,
+            ),
         })
     }
 }
@@ -526,12 +626,19 @@ fn a_recovery_journal_blocks_snapshot_with_recovery() {
 fn explicit_write_hashes_bytes_the_stat_cache_would_trust() {
     let fixture = Fixture::new(Scope::Full);
     fixture.put("f", b"before\n");
-    let tree = fixture.commit(fixture.empty_tree, Some(&batch(WatchToken::Invalid, at(1), Vec::new())));
+    let tree = fixture.commit(
+        fixture.empty_tree,
+        Some(&batch(WatchToken::Invalid, at(1), Vec::new())),
+    );
     fixture.put("f", b"AFTER!\n");
 
     // Model the floor: a same-tick edit whose tuple the cache already holds.
     let key = cache_key(fixture.workspace, b"f");
-    let bytes = fixture.store.fact(FactTable::WsStatus, &key).expect("lookup").expect("row");
+    let bytes = fixture
+        .store
+        .fact(FactTable::WsStatus, &key)
+        .expect("lookup")
+        .expect("row");
     let mut forged: StatusRow = decode_row(&fixture.store, "row", &bytes).expect("decode");
     let meta = std::fs::symlink_metadata(fixture.root.join("f")).expect("stat");
     forged.stat = FileStat::from_metadata(&meta).expect("tuple");
@@ -549,7 +656,10 @@ fn explicit_write_hashes_bytes_the_stat_cache_would_trust() {
         )
         .expect("forge row");
     assert!(
-        matches!(fixture.snapshot(tree, None), SnapshotOutcome::NoChange { .. }),
+        matches!(
+            fixture.snapshot(tree, None),
+            SnapshotOutcome::NoChange { .. }
+        ),
         "a trusted tuple hides a same-tick edit from the crawl"
     );
 
@@ -619,11 +729,18 @@ fn explicit_write_rejects_stale_stamps_and_out_of_scope_paths() {
     let outside = [path("b/f")];
     let error = write(&fixture.store, &make(&fixture, &inside, stale)).expect_err("stale stamp");
     assert_eq!(error.code, ErrorCode::EStale);
-    let error = write(&fixture.store, &make(&fixture, &outside, WorkspaceStamp::INITIAL))
-        .expect_err("out of scope");
+    let error = write(
+        &fixture.store,
+        &make(&fixture, &outside, WorkspaceStamp::INITIAL),
+    )
+    .expect_err("out of scope");
     assert_eq!(error.code, ErrorCode::EInvalid);
     assert!(matches!(
-        write(&fixture.store, &make(&fixture, &inside, WorkspaceStamp::INITIAL)).expect("write"),
+        write(
+            &fixture.store,
+            &make(&fixture, &inside, WorkspaceStamp::INITIAL)
+        )
+        .expect("write"),
         WriteOutcome::Changed(_)
     ));
 }
@@ -647,7 +764,8 @@ fn snapshot_skips_ignored_untracked_files_but_write_includes_them() {
         ignore: &ignored,
         ..fixture.input(fixture.empty_tree, None)
     };
-    let SnapshotOutcome::Changed(prepared) = snapshot(&fixture.store, &input).expect("snapshot") else {
+    let SnapshotOutcome::Changed(prepared) = snapshot(&fixture.store, &input).expect("snapshot")
+    else {
         panic!("the unignored file must change the tree");
     };
     assert_eq!(prepared.descriptor.changed, vec![path("keep")]);
@@ -670,7 +788,8 @@ fn snapshot_skips_ignored_untracked_files_but_write_includes_them() {
         limits: CrawlLimits::reference(),
         journal: &NO_JOURNAL,
     };
-    let WriteOutcome::Changed(prepared) = write(&fixture.store, &write_input).expect("write") else {
+    let WriteOutcome::Changed(prepared) = write(&fixture.store, &write_input).expect("write")
+    else {
         panic!("write never consults the ignore rule");
     };
     assert_eq!(prepared.descriptor.written, vec![path("target/skip")]);
@@ -682,14 +801,23 @@ fn cone_scope_keeps_out_of_scope_trees_by_id() {
     fixture.put("a/in", b"one\n");
     fixture.put("b/out", b"one\n");
     fixture.put("top", b"one\n");
-    let tree = fixture.commit(fixture.empty_tree, Some(&batch(WatchToken::Invalid, at(1), Vec::new())));
+    let tree = fixture.commit(
+        fixture.empty_tree,
+        Some(&batch(WatchToken::Invalid, at(1), Vec::new())),
+    );
     // Root files are always in a cone scope; the unlisted directory is not.
     assert_eq!(
         fixture.files(tree).keys().cloned().collect::<Vec<_>>(),
         vec!["a/in".to_owned(), "top".to_owned()]
     );
     let in_row = cache_key(fixture.workspace, b"a/in");
-    assert!(fixture.store.fact(FactTable::WsStatus, &in_row).expect("lookup").is_some());
+    assert!(
+        fixture
+            .store
+            .fact(FactTable::WsStatus, &in_row)
+            .expect("lookup")
+            .is_some()
+    );
     assert!(
         fixture
             .store

@@ -117,7 +117,10 @@ mod tests {
             Authority::Expired => panic!("fresh interactive lease must be live"),
         }
         assert!(interactive_authority(created, created).is_live());
-        assert!(interactive_authority(created, created + INTERACTIVE_TTL - Duration::from_nanos(1)).is_live());
+        assert!(
+            interactive_authority(created, created + INTERACTIVE_TTL - Duration::from_nanos(1))
+                .is_live()
+        );
         assert!(!interactive_authority(created, created + INTERACTIVE_TTL).is_live());
     }
 
@@ -136,7 +139,10 @@ mod tests {
     fn bulk_no_progress_lapses_at_thirty_seconds() {
         let progress = inst();
         assert!(!bulk_progress_lapsed(progress, progress));
-        assert!(!bulk_progress_lapsed(progress, progress + BULK_NO_PROGRESS - Duration::from_nanos(1)));
+        assert!(!bulk_progress_lapsed(
+            progress,
+            progress + BULK_NO_PROGRESS - Duration::from_nanos(1)
+        ));
         assert!(bulk_progress_lapsed(progress, progress + BULK_NO_PROGRESS));
     }
 

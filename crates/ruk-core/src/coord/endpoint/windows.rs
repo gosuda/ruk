@@ -17,13 +17,13 @@ use std::io;
 
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer};
 
+use crate::StoreId;
 use crate::coord::lock::EndpointAddress;
 use crate::coord::windows::{
     create_first_pipe_server, create_subsequent_pipe_server, generate_pipe_name,
     validate_pipe_address,
 };
 use crate::error::{CoreError, ErrorCode};
-use crate::StoreId;
 
 /// The Windows named pipe coordinator endpoint listener.
 pub(crate) struct WindowsEndpoint {
@@ -216,7 +216,8 @@ mod tests {
             .expect("tokio runtime");
 
         rt.block_on(async {
-            let missing_addr = EndpointAddress::Pipe(r"\\.\pipe\ruk-nonexistent-test-pipe".to_string());
+            let missing_addr =
+                EndpointAddress::Pipe(r"\\.\pipe\ruk-nonexistent-test-pipe".to_string());
             let err = connect(&missing_addr).await.unwrap_err();
             assert_eq!(err.code, ErrorCode::ENotFound);
         });
@@ -239,13 +240,19 @@ mod tests {
                 client.write_all(b"ping").await.expect("client write ping");
 
                 let mut reply = [0u8; 4];
-                client.read_exact(&mut reply).await.expect("client read pong");
+                client
+                    .read_exact(&mut reply)
+                    .await
+                    .expect("client read pong");
                 assert_eq!(&reply, b"pong");
             });
 
             let mut server = endpoint.accept().await.expect("accept server");
             let mut request = [0u8; 4];
-            server.read_exact(&mut request).await.expect("server read ping");
+            server
+                .read_exact(&mut request)
+                .await
+                .expect("server read ping");
             assert_eq!(&request, b"ping");
 
             server.write_all(b"pong").await.expect("server write pong");
@@ -261,7 +268,10 @@ mod tests {
 
             let mut second_server = endpoint.accept().await.expect("second accept");
             let mut buf = [0u8; 2];
-            second_server.read_exact(&mut buf).await.expect("second server read");
+            second_server
+                .read_exact(&mut buf)
+                .await
+                .expect("second server read");
             assert_eq!(&buf, b"ok");
 
             second_client_task.await.expect("second client task");
@@ -281,22 +291,27 @@ mod tests {
             let address = endpoint.address().clone();
 
             // Cancel accept while waiting (timeout of 10 ms).
-            let timeout_result = tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                endpoint.accept(),
-            )
-            .await;
-            assert!(timeout_result.is_err(), "accept must timeout without client");
+            let timeout_result =
+                tokio::time::timeout(std::time::Duration::from_millis(10), endpoint.accept()).await;
+            assert!(
+                timeout_result.is_err(),
+                "accept must timeout without client"
+            );
 
             // Verify endpoint is still intact and can accept subsequent client connection.
             let client_task = tokio::spawn(async move {
-                let mut client = connect(&address).await.expect("connect client after cancel");
+                let mut client = connect(&address)
+                    .await
+                    .expect("connect client after cancel");
                 client.write_all(b"data").await.expect("write after cancel");
             });
 
             let mut server = endpoint.accept().await.expect("accept after cancel");
             let mut buf = [0u8; 4];
-            server.read_exact(&mut buf).await.expect("read after cancel");
+            server
+                .read_exact(&mut buf)
+                .await
+                .expect("read after cancel");
             assert_eq!(&buf, b"data");
 
             client_task.await.expect("client task");

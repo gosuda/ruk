@@ -46,7 +46,7 @@ use ruk_core::store::durability::install_file;
 use ruk_core::store::{ObjectKind, Store, StoreError};
 use ruk_core::workspace::HeadRef;
 
-pub use pack::{PackedEntry, PackWriter, pack_name, write_idx_v2};
+pub use pack::{PackWriter, PackedEntry, pack_name, write_idx_v2};
 pub use report::{
     DroppedReflog, ExportReport, HeadReport, Loss, LossCategory, PackReport, ReflogDropReason,
     ReflogsReport, RefsReport, UnexportedReason, UnexportedRef, disposition, object_format,
@@ -146,7 +146,8 @@ pub fn export_repository(store: &Store, request: &ExportRequest) -> Result<Expor
     };
     layout.install(Path::new("HEAD"), &head_bytes)?;
 
-    plan.unexported.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    plan.unexported
+        .sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
     Ok(ExportReport {
         version: report::REPORT_VERSION,
         object_format: object_format(kind),
@@ -349,10 +350,10 @@ fn verify_export(
         return Err(corrupt("the written index is not version 2".to_owned()));
     }
     let count = expected.len();
-    let pack_count =
-        usize::try_from(pack.num_objects()).map_err(|_| corrupt("the pack is too large".to_owned()))?;
-    let index_count =
-        usize::try_from(index.num_objects()).map_err(|_| corrupt("the index is too large".to_owned()))?;
+    let pack_count = usize::try_from(pack.num_objects())
+        .map_err(|_| corrupt("the pack is too large".to_owned()))?;
+    let index_count = usize::try_from(index.num_objects())
+        .map_err(|_| corrupt("the index is too large".to_owned()))?;
     if pack_count != count || index_count != count {
         return Err(corrupt(format!(
             "the written pack holds {pack_count} objects, expected {count}"
@@ -381,14 +382,24 @@ fn verify_entries(
         by_offset.push((index.pack_offset_at_index(at), oid, want, at));
     }
     by_offset.sort_unstable_by_key(|&(offset, _, _, _)| offset);
-    let end = u64::try_from(pack.pack_end())
-        .map_err(|_| corrupt("the pack is too large".to_owned()))?;
+    let end =
+        u64::try_from(pack.pack_end()).map_err(|_| corrupt("the pack is too large".to_owned()))?;
     for (position, &(offset, oid, want, at)) in by_offset.iter().enumerate() {
         let next = by_offset.get(position + 1).map_or(end, |&(next, ..)| next);
         if next < offset {
             return Err(corrupt(format!("object {oid} has a backwards offset")));
         }
-        verify_entry(store, pack, index, offset, next - offset, oid, want, at, kind)?;
+        verify_entry(
+            store,
+            pack,
+            index,
+            offset,
+            next - offset,
+            oid,
+            want,
+            at,
+            kind,
+        )?;
     }
     Ok(())
 }
@@ -415,7 +426,9 @@ fn verify_entry(
         gix_pack::data::entry::Header::Tag => ObjectKind::Tag,
         gix_pack::data::entry::Header::RefDelta { .. }
         | gix_pack::data::entry::Header::OfsDelta { .. } => {
-            return Err(corrupt(format!("object {oid} is deltified in a stored pack")));
+            return Err(corrupt(format!(
+                "object {oid} is deltified in a stored pack"
+            )));
         }
     };
     if actual != want {
@@ -426,7 +439,8 @@ fn verify_entry(
     let Some(want_crc) = index.crc32_at_index(at) else {
         return Err(corrupt(format!("object {oid} has no CRC in the index")));
     };
-    let size_usize = usize::try_from(size).map_err(|_| corrupt(format!("object {oid} is too large")))?;
+    let size_usize =
+        usize::try_from(size).map_err(|_| corrupt(format!("object {oid} is too large")))?;
     if pack.entry_crc32(offset, size_usize) != want_crc {
         return Err(corrupt(format!("object {oid} fails its index CRC")));
     }
@@ -437,22 +451,16 @@ fn verify_entry(
     // The zlib stream starts after the entry's varint header, at the
     // absolute `data_offset`; the slice starts at the header, so skip the
     // difference.
-    let prefix = entry.data_offset.checked_sub(offset).ok_or_else(|| {
-        corrupt(format!("object {oid} has its data before its header"))
-    })?;
-    let start = usize::try_from(prefix)
-        .map_err(|_| corrupt(format!("object {oid} is too large")))?;
+    let prefix = entry
+        .data_offset
+        .checked_sub(offset)
+        .ok_or_else(|| corrupt(format!("object {oid} has its data before its header")))?;
+    let start =
+        usize::try_from(prefix).map_err(|_| corrupt(format!("object {oid} is too large")))?;
     let Some(compressed) = slice.get(start..) else {
         return Err(corrupt(format!("object {oid} has its data past its end")));
     };
-    verify_bytes(
-        store,
-        compressed,
-        entry.decompressed_size,
-        oid,
-        want,
-        kind,
-    )
+    verify_bytes(store, compressed, entry.decompressed_size, oid, want, kind)
 }
 
 /// Inflates one entry, re-hashes it, and byte-compares it with the store.
@@ -537,23 +545,25 @@ fn hash_trailer(path: &Path, kind: HashKind) -> Result<(Oid, Oid), GitError> {
             .min(remaining);
         let want =
             usize::try_from(capped).map_err(|_| corrupt("a hash chunk is too large".to_owned()))?;
-        reader.read_exact(&mut buf[..want]).map_err(pack::io_error)?;
+        reader
+            .read_exact(&mut buf[..want])
+            .map_err(pack::io_error)?;
         hasher.update(&buf[..want]);
         remaining -= capped;
     }
     drop(reader);
-    let computed = hasher.try_finalize().map(Oid::from).map_err(|err| {
-        corrupt(format!("{} hash refused: {err}", path.display()))
-    })?;
+    let computed = hasher
+        .try_finalize()
+        .map(Oid::from)
+        .map_err(|err| corrupt(format!("{} hash refused: {err}", path.display())))?;
     let mut file = File::open(path).map_err(pack::io_error)?;
     use std::io::Seek as _;
     file.seek(std::io::SeekFrom::Start(len - hash_len))
         .map_err(pack::io_error)?;
     let mut trailer = vec![0u8; kind.oid_len()];
     file.read_exact(&mut trailer).map_err(pack::io_error)?;
-    let stored = Oid::from_bytes(&trailer).map_err(|err| {
-        corrupt(format!("{} has a malformed trailer: {err}", path.display()))
-    })?;
+    let stored = Oid::from_bytes(&trailer)
+        .map_err(|err| corrupt(format!("{} has a malformed trailer: {err}", path.display())))?;
     Ok((computed, stored))
 }
 

@@ -172,14 +172,24 @@ impl AdmissionLimits {
             }
         }
         let shares = [
-            ("interactive", self.storage.interactive, self.interactive.slots),
+            (
+                "interactive",
+                self.storage.interactive,
+                self.interactive.slots,
+            ),
             ("bulk", self.storage.bulk, self.bulk.slots),
             ("hook", self.storage.hook, self.hook.slots),
-            ("maintenance", self.storage.maintenance, self.maintenance.slots),
+            (
+                "maintenance",
+                self.storage.maintenance,
+                self.maintenance.slots,
+            ),
         ];
         for (name, share, slots) in shares {
             if share == 0 || share > slots {
-                return Err(invalid(format!("{name} storage permits must be 1 to the class slots")));
+                return Err(invalid(format!(
+                    "{name} storage permits must be 1 to the class slots"
+                )));
             }
         }
         self.validate_repo_caps()?;
@@ -325,9 +335,9 @@ impl Admission {
             request_bytes,
             deadline: request.deadline,
         };
-        let mut queued = self
-            .shared
-            .enqueue(repo.key, &repo.payload, submission, Instant::now())?;
+        let mut queued =
+            self.shared
+                .enqueue(repo.key, &repo.payload, submission, Instant::now())?;
         let ticket = queued.wait(cancel).await?;
         Ok(Admitted {
             ticket,
@@ -549,7 +559,12 @@ mod tests {
         let now = Instant::now();
         let mut occupant = admission
             .shared
-            .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 0), now)
+            .enqueue(
+                repo.key,
+                &repo.payload,
+                submission(RequestClass::Interactive, 0),
+                now,
+            )
             .expect("occupant");
         let scheduler::Claim::Granted(ticket) = occupant.poll(now) else {
             panic!("the first request takes the only interactive permit");
@@ -558,19 +573,35 @@ mod tests {
         for _ in 0..4 {
             let waiter = admission
                 .shared
-                .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 256), now)
+                .enqueue(
+                    repo.key,
+                    &repo.payload,
+                    submission(RequestClass::Interactive, 256),
+                    now,
+                )
                 .expect("within the repository payload budget");
             waiters.push(waiter);
         }
-        let refused = admission
-            .shared
-            .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 256), now);
-        assert_eq!(refused.err().map(|error| error.code), Some(ErrorCode::ELimit));
+        let refused = admission.shared.enqueue(
+            repo.key,
+            &repo.payload,
+            submission(RequestClass::Interactive, 256),
+            now,
+        );
+        assert_eq!(
+            refused.err().map(|error| error.code),
+            Some(ErrorCode::ELimit)
+        );
 
         drop(waiters.pop());
         admission
             .shared
-            .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 256), now)
+            .enqueue(
+                repo.key,
+                &repo.payload,
+                submission(RequestClass::Interactive, 256),
+                now,
+            )
             .expect("the abandoned waiter released its payload reservation");
         drop(ticket);
     }
@@ -669,9 +700,17 @@ mod tests {
                 .expect("ordinary permit");
             let mut waiter = admission
                 .shared
-                .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 0), Instant::now())
+                .enqueue(
+                    repo.key,
+                    &repo.payload,
+                    submission(RequestClass::Interactive, 0),
+                    Instant::now(),
+                )
                 .expect("queued behind saturation");
-            assert!(matches!(waiter.poll(Instant::now()), scheduler::Claim::Pending));
+            assert!(matches!(
+                waiter.poll(Instant::now()),
+                scheduler::Claim::Pending
+            ));
             let control = admission
                 .admit(&repo, request(RequestClass::Control, 0), &cancel)
                 .await
@@ -695,7 +734,12 @@ mod tests {
                 .expect("granted permit");
             let mut queued = admission
                 .shared
-                .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 0), Instant::now())
+                .enqueue(
+                    repo.key,
+                    &repo.payload,
+                    submission(RequestClass::Interactive, 0),
+                    Instant::now(),
+                )
                 .expect("queued");
             admission.close();
             let error = queued
@@ -718,7 +762,12 @@ mod tests {
         let now = Instant::now();
         let mut queued = admission
             .shared
-            .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 0), now)
+            .enqueue(
+                repo.key,
+                &repo.payload,
+                submission(RequestClass::Interactive, 0),
+                now,
+            )
             .expect("queued");
         let scheduler::Claim::Granted(mut ticket) = queued.poll(now) else {
             panic!("the request runs on an idle admission");
@@ -729,7 +778,10 @@ mod tests {
             .shared
             .deficit_of(repo.key, RequestClass::Interactive)
             .expect("the repository is registered");
-        assert!(balance < 0, "measured work beyond the prediction stays owed");
+        assert!(
+            balance < 0,
+            "measured work beyond the prediction stays owed"
+        );
     }
 
     #[test]
@@ -743,20 +795,35 @@ mod tests {
 
         let mut first = admission
             .shared
-            .enqueue(busy.key, &busy.payload, submission(RequestClass::Interactive, 0), now)
+            .enqueue(
+                busy.key,
+                &busy.payload,
+                submission(RequestClass::Interactive, 0),
+                now,
+            )
             .expect("first");
         let scheduler::Claim::Granted(_holding) = first.poll(now) else {
             panic!("the busy repository takes its cap");
         };
         let mut second = admission
             .shared
-            .enqueue(busy.key, &busy.payload, submission(RequestClass::Interactive, 0), now)
+            .enqueue(
+                busy.key,
+                &busy.payload,
+                submission(RequestClass::Interactive, 0),
+                now,
+            )
             .expect("second");
         assert!(matches!(second.poll(now), scheduler::Claim::Pending));
 
         let mut other = admission
             .shared
-            .enqueue(quiet.key, &quiet.payload, submission(RequestClass::Interactive, 0), now)
+            .enqueue(
+                quiet.key,
+                &quiet.payload,
+                submission(RequestClass::Interactive, 0),
+                now,
+            )
             .expect("quiet");
         assert!(matches!(other.poll(now), scheduler::Claim::Granted(_)));
     }
@@ -768,7 +835,12 @@ mod tests {
         let now = Instant::now();
         let mut queued = admission
             .shared
-            .enqueue(repo.key, &repo.payload, submission(RequestClass::Interactive, 0), now)
+            .enqueue(
+                repo.key,
+                &repo.payload,
+                submission(RequestClass::Interactive, 0),
+                now,
+            )
             .expect("queued");
         let scheduler::Claim::Granted(ticket) = queued.poll(now) else {
             panic!("the request runs on an idle admission");
@@ -778,7 +850,10 @@ mod tests {
             .shared
             .deficit_of(repo.key, RequestClass::Interactive)
             .expect("the repository is registered");
-        assert!(balance <= 0, "a job that reports no work earns no credit back");
+        assert!(
+            balance <= 0,
+            "a job that reports no work earns no credit back"
+        );
     }
 
     #[test]
@@ -802,7 +877,10 @@ mod tests {
                 .shared
                 .deficit_of(repo.key, RequestClass::Interactive)
                 .expect("the repository is registered");
-            assert!(balance < 0, "a 20 ms closure is charged beyond its 1 ms prediction");
+            assert!(
+                balance < 0,
+                "a 20 ms closure is charged beyond its 1 ms prediction"
+            );
         });
     }
 }

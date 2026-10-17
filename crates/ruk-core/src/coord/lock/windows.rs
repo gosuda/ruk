@@ -15,7 +15,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::coord::windows::{
-    lock_exclusive_range, open_lock_file, unlock_exclusive_range, validate_lock_file, LockOpenMode,
+    LockOpenMode, lock_exclusive_range, open_lock_file, unlock_exclusive_range, validate_lock_file,
 };
 use crate::error::{CoreError, ErrorCode};
 

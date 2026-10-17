@@ -126,7 +126,11 @@ fn single_add_publishes_a_live_statement_and_a_repeat_is_a_duplicate() {
     let args = sign(&key(0x11), statement(lab.a, "review", "pass", T0, None));
 
     let first = prepare_add(lab.store(), &args, &open).expect("prepare");
-    assert_eq!(first.mutations.len(), 2, "statement row and order index row");
+    assert_eq!(
+        first.mutations.len(),
+        2,
+        "statement row and order index row"
+    );
     assert_eq!(first.records[0].disposition, Disposition::Added);
     assert_eq!(first.records[0].record.status, AttestationStatus::Live);
     apply(lab.store(), &first);
@@ -159,16 +163,16 @@ fn same_signer_supersession_retires_its_predecessor_and_clears_the_conflict() {
     apply(lab.store(), &prepared);
 
     let records = everything(lab.store());
-    assert_eq!(status_of(&records, fail_digest), AttestationStatus::Superseded);
-    assert_eq!(status_of(&records, digest_of(&pass)), AttestationStatus::Live);
-    let passing = attested(
-        lab.store(),
-        &lab.a,
-        &kind("review"),
-        &result("pass"),
-        &open,
-    )
-    .expect("attested");
+    assert_eq!(
+        status_of(&records, fail_digest),
+        AttestationStatus::Superseded
+    );
+    assert_eq!(
+        status_of(&records, digest_of(&pass)),
+        AttestationStatus::Live
+    );
+    let passing =
+        attested(lab.store(), &lab.a, &kind("review"), &result("pass"), &open).expect("attested");
     assert_eq!(passing.len(), 1);
     assert_eq!(passing[0].status, AttestationStatus::Live);
 }
@@ -178,21 +182,24 @@ fn a_conflicting_future_timestamp_never_wins_and_both_statements_stay_ambiguous(
     let lab = Lab::new("future");
     let signer = key(0x11);
     let pass = sign(&signer, statement(lab.a, "review", "pass", T0, None));
-    let future = sign(&signer, statement(lab.a, "review", "fail", FAR_FUTURE, None));
+    let future = sign(
+        &signer,
+        statement(lab.a, "review", "fail", FAR_FUTURE, None),
+    );
     lab.add(&pass);
     lab.add(&future);
 
     let records = everything(lab.store());
-    assert_eq!(status_of(&records, digest_of(&pass)), AttestationStatus::Ambiguous);
-    assert_eq!(status_of(&records, digest_of(&future)), AttestationStatus::Ambiguous);
-    let passing = attested(
-        lab.store(),
-        &lab.a,
-        &kind("review"),
-        &result("pass"),
-        &open,
-    )
-    .expect("attested");
+    assert_eq!(
+        status_of(&records, digest_of(&pass)),
+        AttestationStatus::Ambiguous
+    );
+    assert_eq!(
+        status_of(&records, digest_of(&future)),
+        AttestationStatus::Ambiguous
+    );
+    let passing =
+        attested(lab.store(), &lab.a, &kind("review"), &result("pass"), &open).expect("attested");
     assert_eq!(passing.len(), 1, "attested exposes the ambiguous match");
     assert_eq!(passing[0].status, AttestationStatus::Ambiguous);
 
@@ -204,9 +211,18 @@ fn a_conflicting_future_timestamp_never_wins_and_both_statements_stay_ambiguous(
     );
     lab.add(&retire);
     let records = everything(lab.store());
-    assert_eq!(status_of(&records, digest_of(&pass)), AttestationStatus::Superseded);
-    assert_eq!(status_of(&records, digest_of(&future)), AttestationStatus::Live);
-    assert_eq!(status_of(&records, digest_of(&retire)), AttestationStatus::Live);
+    assert_eq!(
+        status_of(&records, digest_of(&pass)),
+        AttestationStatus::Superseded
+    );
+    assert_eq!(
+        status_of(&records, digest_of(&future)),
+        AttestationStatus::Live
+    );
+    assert_eq!(
+        status_of(&records, digest_of(&retire)),
+        AttestationStatus::Live
+    );
 }
 
 #[test]
@@ -234,7 +250,13 @@ fn dangling_and_cross_subject_supersession_are_refused() {
     let signer = key(0x11);
     let dangling = sign(
         &signer,
-        statement(lab.a, "review", "pass", T0, Some(StatementDigest::from_bytes([9; 32]))),
+        statement(
+            lab.a,
+            "review",
+            "pass",
+            T0,
+            Some(StatementDigest::from_bytes([9; 32])),
+        ),
     );
     let refused = prepare_add(lab.store(), &dangling, &open).expect_err("dangling");
     assert_eq!(refused.code, ErrorCode::ENotFound);
@@ -261,24 +283,35 @@ fn a_batch_resolves_forward_supersession_regardless_of_order() {
         statement(lab.a, "review", "pass", T1, Some(digest_of(&fail))),
     );
 
-    let prepared =
-        prepare_batch(lab.store(), &[pass.clone(), fail.clone()], &open).expect("batch");
-    assert_eq!(prepared.mutations.len(), 4, "two statements, two rows each, no guard");
+    let prepared = prepare_batch(lab.store(), &[pass.clone(), fail.clone()], &open).expect("batch");
+    assert_eq!(
+        prepared.mutations.len(),
+        4,
+        "two statements, two rows each, no guard"
+    );
     assert_eq!(prepared.records[0].record.status, AttestationStatus::Live);
-    assert_eq!(prepared.records[1].record.status, AttestationStatus::Superseded);
+    assert_eq!(
+        prepared.records[1].record.status,
+        AttestationStatus::Superseded
+    );
     apply(lab.store(), &prepared);
 
     let records = everything(lab.store());
-    assert_eq!(status_of(&records, digest_of(&fail)), AttestationStatus::Superseded);
-    assert_eq!(status_of(&records, digest_of(&pass)), AttestationStatus::Live);
+    assert_eq!(
+        status_of(&records, digest_of(&fail)),
+        AttestationStatus::Superseded
+    );
+    assert_eq!(
+        status_of(&records, digest_of(&pass)),
+        AttestationStatus::Live
+    );
 }
 
 #[test]
 fn a_batch_adds_each_distinct_statement_once_and_marks_the_repeat() {
     let lab = Lab::new("batch-repeat");
     let args = sign(&key(0x11), statement(lab.a, "ci", "pass", T0, None));
-    let prepared =
-        prepare_batch(lab.store(), &[args.clone(), args.clone()], &open).expect("batch");
+    let prepared = prepare_batch(lab.store(), &[args.clone(), args.clone()], &open).expect("batch");
     assert_eq!(prepared.mutations.len(), 2);
     assert_eq!(prepared.records[0].disposition, Disposition::Added);
     assert_eq!(prepared.records[1].disposition, Disposition::Duplicate);
@@ -294,7 +327,11 @@ fn one_invalid_member_refuses_the_whole_batch_and_names_its_index() {
     bad.statement.result = result("fail");
     let refused = prepare_batch(lab.store(), &[good, bad], &open).expect_err("refused");
     assert_eq!(refused.code, ErrorCode::EInvalid);
-    assert!(refused.message.starts_with("statement 1:"), "{}", refused.message);
+    assert!(
+        refused.message.starts_with("statement 1:"),
+        "{}",
+        refused.message
+    );
     assert!(everything(lab.store()).is_empty());
 }
 
@@ -339,7 +376,11 @@ fn a_prepared_publication_is_refused_when_its_rows_changed_underneath_it() {
         .publish(Vec::new(), &prepared.mutations)
         .expect_err("the prepared rows are stale");
     assert_eq!(stale.code(), ErrorCode::EStale);
-    assert_eq!(everything(lab.store()).len(), 1, "the winning rows stay intact");
+    assert_eq!(
+        everything(lab.store()).len(),
+        1,
+        "the winning rows stay intact"
+    );
 }
 
 #[test]
@@ -368,8 +409,14 @@ fn a_land_requirement_binds_to_the_exact_subject_and_to_named_signers() {
     let lab = Lab::new("land-exact");
     let trusted_key = key(0x22);
     let other_key = key(0x11);
-    lab.add(&sign(&trusted_key, statement(lab.a, "review", "pass", T0, None)));
-    lab.add(&sign(&other_key, statement(lab.b, "review", "pass", T0, None)));
+    lab.add(&sign(
+        &trusted_key,
+        statement(lab.a, "review", "pass", T0, None),
+    ));
+    lab.add(&sign(
+        &other_key,
+        statement(lab.b, "review", "pass", T0, None),
+    ));
     let required = [requirement("review", "pass")];
     let trusted = [fingerprint(0x22)];
 
@@ -405,7 +452,10 @@ fn a_land_requirement_binds_to_the_exact_subject_and_to_named_signers() {
 #[test]
 fn an_empty_trust_list_cannot_satisfy_a_required_attestation() {
     let lab = Lab::new("empty-trust");
-    lab.add(&sign(&key(0x22), statement(lab.a, "review", "pass", T0, None)));
+    lab.add(&sign(
+        &key(0x22),
+        statement(lab.a, "review", "pass", T0, None),
+    ));
     let required = [requirement("review", "pass")];
 
     let refused = evaluate_requirements(lab.store(), &lab.a, &required, &[], &open)
@@ -426,8 +476,8 @@ fn a_signers_own_conflict_leaves_its_matching_statement_ambiguous_for_land() {
     let required = [requirement("review", "pass")];
     let trusted = [fingerprint(0x22)];
 
-    let evaluation = evaluate_requirements(lab.store(), &lab.a, &required, &trusted, &open)
-        .expect("evaluate");
+    let evaluation =
+        evaluate_requirements(lab.store(), &lab.a, &required, &trusted, &open).expect("evaluate");
     assert!(!evaluation.satisfied);
     assert_eq!(
         evaluation.requirements[0].outcome,
@@ -554,7 +604,10 @@ fn export_streams_every_variant_and_reload_reproduces_the_same_records() {
     assert_eq!(everything(target.store()), everything(source.store()));
     let mut again = Vec::new();
     export(target.store(), &mut again, &open).expect("re-export");
-    assert_eq!(again, bytes, "export is deterministic and reload is faithful");
+    assert_eq!(
+        again, bytes,
+        "export is deterministic and reload is faithful"
+    );
 }
 
 #[test]
@@ -630,7 +683,10 @@ fn a_stored_row_that_fails_reverification_is_corruption_and_latches_quarantine()
 
     let refused = subject_statements(lab.store(), &lab.a, None, &open).expect_err("corrupt");
     assert_eq!(refused.code, ErrorCode::ECorrupt);
-    assert!(lab.store().quarantine(), "committed damage latches quarantine");
+    assert!(
+        lab.store().quarantine(),
+        "committed damage latches quarantine"
+    );
 }
 
 #[test]
@@ -656,7 +712,10 @@ fn one_payload_signed_by_two_signers_keeps_two_live_rows() {
         .into_iter()
         .map(|record| record.signer)
         .collect();
-    assert_eq!(signers, BTreeSet::from([fingerprint(0x11), fingerprint(0x22)]));
+    assert_eq!(
+        signers,
+        BTreeSet::from([fingerprint(0x11), fingerprint(0x22)])
+    );
 
     let mut exported = Vec::new();
     let summary = export(lab.store(), &mut exported, &open).expect("export");
@@ -757,5 +816,8 @@ fn a_stored_statement_without_its_order_row_is_corruption() {
 
     let refused = prepare_add(lab.store(), &args, &open).expect_err("the order row is missing");
     assert_eq!(refused.code, ErrorCode::ECorrupt);
-    assert!(lab.store().quarantine(), "committed damage latches quarantine");
+    assert!(
+        lab.store().quarantine(),
+        "committed damage latches quarantine"
+    );
 }

@@ -12,8 +12,8 @@ use super::codec::{
     decode_change_entry, decode_change_history, decode_commit_record, decode_imported_change,
 };
 use super::keys::{
-    change_key, decode_change_key, decode_head_key, decode_history_key,
-    decode_imported_change_key, head_key, history_key, imported_change_key,
+    change_key, decode_change_key, decode_head_key, decode_history_key, decode_imported_change_key,
+    head_key, history_key, imported_change_key,
 };
 use super::types::{ChangeEntry, HistoryPage, RecordPage, RecordPageBudget};
 use crate::change::ChangeId;
@@ -197,11 +197,7 @@ impl<'a> Records<'a> {
     // -----------------------------------------------------------------------
 
     /// Checks if `head` is recorded in `change_id`'s history.
-    pub fn has_change_history(
-        &self,
-        change_id: &ChangeId,
-        head: &Head,
-    ) -> Result<bool, CoreError> {
+    pub fn has_change_history(&self, change_id: &ChangeId, head: &Head) -> Result<bool, CoreError> {
         let key = history_key(change_id, head);
         let raw = self.store.fact(FactTable::ChangeHistory, &key)?;
         match raw {
@@ -230,11 +226,9 @@ impl<'a> Records<'a> {
         };
 
         let fact_budget = FactPageBudget::new(budget.rows, budget.bytes);
-        let page = self.store.fact_page(
-            FactTable::ChangeHistory,
-            Some(&after_key),
-            fact_budget,
-        )?;
+        let page = self
+            .store
+            .fact_page(FactTable::ChangeHistory, Some(&after_key), fact_budget)?;
 
         let mut heads = Vec::with_capacity(page.rows.len());
         let mut more = false;
@@ -258,11 +252,7 @@ impl<'a> Records<'a> {
             more = true;
         }
 
-        let next_cursor = if more {
-            heads.last().copied()
-        } else {
-            None
-        };
+        let next_cursor = if more { heads.last().copied() } else { None };
 
         Ok(HistoryPage {
             heads,

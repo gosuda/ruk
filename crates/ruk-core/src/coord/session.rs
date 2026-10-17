@@ -18,14 +18,14 @@ use crate::capability::Capabilities;
 use crate::change::SessionId;
 use crate::coord::clock::{Clock, Times};
 use crate::coord::policy::{Principal, PrincipalPolicy};
-use crate::coord::rows::{decode_session, session_key, SessionRow, RECEIPT_HORIZON};
+use crate::coord::rows::{RECEIPT_HORIZON, SessionRow, decode_session, session_key};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
     ReconnectSecret, SessionAuthority, SessionOpenArgs, SessionOpenReply, SessionResumeArgs,
     SessionResumeReply, Timestamp,
 };
-use crate::store::types::FactTable;
 use crate::store::Store;
+use crate::store::types::FactTable;
 
 /// Maximum number of concurrent live session registrations per repository,
 /// including active connection bindings, pending opens, and detached in-flight work.
@@ -160,8 +160,12 @@ pub(crate) fn prepare_open(
 
     let session_id = SessionId::generate();
     let mut secret_bytes = [0_u8; 32];
-    getrandom::fill(&mut secret_bytes)
-        .map_err(|err| CoreError::new(ErrorCode::EIo, format!("reconnect secret generation failed: {err}")))?;
+    getrandom::fill(&mut secret_bytes).map_err(|err| {
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("reconnect secret generation failed: {err}"),
+        )
+    })?;
 
     let secret_hash: [u8; 32] = Sha256::digest(&secret_bytes).into();
     let idle_expires_at = wall.checked_add(idle).map_err(|err| {
@@ -328,9 +332,10 @@ impl SessionLive {
                 "session has been marked gone",
             ));
         }
-        inner.in_flight = inner.in_flight.checked_add(1).ok_or_else(|| {
-            CoreError::new(ErrorCode::ECapacity, "in-flight requests overflow")
-        })?;
+        inner.in_flight = inner
+            .in_flight
+            .checked_add(1)
+            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "in-flight requests overflow"))?;
         Ok(InFlightGuard {
             session: Arc::clone(self),
             table: table.clone(),
@@ -388,7 +393,6 @@ impl OpenReservation {
 
 impl Drop for OpenReservation {
     fn drop(&mut self) {
-
         if !self.committed {
             if let Some(table) = self.table.upgrade() {
                 let mut entries = table.entries.lock().expect("session table lock");
@@ -589,7 +593,6 @@ impl SessionTable {
         ));
         entries.insert(pending.session_id, Arc::clone(&live));
 
-
         Ok(OpenReservation {
             session_id: pending.session_id,
             live,
@@ -611,9 +614,10 @@ impl SessionTable {
                 "session has been marked gone",
             ));
         }
-        inner.bindings = inner.bindings.checked_add(1).ok_or_else(|| {
-            CoreError::new(ErrorCode::ECapacity, "session bindings overflow")
-        })?;
+        inner.bindings = inner
+            .bindings
+            .checked_add(1)
+            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "session bindings overflow"))?;
 
         Ok(BoundSession {
             session: Arc::clone(live),
@@ -681,7 +685,11 @@ impl SessionTable {
             let entries = self.inner.entries.lock().expect("session table lock");
             if let Some(live) = entries.get(&args.session) {
                 let inner = live.inner.lock().expect("session live lock");
-                (Arc::clone(&inner.row), inner.deadline, Some(Arc::clone(live)))
+                (
+                    Arc::clone(&inner.row),
+                    inner.deadline,
+                    Some(Arc::clone(live)),
+                )
             } else {
                 drop(entries);
                 let key = session_key(args.session);
@@ -721,7 +729,11 @@ impl SessionTable {
                                 format!("live session capacity exceeded (max {MAX_LIVE_SESSIONS})"),
                             ));
                         }
-                        let l = Arc::new(SessionLive::active(args.session, Arc::clone(&row), deadline));
+                        let l = Arc::new(SessionLive::active(
+                            args.session,
+                            Arc::clone(&row),
+                            deadline,
+                        ));
                         entries.insert(args.session, Arc::clone(&l));
                         l
                     }
@@ -767,7 +779,11 @@ impl SessionTable {
                                 format!("live session capacity exceeded (max {MAX_LIVE_SESSIONS})"),
                             ));
                         }
-                        let l = Arc::new(SessionLive::active(args.session, Arc::clone(&row), deadline));
+                        let l = Arc::new(SessionLive::active(
+                            args.session,
+                            Arc::clone(&row),
+                            deadline,
+                        ));
                         entries.insert(args.session, Arc::clone(&l));
                         l
                     }
@@ -820,16 +836,16 @@ impl SessionTable {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::coord::policy::Principal;
     use crate::coord::rows::encode;
     use crate::ids::HashKind;
     use crate::protocol::Timestamp;
-    use crate::store::types::{FactExpectation, FactMutation};
     use crate::store::PreparationBudget;
+    use crate::store::types::{FactExpectation, FactMutation};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -863,8 +879,8 @@ mod tests {
     fn test_store(tag: &str) -> (TempRoot, Store) {
         let temp = TempRoot::new(tag);
         let budget = Arc::new(PreparationBudget::reference_defaults());
-        let store = Store::create(&temp.store_dir(), HashKind::Sha1, budget)
-            .expect("create test store");
+        let store =
+            Store::create(&temp.store_dir(), HashKind::Sha1, budget).expect("create test store");
         (temp, store)
     }
 
@@ -929,16 +945,14 @@ mod tests {
         let deadline = mono0 + Duration::from_secs(3600);
 
         // 1. Initially Active
-        assert_eq!(
-            authority(&row, deadline, wall0, mono0),
-            Authority::Active
-        );
+        assert_eq!(authority(&row, deadline, wall0, mono0), Authority::Active);
 
         // 2. Wall time passes idle expiry -> Expired { latched: false }
         let wall1 = wall0.checked_add(SignedDuration::from_secs(3601)).unwrap();
         let mono1 = mono0 + Duration::from_secs(3601);
         let auth1 = authority(&row, deadline, wall1, mono1);
-        let expected_receipts_until = Timestamp::new(idle_expires.checked_add(RECEIPT_HORIZON).unwrap());
+        let expected_receipts_until =
+            Timestamp::new(idle_expires.checked_add(RECEIPT_HORIZON).unwrap());
         assert_eq!(
             auth1,
             Authority::Expired {
@@ -971,18 +985,23 @@ mod tests {
         // 5. ReceiptsOnly can never regain Active
         let new_active = SessionRow {
             authority: SessionAuthority::Active {
-                idle_expires_at: Timestamp::new(idle_expires.checked_add(SignedDuration::from_hours(10)).unwrap()),
+                idle_expires_at: Timestamp::new(
+                    idle_expires
+                        .checked_add(SignedDuration::from_hours(10))
+                        .unwrap(),
+                ),
             },
             ..row.clone()
         };
         assert!(row.check_successor(&new_active).is_err());
 
         // 6. Beyond 7 days -> Gone
-        let wall_gone = idle_expires.checked_add(RECEIPT_HORIZON).unwrap().checked_add(SignedDuration::from_secs(1)).unwrap();
-        assert_eq!(
-            authority(&row, deadline, wall_gone, mono1),
-            Authority::Gone
-        );
+        let wall_gone = idle_expires
+            .checked_add(RECEIPT_HORIZON)
+            .unwrap()
+            .checked_add(SignedDuration::from_secs(1))
+            .unwrap();
+        assert_eq!(authority(&row, deadline, wall_gone, mono1), Authority::Gone);
     }
 
     #[test]
@@ -1008,15 +1027,27 @@ mod tests {
 
         // Save a real session
         let open_args = SessionOpenArgs::default();
-        let pending = prepare_open(&principal, &sample_policy(&principal), idle, &open_args, times.wall).unwrap();
+        let pending = prepare_open(
+            &principal,
+            &sample_policy(&principal),
+            idle,
+            &open_args,
+            times.wall,
+        )
+        .unwrap();
         let encoded = encode("session", &pending.row).unwrap();
         let key = session_key(pending.session_id);
-        store.publish(Vec::new(), &[FactMutation {
-            table: FactTable::Sessions,
-            key: key.to_vec(),
-            expected: FactExpectation::Absent,
-            value: Some(encoded),
-        }]).unwrap();
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Sessions,
+                    key: key.to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(encoded),
+                }],
+            )
+            .unwrap();
 
         // 2. Wrong principal
         let resume_args2 = SessionResumeArgs {
@@ -1028,7 +1059,11 @@ mod tests {
             .err()
             .expect("wrong principal must be rejected");
         assert_eq!(err2.code, ErrorCode::EForbidden);
-        assert_eq!(err1.to_string(), err2.to_string(), "uniform error message required");
+        assert_eq!(
+            err1.to_string(),
+            err2.to_string(),
+            "uniform error message required"
+        );
 
         // 3. Bad secret
         let resume_args3 = SessionResumeArgs {
@@ -1043,7 +1078,9 @@ mod tests {
         assert_eq!(err1.to_string(), err3.to_string());
 
         // 4. Correct credentials succeed
-        let outcome = table.resume(&store, &resume_args2, &principal, idle, times).unwrap();
+        let outcome = table
+            .resume(&store, &resume_args2, &principal, idle, times)
+            .unwrap();
         match outcome {
             ResumeOutcome::Active(bound, reply) => {
                 assert_eq!(bound.id(), pending.session_id);
@@ -1064,14 +1101,18 @@ mod tests {
 
         let mut reservations = Vec::new();
         for _ in 0..MAX_LIVE_SESSIONS {
-            let pending = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
-            let res = table.reserve_open(&pending).expect("reservation should succeed");
+            let pending =
+                prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
+            let res = table
+                .reserve_open(&pending)
+                .expect("reservation should succeed");
             reservations.push(res);
         }
         assert_eq!(table.live_count(), MAX_LIVE_SESSIONS);
 
         // 129th reservation fails with E_CAPACITY
-        let extra_pending = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
+        let extra_pending =
+            prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
         let err = table
             .reserve_open(&extra_pending)
             .err()
@@ -1083,7 +1124,9 @@ mod tests {
             reservations.pop();
         }
         // Now opening another succeeds!
-        let extra_res = table.reserve_open(&extra_pending).expect("should succeed after drop");
+        let extra_res = table
+            .reserve_open(&extra_pending)
+            .expect("should succeed after drop");
         assert_eq!(extra_res.session_id(), extra_pending.session_id);
     }
 
@@ -1096,7 +1139,14 @@ mod tests {
         let policy = sample_policy(&principal);
         let idle = SignedDuration::from_hours(24);
 
-        let pending = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times.wall).unwrap();
+        let pending = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times.wall,
+        )
+        .unwrap();
         let res = table.reserve_open(&pending).unwrap();
         let session_id = res.session_id();
 
@@ -1113,7 +1163,14 @@ mod tests {
 
         drop(in_flight);
         // After in_flight drops and bindings == 0, entry is eligible for reclaim
-        let dummy_pending = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times.wall).unwrap();
+        let dummy_pending = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times.wall,
+        )
+        .unwrap();
         let _dummy_res = table.reserve_open(&dummy_pending);
         // Previous unused entry was reclaimed
         assert_eq!(table.live_count(), 1);
@@ -1128,7 +1185,14 @@ mod tests {
         let policy = sample_policy(&principal);
         let idle = SignedDuration::from_hours(24);
 
-        let pending = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times.wall).unwrap();
+        let pending = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times.wall,
+        )
+        .unwrap();
         let res = table.reserve_open(&pending).unwrap();
         let session_id = res.session_id();
         let row_arc = Arc::new(pending.row);
@@ -1154,7 +1218,14 @@ mod tests {
         assert_eq!(table.live_count(), 1);
         drop(primary_bound);
         // All bindings and in-flight guards are dropped -> reclaims on next reserve
-        let dummy = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times.wall).unwrap();
+        let dummy = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times.wall,
+        )
+        .unwrap();
         let _dummy_res = table.reserve_open(&dummy);
         assert_eq!(table.live_count(), 1);
     }
@@ -1169,12 +1240,26 @@ mod tests {
         let idle = SignedDuration::from_hours(24);
 
         // Open session A
-        let pending_a = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times.wall).unwrap();
+        let pending_a = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times.wall,
+        )
+        .unwrap();
         let res_a = table.reserve_open(&pending_a).unwrap();
         let bound_a = res_a.into_binding(Arc::new(pending_a.row), idle, times);
 
         // Open session B
-        let pending_b = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times.wall).unwrap();
+        let pending_b = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times.wall,
+        )
+        .unwrap();
         let res_b = table.reserve_open(&pending_b).unwrap();
         let bound_b = res_b.into_binding(Arc::new(pending_b.row), idle, times);
 
@@ -1187,7 +1272,14 @@ mod tests {
         conn_binding = Some(bound_b);
 
         // Trigger reclamation
-        let dummy = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times.wall).unwrap();
+        let dummy = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times.wall,
+        )
+        .unwrap();
         let _dummy_res = table.reserve_open(&dummy);
         // Session A was unreferenced and reclaimed; B + dummy remain (count 2)
         assert_eq!(table.live_count(), 2);
@@ -1210,7 +1302,14 @@ mod tests {
         let idle = SignedDuration::from_hours(1); // 1 hour authority
 
         // 1. Open session with 1 hour idle (expires at 13:00:00Z)
-        let pending = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times0.wall).unwrap();
+        let pending = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times0.wall,
+        )
+        .unwrap();
         let res = table.reserve_open(&pending).unwrap();
         let session_id = res.session_id();
         let row_arc = Arc::new(pending.row.clone());
@@ -1219,16 +1318,28 @@ mod tests {
         // Publish session to store
         let encoded = encode("session", &row_arc).unwrap();
         let key = session_key(session_id);
-        store.publish(Vec::new(), &[FactMutation {
-            table: FactTable::Sessions,
-            key: key.to_vec(),
-            expected: FactExpectation::Absent,
-            value: Some(encoded),
-        }]).unwrap();
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Sessions,
+                    key: key.to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(encoded),
+                }],
+            )
+            .unwrap();
 
         // 2. Drop last binding so session is evicted from in-memory table
         drop(bound);
-        let dummy = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), times0.wall).unwrap();
+        let dummy = prepare_open(
+            &principal,
+            &policy,
+            idle,
+            &SessionOpenArgs::default(),
+            times0.wall,
+        )
+        .unwrap();
         let _dummy_res = table.reserve_open(&dummy);
         // Previous session is no longer in live cache
 
@@ -1243,7 +1354,10 @@ mod tests {
         assert_eq!(times1.wall, expected_effective_wall);
 
         // 4. Reload session from Store under rolled-back host OS clock
-        let reloaded_live = table.get_or_load(&store, session_id, idle, times1).unwrap().expect("loaded");
+        let reloaded_live = table
+            .get_or_load(&store, session_id, idle, times1)
+            .unwrap()
+            .expect("loaded");
 
         // The reloaded session must only have 30 minutes of remaining authority, NOT 3 hours!
         assert!(reloaded_live.is_active(&times1));
@@ -1272,7 +1386,8 @@ mod tests {
 
         // Churn through 300 sessions opening and disconnecting
         for _ in 0..300 {
-            let pending = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
+            let pending =
+                prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
             let res = table.reserve_open(&pending).expect("reserve succeeds");
             let times = table.clock().sample().unwrap();
             let bound = res.into_binding(Arc::new(pending.row), idle, times);
@@ -1282,8 +1397,13 @@ mod tests {
         }
 
         // After all sessions drop, only 1 entry is left upon next reservation
-        let dummy = prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
+        let dummy =
+            prepare_open(&principal, &policy, idle, &SessionOpenArgs::default(), wall).unwrap();
         let _dummy_res = table.reserve_open(&dummy).unwrap();
-        assert_eq!(table.live_count(), 1, "churned entries must be fully reclaimed");
+        assert_eq!(
+            table.live_count(),
+            1,
+            "churned entries must be fully reclaimed"
+        );
     }
 }

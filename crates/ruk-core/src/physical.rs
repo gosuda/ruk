@@ -93,7 +93,10 @@ impl std::fmt::Display for AllocationError {
             Self::NotRegularFile => write!(f, "handle is not a regular file"),
             Self::Overflow => write!(f, "range or reported field overflowed u64"),
             Self::UnverifiedFilesystem => {
-                write!(f, "filesystem profile fails the strict reservation contract")
+                write!(
+                    f,
+                    "filesystem profile fails the strict reservation contract"
+                )
             }
         }
     }
@@ -161,8 +164,12 @@ mod platform {
             // shared on a reflink/COW filesystem and must be unshared; space
             // beyond EOF has nothing to unshare and gets the plain
             // keep-size allocation that wider filesystem support accepts.
-            let size = u64::try_from(fstat(file).map_err(|e| AllocationError::Io(e.into()))?.st_size)
-                .map_err(|_| AllocationError::Overflow)?;
+            let size = u64::try_from(
+                fstat(file)
+                    .map_err(|e| AllocationError::Io(e.into()))?
+                    .st_size,
+            )
+            .map_err(|_| AllocationError::Overflow)?;
             if offset < size {
                 let inner_len = (size - offset).min(len);
                 fallocate(
@@ -174,8 +181,13 @@ mod platform {
                 .map_err(map_fallocate_error)?;
             }
             if end > size {
-                fallocate(file, FallocateFlags::KEEP_SIZE, offset.max(size), end - offset.max(size))
-                    .map_err(map_fallocate_error)?;
+                fallocate(
+                    file,
+                    FallocateFlags::KEEP_SIZE,
+                    offset.max(size),
+                    end - offset.max(size),
+                )
+                .map_err(map_fallocate_error)?;
             }
         }
         stat_receipt(file, len)
@@ -187,9 +199,7 @@ mod platform {
             // that reject UNSHARE_RANGE). ENOSYS: kernel lacks fallocate.
             // EINVAL: cannot distinguish invalid mode from invalid range —
             // fail closed rather than guess a fallback.
-            Errno::OPNOTSUPP | Errno::NOSYS | Errno::INVAL => {
-                AllocationError::UnverifiedFilesystem
-            }
+            Errno::OPNOTSUPP | Errno::NOSYS | Errno::INVAL => AllocationError::UnverifiedFilesystem,
             other => AllocationError::Io(other.into()),
         }
     }
@@ -213,9 +223,19 @@ mod platform {
         let v = fstatvfs(&dir).map_err(|e| AllocationError::Io(e.into()))?;
         // rustix already substitutes f_bsize when a filesystem reports
         // f_frsize == 0 on the linux-raw backend; keep the fallback anyway.
-        let frag = if v.f_frsize == 0 { v.f_bsize } else { v.f_frsize };
-        let available = v.f_bavail.checked_mul(frag).ok_or(AllocationError::Overflow)?;
-        let total = v.f_blocks.checked_mul(frag).ok_or(AllocationError::Overflow)?;
+        let frag = if v.f_frsize == 0 {
+            v.f_bsize
+        } else {
+            v.f_frsize
+        };
+        let available = v
+            .f_bavail
+            .checked_mul(frag)
+            .ok_or(AllocationError::Overflow)?;
+        let total = v
+            .f_blocks
+            .checked_mul(frag)
+            .ok_or(AllocationError::Overflow)?;
         Ok(VolumeFloor { available, total })
     }
 }
@@ -230,15 +250,14 @@ mod platform {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_TAG_INFO, FILE_INFO_BY_HANDLE_CLASS,
-        FILE_REMOTE_DEVICE, FILE_STANDARD_INFO, FILE_SUPPORTS_BLOCK_REFCOUNTING, FileAllocationInfo,
-        FileStandardInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
+        FILE_REMOTE_DEVICE, FILE_STANDARD_INFO, FILE_SUPPORTS_BLOCK_REFCOUNTING,
+        FileAllocationInfo, FileStandardInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
         GetVolumeInformationByHandleW, SetFileInformationByHandle,
     };
 
     const REJECTED_ATTRIBUTES: u32 =
         FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_REPARSE_POINT;
-    const REJECTED_VOLUME_FLAGS: u32 =
-        FILE_SUPPORTS_BLOCK_REFCOUNTING | FILE_REMOTE_DEVICE;
+    const REJECTED_VOLUME_FLAGS: u32 = FILE_SUPPORTS_BLOCK_REFCOUNTING | FILE_REMOTE_DEVICE;
 
     pub(super) fn reserve(
         file: &File,
@@ -253,8 +272,8 @@ mod platform {
         reject_unverifiable_file(handle)?;
         reject_unverifiable_volume(handle)?;
         let before = standard_info(handle)?;
-        let before_alloc = u64::try_from(before.AllocationSize)
-            .map_err(|_| AllocationError::Overflow)?;
+        let before_alloc =
+            u64::try_from(before.AllocationSize).map_err(|_| AllocationError::Overflow)?;
         if len > 0 {
             let need = offset.checked_add(len).ok_or(AllocationError::Overflow)?;
             // FileAllocationInfo is a whole-file allocation setter, not a
@@ -281,8 +300,13 @@ mod platform {
         }
     }
 
-    #[expect(unsafe_code, reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE")]
-    fn tag_info(handle: std::os::windows::raw::HANDLE) -> Result<FILE_ATTRIBUTE_TAG_INFO, AllocationError> {
+    #[expect(
+        unsafe_code,
+        reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE"
+    )]
+    fn tag_info(
+        handle: std::os::windows::raw::HANDLE,
+    ) -> Result<FILE_ATTRIBUTE_TAG_INFO, AllocationError> {
         let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
         // SAFETY: handle is borrowed from a live std::fs::File for the
         // duration of the call; info points to an initialized buffer of the
@@ -302,7 +326,10 @@ mod platform {
         }
     }
 
-    #[expect(unsafe_code, reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE")]
+    #[expect(
+        unsafe_code,
+        reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE"
+    )]
     fn reject_unverifiable_volume(
         handle: std::os::windows::raw::HANDLE,
     ) -> Result<(), AllocationError> {
@@ -343,7 +370,10 @@ mod platform {
         Ok(())
     }
 
-    #[expect(unsafe_code, reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE")]
+    #[expect(
+        unsafe_code,
+        reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE"
+    )]
     fn standard_info(
         handle: std::os::windows::raw::HANDLE,
     ) -> Result<FILE_STANDARD_INFO, AllocationError> {
@@ -365,7 +395,10 @@ mod platform {
         }
     }
 
-    #[expect(unsafe_code, reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE")]
+    #[expect(
+        unsafe_code,
+        reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE"
+    )]
     fn set_allocation(
         handle: std::os::windows::raw::HANDLE,
         target: u64,
@@ -391,8 +424,12 @@ mod platform {
         }
     }
 
-    fn receipt(info: FILE_STANDARD_INFO, requested: u64) -> Result<AllocationReceipt, AllocationError> {
-        let allocated = u64::try_from(info.AllocationSize).map_err(|_| AllocationError::Overflow)?;
+    fn receipt(
+        info: FILE_STANDARD_INFO,
+        requested: u64,
+    ) -> Result<AllocationReceipt, AllocationError> {
+        let allocated =
+            u64::try_from(info.AllocationSize).map_err(|_| AllocationError::Overflow)?;
         let logical = u64::try_from(info.EndOfFile).map_err(|_| AllocationError::Overflow)?;
         Ok(AllocationReceipt {
             requested_bytes: requested,
@@ -401,7 +438,10 @@ mod platform {
         })
     }
 
-    #[expect(unsafe_code, reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE")]
+    #[expect(
+        unsafe_code,
+        reason = "windows-sys FFI bridge: fixed-function calls on a borrowed HANDLE"
+    )]
     pub(super) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         wide.push(0);

@@ -111,8 +111,12 @@ fn platform_stat(meta: &Metadata) -> Result<FileStat, CoreError> {
 /// # Errors
 /// `E_INVALID` when the time is beyond the `i64` second range.
 pub(crate) fn system_time(time: SystemTime) -> Result<StatTime, CoreError> {
-    let out_of_range =
-        || CoreError::new(ErrorCode::EInvalid, "timestamp is out of the supported range");
+    let out_of_range = || {
+        CoreError::new(
+            ErrorCode::EInvalid,
+            "timestamp is out of the supported range",
+        )
+    };
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => Ok(StatTime {
             secs: i64::try_from(after.as_secs()).map_err(|_| out_of_range())?,

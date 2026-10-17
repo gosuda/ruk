@@ -4,8 +4,8 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -29,10 +29,7 @@ impl Fixture {
 
     pub(crate) fn new(hash: HashKind) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "ruk-git-import-{}-{id}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ruk-git-import-{}-{id}", std::process::id()));
         let git_dir = dir.join("src.git");
         fs::create_dir_all(git_dir.join("objects").join("pack")).expect("fixture dirs");
         fs::create_dir_all(git_dir.join("refs").join("heads")).expect("fixture refs");
@@ -56,7 +53,9 @@ impl Fixture {
     }
 
     pub(crate) fn oid(&self, kind: &str, payload: &[u8]) -> Oid {
-        self.hash.hash_git_object(kind, payload).expect("fixture hash")
+        self.hash
+            .hash_git_object(kind, payload)
+            .expect("fixture hash")
     }
 
     /// Writes one loose object; returns its OID.
@@ -120,9 +119,7 @@ impl Fixture {
             payload.extend_from_slice(format!("parent {}\n", parent.to_hex()).as_bytes());
         }
         payload.extend_from_slice(b"author Fixture <fixture@example.com> 1700000000 +0000\n");
-        payload.extend_from_slice(
-            b"committer Fixture <fixture@example.com> 1700000000 +0000\n",
-        );
+        payload.extend_from_slice(b"committer Fixture <fixture@example.com> 1700000000 +0000\n");
         payload.extend_from_slice(extra);
         payload.push(b'\n');
         payload.extend_from_slice(message);
@@ -232,7 +229,10 @@ impl Fixture {
         let checksum = hasher.try_finalize().expect("checksum");
         let pack_checksum = checksum.as_slice()[..trailer_len].to_vec();
         pack.extend_from_slice(&pack_checksum);
-        let stem = format!("pack-{:05}", NEXT_ID.fetch_add(1, Ordering::SeqCst) % 100000);
+        let stem = format!(
+            "pack-{:05}",
+            NEXT_ID.fetch_add(1, Ordering::SeqCst) % 100000
+        );
         let dir = self.git_dir.join("objects").join("pack");
         fs::write(dir.join(format!("{stem}.pack")), &pack).expect("pack file");
         let index = match format {
@@ -316,7 +316,6 @@ impl PackObject {
             _ => unreachable!("fixture kind"),
         }
     }
-
 }
 
 struct PackMeta {
@@ -394,7 +393,11 @@ fn append_ofs_offset(out: &mut Vec<u8>, distance: u64) {
     let groups: Vec<u8> = groups.into_iter().rev().collect();
     let count = groups.len();
     for (index, group) in groups.into_iter().enumerate() {
-        out.push(if index + 1 == count { group } else { group | 0x80 });
+        out.push(if index + 1 == count {
+            group
+        } else {
+            group | 0x80
+        });
     }
 }
 
@@ -499,7 +502,5 @@ pub(crate) fn observation(
     let bytes = store
         .fact(ruk_core::store::FactTable::RemoteObservations, &key)
         .expect("fact")?;
-    Some(
-        crate::import::refs::decode_observation(&bytes, store.hash_kind()).expect("decode"),
-    )
+    Some(crate::import::refs::decode_observation(&bytes, store.hash_kind()).expect("decode"))
 }

@@ -48,8 +48,8 @@ fn check_fixture(
         ours: ours.as_bytes(),
         theirs: theirs.as_bytes(),
     };
-    let outcome =
-        merge_triplet(&request, registry, cancel).unwrap_or_else(|err| panic!("{name} errored: {err}"));
+    let outcome = merge_triplet(&request, registry, cancel)
+        .unwrap_or_else(|err| panic!("{name} errored: {err}"));
     let matched = match (expect, &outcome) {
         (Expectation::Merge(expected), SyntaxOutcome::Merged { bytes, .. }) => {
             bytes.as_slice() == expected.as_bytes()

@@ -107,7 +107,10 @@ impl WorkspaceFence {
                 code,
                 "workspace row changed since it was observed; ownership or state moved",
             )),
-            None => Err(CoreError::new(ErrorCode::ENotFound, "workspace is not registered")),
+            None => Err(CoreError::new(
+                ErrorCode::ENotFound,
+                "workspace is not registered",
+            )),
         }
     }
 }
@@ -574,7 +577,10 @@ impl<'a> Executor<'a> {
 
     fn temp_path(&self, index: usize, full: &Path) -> Result<PathBuf, CoreError> {
         let parent = full.parent().ok_or_else(|| {
-            CoreError::new(ErrorCode::EInvalid, "journaled path has no parent directory")
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "journaled path has no parent directory",
+            )
         })?;
         Ok(parent.join(self.temp_name(index)))
     }
@@ -626,7 +632,9 @@ impl<'a> Executor<'a> {
             journal::replace_mutation(workspace, self.row.clone(), bytes.clone()),
             self.fence.guard(),
         ];
-        self.store.publish(Vec::new(), &facts).map_err(lease_conflict)?;
+        self.store
+            .publish(Vec::new(), &facts)
+            .map_err(lease_conflict)?;
         self.journal = journal;
         self.row = bytes;
         Ok(())
@@ -641,7 +649,11 @@ impl<'a> Executor<'a> {
     }
 
     /// Flushes, then checks every path not in `skip` against one side.
-    pub(super) fn verify(&mut self, toward: Toward, skip: &BTreeSet<usize>) -> Result<(), CoreError> {
+    pub(super) fn verify(
+        &mut self,
+        toward: Toward,
+        skip: &BTreeSet<usize>,
+    ) -> Result<(), CoreError> {
         self.flush_dirs()?;
         let mut wrong = Vec::new();
         for index in 0..self.journal.entries.len() {
@@ -678,11 +690,21 @@ impl<'a> Executor<'a> {
             Some(next) => self.fence.replace(next),
             None => self.fence.guard(),
         };
-        let mut facts = vec![journal::remove_mutation(workspace, self.row), workspace_fact];
+        let mut facts = vec![
+            journal::remove_mutation(workspace, self.row),
+            workspace_fact,
+        ];
         facts.extend(batch.extra);
-        self.store.publish(Vec::new(), &facts).map_err(lease_conflict)?;
+        self.store
+            .publish(Vec::new(), &facts)
+            .map_err(lease_conflict)?;
         Ok(ApplyOutcome {
-            changed: self.journal.entries.into_iter().map(|entry| entry.path).collect(),
+            changed: self
+                .journal
+                .entries
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect(),
             unresolved,
         })
     }
@@ -714,7 +736,8 @@ fn write_blob(
         .open(temp)
         .map_err(|err| safety::io_error("create", temp, &err))?;
     io::copy(&mut object.bytes, &mut file).map_err(|err| safety::io_error("write", temp, &err))?;
-    file.sync_all().map_err(|err| safety::io_error("flush", temp, &err))
+    file.sync_all()
+        .map_err(|err| safety::io_error("flush", temp, &err))
 }
 
 #[cfg(unix)]
@@ -822,7 +845,9 @@ pub(crate) fn recovery_error(paths: &[RepoPath]) -> CoreError {
             names.join(", ")
         ),
     )
-    .with_hint("ws.recover abort keeps these edits; ws.recover discard with the paths overwrites them")
+    .with_hint(
+        "ws.recover abort keeps these edits; ws.recover discard with the paths overwrites them",
+    )
 }
 
 /// Under [`LfsMode::Deny`], no file target may hold a Git LFS pointer.

@@ -233,7 +233,10 @@ pub fn decode_observation(bytes: &[u8], kind: HashKind) -> Result<RefTarget, Git
             let oid = Oid::from_bytes(rest).map_err(|_| corrupt("bad oid bytes"))?;
             if oid.kind() != kind {
                 return Err(GitError::ObjectFormat {
-                    detail: format!("stored observation is {} but the store is {kind}", oid.kind()),
+                    detail: format!(
+                        "stored observation is {} but the store is {kind}",
+                        oid.kind()
+                    ),
                 });
             }
             Ok(RefTarget::Direct(oid))
@@ -327,7 +330,11 @@ pub fn has_object(store: &Store, oid: Oid) -> Result<bool, GitError> {
 ///
 /// # Errors
 /// Store failures, and [`GitError::Limit`] above `max_bytes`.
-pub fn read_object(store: &Store, oid: Oid, max_bytes: u64) -> Result<(ObjectKind, Vec<u8>), GitError> {
+pub fn read_object(
+    store: &Store,
+    oid: Oid,
+    max_bytes: u64,
+) -> Result<(ObjectKind, Vec<u8>), GitError> {
     let mut read = store.read(oid)?;
     let len = read.bytes.len();
     if len > max_bytes {
@@ -384,7 +391,12 @@ mod tests {
         };
         let bytes = row.encode().expect("encode");
         assert_eq!(PromisorRow::decode(&bytes).expect("decode"), row);
-        for bad in [&b""[..], &b"\x02"[..], &b"\x01\x03"[..], &b"\x01\x09\x00\x00\x00ab"[..]] {
+        for bad in [
+            &b""[..],
+            &b"\x02"[..],
+            &b"\x01\x03"[..],
+            &b"\x01\x09\x00\x00\x00ab"[..],
+        ] {
             assert!(PromisorRow::decode(bad).is_err(), "{bad:?} must fail");
         }
     }

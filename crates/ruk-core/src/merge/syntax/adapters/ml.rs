@@ -139,9 +139,10 @@ fn collect(
         // name alone. A module without a body is a leaf unit. Never both:
         // units must not overlap.
         if kind == "module_definition"
-            && tree.named_children(node).iter().any(|child| {
-                BODY_KINDS.contains(&tree.kind_of(*child))
-            })
+            && tree
+                .named_children(node)
+                .iter()
+                .any(|child| BODY_KINDS.contains(&tree.kind_of(*child)))
         {
             let inner = group_name(tree, source, node);
             if inner.is_empty() {
@@ -150,13 +151,13 @@ fn collect(
             let mut qualified = inner;
             qualified.push(0);
             parents.push(qualified);
-                            for child in tree.named_children(node) {
-                    if BODY_KINDS.contains(&tree.kind_of(child)) {
-                        for member in tree.named_children(child) {
-                            collect(tree, source, member, unit_kinds, parents, out, depth + 1);
-                        }
+            for child in tree.named_children(node) {
+                if BODY_KINDS.contains(&tree.kind_of(child)) {
+                    for member in tree.named_children(child) {
+                        collect(tree, source, member, unit_kinds, parents, out, depth + 1);
                     }
                 }
+            }
             parents.pop();
             return;
         }

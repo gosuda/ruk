@@ -100,11 +100,7 @@ pub(crate) fn fold_segments(
         ));
     }
 
-    let mut writer = GraphSegmentWriter::new(
-        hash_kind,
-        base_parent_name,
-        base_parent_commits,
-    );
+    let mut writer = GraphSegmentWriter::new(hash_kind, base_parent_name, base_parent_commits);
 
     for segment in segments_oldest_first {
         let num_local = segment.num_local_commits();

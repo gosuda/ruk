@@ -147,9 +147,9 @@ impl GitError {
             Self::Stale { .. } => ErrorCode::EStale,
             Self::Offline { .. } => ErrorCode::EOffline,
             Self::Shallow { .. } => ErrorCode::EShallow,
-            Self::PushRejected { .. }
-            | Self::PushUncertain { .. }
-            | Self::RemoteMoved { .. } => ErrorCode::EStale,
+            Self::PushRejected { .. } | Self::PushUncertain { .. } | Self::RemoteMoved { .. } => {
+                ErrorCode::EStale
+            }
             Self::Cancelled { .. } => ErrorCode::ECancelled,
         }
     }

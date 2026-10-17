@@ -54,7 +54,8 @@ pub(crate) struct ApplyObservation {
 pub(crate) trait JournalState: Send + Sync + fmt::Debug {
     /// # Errors
     /// Store failures; `E_CORRUPT` for an undecodable journal row.
-    fn observe(&self, store: &Store, workspace: WorkspaceId) -> Result<ApplyObservation, CoreError>;
+    fn observe(&self, store: &Store, workspace: WorkspaceId)
+    -> Result<ApplyObservation, CoreError>;
 }
 
 /// The guard for an observed row: absent stays absent, present bytes are
@@ -84,7 +85,11 @@ pub(crate) fn guard_for(workspace: WorkspaceId, observed: Option<Vec<u8>>) -> Fa
 pub(crate) struct NoJournal;
 
 impl JournalState for NoJournal {
-    fn observe(&self, store: &Store, workspace: WorkspaceId) -> Result<ApplyObservation, CoreError> {
+    fn observe(
+        &self,
+        store: &Store,
+        workspace: WorkspaceId,
+    ) -> Result<ApplyObservation, CoreError> {
         let row = store.fact(FactTable::WsApply, &ws_apply_key(workspace))?;
         let phase = if row.is_some() {
             ApplyPhase::Applying

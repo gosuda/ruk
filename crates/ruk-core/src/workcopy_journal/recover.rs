@@ -28,8 +28,7 @@ use crate::index::RepoPath;
 use crate::store::{FactPageBudget, FactTable, Store, StoreError};
 
 use super::apply::{
-    ApplyOutcome, Executor, FinishBatch, Foreign, PathState, Toward, WorkspaceFence,
-    recovery_error,
+    ApplyOutcome, Executor, FinishBatch, Foreign, PathState, Toward, WorkspaceFence, recovery_error,
 };
 use super::journal::{self, ApplyStep, MAX_JOURNAL_ROW_BYTES, StepCursor};
 use super::safety::WorkRoot;
@@ -147,7 +146,10 @@ pub(crate) fn recover(
         ));
     }
     let (journal, row) = journal::load(store, workspace)?.ok_or_else(|| {
-        CoreError::new(ErrorCode::ENotFound, "workspace has no open materialization journal")
+        CoreError::new(
+            ErrorCode::ENotFound,
+            "workspace has no open materialization journal",
+        )
     })?;
     fence.check(store, ErrorCode::ELeaseLost)?;
     if fence.lease_epoch() < journal.lease_epoch {
@@ -186,7 +188,9 @@ pub(crate) fn recover(
             .entries
             .iter()
             .zip(&states)
-            .filter(|(entry, state)| **state == PathState::Foreign && !discard.contains(&entry.path))
+            .filter(|(entry, state)| {
+                **state == PathState::Foreign && !discard.contains(&entry.path)
+            })
             .map(|(entry, _)| entry.path.clone())
             .collect();
         if !refused.is_empty() {
@@ -210,7 +214,12 @@ pub(crate) fn recover(
     exec.verify(toward, &unresolved)?;
     let unresolved_paths: Vec<RepoPath> = unresolved
         .iter()
-        .filter_map(|index| exec.journal.entries.get(*index).map(|entry| entry.path.clone()))
+        .filter_map(|index| {
+            exec.journal
+                .entries
+                .get(*index)
+                .map(|entry| entry.path.clone())
+        })
         .collect();
     let ApplyOutcome {
         changed,

@@ -260,8 +260,8 @@ impl Metadata {
                 )));
             }
 
-            let manifest = lookup_manifest(&segments_table, cursor_location.segment)?
-                .ok_or_else(|| {
+            let manifest =
+                lookup_manifest(&segments_table, cursor_location.segment)?.ok_or_else(|| {
                     StoreError::Corrupt(format!(
                         "object {cursor_oid} locates unmanifested segment {}",
                         cursor_location.segment
@@ -451,18 +451,13 @@ impl Metadata {
             let key = key_guard.value();
             let value = value_guard.value();
 
-            let row_bytes = key
-                .len()
-                .checked_add(value.len())
-                .ok_or_else(|| {
-                    StoreError::Capacity("fact row key + value bytes overflow usize".to_owned())
-                })?;
+            let row_bytes = key.len().checked_add(value.len()).ok_or_else(|| {
+                StoreError::Capacity("fact row key + value bytes overflow usize".to_owned())
+            })?;
 
-            let new_total = accumulated_bytes
-                .checked_add(row_bytes)
-                .ok_or_else(|| {
-                    StoreError::Capacity("fact page accumulated bytes overflow usize".to_owned())
-                })?;
+            let new_total = accumulated_bytes.checked_add(row_bytes).ok_or_else(|| {
+                StoreError::Capacity("fact page accumulated bytes overflow usize".to_owned())
+            })?;
 
             if new_total > budget.bytes {
                 if rows.is_empty() {
@@ -508,10 +503,9 @@ impl Metadata {
             return Ok(None);
         };
         let value = guard.value();
-        let total_bytes = key
-            .len()
-            .checked_add(value.len())
-            .ok_or_else(|| StoreError::Capacity("fact row key + value bytes overflow usize".to_owned()))?;
+        let total_bytes = key.len().checked_add(value.len()).ok_or_else(|| {
+            StoreError::Capacity("fact row key + value bytes overflow usize".to_owned())
+        })?;
         if total_bytes > MAX_FACT_ROW_BYTES {
             return Err(StoreError::Corrupt(format!(
                 "fact row in table {} has key + value size {total_bytes} bytes exceeding maximum {MAX_FACT_ROW_BYTES}",

@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep_until, timeout_at};
 
-use super::admission::{Admission, AdmissionRequest, RepoAdmission, RequestClass, WorkResources, run_blocking};
+use super::admission::{
+    Admission, AdmissionRequest, RepoAdmission, RequestClass, WorkResources, run_blocking,
+};
 use super::cancel::Cancel;
 use super::client::Client;
 use super::endpoint;
@@ -13,7 +15,10 @@ use crate::store::{StoreFormat, read_format};
 use crate::{CoreError, ErrorCode};
 
 pub(crate) enum Attachment {
-    Owner { lock: StoreLock, format: StoreFormat },
+    Owner {
+        lock: StoreLock,
+        format: StoreFormat,
+    },
     Client(Client),
 }
 

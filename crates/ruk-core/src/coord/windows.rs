@@ -31,36 +31,39 @@ use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, HandleOrInvalid, OwnedHandle, RawHandle};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, FromRawHandle, HandleOrInvalid, OwnedHandle, RawHandle,
+};
 use std::path::{Component, Path, PathBuf, Prefix};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, BOOL, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_CANNOT_IMPERSONATE, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NOT_SUPPORTED,
-    ERROR_NO_DATA, ERROR_NO_TOKEN, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WIN32_ERROR,
+    BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_CANNOT_IMPERSONATE,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION,
+    ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NO_DATA, ERROR_NO_TOKEN,
+    ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GetLastError,
+    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WIN32_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    DACL_SECURITY_INFORMATION, GetSecurityInfo, OWNER_SECURITY_INFORMATION, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-    GetTokenInformation, IsValidAcl, IsValidSid, RevertToSelf, ACCESS_ALLOWED_ACE,
-    ACCESS_ALLOWED_ACE_TYPE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-    CONTAINER_INHERIT_ACE, INHERIT_ONLY_ACE, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE, PSID,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL, SE_DACL_PRESENT,
-    SE_DACL_PROTECTED, TOKEN_ACCESS_MASK, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+    AclSizeInformation, CONTAINER_INHERIT_ACE, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetTokenInformation, INHERIT_ONLY_ACE, IsValidAcl, IsValidSid,
+    NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
+    SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL,
+    TOKEN_ACCESS_MASK, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileType,
-    LockFileEx, UnlockFileEx, BY_HANDLE_FILE_INFORMATION, DRIVE_REMOTE, FILE_ATTRIBUTE_DIRECTORY,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, DRIVE_REMOTE, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_FIRST_PIPE_INSTANCE,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_DISK, GENERIC_READ, GENERIC_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS, OPEN_EXISTING, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT,
+    FILE_SHARE_WRITE, FILE_TYPE_DISK, GENERIC_READ, GENERIC_WRITE, GetDiskFreeSpaceExW,
+    GetDriveTypeW, GetFileInformationByHandle, GetFileType, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
@@ -68,9 +71,9 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
 };
 
+use crate::StoreId;
 use crate::error::{CoreError, ErrorCode};
 use crate::ids::hex_byte;
-use crate::StoreId;
 
 /// Offset in bytes where the exclusive sentinel lock is placed.
 ///
@@ -279,14 +282,20 @@ pub(crate) fn open_lock_file(path: &Path, mode: LockOpenMode) -> Result<File, Co
     Ok(adopt_raw_file(raw_handle))
 }
 
-#[expect(unsafe_code, reason = "adopt verified exclusively-owned Win32 file handle into std::fs::File")]
+#[expect(
+    unsafe_code,
+    reason = "adopt verified exclusively-owned Win32 file handle into std::fs::File"
+)]
 fn adopt_raw_file(handle: HANDLE) -> File {
     // SAFETY: handle was returned by CreateFileW, verified != INVALID_HANDLE_VALUE,
     // is exclusively owned by this process, and safely transferred to std::fs::File.
     unsafe { File::from_raw_handle(handle as RawHandle) }
 }
 
-#[expect(unsafe_code, reason = "adopt verified Win32 token handle into OwnedHandle")]
+#[expect(
+    unsafe_code,
+    reason = "adopt verified Win32 token handle into OwnedHandle"
+)]
 fn adopt_raw_handle(handle: HANDLE) -> Result<OwnedHandle, CoreError> {
     // SAFETY: handle is a valid non-null kernel handle.
     let h = unsafe { HandleOrInvalid::from_raw_handle(handle as RawHandle) };
@@ -333,13 +342,7 @@ pub(crate) fn unlock_exclusive_range(file: &File) -> Result<(), CoreError> {
     overlapped.Anonymous.Anonymous.Offset = LOCK_SENTINEL_OFFSET as u32;
     overlapped.Anonymous.Anonymous.OffsetHigh = (LOCK_SENTINEL_OFFSET >> 32) as u32;
 
-    let ok = unlock_file_ex_raw(
-        handle,
-        0,
-        LOCK_SENTINEL_LENGTH as u32,
-        0,
-        &mut overlapped,
-    );
+    let ok = unlock_file_ex_raw(handle, 0, LOCK_SENTINEL_LENGTH as u32, 0, &mut overlapped);
 
     if ok != 0 {
         Ok(())
@@ -376,17 +379,27 @@ pub(crate) fn validate_lock_file(file: &File, path: &Path) -> Result<(), CoreErr
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     let ok = get_file_info_raw(handle, &mut info);
     if ok == 0 {
-        return Err(io_error(path, "get file information", io::Error::last_os_error()));
+        return Err(io_error(
+            path,
+            "get file information",
+            io::Error::last_os_error(),
+        ));
     }
 
     if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         return Err(forbidden(path, "ownership lock is a directory"));
     }
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(forbidden(path, "ownership lock is a reparse point or symlink"));
+        return Err(forbidden(
+            path,
+            "ownership lock is a reparse point or symlink",
+        ));
     }
     if info.nNumberOfLinks != 1 {
-        return Err(forbidden(path, "ownership lock has more than one hard link"));
+        return Err(forbidden(
+            path,
+            "ownership lock has more than one hard link",
+        ));
     }
 
     // 3. Security descriptor inspection.
@@ -417,7 +430,10 @@ pub(crate) fn create_subsequent_pipe_server(
     create_pipe_server_inner(name, PipeInstanceKind::Subsequent)
 }
 
-#[expect(unsafe_code, reason = "create named pipe server with owner-only SECURITY_ATTRIBUTES")]
+#[expect(
+    unsafe_code,
+    reason = "create named pipe server with owner-only SECURITY_ATTRIBUTES"
+)]
 fn create_pipe_server_inner(
     name: &str,
     kind: PipeInstanceKind,
@@ -452,8 +468,9 @@ fn create_pipe_server_inner(
 /// Generates an unpredictable, local named pipe path bound to `store_id`.
 pub(crate) fn generate_pipe_name(store_id: StoreId) -> Result<String, CoreError> {
     let mut random_bytes = [0u8; 16];
-    getrandom::fill(&mut random_bytes)
-        .map_err(|err| CoreError::new(ErrorCode::EIo, format!("generate pipe randomness: {err}")))?;
+    getrandom::fill(&mut random_bytes).map_err(|err| {
+        CoreError::new(ErrorCode::EIo, format!("generate pipe randomness: {err}"))
+    })?;
 
     let mut hex_suffix = String::with_capacity(32);
     for b in random_bytes {
@@ -471,7 +488,9 @@ pub(crate) fn validate_pipe_address(addr: &str) -> Result<(), CoreError> {
     if !addr.starts_with(LOCAL_PIPE_PREFIX) {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
-            format!("named pipe address must start with local prefix '{LOCAL_PIPE_PREFIX}': {addr}"),
+            format!(
+                "named pipe address must start with local prefix '{LOCAL_PIPE_PREFIX}': {addr}"
+            ),
         ));
     }
 
@@ -500,7 +519,10 @@ pub(crate) fn validate_pipe_address(addr: &str) -> Result<(), CoreError> {
         if !b.is_ascii_alphanumeric() && b != b'-' && b != b'_' && b != b'.' {
             return Err(CoreError::new(
                 ErrorCode::EInvalid,
-                format!("named pipe name contains forbidden character '{}'", b as char),
+                format!(
+                    "named pipe name contains forbidden character '{}'",
+                    b as char
+                ),
             ));
         }
     }
@@ -556,7 +578,10 @@ impl OwnedSid {
     #[expect(unsafe_code, reason = "copy verified SID bytes into aligned Vec<u32>")]
     fn from_raw_sid(psid: PSID, byte_len: usize) -> Result<Self, CoreError> {
         if byte_len < 8 {
-            return Err(CoreError::new(ErrorCode::EIo, "SID byte buffer is too short"));
+            return Err(CoreError::new(
+                ErrorCode::EIo,
+                "SID byte buffer is too short",
+            ));
         }
         let word_count = (byte_len + 3) / 4;
         let mut words = vec![0u32; word_count];
@@ -715,7 +740,10 @@ fn query_current_process_sid() -> Result<OwnedSid, CoreError> {
     query_token_user_sid(token.as_raw_handle())
 }
 
-#[expect(unsafe_code, reason = "read aligned TOKEN_USER struct and copy validated SID bytes")]
+#[expect(
+    unsafe_code,
+    reason = "read aligned TOKEN_USER struct and copy validated SID bytes"
+)]
 fn query_token_user_sid(token_handle: RawHandle) -> Result<OwnedSid, CoreError> {
     let handle = token_handle as HANDLE;
     let mut required_len: u32 = 0;
@@ -777,7 +805,10 @@ fn query_token_user_sid(token_handle: RawHandle) -> Result<OwnedSid, CoreError> 
 
     let sid_len = usize::try_from(get_length_sid_raw(psid))
         .map_err(|_| CoreError::new(ErrorCode::EIo, "SID length overflow"))?;
-    if sid_addr.checked_add(sid_len).map_or(true, |end| end > buf_end) {
+    if sid_addr
+        .checked_add(sid_len)
+        .map_or(true, |end| end > buf_end)
+    {
         return Err(CoreError::new(ErrorCode::EIo, "SID length exceeds buffer"));
     }
 
@@ -842,9 +873,16 @@ fn audit_handle_security(
 
     if ret != 0 {
         if ret == ERROR_NOT_SUPPORTED || ret == ERROR_INVALID_FUNCTION {
-            return Err(forbidden(path, "filesystem does not support security descriptors / DACLs"));
+            return Err(forbidden(
+                path,
+                "filesystem does not support security descriptors / DACLs",
+            ));
         }
-        return Err(io_error(path, "get security info", io::Error::from_raw_os_error(ret as i32)));
+        return Err(io_error(
+            path,
+            "get security info",
+            io::Error::from_raw_os_error(ret as i32),
+        ));
     }
     if psd.is_null() {
         return Err(forbidden(path, "null security descriptor"));
@@ -857,14 +895,24 @@ fn audit_handle_security(
     let mut revision: u32 = 0;
     let ok = get_security_descriptor_control_raw(psd, &mut control, &mut revision);
     if ok == 0 {
-        return Err(io_error(path, "get security descriptor control", io::Error::last_os_error()));
+        return Err(io_error(
+            path,
+            "get security descriptor control",
+            io::Error::last_os_error(),
+        ));
     }
 
     if control & SE_DACL_PRESENT == 0 || pdacl.is_null() {
-        return Err(forbidden(path, "ownership lock has a null DACL (unrestricted access)"));
+        return Err(forbidden(
+            path,
+            "ownership lock has a null DACL (unrestricted access)",
+        ));
     }
     if control & SE_DACL_PROTECTED == 0 {
-        return Err(forbidden(path, "ownership lock DACL is not protected against inheritance"));
+        return Err(forbidden(
+            path,
+            "ownership lock DACL is not protected against inheritance",
+        ));
     }
 
     // Verify owner SID matches expected process user SID.
@@ -872,7 +920,10 @@ fn audit_handle_security(
         return Err(forbidden(path, "ownership lock has an invalid owner SID"));
     }
     if equal_sid_raw(psid_owner, expected_owner.as_psid()) == 0 {
-        return Err(forbidden(path, "ownership lock is not owned by the current process user"));
+        return Err(forbidden(
+            path,
+            "ownership lock is not owned by the current process user",
+        ));
     }
 
     // Verify DACL validity and examine every ACE.
@@ -888,7 +939,11 @@ fn audit_handle_security(
         AclSizeInformation,
     );
     if ok == 0 {
-        return Err(io_error(path, "get ACL size info", io::Error::last_os_error()));
+        return Err(io_error(
+            path,
+            "get ACL size info",
+            io::Error::last_os_error(),
+        ));
     }
 
     // Iterate through all ACEs in the DACL.
@@ -904,7 +959,10 @@ fn audit_handle_security(
     Ok(())
 }
 
-#[expect(unsafe_code, reason = "dereference verified aligned ACE pointer from GetAce")]
+#[expect(
+    unsafe_code,
+    reason = "dereference verified aligned ACE pointer from GetAce"
+)]
 fn audit_single_ace(
     pace: *mut core::ffi::c_void,
     path: &Path,
@@ -928,10 +986,9 @@ fn audit_single_ace(
     }
 
     // Inheritance flags allowed: OBJECT_INHERIT, CONTAINER_INHERIT, NO_PROPAGATE, INHERIT_ONLY.
-    let allowed_flags = (OBJECT_INHERIT_ACE
-        | CONTAINER_INHERIT_ACE
-        | NO_PROPAGATE_INHERIT_ACE
-        | INHERIT_ONLY_ACE) as u8;
+    let allowed_flags =
+        (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | NO_PROPAGATE_INHERIT_ACE | INHERIT_ONLY_ACE)
+            as u8;
     if header.AceFlags & !allowed_flags != 0 {
         return Err(forbidden(
             path,
@@ -957,19 +1014,13 @@ fn audit_single_ace(
     let remaining_in_ace = ace_size - 8;
 
     if remaining_in_ace < 8 || is_valid_sid_raw(ace_sid) == 0 {
-        return Err(forbidden(
-            path,
-            "invalid SID in ownership lock DACL ACE",
-        ));
+        return Err(forbidden(path, "invalid SID in ownership lock DACL ACE"));
     }
 
     let sid_len = usize::try_from(get_length_sid_raw(ace_sid))
         .map_err(|_| forbidden(path, "SID length overflow"))?;
     if sid_len > remaining_in_ace {
-        return Err(forbidden(
-            path,
-            "ACE SID length exceeds ACE boundary",
-        ));
+        return Err(forbidden(path, "ACE SID length exceeds ACE boundary"));
     }
 
     // ACE MUST grant access only to the expected process user SID.
@@ -983,7 +1034,10 @@ fn audit_single_ace(
     Ok(())
 }
 
-#[expect(unsafe_code, reason = "read null-terminated wide string returned by ConvertSidToStringSidW")]
+#[expect(
+    unsafe_code,
+    reason = "read null-terminated wide string returned by ConvertSidToStringSidW"
+)]
 fn sid_to_string(psid: PSID) -> Result<String, CoreError> {
     let mut wide_str: *mut u16 = core::ptr::null_mut();
     let ok = convert_sid_to_string_sid_raw(psid, &mut wide_str);
@@ -1024,11 +1078,17 @@ fn sid_to_string(psid: PSID) -> Result<String, CoreError> {
 
 fn validate_sid_string(sid: &str) -> Result<(), CoreError> {
     if !sid.starts_with("S-1-") || sid.len() < 9 || sid.len() > 186 {
-        return Err(CoreError::new(ErrorCode::EIo, format!("invalid SID string format: {sid}")));
+        return Err(CoreError::new(
+            ErrorCode::EIo,
+            format!("invalid SID string format: {sid}"),
+        ));
     }
     for b in sid.bytes() {
         if !b.is_ascii_digit() && b != b'-' {
-            return Err(CoreError::new(ErrorCode::EIo, format!("invalid character in SID string: {sid}")));
+            return Err(CoreError::new(
+                ErrorCode::EIo,
+                format!("invalid character in SID string: {sid}"),
+            ));
         }
     }
     Ok(())
@@ -1092,14 +1152,20 @@ fn io_error(path: &Path, op: &'static str, err: io::Error) -> CoreError {
 }
 
 fn forbidden(path: &Path, reason: &'static str) -> CoreError {
-    CoreError::new(ErrorCode::EForbidden, format!("{reason}: {}", path.display()))
+    CoreError::new(
+        ErrorCode::EForbidden,
+        format!("{reason}: {}", path.display()),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Narrow, audited FFI helper functions
 // ---------------------------------------------------------------------------
 
-#[expect(unsafe_code, reason = "CreateFileW call with explicit Win32 flags and security attributes")]
+#[expect(
+    unsafe_code,
+    reason = "CreateFileW call with explicit Win32 flags and security attributes"
+)]
 fn open_file_raw(
     filename: *const u16,
     access: u32,
@@ -1130,10 +1196,14 @@ fn open_file_raw(
             {
                 Err(CoreError::new(ErrorCode::ENotFound, "lock file not found"))
             }
-            Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
-                Err(CoreError::new(ErrorCode::EForbidden, "access denied opening lock file"))
-            }
-            _ => Err(CoreError::new(ErrorCode::EIo, format!("open lock file: {err}"))),
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "access denied opening lock file",
+            )),
+            _ => Err(CoreError::new(
+                ErrorCode::EIo,
+                format!("open lock file: {err}"),
+            )),
         }
     } else {
         Ok(h)
@@ -1191,14 +1261,7 @@ fn get_security_info_raw(
     // SAFETY: handle is valid; all output pointers are valid references or null.
     unsafe {
         GetSecurityInfo(
-            handle,
-            obj_type,
-            sec_info,
-            psid_owner,
-            psid_group,
-            pdacl,
-            psacl,
-            psd,
+            handle, obj_type, sec_info, psid_owner, psid_group, pdacl, psacl, psd,
         )
     }
 }
@@ -1255,11 +1318,7 @@ fn equal_sid_raw(sid1: PSID, sid2: PSID) -> BOOL {
 }
 
 #[expect(unsafe_code, reason = "OpenProcessToken Win32 query")]
-fn open_process_token_raw(
-    process: HANDLE,
-    access: TOKEN_ACCESS_MASK,
-    token: *mut HANDLE,
-) -> BOOL {
+fn open_process_token_raw(process: HANDLE, access: TOKEN_ACCESS_MASK, token: *mut HANDLE) -> BOOL {
     // SAFETY: process is a valid process handle; token is a valid output pointer.
     unsafe { OpenProcessToken(process, access, token) }
 }
@@ -1311,7 +1370,10 @@ fn convert_sid_to_string_sid_raw(sid: PSID, str_sid: *mut *mut u16) -> BOOL {
     unsafe { ConvertSidToStringSidW(sid, str_sid) }
 }
 
-#[expect(unsafe_code, reason = "ConvertStringSecurityDescriptorToSecurityDescriptorW Win32 call")]
+#[expect(
+    unsafe_code,
+    reason = "ConvertStringSecurityDescriptorToSecurityDescriptorW Win32 call"
+)]
 fn convert_string_sd_to_sd_raw(
     str_sd: *const u16,
     revision: u32,
@@ -1371,7 +1433,10 @@ mod tests {
     fn test_pipe_name_validation() {
         // Valid local names pass
         assert!(validate_pipe_address(r"\\.\pipe\ruk-test-1234").is_ok());
-        assert!(validate_pipe_address(r"\\.\pipe\ruk-00000000-0000-0000-0000-000000000000-abcd").is_ok());
+        assert!(
+            validate_pipe_address(r"\\.\pipe\ruk-00000000-0000-0000-0000-000000000000-abcd")
+                .is_ok()
+        );
 
         // Remote names fail
         assert!(validate_pipe_address(r"\\server\pipe\ruk-test").is_err());
@@ -1392,9 +1457,18 @@ mod tests {
         let name1 = generate_pipe_name(store_id).expect("generate pipe name 1");
         let name2 = generate_pipe_name(store_id).expect("generate pipe name 2");
 
-        assert_ne!(name1, name2, "independent generations must be unpredictable and distinct");
-        assert!(name1.contains(&store_id.to_string()), "pipe name must contain store ID");
-        assert!(name2.contains(&store_id.to_string()), "pipe name must contain store ID");
+        assert_ne!(
+            name1, name2,
+            "independent generations must be unpredictable and distinct"
+        );
+        assert!(
+            name1.contains(&store_id.to_string()),
+            "pipe name must contain store ID"
+        );
+        assert!(
+            name2.contains(&store_id.to_string()),
+            "pipe name must contain store ID"
+        );
         validate_pipe_address(&name1).expect("generated name 1 must be valid");
         validate_pipe_address(&name2).expect("generated name 2 must be valid");
     }
@@ -1404,7 +1478,10 @@ mod tests {
         let temp = std::env::temp_dir();
         let space = filesystem_space(&temp).expect("query temp dir space");
         assert!(space.total_bytes > 0, "total bytes must be positive");
-        assert!(space.available_bytes <= space.total_bytes, "available <= total");
+        assert!(
+            space.available_bytes <= space.total_bytes,
+            "available <= total"
+        );
 
         // Missing path returns ENotFound
         let missing = temp.join(format!("ruk-nonexistent-{}", uuid::Uuid::new_v4().simple()));
@@ -1450,7 +1527,8 @@ mod tests {
 
     #[test]
     fn test_ensure_local_storage_missing_path() {
-        let missing = std::env::temp_dir().join(format!("ruk-missing-{}", uuid::Uuid::new_v4().simple()));
+        let missing =
+            std::env::temp_dir().join(format!("ruk-missing-{}", uuid::Uuid::new_v4().simple()));
         let err = ensure_local_storage(&missing).unwrap_err();
         assert_eq!(err.code, ErrorCode::ENotFound);
     }
@@ -1576,7 +1654,10 @@ mod tests {
 
             let peer_sid = pipe_peer_sid(&server).expect("inspect pipe peer SID");
             let expected_sid = current_sid().expect("current user SID");
-            assert_eq!(peer_sid, expected_sid, "pipe peer SID must match current user SID");
+            assert_eq!(
+                peer_sid, expected_sid,
+                "pipe peer SID must match current user SID"
+            );
 
             let _client = client_task.await.expect("client task");
         });

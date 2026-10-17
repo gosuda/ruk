@@ -10,16 +10,14 @@
 //! 7. All-or-nothing batch conflict
 //! 8. Bounded high-history paging and corrupt row quarantine
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::codec::encode_change_entry;
 use super::import::ImportBatch;
 use super::keys::{change_key, decode_head_key, head_key, history_key};
 use super::reader::Records;
-use super::types::{
-    ChangeEntry, ChangeState, ImportOutcome, RecordPageBudget,
-};
+use super::types::{ChangeEntry, ChangeState, ImportOutcome, RecordPageBudget};
 use crate::bytes::ByteString;
 use crate::change::ChangeId;
 use crate::commit::NativeCommitInput;
@@ -136,9 +134,7 @@ fn test_exact_imported_byte_preservation() {
         .expect("read commit")
         .expect("commit exists");
 
-    let stored_payload = read_back
-        .git_payload()
-        .expect("git payload exists");
+    let stored_payload = read_back.git_payload().expect("git payload exists");
     assert_eq!(stored_payload, payload.as_slice());
 }
 
@@ -285,9 +281,7 @@ fn test_divergence_vs_trusted_supersession() {
         message: ByteString::from("Initial commit"),
         provenance: None,
     };
-    let prep_1 = records
-        .prepare_native_commit(input_1)
-        .expect("prep 1");
+    let prep_1 = records.prepare_native_commit(input_1).expect("prep 1");
     fixture
         .store()
         .publish(vec![prep_1.prepared_object], &prep_1.mutations)
@@ -312,9 +306,7 @@ fn test_divergence_vs_trusted_supersession() {
         message: ByteString::from("Rewritten commit"),
         provenance: None,
     };
-    let prep_2 = records
-        .prepare_native_commit(input_2)
-        .expect("prep 2");
+    let prep_2 = records.prepare_native_commit(input_2).expect("prep 2");
     fixture
         .store()
         .publish(vec![prep_2.prepared_object], &prep_2.mutations)
@@ -331,7 +323,11 @@ fn test_divergence_vs_trusted_supersession() {
     // Step 3: Imported commit with same change_id but different OID -> Divergence!
     let mut import_payload = Vec::new();
     import_payload.extend_from_slice(b"tree ");
-    import_payload.extend_from_slice(sample_oid(HashKind::Sha1, b"import-tree").to_hex().as_bytes());
+    import_payload.extend_from_slice(
+        sample_oid(HashKind::Sha1, b"import-tree")
+            .to_hex()
+            .as_bytes(),
+    );
     import_payload.push(b'\n');
     import_payload.extend_from_slice(b"author Bob <bob@example.com> 1700000002 +0000\n");
     import_payload.extend_from_slice(b"committer Bob <bob@example.com> 1700000002 +0000\n");
@@ -371,7 +367,11 @@ fn test_stable_absent_change_id_reimport() {
     // Commit payload without any change-id header
     let mut payload = Vec::new();
     payload.extend_from_slice(b"tree ");
-    payload.extend_from_slice(sample_oid(HashKind::Sha1, b"plain-tree").to_hex().as_bytes());
+    payload.extend_from_slice(
+        sample_oid(HashKind::Sha1, b"plain-tree")
+            .to_hex()
+            .as_bytes(),
+    );
     payload.extend_from_slice(b"\nauthor Carol <carol@example.com> 1700000000 +0000\n");
     payload.extend_from_slice(b"committer Carol <carol@example.com> 1700000000 +0000\n\n");
     payload.extend_from_slice(b"No change-id header in this commit\n");
@@ -410,7 +410,10 @@ fn test_stable_absent_change_id_reimport() {
 
     let (objects, mutations) = batch.into_parts().expect("finish batch");
     assert!(objects.is_empty(), "known import should stage no objects");
-    assert!(mutations.is_empty(), "known import should emit no mutations");
+    assert!(
+        mutations.is_empty(),
+        "known import should emit no mutations"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +446,8 @@ fn test_wrong_expected_head_and_cas_failure() {
 
     let err = records
         .prepare_native_commit(input)
-        .err().expect("should fail with E_NOT_FOUND or E_STALE");
+        .err()
+        .expect("should fail with E_NOT_FOUND or E_STALE");
     assert!(
         err.code == ErrorCode::ENotFound || err.code == ErrorCode::EStale,
         "expected ENotFound or EStale, got {err:?}"
@@ -524,10 +528,16 @@ fn test_all_or_nothing_batch_conflict() {
     drop(preparer);
 
     let change = records.get_change(&change_id).expect("read");
-    assert!(change.is_none(), "store must not contain any changes from dropped batch");
+    assert!(
+        change.is_none(),
+        "store must not contain any changes from dropped batch"
+    );
 
     let commit = records.get_commit(&head_1).expect("read");
-    assert!(commit.is_none(), "store must not contain commits from dropped batch");
+    assert!(
+        commit.is_none(),
+        "store must not contain commits from dropped batch"
+    );
 }
 
 // ---------------------------------------------------------------------------

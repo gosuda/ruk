@@ -11,27 +11,17 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::change::ChangeId;
 use crate::commit::CommitRecord;
 use crate::error::{CoreError, CoreModelError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::HashKind;
 use crate::store::{FactMutation, PreparedObject};
-use crate::MAX_CONTROL_FRAME_BYTES;
 
 /// Status of a logical change in Ruk.
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    JsonSchema,
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ChangeState {
@@ -157,32 +147,11 @@ impl ChangeEntry {
 }
 
 /// Value stored in `FactTable::ChangeHistory` representing `(ChangeId, Head)` membership.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ChangeHistoryEntry;
 
 /// Value stored in `FactTable::ImportedChanges` mapping an imported OID to a local ChangeId.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ImportedChangeEntry {
     pub change_id: ChangeId,
 }

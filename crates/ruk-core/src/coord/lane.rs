@@ -31,10 +31,8 @@ mod tests;
 pub(crate) use batch::{
     BatchAccumulator, BatchItem, MAX_BATCH_BYTES, MAX_BATCH_LINGER, MAX_BATCH_REQUESTS,
 };
-pub(crate) use candidate::{
-    InternalCandidate, InternalPayload, MutationCandidate, WorkspaceFence,
-};
-pub(crate) use commit::{classify_store_error, commit_batch, StoreFailureKind};
+pub(crate) use candidate::{InternalCandidate, InternalPayload, MutationCandidate, WorkspaceFence};
+pub(crate) use commit::{StoreFailureKind, classify_store_error, commit_batch};
 
 /// Queue bound for pending submissions to the publication lane.
 ///
@@ -72,13 +70,12 @@ impl PublicationLane {
             reply_tx: Some(reply_tx),
         };
 
-        self.tx.send(LaneCommand::Submit(item)).await.map_err(|_| {
-            self.closed_error()
-        })?;
+        self.tx
+            .send(LaneCommand::Submit(item))
+            .await
+            .map_err(|_| self.closed_error())?;
 
-        reply_rx.await.map_err(|_| {
-            self.closed_error()
-        })?
+        reply_rx.await.map_err(|_| self.closed_error())?
     }
 
     /// Submits an admitted coordinator-internal transaction for serialized publication.
@@ -97,13 +94,12 @@ impl PublicationLane {
             reply_tx: Some(reply_tx),
         };
 
-        self.tx.send(LaneCommand::Submit(item)).await.map_err(|_| {
-            self.closed_error()
-        })?;
+        self.tx
+            .send(LaneCommand::Submit(item))
+            .await
+            .map_err(|_| self.closed_error())?;
 
-        reply_rx.await.map_err(|_| {
-            self.closed_error()
-        })?
+        reply_rx.await.map_err(|_| self.closed_error())?
     }
 
     /// Requests orderly closure of the publication lane.
@@ -120,7 +116,11 @@ impl PublicationLane {
     }
 
     fn closed_error(&self) -> CoreError {
-        let reason = self.closed_reason.lock().ok().and_then(|guard| guard.clone());
+        let reason = self
+            .closed_reason
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
         let message = reason.unwrap_or_else(|| "publication lane is closed".to_owned());
         CoreError::new(ErrorCode::ECoordinatorUnresponsive, message)
     }
@@ -221,10 +221,8 @@ impl PublicationLaneRunner {
 
             let commit_outcome = match chosen_admitted {
                 Some(admitted) => {
-                    let (_admitted, outcome) = run_blocking(
-                        admitted,
-                        batch_cancel.clone(),
-                        move |cancel_ref| {
+                    let (_admitted, outcome) =
+                        run_blocking(admitted, batch_cancel.clone(), move |cancel_ref| {
                             commit_batch(
                                 &store,
                                 &session_table,
@@ -233,9 +231,8 @@ impl PublicationLaneRunner {
                                 batch,
                                 cancel_ref,
                             )
-                        },
-                    )
-                    .await?;
+                        })
+                        .await?;
                     outcome
                 }
                 None => commit_batch(

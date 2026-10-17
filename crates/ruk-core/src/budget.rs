@@ -48,7 +48,10 @@ impl ByteBudget {
 impl Drop for ByteReservation {
     fn drop(&mut self) {
         let previous = self.budget.used.fetch_sub(self.bytes, Ordering::SeqCst);
-        assert!(previous >= self.bytes, "byte reservation accounting underflow");
+        assert!(
+            previous >= self.bytes,
+            "byte reservation accounting underflow"
+        );
     }
 }
 
@@ -61,9 +64,15 @@ mod tests {
     fn overflow_and_failed_admission_do_not_spend_capacity() {
         let budget = ByteBudget::new(u64::MAX);
         let held = budget.reserve(u64::MAX - 1).expect("initial reservation");
-        assert_eq!(budget.reserve(2).expect_err("sum overflows").code, ErrorCode::ELimit);
+        assert_eq!(
+            budget.reserve(2).expect_err("sum overflows").code,
+            ErrorCode::ELimit
+        );
         let last = budget.reserve(1).expect("failed reservation spent nothing");
-        assert_eq!(budget.reserve(1).expect_err("full budget").code, ErrorCode::ELimit);
+        assert_eq!(
+            budget.reserve(1).expect_err("full budget").code,
+            ErrorCode::ELimit
+        );
         drop(held);
         drop(last);
         let _all = budget.reserve(u64::MAX).expect("all capacity returned");
@@ -94,13 +103,20 @@ mod tests {
             held.wait();
             let while_held = budget.reserve(1);
             release.wait();
-            assert_eq!(while_held.expect_err("held reservations fill the budget").code, ErrorCode::ELimit);
+            assert_eq!(
+                while_held
+                    .expect_err("held reservations fill the budget")
+                    .code,
+                ErrorCode::ELimit
+            );
             let accepted = workers
                 .into_iter()
                 .map(|worker| usize::from(worker.join().expect("reservation worker")))
                 .sum::<usize>();
             assert_eq!(accepted, 7);
         });
-        let _all = budget.reserve(7).expect("workers released their own reservations");
+        let _all = budget
+            .reserve(7)
+            .expect("workers released their own reservations");
     }
 }

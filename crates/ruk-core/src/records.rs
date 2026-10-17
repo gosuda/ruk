@@ -22,13 +22,12 @@ mod tests;
 
 pub use import::ImportBatch;
 pub use keys::{
-    change_key, decode_change_key, decode_head_key, decode_history_key,
-    decode_imported_change_key, head_key, history_key, imported_change_key,
-    HEAD_TAG_CONFLICTED, HEAD_TAG_GIT,
+    HEAD_TAG_CONFLICTED, HEAD_TAG_GIT, change_key, decode_change_key, decode_head_key,
+    decode_history_key, decode_imported_change_key, head_key, history_key, imported_change_key,
 };
 pub use preparer::RecordBatchPreparer;
 pub use reader::Records;
 pub use types::{
-    ChangeEntry, ChangeHistoryEntry, ChangeState, HistoryPage, ImportedChangeEntry, ImportOutcome,
+    ChangeEntry, ChangeHistoryEntry, ChangeState, HistoryPage, ImportOutcome, ImportedChangeEntry,
     PreparedImport, PreparedNativeCommit, PreparedRecordBatch, RecordPage, RecordPageBudget,
 };

@@ -248,10 +248,7 @@ impl Drop for StoreLock {
 /// One I/O failure shape for every publish/release step: the operation, the
 /// lock path, and the OS error. No secret bytes ever enter these messages.
 fn lock_io_error(path: &Path, op: &'static str, err: std::io::Error) -> CoreError {
-    CoreError::new(
-        ErrorCode::EIo,
-        format!("{op} {}: {err}", path.display()),
-    )
+    CoreError::new(ErrorCode::EIo, format!("{op} {}: {err}", path.display()))
 }
 
 /// First LF-terminated line, if any. A header without its newline is a
@@ -290,7 +287,10 @@ fn unix_path_bytes(path: &Path) -> Vec<u8> {
 /// UTF-8 paths encode identically on Windows; anything else is unrepresentable.
 #[cfg(windows)]
 fn unix_path_bytes(path: &Path) -> Result<Vec<u8>, ()> {
-    path.as_os_str().to_str().map(|s| s.as_bytes().to_vec()).ok_or(())
+    path.as_os_str()
+        .to_str()
+        .map(|s| s.as_bytes().to_vec())
+        .ok_or(())
 }
 
 /// Byte-level socket-path rules shared by the encoder and the decoder.
@@ -348,7 +348,11 @@ pub(crate) fn encode_body(body: &LockBody) -> Result<Vec<u8>, CoreError> {
             if check_socket_bytes(&raw).is_err() {
                 let limit = raw.len() > MAX_SOCKET_PATH_BYTES;
                 return Err(CoreError::new(
-                    if limit { ErrorCode::ELimit } else { ErrorCode::EInvalid },
+                    if limit {
+                        ErrorCode::ELimit
+                    } else {
+                        ErrorCode::EInvalid
+                    },
                     "lock socket path",
                 ));
             }
@@ -409,10 +413,7 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<LockSnapshot, CoreError> {
     if *header != HEADER_V1.as_bytes() {
         return Ok(LockSnapshot::NotReady);
     }
-    let Some(pid) = pid_line
-        .strip_prefix(b"pid ")
-        .and_then(parse_canonical_u32)
-    else {
+    let Some(pid) = pid_line.strip_prefix(b"pid ").and_then(parse_canonical_u32) else {
         return Ok(LockSnapshot::NotReady);
     };
     let address = if let Some(hex) = address_line.strip_prefix(b"address unix:") {
@@ -570,8 +571,7 @@ mod tests {
             Acquisition::Held(_) => panic!("fresh lock must be acquirable"),
         };
         // A crashed owner mid-publish: truncated file, incomplete lines, no sync.
-        std::fs::write(store.lock_path(), b"ruk-lock 1\npid 42\n")
-            .expect("write partial body");
+        std::fs::write(store.lock_path(), b"ruk-lock 1\npid 42\n").expect("write partial body");
         match StoreLock::try_acquire(&store.dir).expect("contend") {
             Acquisition::Held(LockSnapshot::NotReady) => {}
             Acquisition::Held(LockSnapshot::Ready(_)) => {
@@ -715,11 +715,10 @@ mod tests {
             encode_body(&body).expect_err("relative path").code,
             ErrorCode::EInvalid
         );
-        let long: Vec<u8> =
-            core::iter::once(b'/').chain(core::iter::repeat_n(b'a', MAX_SOCKET_PATH_BYTES)).collect();
-        body.address = EndpointAddress::Unix(PathBuf::from(
-            String::from_utf8(long).expect("utf8"),
-        ));
+        let long: Vec<u8> = core::iter::once(b'/')
+            .chain(core::iter::repeat_n(b'a', MAX_SOCKET_PATH_BYTES))
+            .collect();
+        body.address = EndpointAddress::Unix(PathBuf::from(String::from_utf8(long).expect("utf8")));
         assert_eq!(
             encode_body(&body).expect_err("overlong path").code,
             ErrorCode::ELimit
@@ -747,7 +746,9 @@ mod tests {
         owner.publish(&sample_body()).expect("publish");
         owner.release().expect("release");
         assert_eq!(
-            std::fs::read(store.lock_path()).expect("read released lock").len(),
+            std::fs::read(store.lock_path())
+                .expect("read released lock")
+                .len(),
             0
         );
         match StoreLock::try_acquire(&store.dir).expect("reacquire") {
@@ -789,8 +790,7 @@ mod tests {
             .mode(0o600)
             .open(store.lock_path())
             .expect("pre-create lock");
-        std::fs::hard_link(store.lock_path(), store.dir.join("alias"))
-            .expect("hard link lock");
+        std::fs::hard_link(store.lock_path(), store.dir.join("alias")).expect("hard link lock");
         let err = StoreLock::try_acquire(&store.dir).expect_err("hardlink");
         assert_eq!(err.code, ErrorCode::EForbidden);
         assert!(
@@ -808,7 +808,9 @@ mod tests {
         std::fs::set_permissions(store.lock_path(), std::fs::Permissions::from_mode(0o644))
             .expect("chmod lock");
         assert_eq!(
-            StoreLock::try_acquire(&store.dir).expect_err("insecure mode").code,
+            StoreLock::try_acquire(&store.dir)
+                .expect_err("insecure mode")
+                .code,
             ErrorCode::EForbidden
         );
     }

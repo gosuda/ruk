@@ -193,7 +193,11 @@ impl<'s> Dirs<'s> {
         parse_tree(self.store.hash_kind(), &bytes).map_err(|err| {
             corrupt(
                 self.store,
-                format!("tree object {} does not parse: {}", oid.to_hex(), err.message),
+                format!(
+                    "tree object {} does not parse: {}",
+                    oid.to_hex(),
+                    err.message
+                ),
             )
         })
     }
@@ -343,7 +347,14 @@ pub(crate) fn rebuild(
     };
     let mut seen = HashSet::new();
     // The root is never collapsed: an empty worktree is the empty tree.
-    let Some(root) = rebuild_dir(dirs, &trie, &mut Vec::new(), Some(base), &mut out, &mut seen)?
+    let Some(root) = rebuild_dir(
+        dirs,
+        &trie,
+        &mut Vec::new(),
+        Some(base),
+        &mut out,
+        &mut seen,
+    )?
     else {
         return Err(CoreError::new(
             ErrorCode::ECorrupt,
@@ -460,7 +471,9 @@ fn write_tree(
     if seen.insert(oid) {
         let len = u64::try_from(bytes.len())
             .map_err(|_| CoreError::new(ErrorCode::ECapacity, "tree exceeds u64 bytes"))?;
-        let object = dirs.store.prepare(ObjectKind::Tree, len, bytes.as_slice(), None)?;
+        let object = dirs
+            .store
+            .prepare(ObjectKind::Tree, len, bytes.as_slice(), None)?;
         if object.oid() != oid {
             return Err(CoreError::new(
                 ErrorCode::ECorrupt,

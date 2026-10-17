@@ -229,7 +229,10 @@ impl BatchAccumulator {
     /// # Panics
     /// Panics if called when `can_admit(item)` is false.
     pub(crate) fn add(&mut self, item: BatchItem) {
-        assert!(self.can_admit(&item), "item cannot be admitted into current batch");
+        assert!(
+            self.can_admit(&item),
+            "item cannot be admitted into current batch"
+        );
 
         let item_bytes = item.prepared_bytes();
         if self.items.is_empty() && item_bytes > MAX_BATCH_BYTES {
@@ -264,7 +267,9 @@ impl BatchAccumulator {
                 self.touched_keys
                     .entry(FactTable::Receipts)
                     .or_default()
-                    .insert(rows::receipt_key(candidate.session.id(), candidate.request_id).to_vec());
+                    .insert(
+                        rows::receipt_key(candidate.session.id(), candidate.request_id).to_vec(),
+                    );
             }
             BatchItem::Internal { candidate, .. } => {
                 for fact in &candidate.facts {

@@ -54,7 +54,11 @@ const DECL_KINDS: &[&str] = &[
 /// Whether a declaration node is a single declarator holding a function
 /// value (`const f = () => …`): the only variable shape that becomes a
 /// unit. Multi-declarator lists and non-function values stay gaps.
-fn single_function_value(tree: &ParsedTree, source: &[u8], node: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+fn single_function_value(
+    tree: &ParsedTree,
+    source: &[u8],
+    node: u32,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     if tree.kind_of(node) != "lexical_declaration" && tree.kind_of(node) != "variable_declaration" {
         return None;
     }
@@ -88,9 +92,7 @@ fn single_function_value(tree: &ParsedTree, source: &[u8], node: u32) -> Option<
     let params = tree
         .named_children(value)
         .into_iter()
-        .find(|child| {
-            ["formal_parameters", "parameters"].contains(&tree.kind_of(*child))
-        })
+        .find(|child| ["formal_parameters", "parameters"].contains(&tree.kind_of(*child)))
         .map_or_else(Vec::new, |params| tree.text_of(params, source).to_vec());
     Some((name, params))
 }
@@ -115,7 +117,12 @@ fn export_inner_name(tree: &ParsedTree, source: &[u8], node: u32) -> Option<(Vec
                 tree,
                 source,
                 child,
-                &["formal_parameters", "type_parameters", "return_type", "heritage"],
+                &[
+                    "formal_parameters",
+                    "type_parameters",
+                    "return_type",
+                    "heritage",
+                ],
             );
             return Some((name, discriminator));
         }
@@ -167,17 +174,44 @@ fn collect(
         // Whole import statements are units keyed by their exact text:
         // order and trivia are preserved by the splice, never sorted.
         let text = tree.text_of(node, source).to_vec();
-        push_unit(tree, source, node, kind, text, Vec::new(), &parents.concat(), out);
+        push_unit(
+            tree,
+            source,
+            node,
+            kind,
+            text,
+            Vec::new(),
+            &parents.concat(),
+            out,
+        );
         return;
     }
     if kind == "export_statement" {
         match export_inner_name(tree, source, node) {
             Some((name, discriminator)) => {
-                push_unit(tree, source, node, kind, name, discriminator, &parents.concat(), out);
+                push_unit(
+                    tree,
+                    source,
+                    node,
+                    kind,
+                    name,
+                    discriminator,
+                    &parents.concat(),
+                    out,
+                );
             }
             None => {
                 let text = tree.text_of(node, source).to_vec();
-                push_unit(tree, source, node, kind, text, Vec::new(), &parents.concat(), out);
+                push_unit(
+                    tree,
+                    source,
+                    node,
+                    kind,
+                    text,
+                    Vec::new(),
+                    &parents.concat(),
+                    out,
+                );
             }
         }
         return;
@@ -210,14 +244,37 @@ fn collect(
             tree,
             source,
             node,
-            &["formal_parameters", "type_parameters", "return_type", "heritage"],
+            &[
+                "formal_parameters",
+                "type_parameters",
+                "return_type",
+                "heritage",
+            ],
         );
-        push_unit(tree, source, node, kind, name, discriminator, &parents.concat(), out);
+        push_unit(
+            tree,
+            source,
+            node,
+            kind,
+            name,
+            discriminator,
+            &parents.concat(),
+            out,
+        );
         return;
     }
     if kind == "lexical_declaration" || kind == "variable_declaration" {
         if let Some((name, discriminator)) = single_function_value(tree, source, node) {
-            push_unit(tree, source, node, kind, name, discriminator, &parents.concat(), out);
+            push_unit(
+                tree,
+                source,
+                node,
+                kind,
+                name,
+                discriminator,
+                &parents.concat(),
+                out,
+            );
         }
         return;
     }
@@ -229,7 +286,16 @@ fn collect(
             node,
             &["formal_parameters", "type_parameters", "return_type"],
         );
-        push_unit(tree, source, node, kind, name, discriminator, &parents.concat(), out);
+        push_unit(
+            tree,
+            source,
+            node,
+            kind,
+            name,
+            discriminator,
+            &parents.concat(),
+            out,
+        );
         return;
     }
     let is_root = tree.get(node).is_some_and(|n| n.parent == NODE_NONE);

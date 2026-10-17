@@ -88,13 +88,8 @@ impl<'a> RecordBatchPreparer<'a> {
             }
         };
 
-        self.pending_imported.insert(
-            *oid,
-            PendingImported {
-                change_id,
-                is_new,
-            },
-        );
+        self.pending_imported
+            .insert(*oid, PendingImported { change_id, is_new });
         Ok(change_id)
     }
 
@@ -104,10 +99,7 @@ impl<'a> RecordBatchPreparer<'a> {
     /// present in the change's heads (returning `E_STALE` on mismatch) and replaces
     /// it with the new head. If `input.predecessor` is `None` and the change already
     /// exists, adds a divergent head.
-    pub fn add_native_commit(
-        &mut self,
-        input: NativeCommitInput,
-    ) -> Result<Head, CoreError> {
+    pub fn add_native_commit(&mut self, input: NativeCommitInput) -> Result<Head, CoreError> {
         let kind = self.store.hash_kind();
         let predecessor_head = input.predecessor;
         let change_id = input.change_id;
@@ -216,18 +208,18 @@ impl<'a> RecordBatchPreparer<'a> {
         }
 
         let native = record.native_record().ok_or_else(|| {
-            CoreError::new(ErrorCode::EInvalid, "unexportable record missing native frame")
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "unexportable record missing native frame",
+            )
         })?;
         let frame = native.encode();
         let frame_len = u64::try_from(frame.len()).map_err(|_| {
             CoreError::new(ErrorCode::ECapacity, "conflict frame length overflows u64")
         })?;
-        let prepared = self.store.prepare(
-            ObjectKind::Conflict,
-            frame_len,
-            Cursor::new(frame),
-            None,
-        )?;
+        let prepared =
+            self.store
+                .prepare(ObjectKind::Conflict, frame_len, Cursor::new(frame), None)?;
         Ok(prepared)
     }
 
@@ -290,10 +282,12 @@ impl<'a> RecordBatchPreparer<'a> {
         };
 
         self.load_or_init_change(change_id, initial_head)?;
-        let pending = self
-            .pending_changes
-            .get_mut(&change_id)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "change entry missing in pending overlay"))?;
+        let pending = self.pending_changes.get_mut(&change_id).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                "change entry missing in pending overlay",
+            )
+        })?;
 
         match predecessor {
             Some(old_head) => {
@@ -316,10 +310,12 @@ impl<'a> RecordBatchPreparer<'a> {
         head: Head,
     ) -> Result<(), CoreError> {
         self.load_or_init_change(change_id, Some(head))?;
-        let pending = self
-            .pending_changes
-            .get_mut(&change_id)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "change entry missing in pending overlay"))?;
+        let pending = self.pending_changes.get_mut(&change_id).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                "change entry missing in pending overlay",
+            )
+        })?;
 
         if pending.current_entry.add_head(head)? {
             pending.touched = true;
@@ -411,12 +407,20 @@ impl<'a> Records<'a> {
             .pending_commits
             .get(&head)
             .cloned()
-            .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "prepared commit record missing in pending overlay"))?;
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "prepared commit record missing in pending overlay",
+                )
+            })?;
         let batch = preparer.finish()?;
 
         let mut objects = batch.prepared_objects;
         let prepared_object = if objects.is_empty() {
-            return Err(CoreError::new(ErrorCode::ECorrupt, "no prepared object emitted for native commit"));
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "no prepared object emitted for native commit",
+            ));
         } else {
             objects.remove(0)
         };
@@ -441,7 +445,12 @@ impl<'a> Records<'a> {
             .pending_commits
             .get(&head)
             .cloned()
-            .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "prepared commit record missing in pending overlay"))?;
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "prepared commit record missing in pending overlay",
+                )
+            })?;
         let change_id = record.change_id();
 
         let is_divergent = preparer
@@ -452,7 +461,10 @@ impl<'a> Records<'a> {
         let batch = preparer.finish()?;
         let mut objects = batch.prepared_objects;
         let prepared_object = if objects.is_empty() {
-            return Err(CoreError::new(ErrorCode::ECorrupt, "no prepared object emitted for git import"));
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "no prepared object emitted for git import",
+            ));
         } else {
             objects.remove(0)
         };

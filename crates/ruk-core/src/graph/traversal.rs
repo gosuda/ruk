@@ -206,7 +206,10 @@ pub(crate) fn is_ancestor(
 
     while let Some(node) = heap.pop() {
         if cancel() {
-            return Err(CoreError::new(ErrorCode::ECancelled, "reachability walk cancelled"));
+            return Err(CoreError::new(
+                ErrorCode::ECancelled,
+                "reachability walk cancelled",
+            ));
         }
 
         steps += 1;
@@ -281,14 +284,7 @@ pub(crate) fn find_heads(
             if i == j || is_ancestor_flags[i] {
                 continue;
             }
-            let res = is_ancestor(
-                graph,
-                cand_i,
-                cand_j,
-                None,
-                cancel,
-                max_steps_per_pair,
-            )?;
+            let res = is_ancestor(graph, cand_i, cand_j, None, cancel, max_steps_per_pair)?;
             if res == ShallowAncestry::ProvenYes {
                 is_ancestor_flags[i] = true;
             }
@@ -326,14 +322,7 @@ pub(crate) fn find_roots(
             if i == j || has_ancestor_flags[i] {
                 continue;
             }
-            let res = is_ancestor(
-                graph,
-                cand_j,
-                cand_i,
-                None,
-                cancel,
-                max_steps_per_pair,
-            )?;
+            let res = is_ancestor(graph, cand_j, cand_i, None, cancel, max_steps_per_pair)?;
             if res == ShallowAncestry::ProvenYes {
                 has_ancestor_flags[i] = true;
             }

@@ -88,13 +88,10 @@ pub fn change_key(id: &ChangeId) -> [u8; CHANGE_KEY_LEN] {
 /// # Errors
 /// [`CoreModelError::Invalid`] if `bytes` is not exactly 16 bytes.
 pub fn decode_change_key(bytes: &[u8]) -> Result<ChangeId, CoreModelError> {
-    let raw: [u8; CHANGE_KEY_LEN] =
-        bytes
-            .try_into()
-            .map_err(|_| CoreModelError::Invalid {
-                what: "change key",
-                detail: format!("expected {CHANGE_KEY_LEN} bytes, found {}", bytes.len()),
-            })?;
+    let raw: [u8; CHANGE_KEY_LEN] = bytes.try_into().map_err(|_| CoreModelError::Invalid {
+        what: "change key",
+        detail: format!("expected {CHANGE_KEY_LEN} bytes, found {}", bytes.len()),
+    })?;
     Ok(ChangeId::from_bytes(raw))
 }
 

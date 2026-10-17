@@ -159,7 +159,10 @@ impl RefPlan {
                 let peeled = peeled.unwrap_or(oid);
                 self.direct.insert(entry.name.clone(), (oid, peeled));
             }
-            RootOutcome::Native { reason, oid: native } => self.unexported.push(UnexportedRef {
+            RootOutcome::Native {
+                reason,
+                oid: native,
+            } => self.unexported.push(UnexportedRef {
                 name: entry.name.clone(),
                 reason: reason.into(),
                 oid: Some(native),
@@ -199,7 +202,8 @@ impl RefPlan {
                 if let Some(oid) = terminal.oid {
                     closure.add_root(oid)?;
                 }
-                let terminal_unexported = self.unexported.iter().any(|u| u.name == terminal.terminal);
+                let terminal_unexported =
+                    self.unexported.iter().any(|u| u.name == terminal.terminal);
                 self.head_exported = !terminal_unexported;
             }
         }
@@ -215,7 +219,10 @@ fn load_conflicts(store: &Store) -> Result<BTreeMap<RefName, usize>, GitError> {
         let RefConflictPage { entries, more } =
             page_ref_conflicts(store, after.as_deref(), PAGE_LIMIT)?;
         for RefConflictEntry { name, conflict } in entries {
-            let terms = conflict.adds().len().saturating_add(conflict.removes().len());
+            let terms = conflict
+                .adds()
+                .len()
+                .saturating_add(conflict.removes().len());
             out.insert(name, terms);
         }
         if !more {
@@ -239,7 +246,9 @@ fn load_refs(store: &Store) -> Result<Vec<RefEntry>, GitError> {
         if !more {
             return Ok(out);
         }
-        let Some(last) = out.last() else { return Ok(out) };
+        let Some(last) = out.last() else {
+            return Ok(out);
+        };
         after = Some(last.name.as_bytes().to_vec());
     }
 }
@@ -291,10 +300,7 @@ mod tests {
         let line = packed_line(&name, &oid);
         assert_eq!(line, format!("{oid} refs/heads/main\n").into_bytes());
         assert_eq!(peel_line(&oid), format!("^{oid}\n").into_bytes());
-        assert_eq!(
-            symbolic_bytes(&name),
-            b"ref: refs/heads/main\n".to_vec()
-        );
+        assert_eq!(symbolic_bytes(&name), b"ref: refs/heads/main\n".to_vec());
     }
 
     #[test]

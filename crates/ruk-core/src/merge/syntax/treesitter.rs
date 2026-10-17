@@ -54,9 +54,7 @@ impl TsGrammar {
             .set_language(&TsLanguage::from(export))
             .map_err(|err| SyntaxError::Invalid {
                 what: "grammar",
-                detail: format!(
-                    "tree-sitter rejected pinned grammar for {language}: {err}"
-                ),
+                detail: format!("tree-sitter rejected pinned grammar for {language}: {err}"),
             })?;
         Ok(Self {
             language,
@@ -105,9 +103,9 @@ fn fill_nodes(root: Node<'_>, source_len: u32, cancel: &Cancel) -> Result<Parsed
         let index = u32::try_from(nodes.len()).expect("node table bounded by source size");
         let parent = ancestors.last().copied().unwrap_or(NODE_NONE);
 
-        let field = cursor.field_name().map_or(FIELD_NONE, |name| {
-            intern(&mut fields, &mut field_map, name)
-        });
+        let field = cursor
+            .field_name()
+            .map_or(FIELD_NONE, |name| intern(&mut fields, &mut field_map, name));
         let kind = intern(&mut kinds, &mut kind_map, node.kind());
 
         nodes.push(ParsedNode {
@@ -170,8 +168,7 @@ impl Grammar for TsGrammar {
                 ),
             });
         }
-        let source_len =
-            u32::try_from(source.len()).expect("source bounded to MAX_TRIPLET_BYTES");
+        let source_len = u32::try_from(source.len()).expect("source bounded to MAX_TRIPLET_BYTES");
 
         let mut parser = self.parser.lock().expect("parser mutex poisoned");
         let mut feed = |offset: usize, _point: tree_sitter::Point| -> &[u8] {
@@ -218,10 +215,7 @@ pub fn registry_providers() -> Vec<Result<TsGrammar, SyntaxError>> {
         TsGrammar::new(Language::Python, tree_sitter_python::LANGUAGE),
         TsGrammar::new(Language::Go, tree_sitter_go::LANGUAGE),
         TsGrammar::new(Language::Yaml, tree_sitter_yaml::LANGUAGE),
-        TsGrammar::new(
-            Language::Javascript,
-            tree_sitter_javascript::LANGUAGE,
-        ),
+        TsGrammar::new(Language::Javascript, tree_sitter_javascript::LANGUAGE),
         TsGrammar::new(
             Language::Typescript,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT,

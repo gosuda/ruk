@@ -46,7 +46,7 @@ use core::fmt;
 use logos::Logos;
 
 use crate::error::{CoreError, ErrorCode};
-use crate::protocol::{RevsetText, MAX_REVSET_BYTES};
+use crate::protocol::{MAX_REVSET_BYTES, RevsetText};
 
 /// Maximum nesting depth allowed during recursive Pratt parsing.
 pub const MAX_PARSE_DEPTH: usize = 128;
@@ -167,10 +167,7 @@ pub enum NodeKind {
     /// `files(glob)`: Filter by changed file glob pattern.
     Files(StringId),
     /// `attested(kind, result)`: Filter by attestation kind and result.
-    Attested {
-        kind: StringId,
-        result: StringId,
-    },
+    Attested { kind: StringId, result: StringId },
 
     // --- Contracted Functions with Expression Arguments ---
     /// `heads(x)`: Commits in `x` that are not ancestors of other commits in `x`.
@@ -323,9 +320,7 @@ impl AstArena {
             | NodeKind::Divergent
             | NodeKind::Mine => smallvec::SmallVec::new(),
 
-            NodeKind::Bookmarks(opt)
-            | NodeKind::RemoteBookmarks(opt)
-            | NodeKind::Tags(opt) => {
+            NodeKind::Bookmarks(opt) | NodeKind::RemoteBookmarks(opt) | NodeKind::Tags(opt) => {
                 if let Some(child) = opt {
                     smallvec::smallvec![*child]
                 } else {
@@ -706,7 +701,8 @@ fn tokenize<'a>(input: &'a str) -> Result<Vec<SpannedToken<'a>>, RevsetParseErro
                     return Err(RevsetParseError::invalid(
                         "unrecognized operator '^': use '@-' for parents of '@'",
                         span,
-                    ).with_hint("use '@-' for working copy parents or ancestors()"));
+                    )
+                    .with_hint("use '@-' for working copy parents or ancestors()"));
                 }
                 if ch == '-' {
                     return Err(RevsetParseError::invalid(
@@ -718,13 +714,15 @@ fn tokenize<'a>(input: &'a str) -> Result<Vec<SpannedToken<'a>>, RevsetParseErro
                     return Err(RevsetParseError::invalid(
                         "unterminated double-quoted string literal",
                         Span::new(range.start, input.len()),
-                    ).with_hint("add a closing '\"' at the end of the string"));
+                    )
+                    .with_hint("add a closing '\"' at the end of the string"));
                 }
                 if ch == '\'' {
                     return Err(RevsetParseError::invalid(
                         "unterminated single-quoted string literal",
                         Span::new(range.start, input.len()),
-                    ).with_hint("add a closing '\'' at the end of the raw string"));
+                    )
+                    .with_hint("add a closing '\'' at the end of the raw string"));
                 }
                 if ch == '\0' {
                     return Err(RevsetParseError::invalid(
@@ -950,12 +948,14 @@ impl<'a> Parser<'a> {
             RawToken::ColonColon => Err(RevsetParseError::invalid(
                 "unexpected '::' in prefix position; '::' is a binary DAG range operator ('x::y')",
                 st.span,
-            ).with_hint("use 'x::y' for DAG range or ancestors(y)/descendants(x)")),
+            )
+            .with_hint("use 'x::y' for DAG range or ancestors(y)/descendants(x)")),
 
             RawToken::DotDot => Err(RevsetParseError::invalid(
                 "unexpected '..' in prefix position; '..' is a binary range operator ('x..y')",
                 st.span,
-            ).with_hint("use 'x..y' for range or ancestors(y) ~ ancestors(x)")),
+            )
+            .with_hint("use 'x..y' for range or ancestors(y) ~ ancestors(x)")),
 
             RawToken::LParen => {
                 if self.peek() == Some(RawToken::RParen) {
@@ -1003,10 +1003,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            RawToken::RParen => Err(RevsetParseError::invalid(
-                "unexpected closing ')'",
-                st.span,
-            )),
+            RawToken::RParen => Err(RevsetParseError::invalid("unexpected closing ')'", st.span)),
 
             RawToken::Comma => Err(RevsetParseError::invalid("unexpected comma ','", st.span)),
 
@@ -1275,7 +1272,8 @@ impl<'a> Parser<'a> {
                 }
                 let rparen_st = self.expect_rparen("ancestors")?;
                 let call_span = name_span.join(lparen_st.span).join(rparen_st.span);
-                self.arena.alloc_node(NodeKind::Ancestors(expr_id), call_span)
+                self.arena
+                    .alloc_node(NodeKind::Ancestors(expr_id), call_span)
             }
 
             "descendants" => {
@@ -1296,7 +1294,8 @@ impl<'a> Parser<'a> {
                 }
                 let rparen_st = self.expect_rparen("descendants")?;
                 let call_span = name_span.join(lparen_st.span).join(rparen_st.span);
-                self.arena.alloc_node(NodeKind::Descendants(expr_id), call_span)
+                self.arena
+                    .alloc_node(NodeKind::Descendants(expr_id), call_span)
             }
 
             // 0 or 1 argument: bookmarks([p]), remote_bookmarks([p]), tags([p])
@@ -1335,7 +1334,8 @@ impl<'a> Parser<'a> {
                 };
                 let rparen_st = self.expect_rparen("remote_bookmarks")?;
                 let call_span = name_span.join(lparen_st.span).join(rparen_st.span);
-                self.arena.alloc_node(NodeKind::RemoteBookmarks(arg), call_span)
+                self.arena
+                    .alloc_node(NodeKind::RemoteBookmarks(arg), call_span)
             }
 
             "tags" => {
@@ -1465,7 +1465,9 @@ mod tests {
     #[test]
     fn flat_arena_drop_does_not_overflow_stack_on_deep_structure() {
         let mut arena = AstArena::new();
-        let mut current = arena.alloc_node(NodeKind::At, Span::empty(0)).expect("alloc");
+        let mut current = arena
+            .alloc_node(NodeKind::At, Span::empty(0))
+            .expect("alloc");
         // Build a 20,000 deep chain in the flat arena
         for i in 0..20_000 {
             current = arena
@@ -1711,7 +1713,10 @@ mod tests {
             other => panic!("expected Session, got {other:?}"),
         }
         assert!(parse_str("session(s1)").is_ok());
-        assert_eq!(parse_str("session()").unwrap_err().code, ErrorCode::EInvalid);
+        assert_eq!(
+            parse_str("session()").unwrap_err().code,
+            ErrorCode::EInvalid
+        );
         assert_eq!(
             parse_str("session(a, b)").unwrap_err().code,
             ErrorCode::EInvalid
@@ -1779,23 +1784,35 @@ mod tests {
         // heads(x): exactly 1 argument
         assert!(parse_str("heads(main)").is_ok());
         assert_eq!(parse_str("heads()").unwrap_err().code, ErrorCode::EInvalid);
-        assert_eq!(parse_str("heads(a, b)").unwrap_err().code, ErrorCode::EInvalid);
+        assert_eq!(
+            parse_str("heads(a, b)").unwrap_err().code,
+            ErrorCode::EInvalid
+        );
 
         // roots(x): exactly 1 argument
         assert!(parse_str("roots(main)").is_ok());
         assert_eq!(parse_str("roots()").unwrap_err().code, ErrorCode::EInvalid);
-        assert_eq!(parse_str("roots(a, b)").unwrap_err().code, ErrorCode::EInvalid);
+        assert_eq!(
+            parse_str("roots(a, b)").unwrap_err().code,
+            ErrorCode::EInvalid
+        );
 
         // ancestors(x): exactly 1 argument (NO depth overload!)
         assert!(parse_str("ancestors(@)").is_ok());
-        assert_eq!(parse_str("ancestors()").unwrap_err().code, ErrorCode::EInvalid);
+        assert_eq!(
+            parse_str("ancestors()").unwrap_err().code,
+            ErrorCode::EInvalid
+        );
         let err = parse_str("ancestors(@, 2)").unwrap_err();
         assert_eq!(err.code, ErrorCode::EInvalid);
         assert!(err.message.contains("depth"));
 
         // descendants(x): exactly 1 argument (NO depth overload!)
         assert!(parse_str("descendants(@)").is_ok());
-        assert_eq!(parse_str("descendants()").unwrap_err().code, ErrorCode::EInvalid);
+        assert_eq!(
+            parse_str("descendants()").unwrap_err().code,
+            ErrorCode::EInvalid
+        );
         let err = parse_str("descendants(@, 2)").unwrap_err();
         assert_eq!(err.code, ErrorCode::EInvalid);
         assert!(err.message.contains("depth"));
@@ -1816,7 +1833,10 @@ mod tests {
 
         // mine(): exactly 0 arguments
         assert!(parse_str("mine()").is_ok());
-        assert_eq!(parse_str("mine(extra)").unwrap_err().code, ErrorCode::EInvalid);
+        assert_eq!(
+            parse_str("mine(extra)").unwrap_err().code,
+            ErrorCode::EInvalid
+        );
 
         // bookmarks([p]): 0 or 1 argument
         assert!(parse_str("bookmarks()").is_ok());
@@ -1837,7 +1857,10 @@ mod tests {
         // tags([p]): 0 or 1 argument
         assert!(parse_str("tags()").is_ok());
         assert!(parse_str("tags(\"v*\")").is_ok());
-        assert_eq!(parse_str("tags(a, b)").unwrap_err().code, ErrorCode::EInvalid);
+        assert_eq!(
+            parse_str("tags(a, b)").unwrap_err().code,
+            ErrorCode::EInvalid
+        );
 
         // unknown function
         let err = parse_str("unknown_func()").unwrap_err();

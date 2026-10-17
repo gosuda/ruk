@@ -46,8 +46,14 @@ pub(crate) struct TargetEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Preimage {
     Absent,
-    File { executable: bool, oid: Oid },
-    Symlink { link: ByteString, oid: Oid },
+    File {
+        executable: bool,
+        oid: Oid,
+    },
+    Symlink {
+        link: ByteString,
+        oid: Oid,
+    },
     /// A directory whose every non-directory descendant is itself journaled
     /// (or a gitlink directory left untouched).
     Directory,
@@ -61,7 +67,9 @@ pub(crate) enum Transition {
     /// Created with the bytes and mode that `from` (journaled as a delete)
     /// held. Executed as a write from the store, never as an OS rename, so a
     /// half-done rename cannot strand the source.
-    Rename { from: RepoPath },
+    Rename {
+        from: RepoPath,
+    },
     Modify,
     ModeChange,
     SymlinkChange,
@@ -285,7 +293,9 @@ impl ApplyJournal {
                     return Err("target oid has the wrong hash kind".to_owned());
                 }
                 if (target.mode == FileMode::Symlink) != target.link.is_some() {
-                    return Err("symlink target bytes must be present exactly for symlinks".to_owned());
+                    return Err(
+                        "symlink target bytes must be present exactly for symlinks".to_owned()
+                    );
                 }
             }
             if let Some(oid) = entry.preimage.oid()

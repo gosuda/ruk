@@ -6,12 +6,12 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(windows)]
+pub(crate) use super::windows::ensure_local_storage;
 #[cfg(unix)]
 pub(crate) use unix::{UnixEndpoint as Endpoint, connect, ensure_local_storage};
 #[cfg(windows)]
 pub(crate) use windows::{WindowsEndpoint as Endpoint, connect};
-#[cfg(windows)]
-pub(crate) use super::windows::ensure_local_storage;
 
 #[cfg(unix)]
 pub(crate) type Incoming = tokio::net::UnixStream;
@@ -25,7 +25,9 @@ pub(crate) type Outgoing = tokio::net::windows::named_pipe::NamedPipeClient;
 pub(crate) fn owner() -> Result<Principal, CoreError> {
     #[cfg(unix)]
     {
-        Ok(Principal::from_peer_uid(rustix::process::geteuid().as_raw()))
+        Ok(Principal::from_peer_uid(
+            rustix::process::geteuid().as_raw(),
+        ))
     }
     #[cfg(windows)]
     {

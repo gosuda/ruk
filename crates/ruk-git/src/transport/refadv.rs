@@ -165,7 +165,10 @@ fn oid_field(field: &[u8], kind: HashKind) -> Result<Oid, GitError> {
 
 fn ref_name(field: &[u8]) -> Result<Vec<u8>, GitError> {
     if field.is_empty() || field.iter().any(|b| matches!(b, 0 | b'\n' | b' ')) {
-        return Err(corrupt(format!("malformed ref name {}", field.escape_ascii())));
+        return Err(corrupt(format!(
+            "malformed ref name {}",
+            field.escape_ascii()
+        )));
     }
     Ok(field.to_vec())
 }
@@ -249,7 +252,8 @@ fn read_v0_rest<R: Read>(
     let Some(first) = first else {
         return Ok(adv);
     };
-    let (head, caps) = split_once(&first, 0).ok_or_else(|| corrupt("first ref line has no capability list"))?;
+    let (head, caps) =
+        split_once(&first, 0).ok_or_else(|| corrupt("first ref line has no capability list"))?;
     adv.capabilities = Capabilities::parse_list(caps);
     let kind = adv.capabilities.object_format(local)?;
     let (oid, name) = split_once(head, b' ').ok_or_else(|| corrupt("malformed first ref line"))?;
@@ -266,7 +270,11 @@ fn read_v0_rest<R: Read>(
         let line = match packet {
             Packet::Flush => break,
             Packet::Data(_) => packet.line().unwrap_or_default().to_vec(),
-            other => return Err(corrupt(format!("unexpected {other:?} in ref advertisement"))),
+            other => {
+                return Err(corrupt(format!(
+                    "unexpected {other:?} in ref advertisement"
+                )));
+            }
         };
         if let Some(rest) = line.strip_prefix(b"shallow ") {
             adv.shallow.push(oid_field(rest, kind)?);
@@ -277,7 +285,8 @@ fn read_v0_rest<R: Read>(
         push_v0_ref(&mut adv.refs, oid, name)?;
     }
     for value in adv.capabilities.values("symref") {
-        let (from, to) = split_once(value, b':').ok_or_else(|| corrupt("malformed symref capability"))?;
+        let (from, to) =
+            split_once(value, b':').ok_or_else(|| corrupt("malformed symref capability"))?;
         if let Some(row) = adv.refs.iter_mut().find(|r| r.name == from) {
             row.symref_target = Some(ref_name(to)?);
         }
@@ -287,10 +296,12 @@ fn read_v0_rest<R: Read>(
 
 fn push_v0_ref(refs: &mut Vec<AdvertisedRef>, oid: Oid, name: &[u8]) -> Result<(), GitError> {
     if let Some(base) = name.strip_suffix(b"^{}") {
-        let last = refs
-            .last_mut()
-            .filter(|r| r.name == base)
-            .ok_or_else(|| corrupt(format!("peeled line for {} without its ref", base.escape_ascii())))?;
+        let last = refs.last_mut().filter(|r| r.name == base).ok_or_else(|| {
+            corrupt(format!(
+                "peeled line for {} without its ref",
+                base.escape_ascii()
+            ))
+        })?;
         last.peeled = Some(oid);
         return Ok(());
     }
@@ -343,7 +354,10 @@ pub(crate) fn write_command_header(
         pktline::encode_data(out, format!("agent={AGENT}\n").as_bytes())?;
     }
     if caps.has("object-format") {
-        pktline::encode_data(out, format!("object-format={}\n", kind.format_name()).as_bytes())?;
+        pktline::encode_data(
+            out,
+            format!("object-format={}\n", kind.format_name()).as_bytes(),
+        )?;
     }
     pktline::encode_delimiter(out);
     Ok(())
@@ -376,7 +390,9 @@ pub fn read_ls_refs<R: Read>(
 pub fn parse_ls_refs_line(line: &[u8], kind: HashKind) -> Result<AdvertisedRef, GitError> {
     let mut fields = line.split(|b| *b == b' ');
     let oid = fields.next().ok_or_else(|| corrupt("empty ls-refs line"))?;
-    let name = fields.next().ok_or_else(|| corrupt("ls-refs line without a name"))?;
+    let name = fields
+        .next()
+        .ok_or_else(|| corrupt("ls-refs line without a name"))?;
     let mut row = AdvertisedRef {
         name: ref_name(name)?,
         oid: if oid == b"unborn" {
@@ -427,7 +443,8 @@ mod tests {
 
     #[test]
     fn parses_v0_with_caps_peeled_symref_shallow() {
-        let first = format!("{A} HEAD\0multi_ack side-band-64k symref=HEAD:refs/heads/main agent=git/2\n");
+        let first =
+            format!("{A} HEAD\0multi_ack side-band-64k symref=HEAD:refs/heads/main agent=git/2\n");
         let main = format!("{A} refs/heads/main\n");
         let tag = format!("{B} refs/tags/v1\n");
         let peeled = format!("{A} refs/tags/v1^{{}}\n");
@@ -447,7 +464,10 @@ mod tests {
         assert_eq!(adv.version, ProtocolVersion::V0);
         assert!(adv.capabilities.has("side-band-64k"));
         assert_eq!(adv.refs.len(), 3);
-        assert_eq!(adv.refs[0].symref_target.as_deref(), Some(&b"refs/heads/main"[..]));
+        assert_eq!(
+            adv.refs[0].symref_target.as_deref(),
+            Some(&b"refs/heads/main"[..])
+        );
         assert_eq!(adv.refs[2].peeled, Some(oid(A)));
         assert_eq!(adv.shallow, vec![oid(B)]);
     }
@@ -455,7 +475,13 @@ mod tests {
     #[test]
     fn empty_repository_and_v1_and_service_preamble() {
         let first = format!("{Z} capabilities^{{}}\0report-status delete-refs\n");
-        let bytes = wire(&[b"# service=git-receive-pack\n", b"", b"version 1\n", first.as_bytes(), b""]);
+        let bytes = wire(&[
+            b"# service=git-receive-pack\n",
+            b"",
+            b"version 1\n",
+            first.as_bytes(),
+            b"",
+        ]);
         let mut pkt = PktReader::new(&bytes[..], Interrupt::none());
         let Initial::Refs(adv) = read_initial(&mut pkt, HashKind::Sha1).expect("v1") else {
             panic!("expected v1");
@@ -475,7 +501,10 @@ mod tests {
             Err(GitError::ObjectFormat { .. })
         ));
         let caps = Capabilities::parse_list(b"ofs-delta");
-        assert_eq!(caps.object_format(HashKind::Sha1).expect("default"), HashKind::Sha1);
+        assert_eq!(
+            caps.object_format(HashKind::Sha1).expect("default"),
+            HashKind::Sha1
+        );
         assert!(caps.object_format(HashKind::Sha256).is_err());
     }
 
@@ -485,10 +514,16 @@ mod tests {
         let orphan = format!("{A} refs/tags/x^{{}}\n");
         let bytes = wire(&[first.as_bytes(), orphan.as_bytes(), b""]);
         let mut pkt = PktReader::new(&bytes[..], Interrupt::none());
-        assert!(matches!(read_initial(&mut pkt, HashKind::Sha1), Err(GitError::Corrupt { .. })));
+        assert!(matches!(
+            read_initial(&mut pkt, HashKind::Sha1),
+            Err(GitError::Corrupt { .. })
+        ));
         let bytes = wire(&[b"xyz HEAD\0\n", b""]);
         let mut pkt = PktReader::new(&bytes[..], Interrupt::none());
-        assert!(matches!(read_initial(&mut pkt, HashKind::Sha1), Err(GitError::Corrupt { .. })));
+        assert!(matches!(
+            read_initial(&mut pkt, HashKind::Sha1),
+            Err(GitError::Corrupt { .. })
+        ));
     }
 
     #[test]
@@ -512,7 +547,12 @@ mod tests {
             pktline::encode_data(&mut out, b"command=ls-refs\n").expect("f");
             pktline::encode_data(&mut out, format!("agent={AGENT}\n").as_bytes()).expect("f");
             pktline::encode_delimiter(&mut out);
-            for line in [&b"peel\n"[..], b"symrefs\n", b"unborn\n", b"ref-prefix refs/heads/\n"] {
+            for line in [
+                &b"peel\n"[..],
+                b"symrefs\n",
+                b"unborn\n",
+                b"ref-prefix refs/heads/\n",
+            ] {
                 pktline::encode_data(&mut out, line).expect("f");
             }
             pktline::encode_flush(&mut out);
@@ -522,10 +562,18 @@ mod tests {
 
         let head = format!("{A} HEAD symref-target:refs/heads/main\n");
         let tag = format!("{B} refs/tags/v1 peeled:{A}\n");
-        let bytes = wire(&[head.as_bytes(), tag.as_bytes(), b"unborn refs/x symref-target:refs/heads/y\n", b""]);
+        let bytes = wire(&[
+            head.as_bytes(),
+            tag.as_bytes(),
+            b"unborn refs/x symref-target:refs/heads/y\n",
+            b"",
+        ]);
         let mut pkt = PktReader::new(&bytes[..], Interrupt::none());
         let refs = read_ls_refs(&mut pkt, HashKind::Sha1).expect("ls-refs");
-        assert_eq!(refs[0].symref_target.as_deref(), Some(&b"refs/heads/main"[..]));
+        assert_eq!(
+            refs[0].symref_target.as_deref(),
+            Some(&b"refs/heads/main"[..])
+        );
         assert_eq!(refs[1].peeled, Some(oid(A)));
         assert_eq!(refs[2].oid, None);
         assert!(parse_ls_refs_line(b"unborn HEAD", HashKind::Sha1).is_err());

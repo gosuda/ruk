@@ -1294,7 +1294,11 @@ fn fact_page_first_oversized_row_returns_limit_never_empty_eof() {
 
     // Second row as first row of the continuation page exceeds budget of 19 bytes.
     let after_key = &page1.rows[0].key;
-    let result2 = meta.fact_page(FactTable::Refs, Some(after_key), FactPageBudget::new(10, 19));
+    let result2 = meta.fact_page(
+        FactTable::Refs,
+        Some(after_key),
+        FactPageBudget::new(10, 19),
+    );
     assert!(
         matches!(result2, Err(StoreError::Limit(_))),
         "expected Limit on resumed first row, got {result2:?}"
@@ -1349,7 +1353,10 @@ fn fact_page_exact_budget_eof_versus_another_row() {
     assert_eq!(single_page.rows.len(), 1);
     assert_eq!(single_page.rows[0].key, b"ref1");
     assert_eq!(single_page.rows[0].value, b"val001");
-    assert!(!single_page.more, "more must be false on EOF at exact budget");
+    assert!(
+        !single_page.more,
+        "more must be false on EOF at exact budget"
+    );
 }
 
 #[test]

@@ -34,8 +34,8 @@ use crate::commit::ProvenanceClaims;
 use crate::coord::policy::Principal;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
-    IdentityClaim, MutationOutcome, OperationEntry, ReceiptRef, Reply, SessionAuthority,
-    Timestamp, Validate,
+    IdentityClaim, MutationOutcome, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp,
+    Validate,
 };
 use crate::store::types::FactTable;
 use crate::store::{Store, StoreError};
@@ -420,11 +420,7 @@ pub(crate) fn decode_receipt(
         );
     }
     if outcome.receipt.replayed {
-        return corrupt(
-            store,
-            "receipt row",
-            "stored receipt has replayed == true",
-        );
+        return corrupt(store, "receipt row", "stored receipt has replayed == true");
     }
     Ok(ReceiptRow(reply))
 }
@@ -646,7 +642,10 @@ pub(crate) struct OpDelta {
 /// Resolves a table name string to its approved [`FactTable`] enum variant.
 #[must_use]
 pub(crate) fn fact_table_from_name(name: &str) -> Option<FactTable> {
-    FactTable::ALL.iter().copied().find(|t| t.table_name() == name)
+    FactTable::ALL
+        .iter()
+        .copied()
+        .find(|t| t.table_name() == name)
 }
 
 // ---------------------------------------------------------------------------
@@ -665,8 +664,8 @@ mod tests {
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{
-        BoundedList, Method, RequestDigest, ResultingStamp, SchemaArgs, SchemaReply,
-        SchemaVersion, WsTakeArgs, WsTakeReply,
+        BoundedList, Method, RequestDigest, ResultingStamp, SchemaArgs, SchemaReply, SchemaVersion,
+        WsTakeArgs, WsTakeReply,
     };
     use crate::store::PreparationBudget;
     use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp};
@@ -703,8 +702,8 @@ mod tests {
     fn test_store(tag: &str) -> (TempRoot, Store) {
         let temp = TempRoot::new(tag);
         let budget = Arc::new(PreparationBudget::reference_defaults());
-        let store = Store::create(&temp.store_dir(), HashKind::Sha1, budget)
-            .expect("create test store");
+        let store =
+            Store::create(&temp.store_dir(), HashKind::Sha1, budget).expect("create test store");
         (temp, store)
     }
 
@@ -742,8 +741,8 @@ mod tests {
         assert_eq!(
             o_key,
             [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
             ]
         );
         assert_eq!(OP_HEAD_KEY, b"");
@@ -770,7 +769,9 @@ mod tests {
             claims: ProvenanceClaims::default(),
             capabilities: Capabilities::default(),
             secret_hash: [0xaa; 32],
-            authority: SessionAuthority::Active { idle_expires_at: t0 },
+            authority: SessionAuthority::Active {
+                idle_expires_at: t0,
+            },
         };
 
         // Debug output redacts secret_hash
@@ -780,7 +781,9 @@ mod tests {
 
         // Active expiry increase is valid
         let mut row_active_advanced = row_active.clone();
-        row_active_advanced.authority = SessionAuthority::Active { idle_expires_at: t1 };
+        row_active_advanced.authority = SessionAuthority::Active {
+            idle_expires_at: t1,
+        };
         assert!(row_active.check_successor(&row_active_advanced).is_ok());
 
         // Active expiry decrease is invalid
@@ -794,7 +797,9 @@ mod tests {
 
         // Transition from Active to ReceiptsOnly with exactly +7d is valid
         let mut row_receipts = row_active.clone();
-        row_receipts.authority = SessionAuthority::ReceiptsOnly { receipts_until: t_receipts };
+        row_receipts.authority = SessionAuthority::ReceiptsOnly {
+            receipts_until: t_receipts,
+        };
         assert!(row_active.check_successor(&row_receipts).is_ok());
 
         // Transition from Active to ReceiptsOnly with wrong horizon is invalid
@@ -851,7 +856,9 @@ mod tests {
         };
 
         // Same holder, advance stamp sequence: valid
-        let state_advanced = state0.rescope(state0.stamp(), Scope::Full).expect("advance");
+        let state_advanced = state0
+            .rescope(state0.stamp(), Scope::Full)
+            .expect("advance");
         let row_advanced = WorkspaceRow {
             state: state_advanced,
             holder: holder0,
@@ -891,7 +898,9 @@ mod tests {
             document: schemars::schema_for!(SchemaArgs),
         }));
         assert_eq!(
-            ReceiptRow::new(s, r, schema_reply).expect_err("schema reply").code,
+            ReceiptRow::new(s, r, schema_reply)
+                .expect_err("schema reply")
+                .code,
             ErrorCode::EInvalid
         );
 
@@ -944,7 +953,10 @@ mod tests {
 
         // Store must now be quarantined
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -985,7 +997,10 @@ mod tests {
         let err = decode_receipt(&store, &wrong_key, &bytes).expect_err("key mismatch");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1014,7 +1029,10 @@ mod tests {
         let err = decode_op_header(&store, OperationId(1), &b).expect_err("zero deltas");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1028,26 +1046,22 @@ mod tests {
         10, 119, 111, 114, 107, 115, 112, 97, 99, 101, 115, 4, 1, 2, 3, 4, 0, 1, 4, 5, 6, 7, 8,
     ];
     const GOLDEN_SESSION_ACTIVE: &[u8] = &[
-        9, 117, 110, 105, 120, 58, 49, 48, 48, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-        66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-        0, 0, 0,
+        9, 117, 110, 105, 120, 58, 49, 48, 48, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 66, 66, 66, 66,
+        66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
+        66, 66, 66, 66, 66, 0, 0, 0,
     ];
     const GOLDEN_SESSION_RECEIPTS: &[u8] = &[
-        9, 117, 110, 105, 120, 58, 49, 48, 48, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-        66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
-        1, 128, 234, 73, 0,
+        9, 117, 110, 105, 120, 58, 49, 48, 48, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 66, 66, 66, 66,
+        66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
+        66, 66, 66, 66, 66, 1, 128, 234, 73, 0,
     ];
     const GOLDEN_WS_TAKE_RECEIPT: &[u8] = &[
-        5, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
-        16, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34,
-        32, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51,
-        51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51,
-        0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        16, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        0, 20, 1, 35, 69, 103, 137, 171, 205, 239, 1, 35, 69, 103, 137, 171, 205, 239, 1, 35, 69, 103,
-        0, 0, 0,
+        5, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 16, 34, 34, 34, 34,
+        34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 32, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51,
+        51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 0,
+        0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 0, 20, 1, 35, 69, 103, 137, 171, 205, 239, 1, 35, 69, 103, 137, 171, 205,
+        239, 1, 35, 69, 103, 0, 0, 0,
     ];
 
     #[test]
@@ -1088,7 +1102,8 @@ mod tests {
             before: None,
             after: Some(vec![5, 6, 7, 8]),
         };
-        let decoded_delta: OpDelta = decode(&store, "op delta", GOLDEN_OP_DELTA).expect("decode delta");
+        let decoded_delta: OpDelta =
+            decode(&store, "op delta", GOLDEN_OP_DELTA).expect("decode delta");
         assert_eq!(decoded_delta, expected_delta);
         let delta_bytes = encode("op delta", &expected_delta).expect("encode delta");
         assert_eq!(delta_bytes.as_slice(), GOLDEN_OP_DELTA);
@@ -1111,8 +1126,7 @@ mod tests {
         )
         .expect("decode active");
         assert_eq!(decoded_active, expected_session_active);
-        let active_bytes =
-            encode("session row", &expected_session_active).expect("encode active");
+        let active_bytes = encode("session row", &expected_session_active).expect("encode active");
         assert_eq!(active_bytes.as_slice(), GOLDEN_SESSION_ACTIVE);
 
         let expected_session_receipts = SessionRow {
@@ -1164,9 +1178,8 @@ mod tests {
             state: sample_workspace_state(),
         }));
         let expected_receipt_row = ReceiptRow::new(s, r, ws_reply).expect("receipt");
-        let decoded_receipt =
-            decode_receipt(&store, &receipt_key(s, r), GOLDEN_WS_TAKE_RECEIPT)
-                .expect("decode receipt");
+        let decoded_receipt = decode_receipt(&store, &receipt_key(s, r), GOLDEN_WS_TAKE_RECEIPT)
+            .expect("decode receipt");
         assert_eq!(decoded_receipt, expected_receipt_row);
         let receipt_bytes = encode("receipt row", &expected_receipt_row).expect("encode receipt");
         assert_eq!(receipt_bytes.as_slice(), GOLDEN_WS_TAKE_RECEIPT);

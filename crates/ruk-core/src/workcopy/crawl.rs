@@ -26,7 +26,9 @@ use crate::{CoreError, ErrorCode};
 pub(crate) enum EntryKind {
     /// A regular file; `executable` is the owner-exec bit where the
     /// platform has one and `false` elsewhere.
-    File { executable: bool },
+    File {
+        executable: bool,
+    },
     Symlink,
 }
 
@@ -203,10 +205,7 @@ fn crawl_worker(
                 if state.found.len() > limits.max_entries && state.error.is_none() {
                     state.error = Some(CoreError::new(
                         ErrorCode::ECapacity,
-                        format!(
-                            "worktree crawl exceeded {} entries",
-                            limits.max_entries
-                        ),
+                        format!("worktree crawl exceeded {} entries", limits.max_entries),
                     ));
                 }
             }

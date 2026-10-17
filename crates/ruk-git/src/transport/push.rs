@@ -186,7 +186,11 @@ impl PushPlanRecord {
         }
         let ok = outcomes.iter().all(|o| o.result == RefResult::Ok);
         self.outcomes = outcomes;
-        self.state = if ok { PushState::Confirmed } else { PushState::Rejected };
+        self.state = if ok {
+            PushState::Confirmed
+        } else {
+            PushState::Rejected
+        };
         Ok(())
     }
 
@@ -294,7 +298,8 @@ impl PushPlanRecord {
             });
         }
         let (remote, rest) = take_bytes(rest).ok_or_else(|| corrupt("truncated remote"))?;
-        let (updates, rest) = take_updates(rest, hash).ok_or_else(|| corrupt("truncated updates"))?;
+        let (updates, rest) =
+            take_updates(rest, hash).ok_or_else(|| corrupt("truncated updates"))?;
         let (outcomes, rest) = take_outcomes(rest).ok_or_else(|| corrupt("truncated outcomes"))?;
         if !rest.is_empty() {
             return Err(corrupt("trailing bytes"));
@@ -420,8 +425,10 @@ pub fn reconcile(
     observed: &[(Vec<u8>, Option<Oid>)],
 ) -> Vec<ReconciledRef> {
     let zero = kind.zero_oid();
-    let current: HashMap<&[u8], Option<Oid>> =
-        observed.iter().map(|(name, oid)| (name.as_slice(), *oid)).collect();
+    let current: HashMap<&[u8], Option<Oid>> = observed
+        .iter()
+        .map(|(name, oid)| (name.as_slice(), *oid))
+        .collect();
     plan.updates
         .iter()
         .map(|update| {
@@ -504,7 +511,10 @@ fn persist(
 }
 
 fn persist_best_effort(store: &Store, plan: &PushPlanRecord, kind: HashKind) {
-    let current = store.fact(FactTable::PushPlans, plan.id.as_bytes()).ok().flatten();
+    let current = store
+        .fact(FactTable::PushPlans, plan.id.as_bytes())
+        .ok()
+        .flatten();
     if let Ok(mutation) = plan.persist_mutation(kind, current) {
         let _ = store.publish(Vec::new(), &[mutation]);
     }
@@ -523,7 +533,8 @@ fn push_over_inner<R: Read + Write>(
         super::refadv::Initial::Refs(adv) => adv,
         super::refadv::Initial::V2(_) => {
             return Err(GitError::Unsupported {
-                command: "receive-pack over protocol v2 (Git serves receive-pack on v0/v1 only)".to_owned(),
+                command: "receive-pack over protocol v2 (Git serves receive-pack on v0/v1 only)"
+                    .to_owned(),
             });
         }
     };
@@ -559,7 +570,10 @@ fn push_over_inner<R: Read + Write>(
             Some(current) if *current != update.old => outcomes.push(RefOutcome {
                 name: update.name.clone(),
                 result: RefResult::Rejected {
-                    reason: format!("remote ref moved: advertised {current}, expected {}", update.old),
+                    reason: format!(
+                        "remote ref moved: advertised {current}, expected {}",
+                        update.old
+                    ),
                 },
             }),
             None if update.old != zero => outcomes.push(RefOutcome {
@@ -596,7 +610,11 @@ fn push_over_inner<R: Read + Write>(
     } else {
         None
     };
-    let mut caps_list = vec![if report_v2 { "report-status-v2" } else { "report-status" }];
+    let mut caps_list = vec![if report_v2 {
+        "report-status-v2"
+    } else {
+        "report-status"
+    }];
     if sideband == Some(super::pktline::LARGE_PACKET_MAX) {
         caps_list.push("side-band-64k");
     } else if sideband.is_some() {
@@ -637,7 +655,8 @@ fn push_over_inner<R: Read + Write>(
     let mut entries = push_closure(store, kind, &live, interrupt)?;
     pair_thin_bases(store, kind, &live, &mut entries, interrupt)?;
     if !entries.is_empty() {
-        let pack_entries: Vec<PackEntry<'_>> = entries.iter().map(ClosureObject::as_entry).collect();
+        let pack_entries: Vec<PackEntry<'_>> =
+            entries.iter().map(ClosureObject::as_entry).collect();
         interrupt.check("sending the pack")?;
         if entries.iter().any(|e| e.base.is_some()) {
             write_thin_pack(pkt.get_mut(), kind, &pack_entries, interrupt)?;
@@ -675,7 +694,10 @@ impl ClosureObject {
             oid: self.oid,
             kind: self.kind,
             bytes: &self.bytes,
-            base: self.base.as_ref().map(|(oid, bytes)| (*oid, bytes.as_slice())),
+            base: self
+                .base
+                .as_ref()
+                .map(|(oid, bytes)| (*oid, bytes.as_slice())),
         }
     }
 }
@@ -768,15 +790,20 @@ pub(crate) fn pair_thin_bases(
     interrupt: &Interrupt,
 ) -> Result<(), GitError> {
     let zero = kind.zero_oid();
-    let by_oid: HashMap<Oid, usize> = entries.iter().enumerate().map(|(i, e)| (e.oid, i)).collect();
+    let by_oid: HashMap<Oid, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.oid, i))
+        .collect();
     for update in live {
         interrupt.check("pairing thin bases")?;
         if update.old == zero || update.new == zero {
             continue;
         }
-        let (Some(old_tree), Some(new_tree)) =
-            (commit_tree(store, update.old)?, commit_tree(store, update.new)?)
-        else {
+        let (Some(old_tree), Some(new_tree)) = (
+            commit_tree(store, update.old)?,
+            commit_tree(store, update.new)?,
+        ) else {
             continue;
         };
         for (new_oid, base_oid) in pair_trees(store, kind, old_tree, new_tree, interrupt)? {
@@ -809,27 +836,41 @@ struct NamedEntry {
 }
 
 /// Reads named tree entries with the same validation as the link parser.
-fn named_tree_entries(store: &Store, kind: HashKind, tree: Oid) -> Result<Vec<NamedEntry>, GitError> {
+fn named_tree_entries(
+    store: &Store,
+    kind: HashKind,
+    tree: Oid,
+) -> Result<Vec<NamedEntry>, GitError> {
     let (_, bytes) = read_object(store, tree, WALK_OBJECT_BYTES)?;
     let hash_len = kind.oid_len();
     let mut entries = Vec::new();
     let mut rest = bytes.as_slice();
     while !rest.is_empty() {
-        let space = rest.iter().position(|b| *b == b' ').ok_or_else(|| GitError::Corrupt {
-            detail: "tree entry without mode".to_owned(),
-        })?;
-        if rest[..space].is_empty() || rest[..space].iter().any(|b| !b.is_ascii_digit() || *b > b'7') {
+        let space = rest
+            .iter()
+            .position(|b| *b == b' ')
+            .ok_or_else(|| GitError::Corrupt {
+                detail: "tree entry without mode".to_owned(),
+            })?;
+        if rest[..space].is_empty()
+            || rest[..space]
+                .iter()
+                .any(|b| !b.is_ascii_digit() || *b > b'7')
+        {
             return Err(GitError::Corrupt {
                 detail: "tree entry has a non-octal mode".to_owned(),
             });
         }
-        let mode = rest[..space]
-            .iter()
-            .fold(0u32, |acc, b| acc.saturating_mul(8).saturating_add(u32::from(b - b'0')));
+        let mode = rest[..space].iter().fold(0u32, |acc, b| {
+            acc.saturating_mul(8).saturating_add(u32::from(b - b'0'))
+        });
         let after_mode = &rest[space + 1..];
-        let nul = after_mode.iter().position(|b| *b == 0).ok_or_else(|| GitError::Corrupt {
-            detail: "tree entry without name".to_owned(),
-        })?;
+        let nul = after_mode
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| GitError::Corrupt {
+                detail: "tree entry without name".to_owned(),
+            })?;
         let after_name = after_mode.get(nul + 1..).ok_or_else(|| GitError::Corrupt {
             detail: "tree entry truncates its oid".to_owned(),
         })?;
@@ -845,7 +886,11 @@ fn named_tree_entries(store: &Store, kind: HashKind, tree: Oid) -> Result<Vec<Na
             entries.push(NamedEntry {
                 name: after_mode[..nul].to_vec(),
                 oid,
-                kind: if mode == 0o040000 { ObjectKind::Tree } else { ObjectKind::Blob },
+                kind: if mode == 0o040000 {
+                    ObjectKind::Tree
+                } else {
+                    ObjectKind::Blob
+                },
             });
         }
         rest = &after_name[hash_len..];
@@ -871,8 +916,10 @@ fn pair_trees(
         }
         let old_entries = named_tree_entries(store, kind, old)?;
         let new_entries = named_tree_entries(store, kind, new)?;
-        let old_map: HashMap<&[u8], (Oid, ObjectKind)> =
-            old_entries.iter().map(|e| (e.name.as_slice(), (e.oid, e.kind))).collect();
+        let old_map: HashMap<&[u8], (Oid, ObjectKind)> = old_entries
+            .iter()
+            .map(|e| (e.name.as_slice(), (e.oid, e.kind)))
+            .collect();
         for entry in new_entries {
             let Some((base_oid, base_kind)) = old_map.get(entry.name.as_slice()) else {
                 continue;
@@ -891,7 +938,10 @@ fn pair_trees(
 
 /// Reads a report-status(-v2) response: demultiplexed when the server
 /// negotiated side-band, raw otherwise.
-fn read_report<R: Read>(pkt: &mut PktReader<R>, sideband: Option<usize>) -> Result<Vec<RefOutcome>, GitError> {
+fn read_report<R: Read>(
+    pkt: &mut PktReader<R>,
+    sideband: Option<usize>,
+) -> Result<Vec<RefOutcome>, GitError> {
     if let Some(max_frame) = sideband {
         let mut band = SidebandReader::new(pkt, max_frame);
         let mut raw = Vec::new();
@@ -994,10 +1044,14 @@ mod tests {
         let outcomes = parse_report(raw).expect("report");
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].result, RefResult::Ok);
-        assert!(matches!(&outcomes[1].result, RefResult::Rejected { reason } if reason.contains("pre-receive")));
+        assert!(
+            matches!(&outcomes[1].result, RefResult::Rejected { reason } if reason.contains("pre-receive"))
+        );
         let raw = b"unpack index-pack failed\nok refs/heads/a\n";
         let outcomes = parse_report(raw).expect("report");
-        assert!(matches!(&outcomes[0].result, RefResult::Rejected { reason } if reason.contains("unpack failed")));
+        assert!(
+            matches!(&outcomes[0].result, RefResult::Rejected { reason } if reason.contains("unpack failed"))
+        );
         assert!(parse_report(b"garbage line\n").is_err());
         let v2 = b"unpack ok\nok refs/heads/a\n\toption old-oid 1111\noption new-oid 2222\n";
         // Indented option continuation lines are still option lines here.
@@ -1013,14 +1067,22 @@ mod tests {
             id,
             b"origin".to_vec(),
             true,
-            vec![update(b"refs/heads/main", Z, A), update(b"refs/heads/old", B, Z)],
+            vec![
+                update(b"refs/heads/main", Z, A),
+                update(b"refs/heads/old", B, Z),
+            ],
         );
         plan.begin_send().expect("send");
         plan.finalize(vec![
-            RefOutcome { name: b"refs/heads/main".to_vec(), result: RefResult::Ok },
+            RefOutcome {
+                name: b"refs/heads/main".to_vec(),
+                result: RefResult::Ok,
+            },
             RefOutcome {
                 name: b"refs/heads/old".to_vec(),
-                result: RefResult::Rejected { reason: "denied".to_owned() },
+                result: RefResult::Rejected {
+                    reason: "denied".to_owned(),
+                },
             },
         ])
         .expect("finalize");
@@ -1081,8 +1143,12 @@ mod tests {
             old: Oid::from_hex(zero).expect("hex"),
             new: Oid::from_hex(four).expect("hex"),
         }];
-        let req = PushWireRequest { updates: updates.clone(), atomic: false };
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
         let outcomes =
             push_over(&mut peer, &store, kind, &mut plan, &req, &Interrupt::none()).expect("push");
         assert_eq!(outcomes.len(), 1);
@@ -1091,9 +1157,15 @@ mod tests {
         let written = String::from_utf8_lossy(peer.written());
         let expect = format!("{zero} {four} refs/heads/main");
         assert!(written.contains(expect.as_str()), "update line");
-        assert!(peer.written().windows(4).any(|w| w == b"PACK"), "pack follows");
+        assert!(
+            peer.written().windows(4).any(|w| w == b"PACK"),
+            "pack follows"
+        );
         let row = store
-            .fact(ruk_core::store::types::FactTable::PushPlans, plan.id.as_bytes())
+            .fact(
+                ruk_core::store::types::FactTable::PushPlans,
+                plan.id.as_bytes(),
+            )
             .expect("row read")
             .expect("plan persisted");
         let back = PushPlanRecord::decode(plan.id, kind, &row).expect("decode");
@@ -1120,7 +1192,10 @@ mod tests {
         script.extend(adv);
         pkt::encode_flush(&mut script);
         // Side-band multiplexed report: band-1 payloads, then flush.
-        for payload in [&b"unpack ok\n"[..], &b"ng refs/heads/main atomic failed\n"[..]] {
+        for payload in [
+            &b"unpack ok\n"[..],
+            &b"ng refs/heads/main atomic failed\n"[..],
+        ] {
             let mut band = vec![1u8];
             band.extend_from_slice(payload);
             let mut frame = Vec::new();
@@ -1134,12 +1209,18 @@ mod tests {
             old: Oid::from_hex(zero).expect("hex"),
             new: Oid::from_hex(four).expect("hex"),
         }];
-        let req = PushWireRequest { updates: updates.clone(), atomic: true };
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), true, updates);
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: true,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), true, updates);
         let outcomes =
             push_over(&mut peer, &store, kind, &mut plan, &req, &Interrupt::none()).expect("push");
         assert_eq!(plan.state, PushState::Rejected);
-        assert!(matches!(&outcomes[0].result, RefResult::Rejected { reason } if reason.contains("atomic")));
+        assert!(
+            matches!(&outcomes[0].result, RefResult::Rejected { reason } if reason.contains("atomic"))
+        );
     }
 
     #[test]
@@ -1170,13 +1251,20 @@ mod tests {
             old: Oid::from_hex(other).expect("hex"),
             new: Oid::from_hex(four).expect("hex"),
         }];
-        let req = PushWireRequest { updates: updates.clone(), atomic: false };
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
         let outcomes =
             push_over(&mut peer, &store, kind, &mut plan, &req, &Interrupt::none()).expect("push");
         assert!(matches!(outcomes[0].result, RefResult::Rejected { .. }));
         assert_eq!(plan.state, PushState::Rejected);
-        assert!(peer.written().is_empty(), "nothing is sent after a local refusal");
+        assert!(
+            peer.written().is_empty(),
+            "nothing is sent after a local refusal"
+        );
     }
 
     #[test]
@@ -1195,9 +1283,15 @@ mod tests {
         let reconciled = reconcile(&plan, HashKind::Sha1, &observed);
         assert_eq!(reconciled[0].observation, RefObservation::EqualNew);
         assert_eq!(reconciled[1].observation, RefObservation::EqualOld);
-        let observed = vec![(b"refs/heads/a".to_vec(), Some(oid(B))), (b"refs/heads/d".to_vec(), None)];
+        let observed = vec![
+            (b"refs/heads/a".to_vec(), Some(oid(B))),
+            (b"refs/heads/d".to_vec(), None),
+        ];
         let reconciled = reconcile(&plan, HashKind::Sha1, &observed);
-        assert!(matches!(reconciled[0].observation, RefObservation::Moved { .. }));
+        assert!(matches!(
+            reconciled[0].observation,
+            RefObservation::Moved { .. }
+        ));
         assert_eq!(reconciled[1].observation, RefObservation::EqualNew);
     }
 }

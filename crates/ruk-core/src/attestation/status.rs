@@ -17,7 +17,12 @@ use super::verify::VerifiedStatement;
 pub(super) fn derive(members: &[&VerifiedStatement]) -> Vec<AttestationStatus> {
     let superseded: HashSet<[u8; 32]> = members
         .iter()
-        .filter_map(|member| member.statement().supersedes.map(|digest| *digest.as_bytes()))
+        .filter_map(|member| {
+            member
+                .statement()
+                .supersedes
+                .map(|digest| *digest.as_bytes())
+        })
         .collect();
     let live_results: HashSet<&str> = members
         .iter()

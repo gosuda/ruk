@@ -288,9 +288,10 @@ pub(crate) fn census(store: &Store, store_root: &Path) -> Result<Vec<Loss>, GitE
             std::io::ErrorKind::NotFound => Ok(false),
             _ => Err(super::pack::io_error(err)),
         })?;
-    if present && let Some(loss) = losses
-        .iter_mut()
-        .find(|loss| loss.category == LossCategory::CapabilityPolicy)
+    if present
+        && let Some(loss) = losses
+            .iter_mut()
+            .find(|loss| loss.category == LossCategory::CapabilityPolicy)
     {
         loss.rows = 1;
         loss.sample_keys.push(ByteString::from(POLICY_FILE));

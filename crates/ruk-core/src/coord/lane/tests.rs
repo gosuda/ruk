@@ -15,28 +15,28 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::SignedDuration;
 use tokio::sync::oneshot;
 
 use super::*;
+use crate::bytes::ByteString;
 use crate::change::{RequestId, SessionId, WorkspaceId};
 use crate::coord::cancel::cancellation;
 use crate::coord::clock::Clock;
+use crate::coord::oplog;
 use crate::coord::policy::{Policy, PolicySource, Principal};
 use crate::coord::receipt;
 use crate::coord::rows::{self, SessionRow, WorkspaceRow};
-use crate::coord::session::{prepare_open, SessionLive, SessionTable};
+use crate::coord::session::{SessionLive, SessionTable, prepare_open};
 use crate::error::ErrorCode;
 use crate::ids::HashKind;
-use crate::bytes::ByteString;
-use crate::coord::oplog;
 use crate::protocol::{
-    Method, Mutation, MutationOutcome, ReceiptRef, Reply, Request,
-    RequestDigest, SessionOpenArgs, Timestamp, WorkspaceInit, WsNewArgs, WsNewReply,
+    Method, Mutation, MutationOutcome, ReceiptRef, Reply, Request, RequestDigest, SessionOpenArgs,
+    Timestamp, WorkspaceInit, WsNewArgs, WsNewReply,
 };
 use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject};
 use crate::store::{PreparationBudget, Store, StoreError};
@@ -97,14 +97,14 @@ fn test_session(
     Arc::clone(bound.session())
 }
 
-fn dummy_mutation_request(
-    request_id: RequestId,
-) -> (Request, Reply) {
+fn dummy_mutation_request(request_id: RequestId) -> (Request, Reply) {
     let req = Request::WsNew(Box::new(Mutation {
         request_id,
         args: WsNewArgs {
             root: ByteString::from("/tmp/workspace"),
-            init: WorkspaceInit::Native { parents: Vec::new() },
+            init: WorkspaceInit::Native {
+                parents: Vec::new(),
+            },
             scope: None,
         },
     }));
@@ -127,7 +127,20 @@ fn dummy_mutation_request(
             identity: None,
         },
         workspace: WorkspaceId::generate(),
-        state: WorkspaceState::Native({ let mut w = NativeWorkspace::new(crate::change::ChangeId::from_bytes([0;16]), crate::heads::Head::Git { oid: crate::ids::Oid::from_bytes(&[0u8;20]).unwrap() }, Scope::Full); w.stamp = WorkspaceStamp { sequence: 0, lease_epoch: 0 }; w }),
+        state: WorkspaceState::Native({
+            let mut w = NativeWorkspace::new(
+                crate::change::ChangeId::from_bytes([0; 16]),
+                crate::heads::Head::Git {
+                    oid: crate::ids::Oid::from_bytes(&[0u8; 20]).unwrap(),
+                },
+                Scope::Full,
+            );
+            w.stamp = WorkspaceStamp {
+                sequence: 0,
+                lease_epoch: 0,
+            };
+            w
+        }),
     }));
 
     (req, reply)
@@ -191,7 +204,13 @@ fn test_1_two_disjoint_requests_in_one_batch() {
         value: Some(b"oid-value-2".to_vec()),
     };
 
-    let cand1 = make_candidate(session1, principal.clone(), req_id1, Vec::new(), vec![fact1]);
+    let cand1 = make_candidate(
+        session1,
+        principal.clone(),
+        req_id1,
+        Vec::new(),
+        vec![fact1],
+    );
     let cand2 = make_candidate(session2, principal, req_id2, Vec::new(), vec![fact2]);
 
     let (tx1, rx1) = oneshot::channel();
@@ -210,8 +229,15 @@ fn test_1_two_disjoint_requests_in_one_batch() {
 
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel)
-        .expect("commit batch succeeds");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel,
+    )
+    .expect("commit batch succeeds");
 
     let reply1 = rx1.blocking_recv().expect("reply 1").expect("ok reply 1");
     let reply2 = rx2.blocking_recv().expect("reply 2").expect("ok reply 2");
@@ -222,7 +248,10 @@ fn test_1_two_disjoint_requests_in_one_batch() {
     // Both get distinct, chained operations
     let op1 = outcome1.operation.expect("op1 allocated");
     let op2 = outcome2.operation.expect("op2 allocated");
-    assert!(op2.0 > op1.0, "operations must be strictly increasing in batch order");
+    assert!(
+        op2.0 > op1.0,
+        "operations must be strictly increasing in batch order"
+    );
 
     // Receipts exist for both in FactTable::Receipts
     let key1 = rows::receipt_key(outcome1.receipt.session, outcome1.receipt.request_id);
@@ -259,7 +288,13 @@ fn test_2_per_session_activity_coalescing() {
         value: Some(b"oid-b".to_vec()),
     };
 
-    let cand1 = make_candidate(Arc::clone(&session), principal.clone(), req_id1, Vec::new(), vec![fact1]);
+    let cand1 = make_candidate(
+        Arc::clone(&session),
+        principal.clone(),
+        req_id1,
+        Vec::new(),
+        vec![fact1],
+    );
     let cand2 = make_candidate(session, principal, req_id2, Vec::new(), vec![fact2]);
 
     let (tx1, rx1) = oneshot::channel();
@@ -278,8 +313,15 @@ fn test_2_per_session_activity_coalescing() {
 
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel)
-        .expect("batch commits");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel,
+    )
+    .expect("batch commits");
 
     assert!(rx1.blocking_recv().unwrap().is_ok());
     assert!(rx2.blocking_recv().unwrap().is_ok());
@@ -305,8 +347,20 @@ fn test_3_exact_duplicate_coalescing_and_mismatched_digest() {
         value: Some(b"oid-dedup".to_vec()),
     };
 
-    let cand1 = make_candidate(Arc::clone(&session), principal.clone(), req_id, Vec::new(), vec![fact.clone()]);
-    let cand2 = make_candidate(Arc::clone(&session), principal.clone(), req_id, Vec::new(), vec![fact]);
+    let cand1 = make_candidate(
+        Arc::clone(&session),
+        principal.clone(),
+        req_id,
+        Vec::new(),
+        vec![fact.clone()],
+    );
+    let cand2 = make_candidate(
+        Arc::clone(&session),
+        principal.clone(),
+        req_id,
+        Vec::new(),
+        vec![fact],
+    );
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
@@ -325,8 +379,15 @@ fn test_3_exact_duplicate_coalescing_and_mismatched_digest() {
 
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel)
-        .expect("commit batch succeeds");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel,
+    )
+    .expect("commit batch succeeds");
 
     let r1 = rx1.blocking_recv().unwrap().unwrap();
     let r2 = rx2.blocking_recv().unwrap().unwrap();
@@ -339,7 +400,9 @@ fn test_3_exact_duplicate_coalescing_and_mismatched_digest() {
         args: WsNewArgs {
             root: ByteString::from("/tmp/different-workspace"),
             init: WorkspaceInit::GitCompat {
-                head: crate::workspace::HeadRef::Symbolic(crate::refdata::RefName::new(b"refs/heads/main".to_vec()).unwrap()),
+                head: crate::workspace::HeadRef::Symbolic(
+                    crate::refdata::RefName::new(b"refs/heads/main".to_vec()).unwrap(),
+                ),
             },
             scope: None,
         },
@@ -362,7 +425,20 @@ fn test_3_exact_duplicate_coalescing_and_mismatched_digest() {
             identity: None,
         },
         workspace: WorkspaceId::generate(),
-        state: WorkspaceState::Native({ let mut w = NativeWorkspace::new(crate::change::ChangeId::from_bytes([0;16]), crate::heads::Head::Git { oid: crate::ids::Oid::from_bytes(&[0u8;20]).unwrap() }, Scope::Full); w.stamp = WorkspaceStamp { sequence: 0, lease_epoch: 0 }; w }),
+        state: WorkspaceState::Native({
+            let mut w = NativeWorkspace::new(
+                crate::change::ChangeId::from_bytes([0; 16]),
+                crate::heads::Head::Git {
+                    oid: crate::ids::Oid::from_bytes(&[0u8; 20]).unwrap(),
+                },
+                Scope::Full,
+            );
+            w.stamp = WorkspaceStamp {
+                sequence: 0,
+                lease_epoch: 0,
+            };
+            w
+        }),
     }));
     let cand_mismatched = MutationCandidate::new(
         session,
@@ -386,8 +462,15 @@ fn test_3_exact_duplicate_coalescing_and_mismatched_digest() {
         reply_tx: Some(tx3),
     }];
 
-    commit_batch(&store, &session_table, &policy_source, &clock, batch2, &cancel)
-        .expect("commit batch processes lookup");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch2,
+        &cancel,
+    )
+    .expect("commit batch processes lookup");
 
     let err = rx3.blocking_recv().unwrap().unwrap_err();
     assert_eq!(err.code, ErrorCode::ERequestReused);
@@ -407,9 +490,22 @@ fn test_4_stale_same_workspace_rejection_and_epoch_first_fencing() {
     let session_b = test_session(&session_table, &principal, idle);
 
     let ws_id = WorkspaceId::generate();
-    let ws_stamp = WorkspaceStamp { sequence: 10, lease_epoch: 5 }; // sequence 10, lease_epoch 5
+    let ws_stamp = WorkspaceStamp {
+        sequence: 10,
+        lease_epoch: 5,
+    }; // sequence 10, lease_epoch 5
     let ws_row = WorkspaceRow {
-        state: WorkspaceState::Native({ let mut w = NativeWorkspace::new(crate::change::ChangeId::from_bytes([0;16]), crate::heads::Head::Git { oid: crate::ids::Oid::from_bytes(&[0u8;20]).unwrap() }, Scope::Full); w.stamp = ws_stamp; w }),
+        state: WorkspaceState::Native({
+            let mut w = NativeWorkspace::new(
+                crate::change::ChangeId::from_bytes([0; 16]),
+                crate::heads::Head::Git {
+                    oid: crate::ids::Oid::from_bytes(&[0u8; 20]).unwrap(),
+                },
+                Scope::Full,
+            );
+            w.stamp = ws_stamp;
+            w
+        }),
         holder: session_a.id(),
     };
     let encoded_ws = rows::encode("workspace", &ws_row).unwrap();
@@ -431,42 +527,102 @@ fn test_4_stale_same_workspace_rejection_and_epoch_first_fencing() {
     let _keep = std::mem::ManuallyDrop::new(ch);
 
     // 1. Session B attempts write -> holder mismatch -> E_LEASE_LOST
-    let mut cand_b = make_candidate(session_b, principal.clone(), RequestId::generate(), Vec::new(), Vec::new());
+    let mut cand_b = make_candidate(
+        session_b,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        Vec::new(),
+    );
     cand_b.workspace_fence = Some(WorkspaceFence::new(ws_id, ws_stamp));
     let (tx_b, rx_b) = oneshot::channel();
     let batch_b = vec![BatchItem::Mutation {
         candidate: Box::new(cand_b),
         reply_tx: Some(tx_b),
     }];
-    commit_batch(&store, &session_table, &policy_source, &clock, batch_b, &cancel)
-        .expect("lane stays up for per-candidate rejection");
-    let err_b = rx_b.blocking_recv().expect("reply").expect_err("holder mismatch");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch_b,
+        &cancel,
+    )
+    .expect("lane stays up for per-candidate rejection");
+    let err_b = rx_b
+        .blocking_recv()
+        .expect("reply")
+        .expect_err("holder mismatch");
     assert_eq!(err_b.code, ErrorCode::ELeaseLost);
 
     // 2. Session A with wrong epoch (4 instead of 5) and wrong sequence (9 instead of 10) -> epoch checked first -> E_LEASE_LOST
-    let mut cand_epoch = make_candidate(Arc::clone(&session_a), principal.clone(), RequestId::generate(), Vec::new(), Vec::new());
-    cand_epoch.workspace_fence = Some(WorkspaceFence::new(ws_id, WorkspaceStamp { sequence: 9, lease_epoch: 4 }));
+    let mut cand_epoch = make_candidate(
+        Arc::clone(&session_a),
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        Vec::new(),
+    );
+    cand_epoch.workspace_fence = Some(WorkspaceFence::new(
+        ws_id,
+        WorkspaceStamp {
+            sequence: 9,
+            lease_epoch: 4,
+        },
+    ));
     let (tx_e, rx_e) = oneshot::channel();
     let batch_e = vec![BatchItem::Mutation {
         candidate: Box::new(cand_epoch),
         reply_tx: Some(tx_e),
     }];
-    commit_batch(&store, &session_table, &policy_source, &clock, batch_e, &cancel)
-        .expect("lane stays up for per-candidate rejection");
-    let err_e = rx_e.blocking_recv().expect("reply").expect_err("epoch mismatch");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch_e,
+        &cancel,
+    )
+    .expect("lane stays up for per-candidate rejection");
+    let err_e = rx_e
+        .blocking_recv()
+        .expect("reply")
+        .expect_err("epoch mismatch");
     assert_eq!(err_e.code, ErrorCode::ELeaseLost);
 
     // 3. Session A with right epoch (5) but wrong sequence (9 instead of 10) -> sequence mismatch -> E_STALE
-    let mut cand_seq = make_candidate(session_a, principal, RequestId::generate(), Vec::new(), Vec::new());
-    cand_seq.workspace_fence = Some(WorkspaceFence::new(ws_id, WorkspaceStamp { sequence: 9, lease_epoch: 5 }));
+    let mut cand_seq = make_candidate(
+        session_a,
+        principal,
+        RequestId::generate(),
+        Vec::new(),
+        Vec::new(),
+    );
+    cand_seq.workspace_fence = Some(WorkspaceFence::new(
+        ws_id,
+        WorkspaceStamp {
+            sequence: 9,
+            lease_epoch: 5,
+        },
+    ));
     let (tx_s, rx_s) = oneshot::channel();
     let batch_s = vec![BatchItem::Mutation {
         candidate: Box::new(cand_seq),
         reply_tx: Some(tx_s),
     }];
-    commit_batch(&store, &session_table, &policy_source, &clock, batch_s, &cancel)
-        .expect("lane stays up for per-candidate rejection");
-    let err_s = rx_s.blocking_recv().expect("reply").expect_err("sequence mismatch");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch_s,
+        &cancel,
+    )
+    .expect("lane stays up for per-candidate rejection");
+    let err_s = rx_s
+        .blocking_recv()
+        .expect("reply")
+        .expect_err("sequence mismatch");
     assert_eq!(err_s.code, ErrorCode::EStale);
 }
 
@@ -482,7 +638,13 @@ fn test_5_current_policy_revocation_after_preparation() {
     let idle = SignedDuration::from_hours(24);
 
     let session = test_session(&session_table, &principal, idle);
-    let cand = make_candidate(session, principal, RequestId::generate(), Vec::new(), Vec::new());
+    let cand = make_candidate(
+        session,
+        principal,
+        RequestId::generate(),
+        Vec::new(),
+        Vec::new(),
+    );
 
     let (tx, rx) = oneshot::channel();
     let batch = vec![BatchItem::Mutation {
@@ -493,9 +655,19 @@ fn test_5_current_policy_revocation_after_preparation() {
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
     // Because policy_source owner is other_principal (2000), principal 1000 is not listed!
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel)
-        .expect("lane stays up for per-candidate rejection");
-    let err = rx.blocking_recv().expect("reply").expect_err("policy revoked");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel,
+    )
+    .expect("lane stays up for per-candidate rejection");
+    let err = rx
+        .blocking_recv()
+        .expect("reply")
+        .expect_err("policy revoked");
     assert_eq!(err.code, ErrorCode::EForbidden);
 }
 
@@ -519,7 +691,13 @@ fn test_6_receipt_replay_despite_expiry_or_stale_stamp() {
         value: Some(b"committed-value".to_vec()),
     };
 
-    let cand = make_candidate(Arc::clone(&session), principal.clone(), req_id, Vec::new(), vec![fact]);
+    let cand = make_candidate(
+        Arc::clone(&session),
+        principal.clone(),
+        req_id,
+        Vec::new(),
+        vec![fact],
+    );
 
     let (tx1, rx1) = oneshot::channel();
     let batch = vec![BatchItem::Mutation {
@@ -529,12 +707,26 @@ fn test_6_receipt_replay_despite_expiry_or_stale_stamp() {
 
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel).unwrap();
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel,
+    )
+    .unwrap();
     let first_reply = rx1.blocking_recv().unwrap().unwrap();
 
     // Now submit the same request again, but attach an expired/stale expectation or fence
     let mut cand2 = make_candidate(session, principal, req_id, Vec::new(), Vec::new());
-    cand2.workspace_fence = Some(WorkspaceFence::new(WorkspaceId::generate(), WorkspaceStamp { sequence: 999, lease_epoch: 999 }));
+    cand2.workspace_fence = Some(WorkspaceFence::new(
+        WorkspaceId::generate(),
+        WorkspaceStamp {
+            sequence: 999,
+            lease_epoch: 999,
+        },
+    ));
 
     let (tx2, rx2) = oneshot::channel();
     let batch2 = vec![BatchItem::Mutation {
@@ -542,7 +734,15 @@ fn test_6_receipt_replay_despite_expiry_or_stale_stamp() {
         reply_tx: Some(tx2),
     }];
 
-    commit_batch(&store, &session_table, &policy_source, &clock, batch2, &cancel).unwrap();
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch2,
+        &cancel,
+    )
+    .unwrap();
     let replayed_reply = rx2.blocking_recv().unwrap().unwrap();
 
     assert!(replayed_reply.outcome().unwrap().receipt.replayed);
@@ -573,7 +773,15 @@ fn test_7_noop_receipt_without_operation() {
 
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel).unwrap();
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel,
+    )
+    .unwrap();
 
     let reply = rx.blocking_recv().unwrap().unwrap();
     let outcome = reply.outcome().unwrap();
@@ -625,7 +833,15 @@ fn test_8_atomic_domain_op_receipt_head_after_reopen() {
 
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel).unwrap();
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel,
+    )
+    .unwrap();
     let reply = rx.blocking_recv().unwrap().unwrap();
     let op_id = reply.outcome().unwrap().operation.expect("op id allocated");
 
@@ -646,11 +862,16 @@ fn test_8_atomic_domain_op_receipt_head_after_reopen() {
     assert_eq!(ref_bytes, prep_oid.as_bytes());
 
     // Verify op header exists
-    let op_header = oplog::read_header(&reopened, op_id).unwrap().expect("op header exists");
+    let op_header = oplog::read_header(&reopened, op_id)
+        .unwrap()
+        .expect("op header exists");
     assert_eq!(op_header.entry.id, op_id);
 
     // Verify coordinator head
-    let head_bytes = reopened.fact(FactTable::OpHead, rows::OP_HEAD_KEY).unwrap().unwrap();
+    let head_bytes = reopened
+        .fact(FactTable::OpHead, rows::OP_HEAD_KEY)
+        .unwrap()
+        .unwrap();
     let head = rows::decode_head(&reopened, &head_bytes).unwrap();
     assert_eq!(head.last_op, Some(op_id));
 }
@@ -668,8 +889,12 @@ fn test_9_overlapping_candidates_deferred_with_owned_spools_intact() {
     let session1 = test_session(&session_table, &principal, idle);
     let session2 = test_session(&session_table, &principal, idle);
 
-    let blob1 = store.prepare(ObjectKind::Blob, 5, &b"blob1"[..], None).unwrap();
-    let blob2 = store.prepare(ObjectKind::Blob, 5, &b"blob2"[..], None).unwrap();
+    let blob1 = store
+        .prepare(ObjectKind::Blob, 5, &b"blob1"[..], None)
+        .unwrap();
+    let blob2 = store
+        .prepare(ObjectKind::Blob, 5, &b"blob2"[..], None)
+        .unwrap();
 
     let same_key = b"refs/heads/contended".to_vec();
 
@@ -686,8 +911,20 @@ fn test_9_overlapping_candidates_deferred_with_owned_spools_intact() {
         value: Some(b"second".to_vec()),
     };
 
-    let cand1 = make_candidate(session1, principal.clone(), RequestId::generate(), vec![blob1], vec![fact1]);
-    let cand2 = make_candidate(session2, principal, RequestId::generate(), vec![blob2], vec![fact2]);
+    let cand1 = make_candidate(
+        session1,
+        principal.clone(),
+        RequestId::generate(),
+        vec![blob1],
+        vec![fact1],
+    );
+    let cand2 = make_candidate(
+        session2,
+        principal,
+        RequestId::generate(),
+        vec![blob2],
+        vec![fact2],
+    );
 
     let item1 = BatchItem::Mutation {
         candidate: Box::new(cand1),
@@ -703,21 +940,38 @@ fn test_9_overlapping_candidates_deferred_with_owned_spools_intact() {
     accumulator.add(item1);
 
     // Overlapping key: accumulator MUST reject item2
-    assert!(!accumulator.can_admit(&item2), "overlapping key candidate must be deferred");
+    assert!(
+        !accumulator.can_admit(&item2),
+        "overlapping key candidate must be deferred"
+    );
 
     // Commit batch 1
     let (ch, cancel) = cancellation();
     let _keep = std::mem::ManuallyDrop::new(ch);
-    commit_batch(&store, &session_table, &policy_source, &clock, accumulator.drain(), &cancel)
-        .expect("batch 1 commits");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        accumulator.drain(),
+        &cancel,
+    )
+    .expect("batch 1 commits");
 
     // Spools on item2 are completely intact! Now commit batch 2
     let mut accumulator2 = BatchAccumulator::new();
     assert!(accumulator2.can_admit(&item2));
     accumulator2.add(item2);
 
-    commit_batch(&store, &session_table, &policy_source, &clock, accumulator2.drain(), &cancel)
-        .expect("batch 2 commits with preserved spools");
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        accumulator2.drain(),
+        &cancel,
+    )
+    .expect("batch 2 commits with preserved spools");
 }
 
 #[test]
@@ -742,7 +996,13 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
         expected: FactExpectation::Absent,
         value: Some(b"val".to_vec()),
     };
-    let mut cand = make_candidate(Arc::clone(&session), principal.clone(), RequestId::generate(), Vec::new(), vec![fact]);
+    let mut cand = make_candidate(
+        Arc::clone(&session),
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        vec![fact],
+    );
     cand.cancel = cancel;
 
     let (tx, rx) = oneshot::channel();
@@ -752,10 +1012,23 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
     }];
 
     let (_ch2, cancel2) = cancellation();
-    commit_batch(&store, &session_table, &policy_source, &clock, batch, &cancel2).unwrap();
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch,
+        &cancel2,
+    )
+    .unwrap();
     let err = rx.blocking_recv().unwrap().unwrap_err();
     assert_eq!(err.code, ErrorCode::ECancelled);
-    assert!(store.fact(FactTable::Refs, b"refs/heads/cancelled").unwrap().is_none());
+    assert!(
+        store
+            .fact(FactTable::Refs, b"refs/heads/cancelled")
+            .unwrap()
+            .is_none()
+    );
 
     // Case B: Receiver dropped after commit
     let (tx2, rx2) = oneshot::channel();
@@ -767,16 +1040,33 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
         expected: FactExpectation::Absent,
         value: Some(b"survives".to_vec()),
     };
-    let cand2 = make_candidate(session, principal, RequestId::generate(), Vec::new(), vec![fact2]);
+    let cand2 = make_candidate(
+        session,
+        principal,
+        RequestId::generate(),
+        Vec::new(),
+        vec![fact2],
+    );
     let batch2 = vec![BatchItem::Mutation {
         candidate: Box::new(cand2),
         reply_tx: Some(tx2),
     }];
 
     // Commit must succeed durably even if receiver was dropped
-    commit_batch(&store, &session_table, &policy_source, &clock, batch2, &cancel2).unwrap();
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        batch2,
+        &cancel2,
+    )
+    .unwrap();
     assert_eq!(
-        store.fact(FactTable::Refs, b"refs/heads/dropped-rx").unwrap().unwrap(),
+        store
+            .fact(FactTable::Refs, b"refs/heads/dropped-rx")
+            .unwrap()
+            .unwrap(),
         b"survives"
     );
 }
@@ -790,31 +1080,44 @@ fn test_11_fail_closed_ambiguous_storage_error() {
     let principal = Principal::from_peer_uid(1000);
     let policy_source = Arc::new(PolicySource::open(&temp.store_dir(), principal.clone()));
 
-    let (lane, _runner) = create_publication_lane(
-        store,
-        session_table,
-        policy_source,
-        clock,
-    );
+    let (lane, _runner) = create_publication_lane(store, session_table, policy_source, clock);
 
     // Verify error classification rules
-    let io_err = StoreError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broken"));
-    assert_eq!(classify_store_error(&io_err), StoreFailureKind::AmbiguousOrFatal);
+    let io_err = StoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "pipe broken",
+    ));
+    assert_eq!(
+        classify_store_error(&io_err),
+        StoreFailureKind::AmbiguousOrFatal
+    );
 
     let stale_err = StoreError::StaleFact {
         table: "refs",
         key: "refs/heads/main".to_owned(),
     };
-    assert_eq!(classify_store_error(&stale_err), StoreFailureKind::AmbiguousOrFatal);
+    assert_eq!(
+        classify_store_error(&stale_err),
+        StoreFailureKind::AmbiguousOrFatal
+    );
 
     let closed_err = StoreError::WriterClosed("store quarantined".to_owned());
-    assert_eq!(classify_store_error(&closed_err), StoreFailureKind::AmbiguousOrFatal);
+    assert_eq!(
+        classify_store_error(&closed_err),
+        StoreFailureKind::AmbiguousOrFatal
+    );
 
     let corrupt_err = StoreError::Corrupt("bad crc".to_owned());
-    assert_eq!(classify_store_error(&corrupt_err), StoreFailureKind::AmbiguousOrFatal);
+    assert_eq!(
+        classify_store_error(&corrupt_err),
+        StoreFailureKind::AmbiguousOrFatal
+    );
 
     let invalid_err = StoreError::Invalid("bad argument".to_owned());
-    assert_eq!(classify_store_error(&invalid_err), StoreFailureKind::PreMutation);
+    assert_eq!(
+        classify_store_error(&invalid_err),
+        StoreFailureKind::PreMutation
+    );
 
     // Closing the lane latches fail-closed state
     lane.close();

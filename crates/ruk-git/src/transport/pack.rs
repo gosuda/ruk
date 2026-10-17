@@ -102,7 +102,9 @@ impl StagedPack {
 
     /// The staged payload of `oid`, if it arrived in this pack.
     pub(crate) fn payload(&self, oid: Oid) -> Option<(ObjectKind, &[u8])> {
-        self.payloads.get(&oid).map(|(kind, bytes)| (*kind, bytes.as_slice()))
+        self.payloads
+            .get(&oid)
+            .map(|(kind, bytes)| (*kind, bytes.as_slice()))
     }
 
     /// Consumes the staging into its prepared objects.
@@ -178,15 +180,25 @@ fn parse_tree_links(payload: &[u8], hash: HashKind, links: &mut Links) -> Result
     let hash_len = hash.oid_len();
     let mut rest = payload;
     while !rest.is_empty() {
-        let space = rest.iter().position(|b| *b == b' ').ok_or_else(|| corrupt("tree entry without mode"))?;
-        if rest[..space].is_empty() || rest[..space].iter().any(|b| !b.is_ascii_digit() || *b > b'7') {
+        let space = rest
+            .iter()
+            .position(|b| *b == b' ')
+            .ok_or_else(|| corrupt("tree entry without mode"))?;
+        if rest[..space].is_empty()
+            || rest[..space]
+                .iter()
+                .any(|b| !b.is_ascii_digit() || *b > b'7')
+        {
             return Err(corrupt("tree entry has a non-octal mode"));
         }
-        let mode = rest[..space]
-            .iter()
-            .fold(0u32, |acc, b| acc.saturating_mul(8).saturating_add(u32::from(b - b'0')));
+        let mode = rest[..space].iter().fold(0u32, |acc, b| {
+            acc.saturating_mul(8).saturating_add(u32::from(b - b'0'))
+        });
         let after_mode = &rest[space + 1..];
-        let nul = after_mode.iter().position(|b| *b == 0).ok_or_else(|| corrupt("tree entry without name"))?;
+        let nul = after_mode
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| corrupt("tree entry without name"))?;
         let after_name = &after_mode[nul + 1..];
         if after_name.len() < hash_len {
             return Err(corrupt("tree entry truncates its oid"));
@@ -194,7 +206,11 @@ fn parse_tree_links(payload: &[u8], hash: HashKind, links: &mut Links) -> Result
         if mode != 0o160000 {
             let oid = Oid::from_bytes(&after_name[..hash_len])
                 .map_err(|_| corrupt("tree entry has a bad oid"))?;
-            let kind = if mode == 0o040000 { ObjectKind::Tree } else { ObjectKind::Blob };
+            let kind = if mode == 0o040000 {
+                ObjectKind::Tree
+            } else {
+                ObjectKind::Blob
+            };
             links.entries.push((oid, kind));
         }
         rest = &after_name[hash_len..];
@@ -279,8 +295,13 @@ pub fn ingest_pack<R: Read>(
     interrupt: &Interrupt,
 ) -> Result<StagedPack, GitError> {
     let mut stream = BufReader::new(reader);
-    let iter = BytesToEntriesIter::new_from_header(&mut stream, Mode::Verify, EntryDataMode::Keep, kind.gix())
-        .map_err(|err| corrupt(format!("pack header is malformed: {err}")))?;
+    let iter = BytesToEntriesIter::new_from_header(
+        &mut stream,
+        Mode::Verify,
+        EntryDataMode::Keep,
+        kind.gix(),
+    )
+    .map_err(|err| corrupt(format!("pack header is malformed: {err}")))?;
     let mut raw: Vec<RawEntry> = Vec::new();
     let mut compressed_total = 0u64;
     for item in iter {
@@ -305,7 +326,10 @@ pub fn ingest_pack<R: Read>(
         compressed_total = compressed_total.saturating_add(entry.compressed_size);
         if compressed_total > limits.max_pack_bytes {
             return Err(GitError::Limit {
-                detail: format!("pack exceeds the {}-byte ingest bound", limits.max_pack_bytes),
+                detail: format!(
+                    "pack exceeds the {}-byte ingest bound",
+                    limits.max_pack_bytes
+                ),
             });
         }
         raw.push(RawEntry {
@@ -325,7 +349,11 @@ pub fn ingest_pack<R: Read>(
         oids.push(*oid);
         payloads.insert(*oid, (*kind, bytes.clone()));
     }
-    Ok(StagedPack { oids, objects, payloads })
+    Ok(StagedPack {
+        oids,
+        objects,
+        payloads,
+    })
 }
 
 enum Resolution {
@@ -390,7 +418,9 @@ fn resolve_all(
     let mut out = Vec::with_capacity(raw.len());
     for index in 0..raw.len() {
         let oid = resolver.oids[index].ok_or_else(|| corrupt("pack entry never resolved"))?;
-        let bytes = resolver.payloads[index].take().ok_or_else(|| corrupt("pack entry never resolved"))?;
+        let bytes = resolver.payloads[index]
+            .take()
+            .ok_or_else(|| corrupt("pack entry never resolved"))?;
         out.push((oid, resolver.kinds[index], bytes));
     }
     Ok(out)
@@ -420,7 +450,11 @@ impl Resolver<'_> {
         let pack_offset = self.raw[index].pack_offset;
         let declared = self.raw[index].declared;
         if let Some(kind) = pack_kind(&header) {
-            let bytes = inflate(&self.raw[index].compressed, declared, self.limits.max_object_bytes)?;
+            let bytes = inflate(
+                &self.raw[index].compressed,
+                declared,
+                self.limits.max_object_bytes,
+            )?;
             self.finish(index, kind, bytes)?;
             return Ok(Resolution::Done);
         }
@@ -457,7 +491,11 @@ impl Resolver<'_> {
             _ => return Err(corrupt("unreachable pack entry shape")),
         }
         let base = self.base_bytes(index)?;
-        let delta = inflate(&self.raw[index].compressed, declared, self.limits.max_object_bytes)?;
+        let delta = inflate(
+            &self.raw[index].compressed,
+            declared,
+            self.limits.max_object_bytes,
+        )?;
         let result = apply_delta(&base, &delta)?;
         let kind = self.delta_kind(index)?;
         self.finish(index, kind, result)?;
@@ -468,19 +506,28 @@ impl Resolver<'_> {
         match &self.raw[index].header {
             PackHeader::OfsDelta { base_distance } => {
                 let base_offset = self.raw[index].pack_offset.saturating_sub(*base_distance);
-                let base_index = *self.offsets.get(&base_offset).ok_or_else(|| corrupt("ofs-delta base is not a pack entry"))?;
-                self.payloads[base_index].clone().ok_or_else(|| corrupt("ofs-delta base is unresolved"))
+                let base_index = *self
+                    .offsets
+                    .get(&base_offset)
+                    .ok_or_else(|| corrupt("ofs-delta base is not a pack entry"))?;
+                self.payloads[base_index]
+                    .clone()
+                    .ok_or_else(|| corrupt("ofs-delta base is unresolved"))
             }
             PackHeader::RefDelta { base_id } => {
                 let base_oid = Oid::from(*base_id);
                 if let Some(base_index) = self.oid_index.get(&base_oid) {
-                    return self.payloads[*base_index].clone().ok_or_else(|| corrupt("ref-delta base is unresolved"));
+                    return self.payloads[*base_index]
+                        .clone()
+                        .ok_or_else(|| corrupt("ref-delta base is unresolved"));
                 }
                 let mut read = self.store.read(base_oid)?;
                 let mut bytes = Vec::new();
-                read.bytes.read_to_end(&mut bytes).map_err(|err| GitError::Io {
-                    detail: format!("reading delta base {base_oid}: {err}"),
-                })?;
+                read.bytes
+                    .read_to_end(&mut bytes)
+                    .map_err(|err| GitError::Io {
+                        detail: format!("reading delta base {base_oid}: {err}"),
+                    })?;
                 Ok(bytes)
             }
             _ => Err(corrupt("not a delta entry")),
@@ -491,7 +538,10 @@ impl Resolver<'_> {
         match &self.raw[index].header {
             PackHeader::OfsDelta { base_distance } => {
                 let base_offset = self.raw[index].pack_offset.saturating_sub(*base_distance);
-                let base_index = *self.offsets.get(&base_offset).ok_or_else(|| corrupt("ofs-delta base is not a pack entry"))?;
+                let base_index = *self
+                    .offsets
+                    .get(&base_offset)
+                    .ok_or_else(|| corrupt("ofs-delta base is not a pack entry"))?;
                 Ok(self.kinds[base_index])
             }
             PackHeader::RefDelta { base_id } => {
@@ -506,7 +556,8 @@ impl Resolver<'_> {
     }
 
     fn finish(&mut self, index: usize, kind: ObjectKind, bytes: Vec<u8>) -> Result<(), GitError> {
-        let type_name = git_type_name(kind).ok_or_else(|| corrupt("pack cannot carry a native conflict"))?;
+        let type_name =
+            git_type_name(kind).ok_or_else(|| corrupt("pack cannot carry a native conflict"))?;
         let oid = self
             .kind
             .hash_git_object(type_name, &bytes)
@@ -524,7 +575,9 @@ impl Resolver<'_> {
 fn inflate(compressed: &[u8], declared: u64, max_object_bytes: u64) -> Result<Vec<u8>, GitError> {
     if declared > max_object_bytes {
         return Err(GitError::Limit {
-            detail: format!("pack entry declares {declared} bytes, above the {max_object_bytes}-byte limit"),
+            detail: format!(
+                "pack entry declares {declared} bytes, above the {max_object_bytes}-byte limit"
+            ),
         });
     }
     let capacity = usize::try_from(declared).map_err(|_| GitError::Limit {
@@ -533,7 +586,9 @@ fn inflate(compressed: &[u8], declared: u64, max_object_bytes: u64) -> Result<Ve
     let mut out = Vec::with_capacity(capacity);
     let mut decoder = ZlibDecoder::new(compressed);
     let mut limited = decoder.by_ref().take(max_object_bytes + 1);
-    limited.read_to_end(&mut out).map_err(|err| corrupt(format!("pack entry does not inflate: {err}")))?;
+    limited
+        .read_to_end(&mut out)
+        .map_err(|err| corrupt(format!("pack entry does not inflate: {err}")))?;
     if out.len() as u64 > max_object_bytes {
         return Err(GitError::Limit {
             detail: "pack entry inflates past the object limit".to_owned(),
@@ -554,8 +609,10 @@ fn inflate(compressed: &[u8], declared: u64, max_object_bytes: u64) -> Result<Ve
 /// [`GitError::Corrupt`] for truncated data, the reserved opcode, copies
 /// past the base end, or size headers that disagree with reality.
 pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitError> {
-    let (base_len, mut rest) = read_varint(delta).ok_or_else(|| corrupt("delta truncates its base size"))?;
-    let (result_len, rest2) = read_varint(rest).ok_or_else(|| corrupt("delta truncates its result size"))?;
+    let (base_len, mut rest) =
+        read_varint(delta).ok_or_else(|| corrupt("delta truncates its base size"))?;
+    let (result_len, rest2) =
+        read_varint(rest).ok_or_else(|| corrupt("delta truncates its result size"))?;
     rest = rest2;
     if base_len != base.len() as u64 {
         return Err(corrupt(format!(
@@ -580,14 +637,18 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitError> {
             let mut size = 0usize;
             for i in 0..4 {
                 if op & (1 << i) != 0 {
-                    let byte = *rest.first().ok_or_else(|| corrupt("delta truncates a copy offset"))?;
+                    let byte = *rest
+                        .first()
+                        .ok_or_else(|| corrupt("delta truncates a copy offset"))?;
                     rest = &rest[1..];
                     offset |= usize::from(byte) << (8 * i);
                 }
             }
             for i in 0..3 {
                 if op & (0x10 << i) != 0 {
-                    let byte = *rest.first().ok_or_else(|| corrupt("delta truncates a copy size"))?;
+                    let byte = *rest
+                        .first()
+                        .ok_or_else(|| corrupt("delta truncates a copy size"))?;
                     rest = &rest[1..];
                     size |= usize::from(byte) << (8 * i);
                 }
@@ -872,7 +933,9 @@ fn write_pack_inner<W: Write>(
             len: entry_len,
         });
     }
-    let checksum = hasher.try_finalize().map_err(|err| corrupt(format!("finishing the pack hash: {err}")))?;
+    let checksum = hasher
+        .try_finalize()
+        .map_err(|err| corrupt(format!("finishing the pack hash: {err}")))?;
     out.write_all(checksum.as_bytes()).map_err(io)?;
     out.flush().map_err(io)?;
     Ok(index)
@@ -888,7 +951,10 @@ mod tests {
             (b"", b""),
             (b"a", b"a"),
             (b"hello world", b"hello brave new world"),
-            (b"prefix-same-middle-differs-suffix-same", b"prefix-same-CHANGED-suffix-same"),
+            (
+                b"prefix-same-middle-differs-suffix-same",
+                b"prefix-same-CHANGED-suffix-same",
+            ),
             (&[0u8; 300], &[0u8; 299]),
             (b"short", b"a much longer target with common prefix s"),
         ];
@@ -959,7 +1025,9 @@ mod tests {
                 base: None,
             },
             PackEntry {
-                oid: HashKind::Sha1.hash_git_object("commit", &commit).expect("hash"),
+                oid: HashKind::Sha1
+                    .hash_git_object("commit", &commit)
+                    .expect("hash"),
                 kind: ObjectKind::Commit,
                 bytes: &commit,
                 base: None,
@@ -967,8 +1035,14 @@ mod tests {
         ];
         let mut pack = Vec::new();
         write_pack(&mut pack, HashKind::Sha1, &entries, &Interrupt::none()).expect("write");
-        let staged = ingest_pack(&pack[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("ingest");
+        let staged = ingest_pack(
+            &pack[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("ingest");
         assert_eq!(staged.oids().len(), 3);
         for (want, got) in entries.iter().map(|e| e.oid).zip(staged.oids()) {
             assert_eq!(want, *got);
@@ -979,9 +1053,18 @@ mod tests {
     fn fixture_pack_ingests_with_deltas() {
         let store = crate::transport::session::test_support::test_store(HashKind::Sha1);
         let pack = include_bytes!("fixtures/basic.pack");
-        let staged = ingest_pack(&pack[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("fixture ingests");
-        assert!(staged.oids().len() >= 4, "fixture holds blob/tree/commit/tag");
+        let staged = ingest_pack(
+            &pack[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("fixture ingests");
+        assert!(
+            staged.oids().len() >= 4,
+            "fixture holds blob/tree/commit/tag"
+        );
         let kinds: Vec<ObjectKind> = staged.objects().iter().map(|o| o.kind()).collect();
         assert!(kinds.contains(&ObjectKind::Commit));
         assert!(kinds.contains(&ObjectKind::Tag));
@@ -991,21 +1074,39 @@ mod tests {
     fn thin_fixture_resolves_against_the_store() {
         let store = crate::transport::session::test_support::test_store(HashKind::Sha1);
         let base_pack = include_bytes!("fixtures/base.pack");
-        let staged = ingest_pack(&base_pack[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("base ingests");
+        let staged = ingest_pack(
+            &base_pack[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("base ingests");
         // Commit "three" and its big blob are the thin pack's bases but are
         // not in base.pack: stage them from the full-history fixture so the
         // store holds every base the thin pack may name.
         let basic = include_bytes!("fixtures/basic.pack");
-        let staged_basic = ingest_pack(&basic[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("history ingests");
+        let staged_basic = ingest_pack(
+            &basic[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("history ingests");
         let mut objects = staged.into_objects();
         objects.extend(staged_basic.into_objects());
         let publication = store.publish(objects, &[]).expect("bases publish");
         assert!(!publication.objects.is_empty());
         let thin = include_bytes!("fixtures/thin.pack");
-        let staged = ingest_pack(&thin[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("thin ingests against stored bases");
+        let staged = ingest_pack(
+            &thin[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("thin ingests against stored bases");
         assert_eq!(staged.oids().len(), 3);
     }
 
@@ -1013,8 +1114,14 @@ mod tests {
     fn thin_fixture_fails_without_its_base() {
         let store = crate::transport::session::test_support::test_store(HashKind::Sha1);
         let thin = include_bytes!("fixtures/thin.pack");
-        let err = ingest_pack(&thin[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect_err("external base is absent");
+        let err = ingest_pack(
+            &thin[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect_err("external base is absent");
         assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
     }
 
@@ -1022,8 +1129,14 @@ mod tests {
     fn in_pack_ref_delta_fixture_ingests_standalone() {
         let store = crate::transport::session::test_support::test_store(HashKind::Sha1);
         let pack = include_bytes!("fixtures/delta.pack");
-        let staged = ingest_pack(&pack[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("in-pack ref-delta ingests");
+        let staged = ingest_pack(
+            &pack[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("in-pack ref-delta ingests");
         assert_eq!(staged.oids().len(), 5);
     }
 
@@ -1032,7 +1145,9 @@ mod tests {
         let base = b"the quick brown fox jumps over the lazy dog".to_vec();
         let target = b"the quick brown fox JUMPS over the lazy dog!".to_vec();
         let base_oid = HashKind::Sha1.hash_git_object("blob", &base).expect("hash");
-        let target_oid = HashKind::Sha1.hash_git_object("blob", &target).expect("hash");
+        let target_oid = HashKind::Sha1
+            .hash_git_object("blob", &target)
+            .expect("hash");
         let entries = [PackEntry {
             oid: target_oid,
             kind: ObjectKind::Blob,
@@ -1042,10 +1157,18 @@ mod tests {
         let mut pack = Vec::new();
         write_thin_pack(&mut pack, HashKind::Sha1, &entries, &Interrupt::none()).expect("write");
         let store = crate::transport::session::test_support::test_store(HashKind::Sha1);
-        let prepared = store.prepare(ObjectKind::Blob, base.len() as u64, &base[..], None).expect("stage base");
+        let prepared = store
+            .prepare(ObjectKind::Blob, base.len() as u64, &base[..], None)
+            .expect("stage base");
         store.publish(vec![prepared], &[]).expect("publish base");
-        let staged = ingest_pack(&pack[..], HashKind::Sha1, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("thin ingests");
+        let staged = ingest_pack(
+            &pack[..],
+            HashKind::Sha1,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("thin ingests");
         assert_eq!(staged.oids().len(), 1);
         assert_eq!(staged.oids()[0], target_oid);
     }

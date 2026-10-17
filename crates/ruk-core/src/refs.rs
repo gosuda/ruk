@@ -12,9 +12,7 @@ use crate::merge::Merge;
 use crate::refdata::{
     RefChange, RefError, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
-use crate::store::{
-    FactExpectation, FactMutation, FactPageBudget, FactTable, Store, StoreError,
-};
+use crate::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Store, StoreError};
 
 #[cfg(test)]
 mod tests;
@@ -76,9 +74,9 @@ fn decode_stored_target(
 ) -> Result<RefTarget, CoreError> {
     let res: Result<RefTarget, StoreError> = (|| {
         let target: RefTarget = crate::store::decode("ref target", bytes)?;
-        target.validate(store.hash_kind()).map_err(|err| {
-            StoreError::Corrupt(format!("ref {name} has invalid target: {err}"))
-        })?;
+        target
+            .validate(store.hash_kind())
+            .map_err(|err| StoreError::Corrupt(format!("ref {name} has invalid target: {err}")))?;
         Ok(target)
     })();
     store.observe(res).map_err(CoreError::from)
@@ -96,11 +94,7 @@ pub struct RefPage {
     pub more: bool,
 }
 
-pub fn page_refs(
-    store: &Store,
-    after: Option<&[u8]>,
-    limit: usize,
-) -> Result<RefPage, CoreError> {
+pub fn page_refs(store: &Store, after: Option<&[u8]>, limit: usize) -> Result<RefPage, CoreError> {
     if limit == 0 {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
@@ -112,9 +106,8 @@ pub fn page_refs(
     let page = store.fact_page(FactTable::Refs, after, budget)?;
     let mut entries = Vec::with_capacity(page.rows.len());
     for row in page.rows {
-        let name = RefName::new(row.key).map_err(|err| {
-            corrupt_store(store, format!("stored ref key is invalid: {err}"))
-        })?;
+        let name = RefName::new(row.key)
+            .map_err(|err| corrupt_store(store, format!("stored ref key is invalid: {err}")))?;
         let target = decode_stored_target(store, &name, &row.value)?;
         entries.push(RefEntry { name, target });
     }
@@ -228,7 +221,9 @@ pub fn prepare_checked_transaction(
         };
 
         let key = name_bytes.to_vec();
-        let row_pair_len = key.len().saturating_add(new_value.as_ref().map_or(0, |v| v.len()));
+        let row_pair_len = key
+            .len()
+            .saturating_add(new_value.as_ref().map_or(0, |v| v.len()));
         if row_pair_len > MAX_CONTROL_FRAME_BYTES {
             return Err(CoreError::new(
                 ErrorCode::ELimit,
@@ -414,12 +409,14 @@ impl ReflogKey {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CoreModelError> {
-        let nul_pos = bytes.iter().position(|&b| b == 0x00).ok_or_else(|| {
-            CoreModelError::Invalid {
-                what: "reflog key",
-                detail: "missing NUL delimiter".to_owned(),
-            }
-        })?;
+        let nul_pos =
+            bytes
+                .iter()
+                .position(|&b| b == 0x00)
+                .ok_or_else(|| CoreModelError::Invalid {
+                    what: "reflog key",
+                    detail: "missing NUL delimiter".to_owned(),
+                })?;
         let name_bytes = &bytes[..nul_pos];
         let suffix = &bytes[nul_pos + 1..];
         if suffix.len() != 16 {
@@ -558,10 +555,7 @@ pub fn prepare_append_reflog(
     })
 }
 
-pub fn get_reflog(
-    store: &Store,
-    key: &ReflogKey,
-) -> Result<Option<ReflogRecord>, CoreError> {
+pub fn get_reflog(store: &Store, key: &ReflogKey) -> Result<Option<ReflogRecord>, CoreError> {
     let key_bytes = key.encode();
     let raw = store.fact(FactTable::Reflogs, &key_bytes)?;
     match raw {
@@ -616,9 +610,8 @@ pub fn page_reflogs(
             more = true;
             break;
         }
-        let key = ReflogKey::decode(&row.key).map_err(|err| {
-            corrupt_store(store, format!("reflog key corrupt: {err}"))
-        })?;
+        let key = ReflogKey::decode(&row.key)
+            .map_err(|err| corrupt_store(store, format!("reflog key corrupt: {err}")))?;
         let record = decode_stored_reflog(store, &key, &row.value)?;
         entries.push(ReflogEntry { key, record });
     }

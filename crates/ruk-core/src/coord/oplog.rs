@@ -27,13 +27,13 @@ use serde::Serialize;
 
 use crate::change::{CheckedOperationId, OperationId, SessionId};
 use crate::coord::rows::{
-    corrupt, decode, decode_op_header, encode, fact_table_from_name, op_key, OpDelta, OpHeader,
-    MAX_ENCODED_DELTA_BYTES, OP_FRAGMENT_MAX_BYTES, ROW_MAX_BYTES,
+    MAX_ENCODED_DELTA_BYTES, OP_FRAGMENT_MAX_BYTES, OpDelta, OpHeader, ROW_MAX_BYTES, corrupt,
+    decode, decode_op_header, encode, fact_table_from_name, op_key,
 };
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Method, OperationEntry, Timestamp};
-use crate::store::types::{FactExpectation, FactMutation, FactTable};
 use crate::store::Store;
+use crate::store::types::{FactExpectation, FactMutation, FactTable};
 
 // ---------------------------------------------------------------------------
 // Tracked Table Census
@@ -121,26 +121,23 @@ impl FragmentWriter {
     }
 
     fn push_bytes(&mut self, mut data: &[u8]) -> Result<(), CoreError> {
-        let data_len = u64::try_from(data.len())
-            .map_err(|_| {
-                CoreError::new(ErrorCode::EInvalid, "data length: data slice length exceeds u64")
-            })?;
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(data_len)
-            .ok_or_else(|| {
-                CoreError::new(
-                    ErrorCode::EInvalid,
-                    "stream bytes: stream bytes counter overflow",
-                )
-            })?;
+        let data_len = u64::try_from(data.len()).map_err(|_| {
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "data length: data slice length exceeds u64",
+            )
+        })?;
+        self.total_bytes = self.total_bytes.checked_add(data_len).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "stream bytes: stream bytes counter overflow",
+            )
+        })?;
         while !data.is_empty() {
             let available = OP_FRAGMENT_MAX_BYTES.saturating_sub(self.current.len());
             if available == 0 {
-                let full = std::mem::replace(
-                    &mut self.current,
-                    Vec::with_capacity(OP_FRAGMENT_MAX_BYTES),
-                );
+                let full =
+                    std::mem::replace(&mut self.current, Vec::with_capacity(OP_FRAGMENT_MAX_BYTES));
                 self.fragments.push(full);
                 continue;
             }
@@ -148,10 +145,8 @@ impl FragmentWriter {
             self.current.extend_from_slice(&data[..to_copy]);
             data = &data[to_copy..];
             if self.current.len() == OP_FRAGMENT_MAX_BYTES {
-                let full = std::mem::replace(
-                    &mut self.current,
-                    Vec::with_capacity(OP_FRAGMENT_MAX_BYTES),
-                );
+                let full =
+                    std::mem::replace(&mut self.current, Vec::with_capacity(OP_FRAGMENT_MAX_BYTES));
                 self.fragments.push(full);
             }
         }
@@ -254,22 +249,23 @@ pub(crate) fn record(
 
     let id = ops.allocate().map_err(CoreError::from)?;
     let mut fragment_writer = FragmentWriter::new();
-    let deltas_count = u64::try_from(tracked_deltas.len())
-        .map_err(|_| {
-            CoreError::new(ErrorCode::EInvalid, "deltas count: deltas count exceeds u64")
-        })?;
+    let deltas_count = u64::try_from(tracked_deltas.len()).map_err(|_| {
+        CoreError::new(
+            ErrorCode::EInvalid,
+            "deltas count: deltas count exceeds u64",
+        )
+    })?;
 
     for delta in &tracked_deltas {
-        let delta_size = postcard::serialize_with_flavor(
-            delta,
-            postcard::ser_flavors::Size::default(),
-        )
-        .map_err(|e| CoreError::new(ErrorCode::EInvalid, format!("serialize delta: {e}")))?;
+        let delta_size =
+            postcard::serialize_with_flavor(delta, postcard::ser_flavors::Size::default())
+                .map_err(|e| {
+                    CoreError::new(ErrorCode::EInvalid, format!("serialize delta: {e}"))
+                })?;
 
-        let delta_size_u64 = u64::try_from(delta_size)
-            .map_err(|_| {
-                CoreError::new(ErrorCode::EInvalid, "delta size: delta size exceeds u64")
-            })?;
+        let delta_size_u64 = u64::try_from(delta_size).map_err(|_| {
+            CoreError::new(ErrorCode::EInvalid, "delta size: delta size exceeds u64")
+        })?;
         let length_prefix = delta_size_u64.to_be_bytes();
         fragment_writer.push_bytes(&length_prefix)?;
 
@@ -284,9 +280,7 @@ pub(crate) fn record(
 
     let (fragments, stream_bytes) = fragment_writer.finish();
     let parts = u64::try_from(fragments.len())
-        .map_err(|_| {
-            CoreError::new(ErrorCode::EInvalid, "parts count: parts count exceeds u64")
-        })?;
+        .map_err(|_| CoreError::new(ErrorCode::EInvalid, "parts count: parts count exceeds u64"))?;
 
     let entry = OperationEntry {
         id,
@@ -313,21 +307,18 @@ pub(crate) fn record(
     });
 
     for (idx, fragment) in fragments.into_iter().enumerate() {
-        let idx_u64 = u64::try_from(idx)
-            .map_err(|_| {
-                CoreError::new(
-                    ErrorCode::EInvalid,
-                    "fragment index: fragment index exceeds u64",
-                )
-            })?;
-        let part_num = idx_u64
-            .checked_add(1)
-            .ok_or_else(|| {
-                CoreError::new(
-                    ErrorCode::EInvalid,
-                    "part number: part number counter overflow",
-                )
-            })?;
+        let idx_u64 = u64::try_from(idx).map_err(|_| {
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "fragment index: fragment index exceeds u64",
+            )
+        })?;
+        let part_num = idx_u64.checked_add(1).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "part number: part number counter overflow",
+            )
+        })?;
         mutations.push(FactMutation {
             table: FactTable::Ops,
             key: op_key(id, part_num).to_vec(),
@@ -347,10 +338,7 @@ pub(crate) fn record(
 ///
 /// Returns `Ok(None)` if the operation does not exist. Malformed bytes or semantic
 /// violations report to [`Store::observe`] and return `E_CORRUPT`.
-pub(crate) fn read_header(
-    store: &Store,
-    id: OperationId,
-) -> Result<Option<OpHeader>, CoreError> {
+pub(crate) fn read_header(store: &Store, id: OperationId) -> Result<Option<OpHeader>, CoreError> {
     let key = op_key(id, 0);
     let Some(bytes) = store.fact(FactTable::Ops, &key)? else {
         return Ok(None);
@@ -469,12 +457,9 @@ impl<'a> OpDeltaReader<'a> {
             }
             self.current_fragment = Some(part_bytes);
             self.fragment_offset = 0;
-            self.current_part = self
-                .current_part
-                .checked_add(1)
-                .ok_or_else(|| {
-                    CoreError::new(ErrorCode::ECorrupt, "op stream: part counter overflow")
-                })?;
+            self.current_part = self.current_part.checked_add(1).ok_or_else(|| {
+                CoreError::new(ErrorCode::ECorrupt, "op stream: part counter overflow")
+            })?;
             return Ok(());
         }
 
@@ -518,12 +503,9 @@ impl<'a> OpDeltaReader<'a> {
 
         self.current_fragment = Some(part_bytes);
         self.fragment_offset = 0;
-        self.current_part = self
-            .current_part
-            .checked_add(1)
-            .ok_or_else(|| {
-                CoreError::new(ErrorCode::ECorrupt, "op stream: part counter overflow")
-            })?;
+        self.current_part = self.current_part.checked_add(1).ok_or_else(|| {
+            CoreError::new(ErrorCode::ECorrupt, "op stream: part counter overflow")
+        })?;
         Ok(())
     }
 
@@ -546,15 +528,12 @@ impl<'a> OpDeltaReader<'a> {
                     "op stream: copied byte count exceeds u64",
                 )
             })?;
-            self.stream_bytes_read = self
-                .stream_bytes_read
-                .checked_add(to_copy_u64)
-                .ok_or_else(|| {
-                    CoreError::new(
-                        ErrorCode::ECorrupt,
-                        "op stream: stream bytes read overflow",
-                    )
-                })?;
+            self.stream_bytes_read =
+                self.stream_bytes_read
+                    .checked_add(to_copy_u64)
+                    .ok_or_else(|| {
+                        CoreError::new(ErrorCode::ECorrupt, "op stream: stream bytes read overflow")
+                    })?;
             buf = &mut buf[to_copy..];
         }
         Ok(())
@@ -650,13 +629,9 @@ impl<'a> OpDeltaReader<'a> {
             );
         }
 
-        let delta_len_usize = usize::try_from(delta_len)
-            .map_err(|_| {
-                CoreError::new(
-                    ErrorCode::ECorrupt,
-                    "op stream: delta length exceeds usize",
-                )
-            })?;
+        let delta_len_usize = usize::try_from(delta_len).map_err(|_| {
+            CoreError::new(ErrorCode::ECorrupt, "op stream: delta length exceeds usize")
+        })?;
         self.delta_buffer.resize(delta_len_usize, 0);
         let mut buffer = std::mem::take(&mut self.delta_buffer);
         let filled = self.read_exact(&mut buffer).map(|()| buffer);
@@ -684,7 +659,10 @@ impl<'a> OpDeltaReader<'a> {
             return corrupt(
                 self.store,
                 "op delta",
-                format!("delta for table `{}` has neither before nor after", delta.table),
+                format!(
+                    "delta for table `{}` has neither before nor after",
+                    delta.table
+                ),
             );
         }
 
@@ -711,13 +689,12 @@ impl<'a> OpDeltaReader<'a> {
             );
         }
         if let Some(b) = &delta.before {
-            let b_len = u64::try_from(b.len())
-                .map_err(|_| {
-                    CoreError::new(
-                        ErrorCode::ECorrupt,
-                        "op delta: before value length exceeds u64",
-                    )
-                })?;
+            let b_len = u64::try_from(b.len()).map_err(|_| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "op delta: before value length exceeds u64",
+                )
+            })?;
             if key_len.saturating_add(b_len) > ROW_MAX_BYTES {
                 return corrupt(
                     self.store,
@@ -727,13 +704,12 @@ impl<'a> OpDeltaReader<'a> {
             }
         }
         if let Some(a) = &delta.after {
-            let a_len = u64::try_from(a.len())
-                .map_err(|_| {
-                    CoreError::new(
-                        ErrorCode::ECorrupt,
-                        "op delta: after value length exceeds u64",
-                    )
-                })?;
+            let a_len = u64::try_from(a.len()).map_err(|_| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "op delta: after value length exceeds u64",
+                )
+            })?;
             if key_len.saturating_add(a_len) > ROW_MAX_BYTES {
                 return corrupt(
                     self.store,
@@ -743,12 +719,9 @@ impl<'a> OpDeltaReader<'a> {
             }
         }
 
-        self.deltas_read = self
-            .deltas_read
-            .checked_add(1)
-            .ok_or_else(|| {
-                CoreError::new(ErrorCode::ECorrupt, "op stream: deltas count overflow")
-            })?;
+        self.deltas_read = self.deltas_read.checked_add(1).ok_or_else(|| {
+            CoreError::new(ErrorCode::ECorrupt, "op stream: deltas count overflow")
+        })?;
 
         Ok(Some(delta))
     }
@@ -814,8 +787,8 @@ mod tests {
     fn test_store(tag: &str) -> (TempRoot, Store) {
         let temp = TempRoot::new(tag);
         let budget = Arc::new(PreparationBudget::reference_defaults());
-        let store = Store::create(&temp.store_dir(), HashKind::Sha1, budget)
-            .expect("create test store");
+        let store =
+            Store::create(&temp.store_dir(), HashKind::Sha1, budget).expect("create test store");
         (temp, store)
     }
 
@@ -1043,7 +1016,9 @@ mod tests {
 
         store.publish(Vec::new(), &mutations).expect("publish");
 
-        let header = read_header(&store, id).expect("read header").expect("header present");
+        let header = read_header(&store, id)
+            .expect("read header")
+            .expect("header present");
         assert_eq!(header.deltas, 1);
         assert_eq!(header.parts, 2);
 
@@ -1108,7 +1083,10 @@ mod tests {
         let err = reader.next_delta().expect_err("unknown table must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1164,7 +1142,10 @@ mod tests {
         let err = reader.next_delta().expect_err("untracked table must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1207,10 +1188,15 @@ mod tests {
         store.publish(Vec::new(), &mutations).expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
-        let err = reader.next_delta().expect_err("zero length delta must fail");
+        let err = reader
+            .next_delta()
+            .expect_err("zero length delta must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1255,10 +1241,15 @@ mod tests {
         store.publish(Vec::new(), &mutations).expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
-        let err = reader.next_delta().expect_err("oversized delta length must fail");
+        let err = reader
+            .next_delta()
+            .expect_err("oversized delta length must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1303,7 +1294,10 @@ mod tests {
         let err = reader.next_delta().expect_err("missing part must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1364,7 +1358,10 @@ mod tests {
         let err = reader.next_delta().expect_err("trailing bytes must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1430,7 +1427,10 @@ mod tests {
         let err = reader.next_delta().expect_err("extra part must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -1483,10 +1483,15 @@ mod tests {
         store.publish(Vec::new(), &mutations).expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
-        let err = reader.next_delta().expect_err("identical before/after must fail");
+        let err = reader
+            .next_delta()
+            .expect_err("identical before/after must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }

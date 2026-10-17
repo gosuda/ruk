@@ -16,12 +16,12 @@
 
 use std::sync::Arc;
 
+use crate::OperationId;
 use crate::budget::{ByteBudget, ByteReservation};
 use crate::coord::leases::condemned::CondemnedSet;
 use crate::coord::leases::timing::GRAY_ALLOWANCE_BYTES;
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
-use crate::OperationId;
 
 /// Barrier phase. `Closed` is terminal after an ambiguous sweep-record
 /// failure: the coordinator refuses further collection work instead of
@@ -195,7 +195,10 @@ impl RootBarrier {
         }
         if let Some((low, high)) = op_window {
             if low > high {
-                return Err(CoreError::new(ErrorCode::EInvalid, "collection op window inverted"));
+                return Err(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "collection op window inverted",
+                ));
             }
         }
         self.phase = CollectionPhase::Mark;
@@ -216,10 +219,16 @@ impl RootBarrier {
     pub(crate) fn note_gray(&mut self, head: Head) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if self.phase != CollectionPhase::Mark {
-            return Err(CoreError::new(ErrorCode::EInvalid, "gray work outside Mark"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "gray work outside Mark",
+            ));
         }
         let Some(books) = self.gray_books.clone() else {
-            return Err(CoreError::new(ErrorCode::ECorrupt, "mark cycle lost its gray budget"));
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "mark cycle lost its gray budget",
+            ));
         };
         let bytes = u64::try_from(crate::coord::leases::condemned::RECORD_LEN)
             .map_err(|_| CoreError::new(ErrorCode::ECapacity, "gray record size overflows u64"))?;
@@ -260,10 +269,16 @@ impl RootBarrier {
     pub(crate) fn begin_frontier_publish(&mut self) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if self.phase != CollectionPhase::Mark {
-            return Err(CoreError::new(ErrorCode::EInvalid, "frontier publish outside Mark"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "frontier publish outside Mark",
+            ));
         }
         if self.frontier_in_flight {
-            return Err(CoreError::new(ErrorCode::EInvalid, "frontier publish already in flight"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "frontier publish already in flight",
+            ));
         }
         self.frontier_in_flight = true;
         Ok(())
@@ -273,7 +288,10 @@ impl RootBarrier {
     pub(crate) fn end_frontier_publish(&mut self) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if !self.frontier_in_flight {
-            return Err(CoreError::new(ErrorCode::EInvalid, "no frontier publish in flight"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "no frontier publish in flight",
+            ));
         }
         self.frontier_in_flight = false;
         Ok(())
@@ -283,7 +301,10 @@ impl RootBarrier {
     pub(crate) fn finish_enumeration(&mut self, cycle: u64) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if self.phase != CollectionPhase::Mark || cycle != self.cycle {
-            return Err(CoreError::new(ErrorCode::EStale, "enumeration for a stale cycle"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "enumeration for a stale cycle",
+            ));
         }
         self.enumeration_done = true;
         Ok(())
@@ -295,13 +316,19 @@ impl RootBarrier {
     pub(crate) fn drain_gray(&mut self, through_epoch: u64) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if self.phase != CollectionPhase::Mark {
-            return Err(CoreError::new(ErrorCode::EInvalid, "gray drain outside Mark"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "gray drain outside Mark",
+            ));
         }
         let total = u64::try_from(self.gray.len())
             .map_err(|_| CoreError::new(ErrorCode::ECapacity, "gray set size overflows u64"))?;
         let base = self.root_epoch.saturating_sub(total);
         if through_epoch < base {
-            return Err(CoreError::new(ErrorCode::EInvalid, "gray drain epoch predates the gray set"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "gray drain epoch predates the gray set",
+            ));
         }
         // Entries carry no per-entry epoch; the collector drains in order, so
         // the acknowledged prefix length is the epoch delta from the gray
@@ -332,19 +359,34 @@ impl RootBarrier {
             return Err(CoreError::new(ErrorCode::EStale, "seal for a stale cycle"));
         }
         if candidate_epoch != self.root_epoch {
-            return Err(CoreError::new(ErrorCode::EStale, "candidate epoch moved under the collector"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "candidate epoch moved under the collector",
+            ));
         }
         if !self.gray.is_empty() {
-            return Err(CoreError::new(ErrorCode::EStale, "gray work outstanding at seal"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "gray work outstanding at seal",
+            ));
         }
         if !self.enumeration_done {
-            return Err(CoreError::new(ErrorCode::EStale, "root enumeration unfinished at seal"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "root enumeration unfinished at seal",
+            ));
         }
         if self.frontier_in_flight {
-            return Err(CoreError::new(ErrorCode::EStale, "frontier publication in flight at seal"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "frontier publication in flight at seal",
+            ));
         }
         if condemned.cycle() != self.cycle {
-            return Err(CoreError::new(ErrorCode::EStale, "condemned set bound to another cycle"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "condemned set bound to another cycle",
+            ));
         }
         self.phase = CollectionPhase::SweepPending;
         self.condemned = Some(condemned);
@@ -359,7 +401,10 @@ impl RootBarrier {
     fn check_token(&self, token: &SealedCycle) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if token.cycle != self.cycle || token.root_epoch != self.root_epoch {
-            return Err(CoreError::new(ErrorCode::EStale, "sealed cycle moved under the lane"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "sealed cycle moved under the lane",
+            ));
         }
         Ok(())
     }
@@ -373,7 +418,10 @@ impl RootBarrier {
         outcome: SweepOutcome,
     ) -> Result<(), CoreError> {
         if self.phase != CollectionPhase::SweepPending {
-            return Err(CoreError::new(ErrorCode::EInvalid, "sweep outcome outside SweepPending"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "sweep outcome outside SweepPending",
+            ));
         }
         self.check_token(token)?;
         match outcome {
@@ -402,7 +450,10 @@ impl RootBarrier {
     /// condemned handle. The registry deletes nothing itself.
     pub(crate) fn complete_sweep(&mut self, token: &SealedCycle) -> Result<(), CoreError> {
         if self.phase != CollectionPhase::Sweep {
-            return Err(CoreError::new(ErrorCode::EInvalid, "sweep completion outside Sweep"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "sweep completion outside Sweep",
+            ));
         }
         self.check_token(token)?;
         self.next_cycle()?;
@@ -423,7 +474,10 @@ impl RootBarrier {
     /// original locator is always retained.
     pub(crate) fn dedupe_needs_lookup(&self) -> Result<bool, CoreError> {
         self.refuse_if_closed()?;
-        Ok(matches!(self.phase, CollectionPhase::SweepPending | CollectionPhase::Sweep))
+        Ok(matches!(
+            self.phase,
+            CollectionPhase::SweepPending | CollectionPhase::Sweep
+        ))
     }
 
     /// Confirms a condemned lookup performed outside the lock. `observed`
@@ -437,12 +491,21 @@ impl RootBarrier {
     ) -> Result<Dedupe, CoreError> {
         self.refuse_if_closed()?;
         if observed_cycle != self.cycle
-            || !matches!(self.phase, CollectionPhase::SweepPending | CollectionPhase::Sweep)
+            || !matches!(
+                self.phase,
+                CollectionPhase::SweepPending | CollectionPhase::Sweep
+            )
         {
-            return Err(CoreError::new(ErrorCode::EStale, "dedupe lookup raced a cycle rollover"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "dedupe lookup raced a cycle rollover",
+            ));
         }
         if member {
-            return Err(CoreError::new(ErrorCode::ELimit, "condemned object reuse rejected"));
+            return Err(CoreError::new(
+                ErrorCode::ELimit,
+                "condemned object reuse rejected",
+            ));
         }
         Ok(Dedupe::RetainOriginal)
     }
@@ -460,11 +523,15 @@ mod tests {
     }
 
     fn sealed_through_mark(barrier: &mut RootBarrier) -> SealedCycle {
-        barrier.begin_mark(42, Some((3, 9)),).expect("begin");
+        barrier.begin_mark(42, Some((3, 9))).expect("begin");
         let cycle = barrier.cycle();
         barrier.finish_enumeration(cycle).expect("finish");
         barrier
-            .seal_candidate(cycle, barrier.root_epoch(), Arc::new(CondemnedSet::empty(cycle)))
+            .seal_candidate(
+                cycle,
+                barrier.root_epoch(),
+                Arc::new(CondemnedSet::empty(cycle)),
+            )
             .expect("seal")
     }
 
@@ -476,11 +543,21 @@ mod tests {
         barrier.note_gray(head(1)).expect("gray");
         barrier.finish_enumeration(cycle).expect("finish");
         let err = barrier
-            .seal_candidate(cycle, barrier.root_epoch(), Arc::new(CondemnedSet::empty(cycle)))
+            .seal_candidate(
+                cycle,
+                barrier.root_epoch(),
+                Arc::new(CondemnedSet::empty(cycle)),
+            )
             .expect_err("gray outstanding");
         assert_eq!(err.code, ErrorCode::EStale);
         barrier.drain_gray(barrier.root_epoch()).expect("drain");
-        barrier.seal_candidate(cycle, barrier.root_epoch(), Arc::new(CondemnedSet::empty(cycle))).expect("seal");
+        barrier
+            .seal_candidate(
+                cycle,
+                barrier.root_epoch(),
+                Arc::new(CondemnedSet::empty(cycle)),
+            )
+            .expect("seal");
     }
 
     #[test]
@@ -521,10 +598,14 @@ mod tests {
         let mut barrier = RootBarrier::new();
         let token = sealed_through_mark(&mut barrier);
         let observed = token.cycle();
-        barrier.sweep_record_outcome(&token, SweepOutcome::Committed).expect("sweep");
+        barrier
+            .sweep_record_outcome(&token, SweepOutcome::Committed)
+            .expect("sweep");
         barrier.complete_sweep(&token).expect("complete");
         // Lookup sampled the old cycle: confirmation must go stale.
-        let err = barrier.confirm_dedupe(observed, false).expect_err("rollover");
+        let err = barrier
+            .confirm_dedupe(observed, false)
+            .expect_err("rollover");
         assert_eq!(err.code, ErrorCode::EStale);
     }
 }

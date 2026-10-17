@@ -25,9 +25,7 @@ use std::path::Path;
 use super::crawl::{CrawlLimits, Observed, Probe, Prober, crawl, parallel_map};
 use super::ingest::{Ingested, file_mode, ingest};
 use super::journal_state::{ApplyPhase, JournalState, ensure_idle};
-use super::statcache::{
-    StatClock, StatusMeta, StatusRow, Trust, decode_row, encode_row, trust,
-};
+use super::statcache::{StatClock, StatusMeta, StatusRow, Trust, decode_row, encode_row, trust};
 use super::tree::{Dirs, Leaf, TreeMode, rebuild};
 use super::watcher::{DirtySet, WatchBatch, WatchToken, reduce};
 use super::{FactSet, IgnoreRule, cache_key, scan_prefix};
@@ -114,7 +112,9 @@ pub(crate) enum SnapshotOutcome {
     /// The worktree matches the base tree. `cache` may refresh stat rows and
     /// the watcher token; publishing it records no operation and does not
     /// advance the workspace stamp. Empty when nothing needs refreshing.
-    NoChange { cache: Vec<FactMutation> },
+    NoChange {
+        cache: Vec<FactMutation>,
+    },
     Changed(PreparedSnapshot),
 }
 
@@ -263,7 +263,11 @@ fn compute(
         token,
     };
     if meta.as_ref().is_none_or(|(_, old)| *old != next_meta) {
-        computed.facts.push(meta_mutation(input.workspace, meta.map(|(bytes, _)| bytes), &next_meta)?);
+        computed.facts.push(meta_mutation(
+            input.workspace,
+            meta.map(|(bytes, _)| bytes),
+            &next_meta,
+        )?);
     }
     Ok(Some(computed))
 }

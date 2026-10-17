@@ -18,7 +18,9 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::ObjectKind;
 
 use crate::GitError;
-use crate::import::objects::{Body, Location, SourceObject, SourceObjects, corrupt, header_name, verify};
+use crate::import::objects::{
+    Body, Location, SourceObject, SourceObjects, corrupt, header_name, verify,
+};
 
 /// Outgoing links of one object, in emission order.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -99,7 +101,9 @@ pub fn object_links(
                 gix_object::Kind::Tag => ObjectKind::Tag,
             };
             let oid = hex_to_oid(&parsed.target().to_hex().to_string(), hash)?;
-            Ok(ObjectLinks { links: vec![Link { oid, kind }] })
+            Ok(ObjectLinks {
+                links: vec![Link { oid, kind }],
+            })
         }
         ObjectKind::Conflict => Err(GitError::Invalid {
             detail: "native conflict records are not Git objects".to_owned(),
@@ -147,7 +151,9 @@ pub(crate) struct Seen {
 
 impl Seen {
     fn program(sizes: impl Iterator<Item = u32>) -> Self {
-        let packed = sizes.map(|size| vec![0_u64; size.div_ceil(64) as usize]).collect();
+        let packed = sizes
+            .map(|size| vec![0_u64; size.div_ceil(64) as usize])
+            .collect();
         Self {
             packed,
             loose: HashSet::new(),
@@ -218,7 +224,11 @@ impl Walker {
         tips: impl Iterator<Item = (Oid, Option<ObjectKind>, Option<Oid>)>,
     ) -> Result<(), GitError> {
         for (oid, kind, referrer) in tips {
-            self.push(Frame::Enter { oid, kind, referrer })?;
+            self.push(Frame::Enter {
+                oid,
+                kind,
+                referrer,
+            })?;
         }
         Ok(())
     }
@@ -246,7 +256,11 @@ impl Walker {
                 });
             }
             match frame {
-                Frame::Enter { oid, kind, referrer } => {
+                Frame::Enter {
+                    oid,
+                    kind,
+                    referrer,
+                } => {
                     let Some(location) = source.locate(oid)? else {
                         return Err(missing(oid, referrer));
                     };
@@ -400,7 +414,9 @@ fn check_kind(
     }
     let name = header_name(actual).unwrap_or("unknown");
     Err(corrupt(match referrer {
-        Some(from) => format!("object {oid} referenced by {from} is a {name}, not the expected kind"),
+        Some(from) => {
+            format!("object {oid} referenced by {from} is a {name}, not the expected kind")
+        }
         None => format!("object {oid} is a {name}, not the expected kind"),
     }))
 }

@@ -47,9 +47,7 @@ pub const FIELD_NONE: u32 = u32::MAX;
 /// Every parser variant the syntax engine catalogues. The spelling of
 /// [`Language::id`] is the validated `ruk-language` attribute value and the
 /// notice `language` field.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Language {
     Rust,
@@ -206,52 +204,167 @@ impl Language {
     #[must_use]
     pub const fn grammar_pin(self) -> GrammarPin {
         match self {
-            Self::Rust => GrammarPin::crate_pin("tree-sitter-rust", "0.24.2", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-rust/0.24.2/source/"),
-            Self::Python => GrammarPin::crate_pin("tree-sitter-python", "0.25.0", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-python/0.25.0/source/"),
-            Self::Go => GrammarPin::crate_pin("tree-sitter-go", "0.25.0", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-go/0.25.0/source/"),
-            Self::Yaml => GrammarPin::crate_pin("tree-sitter-yaml", "0.7.2", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-yaml/0.7.2/source/"),
-            Self::Javascript => GrammarPin::crate_pin("tree-sitter-javascript", "0.25.0", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-javascript/0.25.0/source/"),
-            Self::Typescript => GrammarPin::crate_pin("tree-sitter-typescript", "0.23.2", "LANGUAGE_TYPESCRIPT", 14,
-                "https://docs.rs/crate/tree-sitter-typescript/0.23.2/source/"),
-            Self::Tsx => GrammarPin::crate_pin("tree-sitter-typescript", "0.23.2", "LANGUAGE_TSX", 14,
-                "https://docs.rs/crate/tree-sitter-typescript/0.23.2/source/"),
-            Self::C => GrammarPin::crate_pin("tree-sitter-c", "0.24.2", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-c/0.24.2/source/"),
-            Self::Cpp => GrammarPin::crate_pin("tree-sitter-cpp", "0.23.4", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-cpp/0.23.4/source/"),
-            Self::Java => GrammarPin::crate_pin("tree-sitter-java", "0.23.5", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-java/0.23.5/source/"),
-            Self::CSharp => GrammarPin::crate_pin("tree-sitter-c-sharp", "0.23.5", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-c-sharp/0.23.5/source/"),
-            Self::Kotlin => GrammarPin::crate_pin("tree-sitter-kotlin-ng", "1.1.0", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-kotlin-ng/1.1.0/source/"),
-            Self::Swift => GrammarPin::crate_pin("tree-sitter-swift", "0.7.4", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-swift/0.7.4/source/"),
-            Self::Ruby => GrammarPin::crate_pin("tree-sitter-ruby", "0.23.1", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-ruby/0.23.1/source/"),
-            Self::Php => GrammarPin::crate_pin("tree-sitter-php", "0.25.1", "LANGUAGE_PHP", 15,
-                "https://docs.rs/crate/tree-sitter-php/0.25.1/source/"),
-            Self::Bash => GrammarPin::crate_pin("tree-sitter-bash", "0.25.1", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-bash/0.25.1/source/"),
-            Self::Ocaml => GrammarPin::crate_pin("tree-sitter-ocaml", "0.26.0", "LANGUAGE_OCAML", 15,
-                "https://docs.rs/crate/tree-sitter-ocaml/0.26.0/source/"),
-            Self::OcamlInterface => GrammarPin::crate_pin("tree-sitter-ocaml", "0.26.0", "LANGUAGE_OCAML_INTERFACE", 15,
-                "https://docs.rs/crate/tree-sitter-ocaml/0.26.0/source/"),
-            Self::Lua => GrammarPin::crate_pin("tree-sitter-lua", "0.5.0", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-lua/0.5.0/source/"),
-            Self::Html => GrammarPin::crate_pin("tree-sitter-html", "0.23.2", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-html/0.23.2/source/"),
-            Self::Css => GrammarPin::crate_pin("tree-sitter-css", "0.25.0", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-css/0.25.0/source/"),
-            Self::Json => GrammarPin::crate_pin("tree-sitter-json", "0.24.8", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-json/0.24.8/source/"),
-            Self::Toml => GrammarPin::crate_pin("tree-sitter-toml-ng", "0.7.0", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-toml-ng/0.7.0/source/"),
+            Self::Rust => GrammarPin::crate_pin(
+                "tree-sitter-rust",
+                "0.24.2",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-rust/0.24.2/source/",
+            ),
+            Self::Python => GrammarPin::crate_pin(
+                "tree-sitter-python",
+                "0.25.0",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-python/0.25.0/source/",
+            ),
+            Self::Go => GrammarPin::crate_pin(
+                "tree-sitter-go",
+                "0.25.0",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-go/0.25.0/source/",
+            ),
+            Self::Yaml => GrammarPin::crate_pin(
+                "tree-sitter-yaml",
+                "0.7.2",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-yaml/0.7.2/source/",
+            ),
+            Self::Javascript => GrammarPin::crate_pin(
+                "tree-sitter-javascript",
+                "0.25.0",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-javascript/0.25.0/source/",
+            ),
+            Self::Typescript => GrammarPin::crate_pin(
+                "tree-sitter-typescript",
+                "0.23.2",
+                "LANGUAGE_TYPESCRIPT",
+                14,
+                "https://docs.rs/crate/tree-sitter-typescript/0.23.2/source/",
+            ),
+            Self::Tsx => GrammarPin::crate_pin(
+                "tree-sitter-typescript",
+                "0.23.2",
+                "LANGUAGE_TSX",
+                14,
+                "https://docs.rs/crate/tree-sitter-typescript/0.23.2/source/",
+            ),
+            Self::C => GrammarPin::crate_pin(
+                "tree-sitter-c",
+                "0.24.2",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-c/0.24.2/source/",
+            ),
+            Self::Cpp => GrammarPin::crate_pin(
+                "tree-sitter-cpp",
+                "0.23.4",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-cpp/0.23.4/source/",
+            ),
+            Self::Java => GrammarPin::crate_pin(
+                "tree-sitter-java",
+                "0.23.5",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-java/0.23.5/source/",
+            ),
+            Self::CSharp => GrammarPin::crate_pin(
+                "tree-sitter-c-sharp",
+                "0.23.5",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-c-sharp/0.23.5/source/",
+            ),
+            Self::Kotlin => GrammarPin::crate_pin(
+                "tree-sitter-kotlin-ng",
+                "1.1.0",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-kotlin-ng/1.1.0/source/",
+            ),
+            Self::Swift => GrammarPin::crate_pin(
+                "tree-sitter-swift",
+                "0.7.4",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-swift/0.7.4/source/",
+            ),
+            Self::Ruby => GrammarPin::crate_pin(
+                "tree-sitter-ruby",
+                "0.23.1",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-ruby/0.23.1/source/",
+            ),
+            Self::Php => GrammarPin::crate_pin(
+                "tree-sitter-php",
+                "0.25.1",
+                "LANGUAGE_PHP",
+                15,
+                "https://docs.rs/crate/tree-sitter-php/0.25.1/source/",
+            ),
+            Self::Bash => GrammarPin::crate_pin(
+                "tree-sitter-bash",
+                "0.25.1",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-bash/0.25.1/source/",
+            ),
+            Self::Ocaml => GrammarPin::crate_pin(
+                "tree-sitter-ocaml",
+                "0.26.0",
+                "LANGUAGE_OCAML",
+                15,
+                "https://docs.rs/crate/tree-sitter-ocaml/0.26.0/source/",
+            ),
+            Self::OcamlInterface => GrammarPin::crate_pin(
+                "tree-sitter-ocaml",
+                "0.26.0",
+                "LANGUAGE_OCAML_INTERFACE",
+                15,
+                "https://docs.rs/crate/tree-sitter-ocaml/0.26.0/source/",
+            ),
+            Self::Lua => GrammarPin::crate_pin(
+                "tree-sitter-lua",
+                "0.5.0",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-lua/0.5.0/source/",
+            ),
+            Self::Html => GrammarPin::crate_pin(
+                "tree-sitter-html",
+                "0.23.2",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-html/0.23.2/source/",
+            ),
+            Self::Css => GrammarPin::crate_pin(
+                "tree-sitter-css",
+                "0.25.0",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-css/0.25.0/source/",
+            ),
+            Self::Json => GrammarPin::crate_pin(
+                "tree-sitter-json",
+                "0.24.8",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-json/0.24.8/source/",
+            ),
+            Self::Toml => GrammarPin::crate_pin(
+                "tree-sitter-toml-ng",
+                "0.7.0",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-toml-ng/0.7.0/source/",
+            ),
             Self::Vue => GrammarPin::vendored(
                 "tree-sitter-grammars/tree-sitter-vue",
                 "ce8011a414fdf8091f4e4071752efc376f4afb08",
@@ -259,10 +372,20 @@ impl Language {
                 15,
                 "https://github.com/tree-sitter-grammars/tree-sitter-vue/blob/ce8011a414fdf8091f4e4071752efc376f4afb08/src/parser.c",
             ),
-            Self::Svelte => GrammarPin::crate_pin("tree-sitter-svelte-ng", "1.0.2", "LANGUAGE", 14,
-                "https://docs.rs/crate/tree-sitter-svelte-ng/1.0.2/source/"),
-            Self::Markdown => GrammarPin::crate_pin("tree-sitter-md", "0.5.3", "LANGUAGE", 15,
-                "https://docs.rs/crate/tree-sitter-md/0.5.3/source/"),
+            Self::Svelte => GrammarPin::crate_pin(
+                "tree-sitter-svelte-ng",
+                "1.0.2",
+                "LANGUAGE",
+                14,
+                "https://docs.rs/crate/tree-sitter-svelte-ng/1.0.2/source/",
+            ),
+            Self::Markdown => GrammarPin::crate_pin(
+                "tree-sitter-md",
+                "0.5.3",
+                "LANGUAGE",
+                15,
+                "https://docs.rs/crate/tree-sitter-md/0.5.3/source/",
+            ),
             Self::Mdx => GrammarPin::host_library(
                 "mdxjs",
                 "1.0.4",
@@ -312,7 +435,9 @@ impl Language {
             Self::Svelte => "<script>\n  let msg = 1;\n</script>\n<p>{msg}</p>\n",
             Self::Markdown => "# Ready\n\nSome text.\n",
             Self::Mdx => "# Ready\n\nSome text.\n",
-            Self::Notebook => "{\"cells\": [], \"metadata\": {}, \"nbformat\": 4, \"nbformat_minor\": 5}\n",
+            Self::Notebook => {
+                "{\"cells\": [], \"metadata\": {}, \"nbformat\": 4, \"nbformat_minor\": 5}\n"
+            }
         }
     }
 }
@@ -630,9 +755,7 @@ impl ParsedTree {
     /// Whether any node is an ERROR or missing node.
     #[must_use]
     pub fn has_error(&self) -> bool {
-        self.nodes
-            .iter()
-            .any(|n| n.is_error || n.is_missing)
+        self.nodes.iter().any(|n| n.is_error || n.is_missing)
     }
 
     /// Whether the tree holds no nodes.
@@ -777,7 +900,10 @@ fn shebang_language(first_line: &[u8]) -> Option<Language> {
         }
         next
     } else {
-        interpreter.rsplit(|byte| *byte == b'/').next().unwrap_or(interpreter)
+        interpreter
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or(interpreter)
     };
     // A version suffix (python3.12) or flag bundle still names the same
     // interpreter only for the fixed basenames below.
@@ -837,7 +963,10 @@ pub fn dispatch(
 
 /// Maps a lowercase file extension to its language. `.h`/`.inc` never guess
 /// C versus C++; `.sh` selects Bash only for a Bash shebang.
-fn dispatch_extension(ext: &[u8], first_line: Option<&[u8]>) -> Result<Option<Language>, SyntaxError> {
+fn dispatch_extension(
+    ext: &[u8],
+    first_line: Option<&[u8]>,
+) -> Result<Option<Language>, SyntaxError> {
     let language = match ext {
         b"rs" => Some(Language::Rust),
         b"py" | b"pyi" => Some(Language::Python),

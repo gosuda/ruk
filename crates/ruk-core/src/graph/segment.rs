@@ -63,9 +63,8 @@ use crate::change::ChangeId;
 use crate::error::{CoreError, ErrorCode};
 use crate::graph::bloom::{build_bloom_filter, check_bloom_filter};
 use crate::graph::types::{
-    BloomMatch, Generation, GlobalPosition, LocalPosition, PrefixResolution,
-    GRAPH_SEGMENT_MAGIC, GRAPH_SEGMENT_V1_FORMAT, MAX_GRAPH_POSITIONS, NO_PARENT,
-    OVERFLOW_FLAG,
+    BloomMatch, GRAPH_SEGMENT_MAGIC, GRAPH_SEGMENT_V1_FORMAT, Generation, GlobalPosition,
+    LocalPosition, MAX_GRAPH_POSITIONS, NO_PARENT, OVERFLOW_FLAG, PrefixResolution,
 };
 use crate::heads::Head;
 use crate::ids::{CommitKey, HashKind, Oid};
@@ -77,13 +76,16 @@ pub(crate) const MAX_SEGMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[inline]
 fn read_u32_at(slice: &[u8], offset: usize) -> Result<u32, CoreError> {
-    let end = offset.checked_add(4).ok_or_else(|| {
-        CoreError::new(ErrorCode::ECorrupt, "offset overflow reading u32")
-    })?;
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "offset overflow reading u32"))?;
     if end > slice.len() {
         return Err(CoreError::new(
             ErrorCode::ECorrupt,
-            format!("slice length {} too short for u32 at offset {offset}", slice.len()),
+            format!(
+                "slice length {} too short for u32 at offset {offset}",
+                slice.len()
+            ),
         ));
     }
     let bytes: [u8; 4] = slice[offset..end]
@@ -94,13 +96,16 @@ fn read_u32_at(slice: &[u8], offset: usize) -> Result<u32, CoreError> {
 
 #[inline]
 fn read_16_bytes_at(slice: &[u8], offset: usize) -> Result<[u8; 16], CoreError> {
-    let end = offset.checked_add(16).ok_or_else(|| {
-        CoreError::new(ErrorCode::ECorrupt, "offset overflow reading 16 bytes")
-    })?;
+    let end = offset
+        .checked_add(16)
+        .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "offset overflow reading 16 bytes"))?;
     if end > slice.len() {
         return Err(CoreError::new(
             ErrorCode::ECorrupt,
-            format!("slice length {} too short for 16 bytes at offset {offset}", slice.len()),
+            format!(
+                "slice length {} too short for 16 bytes at offset {offset}",
+                slice.len()
+            ),
         ));
     }
     slice[offset..end]
@@ -256,7 +261,9 @@ impl GraphSegment {
         if expected_crc != actual_crc {
             return Err(CoreError::new(
                 ErrorCode::ECorrupt,
-                format!("graph segment checksum mismatch: expected {expected_crc:#x}, computed {actual_crc:#x}"),
+                format!(
+                    "graph segment checksum mismatch: expected {expected_crc:#x}, computed {actual_crc:#x}"
+                ),
             ));
         }
 
@@ -289,11 +296,14 @@ impl GraphSegment {
         if hash_kind != expected_hash_kind {
             return Err(CoreError::new(
                 ErrorCode::EObjectFormat,
-                format!("segment hash kind {hash_kind:?} disagrees with expected {expected_hash_kind:?}"),
+                format!(
+                    "segment hash kind {hash_kind:?} disagrees with expected {expected_hash_kind:?}"
+                ),
             ));
         }
 
-        let parent_name_len = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+        let parent_name_len =
+            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
         let parent_name_offset = HEADER_PREFIX_LEN;
         let parent_name_end = parent_name_offset
             .checked_add(parent_name_len)
@@ -306,7 +316,9 @@ impl GraphSegment {
         }
 
         let parent_segment_name = std::str::from_utf8(&bytes[parent_name_offset..parent_name_end])
-            .map_err(|_| CoreError::new(ErrorCode::ECorrupt, "invalid UTF-8 in parent segment name"))?
+            .map_err(|_| {
+                CoreError::new(ErrorCode::ECorrupt, "invalid UTF-8 in parent segment name")
+            })?
             .to_string();
 
         let counts_offset = parent_name_end;
@@ -346,7 +358,9 @@ impl GraphSegment {
         } else if num_parent_commits != 0 {
             return Err(CoreError::new(
                 ErrorCode::ECorrupt,
-                format!("segment claims {num_parent_commits} parent commits but no parent segment was provided"),
+                format!(
+                    "segment claims {num_parent_commits} parent commits but no parent segment was provided"
+                ),
             ));
         }
 
@@ -356,37 +370,60 @@ impl GraphSegment {
 
         let entries_len = (num_local_commits as usize)
             .checked_mul(COMMIT_ENTRY_LEN)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "commit entries table length overflow"))?;
+            .ok_or_else(|| {
+                CoreError::new(ErrorCode::ECapacity, "commit entries table length overflow")
+            })?;
         let head_lookup_offset = entries_offset + entries_len;
 
-        let head_lookup_len = (num_local_commits as usize)
-            .checked_mul(4)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "head lookup table length overflow"))?;
+        let head_lookup_len = (num_local_commits as usize).checked_mul(4).ok_or_else(|| {
+            CoreError::new(ErrorCode::ECapacity, "head lookup table length overflow")
+        })?;
         let change_ids_offset = head_lookup_offset + head_lookup_len;
 
         let change_ids_len = (num_local_change_ids as usize)
             .checked_mul(16)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "change IDs table length overflow"))?;
+            .ok_or_else(|| {
+                CoreError::new(ErrorCode::ECapacity, "change IDs table length overflow")
+            })?;
         let change_id_positions_offset = change_ids_offset + change_ids_len;
 
-        let change_id_positions_len = (num_local_change_ids as usize)
-            .checked_mul(4)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "change ID positions table length overflow"))?;
+        let change_id_positions_len =
+            (num_local_change_ids as usize)
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::ECapacity,
+                        "change ID positions table length overflow",
+                    )
+                })?;
         let overflow_parents_offset = change_id_positions_offset + change_id_positions_len;
 
-        let overflow_parents_len = (num_overflow_parents as usize)
-            .checked_mul(4)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "overflow parents table length overflow"))?;
+        let overflow_parents_len =
+            (num_overflow_parents as usize)
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::ECapacity,
+                        "overflow parents table length overflow",
+                    )
+                })?;
         let overflow_change_ids_offset = overflow_parents_offset + overflow_parents_len;
 
         let overflow_change_ids_len = (num_overflow_change_ids as usize)
             .checked_mul(4)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "overflow change IDs table length overflow"))?;
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ECapacity,
+                    "overflow change IDs table length overflow",
+                )
+            })?;
         let bloom_offsets_offset = overflow_change_ids_offset + overflow_change_ids_len;
 
         let bloom_offsets_len = ((num_local_commits as usize) + 1)
             .checked_mul(4)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "bloom offsets table length overflow"))?;
+            .ok_or_else(|| {
+                CoreError::new(ErrorCode::ECapacity, "bloom offsets table length overflow")
+            })?;
         let bloom_data_offset = bloom_offsets_offset + bloom_offsets_len;
 
         let bloom_data_len_usize = bloom_data_len as usize;
@@ -398,7 +435,9 @@ impl GraphSegment {
         if expected_total_bytes != total_size {
             return Err(CoreError::new(
                 ErrorCode::ECorrupt,
-                format!("computed segment size {expected_total_bytes} differs from actual size {total_size}"),
+                format!(
+                    "computed segment size {expected_total_bytes} differs from actual size {total_size}"
+                ),
             ));
         }
 
@@ -433,13 +472,18 @@ impl GraphSegment {
         parent_segment: Option<Arc<GraphSegment>>,
         budget: &Arc<ByteBudget>,
     ) -> Result<Arc<Self>, CoreError> {
-        let mut file = File::open(path).map_err(|e| CoreError::new(ErrorCode::EIo, e.to_string()))?;
-        let metadata = file.metadata().map_err(|e| CoreError::new(ErrorCode::EIo, e.to_string()))?;
+        let mut file =
+            File::open(path).map_err(|e| CoreError::new(ErrorCode::EIo, e.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| CoreError::new(ErrorCode::EIo, e.to_string()))?;
         let file_len = metadata.len();
         if file_len > MAX_SEGMENT_FILE_BYTES {
             return Err(CoreError::new(
                 ErrorCode::ECapacity,
-                format!("graph segment file size {file_len} exceeds maximum limit {MAX_SEGMENT_FILE_BYTES}"),
+                format!(
+                    "graph segment file size {file_len} exceeds maximum limit {MAX_SEGMENT_FILE_BYTES}"
+                ),
             ));
         }
 
@@ -486,13 +530,21 @@ impl GraphSegment {
         if pos >= (self.num_local_commits as usize) {
             return Err(CoreError::new(
                 ErrorCode::ENotFound,
-                format!("local position {pos} out of range (num_local_commits = {})", self.num_local_commits),
+                format!(
+                    "local position {pos} out of range (num_local_commits = {})",
+                    self.num_local_commits
+                ),
             ));
         }
         let offset = self.entries_offset + pos * COMMIT_ENTRY_LEN;
         let slice: &[u8; COMMIT_ENTRY_LEN] = self.data[offset..offset + COMMIT_ENTRY_LEN]
             .try_into()
-            .map_err(|_| CoreError::new(ErrorCode::ECorrupt, "failed reading commit graph entry slice"))?;
+            .map_err(|_| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "failed reading commit graph entry slice",
+                )
+            })?;
         Ok(CommitGraphEntry::decode(slice))
     }
 
@@ -512,7 +564,10 @@ impl GraphSegment {
         if cid_idx >= (self.num_local_change_ids as usize) {
             return Err(CoreError::new(
                 ErrorCode::ECorrupt,
-                format!("change_id_pos {cid_idx} exceeds num_local_change_ids {}", self.num_local_change_ids),
+                format!(
+                    "change_id_pos {cid_idx} exceeds num_local_change_ids {}",
+                    self.num_local_change_ids
+                ),
             ));
         }
         let offset = self.change_ids_offset + cid_idx * 16;
@@ -520,7 +575,10 @@ impl GraphSegment {
         Ok(ChangeId::from_bytes(bytes))
     }
 
-    pub(crate) fn parents_at(&self, local_pos: LocalPosition) -> Result<SmallVec<[GlobalPosition; 2]>, CoreError> {
+    pub(crate) fn parents_at(
+        &self,
+        local_pos: LocalPosition,
+    ) -> Result<SmallVec<[GlobalPosition; 2]>, CoreError> {
         let entry = self.entry_at(local_pos)?;
         if entry.parent1_raw == NO_PARENT {
             return Ok(SmallVec::new());
@@ -538,13 +596,19 @@ impl GraphSegment {
         let overflow_offset = (entry.parent1_raw & !OVERFLOW_FLAG) as usize;
         let count = (entry.parent2_raw & !OVERFLOW_FLAG) as usize;
 
-        let end = overflow_offset
-            .checked_add(count)
-            .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "overflow parents offset calculation overflow"))?;
+        let end = overflow_offset.checked_add(count).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                "overflow parents offset calculation overflow",
+            )
+        })?;
         if end > (self.num_overflow_parents as usize) {
             return Err(CoreError::new(
                 ErrorCode::ECorrupt,
-                format!("overflow parents range {overflow_offset}..{end} exceeds table length {}", self.num_overflow_parents),
+                format!(
+                    "overflow parents range {overflow_offset}..{end} exceeds table length {}",
+                    self.num_overflow_parents
+                ),
             ));
         }
 
@@ -671,9 +735,8 @@ impl GraphSegment {
         let overflow_offset = (raw_val & !OVERFLOW_FLAG) as usize;
         let overflow_slice = &self.data[self.overflow_change_ids_offset..];
         let count_raw = read_u32_at(overflow_slice, overflow_offset * 4)?;
-        let total_count = usize::try_from(count_raw).map_err(|_| {
-            CoreError::new(ErrorCode::ECapacity, "overflow count exceeds usize")
-        })?;
+        let total_count = usize::try_from(count_raw)
+            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "overflow count exceeds usize"))?;
 
         if offset >= total_count {
             return Ok(ChangeIdPage {
@@ -707,7 +770,10 @@ impl GraphSegment {
     }
 
     /// Indexed prefix lookup in sorted head lookup table; stops on first ambiguity.
-    pub(crate) fn resolve_head_prefix(&self, prefix: &str) -> Result<PrefixResolution<Head>, CoreError> {
+    pub(crate) fn resolve_head_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<PrefixResolution<Head>, CoreError> {
         if prefix.is_empty() {
             return Ok(PrefixResolution::AmbiguousMatch);
         }
@@ -718,13 +784,17 @@ impl GraphSegment {
         let prefix_bytes = prefix.as_bytes();
         for &b in prefix_bytes {
             if !b.is_ascii_hexdigit() {
-                return Err(CoreError::new(ErrorCode::EInvalid, "invalid hex character in prefix"));
+                return Err(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "invalid hex character in prefix",
+                ));
             }
         }
 
         let (start, end) = if prefix_bytes.len() >= 2 {
             let byte_val = u8::from_str_radix(&prefix[..2], 16)
-                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "invalid hex prefix byte"))? as usize;
+                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "invalid hex prefix byte"))?
+                as usize;
             let fanout_slice = &self.data[self.fanout_offset..self.fanout_offset + 1024];
             let s = if byte_val == 0 {
                 0usize
@@ -735,7 +805,8 @@ impl GraphSegment {
             (s, e)
         } else {
             let nibble = u8::from_str_radix(&prefix[..1], 16)
-                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "invalid hex prefix nibble"))? as usize;
+                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "invalid hex prefix nibble"))?
+                as usize;
             let low_byte = nibble << 4;
             let high_byte = (nibble << 4) | 0x0F;
             let fanout_slice = &self.data[self.fanout_offset..self.fanout_offset + 1024];
@@ -783,7 +854,10 @@ impl GraphSegment {
     }
 
     /// Indexed prefix lookup in sorted change IDs table; stops on ambiguity.
-    pub(crate) fn resolve_change_id_prefix(&self, prefix: &str) -> Result<PrefixResolution<ChangeId>, CoreError> {
+    pub(crate) fn resolve_change_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<PrefixResolution<ChangeId>, CoreError> {
         if prefix.is_empty() {
             return Ok(PrefixResolution::AmbiguousMatch);
         }
@@ -834,7 +908,11 @@ impl GraphSegment {
     }
 
     #[must_use]
-    pub(crate) fn bloom_filter_candidate(&self, local_pos: LocalPosition, path: &[u8]) -> BloomMatch {
+    pub(crate) fn bloom_filter_candidate(
+        &self,
+        local_pos: LocalPosition,
+        path: &[u8],
+    ) -> BloomMatch {
         let pos = local_pos.as_usize();
         if pos >= (self.num_local_commits as usize) {
             return BloomMatch::Candidate;
@@ -858,7 +936,8 @@ impl GraphSegment {
             return BloomMatch::Candidate;
         }
 
-        let filter_data = &self.data[self.bloom_data_offset + start_offset..self.bloom_data_offset + end_offset];
+        let filter_data =
+            &self.data[self.bloom_data_offset + start_offset..self.bloom_data_offset + end_offset];
         check_bloom_filter(filter_data, path)
     }
 }
@@ -913,14 +992,17 @@ impl GraphSegmentWriter {
             ));
         }
 
-        let mut change_map: std::collections::BTreeMap<ChangeId, Vec<u32>> = std::collections::BTreeMap::new();
+        let mut change_map: std::collections::BTreeMap<ChangeId, Vec<u32>> =
+            std::collections::BTreeMap::new();
         for (i, commit) in self.commits.iter().enumerate() {
-            change_map.entry(commit.change_id).or_default().push(i as u32);
+            change_map
+                .entry(commit.change_id)
+                .or_default()
+                .push(i as u32);
         }
 
-        let num_local_change_ids = u32::try_from(change_map.len()).map_err(|_| {
-            CoreError::new(ErrorCode::ECapacity, "too many change IDs in segment")
-        })?;
+        let num_local_change_ids = u32::try_from(change_map.len())
+            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "too many change IDs in segment"))?;
 
         let mut overflow_parents = Vec::new();
         let mut entries = Vec::with_capacity(self.commits.len());
@@ -984,9 +1066,8 @@ impl GraphSegmentWriter {
             });
         }
 
-        let num_overflow_parents = u32::try_from(overflow_parents.len()).map_err(|_| {
-            CoreError::new(ErrorCode::ECapacity, "too many overflow parents")
-        })?;
+        let num_overflow_parents = u32::try_from(overflow_parents.len())
+            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "too many overflow parents"))?;
 
         let mut head_sort_indices: Vec<u32> = (0..num_local_commits).collect();
         let oid_len = self.hash_kind.oid_len();
@@ -1032,9 +1113,8 @@ impl GraphSegmentWriter {
             }
         }
 
-        let num_overflow_change_ids = u32::try_from(overflow_change_ids.len()).map_err(|_| {
-            CoreError::new(ErrorCode::ECapacity, "too many overflow change IDs")
-        })?;
+        let num_overflow_change_ids = u32::try_from(overflow_change_ids.len())
+            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "too many overflow change IDs"))?;
 
         let mut bloom_offsets = Vec::with_capacity(self.commits.len() + 1);
         let mut bloom_data = Vec::new();
@@ -1050,9 +1130,8 @@ impl GraphSegmentWriter {
             bloom_offsets.push(next_offset);
         }
 
-        let bloom_data_len = u32::try_from(bloom_data.len()).map_err(|_| {
-            CoreError::new(ErrorCode::ECapacity, "bloom data length exceeds u32")
-        })?;
+        let bloom_data_len = u32::try_from(bloom_data.len())
+            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "bloom data length exceeds u32"))?;
 
         let mut buffer = Vec::new();
         buffer.extend_from_slice(&GRAPH_SEGMENT_MAGIC);
@@ -1064,9 +1143,8 @@ impl GraphSegmentWriter {
         buffer.extend_from_slice(&[0u8; 3]);
 
         let parent_name_bytes = self.parent_segment_name.as_bytes();
-        let parent_name_len = u32::try_from(parent_name_bytes.len()).map_err(|_| {
-            CoreError::new(ErrorCode::ECapacity, "parent name too long")
-        })?;
+        let parent_name_len = u32::try_from(parent_name_bytes.len())
+            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "parent name too long"))?;
         buffer.extend_from_slice(&parent_name_len.to_le_bytes());
         buffer.extend_from_slice(&[0u8; 20]);
         buffer.extend_from_slice(parent_name_bytes);
@@ -1116,10 +1194,7 @@ impl GraphSegmentWriter {
         Ok(buffer)
     }
 
-    pub(crate) fn install_to_disk(
-        self,
-        target_path: &Path,
-    ) -> Result<(), CoreError> {
+    pub(crate) fn install_to_disk(self, target_path: &Path) -> Result<(), CoreError> {
         let bytes = self.build()?;
         install_file(target_path, |file| {
             file.write_all(&bytes)?;

@@ -89,7 +89,8 @@ fn open_validated(mut options: OpenOptions, path: &Path) -> Result<File, CoreErr
     options.custom_flags(open_flags());
     options.open(path).map_err(|err| match err.kind() {
         kind if kind == ErrorKind::PermissionDenied
-            || err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            || err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+        {
             forbidden(path, "ownership lock is not safely openable")
         }
         ErrorKind::NotFound => CoreError::new(
@@ -118,9 +119,7 @@ fn open_flags() -> i32 {
 /// processes with store write access are trusted; this is not a sandbox
 /// against malicious peers holding that authority.
 fn validate_lock_file(file: &File, path: &Path) -> Result<(), CoreError> {
-    let metadata = file
-        .metadata()
-        .map_err(|err| io_error(path, "stat", err))?;
+    let metadata = file.metadata().map_err(|err| io_error(path, "stat", err))?;
     if !metadata.is_file() {
         return Err(forbidden(path, "ownership lock is not a regular file"));
     }

@@ -96,8 +96,7 @@ struct RepoCore {
 
 impl RepoCore {
     fn is_idle(&self) -> bool {
-        self.running.iter().all(|&count| count == 0)
-            && self.queues.iter().all(VecDeque::is_empty)
+        self.running.iter().all(|&count| count == 0) && self.queues.iter().all(VecDeque::is_empty)
     }
 }
 
@@ -208,7 +207,10 @@ impl Shared {
     #[cfg(test)]
     pub(super) fn deficit_of(&self, repo: u64, class: RequestClass) -> Option<i128> {
         let index = ordinary_index(class)?;
-        self.lock().repos.get(&repo).map(|state| state.deficit[index])
+        self.lock()
+            .repos
+            .get(&repo)
+            .map(|state| state.deficit[index])
     }
 
     fn lock(&self) -> MutexGuard<'_, Core> {
@@ -610,12 +612,18 @@ fn run_visit(
 
 /// Refuses heads whose deadline has passed, from the front of one queue.
 fn refuse_expired(class: &mut ClassCore, repo: &mut RepoCore, c: usize, now: Instant) {
-    while repo.queues[c].front().is_some_and(|head| head.deadline <= now) {
+    while repo.queues[c]
+        .front()
+        .is_some_and(|head| head.deadline <= now)
+    {
         let Some(expired) = repo.queues[c].pop_front() else {
             return;
         };
         class.queued = class.queued.saturating_sub(1);
-        refuse(expired, limit("queue wait exceeded the class admission bound"));
+        refuse(
+            expired,
+            limit("queue wait exceeded the class admission bound"),
+        );
     }
 }
 
@@ -715,8 +723,7 @@ fn grant(
         class.storage_running += 1;
     }
     repo.running[c] += 1;
-    repo.deficit[c] = repo
-        .deficit[c]
+    repo.deficit[c] = repo.deficit[c]
         .checked_sub(i128::from(waiter.predicted))
         .unwrap_or(i128::MIN);
     issue(shared, ORDINARY_CLASSES[c], waiter);
@@ -730,7 +737,10 @@ fn dispatch_control(shared: &Arc<Shared>, core: &mut Core, now: Instant) {
             return;
         };
         if waiter.deadline <= now {
-            refuse(waiter, limit("control queue wait exceeded its admission bound"));
+            refuse(
+                waiter,
+                limit("control queue wait exceeded its admission bound"),
+            );
             continue;
         }
         core.control_running += 1;

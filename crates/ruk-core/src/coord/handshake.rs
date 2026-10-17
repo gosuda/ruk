@@ -493,8 +493,7 @@ mod tests {
         deadline: Instant,
     ) -> Result<(), CoreError> {
         let client_challenge = read_hello(&mut stream, deadline).await?;
-        let mut frame =
-            server_proof_frame(&nonce, &store, &client_challenge, &random_challenge())?;
+        let mut frame = server_proof_frame(&nonce, &store, &client_challenge, &random_challenge())?;
         mutate(&mut frame);
         write_frame(&mut stream, &frame, deadline).await
     }
@@ -522,8 +521,7 @@ mod tests {
         deadline: Instant,
     ) -> Result<(), CoreError> {
         let client_challenge = read_hello(&mut stream, deadline).await?;
-        let mut frame =
-            server_proof_frame(&nonce, &store, &client_challenge, &random_challenge())?;
+        let mut frame = server_proof_frame(&nonce, &store, &client_challenge, &random_challenge())?;
         frame[S1_LEN - 1] ^= 0x01;
         write_frame(&mut stream, &frame, deadline).await?;
         let mut probe = [0u8; 1];
@@ -618,7 +616,13 @@ mod tests {
         let store = fixture_store();
         let key = fresh_nonce();
         let deadline = generous_deadline();
-        let peer = tokio::spawn(send_mutated_s1(server, key.clone(), store, mutate, deadline));
+        let peer = tokio::spawn(send_mutated_s1(
+            server,
+            key.clone(),
+            store,
+            mutate,
+            deadline,
+        ));
         let result = prove_client(&mut client, store, &key, deadline).await;
         assert_eq!(result.expect_err(name).code, expected, "case {name}");
         drop(client);
@@ -694,7 +698,10 @@ mod tests {
             let deadline = generous_deadline();
             let peer = tokio::spawn(serve_reject(server, store, key.clone(), deadline));
             let result = prove_client(&mut client, store, &key, deadline).await;
-            assert_eq!(result.expect_err("refused peer").code, ErrorCode::EForbidden);
+            assert_eq!(
+                result.expect_err("refused peer").code,
+                ErrorCode::EForbidden
+            );
             peer.await.expect("server task").expect("refusal sent");
         });
     }
@@ -711,7 +718,10 @@ mod tests {
             assert_eq!(result.expect_err("wrong nonce").code, ErrorCode::EForbidden);
             drop(client);
             let peer_result = peer.await.expect("server task");
-            assert_eq!(peer_result.expect_err("no client proof").code, ErrorCode::EIo);
+            assert_eq!(
+                peer_result.expect_err("no client proof").code,
+                ErrorCode::EIo
+            );
         });
     }
 
@@ -726,7 +736,10 @@ mod tests {
             assert_eq!(result.expect_err("wrong store").code, ErrorCode::EForbidden);
             drop(client);
             let peer_result = peer.await.expect("server task");
-            assert_eq!(peer_result.expect_err("no client proof").code, ErrorCode::EIo);
+            assert_eq!(
+                peer_result.expect_err("no client proof").code,
+                ErrorCode::EIo
+            );
         });
     }
 
@@ -767,8 +780,14 @@ mod tests {
             .expect("recorded transcript");
             let replayer = tokio::spawn(send_replayed_tag(client, recorded, deadline));
             let result = prove_server(&mut server, store, &key, deadline).await;
-            assert_eq!(result.expect_err("replayed tag").code, ErrorCode::EForbidden);
-            replayer.await.expect("replayer task").expect("replayer frames");
+            assert_eq!(
+                result.expect_err("replayed tag").code,
+                ErrorCode::EForbidden
+            );
+            replayer
+                .await
+                .expect("replayer task")
+                .expect("replayer frames");
         });
     }
 
@@ -794,9 +813,17 @@ mod tests {
             let store = fixture_store();
             let key = fresh_nonce();
             let deadline = generous_deadline();
-            let peer = tokio::spawn(send_bad_tag_then_probe(server, key.clone(), store, deadline));
+            let peer = tokio::spawn(send_bad_tag_then_probe(
+                server,
+                key.clone(),
+                store,
+                deadline,
+            ));
             let result = prove_client(&mut client, store, &key, deadline).await;
-            assert_eq!(result.expect_err("bad server tag").code, ErrorCode::EForbidden);
+            assert_eq!(
+                result.expect_err("bad server tag").code,
+                ErrorCode::EForbidden
+            );
             drop(client);
             peer.await
                 .expect("peer task")
@@ -807,7 +834,11 @@ mod tests {
     #[test]
     fn malformed_server_proof_is_refused_by_client() {
         let cases: [(&'static str, fn(&mut [u8; S1_LEN]), ErrorCode); 5] = [
-            ("magic", |frame: &mut [u8; S1_LEN]| frame[0] ^= 0xff, ErrorCode::EInvalid),
+            (
+                "magic",
+                |frame: &mut [u8; S1_LEN]| frame[0] ^= 0xff,
+                ErrorCode::EInvalid,
+            ),
             (
                 "version",
                 |frame: &mut [u8; S1_LEN]| frame[VERSION_POS] = PROTOCOL_VERSION.wrapping_add(1),
@@ -851,7 +882,11 @@ mod tests {
     #[test]
     fn malformed_verdict_is_refused_by_client() {
         let cases: [(&'static str, fn(&mut [u8; S2_LEN]), ErrorCode); 5] = [
-            ("magic", |frame: &mut [u8; S2_LEN]| frame[0] ^= 0xff, ErrorCode::EInvalid),
+            (
+                "magic",
+                |frame: &mut [u8; S2_LEN]| frame[0] ^= 0xff,
+                ErrorCode::EInvalid,
+            ),
             (
                 "version",
                 |frame: &mut [u8; S2_LEN]| frame[VERSION_POS] = PROTOCOL_VERSION.wrapping_add(1),
@@ -901,7 +936,11 @@ mod tests {
     #[test]
     fn malformed_client_hello_is_refused_by_server() {
         let cases: [(&'static str, fn(&mut [u8; C1_LEN]), ErrorCode); 4] = [
-            ("magic", |frame: &mut [u8; C1_LEN]| frame[0] ^= 0xff, ErrorCode::EInvalid),
+            (
+                "magic",
+                |frame: &mut [u8; C1_LEN]| frame[0] ^= 0xff,
+                ErrorCode::EInvalid,
+            ),
             (
                 "version",
                 |frame: &mut [u8; C1_LEN]| frame[VERSION_POS] = PROTOCOL_VERSION.wrapping_add(1),
@@ -949,8 +988,7 @@ mod tests {
         run(async {
             let (mut client, _silent_server) = duplex(256);
             let key = fresh_nonce();
-            let result =
-                prove_client(&mut client, fixture_store(), &key, short_deadline()).await;
+            let result = prove_client(&mut client, fixture_store(), &key, short_deadline()).await;
             assert_eq!(
                 result.expect_err("silent server").code,
                 ErrorCode::ECoordinatorUnresponsive
@@ -967,8 +1005,7 @@ mod tests {
                 .write_all(&client_hello(&random_challenge()))
                 .await
                 .expect("write hello");
-            let result =
-                prove_server(&mut server, fixture_store(), &key, short_deadline()).await;
+            let result = prove_server(&mut server, fixture_store(), &key, short_deadline()).await;
             assert_eq!(
                 result.expect_err("silent client").code,
                 ErrorCode::ECoordinatorUnresponsive

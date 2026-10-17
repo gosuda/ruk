@@ -92,8 +92,14 @@ pub(crate) enum Ancestry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Observed {
     Absent,
-    File { executable: bool, oid: Oid },
-    Symlink { link: Vec<u8>, oid: Oid },
+    File {
+        executable: bool,
+        oid: Oid,
+    },
+    Symlink {
+        link: Vec<u8>,
+        oid: Oid,
+    },
     Dir,
     /// A FIFO, socket or device: never captured, never overwritten.
     Other,
@@ -211,7 +217,9 @@ pub(crate) fn observe_leaf(kind: HashKind, full: &Path) -> Result<Observed, Core
         return Ok(Observed::Other);
     }
     let file = open_no_follow(full)?;
-    let meta = file.metadata().map_err(|err| io_error("stat", full, &err))?;
+    let meta = file
+        .metadata()
+        .map_err(|err| io_error("stat", full, &err))?;
     if !meta.is_file() {
         return Ok(Observed::Other);
     }
@@ -300,7 +308,11 @@ pub(crate) fn lstat(path: &Path) -> Result<Option<Metadata>, CoreError> {
 
 /// Streams a Git blob hash of exactly `len` bytes. `None` when the reader
 /// yields a different length (the file changed while it was read).
-pub(crate) fn hash_blob(kind: HashKind, len: u64, mut reader: impl Read) -> io::Result<Option<Oid>> {
+pub(crate) fn hash_blob(
+    kind: HashKind,
+    len: u64,
+    mut reader: impl Read,
+) -> io::Result<Option<Oid>> {
     let mut hasher = gix_hash::hasher(kind.gix());
     hasher.update(format!("blob {len}\0").as_bytes());
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -337,7 +349,9 @@ pub(crate) fn open_no_follow(path: &Path) -> Result<File, CoreError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed());
     }
-    options.open(path).map_err(|err| io_error("open", path, &err))
+    options
+        .open(path)
+        .map_err(|err| io_error("open", path, &err))
 }
 
 #[cfg(unix)]

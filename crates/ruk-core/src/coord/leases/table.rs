@@ -18,7 +18,7 @@ use crate::coord::cancel::{Cancel, CancelHandle, cancellation};
 use crate::coord::leases::timing::{self, Authority};
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
-use crate::protocol::{PageCursor, QueryDigest, MAX_CURSOR_POSITION_BYTES, MAX_PAGE_SIZE};
+use crate::protocol::{MAX_CURSOR_POSITION_BYTES, MAX_PAGE_SIZE, PageCursor, QueryDigest};
 use crate::{LeaseId, OperationId, SessionId, StoreId};
 
 /// Interactive or bulk/scratch/export lifetime class.
@@ -166,14 +166,25 @@ impl LeaseTable {
     /// returned [`Cancel`] observes authority; the registry wraps the id in
     /// its RAII owner guard, which retains protection until the owned task
     /// terminates.
-    pub(crate) fn acquire(&mut self, args: AcquireArgs, now: Instant) -> Result<(LeaseId, Cancel), CoreError> {
+    pub(crate) fn acquire(
+        &mut self,
+        args: AcquireArgs,
+        now: Instant,
+    ) -> Result<(LeaseId, Cancel), CoreError> {
         if !args.view_retained {
-            return Err(CoreError::new(ErrorCode::EStale, "lease view is unknown or pruned"));
+            return Err(CoreError::new(
+                ErrorCode::EStale,
+                "lease view is unknown or pruned",
+            ));
         }
-        let charge = binding_bytes(args.position_bytes, args.roots.len())
-            .and_then(|bytes| self.books.reserve(bytes).map_err(|refused| {
-                CoreError::new(ErrorCode::ELimit, format!("lease budget refused: {refused}"))
-            }))?;
+        let charge = binding_bytes(args.position_bytes, args.roots.len()).and_then(|bytes| {
+            self.books.reserve(bytes).map_err(|refused| {
+                CoreError::new(
+                    ErrorCode::ELimit,
+                    format!("lease budget refused: {refused}"),
+                )
+            })
+        })?;
         let id = LeaseId::generate();
         let (authority, observer) = cancellation();
         let entry = LeaseEntry {
@@ -198,16 +209,16 @@ impl LeaseTable {
 
     /// Looks up the entry or reports lease loss without revealing anything else.
     fn entry(&self, lease: &LeaseId) -> Result<&LeaseEntry, CoreError> {
-        self.entries.get(lease).ok_or_else(|| {
-            CoreError::new(ErrorCode::ELeaseLost, "lease is unknown or retired")
-        })
+        self.entries
+            .get(lease)
+            .ok_or_else(|| CoreError::new(ErrorCode::ELeaseLost, "lease is unknown or retired"))
     }
 
     /// Mutable lookup with the same lease-loss contract.
     fn entry_mut(&mut self, lease: &LeaseId) -> Result<&mut LeaseEntry, CoreError> {
-        self.entries.get_mut(lease).ok_or_else(|| {
-            CoreError::new(ErrorCode::ELeaseLost, "lease is unknown or retired")
-        })
+        self.entries
+            .get_mut(lease)
+            .ok_or_else(|| CoreError::new(ErrorCode::ELeaseLost, "lease is unknown or retired"))
     }
 
     /// Verifies cursor binding: every field must match the issuing lease.
@@ -231,7 +242,10 @@ impl LeaseTable {
             ));
         }
         if entry.expired || !entry.authority_at(now).is_live() {
-            return Err(CoreError::new(ErrorCode::ELeaseLost, "lease authority expired"));
+            return Err(CoreError::new(
+                ErrorCode::ELeaseLost,
+                "lease authority expired",
+            ));
         }
         Ok(LeaseBinding {
             lease: cursor.lease,
@@ -254,13 +268,19 @@ impl LeaseTable {
         // report is itself the renewal, re-arming the interval it satisfies.
         // Heartbeats stamp nothing and can never extend any deadline.
         if entry.expired {
-            return Err(CoreError::new(ErrorCode::ELeaseLost, "lease authority expired"));
+            return Err(CoreError::new(
+                ErrorCode::ELeaseLost,
+                "lease authority expired",
+            ));
         }
         if entry.kind == LeaseKind::Bulk && progress == BulkProgress::AdmittedWork {
             entry.progress = now;
         }
         if !entry.authority_at(now).is_live() {
-            return Err(CoreError::new(ErrorCode::ELeaseLost, "lease authority expired"));
+            return Err(CoreError::new(
+                ErrorCode::ELeaseLost,
+                "lease authority expired",
+            ));
         }
         Ok(())
     }
@@ -295,20 +315,25 @@ impl LeaseTable {
         // authority check: the page is itself the renewal. Streaming owners
         // stay alive without a separate progress call.
         if entry.expired {
-            return Err(CoreError::new(ErrorCode::ELeaseLost, "lease authority expired"));
+            return Err(CoreError::new(
+                ErrorCode::ELeaseLost,
+                "lease authority expired",
+            ));
         }
         if entry.kind == LeaseKind::Bulk {
             entry.progress = now;
         }
         if !entry.authority_at(now).is_live() {
-
-            return Err(CoreError::new(ErrorCode::ELeaseLost, "lease authority expired"));
+            return Err(CoreError::new(
+                ErrorCode::ELeaseLost,
+                "lease authority expired",
+            ));
         }
         let position = u64::try_from(position_len)
             .map_err(|_| CoreError::new(ErrorCode::ECapacity, "position size overflows u64"))?;
-        let cost = bytes.checked_add(position).ok_or_else(|| {
-            CoreError::new(ErrorCode::ECapacity, "page charge overflows u64")
-        })?;
+        let cost = bytes
+            .checked_add(position)
+            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "page charge overflows u64"))?;
         // Disjoint-field borrow: the entry must stay mutable below while the
         // page charge reserves against the table books.
         let books = &self.books;
@@ -374,7 +399,9 @@ impl LeaseTable {
     /// Whether `lease` currently holds owner protection.
     #[must_use]
     pub(crate) fn owner_live(&self, lease: &LeaseId) -> bool {
-        self.entries.get(lease).is_some_and(|entry| entry.owner_live)
+        self.entries
+            .get(lease)
+            .is_some_and(|entry| entry.owner_live)
     }
 
     /// Copied rows and bytes recorded for `lease`.
@@ -386,7 +413,10 @@ impl LeaseTable {
     /// Minimum retained-operation floor over live leases for pruning.
     #[must_use]
     pub(crate) fn min_lease_floor(&self) -> Option<OperationId> {
-        self.entries.values().filter_map(|entry| entry.op_floor).min_by_key(|id| id.0)
+        self.entries
+            .values()
+            .filter_map(|entry| entry.op_floor)
+            .min_by_key(|id| id.0)
     }
 }
 
@@ -430,7 +460,9 @@ mod tests {
         let books = books();
         let mut table = LeaseTable::new(&books);
         let now = Instant::now();
-        let (id, _cancel) = table.acquire(args(LeaseKind::Interactive), now).expect("acquire");
+        let (id, _cancel) = table
+            .acquire(args(LeaseKind::Interactive), now)
+            .expect("acquire");
         assert!(table.owner_live(&id));
         let cursor = PageCursor {
             store: StoreId::from_bytes([1; 16]),
@@ -445,10 +477,14 @@ mod tests {
             view: OperationId(7),
             query: QueryDigest::from_bytes([3; 32]),
         };
-        let err = table.check_cursor(&cursor, &want, now).expect_err("wrong session");
+        let err = table
+            .check_cursor(&cursor, &want, now)
+            .expect_err("wrong session");
         assert_eq!(err.code, ErrorCode::EForbidden);
         want.session = SessionId::from_bytes([2; 16]);
-        let binding = table.check_cursor(&cursor, &want, now).expect("correct binding");
+        let binding = table
+            .check_cursor(&cursor, &want, now)
+            .expect("correct binding");
         assert_eq!(binding.lease, id);
         assert_eq!(binding.kind, LeaseKind::Interactive);
     }
@@ -458,10 +494,15 @@ mod tests {
         let books = books();
         let mut table = LeaseTable::new(&books);
         let now = Instant::now();
-        let (id, cancel) = table.acquire(args(LeaseKind::Interactive), now).expect("acquire");
+        let (id, cancel) = table
+            .acquire(args(LeaseKind::Interactive), now)
+            .expect("acquire");
         let late = now + timing::INTERACTIVE_TTL;
         table.sweep_expiry(late);
-        assert_eq!(cancel.check().expect_err("cancelled").code, ErrorCode::ECancelled);
+        assert_eq!(
+            cancel.check().expect_err("cancelled").code,
+            ErrorCode::ECancelled
+        );
         // Owner still holds protection: the slot survives the sweep.
         assert_eq!(table.len(), 1);
         table.release_owner(&id);
@@ -477,7 +518,9 @@ mod tests {
         let mut table = LeaseTable::new(&books);
         let mut bare = args(LeaseKind::Interactive);
         bare.position_bytes = 0;
-        let err = table.acquire(bare, Instant::now()).expect_err("floor refuses");
+        let err = table
+            .acquire(bare, Instant::now())
+            .expect_err("floor refuses");
         assert_eq!(err.code, ErrorCode::ELimit);
         assert_eq!(table.len(), 0);
     }
@@ -497,7 +540,9 @@ mod tests {
         let mut step = timing::BULK_INTERVAL - Duration::from_secs(60);
         while at < now + timing::BULK_TOTAL - Duration::from_secs(60) {
             at += step;
-            table.account_page(&id, 1, 64, 0, at).expect("page keeps alive");
+            table
+                .account_page(&id, 1, 64, 0, at)
+                .expect("page keeps alive");
             step = timing::BULK_NO_PROGRESS - Duration::from_secs(5);
         }
         let err = table
@@ -514,7 +559,9 @@ mod tests {
         let (id, _cancel) = table.acquire(args(LeaseKind::Bulk), now).expect("acquire");
         let edge = now + timing::BULK_INTERVAL;
         // Heartbeat at the edge cannot save the interval.
-        let err = table.report_progress(&id, BulkProgress::Heartbeat, edge).expect_err("lapsed");
+        let err = table
+            .report_progress(&id, BulkProgress::Heartbeat, edge)
+            .expect_err("lapsed");
         assert_eq!(err.code, ErrorCode::ELeaseLost);
     }
 }

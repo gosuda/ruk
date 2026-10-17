@@ -77,8 +77,7 @@ fn collect(
         let Some(record) = tree.get(node) else {
             return;
         };
-        let start =
-            attach_leading_trivia(tree, source, node, rules.comment_kinds, &[]).min(floor);
+        let start = attach_leading_trivia(tree, source, node, rules.comment_kinds, &[]).min(floor);
         if offset(start).is_none() || offset(record.end).is_none() || start > record.end {
             return;
         }
@@ -115,7 +114,17 @@ fn collect(
         floor
     };
     for child in tree.named_children(node) {
-        collect(tree, source, child, rules, language, parents, out, depth + 1, floor);
+        collect(
+            tree,
+            source,
+            child,
+            rules,
+            language,
+            parents,
+            out,
+            depth + 1,
+            floor,
+        );
     }
     if pushed {
         parents.pop();
@@ -133,7 +142,17 @@ fn extract(
         return out;
     }
     let mut parents = Vec::new();
-    collect(tree, source, 0, rules, language, &mut parents, &mut out, 0, u32::MAX);
+    collect(
+        tree,
+        source,
+        0,
+        rules,
+        language,
+        &mut parents,
+        &mut out,
+        0,
+        u32::MAX,
+    );
     if let Some(boundary) = rules.boundary_kind {
         let marked = mark_ancestors(tree, boundary);
         out.retain(|unit| !marked.contains(&unit.node));
@@ -172,7 +191,12 @@ const PYTHON_RULES: ScriptRules = ScriptRules {
     name_alts: &[],
     // Parameter lists pin the declared form; decorators live inside the
     // wrapped node so they travel with the unit.
-    disc_kinds: &["parameters", "type_parameters", "return_type", "superclasses"],
+    disc_kinds: &[
+        "parameters",
+        "type_parameters",
+        "return_type",
+        "superclasses",
+    ],
     comment_kinds: &["comment"],
     boundary_kind: None,
 };
@@ -213,7 +237,12 @@ const PHP_RULES: ScriptRules = ScriptRules {
     body_kinds: &["declaration_list"],
     passthrough_kinds: &[],
     name_alts: &[],
-    disc_kinds: &["parameters", "return_type", "base_clause", "class_interface_clause"],
+    disc_kinds: &[
+        "parameters",
+        "return_type",
+        "base_clause",
+        "class_interface_clause",
+    ],
     comment_kinds: &["comment"],
     boundary_kind: Some("text"),
 };

@@ -71,7 +71,10 @@ impl GenerationRegistry {
     /// The reader is assigned epoch `u128::from(published_generation) + 1`.
     #[must_use]
     pub(crate) fn register(self: &Arc<Self>) -> GenerationGuard {
-        let mut inner = self.inner.lock().expect("generation registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("generation registry lock poisoned");
         let epoch = u128::from(inner.published_generation)
             .checked_add(1)
             .expect("reader epoch overflow u128");
@@ -85,7 +88,10 @@ impl GenerationRegistry {
 
     /// Deregisters an active reader epoch. Called by `GenerationGuard::drop`.
     fn deregister(&self, epoch: u128) {
-        let mut inner = self.inner.lock().expect("generation registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("generation registry lock poisoned");
         let Some(count) = inner.active_readers.get_mut(&epoch) else {
             panic!("deregistering unknown reader epoch {epoch}");
         };
@@ -98,7 +104,10 @@ impl GenerationRegistry {
     /// Advances the durably published generation after a successful publication commit.
     /// Readers admitted after this call register with an epoch strictly greater than `generation`.
     pub(crate) fn advance_published_generation(&self, generation: u64) {
-        let mut inner = self.inner.lock().expect("generation registry lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("generation registry lock poisoned");
         if generation > inner.published_generation {
             inner.published_generation = generation;
         }
@@ -107,7 +116,10 @@ impl GenerationRegistry {
     /// The oldest active reader epoch, or `None` if no readers are active.
     #[must_use]
     pub(crate) fn oldest_active_reader_epoch(&self) -> Option<u128> {
-        let inner = self.inner.lock().expect("generation registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .expect("generation registry lock poisoned");
         inner.active_readers.keys().next().copied()
     }
 
@@ -120,7 +132,10 @@ impl GenerationRegistry {
     /// No filesystem I/O is performed under this registry mutex.
     #[must_use]
     pub(crate) fn is_segment_retired_ready_for_unlink(&self, retired_generation: u64) -> bool {
-        let inner = self.inner.lock().expect("generation registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .expect("generation registry lock poisoned");
         match inner.active_readers.keys().next().copied() {
             Some(oldest) => oldest > u128::from(retired_generation),
             None => true,
@@ -130,14 +145,20 @@ impl GenerationRegistry {
     /// Total number of active registered readers.
     #[must_use]
     pub(crate) fn active_reader_count(&self) -> usize {
-        let inner = self.inner.lock().expect("generation registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .expect("generation registry lock poisoned");
         inner.active_readers.values().sum()
     }
 
     /// The current published generation recorded in the registry.
     #[must_use]
     pub(crate) fn published_generation(&self) -> u64 {
-        let inner = self.inner.lock().expect("generation registry lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .expect("generation registry lock poisoned");
         inner.published_generation
     }
 }
@@ -198,14 +219,14 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::ids::HashKind;
     use crate::store::metadata_tests::{raw_put_object, raw_put_segment};
     use crate::store::types::PreparedObject;
     use crate::store::{
-        encode, BudgetLimits, PreparationBudget, Store, StoreError, MAX_DELTA_DEPTH, META_FILE,
+        BudgetLimits, MAX_DELTA_DEPTH, META_FILE, PreparationBudget, Store, StoreError, encode,
     };
 
     static TEST_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -467,9 +488,7 @@ mod tests {
         };
 
         // Decode using captured snapshot
-        let decoded = committed
-            .load_snapshot(&snapshot)
-            .expect("load snapshot");
+        let decoded = committed.load_snapshot(&snapshot).expect("load snapshot");
         let mut got = Vec::new();
         decoded.view().read_to_end(&mut got).expect("read spool");
         assert_eq!(got, data);
@@ -507,7 +526,8 @@ mod tests {
             retired: true,
             generation: snapshot.links[0].manifest.generation,
         };
-        let encoded_manifest = encode("segment manifest", &retired_manifest).expect("encode manifest");
+        let encoded_manifest =
+            encode("segment manifest", &retired_manifest).expect("encode manifest");
 
         let reg = Arc::clone(store.generation_registry());
         let store_dir = dir.store_dir();
@@ -528,16 +548,17 @@ mod tests {
         };
 
         // Decode using captured snapshot: uses captured non-retired manifest!
-        let decoded = committed
-            .load_snapshot(&snapshot)
-            .expect("load snapshot");
+        let decoded = committed.load_snapshot(&snapshot).expect("load snapshot");
         let mut got = Vec::new();
         decoded.view().read_to_end(&mut got).expect("read spool");
         assert_eq!(got, data);
 
         // A new read starting after retirement sees the retired manifest and refuses as Corrupt
         let new_read = committed.read(oid);
-        assert!(matches!(new_read, Err(StoreError::Corrupt(_))), "new read must reject retired segment: {new_read:?}");
+        assert!(
+            matches!(new_read, Err(StoreError::Corrupt(_))),
+            "new read must reject retired segment: {new_read:?}"
+        );
 
         drop(guard);
     }
@@ -632,12 +653,21 @@ mod tests {
             base: None,
             generation: 1,
         };
-        let bad_non_delta_oid = HashKind::Sha1.hash_git_object("blob", b"bad-non-delta").unwrap();
-        raw_put_object(&meta_path, bad_non_delta_oid.as_bytes(), &encode("loc", &bad_non_delta).unwrap());
+        let bad_non_delta_oid = HashKind::Sha1
+            .hash_git_object("blob", b"bad-non-delta")
+            .unwrap();
+        raw_put_object(
+            &meta_path,
+            bad_non_delta_oid.as_bytes(),
+            &encode("loc", &bad_non_delta).unwrap(),
+        );
         {
             let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
             let res = meta.snapshot_object_chain(HashKind::Sha1, &bad_non_delta_oid);
-            assert!(matches!(res, Err(StoreError::Corrupt(_))), "expected corrupt for non-delta with depth 1, got {res:?}");
+            assert!(
+                matches!(res, Err(StoreError::Corrupt(_))),
+                "expected corrupt for non-delta with depth 1, got {res:?}"
+            );
         }
 
         // Case 2: Delta object with depth == 0
@@ -651,12 +681,21 @@ mod tests {
             base: Some(base_oid),
             generation: 1,
         };
-        let bad_delta_zero_oid = HashKind::Sha1.hash_git_object("blob", b"bad-delta-zero").unwrap();
-        raw_put_object(&meta_path, bad_delta_zero_oid.as_bytes(), &encode("loc", &bad_delta_zero).unwrap());
+        let bad_delta_zero_oid = HashKind::Sha1
+            .hash_git_object("blob", b"bad-delta-zero")
+            .unwrap();
+        raw_put_object(
+            &meta_path,
+            bad_delta_zero_oid.as_bytes(),
+            &encode("loc", &bad_delta_zero).unwrap(),
+        );
         {
             let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
             let res = meta.snapshot_object_chain(HashKind::Sha1, &bad_delta_zero_oid);
-            assert!(matches!(res, Err(StoreError::Corrupt(_))), "expected corrupt for delta with depth 0, got {res:?}");
+            assert!(
+                matches!(res, Err(StoreError::Corrupt(_))),
+                "expected corrupt for delta with depth 0, got {res:?}"
+            );
         }
 
         // Case 3: Delta object with depth > MAX_DELTA_DEPTH
@@ -670,16 +709,27 @@ mod tests {
             base: Some(base_oid),
             generation: 1,
         };
-        let bad_depth_oid = HashKind::Sha1.hash_git_object("blob", b"bad-depth").unwrap();
-        raw_put_object(&meta_path, bad_depth_oid.as_bytes(), &encode("loc", &bad_depth).unwrap());
+        let bad_depth_oid = HashKind::Sha1
+            .hash_git_object("blob", b"bad-depth")
+            .unwrap();
+        raw_put_object(
+            &meta_path,
+            bad_depth_oid.as_bytes(),
+            &encode("loc", &bad_depth).unwrap(),
+        );
         {
             let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
             let res = meta.snapshot_object_chain(HashKind::Sha1, &bad_depth_oid);
-            assert!(matches!(res, Err(StoreError::Corrupt(_))), "expected corrupt for depth > MAX, got {res:?}");
+            assert!(
+                matches!(res, Err(StoreError::Corrupt(_))),
+                "expected corrupt for depth > MAX, got {res:?}"
+            );
         }
 
         // Case 4: Delta object referencing missing base
-        let missing_base_oid = HashKind::Sha1.hash_git_object("blob", b"missing-base").unwrap();
+        let missing_base_oid = HashKind::Sha1
+            .hash_git_object("blob", b"missing-base")
+            .unwrap();
         let bad_missing_base = ObjectLocation {
             segment: 0,
             offset: 0,
@@ -690,12 +740,21 @@ mod tests {
             base: Some(missing_base_oid),
             generation: 1,
         };
-        let bad_missing_base_oid = HashKind::Sha1.hash_git_object("blob", b"bad-missing-base").unwrap();
-        raw_put_object(&meta_path, bad_missing_base_oid.as_bytes(), &encode("loc", &bad_missing_base).unwrap());
+        let bad_missing_base_oid = HashKind::Sha1
+            .hash_git_object("blob", b"bad-missing-base")
+            .unwrap();
+        raw_put_object(
+            &meta_path,
+            bad_missing_base_oid.as_bytes(),
+            &encode("loc", &bad_missing_base).unwrap(),
+        );
         {
             let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
             let res = meta.snapshot_object_chain(HashKind::Sha1, &bad_missing_base_oid);
-            assert!(matches!(res, Err(StoreError::Corrupt(_))), "expected corrupt for missing base, got {res:?}");
+            assert!(
+                matches!(res, Err(StoreError::Corrupt(_))),
+                "expected corrupt for missing base, got {res:?}"
+            );
         }
 
         // Case 5: Base depth disagreeing with child depth (base depth is 0, child claims depth 2)
@@ -709,12 +768,21 @@ mod tests {
             base: Some(base_oid),
             generation: 1,
         };
-        let bad_mismatch_oid = HashKind::Sha1.hash_git_object("blob", b"bad-mismatch").unwrap();
-        raw_put_object(&meta_path, bad_mismatch_oid.as_bytes(), &encode("loc", &bad_depth_mismatch).unwrap());
+        let bad_mismatch_oid = HashKind::Sha1
+            .hash_git_object("blob", b"bad-mismatch")
+            .unwrap();
+        raw_put_object(
+            &meta_path,
+            bad_mismatch_oid.as_bytes(),
+            &encode("loc", &bad_depth_mismatch).unwrap(),
+        );
         {
             let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
             let res = meta.snapshot_object_chain(HashKind::Sha1, &bad_mismatch_oid);
-            assert!(matches!(res, Err(StoreError::Corrupt(_))), "expected corrupt for base depth mismatch, got {res:?}");
+            assert!(
+                matches!(res, Err(StoreError::Corrupt(_))),
+                "expected corrupt for base depth mismatch, got {res:?}"
+            );
         }
     }
 }

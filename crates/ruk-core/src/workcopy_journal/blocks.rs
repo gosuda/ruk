@@ -20,7 +20,11 @@ use super::journal::{self, ApplyJournal};
 pub(crate) struct JournalReader;
 
 impl JournalState for JournalReader {
-    fn observe(&self, store: &Store, workspace: WorkspaceId) -> Result<ApplyObservation, CoreError> {
+    fn observe(
+        &self,
+        store: &Store,
+        workspace: WorkspaceId,
+    ) -> Result<ApplyObservation, CoreError> {
         let loaded = journal::load(store, workspace)?;
         let phase = if loaded.is_some() {
             ApplyPhase::Applying

@@ -73,7 +73,9 @@ impl<W: Write> Write for Sink<W> {
         if let Some(done) = buf.get(..written) {
             self.hasher.update(done);
         }
-        self.offset = self.offset.saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        self.offset = self
+            .offset
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
         Ok(written)
     }
 
@@ -150,7 +152,12 @@ impl<W: Write> PackWriter<W> {
     /// # Errors
     /// [`GitError::Invalid`] for a conflict record, a wrong-width id, or more
     /// entries than declared; [`GitError::Io`] for write failures.
-    pub fn append(&mut self, oid: Oid, kind: ObjectKind, data: &[u8]) -> Result<PackedEntry, GitError> {
+    pub fn append(
+        &mut self,
+        oid: Oid,
+        kind: ObjectKind,
+        data: &[u8],
+    ) -> Result<PackedEntry, GitError> {
         self.append_stream(oid, kind, to_u64(data.len()), data)
     }
 
@@ -173,7 +180,9 @@ impl<W: Write> PackWriter<W> {
             sink: &mut self.sink,
             crc: Crc::new(),
         };
-        entry.write_all(&entry_header(type_code, len)).map_err(io_error)?;
+        entry
+            .write_all(&entry_header(type_code, len))
+            .map_err(io_error)?;
         let mut encoder = ZlibEncoder::new(entry, Compression::default());
         let copied = copy_exact(reader, &mut encoder, len)?;
         if copied != len {
@@ -196,7 +205,12 @@ impl<W: Write> PackWriter<W> {
     ///
     /// # Errors
     /// As [`Self::append`].
-    pub fn append_ref_delta(&mut self, oid: Oid, base: Oid, delta: &[u8]) -> Result<PackedEntry, GitError> {
+    pub fn append_ref_delta(
+        &mut self,
+        oid: Oid,
+        base: Oid,
+        delta: &[u8],
+    ) -> Result<PackedEntry, GitError> {
         self.admit(oid)?;
         crate::require_kind(base, self.kind)?;
         let offset = self.sink.offset;
@@ -235,7 +249,10 @@ impl<W: Write> PackWriter<W> {
         } = self;
         if to_u64(entries.len()) != u64::from(declared) {
             return Err(GitError::Invalid {
-                detail: format!("pack declared {declared} entries, {} written", entries.len()),
+                detail: format!(
+                    "pack declared {declared} entries, {} written",
+                    entries.len()
+                ),
             });
         }
         let checksum = seal(sink)?;
@@ -285,7 +302,8 @@ fn copy_exact(reader: impl Read, out: &mut impl Write, limit: u64) -> Result<u64
         if total > limit {
             return Ok(total);
         }
-        out.write_all(buf.get(..read).unwrap_or_default()).map_err(io_error)?;
+        out.write_all(buf.get(..read).unwrap_or_default())
+            .map_err(io_error)?;
     }
 }
 
@@ -342,7 +360,9 @@ pub fn write_idx_v2(
         writer.write_all(entry.oid.as_bytes()).map_err(io_error)?;
     }
     for entry in entries.iter() {
-        writer.write_all(&entry.crc32.to_be_bytes()).map_err(io_error)?;
+        writer
+            .write_all(&entry.crc32.to_be_bytes())
+            .map_err(io_error)?;
     }
     let mut large = Vec::new();
     for entry in entries.iter() {
@@ -360,7 +380,9 @@ pub fn write_idx_v2(
     for offset in large {
         writer.write_all(&offset.to_be_bytes()).map_err(io_error)?;
     }
-    writer.write_all(pack_checksum.as_bytes()).map_err(io_error)?;
+    writer
+        .write_all(pack_checksum.as_bytes())
+        .map_err(io_error)?;
     writer.flush().map_err(io_error)?;
     drop(writer);
     seal(sink)
@@ -392,9 +414,12 @@ pub fn pack_name(kind: HashKind, sorted: &[Oid]) -> Result<Oid, GitError> {
 }
 
 fn finish_hash(hasher: gix_hash::Hasher) -> Result<Oid, GitError> {
-    hasher.try_finalize().map(Oid::from).map_err(|err| GitError::Corrupt {
-        detail: format!("hash refused: {err}"),
-    })
+    hasher
+        .try_finalize()
+        .map(Oid::from)
+        .map_err(|err| GitError::Corrupt {
+            detail: format!("hash refused: {err}"),
+        })
 }
 
 pub(crate) fn io_error(err: io::Error) -> GitError {
@@ -471,8 +496,16 @@ mod tests {
         let b = kind.hash_git_object("blob", b"b").unwrap();
         let pack = kind.hash_git_object("blob", b"pack").unwrap();
         let mut entries = vec![
-            PackedEntry { oid: a, offset: 12, crc32: 1 },
-            PackedEntry { oid: b, offset: 0x1_0000_0000, crc32: 2 },
+            PackedEntry {
+                oid: a,
+                offset: 12,
+                crc32: 1,
+            },
+            PackedEntry {
+                oid: b,
+                offset: 0x1_0000_0000,
+                crc32: 2,
+            },
         ];
         let mut idx = Vec::new();
         write_idx_v2(&mut entries, pack, kind, &mut idx).unwrap();
@@ -491,8 +524,16 @@ mod tests {
         let kind = HashKind::Sha1;
         let a = kind.hash_git_object("blob", b"a").unwrap();
         let mut entries = vec![
-            PackedEntry { oid: a, offset: 12, crc32: 1 },
-            PackedEntry { oid: a, offset: 40, crc32: 2 },
+            PackedEntry {
+                oid: a,
+                offset: 12,
+                crc32: 1,
+            },
+            PackedEntry {
+                oid: a,
+                offset: 40,
+                crc32: 2,
+            },
         ];
         assert!(matches!(
             write_idx_v2(&mut entries, a, kind, Vec::new()),

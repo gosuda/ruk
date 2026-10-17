@@ -35,9 +35,7 @@ use super::endpoint::{self, Outgoing};
 use super::handshake;
 use super::lock::LockBody;
 use super::transport;
-use crate::protocol::{
-    ReplyBody, ReplyEnvelope, RequestEnvelope, decode_reply, encode_request,
-};
+use crate::protocol::{ReplyBody, ReplyEnvelope, RequestEnvelope, decode_reply, encode_request};
 use crate::{CoreError, ErrorCode, StoreId};
 
 /// A connected, authenticated coordinator client.
@@ -74,7 +72,8 @@ impl Client {
             ));
         }
 
-        let mut stream = match timeout_at(attempt_deadline, endpoint::connect(&body.address)).await {
+        let mut stream = match timeout_at(attempt_deadline, endpoint::connect(&body.address)).await
+        {
             Ok(result) => result?,
             Err(_) => {
                 return Err(CoreError::new(
@@ -235,12 +234,12 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
+    use crate::MAX_CONTROL_FRAME_BYTES;
     use crate::change::RequestId;
     use crate::protocol::{
-        ErrorReply, Method, MethodDescriptor, MethodKind, Mutation, OpPruneArgs,
-        Reply, Request, SchemaArgs, SchemaReply, SchemaVersion, SessionOpenArgs,
+        ErrorReply, Method, MethodDescriptor, MethodKind, Mutation, OpPruneArgs, Reply, Request,
+        SchemaArgs, SchemaReply, SchemaVersion, SessionOpenArgs,
     };
-    use crate::MAX_CONTROL_FRAME_BYTES;
 
     fn runtime() -> tokio::runtime::Runtime {
         Builder::new_current_thread()
@@ -309,9 +308,10 @@ mod tests {
                 let req_len = transport::read_length(&mut server_stream, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_stream, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_stream, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 // Encode response.
                 let reply_env = schema_reply();
@@ -320,9 +320,15 @@ mod tests {
                 // Write 4-byte prefix in 2 separate writes.
                 let len_u32 = u32::try_from(reply_bytes.len()).expect("fits u32");
                 let len_bytes = len_u32.to_be_bytes();
-                server_stream.write_all(&len_bytes[..1]).await.expect("write len 1");
+                server_stream
+                    .write_all(&len_bytes[..1])
+                    .await
+                    .expect("write len 1");
                 tokio::task::yield_now().await;
-                server_stream.write_all(&len_bytes[1..]).await.expect("write len 2");
+                server_stream
+                    .write_all(&len_bytes[1..])
+                    .await
+                    .expect("write len 2");
                 tokio::task::yield_now().await;
 
                 // Write body in small fragments (e.g. 15 bytes each).
@@ -360,14 +366,18 @@ mod tests {
                 let req_len = transport::read_length(&mut server_stream, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_stream, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_stream, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 // Send advertised length > MAX_CONTROL_FRAME_BYTES.
                 let max_u32 = u32::try_from(MAX_CONTROL_FRAME_BYTES).expect("fits u32");
                 let oversized_len = max_u32 + 1;
-                server_stream.write_all(&oversized_len.to_be_bytes()).await.expect("write prefix");
+                server_stream
+                    .write_all(&oversized_len.to_be_bytes())
+                    .await
+                    .expect("write prefix");
                 // Intentionally do NOT send body bytes.
             });
 
@@ -379,7 +389,10 @@ mod tests {
             server_task.await.expect("server task finishes");
 
             assert_eq!(err.code, ErrorCode::ELimit);
-            assert!(client_slot.is_none(), "stream must be taken and dropped on error");
+            assert!(
+                client_slot.is_none(),
+                "stream must be taken and dropped on error"
+            );
         });
     }
 
@@ -396,9 +409,10 @@ mod tests {
                 let req_len = transport::read_length(&mut server_stream, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_stream, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_stream, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 // Return a failure reply with the WRONG request_id.
                 let err_reply = ErrorReply {
@@ -424,7 +438,10 @@ mod tests {
 
             assert_eq!(err.code, ErrorCode::EInvalid);
             assert!(err.message.contains("request_id mismatch"));
-            assert!(client_slot.is_none(), "connection must be closed on correlation failure");
+            assert!(
+                client_slot.is_none(),
+                "connection must be closed on correlation failure"
+            );
         });
     }
 
@@ -438,9 +455,10 @@ mod tests {
                 let req_len = transport::read_length(&mut server_stream, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_stream, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_stream, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 // Client asked for session.open; server answers with Schema success reply!
                 let reply_env = schema_reply();
@@ -459,7 +477,10 @@ mod tests {
 
             assert_eq!(err.code, ErrorCode::EInvalid);
             assert!(err.message.contains("method mismatch"));
-            assert!(client_slot.is_none(), "connection must be closed on method mismatch");
+            assert!(
+                client_slot.is_none(),
+                "connection must be closed on method mismatch"
+            );
         });
     }
 
@@ -475,9 +496,10 @@ mod tests {
                 let req_len = transport::read_length(&mut server_stream, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_stream, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_stream, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 // Legitimate typed failure reply with MATCHING request_id.
                 let err_reply = ErrorReply {
@@ -509,7 +531,10 @@ mod tests {
                 }
                 ReplyBody::Success(_) => panic!("expected Failure reply"),
             }
-            assert!(client_slot.is_some(), "stream must be restored on valid failure response");
+            assert!(
+                client_slot.is_some(),
+                "stream must be restored on valid failure response"
+            );
         });
     }
 
@@ -524,9 +549,10 @@ mod tests {
                 let req_len = transport::read_length(&mut server_stream, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_stream, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_stream, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 // Stall until cancelled.
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -539,7 +565,10 @@ mod tests {
                 .expect_err("stalled peer must hit absolute deadline");
 
             assert_eq!(err.code, ErrorCode::ECoordinatorUnresponsive);
-            assert!(client_slot.is_none(), "stream must be dropped on deadline expiry");
+            assert!(
+                client_slot.is_none(),
+                "stream must be dropped on deadline expiry"
+            );
 
             server_task.abort();
         });
@@ -558,7 +587,10 @@ mod tests {
                 .expect_err("already expired deadline must fail immediately");
 
             assert_eq!(err.code, ErrorCode::ECoordinatorUnresponsive);
-            assert!(client_slot.is_none(), "stream must be taken and dropped, leaving stream unusable");
+            assert!(
+                client_slot.is_none(),
+                "stream must be taken and dropped, leaving stream unusable"
+            );
 
             // Subsequent exchange fails immediately because connection is closed.
             let err2 = exchange(&mut client_slot, &req, generous_deadline())
@@ -578,22 +610,30 @@ mod tests {
                 let req_len = transport::read_length(&mut server_stream, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_stream, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_stream, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 // Sleep to ensure client cancels while waiting for response.
                 tokio::time::sleep(Duration::from_millis(200)).await;
             });
 
             let req = schema_request();
-            assert!(tokio::time::timeout(
-                Duration::from_millis(20),
-                exchange(&mut client_slot, &req, generous_deadline()),
-            ).await.is_err());
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    exchange(&mut client_slot, &req, generous_deadline()),
+                )
+                .await
+                .is_err()
+            );
 
             // Stream must NOT be restored after mid-frame cancellation.
-            assert!(client_slot.is_none(), "canceled exchange must not leave a reusable stream");
+            assert!(
+                client_slot.is_none(),
+                "canceled exchange must not leave a reusable stream"
+            );
 
             // Attempting to reuse the stream fails immediately.
             let err = exchange(&mut client_slot, &req, generous_deadline())
@@ -609,7 +649,8 @@ mod tests {
     #[test]
     fn unix_socket_pair_real_stream_exchange() {
         runtime().block_on(async {
-            let (client_sock, mut server_sock) = tokio::net::UnixStream::pair().expect("unix socket pair");
+            let (client_sock, mut server_sock) =
+                tokio::net::UnixStream::pair().expect("unix socket pair");
             let mut client = Client::from_stream(fixture_store(), client_sock);
             assert!(client.is_connected());
 
@@ -617,9 +658,10 @@ mod tests {
                 let req_len = transport::read_length(&mut server_sock, generous_deadline())
                     .await
                     .expect("server read req len");
-                let _req_body = transport::read_body(&mut server_sock, req_len, generous_deadline())
-                    .await
-                    .expect("server read req body");
+                let _req_body =
+                    transport::read_body(&mut server_sock, req_len, generous_deadline())
+                        .await
+                        .expect("server read req body");
 
                 let reply_env = schema_reply();
                 let reply_bytes = crate::protocol::encode_reply(&reply_env).expect("encode reply");
@@ -638,14 +680,24 @@ mod tests {
             let _held_server = server_task.await.expect("server task completes");
 
             assert_eq!(result.schema_version, SchemaVersion::current());
-            assert!(client.is_connected(), "client must remain connected after success");
+            assert!(
+                client.is_connected(),
+                "client must remain connected after success"
+            );
 
-            assert!(tokio::time::timeout(
-                Duration::from_millis(20),
-                client.request(&req, generous_deadline()),
-            ).await.is_err());
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    client.request(&req, generous_deadline()),
+                )
+                .await
+                .is_err()
+            );
 
-            assert!(!client.is_connected(), "client must be disconnected after cancellation");
+            assert!(
+                !client.is_connected(),
+                "client must be disconnected after cancellation"
+            );
             let err = client
                 .request(&req, generous_deadline())
                 .await
@@ -659,7 +711,9 @@ mod tests {
         runtime().block_on(async {
             let lock_body = LockBody {
                 pid: 1234,
-                address: crate::coord::lock::EndpointAddress::Unix(std::path::PathBuf::from("/tmp/nonexistent")),
+                address: crate::coord::lock::EndpointAddress::Unix(std::path::PathBuf::from(
+                    "/tmp/nonexistent",
+                )),
                 nonce: crate::coord::lock::EndpointNonce::generate().expect("nonce"),
             };
             let expired = Instant::now() - Duration::from_millis(100);

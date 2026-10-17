@@ -33,19 +33,16 @@ pub mod vue_ffi;
 pub use adapters::{Adapter, Decline, DeclineReason, SourceUnit, UnitKey, adapter_for};
 pub use alignment::merge_triplet;
 pub use grammar::{
-    Cancel, Grammar, GrammarPin, GrammarRegistry, Language, ParsedNode, ParsedTree,
-    SyntaxError, dispatch, manifest_digest, manifest_digest_input, sha256_hex,
-    LANGUAGE_SET_VERSION,
-    MAX_TRIPLET_BYTES,
+    Cancel, Grammar, GrammarPin, GrammarRegistry, LANGUAGE_SET_VERSION, Language,
+    MAX_TRIPLET_BYTES, ParsedNode, ParsedTree, SyntaxError, dispatch, manifest_digest,
+    manifest_digest_input, sha256_hex,
 };
 pub use treesitter::{TsGrammar, registry_providers};
 
 use serde::{Deserialize, Serialize};
 
 use crate::ByteString;
-use crate::merge::composed::{
-    MergeNotice, MergeNotices, NoticeCollector, NoticeRegion,
-};
+use crate::merge::composed::{MergeNotice, MergeNotices, NoticeCollector, NoticeRegion};
 
 /// One bounded source triplet to merge, with its validated language.
 #[derive(Debug)]

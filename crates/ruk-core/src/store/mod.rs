@@ -63,8 +63,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use error::StoreError;
 pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
-pub(crate) use metadata::{decode, encode, MAX_FACT_ROW_BYTES};
 pub use metadata::{FactPage, FactPageBudget, FactRow};
+pub(crate) use metadata::{MAX_FACT_ROW_BYTES, decode, encode};
 pub use spool::{BudgetLimits, PreparationBudget, Spool};
 pub use types::{
     Encoding, FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
@@ -331,7 +331,9 @@ impl Store {
                 return Err(err);
             }
         };
-        Ok(Self::assemble(root, format, meta, budget, guards, recovered))
+        Ok(Self::assemble(
+            root, format, meta, budget, guards, recovered,
+        ))
     }
 
     fn assemble(
@@ -404,7 +406,8 @@ impl Store {
     /// No filesystem I/O is performed under this registry mutex.
     #[must_use]
     pub(crate) fn is_segment_retired_ready_for_unlink(&self, retired_generation: u64) -> bool {
-        self.guards.is_segment_retired_ready_for_unlink(retired_generation)
+        self.guards
+            .is_segment_retired_ready_for_unlink(retired_generation)
     }
 
     /// Accessor for the store's generation registry.
@@ -513,9 +516,11 @@ impl Store {
         self.refuse_if_quarantined()?;
         self.io.locator_lookups.fetch_add(1, Ordering::Relaxed);
         self.committed().check_width(oid)?;
-        self.observe(self.meta.get_object(&oid).map(|location| {
-            location.map(|location| location.decoded_len)
-        }))
+        self.observe(
+            self.meta
+                .get_object(&oid)
+                .map(|location| location.map(|location| location.decoded_len)),
+        )
     }
 
     /// Decodes a prepared, not yet committed object and verifies its

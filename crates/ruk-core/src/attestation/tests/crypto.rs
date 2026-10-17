@@ -8,11 +8,13 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey, SshSig};
 use crate::attestation::{ATTEST_NAMESPACE, verify_statement};
 use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
-use crate::protocol::{AttestAddArgs, AttestSignature, AttestStatement, StatementDigest, Timestamp};
+use crate::protocol::{
+    AttestAddArgs, AttestSignature, AttestStatement, StatementDigest, Timestamp,
+};
 
 use super::fixtures::{
-    SshSigParts, armor, ecdsa_key_blob, ed25519_key_blob, independent_fingerprint, key,
-    kind, named_signature_blob, oid, public_bytes, result, rsa_key_blob, sign, sign_for,
+    SshSigParts, armor, ecdsa_key_blob, ed25519_key_blob, independent_fingerprint, key, kind,
+    named_signature_blob, oid, public_bytes, result, rsa_key_blob, sign, sign_for,
     sk_ed25519_key_blob, sshsig_binary, statement,
 };
 
@@ -222,7 +224,11 @@ fn non_ed25519_key_types_are_policy_refusals() {
     let statement = review_pass();
     let (_, signature_blob) = genuine_blobs(&signer, &statement);
     let public = public_bytes(&signer);
-    for key_blob in [rsa_key_blob(), ecdsa_key_blob(), sk_ed25519_key_blob(&public)] {
+    for key_blob in [
+        rsa_key_blob(),
+        ecdsa_key_blob(),
+        sk_ed25519_key_blob(&public),
+    ] {
         let args = assemble(
             &statement,
             &key_blob,

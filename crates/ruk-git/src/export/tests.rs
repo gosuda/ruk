@@ -12,14 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ruk_core::ByteString;
+use ruk_core::OperationId;
 use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
-use ruk_core::refs::{ReflogKey, ReflogRecord, prepare_append_reflog, prepare_checked_transaction};
 use ruk_core::refs::prepare_set_ref_conflict;
+use ruk_core::refs::{ReflogKey, ReflogRecord, prepare_append_reflog, prepare_checked_transaction};
 use ruk_core::store::{ObjectKind, PreparationBudget, Store};
 use ruk_core::workspace::HeadRef;
-use ruk_core::OperationId;
 
 use super::{ExportReport, ExportRequest, export_repository};
 use crate::GitError;
@@ -123,14 +123,27 @@ fn tree_bytes(entries: &[(&str, u32, Oid)]) -> Vec<u8> {
 
 fn chain(store: &Store) -> Chain {
     let blob = put(store, ObjectKind::Blob, b"hello\n");
-    let tree = put(store, ObjectKind::Tree, &tree_bytes(&[("hello.txt", 0o100644, blob)]));
-    let commit = put(store, ObjectKind::Commit, &commit_bytes(tree, &[], b"init\n"));
+    let tree = put(
+        store,
+        ObjectKind::Tree,
+        &tree_bytes(&[("hello.txt", 0o100644, blob)]),
+    );
+    let commit = put(
+        store,
+        ObjectKind::Commit,
+        &commit_bytes(tree, &[], b"init\n"),
+    );
     let mut tag = Vec::new();
     tag.extend_from_slice(b"object ");
     tag.extend_from_slice(commit.to_hex().as_bytes());
     tag.extend_from_slice(b"\ntype commit\ntag v1\ntagger a <a@example.com> 1 +0000\n\nrelease\n");
     let tag = put(store, ObjectKind::Tag, &tag);
-    Chain { blob, tree, commit, tag }
+    Chain {
+        blob,
+        tree,
+        commit,
+        tag,
+    }
 }
 
 fn gix_kind(kind: HashKind) -> gix_hash::Kind {
@@ -241,10 +254,15 @@ fn conflicted_bookmark_is_named_never_exported() {
     let store = test_store(&scratch, "store", HashKind::Sha1);
     let built = chain(&store);
     // A second commit reachable only from the conflicted ref.
-    let other = put(&store, ObjectKind::Commit, &commit_bytes(built.tree, &[], b"other\n"));
+    let other = put(
+        &store,
+        ObjectKind::Commit,
+        &commit_bytes(built.tree, &[], b"other\n"),
+    );
     set_ref(&store, "refs/heads/main", RefTarget::Direct(built.commit));
     set_ref(&store, "refs/heads/conflicted", RefTarget::Direct(other));
-    let conflict = ruk_core::merge::Merge::from_removes_adds([Some(other)], [Some(other), Some(built.commit)]);
+    let conflict =
+        ruk_core::merge::Merge::from_removes_adds([Some(other)], [Some(other), Some(built.commit)]);
     let name = RefName::new(b"refs/heads/conflicted" as &[u8]).unwrap();
     let mutation = prepare_set_ref_conflict(&store, &name, &conflict).unwrap();
     store.publish(Vec::new(), &[mutation]).unwrap();
@@ -276,7 +294,11 @@ fn conflicted_bookmark_is_named_never_exported() {
     )
     .unwrap();
     assert!(index.lookup(gix_hash::ObjectId::from(other)).is_none());
-    assert!(index.lookup(gix_hash::ObjectId::from(built.commit)).is_some());
+    assert!(
+        index
+            .lookup(gix_hash::ObjectId::from(built.commit))
+            .is_some()
+    );
 }
 
 #[test]
@@ -303,7 +325,10 @@ fn native_record_root_is_named_not_rendered() {
         .filter(|u| u.name.as_bytes() == b"refs/heads/native")
         .collect();
     assert_eq!(named.len(), 1);
-    assert_eq!(named[0].reason, super::report::UnexportedReason::NativeRecord);
+    assert_eq!(
+        named[0].reason,
+        super::report::UnexportedReason::NativeRecord
+    );
     assert_eq!(named[0].oid, Some(native));
     let index = gix_pack::index::File::at(
         target.join(format!("objects/pack/{}.idx", report.pack.name)),
@@ -348,7 +373,10 @@ fn native_parent_marks_the_whole_branch() {
         .filter(|u| u.name.as_bytes() == b"refs/heads/main")
         .collect();
     assert_eq!(named.len(), 1);
-    assert_eq!(named[0].reason, super::report::UnexportedReason::NativeInClosure);
+    assert_eq!(
+        named[0].reason,
+        super::report::UnexportedReason::NativeInClosure
+    );
     assert!(!report.head.exported);
 }
 
@@ -357,8 +385,14 @@ fn dangling_parent_without_promisor_is_corrupt() {
     let scratch = Scratch::new();
     let store = test_store(&scratch, "store", HashKind::Sha1);
     let tree = put(&store, ObjectKind::Tree, b"");
-    let missing = HashKind::Sha1.hash_git_object("blob", b"never-stored").unwrap();
-    let commit = put(&store, ObjectKind::Commit, &commit_bytes(tree, &[missing], b"dangling\n"));
+    let missing = HashKind::Sha1
+        .hash_git_object("blob", b"never-stored")
+        .unwrap();
+    let commit = put(
+        &store,
+        ObjectKind::Commit,
+        &commit_bytes(tree, &[missing], b"dangling\n"),
+    );
     set_ref(&store, "refs/heads/main", RefTarget::Direct(commit));
     let error = export_repository(
         &store,

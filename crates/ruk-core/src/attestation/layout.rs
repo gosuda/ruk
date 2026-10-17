@@ -53,12 +53,7 @@ pub(super) fn group_prefix(subject: &Oid, kind: &str, signer: &str) -> Vec<u8> {
 }
 
 /// The exact key of one statement row.
-pub(super) fn statement_key(
-    subject: &Oid,
-    kind: &str,
-    signer: &str,
-    digest: &[u8; 32],
-) -> Vec<u8> {
+pub(super) fn statement_key(subject: &Oid, kind: &str, signer: &str, digest: &[u8; 32]) -> Vec<u8> {
     let mut key = group_prefix(subject, kind, signer);
     key.extend_from_slice(digest);
     key

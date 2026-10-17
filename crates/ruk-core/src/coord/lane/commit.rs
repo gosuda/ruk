@@ -19,9 +19,7 @@ use crate::coord::oplog::{self, OpMeta};
 use crate::coord::policy::{Policy, PolicySource};
 use crate::coord::receipt::{self, Lookup};
 use crate::coord::retention;
-use crate::coord::rows::{
-    self, CoordinatorHead, ReceiptRow, SessionRow, RECEIPT_HORIZON,
-};
+use crate::coord::rows::{self, CoordinatorHead, RECEIPT_HORIZON, ReceiptRow, SessionRow};
 use crate::coord::session::Authority;
 use crate::coord::session::SessionTable;
 use crate::coord::workspace;
@@ -125,19 +123,28 @@ pub(crate) fn commit_batch(
     // 2. Separate mutations and internal items; resolve idempotency replays and in-batch duplicates.
     let mut candidate_mutations: Vec<ActiveMutation> = Vec::new();
     let mut active_internals: Vec<ActiveInternal> = Vec::new();
-    let mut coalesced_duplicates: HashMap<(SessionId, RequestId), Vec<oneshot::Sender<Result<Reply, CoreError>>>> = HashMap::new();
+    let mut coalesced_duplicates: HashMap<
+        (SessionId, RequestId),
+        Vec<oneshot::Sender<Result<Reply, CoreError>>>,
+    > = HashMap::new();
     let mut seen_batch_mutations: HashMap<(SessionId, RequestId), RequestDigest> = HashMap::new();
 
     for item in pending_items {
         match item {
-            BatchItem::Internal { candidate, reply_tx } => {
+            BatchItem::Internal {
+                candidate,
+                reply_tx,
+            } => {
                 active_internals.push(ActiveInternal {
                     payload: candidate.payload,
                     facts: candidate.facts,
                     reply_tx,
                 });
             }
-            BatchItem::Mutation { candidate, reply_tx } => {
+            BatchItem::Mutation {
+                candidate,
+                reply_tx,
+            } => {
                 let session_id = candidate.session.id();
                 let request_id = candidate.request_id;
                 let digest = candidate.digest;
@@ -197,7 +204,9 @@ pub(crate) fn commit_batch(
     for mut m in candidate_mutations {
         let validation_res = validate_candidate(store, &policy, &m.candidate, &times);
         if let Err(err) = validation_res {
-            if let Some(duplicates) = coalesced_duplicates.remove(&(m.candidate.session.id(), m.candidate.request_id)) {
+            if let Some(duplicates) =
+                coalesced_duplicates.remove(&(m.candidate.session.id(), m.candidate.request_id))
+            {
                 for tx in duplicates {
                     let _ = tx.send(Err(err.clone()));
                 }
@@ -283,7 +292,8 @@ pub(crate) fn commit_batch(
             m.candidate.mut_reply.clone(),
         )?;
         let encoded_receipt = rows::encode("receipt row", &receipt_row)?;
-        let receipt_key = rows::receipt_key(m.candidate.session.id(), m.candidate.request_id).to_vec();
+        let receipt_key =
+            rows::receipt_key(m.candidate.session.id(), m.candidate.request_id).to_vec();
 
         all_facts.push(FactMutation {
             table: FactTable::Receipts,
@@ -437,12 +447,7 @@ pub(crate) fn commit_batch(
             .cloned()
             .unwrap_or_else(|| m.candidate.session.row());
 
-        session_table.apply_committed(
-            session_id,
-            Some(session_row),
-            default_idle,
-            times,
-        );
+        session_table.apply_committed(session_id, Some(session_row), default_idle, times);
     }
 
     for internal in &valid_internals {
@@ -538,7 +543,10 @@ fn validate_fact_expectation(store: &Store, fact: &FactMutation) -> Result<(), C
             if current.is_some() {
                 return Err(CoreError::new(
                     ErrorCode::EStale,
-                    format!("fact in table {:?} was expected absent but exists", fact.table),
+                    format!(
+                        "fact in table {:?} was expected absent but exists",
+                        fact.table
+                    ),
                 ));
             }
         }
@@ -546,13 +554,19 @@ fn validate_fact_expectation(store: &Store, fact: &FactMutation) -> Result<(), C
             let Some(bytes) = &current else {
                 return Err(CoreError::new(
                     ErrorCode::EStale,
-                    format!("fact in table {:?} was expected present but is absent", fact.table),
+                    format!(
+                        "fact in table {:?} was expected present but is absent",
+                        fact.table
+                    ),
                 ));
             };
             if bytes != expected_bytes {
                 return Err(CoreError::new(
                     ErrorCode::EStale,
-                    format!("fact in table {:?} did not match expected value", fact.table),
+                    format!(
+                        "fact in table {:?} did not match expected value",
+                        fact.table
+                    ),
                 ));
             }
         }

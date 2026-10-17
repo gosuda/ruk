@@ -49,7 +49,11 @@ pub(crate) enum Ingested {
 /// `E_STALE` when the path keeps changing type or shrinking across every
 /// attempt; `E_IO`, preparation admission (`E_LIMIT`, `E_CAPACITY`), and
 /// quarantine.
-pub(crate) fn ingest(store: &Store, root: &Path, observed: &Observed) -> Result<Ingested, CoreError> {
+pub(crate) fn ingest(
+    store: &Store,
+    root: &Path,
+    observed: &Observed,
+) -> Result<Ingested, CoreError> {
     let abs = fs_path(root, observed.path.as_bytes())?;
     let mut current = (observed.stat, observed.kind);
     for _ in 0..MAX_ATTEMPTS {
@@ -147,7 +151,11 @@ fn hash_file(store: &Store, abs: &Path, observed: FileStat) -> Result<Attempt, C
     };
     let after = relstat(abs)?;
     let stable = after.is_some_and(|(now, _)| now == before);
-    Ok(Attempt::Done(object.oid(), object, stable.then_some(before)))
+    Ok(Attempt::Done(
+        object.oid(),
+        object,
+        stable.then_some(before),
+    ))
 }
 
 fn hash_symlink(store: &Store, abs: &Path, observed: FileStat) -> Result<Attempt, CoreError> {
@@ -164,7 +172,11 @@ fn hash_symlink(store: &Store, abs: &Path, observed: FileStat) -> Result<Attempt
     let object = store.prepare(ObjectKind::Blob, len, bytes.as_slice(), None)?;
     let after = relstat(abs)?;
     let stable = after.is_some_and(|(now, kind)| kind == EntryKind::Symlink && now == observed);
-    Ok(Attempt::Done(object.oid(), object, stable.then_some(observed)))
+    Ok(Attempt::Done(
+        object.oid(),
+        object,
+        stable.then_some(observed),
+    ))
 }
 
 #[cfg(unix)]

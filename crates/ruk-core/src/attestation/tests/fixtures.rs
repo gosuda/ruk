@@ -135,7 +135,13 @@ pub(super) fn statement(
 /// Signs `statement` with the SHA-1 repository format and `ssh-keygen`-style
 /// defaults: namespace `ruk-attest`, SHA-256 hash.
 pub(super) fn sign(key: &PrivateKey, statement: AttestStatement) -> AttestAddArgs {
-    sign_for(HashKind::Sha1, key, statement, ATTEST_NAMESPACE, HashAlg::Sha256)
+    sign_for(
+        HashKind::Sha1,
+        key,
+        statement,
+        ATTEST_NAMESPACE,
+        HashAlg::Sha256,
+    )
 }
 
 /// Signs the canonical payload of `statement` for `format`, in `namespace`,
@@ -264,8 +270,7 @@ pub(super) fn armor(binary: &[u8]) -> AttestSignature {
 
 /// Standard base64 with padding.
 pub(super) fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = usize::from(chunk[0]);

@@ -15,9 +15,7 @@
 
 use std::collections::HashSet;
 
-use super::{
-    Adapter, Decline, DeclineReason, SourceUnit, UnitKey, attach_leading_trivia, offset,
-};
+use super::{Adapter, Decline, DeclineReason, SourceUnit, UnitKey, attach_leading_trivia, offset};
 use crate::merge::syntax::grammar::{Language, NODE_NONE, ParsedTree};
 
 use super::MAX_WALK_DEPTH;
@@ -97,9 +95,10 @@ fn toml_key_text(tree: &ParsedTree, source: &[u8], pair: u32) -> Vec<u8> {
 
 /// A TOML pair's value: its last named child that is not the key.
 fn toml_value_child(tree: &ParsedTree, pair: u32) -> Option<u32> {
-    tree.named_children(pair).into_iter().rev().find(|child| {
-        !is_toml_key(tree, *child) && tree.kind_of(*child) != "comment"
-    })
+    tree.named_children(pair)
+        .into_iter()
+        .rev()
+        .find(|child| !is_toml_key(tree, *child) && tree.kind_of(*child) != "comment")
 }
 
 fn push(
@@ -222,7 +221,11 @@ impl JsonAdapter {
 }
 
 /// Pushes `qualified` as parent context for `body`, then pops it.
-fn parents_push(parent: &mut Vec<Vec<u8>>, qualified: Vec<u8>, body: impl FnOnce(&mut Vec<Vec<u8>>)) {
+fn parents_push(
+    parent: &mut Vec<Vec<u8>>,
+    qualified: Vec<u8>,
+    body: impl FnOnce(&mut Vec<Vec<u8>>),
+) {
     parent.push(qualified);
     body(parent);
     parent.pop();
@@ -360,9 +363,7 @@ impl TomlAdapter {
         let mut tables = Vec::new();
         let mut multiline = Vec::new();
         for node in descendants_by_kind(tree, 0, &["table", "table_array_element", "pair"]) {
-            if tree.kind_of(node) == "table_array_element"
-                || Self::inside_table_array(tree, node)
-            {
+            if tree.kind_of(node) == "table_array_element" || Self::inside_table_array(tree, node) {
                 continue;
             }
             match tree.kind_of(node) {
@@ -494,8 +495,7 @@ impl Adapter for TomlAdapter {
         }
         // Multiline string contents decline when edited.
         if multiline_sets.len() == 3
-            && (multiline_sets[1] != multiline_sets[0]
-                || multiline_sets[2] != multiline_sets[0])
+            && (multiline_sets[1] != multiline_sets[0] || multiline_sets[2] != multiline_sets[0])
         {
             return Some(Decline::new(
                 DeclineReason::UnsupportedConstruct,
@@ -509,8 +509,8 @@ impl Adapter for TomlAdapter {
         if tree.kind_of(node) != "pair" {
             return Vec::new();
         }
-        let inline = toml_value_child(tree, node)
-            .filter(|value| tree.kind_of(*value) == "inline_table");
+        let inline =
+            toml_value_child(tree, node).filter(|value| tree.kind_of(*value) == "inline_table");
         let Some(inline) = inline else {
             return Vec::new();
         };
@@ -621,7 +621,8 @@ impl YamlAdapter {
             }
             match value_child(tree, pair) {
                 Some(nested)
-                    if ["block_mapping", "block_node", "mapping"].contains(&tree.kind_of(nested)) =>
+                    if ["block_mapping", "block_node", "mapping"]
+                        .contains(&tree.kind_of(nested)) =>
                 {
                     let mut qualified = key;
                     qualified.push(0);
@@ -666,9 +667,11 @@ impl YamlAdapter {
         }
         for mapping in descendants_by_kind(tree, 0, &["block_mapping", "flow_mapping"]) {
             let mut seen = HashSet::new();
-            for pair in tree.named_children(mapping).into_iter().filter(|child| {
-                ["block_mapping_pair", "flow_pair"].contains(&tree.kind_of(*child))
-            }) {
+            for pair in tree
+                .named_children(mapping)
+                .into_iter()
+                .filter(|child| ["block_mapping_pair", "flow_pair"].contains(&tree.kind_of(*child)))
+            {
                 let key = key_text(tree, source, pair);
                 if key == b"<<" {
                     return Some(Decline::new(
@@ -716,9 +719,7 @@ impl YamlAdapter {
                 .iter()
                 .position(|b| !b.is_ascii_whitespace())
                 .map_or(&line[..0], |start| &line[start..]);
-            stripped.starts_with(b"<<:")
-                || stripped.starts_with(b"<< ")
-                || stripped == b"<<"
+            stripped.starts_with(b"<<:") || stripped.starts_with(b"<< ") || stripped == b"<<"
         })
     }
 }
@@ -799,8 +800,9 @@ impl Adapter for YamlAdapter {
         if tree.kind_of(node) != "block_mapping_pair" {
             return Vec::new();
         }
-        let nested = value_child(tree, node)
-            .filter(|value| ["block_mapping", "block_node", "mapping"].contains(&tree.kind_of(*value)));
+        let nested = value_child(tree, node).filter(|value| {
+            ["block_mapping", "block_node", "mapping"].contains(&tree.kind_of(*value))
+        });
         let Some(nested) = nested else {
             return Vec::new();
         };
@@ -1011,8 +1013,12 @@ impl CssAdapter {
         }
         // Body-less at-rules (@import, @charset) are whole-text units;
         // at-rules with bodies contribute prelude context.
-        if ["charset_statement", "import_statement", "namespace_statement"]
-            .contains(&kind)
+        if [
+            "charset_statement",
+            "import_statement",
+            "namespace_statement",
+        ]
+        .contains(&kind)
         {
             let text = tree.text_of(node, source).to_vec();
             let end = tree.get(node).map_or(0, |n| n.end);
@@ -1061,9 +1067,7 @@ impl HtmlAdapter {
     fn tag_name(tree: &ParsedTree, source: &[u8], element: u32) -> Vec<u8> {
         tree.named_children(element)
             .into_iter()
-            .find(|child| {
-                ["start_tag", "self_closing_tag"].contains(&tree.kind_of(*child))
-            })
+            .find(|child| ["start_tag", "self_closing_tag"].contains(&tree.kind_of(*child)))
             .and_then(|tag| {
                 tree.named_children(tag)
                     .into_iter()
@@ -1074,9 +1078,10 @@ impl HtmlAdapter {
 
     /// Literal `id` attribute value of an element, or empty.
     fn id_value(tree: &ParsedTree, source: &[u8], element: u32) -> Vec<u8> {
-        let start_tag = tree.named_children(element).into_iter().find(|child| {
-            ["start_tag", "self_closing_tag"].contains(&tree.kind_of(*child))
-        });
+        let start_tag = tree
+            .named_children(element)
+            .into_iter()
+            .find(|child| ["start_tag", "self_closing_tag"].contains(&tree.kind_of(*child)));
         let Some(start_tag) = start_tag else {
             return Vec::new();
         };
@@ -1085,13 +1090,9 @@ impl HtmlAdapter {
             .into_iter()
             .filter(|child| tree.kind_of(*child) == "attribute")
         {
-            let is_id = tree
-                .named_children(attribute)
-                .into_iter()
-                .any(|part| {
-                    tree.kind_of(part) == "attribute_name"
-                        && tree.text_of(part, source) == b"id"
-                });
+            let is_id = tree.named_children(attribute).into_iter().any(|part| {
+                tree.kind_of(part) == "attribute_name" && tree.text_of(part, source) == b"id"
+            });
             if is_id {
                 return tree
                     .named_children(attribute)
@@ -1143,7 +1144,8 @@ impl Adapter for HtmlAdapter {
         if tree.is_empty() {
             return out;
         }
-        let elements = descendants_by_kind(tree, 0, &["element", "script_element", "style_element"]);
+        let elements =
+            descendants_by_kind(tree, 0, &["element", "script_element", "style_element"]);
         let element_set: HashSet<u32> = elements.iter().copied().collect();
         // Only innermost elements are units: an ancestor that contains
         // another element stays a gap, so unit ranges never overlap. A tag

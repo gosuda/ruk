@@ -69,7 +69,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::MAX_CONTROL_FRAME_BYTES;
-use crate::capability::{Capabilities, PathPattern, ReadIntents, RefPattern, UndoScope, WriteScope};
+use crate::capability::{
+    Capabilities, PathPattern, ReadIntents, RefPattern, UndoScope, WriteScope,
+};
 use crate::commit::ProvenanceClaims;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{IdentityClaim, Validate};
@@ -915,14 +917,20 @@ mod tests {
             assert_eq!(String::from(principal.clone()), text);
             let json = sonic_rs::to_string(&principal).expect("json");
             assert_eq!(json, format!("\"{text}\""));
-            assert_eq!(sonic_rs::from_str::<Principal>(&json).expect("json"), principal);
+            assert_eq!(
+                sonic_rs::from_str::<Principal>(&json).expect("json"),
+                principal
+            );
             let bytes = postcard::to_allocvec(&principal).expect("postcard");
             assert_eq!(
                 postcard::from_bytes::<Principal>(&bytes).expect("postcard"),
                 principal
             );
         }
-        assert_eq!(Principal::from_peer_uid(1000), Principal::parse("unix:1000").expect("uid"));
+        assert_eq!(
+            Principal::from_peer_uid(1000),
+            Principal::parse("unix:1000").expect("uid")
+        );
     }
 
     #[test]
@@ -1028,7 +1036,10 @@ mod tests {
                 "trusted parse accepted {bad:?}"
             );
         }
-        assert!(Principal::from_verified_sid(&sixteen).is_err(), "16 sub-authorities");
+        assert!(
+            Principal::from_verified_sid(&sixteen).is_err(),
+            "16 sub-authorities"
+        );
         let huge = format!("S-1-5{}", "-1".repeat(400));
         assert!(Principal::from_verified_sid(&huge).is_err());
         assert!(Principal::parse(&format!("windows:{huge}")).is_err());
@@ -1089,10 +1100,7 @@ mod tests {
     #[test]
     fn lfs_mode_defaults_to_deny_and_only_known_modes_are_accepted() {
         assert_eq!(parsed("version = 1\n").lfs(), LfsMode::Deny);
-        assert_eq!(
-            parsed("version = 1\nlfs = \"deny\"\n").lfs(),
-            LfsMode::Deny
-        );
+        assert_eq!(parsed("version = 1\nlfs = \"deny\"\n").lfs(), LfsMode::Deny);
         assert_eq!(
             parsed("version = 1\nlfs = \"pointers\"\n").lfs(),
             LfsMode::Pointers
@@ -1241,12 +1249,18 @@ mod tests {
     fn the_owner_alias_resolves_to_the_coordinators_principal_only() {
         let policy = parsed(&owner_grant("all"));
         assert_eq!(write_scope_of(&policy, &owner()), Some(WriteScope::All));
-        assert!(policy.lookup(&other()).is_err(), "the alias is not a wildcard");
+        assert!(
+            policy.lookup(&other()).is_err(),
+            "the alias is not a wildcard"
+        );
 
         let windows_owner = Principal::from_verified_sid("S-1-5-21-1-2-3-1001").expect("sid");
         let policy =
             Policy::parse(owner_grant("own").as_bytes(), &windows_owner).expect("windows owner");
-        assert_eq!(write_scope_of(&policy, &windows_owner), Some(WriteScope::Own));
+        assert_eq!(
+            write_scope_of(&policy, &windows_owner),
+            Some(WriteScope::Own)
+        );
         assert!(policy.lookup(&owner()).is_err());
     }
 
@@ -1267,14 +1281,24 @@ mod tests {
             assert_eq!(code_of(&text), ErrorCode::EPolicy, "{names:?}");
         }
         let windows_owner = Principal::from_verified_sid("S-1-5-18").expect("sid");
-        let text = format!("version = 1\n{}{}", entry("owner"), entry("windows:S-1-5-18"));
+        let text = format!(
+            "version = 1\n{}{}",
+            entry("owner"),
+            entry("windows:S-1-5-18")
+        );
         assert_eq!(
             Policy::parse(text.as_bytes(), &windows_owner)
                 .expect_err("alias collision")
                 .code,
             ErrorCode::EPolicy
         );
-        assert!(Policy::parse(format!("version = 1\n{}{}", entry("owner"), entry("unix:2000")).as_bytes(), &owner()).is_ok());
+        assert!(
+            Policy::parse(
+                format!("version = 1\n{}{}", entry("owner"), entry("unix:2000")).as_bytes(),
+                &owner()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1299,8 +1323,15 @@ mod tests {
             let text = format!("version = 1\n[[principal]]\nname = {name:?}\n");
             assert_eq!(code_of(&text), ErrorCode::EPolicy, "{name:?}");
         }
-        assert_eq!(code_of("version = 1\n[[principal]]\n"), ErrorCode::EPolicy, "name is required");
-        assert_eq!(code_of("version = 1\n[[principal]]\nname = 1000\n"), ErrorCode::EPolicy);
+        assert_eq!(
+            code_of("version = 1\n[[principal]]\n"),
+            ErrorCode::EPolicy,
+            "name is required"
+        );
+        assert_eq!(
+            code_of("version = 1\n[[principal]]\nname = 1000\n"),
+            ErrorCode::EPolicy
+        );
     }
 
     #[test]
@@ -1400,8 +1431,11 @@ mod tests {
         ] {
             assert_eq!(code_of(text), ErrorCode::EPolicy, "{text:?}");
         }
-        let error = Policy::parse(b"version = 2\nfuture_field = 1\n[[principal]]\nname = 3\n", &owner())
-            .expect_err("future format");
+        let error = Policy::parse(
+            b"version = 2\nfuture_field = 1\n[[principal]]\nname = 3\n",
+            &owner(),
+        )
+        .expect_err("future format");
         assert_eq!(error.code, ErrorCode::EPolicy);
         assert!(
             error.message.contains("version 2"),
@@ -1524,11 +1558,18 @@ mod tests {
         let ada = identity("Ada", "ada@example.test");
         let tool = claims(&[("tool", "anything at all")]);
 
-        assert!(entry.admit_claims(None, &ProvenanceClaims::default()).is_ok());
+        assert!(
+            entry
+                .admit_claims(None, &ProvenanceClaims::default())
+                .is_ok()
+        );
         assert!(entry.admit_claims(Some(&ada), &tool).is_ok());
         assert!(
             entry
-                .admit_claims(Some(&identity("Bot", "bot@example.test")), &claims(&[("model.name", "")]))
+                .admit_claims(
+                    Some(&identity("Bot", "bot@example.test")),
+                    &claims(&[("model.name", "")])
+                )
                 .is_ok()
         );
 
@@ -1548,7 +1589,9 @@ mod tests {
         // Grammar-invalid keys never reach the policy: construction rejects
         // them as E_INVALID before admit_claims can check the allowlist.
         let invalid = ProvenanceClaims::new(
-            [("Tool".to_owned(), "x".to_owned())].into_iter().collect::<BTreeMap<_, _>>(),
+            [("Tool".to_owned(), "x".to_owned())]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
         )
         .expect_err("uppercase key is not a claim");
         assert_eq!(invalid.code(), ErrorCode::EInvalid);
@@ -1565,7 +1608,11 @@ mod tests {
     fn by_default_no_identity_and_no_claim_key_is_allowed() {
         let policy = parsed("version = 1\n[[principal]]\nname = \"unix:2000\"\n");
         let entry = policy.lookup(&other()).expect("listed");
-        assert!(entry.admit_claims(None, &ProvenanceClaims::default()).is_ok());
+        assert!(
+            entry
+                .admit_claims(None, &ProvenanceClaims::default())
+                .is_ok()
+        );
         assert_eq!(
             entry
                 .admit_claims(Some(&identity("A", "a@x")), &ProvenanceClaims::default())
@@ -1589,14 +1636,24 @@ mod tests {
              true\n\n[[principal]]\nname = \"unix:3000\"\nallow_any_claim_keys = true\n",
         );
         let any_identity = policy.lookup(&other()).expect("identity-open");
-        let any_claims = policy.lookup(&Principal::from_peer_uid(3000)).expect("claims-open");
+        let any_claims = policy
+            .lookup(&Principal::from_peer_uid(3000))
+            .expect("claims-open");
         let someone = identity("Someone", "s@example.test");
         let tagged = claims(&[("anything", "x"), ("goes", "y")]);
 
-        assert!(any_identity.admit_claims(Some(&someone), &ProvenanceClaims::default()).is_ok());
+        assert!(
+            any_identity
+                .admit_claims(Some(&someone), &ProvenanceClaims::default())
+                .is_ok()
+        );
         assert!(any_identity.admit_claims(None, &tagged).is_err());
         assert!(any_claims.admit_claims(None, &tagged).is_ok());
-        assert!(any_claims.admit_claims(Some(&someone), &ProvenanceClaims::default()).is_err());
+        assert!(
+            any_claims
+                .admit_claims(Some(&someone), &ProvenanceClaims::default())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1610,8 +1667,13 @@ mod tests {
         let tool = claims(&[("tool", "x")]);
         let granted = policy.lookup(&other()).expect("granted");
         assert!(granted.admit_claims(Some(&ada), &tool).is_ok());
-        let bare = policy.lookup(&Principal::from_peer_uid(3000)).expect("bare");
-        assert!(bare.admit_claims(Some(&ada), &ProvenanceClaims::default()).is_err());
+        let bare = policy
+            .lookup(&Principal::from_peer_uid(3000))
+            .expect("bare");
+        assert!(
+            bare.admit_claims(Some(&ada), &ProvenanceClaims::default())
+                .is_err()
+        );
         assert!(bare.admit_claims(None, &tool).is_err());
     }
 
@@ -1639,7 +1701,9 @@ mod tests {
             assert_eq!(code_of(&text), ErrorCode::EPolicy, "{body}");
         }
         let too_long = "k".repeat(65);
-        let text = format!("version = 1\n[[principal]]\nname = \"owner\"\nclaim_keys = [\"{too_long}\"]\n");
+        let text = format!(
+            "version = 1\n[[principal]]\nname = \"owner\"\nclaim_keys = [\"{too_long}\"]\n"
+        );
         assert_eq!(code_of(&text), ErrorCode::EPolicy);
     }
 
@@ -1651,7 +1715,10 @@ mod tests {
         let source = PolicySource::open(&dir.0, owner());
         let policy = source.load().expect("default");
         assert_eq!(policy.session_idle(), SignedDuration::from_hours(24));
-        assert_eq!(policy.lookup(&other()).expect_err("not the owner").code, ErrorCode::EForbidden);
+        assert_eq!(
+            policy.lookup(&other()).expect_err("not the owner").code,
+            ErrorCode::EForbidden
+        );
         assert!(
             policy
                 .lookup(&Principal::from_verified_sid("S-1-5-18").expect("sid"))
@@ -1739,7 +1806,9 @@ mod tests {
             b"\xFF\xFE\x00",
         ] {
             std::fs::write(dir.policy(), bad).expect("write");
-            let error = source.load().expect_err("must not fall back to the default");
+            let error = source
+                .load()
+                .expect_err("must not fall back to the default");
             assert_eq!(error.code, ErrorCode::EPolicy, "{bad:?}");
             let again = source.load().expect_err("stays failed");
             assert_eq!(again, error, "a cached failure is the same failure");
@@ -1784,7 +1853,11 @@ mod tests {
         drop(file);
         let after = std::fs::metadata(dir.policy()).expect("metadata");
         assert_eq!(after.len(), u64::try_from(narrow.len()).expect("len"));
-        assert_eq!(after.modified().expect("mtime"), stamped, "test precondition");
+        assert_eq!(
+            after.modified().expect("mtime"),
+            stamped,
+            "test precondition"
+        );
 
         let second = source.load().expect("wide");
         assert_eq!(write_scope_of(&second, &owner()), Some(WriteScope::All));
@@ -1811,7 +1884,10 @@ mod tests {
         std::fs::write(dir.policy(), owner_grant("own")).expect("write");
         let first = source.load().expect("first");
         let second = source.load().expect("second");
-        assert!(Arc::ptr_eq(&first, &second), "an unchanged file reparses nothing");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged file reparses nothing"
+        );
 
         std::fs::write(dir.policy(), owner_grant("all")).expect("write");
         let third = source.load().expect("third");
@@ -1831,8 +1907,9 @@ mod tests {
         )
         .expect("write");
         let before = source.load().expect("granted");
-        let session = Capabilities::negotiate(&before.lookup(&owner()).expect("listed").ceiling, None)
-            .expect("session capabilities");
+        let session =
+            Capabilities::negotiate(&before.lookup(&owner()).expect("listed").ceiling, None)
+                .expect("session capabilities");
         assert!(session.require_write(WriteScope::All).is_ok());
 
         std::fs::write(
@@ -1847,10 +1924,16 @@ mod tests {
             .expect_err("the session now exceeds the policy");
         assert_eq!(error.code, ErrorCode::EForbidden);
 
-        std::fs::write(dir.policy(), "version = 1\n[[principal]]\nname = \"unix:2000\"\n")
-            .expect("write");
+        std::fs::write(
+            dir.policy(),
+            "version = 1\n[[principal]]\nname = \"unix:2000\"\n",
+        )
+        .expect("write");
         let removed = source.load().expect("owner removed");
-        assert_eq!(removed.lookup(&owner()).expect_err("removed").code, ErrorCode::EForbidden);
+        assert_eq!(
+            removed.lookup(&owner()).expect_err("removed").code,
+            ErrorCode::EForbidden
+        );
     }
 
     #[test]
@@ -1881,7 +1964,10 @@ mod tests {
 
         let far_over = padded_policy(MAX_CONTROL_FRAME_BYTES * 2);
         std::fs::write(dir.policy(), &far_over).expect("write");
-        assert_eq!(source.load().expect_err("far over").code, ErrorCode::EPolicy);
+        assert_eq!(
+            source.load().expect_err("far over").code,
+            ErrorCode::EPolicy
+        );
     }
 
     /// A policy of exactly `total` bytes: the version line, then comment
@@ -1924,7 +2010,10 @@ mod tests {
         let dir = TempDir::new("special");
         let source = PolicySource::open(&dir.0, owner());
         std::fs::create_dir(dir.policy()).expect("directory");
-        assert_eq!(source.load().expect_err("directory").code, ErrorCode::EPolicy);
+        assert_eq!(
+            source.load().expect_err("directory").code,
+            ErrorCode::EPolicy
+        );
         std::fs::remove_dir(dir.policy()).expect("remove");
 
         rustix::fs::mknodat(
@@ -1960,7 +2049,13 @@ mod tests {
         let dir = TempDir::new("windows-owner");
         let windows_owner = Principal::from_verified_sid("S-1-5-21-10-20-30-1001").expect("sid");
         let source = PolicySource::open(&dir.0, windows_owner.clone());
-        assert!(source.load().expect("default").lookup(&windows_owner).is_ok());
+        assert!(
+            source
+                .load()
+                .expect("default")
+                .lookup(&windows_owner)
+                .is_ok()
+        );
         assert!(source.load().expect("default").lookup(&owner()).is_err());
 
         std::fs::write(
@@ -1970,6 +2065,9 @@ mod tests {
         )
         .expect("write");
         let policy = source.load().expect("spelled");
-        assert_eq!(write_scope_of(&policy, &windows_owner), Some(WriteScope::Own));
+        assert_eq!(
+            write_scope_of(&policy, &windows_owner),
+            Some(WriteScope::Own)
+        );
     }
 }

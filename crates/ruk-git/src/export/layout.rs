@@ -285,7 +285,9 @@ mod tests {
         layout.note(&Layout::pack_relative("pack-abc"), 100);
         layout.note(&Layout::idx_relative("pack-abc"), 50);
         layout.install(Path::new("packed-refs"), b"refs").unwrap();
-        layout.install(Path::new("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        layout
+            .install(Path::new("HEAD"), b"ref: refs/heads/main\n")
+            .unwrap();
         let order: Vec<&str> = layout
             .installed
             .iter()
@@ -335,8 +337,10 @@ mod tests {
         let sha256 = String::from_utf8(config_bytes(HashKind::Sha256)).unwrap();
         assert!(sha256.contains("repositoryformatversion = 1"));
         assert!(sha256.contains("objectformat = sha256"));
-        assert!(String::from_utf8(description_bytes())
-            .unwrap()
-            .starts_with("Unnamed repository;"));
+        assert!(
+            String::from_utf8(description_bytes())
+                .unwrap()
+                .starts_with("Unnamed repository;")
+        );
     }
 }

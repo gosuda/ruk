@@ -501,7 +501,10 @@ mod tests {
             Ok(())
         })
         .expect("install completed file");
-        assert_eq!(std::fs::read(&target).expect("read installed file"), b"immutable graph");
+        assert_eq!(
+            std::fs::read(&target).expect("read installed file"),
+            b"immutable graph"
+        );
         let error = install_file(&target, |file| {
             file.write_all(b"replacement")?;
             Ok(())
@@ -511,7 +514,10 @@ mod tests {
             &error,
             StoreError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists
         ));
-        assert_eq!(std::fs::read(&target).expect("read original file"), b"immutable graph");
+        assert_eq!(
+            std::fs::read(&target).expect("read original file"),
+            b"immutable graph"
+        );
         assert_eq!(entry_names(&root), vec!["graph"]);
         std::fs::remove_dir_all(&root).expect("cleanup");
     }

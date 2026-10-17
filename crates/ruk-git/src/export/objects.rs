@@ -102,7 +102,10 @@ impl<'s> Closure<'s> {
             } else {
                 NativeReason::NativeInClosure
             };
-            return Ok(RootOutcome::Native { reason, oid: native });
+            return Ok(RootOutcome::Native {
+                reason,
+                oid: native,
+            });
         }
         Ok(RootOutcome::Exported {
             peeled: self.peel(root)?,
@@ -134,7 +137,11 @@ impl<'s> Closure<'s> {
                     let bytes = drain(object.bytes)?;
                     let header = parse_commit(oid, &bytes, self.kind)?;
                     pending.push((header.tree, Expect::Kind(ObjectKind::Tree)));
-                    if self.store.fact(FactTable::Shallow, oid.as_bytes())?.is_some() {
+                    if self
+                        .store
+                        .fact(FactTable::Shallow, oid.as_bytes())?
+                        .is_some()
+                    {
                         boundaries.push(oid);
                     } else {
                         pending.extend(
@@ -211,7 +218,9 @@ pub(crate) fn read_object(
 /// tags) are bounded by the store's own admission; blobs never come here.
 fn drain(mut spool: ruk_core::store::Spool) -> Result<Vec<u8>, GitError> {
     let mut bytes = Vec::new();
-    spool.read_to_end(&mut bytes).map_err(super::pack::io_error)?;
+    spool
+        .read_to_end(&mut bytes)
+        .map_err(super::pack::io_error)?;
     Ok(bytes)
 }
 
@@ -246,7 +255,11 @@ pub(crate) struct CommitHeader {
 
 /// Reads `tree` then every `parent` line; the rest of the commit is opaque
 /// and preserved byte-for-byte by the pack.
-pub(crate) fn parse_commit(oid: Oid, bytes: &[u8], kind: HashKind) -> Result<CommitHeader, GitError> {
+pub(crate) fn parse_commit(
+    oid: Oid,
+    bytes: &[u8],
+    kind: HashKind,
+) -> Result<CommitHeader, GitError> {
     let mut lines = bytes.split(|&b| b == b'\n');
     let tree = lines
         .next()
@@ -264,7 +277,11 @@ pub(crate) fn parse_commit(oid: Oid, bytes: &[u8], kind: HashKind) -> Result<Com
 }
 
 /// Reads a tag's `object` and `type` lines.
-pub(crate) fn parse_tag(oid: Oid, bytes: &[u8], kind: HashKind) -> Result<(Oid, ObjectKind), GitError> {
+pub(crate) fn parse_tag(
+    oid: Oid,
+    bytes: &[u8],
+    kind: HashKind,
+) -> Result<(Oid, ObjectKind), GitError> {
     let mut lines = bytes.split(|&b| b == b'\n');
     let target = lines
         .next()

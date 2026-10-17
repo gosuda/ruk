@@ -121,7 +121,15 @@ pub(crate) fn capture(
     let mut prepared: BTreeSet<Oid> = BTreeSet::new();
     let mut entries = Vec::with_capacity(planned.len());
     for ((path, entry), seen) in planned.into_iter().zip(observed) {
-        let preimage = capture_preimage(store, root, &path, entry.expected.as_ref(), seen, &mut objects, &mut prepared)?;
+        let preimage = capture_preimage(
+            store,
+            root,
+            &path,
+            entry.expected.as_ref(),
+            seen,
+            &mut objects,
+            &mut prepared,
+        )?;
         entries.push((path, entry.target, preimage));
     }
     Ok(Captured {
@@ -147,12 +155,22 @@ fn validate_plan(
                 .map_err(CoreError::from)?;
         }
         if entry.target.is_some() && !scope.includes_file(&entry.path) {
-            return Err(invalid(format!("{name}: target lies outside the workspace scope")));
+            return Err(invalid(format!(
+                "{name}: target lies outside the workspace scope"
+            )));
         }
         let target = match entry.target {
-            Some(manifest) => Some(target_entry(store, kind, &name, manifest, entry.target_link)?),
+            Some(manifest) => Some(target_entry(
+                store,
+                kind,
+                &name,
+                manifest,
+                entry.target_link,
+            )?),
             None if entry.target_link.is_some() => {
-                return Err(invalid(format!("{name}: link bytes without a symlink target")));
+                return Err(invalid(format!(
+                    "{name}: link bytes without a symlink target"
+                )));
             }
             None => None,
         };
@@ -196,7 +214,9 @@ fn target_entry(
 ) -> Result<TargetEntry, CoreError> {
     if manifest.mode != FileMode::Symlink {
         if link.is_some() {
-            return Err(invalid(format!("{name}: link bytes for a non-symlink target")));
+            return Err(invalid(format!(
+                "{name}: link bytes for a non-symlink target"
+            )));
         }
         return Ok(TargetEntry {
             mode: manifest.mode,
@@ -208,11 +228,19 @@ fn target_entry(
         Some(link) => link,
         None => ByteString::new(read_link_blob(store, manifest.oid)?),
     };
-    if kind.hash_git_object("blob", link.as_bytes()).map_err(CoreError::from)? != manifest.oid {
-        return Err(invalid(format!("{name}: symlink bytes do not hash to the target oid")));
+    if kind
+        .hash_git_object("blob", link.as_bytes())
+        .map_err(CoreError::from)?
+        != manifest.oid
+    {
+        return Err(invalid(format!(
+            "{name}: symlink bytes do not hash to the target oid"
+        )));
     }
     if link.is_empty() || link.as_bytes().contains(&0) {
-        return Err(invalid(format!("{name}: symlink target is empty or contains NUL")));
+        return Err(invalid(format!(
+            "{name}: symlink target is empty or contains NUL"
+        )));
     }
     Ok(TargetEntry {
         mode: FileMode::Symlink,
@@ -329,7 +357,10 @@ fn add_replaced_dir_contents(
             if discard.contains(&path) {
                 planned.insert(path, Planned::UNTRACKED);
             } else {
-                dirty.push(format!("{} (untracked, in a replaced directory)", lossy(&bytes)));
+                dirty.push(format!(
+                    "{} (untracked, in a replaced directory)",
+                    lossy(&bytes)
+                ));
             }
         }
     }
@@ -426,7 +457,9 @@ fn assign_transitions(
             && !target_dirs.contains(path.as_bytes())
             && let Preimage::File { executable, oid } = preimage
         {
-            deleted.entry((*executable, *oid)).or_insert_with(|| path.clone());
+            deleted
+                .entry((*executable, *oid))
+                .or_insert_with(|| path.clone());
         }
     }
     let mut journal = Vec::with_capacity(entries.len());
@@ -448,7 +481,9 @@ fn assign_transitions(
             (_, Shape::Absent) => Transition::Delete,
             (pre, post) if pre.is_dir() || post.is_dir() => Transition::DirFileSwap,
             (Shape::Symlink { .. }, _) | (_, Shape::Symlink { .. }) => Transition::SymlinkChange,
-            (Shape::File { oid: before, .. }, Shape::File { oid: after, .. }) if before == after => {
+            (Shape::File { oid: before, .. }, Shape::File { oid: after, .. })
+                if before == after =>
+            {
                 Transition::ModeChange
             }
             _ => Transition::Modify,
@@ -481,7 +516,14 @@ fn dirty_error(mut paths: Vec<String>) -> CoreError {
     paths.dedup();
     let total = paths.len();
     let mut message = format!("{total} unsafe overwrite(s) before materialization: ");
-    message.push_str(&paths.iter().take(DIRTY_REPORT_LIMIT).cloned().collect::<Vec<_>>().join(", "));
+    message.push_str(
+        &paths
+            .iter()
+            .take(DIRTY_REPORT_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     if total > DIRTY_REPORT_LIMIT {
         message.push_str(&format!(", and {} more", total - DIRTY_REPORT_LIMIT));
     }

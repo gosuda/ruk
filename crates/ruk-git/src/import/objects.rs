@@ -97,7 +97,10 @@ pub fn source_hash_kind(git_dir: &Path) -> Result<HashKind, GitError> {
         let Some(eq) = line.iter().position(|&b| b == b'=') else {
             continue;
         };
-        if !line[..eq].trim_ascii().eq_ignore_ascii_case(b"objectformat") {
+        if !line[..eq]
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"objectformat")
+        {
             continue;
         }
         let value = line[eq + 1..].trim_ascii();
@@ -160,7 +163,9 @@ pub struct LooseStream {
 
 impl fmt::Debug for LooseStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LooseStream").field("size", &self.size).finish_non_exhaustive()
+        f.debug_struct("LooseStream")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
     }
 }
 
@@ -330,7 +335,12 @@ impl SourceObjects {
         let mut inflate = Default::default();
         let kind = {
             let (data, _location) = bundle
-                .get_object_by_index(index, &mut payload, &mut inflate, &mut gix_pack::cache::Never)
+                .get_object_by_index(
+                    index,
+                    &mut payload,
+                    &mut inflate,
+                    &mut gix_pack::cache::Never,
+                )
                 .map_err(|err| corrupt(format!("packed object {oid}: {err}")))?;
             object_kind(data.kind)
         };
@@ -474,7 +484,9 @@ fn ensure_eof(reader: &mut impl Read, oid: Oid) -> Result<(), GitError> {
     let mut extra = [0_u8; 1];
     match reader.read(&mut extra) {
         Ok(0) => Ok(()),
-        Ok(_) => Err(corrupt(format!("loose object {oid}: data after the declared payload"))),
+        Ok(_) => Err(corrupt(format!(
+            "loose object {oid}: data after the declared payload"
+        ))),
         Err(err) => Err(corrupt(format!("loose object {oid}: {err}"))),
     }
 }

@@ -73,7 +73,11 @@ fn c_declarator_name(tree: &ParsedTree, source: &[u8], node: u32) -> Vec<u8> {
             return tree.text_of(cursor, source).to_vec();
         }
         if kind == "parenthesized_declarator" {
-            cursor = tree.named_children(cursor).first().copied().unwrap_or(NODE_NONE);
+            cursor = tree
+                .named_children(cursor)
+                .first()
+                .copied()
+                .unwrap_or(NODE_NONE);
             if cursor == NODE_NONE {
                 return Vec::new();
             }
@@ -89,12 +93,7 @@ fn c_declarator_name(tree: &ParsedTree, source: &[u8], node: u32) -> Vec<u8> {
 /// Discriminator bytes for one unit: the optional field edge (receivers)
 /// followed by the kind-based signature children (first match, or every
 /// match in order when `disc_all`).
-fn unit_discriminator(
-    tree: &ParsedTree,
-    source: &[u8],
-    node: u32,
-    rules: &CodeRules,
-) -> Vec<u8> {
+fn unit_discriminator(tree: &ParsedTree, source: &[u8], node: u32, rules: &CodeRules) -> Vec<u8> {
     let mut discriminator = Vec::new();
     if let Some(field) = rules.disc_field {
         if let Some(edge) = tree.child_with_field(node, field) {
@@ -132,9 +131,7 @@ fn c_signature(tree: &ParsedTree, source: &[u8], node: u32) -> Vec<u8> {
             return tree
                 .named_children(current)
                 .into_iter()
-                .filter(|child| {
-                    ["parameter_list", "parameters"].contains(&tree.kind_of(*child))
-                })
+                .filter(|child| ["parameter_list", "parameters"].contains(&tree.kind_of(*child)))
                 .map(|child| tree.text_of(child, source).to_vec())
                 .collect::<Vec<_>>()
                 .concat();
@@ -190,7 +187,8 @@ fn collect(
         let Some(record) = tree.get(node) else {
             return;
         };
-        let start = attach_leading_trivia(tree, source, node, rules.comment_kinds, rules.attr_kinds);
+        let start =
+            attach_leading_trivia(tree, source, node, rules.comment_kinds, rules.attr_kinds);
         let (Some(_s), Some(_e)) = (offset(start), offset(record.end)) else {
             return;
         };
@@ -219,7 +217,16 @@ fn collect(
         return;
     }
     for child in tree.named_children(node) {
-        collect(tree, source, child, rules, language, parents, out, depth + 1);
+        collect(
+            tree,
+            source,
+            child,
+            rules,
+            language,
+            parents,
+            out,
+            depth + 1,
+        );
     }
     if pushed {
         parents.pop();
@@ -264,7 +271,6 @@ macro_rules! plain_adapter {
                 extract(tree, source, &$rules, $lang)
             }
         }
-
     };
 }
 
@@ -284,7 +290,12 @@ const RUST_RULES: CodeRules = CodeRules {
     // Module and impl members wrap in `declaration_list`; function bodies
     // use `block`, which stays opaque.
     body_kinds: &["declaration_list"],
-    opaque_kinds: &["macro_invocation", "macro_definition", "macro_rule", "use_declaration"],
+    opaque_kinds: &[
+        "macro_invocation",
+        "macro_definition",
+        "macro_rule",
+        "use_declaration",
+    ],
     name_alts: &["type", "trait"],
     // Parameters (and return types they textually contain) separate overloads;
     // impl headers separate same-name methods across impl blocks.
@@ -360,7 +371,11 @@ const CPP_RULES: CodeRules = CodeRules {
         "enum_specifier",
         "field_declaration",
     ],
-    container_kinds: &["namespace_definition", "class_specifier", "struct_specifier"],
+    container_kinds: &[
+        "namespace_definition",
+        "class_specifier",
+        "struct_specifier",
+    ],
     // Class bodies wrap in `field_declaration_list`; namespaces in
     // `declaration_list`.
     body_kinds: &["field_declaration_list", "declaration_list"],
@@ -410,7 +425,11 @@ const JAVA_RULES: CodeRules = CodeRules {
     ],
     // Member bodies wrap per enclosing kind; method bodies use `block`.
     body_kinds: &["class_body", "interface_body", "enum_body"],
-    opaque_kinds: &["import_declaration", "package_declaration", "module_declaration"],
+    opaque_kinds: &[
+        "import_declaration",
+        "package_declaration",
+        "module_declaration",
+    ],
     name_alts: &[],
     // Full syntactic signatures: parameters, type parameters, return type,
     // and throws clause text. Never method name alone.
@@ -471,7 +490,11 @@ const KOTLIN_RULES: CodeRules = CodeRules {
         "secondary_constructor",
         "primary_constructor",
     ],
-    container_kinds: &["class_declaration", "object_declaration", "companion_object"],
+    container_kinds: &[
+        "class_declaration",
+        "object_declaration",
+        "companion_object",
+    ],
     // Member bodies wrap in `class_body`; function bodies use `block`.
     body_kinds: &["class_body"],
     // Imports use the `import` node (there is no `import_header`).

@@ -30,12 +30,10 @@ use std::time::{Duration, Instant};
 use jiff::SignedDuration;
 
 use crate::coord::clock::Times;
-use crate::coord::rows::{
-    decode_receipt, decode_session, Retained, SweepCursors, RECEIPT_HORIZON,
-};
+use crate::coord::rows::{RECEIPT_HORIZON, Retained, SweepCursors, decode_receipt, decode_session};
 use crate::error::{CoreError, ErrorCode};
-use crate::protocol::Timestamp;
 use crate::protocol::SessionAuthority;
+use crate::protocol::Timestamp;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
 use crate::store::{FactPageBudget, FactRow, Store, StoreError};
 
@@ -144,7 +142,14 @@ pub(crate) fn apply_facts(
             TrackedTable::Ops => &mut working.ops,
         };
 
-        apply_mutation_to_usage(store, fact.table, usage, &fact.key, &fact.expected, fact.value.as_deref())?;
+        apply_mutation_to_usage(
+            store,
+            fact.table,
+            usage,
+            &fact.key,
+            &fact.expected,
+            fact.value.as_deref(),
+        )?;
 
         // Ledger contradiction check: rows == 0 must imply stored_bytes == 0.
         if usage.rows == 0 && usage.stored_bytes != 0 {
@@ -171,20 +176,23 @@ fn apply_mutation_to_usage(
     expected: &FactExpectation,
     value: Option<&[u8]>,
 ) -> Result<(), CoreError> {
-    let k_len = u64::try_from(key.len()).map_err(|_| {
-        CoreError::new(ErrorCode::ELimit, "key length exceeds u64 limit")
-    })?;
+    let k_len = u64::try_from(key.len())
+        .map_err(|_| CoreError::new(ErrorCode::ELimit, "key length exceeds u64 limit"))?;
 
     match (expected, value) {
         (FactExpectation::Absent, Some(new_val)) => {
-            let v_len = u64::try_from(new_val.len()).map_err(|_| {
-                CoreError::new(ErrorCode::ELimit, "value length exceeds u64 limit")
-            })?;
-            usage.rows = usage.rows.checked_add(1).ok_or_else(|| {
-                underflow_or_overflow_corrupt(store, table, "row count overflow")
-            })?;
+            let v_len = u64::try_from(new_val.len())
+                .map_err(|_| CoreError::new(ErrorCode::ELimit, "value length exceeds u64 limit"))?;
+            usage.rows = usage
+                .rows
+                .checked_add(1)
+                .ok_or_else(|| underflow_or_overflow_corrupt(store, table, "row count overflow"))?;
             let row_bytes = k_len.checked_add(v_len).ok_or_else(|| {
-                underflow_or_overflow_corrupt(store, table, "key length + value length overflow u64")
+                underflow_or_overflow_corrupt(
+                    store,
+                    table,
+                    "key length + value length overflow u64",
+                )
             })?;
             usage.stored_bytes = usage.stored_bytes.checked_add(row_bytes).ok_or_else(|| {
                 underflow_or_overflow_corrupt(store, table, "stored bytes overflow")
@@ -231,7 +239,11 @@ fn apply_mutation_to_usage(
                 )
             })?;
             let old_bytes = k_len.checked_add(old_len).ok_or_else(|| {
-                underflow_or_overflow_corrupt(store, table, "key length + old value length overflow u64")
+                underflow_or_overflow_corrupt(
+                    store,
+                    table,
+                    "key length + old value length overflow u64",
+                )
             })?;
             usage.stored_bytes = usage.stored_bytes.checked_sub(old_bytes).ok_or_else(|| {
                 underflow_or_overflow_corrupt(
@@ -256,7 +268,11 @@ fn underflow_or_overflow_corrupt(
     table: FactTable,
     detail: impl Into<String>,
 ) -> CoreError {
-    let msg = format!("retention ledger corruption on {:?}: {}", table, detail.into());
+    let msg = format!(
+        "retention ledger corruption on {:?}: {}",
+        table,
+        detail.into()
+    );
     let _ = store.observe::<()>(Err(StoreError::Corrupt(msg.clone())));
     CoreError::new(ErrorCode::ECorrupt, msg)
 }
@@ -473,7 +489,9 @@ fn is_session_expired(
                     ))));
                     CoreError::new(
                         ErrorCode::ECorrupt,
-                        format!("session active expiry + RECEIPT_HORIZON arithmetic overflow: {err}"),
+                        format!(
+                            "session active expiry + RECEIPT_HORIZON arithmetic overflow: {err}"
+                        ),
                     )
                 })?;
             Ok(Timestamp::new(eligible_instant) <= now)
@@ -545,22 +563,21 @@ impl RetentionClock {
         let safe_wall = std::cmp::min(current.wall, monotonic_bound);
         Ok(Timestamp::new(safe_wall))
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::capability::Capabilities;
     use crate::change::{ChangeId, OperationId, RequestId, SessionId};
     use crate::commit::ProvenanceClaims;
     use crate::coord::policy::Principal;
-    use crate::coord::rows::{encode, receipt_key, session_key, ReceiptRow, SessionRow, Usage};
+    use crate::coord::rows::{ReceiptRow, SessionRow, Usage, encode, receipt_key, session_key};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{
@@ -601,8 +618,8 @@ mod tests {
     fn test_store(tag: &str) -> (TempRoot, Store) {
         let temp = TempRoot::new(tag);
         let budget = Arc::new(PreparationBudget::reference_defaults());
-        let store = Store::create(&temp.store_dir(), HashKind::Sha1, budget)
-            .expect("create test store");
+        let store =
+            Store::create(&temp.store_dir(), HashKind::Sha1, budget).expect("create test store");
         (temp, store)
     }
 
@@ -659,7 +676,10 @@ mod tests {
         let (_temp, store) = test_store("ledger-exact");
         let mut retained = Retained::default();
 
-        let key_r = receipt_key(SessionId::from_bytes([1; 16]), RequestId::from_bytes([2; 16]));
+        let key_r = receipt_key(
+            SessionId::from_bytes([1; 16]),
+            RequestId::from_bytes([2; 16]),
+        );
         let val1 = vec![1, 2, 3, 4, 5]; // 5 bytes
         let val2 = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 8 bytes (grow by 3)
         let val3 = vec![9, 10]; // 2 bytes (shrink by 6)
@@ -745,14 +765,26 @@ mod tests {
     fn ledger_no_partial_update_on_failure() {
         let (_temp, store) = test_store("ledger-no-partial");
         let initial = Retained {
-            receipts: Usage { rows: 10, stored_bytes: 500 },
-            sessions: Usage { rows: 2, stored_bytes: 80 },
-            ops: Usage { rows: 5, stored_bytes: 200 },
+            receipts: Usage {
+                rows: 10,
+                stored_bytes: 500,
+            },
+            sessions: Usage {
+                rows: 2,
+                stored_bytes: 80,
+            },
+            ops: Usage {
+                rows: 5,
+                stored_bytes: 200,
+            },
         };
         let mut retained = initial;
 
         // Batch with 1 valid mutation followed by FactExpectation::Any on tracked table
-        let key_r = receipt_key(SessionId::from_bytes([9; 16]), RequestId::from_bytes([9; 16]));
+        let key_r = receipt_key(
+            SessionId::from_bytes([9; 16]),
+            RequestId::from_bytes([9; 16]),
+        );
         let valid_fact = FactMutation {
             table: FactTable::Receipts,
             key: key_r.to_vec(),
@@ -766,9 +798,13 @@ mod tests {
             value: Some(vec![1, 2, 3]),
         };
 
-        let err = apply_facts(&store, &mut retained, &[valid_fact, invalid_any]).expect_err("any must fail");
+        let err = apply_facts(&store, &mut retained, &[valid_fact, invalid_any])
+            .expect_err("any must fail");
         assert_eq!(err.code, ErrorCode::EInvalid);
-        assert_eq!(retained, initial, "retained ledger must be unchanged after failure");
+        assert_eq!(
+            retained, initial,
+            "retained ledger must be unchanged after failure"
+        );
 
         // Batch with 1 valid mutation followed by underflow delete
         let underflow_delete = FactMutation {
@@ -787,7 +823,10 @@ mod tests {
         let err2 = apply_facts(&store, &mut retained, &[valid_fact2, underflow_delete])
             .expect_err("underflow must fail");
         assert_eq!(err2.code, ErrorCode::ECorrupt);
-        assert_eq!(retained, initial, "retained ledger must be unchanged after underflow failure");
+        assert_eq!(
+            retained, initial,
+            "retained ledger must be unchanged after underflow failure"
+        );
     }
 
     #[test]
@@ -809,9 +848,15 @@ mod tests {
         assert_eq!(err.code, ErrorCode::ECorrupt);
 
         // Store must now be quarantined
-        assert!(store.quarantine(), "store must be quarantined after committed underflow");
+        assert!(
+            store.quarantine(),
+            "store must be quarantined after committed underflow"
+        );
         assert_eq!(
-            store.fact(FactTable::OpHead, b"").expect_err("quarantined").code(),
+            store
+                .fact(FactTable::OpHead, b"")
+                .expect_err("quarantined")
+                .code(),
             ErrorCode::ECorrupt
         );
     }
@@ -820,7 +865,10 @@ mod tests {
     fn ledger_contradiction_zero_rows_non_zero_bytes_corrupt() {
         let (_temp, store) = test_store("ledger-contradiction");
         let mut retained = Retained {
-            receipts: Usage { rows: 1, stored_bytes: 100 },
+            receipts: Usage {
+                rows: 1,
+                stored_bytes: 100,
+            },
             sessions: Usage::default(),
             ops: Usage::default(),
         };
@@ -964,10 +1012,18 @@ mod tests {
                 .expect("sub"),
         );
 
-        let row_s1 = sample_session_row(SessionAuthority::ReceiptsOnly { receipts_until: past_1h });
-        let row_s2 = sample_session_row(SessionAuthority::ReceiptsOnly { receipts_until: future_1h });
-        let row_s3 = sample_session_row(SessionAuthority::Active { idle_expires_at: past_8d });
-        let row_s4 = sample_session_row(SessionAuthority::Active { idle_expires_at: past_2d });
+        let row_s1 = sample_session_row(SessionAuthority::ReceiptsOnly {
+            receipts_until: past_1h,
+        });
+        let row_s2 = sample_session_row(SessionAuthority::ReceiptsOnly {
+            receipts_until: future_1h,
+        });
+        let row_s3 = sample_session_row(SessionAuthority::Active {
+            idle_expires_at: past_8d,
+        });
+        let row_s4 = sample_session_row(SessionAuthority::Active {
+            idle_expires_at: past_2d,
+        });
 
         let enc1 = encode("session", &row_s1).expect("enc");
         let enc2 = encode("session", &row_s2).expect("enc");
@@ -1147,7 +1203,10 @@ mod tests {
         let err = sweep_page(&store, SweepTable::Receipts, SweepCursors::default(), now)
             .expect_err("invalid key width must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
-        assert!(store.quarantine(), "store must be quarantined on invalid key width");
+        assert!(
+            store.quarantine(),
+            "store must be quarantined on invalid key width"
+        );
     }
 
     #[test]
@@ -1171,7 +1230,10 @@ mod tests {
         let err = sweep_page(&store, SweepTable::Sessions, SweepCursors::default(), now)
             .expect_err("invalid session key width must fail");
         assert_eq!(err.code, ErrorCode::ECorrupt);
-        assert!(store.quarantine(), "store must be quarantined on invalid key width");
+        assert!(
+            store.quarantine(),
+            "store must be quarantined on invalid key width"
+        );
     }
 
     #[test]
@@ -1230,7 +1292,12 @@ mod tests {
         assert_eq!(now_backward.instant(), wall_backward);
 
         // 3. Monotonic before initial (saturating safety)
-        let sample_prior_mono = Times::new(base_wall, base_mono.checked_sub(Duration::from_secs(1)).unwrap_or(base_mono));
+        let sample_prior_mono = Times::new(
+            base_wall,
+            base_mono
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or(base_mono),
+        );
         let now_prior = clock.now(&sample_prior_mono).expect("prior mono");
         assert_eq!(now_prior.instant(), base_wall);
     }

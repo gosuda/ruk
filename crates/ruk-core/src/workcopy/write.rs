@@ -17,9 +17,7 @@ use std::path::Path;
 
 use super::crawl::CrawlLimits;
 use super::journal_state::{JournalState, ensure_idle};
-use super::snapshot::{
-    ConflictEdit, DirtySource, Engine, Parts, Policy, meta_mutation, read_meta,
-};
+use super::snapshot::{ConflictEdit, DirtySource, Engine, Parts, Policy, meta_mutation, read_meta};
 use super::statcache::{StatClock, StatusMeta};
 use super::watcher::WatchToken;
 use super::{in_scope, is_internal};
@@ -77,7 +75,9 @@ pub(crate) struct PreparedWrite {
 pub(crate) enum WriteOutcome {
     /// The named paths already match the base tree; `cache` refreshes
     /// their stat rows and records no operation.
-    NoChange { cache: Vec<FactMutation> },
+    NoChange {
+        cache: Vec<FactMutation>,
+    },
     Changed(PreparedWrite),
 }
 

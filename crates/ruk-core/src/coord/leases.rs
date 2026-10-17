@@ -28,9 +28,13 @@ pub(crate) mod table;
 pub(crate) mod timing;
 
 pub(crate) use barrier::{CollectionPhase, Dedupe, RootBarrier, SealedCycle, SweepOutcome};
-pub(crate) use condemned::{CondemnedBuilder, CondemnedSet, BLOCK_LEN, BLOCK_RECORDS, RECORD_LEN};
-pub(crate) use table::{AcquireArgs, BulkProgress, CursorWant, LeaseBinding, LeaseKind, RootOrigin};
-pub(crate) use timing::{BULK_INTERVAL, BULK_NO_PROGRESS, BULK_TOTAL, GRAY_ALLOWANCE_BYTES, INTERACTIVE_TTL};
+pub(crate) use condemned::{BLOCK_LEN, BLOCK_RECORDS, CondemnedBuilder, CondemnedSet, RECORD_LEN};
+pub(crate) use table::{
+    AcquireArgs, BulkProgress, CursorWant, LeaseBinding, LeaseKind, RootOrigin,
+};
+pub(crate) use timing::{
+    BULK_INTERVAL, BULK_NO_PROGRESS, BULK_TOTAL, GRAY_ALLOWANCE_BYTES, INTERACTIVE_TTL,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -88,7 +92,9 @@ impl Drop for OwnerGuard {
 
 impl std::fmt::Debug for OwnerGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnerGuard").field("lease", &self.lease).finish_non_exhaustive()
+        f.debug_struct("OwnerGuard")
+            .field("lease", &self.lease)
+            .finish_non_exhaustive()
     }
 }
 
@@ -167,7 +173,9 @@ impl LeaseRegistry {
 
     /// Locks the state or fails closed on poisoning.
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, CoreError> {
-        self.inner.lock().map_err(|_| CoreError::new(ErrorCode::EIo, "lease registry lock poisoned"))
+        self.inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "lease registry lock poisoned"))
     }
 
     /// Acquires one lease. `args` carries binding, roots, floor, and the
@@ -192,14 +200,20 @@ impl LeaseRegistry {
                 CollectionPhase::SweepPending | CollectionPhase::Sweep
             );
             let needs_lookup = sweep
-                && args.roots.iter().any(|(_, origin)| *origin == RootOrigin::PrePivot);
+                && args
+                    .roots
+                    .iter()
+                    .any(|(_, origin)| *origin == RootOrigin::PrePivot);
             needs_lookup.then(|| (state.barrier.cycle(), state.barrier.condemned()))
         };
         // Phase two, outside the lock: real condemned membership lookups.
         let mut condemned_hits = Vec::new();
         if let Some((cycle, condemned)) = &snapshot {
             let Some(set) = condemned else {
-                return Err(CoreError::new(ErrorCode::ECorrupt, "sweep phase without a condemned set"));
+                return Err(CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "sweep phase without a condemned set",
+                ));
             };
             for (root, origin) in &args.roots {
                 if *origin != RootOrigin::PrePivot {
@@ -273,7 +287,10 @@ impl LeaseRegistry {
                 ));
             }
             if !state.table.owner_live(&owner) {
-                return Err(CoreError::new(ErrorCode::ELeaseLost, "staging owner holds no live lease"));
+                return Err(CoreError::new(
+                    ErrorCode::ELeaseLost,
+                    "staging owner holds no live lease",
+                ));
             }
             let sweep = matches!(
                 state.barrier.phase(),
@@ -284,7 +301,10 @@ impl LeaseRegistry {
         };
         if let Some((cycle, condemned)) = snapshot {
             let Some(set) = condemned else {
-                return Err(CoreError::new(ErrorCode::ECorrupt, "sweep phase without a condemned set"));
+                return Err(CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "sweep phase without a condemned set",
+                ));
             };
             let member = set.contains(&head)?;
             let state = self.lock()?;
@@ -292,7 +312,10 @@ impl LeaseRegistry {
         }
         let mut state = self.lock()?;
         if !state.table.owner_live(&owner) {
-            return Err(CoreError::new(ErrorCode::ELeaseLost, "staging owner holds no live lease"));
+            return Err(CoreError::new(
+                ErrorCode::ELeaseLost,
+                "staging owner holds no live lease",
+            ));
         }
         state
             .live_roots
@@ -356,7 +379,9 @@ impl LeaseRegistry {
         let mut state = self.lock()?;
         // A completed page is admitted work: stamp the renewal before the
         // sweep may judge silence, matching report_progress ordering.
-        let result = state.table.account_page(lease, rows, bytes, position_len, now);
+        let result = state
+            .table
+            .account_page(lease, rows, bytes, position_len, now);
         state.table.sweep_expiry(now);
         result
     }
@@ -382,7 +407,10 @@ impl LeaseRegistry {
             .checked_mul(record)
             .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "frontier charge overflows u64"))?;
         let charge = self.books.reserve(bytes).map_err(|refused| {
-            CoreError::new(ErrorCode::ELimit, format!("frontier budget refused: {refused}"))
+            CoreError::new(
+                ErrorCode::ELimit,
+                format!("frontier budget refused: {refused}"),
+            )
         })?;
         let snapshot: Vec<Head> = state.live_roots.keys().copied().collect();
         Ok(FrontierSnapshot {
@@ -443,7 +471,9 @@ impl LeaseRegistry {
         candidate_epoch: u64,
         condemned: Arc<CondemnedSet>,
     ) -> Result<SealedCycle, CoreError> {
-        self.lock()?.barrier.seal_candidate(cycle, candidate_epoch, condemned)
+        self.lock()?
+            .barrier
+            .seal_candidate(cycle, candidate_epoch, condemned)
     }
 
     /// Applies the parent's sweep-record commit outcome.
@@ -475,7 +505,10 @@ impl LeaseRegistry {
         };
         let (cycle, condemned) = snapshot;
         let Some(set) = condemned else {
-            return Err(CoreError::new(ErrorCode::ECorrupt, "sweep phase without a condemned set"));
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "sweep phase without a condemned set",
+            ));
         };
         let member = set.contains(head)?;
         self.lock()?.barrier.confirm_dedupe(cycle, member)
@@ -486,12 +519,14 @@ impl LeaseRegistry {
     /// against this pin under sole lane ownership before pruning.
     pub(crate) fn min_retained_floor(&self) -> Result<Option<OperationId>, CoreError> {
         let state = self.lock()?;
-        Ok(match (state.table.min_lease_floor(), state.barrier.cycle_floor()) {
-            (Some(lease), Some(cycle)) => Some(OperationId(lease.0.min(cycle.0))),
-            (Some(lease), None) => Some(lease),
-            (None, Some(cycle)) => Some(cycle),
-            (None, None) => None,
-        })
+        Ok(
+            match (state.table.min_lease_floor(), state.barrier.cycle_floor()) {
+                (Some(lease), Some(cycle)) => Some(OperationId(lease.0.min(cycle.0))),
+                (Some(lease), None) => Some(lease),
+                (None, Some(cycle)) => Some(cycle),
+                (None, None) => None,
+            },
+        )
     }
 
     /// Copied rows and bytes recorded for `lease`.
@@ -580,16 +615,30 @@ mod tests {
         let clock = test_clock();
         let registry = LeaseRegistry::new(clock.clone(), scratch_dir("expiry"));
         let start = now(&clock);
-        let (id, observer, guard) = registry.acquire(args(LeaseKind::Interactive, vec![(head(1), RootOrigin::PostPivot)]), start).expect("acquire");
+        let (id, observer, guard) = registry
+            .acquire(
+                args(
+                    LeaseKind::Interactive,
+                    vec![(head(1), RootOrigin::PostPivot)],
+                ),
+                start,
+            )
+            .expect("acquire");
         assert_eq!(guard.lease(), Some(id));
         let _ = registry.clock().sample().expect("clock samples");
         let late = start + INTERACTIVE_TTL;
         // Sweep with an explicit late sample: authority lapses and fires.
         registry.lock().expect("lock").table.sweep_expiry(late);
-        assert_eq!(observer.check().expect_err("cancelled").code, ErrorCode::ECancelled);
+        assert_eq!(
+            observer.check().expect_err("cancelled").code,
+            ErrorCode::ECancelled
+        );
         // Held work keeps slot, roots, and prune floor: expired but protected.
         assert_eq!(registry.lease_count().expect("count"), 1);
-        assert_eq!(registry.min_retained_floor().expect("floor"), Some(OperationId(5)));
+        assert_eq!(
+            registry.min_retained_floor().expect("floor"),
+            Some(OperationId(5))
+        );
         assert!(!registry.frontier_snapshot().expect("snapshot").is_empty());
         drop(guard);
         registry.release_owner(&id);
@@ -604,8 +653,9 @@ mod tests {
         let clock = test_clock();
         let registry = LeaseRegistry::new(clock.clone(), scratch_dir("binding"));
         let start = now(&clock);
-        let (id, _observer, _guard) =
-            registry.acquire(args(LeaseKind::Interactive, Vec::new()), start).expect("acquire");
+        let (id, _observer, _guard) = registry
+            .acquire(args(LeaseKind::Interactive, Vec::new()), start)
+            .expect("acquire");
         let cursor = PageCursor {
             store: StoreId::from_bytes([1; 16]),
             view: OperationId(7),
@@ -625,7 +675,9 @@ mod tests {
                 view: OperationId(view),
                 query: QueryDigest::from_bytes(query),
             };
-            let err = registry.check_cursor(&cursor, &want, start).expect_err("mismatch forbids");
+            let err = registry
+                .check_cursor(&cursor, &want, start)
+                .expect_err("mismatch forbids");
             assert_eq!(err.code, ErrorCode::EForbidden);
         }
         let _ = std::fs::remove_dir_all(scratch_dir("binding"));
@@ -636,7 +688,9 @@ mod tests {
         let clock = test_clock();
         let registry = LeaseRegistry::new(clock.clone(), scratch_dir("bulk"));
         let start = now(&clock);
-        let (id, _observer, _guard) = registry.acquire(args(LeaseKind::Bulk, Vec::new()), start).expect("acquire");
+        let (id, _observer, _guard) = registry
+            .acquire(args(LeaseKind::Bulk, Vec::new()), start)
+            .expect("acquire");
         // Admitted progress every minute for the full lifetime still dies at 2h.
         // After the first admitted work stamps progress, the silence window
         // is 30 seconds, so admitted-work reports must arrive faster than that
@@ -645,7 +699,9 @@ mod tests {
         let mut step = Duration::from_secs(60);
         while at + step < start + BULK_TOTAL {
             at += step;
-            registry.report_progress(&id, BulkProgress::AdmittedWork, at).expect("renew");
+            registry
+                .report_progress(&id, BulkProgress::AdmittedWork, at)
+                .expect("renew");
             step = BULK_NO_PROGRESS - Duration::from_secs(5);
         }
         let err = registry
@@ -660,8 +716,13 @@ mod tests {
         let clock = test_clock();
         let registry = LeaseRegistry::new(clock.clone(), scratch_dir("floor"));
         let start = now(&clock);
-        let (id, _observer, guard) = registry.acquire(args(LeaseKind::Bulk, Vec::new()), start).expect("acquire");
-        assert_eq!(registry.min_retained_floor().expect("floor"), Some(OperationId(5)));
+        let (id, _observer, guard) = registry
+            .acquire(args(LeaseKind::Bulk, Vec::new()), start)
+            .expect("acquire");
+        assert_eq!(
+            registry.min_retained_floor().expect("floor"),
+            Some(OperationId(5))
+        );
         // Early release retires the lease at once with its floor pin.
         guard.release();
         assert_eq!(registry.lease_count().expect("count"), 0);
@@ -678,20 +739,33 @@ mod tests {
         let cycle = registry.cycle().expect("cycle");
         // Raw insertion racing mark closure lands in gray and moves the epoch.
         let epoch_before = registry.root_epoch().expect("epoch");
-        let (_id, _observer, _guard) =
-            registry.acquire(args(LeaseKind::Bulk, vec![(head(4), RootOrigin::PrePivot)]), start).expect("acquire");
+        let (_id, _observer, _guard) = registry
+            .acquire(
+                args(LeaseKind::Bulk, vec![(head(4), RootOrigin::PrePivot)]),
+                start,
+            )
+            .expect("acquire");
         assert!(registry.root_epoch().expect("epoch") > epoch_before);
         registry.finish_enumeration(cycle).expect("finish");
         let err = registry
             .seal_candidate(cycle, epoch_before, Arc::new(CondemnedSet::empty(cycle)))
             .expect_err("stale candidate epoch");
         assert_eq!(err.code, ErrorCode::EStale);
-        registry.drain_gray(registry.root_epoch().expect("epoch")).expect("drain");
+        registry
+            .drain_gray(registry.root_epoch().expect("epoch"))
+            .expect("drain");
         let token = registry
-            .seal_candidate(cycle, registry.root_epoch().expect("epoch"), Arc::new(CondemnedSet::empty(cycle)))
+            .seal_candidate(
+                cycle,
+                registry.root_epoch().expect("epoch"),
+                Arc::new(CondemnedSet::empty(cycle)),
+            )
             .expect("seal after drain");
         assert_eq!(token.pivot(), 100);
-        assert_eq!(registry.phase().expect("phase"), CollectionPhase::SweepPending);
+        assert_eq!(
+            registry.phase().expect("phase"),
+            CollectionPhase::SweepPending
+        );
         let _ = std::fs::remove_dir_all(scratch_dir("closure"));
     }
 
@@ -732,23 +806,34 @@ mod tests {
         let set = Arc::new(builder.seal(cycle).expect("seal"));
         let epoch = registry.root_epoch().expect("epoch");
         let token = registry.seal_candidate(cycle, epoch, set).expect("seal");
-        registry.sweep_record_outcome(&token, SweepOutcome::Committed).expect("sweep");
+        registry
+            .sweep_record_outcome(&token, SweepOutcome::Committed)
+            .expect("sweep");
         // Pre-pivot condemned root: E_LIMIT before any lease exists.
         let err = registry
-            .acquire(args(LeaseKind::Bulk, vec![(head(6), RootOrigin::PrePivot)]), start)
+            .acquire(
+                args(LeaseKind::Bulk, vec![(head(6), RootOrigin::PrePivot)]),
+                start,
+            )
             .expect_err("condemned reuse");
         assert_eq!(err.code, ErrorCode::ELimit);
         assert_eq!(registry.lease_count().expect("count"), 0);
         // Post-pivot root stays live in the same phase.
         registry
-            .acquire(args(LeaseKind::Bulk, vec![(head(6), RootOrigin::PostPivot)]), start)
+            .acquire(
+                args(LeaseKind::Bulk, vec![(head(6), RootOrigin::PostPivot)]),
+                start,
+            )
             .expect("post-pivot live");
         // Dedupe agrees: member rejects, fresh root retains its locator.
         assert_eq!(
             registry.check_dedupe(&head(6)).expect_err("member").code,
             ErrorCode::ELimit
         );
-        assert_eq!(registry.check_dedupe(&head(9)).expect("fresh"), Dedupe::RetainOriginal);
+        assert_eq!(
+            registry.check_dedupe(&head(9)).expect("fresh"),
+            Dedupe::RetainOriginal
+        );
         let _ = std::fs::remove_dir_all(scratch_dir("condemned"));
     }
 
@@ -765,12 +850,20 @@ mod tests {
         let token = registry
             .seal_candidate(cycle, registry.root_epoch().expect("epoch"), set)
             .expect("seal");
-        registry.sweep_record_outcome(&token, SweepOutcome::Committed).expect("sweep");
-        assert_eq!(registry.check_dedupe(&head(1)).expect_err("member").code, ErrorCode::ELimit);
+        registry
+            .sweep_record_outcome(&token, SweepOutcome::Committed)
+            .expect("sweep");
+        assert_eq!(
+            registry.check_dedupe(&head(1)).expect_err("member").code,
+            ErrorCode::ELimit
+        );
         registry.complete_sweep(&token).expect("complete");
         // The old cycle's verdict never leaks into the new one: the same
         // object retains its original locator once the sweep closes.
-        assert_eq!(registry.check_dedupe(&head(1)).expect("fresh cycle"), Dedupe::RetainOriginal);
+        assert_eq!(
+            registry.check_dedupe(&head(1)).expect("fresh cycle"),
+            Dedupe::RetainOriginal
+        );
         let _ = std::fs::remove_dir_all(scratch_dir("rollover"));
     }
 
@@ -782,7 +875,11 @@ mod tests {
         let cycle = registry.cycle().expect("cycle");
         registry.finish_enumeration(cycle).expect("finish");
         let token = registry
-            .seal_candidate(cycle, registry.root_epoch().expect("epoch"), Arc::new(CondemnedSet::empty(cycle)))
+            .seal_candidate(
+                cycle,
+                registry.root_epoch().expect("epoch"),
+                Arc::new(CondemnedSet::empty(cycle)),
+            )
             .expect("seal");
         registry
             .sweep_record_outcome(&token, SweepOutcome::DefiniteFailure)
@@ -795,7 +892,11 @@ mod tests {
         let cycle2 = registry2.cycle().expect("cycle");
         registry2.finish_enumeration(cycle2).expect("finish");
         let token2 = registry2
-            .seal_candidate(cycle2, registry2.root_epoch().expect("epoch"), Arc::new(CondemnedSet::empty(cycle2)))
+            .seal_candidate(
+                cycle2,
+                registry2.root_epoch().expect("epoch"),
+                Arc::new(CondemnedSet::empty(cycle2)),
+            )
             .expect("seal");
         registry2
             .sweep_record_outcome(&token2, SweepOutcome::Ambiguous)
@@ -879,7 +980,11 @@ mod tests {
         let mut builder = registry.condemned_builder();
         builder.push(&head(6)).expect("push");
         let token = registry
-            .seal_candidate(cycle, registry.root_epoch().expect("epoch"), Arc::new(builder.seal(cycle).expect("seal")))
+            .seal_candidate(
+                cycle,
+                registry.root_epoch().expect("epoch"),
+                Arc::new(builder.seal(cycle).expect("seal")),
+            )
             .expect("seal");
         registry
             .sweep_record_outcome(&token, SweepOutcome::Committed)
@@ -932,7 +1037,10 @@ mod tests {
                     for round in 0..25_u8 {
                         let root = head(worker.wrapping_mul(32).wrapping_add(round));
                         let (id, _observer, guard) = registry
-                            .acquire(args(LeaseKind::Interactive, vec![(root, RootOrigin::PostPivot)]), start)
+                            .acquire(
+                                args(LeaseKind::Interactive, vec![(root, RootOrigin::PostPivot)]),
+                                start,
+                            )
                             .expect("concurrent acquire");
                         registry
                             .stage_raw_root(head(200), RootOrigin::PostPivot, id)

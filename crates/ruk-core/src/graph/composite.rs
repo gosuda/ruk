@@ -25,7 +25,7 @@ use crate::graph::folding::{fold_segments, select_folding_chain};
 use crate::graph::segment::{ChangeIdPage, GraphSegment, GraphSegmentWriter, StagedCommit};
 use crate::graph::traversal::GraphAccess;
 use crate::graph::types::{
-    Generation, GlobalPosition, LocalPosition, PrefixResolution, MAX_GRAPH_POSITIONS,
+    Generation, GlobalPosition, LocalPosition, MAX_GRAPH_POSITIONS, PrefixResolution,
 };
 use crate::heads::Head;
 use crate::ids::HashKind;
@@ -92,7 +92,9 @@ impl GraphIndex {
         if (expected_parent_commits as u64) > (MAX_GRAPH_POSITIONS as u64) {
             return Err(CoreError::new(
                 ErrorCode::ECapacity,
-                format!("composite index total commits {expected_parent_commits} exceeds 2^31 capacity"),
+                format!(
+                    "composite index total commits {expected_parent_commits} exceeds 2^31 capacity"
+                ),
             ));
         }
 
@@ -139,7 +141,10 @@ impl GraphIndex {
     }
 
     /// Finds the owning segment and local position for `pos`.
-    pub(crate) fn find_segment_for_pos(&self, pos: GlobalPosition) -> Result<(&GraphSegment, LocalPosition), CoreError> {
+    pub(crate) fn find_segment_for_pos(
+        &self,
+        pos: GlobalPosition,
+    ) -> Result<(&GraphSegment, LocalPosition), CoreError> {
         let raw = pos.as_u32();
         for seg in self.segments_oldest_first.iter().rev() {
             let start = seg.num_parent_commits();
@@ -169,7 +174,10 @@ impl GraphIndex {
     }
 
     /// Resolves parents at `pos`.
-    pub(crate) fn pos_to_parents(&self, pos: GlobalPosition) -> Result<SmallVec<[GlobalPosition; 2]>, CoreError> {
+    pub(crate) fn pos_to_parents(
+        &self,
+        pos: GlobalPosition,
+    ) -> Result<SmallVec<[GlobalPosition; 2]>, CoreError> {
         let (seg, lpos) = self.find_segment_for_pos(pos)?;
         seg.parents_at(lpos)
     }
@@ -200,7 +208,9 @@ impl GraphIndex {
         limit: usize,
     ) -> Result<DivergentPage<Head>, CoreError> {
         let page_bound = limit.min(64);
-        let start_seg = cursor.map(|c| c.segment_idx).unwrap_or(self.segments_oldest_first.len());
+        let start_seg = cursor
+            .map(|c| c.segment_idx)
+            .unwrap_or(self.segments_oldest_first.len());
         let mut overflow_offset = cursor.map(|c| c.overflow_offset).unwrap_or(0);
         let mut heads = SmallVec::new();
         let mut total_divergent = 0usize;
@@ -277,7 +287,9 @@ impl GraphIndex {
         limit: usize,
     ) -> Result<DivergentPage<GlobalPosition>, CoreError> {
         let page_bound = limit.min(64);
-        let start_seg = cursor.map(|c| c.segment_idx).unwrap_or(self.segments_oldest_first.len());
+        let start_seg = cursor
+            .map(|c| c.segment_idx)
+            .unwrap_or(self.segments_oldest_first.len());
         let mut overflow_offset = cursor.map(|c| c.overflow_offset).unwrap_or(0);
         let mut positions = SmallVec::new();
         let mut total_divergent = 0usize;
@@ -289,7 +301,8 @@ impl GraphIndex {
             total_divergent += page.total_count;
 
             for lpos in page.items {
-                let gpos = GlobalPosition::from_raw_checked(seg.num_parent_commits() + lpos.as_u32());
+                let gpos =
+                    GlobalPosition::from_raw_checked(seg.num_parent_commits() + lpos.as_u32());
                 if !positions.contains(&gpos) {
                     positions.push(gpos);
                 }
@@ -332,7 +345,10 @@ impl GraphIndex {
     }
 
     /// Indexed prefix lookup against commit heads across segments; stops on ambiguity.
-    pub(crate) fn resolve_head_prefix(&self, prefix: &str) -> Result<PrefixResolution<Head>, CoreError> {
+    pub(crate) fn resolve_head_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<PrefixResolution<Head>, CoreError> {
         let mut resolution = PrefixResolution::NoMatch;
         for seg in self.segments_oldest_first.iter().rev() {
             let seg_res = seg.resolve_head_prefix(prefix)?;
@@ -346,7 +362,10 @@ impl GraphIndex {
     }
 
     /// Indexed prefix lookup against change IDs across segments; stops on ambiguity.
-    pub(crate) fn resolve_change_id_prefix(&self, prefix: &str) -> Result<PrefixResolution<ChangeId>, CoreError> {
+    pub(crate) fn resolve_change_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<PrefixResolution<ChangeId>, CoreError> {
         let mut resolution = PrefixResolution::NoMatch;
         for seg in self.segments_oldest_first.iter().rev() {
             let seg_res = seg.resolve_change_id_prefix(prefix)?;
@@ -433,7 +452,8 @@ impl GraphIndexBuilder {
         }
 
         let generation = Generation::from_parents(&parent_generations);
-        let current_total = (self.base_index.num_total_commits() as u64) + (self.staged.len() as u64);
+        let current_total =
+            (self.base_index.num_total_commits() as u64) + (self.staged.len() as u64);
         if current_total >= (MAX_GRAPH_POSITIONS as u64) {
             return Err(CoreError::new(
                 ErrorCode::ECapacity,
@@ -478,12 +498,8 @@ impl GraphIndexBuilder {
 
         let (segments_to_fold, base_parent) = select_folding_chain(&child_seg);
         if segments_to_fold.len() > 1 {
-            let folded_seg = fold_segments(
-                &segments_to_fold,
-                base_parent.as_ref(),
-                hash_kind,
-                budget,
-            )?;
+            let folded_seg =
+                fold_segments(&segments_to_fold, base_parent.as_ref(), hash_kind, budget)?;
             let mut final_segments = Vec::new();
             if let Some(base) = base_parent {
                 for seg in self.base_index.segments() {

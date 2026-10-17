@@ -42,9 +42,8 @@ impl Authentication {
             let principal = authorize_peer(&stream, &policy, cancel);
             (stream, principal)
         });
-        let (admitted, (mut stream, principal)) = timeout_at(deadline, work)
-            .await
-            .map_err(|_| {
+        let (admitted, (mut stream, principal)) =
+            timeout_at(deadline, work).await.map_err(|_| {
                 CoreError::new(
                     ErrorCode::ECoordinatorUnresponsive,
                     "coordinator authentication deadline expired",

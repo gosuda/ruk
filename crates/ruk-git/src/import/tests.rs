@@ -65,9 +65,10 @@ fn loose_repo() -> (Fixture, Store, TestOids) {
     // Re-sort: entries must be ordered ` \xff\xfe` < `file` < `sub`.
     let tree_oid = fixture.loose("tree", &tree_payload);
     let (_id, header) = change_hex(0x11);
-    let extra = format!("{header}x-custom yes\nmergetag first\nmergetag second\ngpgsig -----BEGIN\n \n -----END\n");
-    let (commit_payload, commit) =
-        fixture.commit(tree_oid, &[], extra.as_bytes(), b"initial\n");
+    let extra = format!(
+        "{header}x-custom yes\nmergetag first\nmergetag second\ngpgsig -----BEGIN\n \n -----END\n"
+    );
+    let (commit_payload, commit) = fixture.commit(tree_oid, &[], extra.as_bytes(), b"initial\n");
     let (tag_payload, tag) = fixture.tag(commit, "commit", b"v1");
     fixture.write_ref("refs/heads/main", commit);
     fixture.write_ref("refs/tags/v1", tag);
@@ -116,7 +117,11 @@ fn loose_import_preserves_bytes_and_refs() {
     for (oid, kind, payload) in [
         (oids.blob, ObjectKind::Blob, b"hello\n".as_slice()),
         (oids.tree, ObjectKind::Tree, oids.tree_payload.as_slice()),
-        (oids.commit, ObjectKind::Commit, oids.commit_payload.as_slice()),
+        (
+            oids.commit,
+            ObjectKind::Commit,
+            oids.commit_payload.as_slice(),
+        ),
         (oids.tag, ObjectKind::Tag, oids.tag_payload.as_slice()),
     ] {
         let (kind_got, bytes) = read_object(&store, oid);
@@ -163,14 +168,15 @@ fn reimport_is_idempotent() {
     let (fixture, store, oids) = loose_repo();
     let progress = ImportProgress::new();
     let mut sink = DirectPublish(&store);
-    import_repository(&store, &fixture.request(1, b"origin"), &progress, &mut sink)
-        .expect("first");
-    let report =
-        import_repository(&store, &fixture.request(2, b"origin"), &progress, &mut sink)
-            .expect("second");
+    import_repository(&store, &fixture.request(1, b"origin"), &progress, &mut sink).expect("first");
+    let report = import_repository(&store, &fixture.request(2, b"origin"), &progress, &mut sink)
+        .expect("second");
 
     for name in ["refs/heads/main", "refs/tags/v1"] {
-        assert_eq!(outcome(&report, name).decision, super::RefDecision::Unchanged);
+        assert_eq!(
+            outcome(&report, name).decision,
+            super::RefDecision::Unchanged
+        );
     }
     assert_eq!(report.commits.known, vec![oids.commit]);
     assert!(report.commits.new_changes.is_empty());
@@ -182,8 +188,7 @@ fn known_change_id_with_new_oid_diverges() {
     let (fixture, store, oids) = loose_repo();
     let progress = ImportProgress::new();
     let mut sink = DirectPublish(&store);
-    import_repository(&store, &fixture.request(1, b"origin"), &progress, &mut sink)
-        .expect("first");
+    import_repository(&store, &fixture.request(1, b"origin"), &progress, &mut sink).expect("first");
 
     let second = Fixture::sha1();
     let blob = second.blob(b"different\n");
@@ -229,8 +234,8 @@ fn ref_moves_without_base_conflict_and_keep_local() {
     let (_, commit_b) = second.commit(tree_b, &[], b"", b"b\n");
     second.write_ref("refs/heads/main", commit_b);
 
-    let report = import_repository(&store, &second.request(2, b"s2"), &progress, &mut sink)
-        .expect("second");
+    let report =
+        import_repository(&store, &second.request(2, b"s2"), &progress, &mut sink).expect("second");
     assert_eq!(
         outcome(&report, "refs/heads/main").decision,
         super::RefDecision::Conflicted {
@@ -244,8 +249,8 @@ fn ref_moves_without_base_conflict_and_keep_local() {
 
     // Reimporting the same source now sees a natively kept ref: the source
     // did not move since the observation, so the local ref stays.
-    let report = import_repository(&store, &second.request(3, b"s2"), &progress, &mut sink)
-        .expect("third");
+    let report =
+        import_repository(&store, &second.request(3, b"s2"), &progress, &mut sink).expect("third");
     assert_eq!(
         outcome(&report, "refs/heads/main").decision,
         super::RefDecision::KeptLocal {
@@ -270,8 +275,8 @@ fn symbolic_refs_diverge_without_merge() {
     let store = first.store();
     let progress = ImportProgress::new();
     let mut sink = DirectPublish(&store);
-    let report = import_repository(&store, &first.request(1, b"s1"), &progress, &mut sink)
-        .expect("first");
+    let report =
+        import_repository(&store, &first.request(1, b"s1"), &progress, &mut sink).expect("first");
     assert_eq!(
         outcome(&report, "refs/heads/alias").decision,
         super::RefDecision::Created
@@ -287,8 +292,8 @@ fn symbolic_refs_diverge_without_merge() {
         "ref: refs/heads/other\n",
     )
     .expect("symref");
-    let report = import_repository(&store, &second.request(2, b"s2"), &progress, &mut sink)
-        .expect("second");
+    let report =
+        import_repository(&store, &second.request(2, b"s2"), &progress, &mut sink).expect("second");
     assert_eq!(
         outcome(&report, "refs/heads/alias").decision,
         super::RefDecision::SymbolicDiverged {
@@ -312,8 +317,8 @@ fn noncanonical_change_id_falls_back_to_oid() {
     let store = fixture.store();
     let progress = ImportProgress::new();
     let mut sink = DirectPublish(&store);
-    let report = import_repository(&store, &fixture.request(1, b"o"), &progress, &mut sink)
-        .expect("import");
+    let report =
+        import_repository(&store, &fixture.request(1, b"o"), &progress, &mut sink).expect("import");
     assert_eq!(report.commits.noncanonical_change_ids, vec![commit]);
     assert_eq!(report.commits.new_changes.len(), 1);
     assert_eq!(report.commits.new_changes[0].1, commit);
@@ -333,17 +338,9 @@ fn packed_repo(format: IndexFormat) -> (Fixture, Store, PackIds) {
         (false, b"base.txt", base_oid),
         (false, b"derived.txt", derived_oid),
     ]);
-    let commit_payload = Fixture::commit_payload(
-        fixture.oid("tree", &tree_payload),
-        &[],
-        b"",
-        b"packed\n",
-    );
-    let tag_payload = Fixture::tag_payload(
-        fixture.oid("commit", &commit_payload),
-        "commit",
-        b"v1",
-    );
+    let commit_payload =
+        Fixture::commit_payload(fixture.oid("tree", &tree_payload), &[], b"", b"packed\n");
+    let tag_payload = Fixture::tag_payload(fixture.oid("commit", &commit_payload), "commit", b"v1");
     let oids = fixture.pack(
         &[
             PackObject::full(3, base_payload.clone()),
@@ -473,7 +470,12 @@ fn corrupt_object_fails_without_ref_facts() {
         .expect_err("corrupt");
     assert!(matches!(error, GitError::Corrupt { .. }), "{error:?}");
     let key = observation_key(b"o", &ref_name("refs/heads/main"));
-    assert_eq!(store.fact(FactTable::RemoteObservations, &key).expect("fact"), None);
+    assert_eq!(
+        store
+            .fact(FactTable::RemoteObservations, &key)
+            .expect("fact"),
+        None
+    );
 }
 
 #[test]
@@ -505,8 +507,8 @@ fn empty_source_is_noop() {
         inner: DirectPublish(&store),
         calls: 0,
     };
-    let report = import_repository(&store, &fixture.request(1, b"o"), &progress, &mut sink)
-        .expect("empty");
+    let report =
+        import_repository(&store, &fixture.request(1, b"o"), &progress, &mut sink).expect("empty");
     assert_eq!(report.objects, 0);
     assert_eq!(report.batches, 0);
     assert!(report.refs.is_empty());
@@ -552,8 +554,8 @@ fn shallow_boundary_is_recorded() {
     fixture.write_shallow(&[oids.commit]);
     let progress = ImportProgress::new();
     let mut sink = DirectPublish(&store);
-    let report = import_repository(&store, &fixture.request(1, b"o"), &progress, &mut sink)
-        .expect("import");
+    let report =
+        import_repository(&store, &fixture.request(1, b"o"), &progress, &mut sink).expect("import");
     assert_eq!(report.shallow, vec![oids.commit]);
     let key = super::refs::shallow_key(oids.commit);
     assert_eq!(
@@ -565,7 +567,12 @@ fn shallow_boundary_is_recorded() {
 #[test]
 fn object_links_cover_all_kinds() {
     let hash = HashKind::Sha1;
-    assert!(object_links(ObjectKind::Blob, b"data", hash).expect("blob").links.is_empty());
+    assert!(
+        object_links(ObjectKind::Blob, b"data", hash)
+            .expect("blob")
+            .links
+            .is_empty()
+    );
 
     let blob = HashKind::Sha1.hash_git_object("blob", b"f").expect("blob");
     let tree_hex = blob.to_hex();

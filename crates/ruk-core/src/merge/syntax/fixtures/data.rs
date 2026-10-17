@@ -207,9 +207,7 @@ pub fn fixtures() -> Vec<Fixture> {
             base: "<div><p>x</p></div>\n<script>let a = 1;</script>\n",
             ours: "<div><p>x</p></div>\n<script>let a = 2;</script>\n",
             theirs: "<div><p>X</p></div>\n<script>let a = 1;</script>\n",
-            expect: Expectation::Merge(
-                "<div><p>X</p></div>\n<script>let a = 2;</script>\n",
-            ),
+            expect: Expectation::Merge("<div><p>X</p></div>\n<script>let a = 2;</script>\n"),
         },
     ]
 }

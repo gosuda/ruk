@@ -36,13 +36,15 @@ mod tests;
 use std::collections::HashMap;
 use std::fmt;
 
+use ruk_core::ByteString;
 use ruk_core::change::OperationId;
 use ruk_core::conflict::Signature;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::refdata::RefTarget;
 use ruk_core::records::ImportBatch;
-use ruk_core::store::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject, Publication, Store};
-use ruk_core::ByteString;
+use ruk_core::refdata::RefTarget;
+use ruk_core::store::{
+    FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject, Publication, Store,
+};
 
 use crate::GitError;
 
@@ -217,10 +219,15 @@ pub fn import_repository(
     let shallow = walk::ShallowSet::read_shallow_file(request.git_dir, store.hash_kind())?;
 
     let mut walker = walk::Walker::new(&source, request.limits.max_frontier);
-    walker.seed(source_refs.refs.iter().filter_map(|candidate| match &candidate.target {
-        RefTarget::Direct(oid) => Some((*oid, None, None)),
-        RefTarget::Symbolic(_) => None,
-    }))?;
+    walker.seed(
+        source_refs
+            .refs
+            .iter()
+            .filter_map(|candidate| match &candidate.target {
+                RefTarget::Direct(oid) => Some((*oid, None, None)),
+                RefTarget::Symbolic(_) => None,
+            }),
+    )?;
     if let Some(SourceHead::Detached(oid)) = &head {
         walker.seed(core::iter::once((*oid, None, None)))?;
     }
@@ -245,7 +252,11 @@ pub fn import_repository(
         }
         shallow_seen.push(oid);
         let key = refs::shallow_key(oid);
-        if store.fact(FactTable::Shallow, &key).map_err(GitError::from)?.is_none() {
+        if store
+            .fact(FactTable::Shallow, &key)
+            .map_err(GitError::from)?
+            .is_none()
+        {
             shallow_facts.push(FactMutation {
                 table: FactTable::Shallow,
                 key,
@@ -367,7 +378,11 @@ impl<'a, 'p> Batcher<'a, 'p> {
 
     /// Publishes everything staged with `extra` facts. Empty batches
     /// publish nothing and advance no generation.
-    fn flush(&mut self, sink: &mut dyn PublishSink, extra: Vec<FactMutation>) -> Result<(), GitError> {
+    fn flush(
+        &mut self,
+        sink: &mut dyn PublishSink,
+        extra: Vec<FactMutation>,
+    ) -> Result<(), GitError> {
         if self.progress.is_cancelled() {
             return Err(GitError::Cancelled {
                 detail: "import cancelled".to_owned(),
@@ -376,15 +391,15 @@ impl<'a, 'p> Batcher<'a, 'p> {
         let pending = core::mem::take(&mut self.objects);
         self.bytes = 0;
         let staged = core::mem::replace(&mut self.records, ImportBatch::new(self.store));
-        let (mut staged_objects, mut staged_facts) =
-            staged.into_parts().map_err(GitError::from)?;
-        if pending.is_empty() && staged_objects.is_empty() && staged_facts.is_empty() && extra.is_empty() {
+        let (mut staged_objects, mut staged_facts) = staged.into_parts().map_err(GitError::from)?;
+        if pending.is_empty()
+            && staged_objects.is_empty()
+            && staged_facts.is_empty()
+            && extra.is_empty()
+        {
             return Ok(());
         }
-        let count = u64_len(
-            pending.len() + staged_objects.len(),
-            "batch objects",
-        )?;
+        let count = u64_len(pending.len() + staged_objects.len(), "batch objects")?;
         let mut objects = pending;
         objects.append(&mut staged_objects);
         staged_facts.extend(extra);

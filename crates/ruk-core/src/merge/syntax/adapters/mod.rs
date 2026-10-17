@@ -228,12 +228,7 @@ pub trait Adapter {
     /// default is no descent: the unit is atomic and any double change
     /// declines. Implementations read the defining `node` from the parsed
     /// tree; child ranges must lie strictly inside the unit range.
-    fn children(
-        &self,
-        _tree: &ParsedTree,
-        _source: &[u8],
-        _node: u32,
-    ) -> Vec<SourceUnit> {
+    fn children(&self, _tree: &ParsedTree, _source: &[u8], _node: u32) -> Vec<SourceUnit> {
         Vec::new()
     }
 
@@ -303,12 +298,7 @@ pub fn slice_range(source: &[u8], start: u32, end: u32) -> Option<&[u8]> {
 /// edge, or — for grammars that put the declarator on a differently named
 /// edge — the first candidate in `alt_fields`. Returns an empty vector when
 /// no name edge exists; callers treat empty names as unnamed units.
-pub fn declared_name(
-    tree: &ParsedTree,
-    source: &[u8],
-    node: u32,
-    alt_fields: &[&str],
-) -> Vec<u8> {
+pub fn declared_name(tree: &ParsedTree, source: &[u8], node: u32, alt_fields: &[&str]) -> Vec<u8> {
     if let Some(name) = tree.child_with_field(node, "name") {
         return tree.text_of(name, source).to_vec();
     }

@@ -16,7 +16,10 @@ fn main() {
         .warnings(false)
         .compile("tree_sitter_vue_vendored");
 
-    println!("cargo:rerun-if-changed={}", vendor.join("parser.c").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        vendor.join("parser.c").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         vendor.join("scanner.c").display()

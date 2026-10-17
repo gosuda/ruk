@@ -71,7 +71,10 @@ pub fn parse_length(prefix: [u8; 4]) -> Result<usize, GitError> {
     let mut len = 0usize;
     for byte in prefix {
         let digit = hex_digit(byte).ok_or_else(|| GitError::Corrupt {
-            detail: format!("pkt-line length {:?} is not hex", prefix.escape_ascii().to_string()),
+            detail: format!(
+                "pkt-line length {:?} is not hex",
+                prefix.escape_ascii().to_string()
+            ),
         })?;
         len = len * 16 + digit;
     }
@@ -331,7 +334,8 @@ impl RemoteMessages {
         if text.len() > room {
             self.truncated = true;
         }
-        self.progress.extend_from_slice(&text[..text.len().min(room)]);
+        self.progress
+            .extend_from_slice(&text[..text.len().min(room)]);
     }
 }
 
@@ -593,7 +597,9 @@ mod tests {
         let mut pkt = PktReader::new(&wire[..], Interrupt::none());
         let mut band = SidebandReader::new(&mut pkt, LARGE_PACKET_MAX);
         let err = band.read_to_end(&mut Vec::new()).expect_err("band 3");
-        assert!(matches!(io_error("x", &err), GitError::Io { detail } if detail.contains("access denied")));
+        assert!(
+            matches!(io_error("x", &err), GitError::Io { detail } if detail.contains("access denied"))
+        );
 
         assert!(matches!(demux(b"\x04x"), Err(GitError::Corrupt { .. })));
         assert!(matches!(demux(b""), Err(GitError::Corrupt { .. })));

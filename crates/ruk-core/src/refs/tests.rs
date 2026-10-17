@@ -481,10 +481,7 @@ fn test_same_transaction_deleting_conflicting_path_before_creation() {
         FactExpectation::Value(_)
     ));
     assert_eq!(prep_rename.mutations()[0].value, None);
-    assert_eq!(
-        prep_rename.mutations()[1].expected,
-        FactExpectation::Absent
-    );
+    assert_eq!(prep_rename.mutations()[1].expected, FactExpectation::Absent);
     assert!(prep_rename.mutations()[1].value.is_some());
 
     ts.publish_mutations(prep_rename.mutations());
@@ -617,10 +614,14 @@ fn test_byte_exact_conflict_recovery_and_bounded_continuation() {
     ts.publish_mutations(&[m1, m2]);
 
     // Read back exact conflicts
-    let read1 = get_ref_conflict(store, &name1).expect("read c1").expect("present");
+    let read1 = get_ref_conflict(store, &name1)
+        .expect("read c1")
+        .expect("present");
     assert_eq!(read1, conflict1);
 
-    let read2 = get_ref_conflict(store, &name2).expect("read c2").expect("present");
+    let read2 = get_ref_conflict(store, &name2)
+        .expect("read c2")
+        .expect("present");
     assert_eq!(read2, conflict2);
 
     // Bounded paging: page 1 entry at a time

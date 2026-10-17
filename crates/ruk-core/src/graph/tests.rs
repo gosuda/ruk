@@ -9,16 +9,16 @@ use crate::budget::ByteBudget;
 use crate::change::ChangeId;
 use crate::error::ErrorCode;
 use crate::graph::bloom::{
-    build_bloom_filter, check_bloom_filter, murmur3_seeded, DEFAULT_MAX_CHANGED_PATHS,
+    DEFAULT_MAX_CHANGED_PATHS, build_bloom_filter, check_bloom_filter, murmur3_seeded,
 };
 use crate::graph::cache::ReachabilityCache;
 use crate::graph::composite::{ChangeIdCursor, GraphIndex, GraphIndexBuilder};
 use crate::graph::folding::{fold_segments, should_fold};
 use crate::graph::segment::{CommitGraphEntry, GraphSegment, GraphSegmentWriter, StagedCommit};
-use crate::graph::traversal::{find_heads, find_roots, is_ancestor, AncestorStepper};
+use crate::graph::traversal::{AncestorStepper, find_heads, find_roots, is_ancestor};
 use crate::graph::types::{
-    BloomMatch, ExactPathVerifier, Generation, GlobalPosition, LocalPosition, PrefixResolution,
-    ShallowAncestry, GRAPH_SEGMENT_MAGIC, GRAPH_SEGMENT_V1_FORMAT, MAX_GRAPH_POSITIONS,
+    BloomMatch, ExactPathVerifier, GRAPH_SEGMENT_MAGIC, GRAPH_SEGMENT_V1_FORMAT, Generation,
+    GlobalPosition, LocalPosition, MAX_GRAPH_POSITIONS, PrefixResolution, ShallowAncestry,
 };
 use crate::heads::Head;
 use crate::ids::{CommitKey, HashKind, Oid};
@@ -101,9 +101,12 @@ fn test_sha1_native_head_fixed32_regression() {
     });
 
     let bytes = writer.build().expect("built segment");
-    let segment = GraphSegment::open_from_bytes(bytes, kind, None, &budget).expect("opened segment");
+    let segment =
+        GraphSegment::open_from_bytes(bytes, kind, None, &budget).expect("opened segment");
 
-    let read_head = segment.head_at(LocalPosition::from_raw_checked(0)).expect("read head");
+    let read_head = segment
+        .head_at(LocalPosition::from_raw_checked(0))
+        .expect("read head");
     assert_eq!(read_head, head);
     match read_head {
         Head::Conflicted { key: k } => {
@@ -153,7 +156,10 @@ fn test_cache_held_arc_eviction() {
         bm.insert(i);
     }
 
-    let held_entry_1 = cache.admit(h1, &bm).expect("admitted h1").expect("not declined");
+    let held_entry_1 = cache
+        .admit(h1, &bm)
+        .expect("admitted h1")
+        .expect("not declined");
     assert_eq!(held_entry_1.cardinality(), 10);
 
     let _held_entry_2 = cache.admit(h2, &bm).expect("admitted h2");
@@ -200,7 +206,9 @@ fn test_bounded_high_divergence_paging() {
 
     for i in 0..total_divergent {
         let h = make_git_head((i % 250 + 1) as u8, kind);
-        builder.add_commit(h, cid, &[], vec![]).expect("added commit");
+        builder
+            .add_commit(h, cid, &[], vec![])
+            .expect("added commit");
         expected_heads.push(h);
     }
 
@@ -236,19 +244,31 @@ fn test_prefix_lookup_work_and_early_ambiguity() {
     // Two heads sharing the exact first byte 0xAA
     let mut b1 = vec![0xAA; 20];
     b1[1] = 0x11;
-    let h1 = Head::Git { oid: Oid::from_bytes(&b1).unwrap() };
+    let h1 = Head::Git {
+        oid: Oid::from_bytes(&b1).unwrap(),
+    };
 
     let mut b2 = vec![0xAA; 20];
     b2[1] = 0x22;
-    let h2 = Head::Git { oid: Oid::from_bytes(&b2).unwrap() };
+    let h2 = Head::Git {
+        oid: Oid::from_bytes(&b2).unwrap(),
+    };
 
     // Third head with completely different first byte 0xBB
     let mut b3 = vec![0xBB; 20];
-    let h3 = Head::Git { oid: Oid::from_bytes(&b3).unwrap() };
+    let h3 = Head::Git {
+        oid: Oid::from_bytes(&b3).unwrap(),
+    };
 
-    builder.add_commit(h1, make_change_id(1), &[], vec![]).unwrap();
-    builder.add_commit(h2, make_change_id(2), &[], vec![]).unwrap();
-    builder.add_commit(h3, make_change_id(3), &[], vec![]).unwrap();
+    builder
+        .add_commit(h1, make_change_id(1), &[], vec![])
+        .unwrap();
+    builder
+        .add_commit(h2, make_change_id(2), &[], vec![])
+        .unwrap();
+    builder
+        .add_commit(h3, make_change_id(3), &[], vec![])
+        .unwrap();
 
     let index = builder.finish(&budget).unwrap();
 
@@ -303,7 +323,10 @@ fn test_corrupt_file_ranges_and_checksum() {
     let mut bad_crc_bytes = valid_bytes.clone();
     bad_crc_bytes[20] ^= 0x55;
     let err_crc = GraphSegment::open_from_bytes(bad_crc_bytes, kind, None, &budget);
-    assert_eq!(err_crc.err().expect("crc32 must fail").code, ErrorCode::ECorrupt);
+    assert_eq!(
+        err_crc.err().expect("crc32 must fail").code,
+        ErrorCode::ECorrupt
+    );
 
     let mut bad_magic_bytes = valid_bytes.clone();
     bad_magic_bytes[0..8].copy_from_slice(b"BADMAGIC");
@@ -312,7 +335,10 @@ fn test_corrupt_file_ranges_and_checksum() {
     bad_magic_bytes[csum_off..].copy_from_slice(&new_crc.to_le_bytes());
 
     let err_magic = GraphSegment::open_from_bytes(bad_magic_bytes, kind, None, &budget);
-    assert_eq!(err_magic.err().expect("magic must fail").code, ErrorCode::ECorrupt);
+    assert_eq!(
+        err_magic.err().expect("magic must fail").code,
+        ErrorCode::ECorrupt
+    );
 }
 
 #[test]
@@ -325,7 +351,9 @@ fn test_octopus_parent_ordering_preservation() {
     let mut parent_positions = Vec::new();
     for i in 1..=6 {
         let h = make_git_head(i, kind);
-        let pos = builder.add_commit(h, make_change_id(i), &[], vec![]).unwrap();
+        let pos = builder
+            .add_commit(h, make_change_id(i), &[], vec![])
+            .unwrap();
         parent_heads.push(h);
         parent_positions.push(pos);
     }
@@ -349,7 +377,12 @@ fn test_octopus_parent_ordering_preservation() {
 
     let merge_head = make_conflicted_head(99, kind);
     let merge_pos = builder
-        .add_commit(merge_head, make_change_id(99), &ordered_parent_heads, vec![])
+        .add_commit(
+            merge_head,
+            make_change_id(99),
+            &ordered_parent_heads,
+            vec![],
+        )
         .unwrap();
 
     let index = builder.finish(&budget).expect("built index with octopus");
@@ -368,10 +401,18 @@ fn test_fold_and_reopen_equivalence() {
     let h3 = make_git_head(3, kind);
     let h4 = make_git_head(4, kind);
 
-    builder1.add_commit(h1, make_change_id(1), &[], vec![]).unwrap();
-    builder1.add_commit(h2, make_change_id(2), &[h1], vec![]).unwrap();
-    builder1.add_commit(h3, make_change_id(3), &[h2], vec![]).unwrap();
-    builder1.add_commit(h4, make_change_id(4), &[h3], vec![]).unwrap();
+    builder1
+        .add_commit(h1, make_change_id(1), &[], vec![])
+        .unwrap();
+    builder1
+        .add_commit(h2, make_change_id(2), &[h1], vec![])
+        .unwrap();
+    builder1
+        .add_commit(h3, make_change_id(3), &[h2], vec![])
+        .unwrap();
+    builder1
+        .add_commit(h4, make_change_id(4), &[h3], vec![])
+        .unwrap();
 
     let index1 = builder1.finish(&budget).unwrap();
     assert_eq!(index1.num_total_commits(), 4);
@@ -382,9 +423,15 @@ fn test_fold_and_reopen_equivalence() {
     let h6 = make_git_head(6, kind);
     let h7 = make_git_head(7, kind);
 
-    builder2.add_commit(h5, make_change_id(5), &[h4], vec![]).unwrap();
-    builder2.add_commit(h6, make_change_id(6), &[h5], vec![]).unwrap();
-    builder2.add_commit(h7, make_change_id(7), &[h6], vec![]).unwrap();
+    builder2
+        .add_commit(h5, make_change_id(5), &[h4], vec![])
+        .unwrap();
+    builder2
+        .add_commit(h6, make_change_id(6), &[h5], vec![])
+        .unwrap();
+    builder2
+        .add_commit(h7, make_change_id(7), &[h6], vec![])
+        .unwrap();
 
     let index_folded = builder2.finish(&budget).unwrap();
     assert_eq!(index_folded.num_total_commits(), 7);
@@ -396,7 +443,10 @@ fn test_fold_and_reopen_equivalence() {
         let pos = index_folded.head_to_pos(&head).expect("head resolved");
         assert_eq!(pos.as_u32(), i as u32);
         assert_eq!(index_folded.pos_to_head(pos).unwrap(), head);
-        assert_eq!(index_folded.pos_to_generation(pos).unwrap().as_u32(), (i + 1) as u32);
+        assert_eq!(
+            index_folded.pos_to_generation(pos).unwrap().as_u32(),
+            (i + 1) as u32
+        );
 
         if i > 0 {
             let prev_pos = GlobalPosition::new((i - 1) as u32).unwrap();
@@ -419,10 +469,18 @@ fn test_shallow_ambiguity_tri_state() {
     let h3 = make_git_head(3, kind);
     let h4 = make_git_head(4, kind);
 
-    let p1 = builder.add_commit(h1, make_change_id(1), &[], vec![]).unwrap();
-    let p2 = builder.add_commit(h2, make_change_id(2), &[h1], vec![]).unwrap();
-    let p3 = builder.add_commit(h3, make_change_id(3), &[h2], vec![]).unwrap();
-    let p4 = builder.add_commit(h4, make_change_id(4), &[h3], vec![]).unwrap();
+    let p1 = builder
+        .add_commit(h1, make_change_id(1), &[], vec![])
+        .unwrap();
+    let p2 = builder
+        .add_commit(h2, make_change_id(2), &[h1], vec![])
+        .unwrap();
+    let p3 = builder
+        .add_commit(h3, make_change_id(3), &[h2], vec![])
+        .unwrap();
+    let p4 = builder
+        .add_commit(h4, make_change_id(4), &[h3], vec![])
+        .unwrap();
 
     let index = builder.finish(&budget).unwrap();
     let cancel = || false;
@@ -511,16 +569,27 @@ fn test_graph_installed_file_reopen() {
         changed_paths: vec![b"src/main.rs".to_vec()],
     });
 
-    writer.install_to_disk(&file_path).expect("installed segment to disk");
+    writer
+        .install_to_disk(&file_path)
+        .expect("installed segment to disk");
     assert!(file_path.exists());
 
-    let opened = GraphSegment::open_file(&file_path, kind, None, &budget).expect("reopened installed file");
+    let opened =
+        GraphSegment::open_file(&file_path, kind, None, &budget).expect("reopened installed file");
     assert_eq!(opened.num_local_commits(), 2);
     assert_eq!(opened.num_parent_commits(), 0);
-    assert_eq!(opened.head_at(LocalPosition::from_raw_checked(0)).unwrap(), h1);
-    assert_eq!(opened.head_at(LocalPosition::from_raw_checked(1)).unwrap(), h2);
+    assert_eq!(
+        opened.head_at(LocalPosition::from_raw_checked(0)).unwrap(),
+        h1
+    );
+    assert_eq!(
+        opened.head_at(LocalPosition::from_raw_checked(1)).unwrap(),
+        h2
+    );
 
-    let parents_1 = opened.parents_at(LocalPosition::from_raw_checked(1)).unwrap();
+    let parents_1 = opened
+        .parents_at(LocalPosition::from_raw_checked(1))
+        .unwrap();
     assert_eq!(parents_1.as_slice(), &[GlobalPosition::from_raw_checked(0)]);
 
     let _ = std::fs::remove_file(&file_path);
@@ -548,7 +617,9 @@ fn measure_object_and_row_work() {
         for (off, b) in bytes.iter_mut().enumerate().skip(4) {
             *b = ((i as usize).wrapping_add(off * 53) % 256) as u8;
         }
-        Head::Git { oid: Oid::from_bytes(&bytes).expect("oid") }
+        Head::Git {
+            oid: Oid::from_bytes(&bytes).expect("oid"),
+        }
     }
 
     // --- history: 100k linear commits, one changed path each ---
@@ -571,12 +642,16 @@ fn measure_object_and_row_work() {
         prev = Some(seq_head(i, kind));
     }
     let index = builder.finish(&budget).expect("index");
-    println!("MEASURE index_build commits={N} ms={}", t.elapsed().as_millis());
+    println!(
+        "MEASURE index_build commits={N} ms={}",
+        t.elapsed().as_millis()
+    );
     assert_eq!(index.num_total_commits(), N);
 
     // --- full-depth ancestor walk from the tip ---
     let t = Instant::now();
-    let mut stepper = AncestorStepper::new(&index, &[*positions.last().expect("tip")], None).expect("stepper");
+    let mut stepper =
+        AncestorStepper::new(&index, &[*positions.last().expect("tip")], None).expect("stepper");
     let mut walked = 0usize;
     loop {
         let page = stepper
@@ -587,7 +662,10 @@ fn measure_object_and_row_work() {
         }
         walked += page.positions.len();
     }
-    println!("MEASURE ancestor_walk depth={N} visited={walked} ms={}", t.elapsed().as_millis());
+    println!(
+        "MEASURE ancestor_walk depth={N} visited={walked} ms={}",
+        t.elapsed().as_millis()
+    );
     assert_eq!(walked, N as usize);
 
     // --- ancestry probes: 1k distant pairs (generation short-circuit) ---
@@ -602,7 +680,10 @@ fn measure_object_and_row_work() {
             proven += 1;
         }
     }
-    println!("MEASURE ancestor_probe pairs=1000 proven={proven} us={}", t.elapsed().as_micros());
+    println!(
+        "MEASURE ancestor_probe pairs=1000 proven={proven} us={}",
+        t.elapsed().as_micros()
+    );
     assert_eq!(proven, 1000);
 
     // --- prefix resolution over 100k heads ---
@@ -619,7 +700,10 @@ fn measure_object_and_row_work() {
             misses += 1;
         }
     }
-    println!("MEASURE head_prefix hits=1000 misses={misses} us={}", t.elapsed().as_micros());
+    println!(
+        "MEASURE head_prefix hits=1000 misses={misses} us={}",
+        t.elapsed().as_micros()
+    );
     assert_eq!(misses, 0);
 
     // --- changed-path Bloom: 10k checks against one dense filter ---
@@ -670,7 +754,10 @@ fn measure_object_and_row_work() {
         });
     }
     store.publish(Vec::new(), &facts).expect("publish refs");
-    println!("MEASURE ref_publish rows=10000 ms={}", t.elapsed().as_millis());
+    println!(
+        "MEASURE ref_publish rows=10000 ms={}",
+        t.elapsed().as_millis()
+    );
 
     let base = store.io_stats();
     let t = Instant::now();
@@ -715,15 +802,16 @@ fn measure_object_and_row_work() {
         );
     }
     store.publish(prepared, &[]).expect("publish blobs");
-    println!("MEASURE blob_publish objects=1000 ms={}", t.elapsed().as_millis());
+    println!(
+        "MEASURE blob_publish objects=1000 ms={}",
+        t.elapsed().as_millis()
+    );
 
     let base = store.io_stats();
     let t = Instant::now();
     for i in 0..1000u32 {
         let expected = format!("blob-body-{i}").into_bytes();
-        let oid = kind
-            .hash_git_object("blob", &expected)
-            .expect("hash");
+        let oid = kind.hash_git_object("blob", &expected).expect("hash");
         let mut got = Vec::new();
         std::io::Read::read_to_end(&mut store.read(oid).expect("read").bytes, &mut got)
             .expect("drain");
@@ -747,23 +835,22 @@ fn measure_object_and_row_work() {
 /// `resolve_change_id_prefix` mis-resolve full-hex symbols and prefixes.
 #[test]
 fn change_id_table_searches_in_reverse_hex_order() {
-
     let kind = HashKind::Sha1;
     let budget = Arc::new(ByteBudget::new(64 * 1024 * 1024));
 
     // Bytes chosen so reverse-hex prefixes are known: reverse-hex of byte
     // 0xAB is "kj", of 0x00 is "zz", of 0xFF is "00".
     let cid_unique = ChangeId::from_bytes([
-        0xAB, 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67, 0x89,
-        0xAB, 0xCD,
+        0xAB, 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+        0xCD,
     ]);
     let cid_dup_a = ChangeId::from_bytes([
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
-        0xEE, 0xF0,
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        0xF0,
     ]);
     let cid_dup_b = ChangeId::from_bytes([
-        0x00, 0x21, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
-        0xEE, 0xF0,
+        0x00, 0x21, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        0xF0,
     ]);
     assert!(cid_dup_a.to_reverse_hex().starts_with("zz"));
     assert!(cid_dup_b.to_reverse_hex().starts_with("zz"));

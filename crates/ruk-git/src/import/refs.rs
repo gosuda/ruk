@@ -32,7 +32,9 @@ use ruk_core::bytes::ByteString;
 use ruk_core::change::OperationId;
 use ruk_core::conflict::Signature;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate};
+use ruk_core::refdata::{
+    RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
+};
 use ruk_core::refs::{
     ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog, prepare_checked_transaction,
     prepare_set_ref_conflict,
@@ -123,18 +125,17 @@ pub(crate) fn read_source_refs(
             detail: format!("source ref name is invalid: {err}"),
         })?;
         let target = match &reference.target {
-            gix_ref::Target::Object(id) => {
-                RefTarget::Direct(oid_from_gix(id, kind).map_err(|err| GitError::ObjectFormat {
+            gix_ref::Target::Object(id) => RefTarget::Direct(oid_from_gix(id, kind).map_err(
+                |err| GitError::ObjectFormat {
                     detail: err.to_string(),
-                })?)
-            }
+                },
+            )?),
             gix_ref::Target::Symbolic(name) => {
                 let raw_target: &[u8] = AsRef::<[u8]>::as_ref(name.as_bstr());
-                let target = RefName::new(raw_target.to_vec()).map_err(|err| {
-                    GitError::Invalid {
+                let target =
+                    RefName::new(raw_target.to_vec()).map_err(|err| GitError::Invalid {
                         detail: format!("source symbolic target is invalid: {err}"),
-                    }
-                })?;
+                    })?;
                 RefTarget::Symbolic(target)
             }
         };
@@ -169,12 +170,10 @@ fn read_head(
         let name = RefName::new(name.to_vec()).map_err(|err| GitError::Corrupt {
             detail: format!("source HEAD is invalid: {err}"),
         })?;
-        let target = source
-            .find(&name)
-            .and_then(|found| match &found.target {
-                RefTarget::Direct(oid) => Some(*oid),
-                RefTarget::Symbolic(_) => None,
-            });
+        let target = source.find(&name).and_then(|found| match &found.target {
+            RefTarget::Direct(oid) => Some(*oid),
+            RefTarget::Symbolic(_) => None,
+        });
         return Ok(Some(SourceHead::Symbolic { name, target }));
     }
     let text = core::str::from_utf8(line).map_err(|_| GitError::Corrupt {
@@ -230,13 +229,15 @@ pub fn decode_observation(bytes: &[u8], kind: HashKind) -> Result<RefTarget, Git
     match tag {
         0x00 => {
             let oid = Oid::from_bytes(rest).map_err(|_| bad())?;
-            crate::require_kind(oid, kind).map(RefTarget::Direct).map_err(|err| {
-                GitError::Corrupt {
+            crate::require_kind(oid, kind)
+                .map(RefTarget::Direct)
+                .map_err(|err| GitError::Corrupt {
                     detail: err.to_string(),
-                }
-            })
+                })
         }
-        0x01 => RefName::new(rest.to_vec()).map(RefTarget::Symbolic).map_err(|_| bad()),
+        0x01 => RefName::new(rest.to_vec())
+            .map(RefTarget::Symbolic)
+            .map_err(|_| bad()),
         _ => Err(bad()),
     }
 }
@@ -293,7 +294,9 @@ pub(crate) fn plan_refs(
     for candidate in &source.refs {
         let local = reader.get(&candidate.name).map_err(GitError::from)?;
         let key = observation_key(observation_source, &candidate.name);
-        let base_bytes = store.fact(FactTable::RemoteObservations, &key).map_err(GitError::from)?;
+        let base_bytes = store
+            .fact(FactTable::RemoteObservations, &key)
+            .map_err(GitError::from)?;
         let base = base_bytes
             .as_deref()
             .map(|bytes| decode_observation(bytes, store.hash_kind()))
@@ -329,7 +332,9 @@ pub(crate) fn plan_refs(
                     expected,
                     change: RefChange::Set(candidate.target.clone()),
                 });
-                if direct(&candidate.target).is_some() || local.as_ref().is_some_and(|t| direct(t).is_some()) {
+                if direct(&candidate.target).is_some()
+                    || local.as_ref().is_some_and(|t| direct(t).is_some())
+                {
                     reflogs.push((
                         candidate.name.clone(),
                         local.as_ref().and_then(direct),
@@ -344,10 +349,13 @@ pub(crate) fn plan_refs(
                     [direct(local), direct(&candidate.target)],
                 );
                 facts.push(
-                    prepare_set_ref_conflict(store, &candidate.name, &merge).map_err(GitError::from)?,
+                    prepare_set_ref_conflict(store, &candidate.name, &merge)
+                        .map_err(GitError::from)?,
                 );
             }
-            RefDecision::Unchanged | RefDecision::KeptLocal { .. } | RefDecision::SymbolicDiverged { .. } => {}
+            RefDecision::Unchanged
+            | RefDecision::KeptLocal { .. }
+            | RefDecision::SymbolicDiverged { .. } => {}
         }
 
         let expected = base_bytes.map_or(FactExpectation::Absent, FactExpectation::Value);
@@ -371,11 +379,10 @@ pub(crate) fn plan_refs(
     }
 
     if !updates.is_empty() {
-        let transaction = RefTransaction::new(store.hash_kind(), updates)
-            .map_err(|err| ref_error(err))?;
+        let transaction =
+            RefTransaction::new(store.hash_kind(), updates).map_err(|err| ref_error(err))?;
         transaction.check(&reader).map_err(ref_error)?;
-        let prepared =
-            prepare_checked_transaction(store, &transaction).map_err(GitError::from)?;
+        let prepared = prepare_checked_transaction(store, &transaction).map_err(GitError::from)?;
         facts.extend(prepared.into_mutations());
     }
 

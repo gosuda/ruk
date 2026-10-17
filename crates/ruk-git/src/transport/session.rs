@@ -22,15 +22,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate};
+use ruk_core::refdata::{
+    RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
+};
 use ruk_core::refs::{StoreRefs, page_refs, prepare_checked_transaction};
 use ruk_core::store::types::{ObjectKind, Publication};
 use ruk_core::store::{PreparationBudget, Store};
 
+use super::fetch::observation_mutations;
 use super::fetch::{FetchWireRequest, Filter, promisor_facts, shallow_facts};
 use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, object_links, write_pack};
-use super::push::{PushPlanRecord, PushUpdate, PushWireRequest, RefOutcome, RefResult, push_closure, reconcile};
-use super::fetch::observation_mutations;
+use super::push::{
+    PushPlanRecord, PushUpdate, PushWireRequest, RefOutcome, RefResult, push_closure, reconcile,
+};
 use super::{Interrupt, read_object};
 use crate::GitError;
 
@@ -103,7 +107,9 @@ impl Remote {
                     detail: "empty file:// remote".to_owned(),
                 });
             }
-            return Ok(Self { path: PathBuf::from(rest) });
+            return Ok(Self {
+                path: PathBuf::from(rest),
+            });
         }
         if let Some(scheme_end) = spec.find("://") {
             let scheme = &spec[..scheme_end];
@@ -111,7 +117,9 @@ impl Remote {
                 command: format!("{scheme} transports (network adapters are a later slice)"),
             });
         }
-        Ok(Self { path: PathBuf::from(spec) })
+        Ok(Self {
+            path: PathBuf::from(spec),
+        })
     }
 }
 
@@ -148,7 +156,10 @@ pub fn open_local_store(path: &Path) -> Result<Store, GitError> {
         });
     }
     Err(GitError::Invalid {
-        detail: format!("{} is neither a Ruk store nor a Git repository", path.display()),
+        detail: format!(
+            "{} is neither a Ruk store nor a Git repository",
+            path.display()
+        ),
     })
 }
 
@@ -265,7 +276,14 @@ pub fn local_fetch(
     let mut pack = Vec::new();
     write_pack(&mut pack, kind, &pack_entries, interrupt)?;
     let staged = ingest_pack(&pack[..], kind, dest, limits, interrupt)?;
-    let report = super::fetch::verify_closure(dest, &staged, &req.wants, req.filter, &closure.shallow, interrupt)?;
+    let report = super::fetch::verify_closure(
+        dest,
+        &staged,
+        &req.wants,
+        req.filter,
+        &closure.shallow,
+        interrupt,
+    )?;
     let mut facts: Vec<ruk_core::store::types::FactMutation> = Vec::new();
     if let Some(filter) = req.filter {
         facts.extend(promisor_facts(remote, filter, &report.missing_promisor)?);
@@ -310,14 +328,18 @@ fn local_closure(
             Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
             Err(err) => return Err(err),
         };
-        frontier.extend(object_links(ObjectKind::Commit, &bytes, kind)?.parents.iter().copied());
+        frontier.extend(
+            object_links(ObjectKind::Commit, &bytes, kind)?
+                .parents
+                .iter()
+                .copied(),
+        );
     }
     let mut objects = Vec::new();
     let mut shallow = Vec::new();
     let mut visited = HashSet::new();
     // (oid, commit depth from the wants; non-commits ride along).
-    let mut queue: VecDeque<(Oid, u32)> =
-        req.wants.iter().map(|oid| (*oid, 0)).collect();
+    let mut queue: VecDeque<(Oid, u32)> = req.wants.iter().map(|oid| (*oid, 0)).collect();
     while let Some((oid, depth)) = queue.pop_front() {
         interrupt.check("computing the local fetch closure")?;
         if !visited.insert(oid) || uninteresting.contains(&oid) {
@@ -330,7 +352,9 @@ fn local_closure(
             other => other,
         })?;
         let links = object_links(obj_kind, &bytes, kind)?;
-        let cutoff = req.depth.is_some_and(|max| obj_kind == ObjectKind::Commit && depth >= max);
+        let cutoff = req
+            .depth
+            .is_some_and(|max| obj_kind == ObjectKind::Commit && depth >= max);
         if cutoff {
             shallow.push(oid);
         }
@@ -401,14 +425,23 @@ fn persist_plan(
 }
 
 fn persist_plan_best_effort(store: &Store, plan: &PushPlanRecord, kind: HashKind) {
-    let current = store.fact(ruk_core::store::types::FactTable::PushPlans, plan.id.as_bytes()).ok().flatten();
+    let current = store
+        .fact(
+            ruk_core::store::types::FactTable::PushPlans,
+            plan.id.as_bytes(),
+        )
+        .ok()
+        .flatten();
     if let Ok(mutation) = plan.persist_mutation(kind, current) {
         let _ = store.publish(Vec::new(), &[mutation]);
     }
 }
 
 fn plan_encoding(store: &Store, plan: &PushPlanRecord) -> Result<Option<Vec<u8>>, GitError> {
-    Ok(store.fact(ruk_core::store::types::FactTable::PushPlans, plan.id.as_bytes())?)
+    Ok(store.fact(
+        ruk_core::store::types::FactTable::PushPlans,
+        plan.id.as_bytes(),
+    )?)
 }
 
 fn local_push_inner(
@@ -431,13 +464,20 @@ fn local_push_inner(
         let name = RefName::new(update.name.clone()).map_err(|err| GitError::Invalid {
             detail: format!("malformed ref name: {err}"),
         })?;
-        current.insert(update.name.clone(), refs.get(&name).map_err(GitError::from)?);
+        current.insert(
+            update.name.clone(),
+            refs.get(&name).map_err(GitError::from)?,
+        );
     }
     let mut live: Vec<&PushUpdate> = Vec::with_capacity(req.updates.len());
     let mut outcomes: Vec<RefOutcome> = Vec::with_capacity(req.updates.len());
     for update in &req.updates {
         let at = current.get(update.name.as_slice()).cloned().flatten();
-        let expected = if update.old == zero { None } else { Some(RefTarget::Direct(update.old)) };
+        let expected = if update.old == zero {
+            None
+        } else {
+            Some(RefTarget::Direct(update.old))
+        };
         if at != expected {
             outcomes.push(RefOutcome {
                 name: update.name.clone(),
@@ -471,15 +511,19 @@ fn local_push_inner(
     persist_plan(dest, plan, kind, plan_encoding(dest, plan)?)?;
     let entries = push_closure(src, kind, &live, interrupt)?;
     if !entries.is_empty() {
-        let pack_entries: Vec<PackEntry<'_>> = entries.iter().map(|entry| PackEntry {
-            oid: entry.oid,
-            kind: entry.kind,
-            bytes: &entry.bytes,
-            base: None,
-        }).collect();
+        let pack_entries: Vec<PackEntry<'_>> = entries
+            .iter()
+            .map(|entry| PackEntry {
+                oid: entry.oid,
+                kind: entry.kind,
+                bytes: &entry.bytes,
+                base: None,
+            })
+            .collect();
         let mut pack = Vec::new();
         write_pack(&mut pack, kind, &pack_entries, interrupt)?;
-        let staged: StagedPack = ingest_pack(&pack[..], kind, dest, IngestLimits::default(), interrupt)?;
+        let staged: StagedPack =
+            ingest_pack(&pack[..], kind, dest, IngestLimits::default(), interrupt)?;
         dest.publish(staged.into_objects(), &[])?;
     }
     let mut report = apply_refs(dest, kind, &live, req.atomic)?;
@@ -518,7 +562,10 @@ fn apply_refs(
         })
     };
     if atomic {
-        let updates: Vec<RefUpdate> = live.iter().map(|u| to_update(u)).collect::<Result<_, _>>()?;
+        let updates: Vec<RefUpdate> = live
+            .iter()
+            .map(|u| to_update(u))
+            .collect::<Result<_, _>>()?;
         let transaction = RefTransaction::new(kind, updates).map_err(map_ref_error)?;
         let prepared = prepare_checked_transaction(dest, &transaction).map_err(GitError::from)?;
         match dest.publish(Vec::new(), &prepared.into_mutations()) {
@@ -545,19 +592,22 @@ fn apply_refs(
         for update in live {
             let transaction =
                 RefTransaction::new(kind, vec![to_update(update)?]).map_err(map_ref_error)?;
-            let outcome = match prepare_checked_transaction(dest, &transaction).map_err(GitError::from) {
-                Ok(prepared) => match dest.publish(Vec::new(), &prepared.into_mutations()) {
-                    Ok(_) => RefResult::Ok,
-                    Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => RefResult::Rejected {
-                        reason: "destination ref moved during apply".to_owned(),
+            let outcome =
+                match prepare_checked_transaction(dest, &transaction).map_err(GitError::from) {
+                    Ok(prepared) => match dest.publish(Vec::new(), &prepared.into_mutations()) {
+                        Ok(_) => RefResult::Ok,
+                        Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
+                            RefResult::Rejected {
+                                reason: "destination ref moved during apply".to_owned(),
+                            }
+                        }
+                        Err(err) => return Err(err.into()),
                     },
-                    Err(err) => return Err(err.into()),
-                },
-                Err(GitError::Stale { .. }) => RefResult::Rejected {
-                    reason: "destination ref moved".to_owned(),
-                },
-                Err(err) => return Err(err),
-            };
+                    Err(GitError::Stale { .. }) => RefResult::Rejected {
+                        reason: "destination ref moved".to_owned(),
+                    },
+                    Err(err) => return Err(err),
+                };
             outcomes.push(RefOutcome {
                 name: update.name.clone(),
                 result: outcome,
@@ -620,8 +670,8 @@ pub fn prefetch_request(wants: Vec<Oid>) -> FetchWireRequest {
 /// plumbing live here so fetch and push tests share one harness.
 #[cfg(test)]
 pub mod test_support {
-    use super::*;
     use super::super::fetch::ReceivedPack;
+    use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -672,7 +722,8 @@ pub mod test_support {
     /// A fresh empty store in a unique scratch directory.
     pub fn test_store(kind: HashKind) -> Store {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("ruk-transport-test-{}-{id}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ruk-transport-test-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         Store::create(&dir, kind, default_budget()).expect("test store")
     }
@@ -681,13 +732,21 @@ pub mod test_support {
     /// publishes them, returning the store.
     pub fn store_with_pack(kind: HashKind, pack: &[u8]) -> Store {
         let store = test_store(kind);
-        let staged = ingest_pack(pack, kind, &store, IngestLimits::default(), &Interrupt::none())
-            .expect("fixture stages");
-        store.publish(staged.into_objects(), &[]).expect("fixture publishes");
+        let staged = ingest_pack(
+            pack,
+            kind,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("fixture stages");
+        store
+            .publish(staged.into_objects(), &[])
+            .expect("fixture publishes");
         store
     }
 
-        /// The `ReceivedPack` plumbing shared by wire tests: runs `receive`
+    /// The `ReceivedPack` plumbing shared by wire tests: runs `receive`
     /// against a scripted peer.
     pub fn receive_from_script(
         script: Vec<u8>,
@@ -696,7 +755,14 @@ pub mod test_support {
         req: &FetchWireRequest,
     ) -> (ReceivedPack, Vec<u8>) {
         let mut peer = ScriptedPeer::new(script);
-        let out = super::super::fetch::receive(&mut peer, kind, store, req, IngestLimits::default(), &Interrupt::none());
+        let out = super::super::fetch::receive(
+            &mut peer,
+            kind,
+            store,
+            req,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        );
         let written = peer.written().to_vec();
         (out.expect("receive"), written)
     }
@@ -705,9 +771,9 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{store_with_pack, test_store};
-    use crate::transport::push::PushState;
     use super::*;
     use crate::transport::fetch::verify_closure;
+    use crate::transport::push::PushState;
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
     const THREE: &str = "7a4943e466a7ce4f4c56d9eeb89c8909b1c43d22";
@@ -784,9 +850,17 @@ mod tests {
             filter: None,
             depth: Some(1),
         };
-        let report =
-            local_fetch(&dest, &src, b"origin", &req, &[], &[], IngestLimits::default(), &Interrupt::none())
-                .expect("shallow local fetch");
+        let report = local_fetch(
+            &dest,
+            &src,
+            b"origin",
+            &req,
+            &[],
+            &[],
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("shallow local fetch");
         // Depth 1 keeps the tip, its tree and its blobs; the parent is the
         // recorded boundary, excluded with its history.
         assert_eq!(report.shallow, vec![oid(THREE)]);
@@ -807,15 +881,19 @@ mod tests {
             old: kind.zero_oid(),
             new: oid(FOUR),
         }];
-        let req = PushWireRequest { updates: updates.clone(), atomic: false };
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
-        let outcomes = local_push(&dest, &src, kind, &mut plan, &req, &Interrupt::none()).expect("push");
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
+        let outcomes =
+            local_push(&dest, &src, kind, &mut plan, &req, &Interrupt::none()).expect("push");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].result, RefResult::Ok);
         assert_eq!(plan.state, PushState::Confirmed);
         assert!(
-            dest
-                .fact(ruk_core::store::types::FactTable::Refs, &name)
+            dest.fact(ruk_core::store::types::FactTable::Refs, &name)
                 .expect("read")
                 .is_some(),
             "ref published"
@@ -826,21 +904,33 @@ mod tests {
             old: kind.zero_oid(),
             new: oid(THREE),
         }];
-        let req = PushWireRequest { updates: updates.clone(), atomic: false };
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
-        let outcomes = local_push(&dest, &src, kind, &mut plan, &req, &Interrupt::none()).expect("push");
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
+        let outcomes =
+            local_push(&dest, &src, kind, &mut plan, &req, &Interrupt::none()).expect("push");
         assert!(matches!(outcomes[0].result, RefResult::Rejected { .. }));
     }
 
     #[test]
     fn open_local_store_names_its_boundaries() {
         let missing = std::env::temp_dir().join("ruk-transport-test-no-such-dir-xyz");
-        assert!(matches!(open_local_store(&missing), Err(GitError::NotFound { .. })));
+        assert!(matches!(
+            open_local_store(&missing),
+            Err(GitError::NotFound { .. })
+        ));
         // A Git-format directory is refused naming the import/export slice.
-        let dir = std::env::temp_dir().join(format!("ruk-transport-test-gitfmt-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ruk-transport-test-gitfmt-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("objects")).expect("scratch");
         std::fs::write(dir.join("HEAD"), b"ref: refs/heads/main\n").expect("scratch");
-        assert!(matches!(open_local_store(&dir), Err(GitError::Unsupported { .. })));
+        assert!(matches!(
+            open_local_store(&dir),
+            Err(GitError::Unsupported { .. })
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -860,8 +950,14 @@ mod tests {
         };
         let mut pack = Vec::new();
         write_pack(&mut pack, kind, &[entry], &Interrupt::none()).expect("pack");
-        let staged =
-            ingest_pack(&pack[..], kind, &dest, IngestLimits::default(), &Interrupt::none()).expect("ingest");
+        let staged = ingest_pack(
+            &pack[..],
+            kind,
+            &dest,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("ingest");
         let err = verify_closure(&dest, &staged, &[oid(FOUR)], None, &[], &Interrupt::none())
             .expect_err("tree is missing");
         assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");

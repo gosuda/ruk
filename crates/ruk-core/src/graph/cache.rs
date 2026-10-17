@@ -42,8 +42,12 @@ impl CachedReachabilityEntry {
             .saturating_mul(4)
             .max(1024);
         let reservation = budget.reserve(decode_bound)?;
-        let bitmap = RoaringBitmap::deserialize_from(&self.serialized_bytes[..])
-            .map_err(|e| CoreError::new(ErrorCode::ECorrupt, format!("failed decoding roaring bitmap: {e}")))?;
+        let bitmap = RoaringBitmap::deserialize_from(&self.serialized_bytes[..]).map_err(|e| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("failed decoding roaring bitmap: {e}"),
+            )
+        })?;
         Ok(ScopedReachability {
             _reservation: reservation,
             bitmap,
@@ -110,9 +114,9 @@ impl ReachabilityCache {
     /// Creates a new cache with pre-reserved slot and index capacity.
     pub(crate) fn new(budget: Arc<ByteBudget>, max_entries: usize) -> Result<Self, CoreError> {
         let capacity = max_entries.max(16);
-        let hash_size = capacity.checked_mul(2).ok_or_else(|| {
-            CoreError::new(ErrorCode::ECapacity, "cache capacity overflow")
-        })?;
+        let hash_size = capacity
+            .checked_mul(2)
+            .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "cache capacity overflow"))?;
 
         let slot_bytes = (capacity as u64) * (std::mem::size_of::<Slot>() as u64);
         let hash_bytes = (hash_size as u64) * (std::mem::size_of::<usize>() as u64);
@@ -163,7 +167,10 @@ impl ReachabilityCache {
     /// Looks up a cached reachability checkpoint by commit [`Head`].
     #[must_use]
     pub(crate) fn get(&self, head: &Head) -> Option<Arc<CachedReachabilityEntry>> {
-        let mut inner = self.inner.lock().expect("reachability cache mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("reachability cache mutex poisoned");
         let slot_idx = Self::find_slot(&inner, head)?;
         Self::touch_mru(&mut inner, slot_idx);
         inner.slots[slot_idx].entry.as_ref().map(Arc::clone)
@@ -271,7 +278,10 @@ impl ReachabilityCache {
 
         let mut reservation = self.budget.reserve(resident_memory);
 
-        let mut inner = self.inner.lock().expect("reachability cache mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("reachability cache mutex poisoned");
 
         // If head already exists, replace entry
         if let Some(existing_slot) = Self::find_slot(&inner, &head) {
@@ -279,7 +289,10 @@ impl ReachabilityCache {
             if let Ok(res) = reservation {
                 let mut buf = Vec::with_capacity(encoded_len);
                 bitmap.serialize_into(&mut buf).map_err(|e| {
-                    CoreError::new(ErrorCode::EIo, format!("failed serializing roaring bitmap: {e}"))
+                    CoreError::new(
+                        ErrorCode::EIo,
+                        format!("failed serializing roaring bitmap: {e}"),
+                    )
                 })?;
                 let entry = Arc::new(CachedReachabilityEntry {
                     _reservation: res,
@@ -315,7 +328,10 @@ impl ReachabilityCache {
 
         let mut buf = Vec::with_capacity(encoded_len);
         bitmap.serialize_into(&mut buf).map_err(|e| {
-            CoreError::new(ErrorCode::EIo, format!("failed serializing roaring bitmap: {e}"))
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("failed serializing roaring bitmap: {e}"),
+            )
         })?;
 
         let entry = Arc::new(CachedReachabilityEntry {
@@ -347,7 +363,10 @@ impl ReachabilityCache {
     /// Number of cached checkpoints currently held.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().expect("reachability cache mutex poisoned").count
+        self.inner
+            .lock()
+            .expect("reachability cache mutex poisoned")
+            .count
     }
 
     /// True if the cache contains no entries.

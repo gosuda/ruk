@@ -12,7 +12,7 @@ use crate::coord::cancel::Cancel;
 use crate::coord::policy::Principal;
 use crate::coord::receipt;
 use crate::coord::rows::SweepCursors;
-use crate::coord::rows::{SessionRow, ROW_MAX_BYTES};
+use crate::coord::rows::{ROW_MAX_BYTES, SessionRow};
 use crate::coord::session::SessionLive;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Reply, Request, RequestDigest};
@@ -159,8 +159,9 @@ impl MutationCandidate {
             ));
         }
 
-        let digest = receipt::digest_v1(&request)?
-            .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "failed to compute request digest"))?;
+        let digest = receipt::digest_v1(&request)?.ok_or_else(|| {
+            CoreError::new(ErrorCode::EInvalid, "failed to compute request digest")
+        })?;
 
         let mut prepared_bytes: u64 = 0;
         for obj in &objects {
@@ -209,9 +210,7 @@ pub(crate) enum InternalPayload {
         idle: SignedDuration,
     },
     /// Bounded expiry sweep: deletes expired receipts or sessions and advances sweep cursors.
-    Sweep {
-        cursors: SweepCursors,
-    },
+    Sweep { cursors: SweepCursors },
     /// Maintenance or pruning: general exact-CAS facts with optional retention head adjustment.
     Maintenance,
 }

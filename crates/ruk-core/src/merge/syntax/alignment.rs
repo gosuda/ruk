@@ -31,7 +31,9 @@ use crate::merge::composed::{MergeNotices, NoticeCode};
 use super::adapters::{
     Decline, DeclineReason, SourceUnit, UnitKey, adapter_for, index_units, offset, slice_range,
 };
-use super::grammar::{Cancel, GrammarRegistry, Language, MAX_TRIPLET_BYTES, ParsedTree, SyntaxError};
+use super::grammar::{
+    Cancel, GrammarRegistry, Language, MAX_TRIPLET_BYTES, ParsedTree, SyntaxError,
+};
 use super::{
     ByteEdit, EditProvenance, EditSource, SyntaxOutcome, SyntaxProvenance, SyntaxRequest,
     decline_notices,
@@ -162,7 +164,10 @@ fn whole_lines(source: &[u8], start: u32, end: u32) -> Option<(u32, u32)> {
     while line_start > 0 && source[line_start - 1] != b'\n' {
         line_start -= 1;
     }
-    if source[line_start..start].iter().any(|b| !b.is_ascii_whitespace()) {
+    if source[line_start..start]
+        .iter()
+        .any(|b| !b.is_ascii_whitespace())
+    {
         return None;
     }
     let mut line_end = end;
@@ -172,7 +177,10 @@ fn whole_lines(source: &[u8], start: u32, end: u32) -> Option<(u32, u32)> {
     if line_end < source.len() {
         line_end += 1;
     }
-    if source[end..line_end].iter().any(|b| !b.is_ascii_whitespace()) {
+    if source[end..line_end]
+        .iter()
+        .any(|b| !b.is_ascii_whitespace())
+    {
         return None;
     }
     Some((to_u32(line_start)?, to_u32(line_end)?))
@@ -345,11 +353,23 @@ fn present(
         return Ok(());
     }
     if theirs_bytes == base_bytes {
-        edits.push(replace_range(unit, ours.0, ours.1, ours_bytes, EditSource::Ours));
+        edits.push(replace_range(
+            unit,
+            ours.0,
+            ours.1,
+            ours_bytes,
+            EditSource::Ours,
+        ));
         return Ok(());
     }
     if ours_bytes == base_bytes {
-        edits.push(replace_range(unit, theirs.0, theirs.1, theirs_bytes, EditSource::Theirs));
+        edits.push(replace_range(
+            unit,
+            theirs.0,
+            theirs.1,
+            theirs_bytes,
+            EditSource::Theirs,
+        ));
         return Ok(());
     }
     descend(level, unit, ours, theirs, edits)
@@ -391,10 +411,16 @@ fn descend(
     theirs: (u32, u32, u32),
     edits: &mut Vec<RawEdit>,
 ) -> Result<(), MergeHalt> {
-    let mut base_children = level.adapter.children(level.base_tree, level.base_source, unit.node);
-    let mut ours_children = level.adapter.children(level.ours_tree, level.ours_source, ours.2);
+    let mut base_children = level
+        .adapter
+        .children(level.base_tree, level.base_source, unit.node);
+    let mut ours_children = level
+        .adapter
+        .children(level.ours_tree, level.ours_source, ours.2);
     let mut theirs_children =
-        level.adapter.children(level.theirs_tree, level.theirs_source, theirs.2);
+        level
+            .adapter
+            .children(level.theirs_tree, level.theirs_source, theirs.2);
     if base_children.is_empty() && ours_children.is_empty() && theirs_children.is_empty() {
         return Err(Decline::new(
             DeclineReason::SameUnitChanged,
@@ -557,7 +583,15 @@ fn deleted_both(args: DeleteBothArgs<'_, '_, '_, '_>) -> Result<(), Decline> {
     }
     verify_deletion(level, base_units, ours_units, ours_side, unit, index, edits)?;
     let anchor = edits.len();
-    verify_deletion(level, base_units, theirs_units, theirs_side, unit, index, edits)?;
+    verify_deletion(
+        level,
+        base_units,
+        theirs_units,
+        theirs_side,
+        unit,
+        index,
+        edits,
+    )?;
     if edits.len() > anchor {
         edits.pop();
     }
@@ -565,11 +599,7 @@ fn deleted_both(args: DeleteBothArgs<'_, '_, '_, '_>) -> Result<(), Decline> {
 }
 
 /// Exact bytes of one unit's range.
-fn unit_bytes<'s>(
-    source: &'s [u8],
-    unit: &SourceUnit,
-    which: &str,
-) -> Result<&'s [u8], Decline> {
+fn unit_bytes<'s>(source: &'s [u8], unit: &SourceUnit, which: &str) -> Result<&'s [u8], Decline> {
     slice_range(source, unit.start, unit.end).ok_or_else(|| {
         Decline::new(
             DeclineReason::UnsupportedConstruct,
@@ -732,15 +762,12 @@ fn apply_insertion_group(
     };
     let base_gap = (
         group.prev.map_or(level.base_span.0, |i| base_units[i].end),
-        group.next.map_or(level.base_span.1, |i| base_units[i].start),
+        group
+            .next
+            .map_or(level.base_span.1, |i| base_units[i].start),
     );
     let side_gap = side_gap_span(
-        base_units,
-        side_units,
-        side,
-        group.prev,
-        group.next,
-        side_span,
+        base_units, side_units, side, group.prev, group.next, side_span,
     )
     .ok_or_else(|| {
         Decline::new(
@@ -843,8 +870,8 @@ fn verify_gaps(
         {
             continue;
         }
-        let side_gap =
-            side_gap_span(base_units, side_units, side, prev, next, side_span).ok_or_else(|| {
+        let side_gap = side_gap_span(base_units, side_units, side, prev, next, side_span)
+            .ok_or_else(|| {
                 Decline::new(
                     DeclineReason::UnsupportedConstruct,
                     "cannot resolve an unchanged gap".to_owned(),
@@ -891,8 +918,11 @@ fn classify_level(level: &Level<'_>) -> Result<Vec<RawEdit>, MergeHalt> {
     if let Some(decline) = decline {
         return Err(decline.into());
     }
-    let (ours_map, decline) =
-        index_units(ours_units, level.ours_source, &[(base_units, level.base_source)]);
+    let (ours_map, decline) = index_units(
+        ours_units,
+        level.ours_source,
+        &[(base_units, level.base_source)],
+    );
     if let Some(decline) = decline {
         return Err(decline.into());
     }
@@ -1031,7 +1061,11 @@ pub fn merge_triplet(
             None,
         ));
     }
-    for (which, bytes) in [("base", req.base), ("ours", req.ours), ("theirs", req.theirs)] {
+    for (which, bytes) in [
+        ("base", req.base),
+        ("ours", req.ours),
+        ("theirs", req.theirs),
+    ] {
         if bytes.contains(&0) {
             return Ok(declined(
                 req,
@@ -1251,12 +1285,14 @@ fn splice_edits(
 ) -> Result<(Vec<u8>, Vec<ByteEdit>, Vec<EditProvenance>), Decline> {
     edits.sort_by_key(|edit| (edit.base_start, edit.base_end));
     let base_len = to_u32(base.len()).ok_or_else(|| {
-        Decline::new(DeclineReason::SizeLimit, "base exceeds addressable range".to_owned())
+        Decline::new(
+            DeclineReason::SizeLimit,
+            "base exceeds addressable range".to_owned(),
+        )
     })?;
     let mut cursor = 0_u32;
     for edit in &edits {
-        if edit.base_start < cursor || edit.base_end < edit.base_start || edit.base_end > base_len
-        {
+        if edit.base_start < cursor || edit.base_end < edit.base_start || edit.base_end > base_len {
             return Err(Decline::new(
                 DeclineReason::OverlappingEdits,
                 format!("edits overlap or leave base near `{}`", edit.unit),

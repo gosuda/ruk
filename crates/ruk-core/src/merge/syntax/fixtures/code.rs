@@ -22,9 +22,7 @@ pub fn fixtures() -> Vec<Fixture> {
             base: "fn a() -> u32 {\n    1\n}\nfn b() -> u32 {\n    2\n}\n",
             ours: "fn a() -> u32 {\n    10\n}\nfn b() -> u32 {\n    2\n}\n",
             theirs: "fn a() -> u32 {\n    1\n}\nfn b() -> u32 {\n    20\n}\n",
-            expect: Expectation::Merge(
-                "fn a() -> u32 {\n    10\n}\nfn b() -> u32 {\n    20\n}\n",
-            ),
+            expect: Expectation::Merge("fn a() -> u32 {\n    10\n}\nfn b() -> u32 {\n    20\n}\n"),
         },
         // Rust: the same item edited on both sides declines.
         Fixture {

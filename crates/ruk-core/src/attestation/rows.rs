@@ -70,8 +70,7 @@ pub(super) fn decode_row(
     key: &[u8],
     bytes: &[u8],
 ) -> Result<VerifiedStatement, CoreError> {
-    let decoded: Result<StatementRow, StoreError> =
-        crate::store::decode("attestation row", bytes);
+    let decoded: Result<StatementRow, StoreError> = crate::store::decode("attestation row", bytes);
     let StatementRow {
         version,
         statement,

@@ -60,13 +60,17 @@ pub(crate) fn encode_record(head: &Head) -> [u8; RECORD_LEN] {
 
 /// Converts a precise byte count into the budget charge form.
 fn charge_len(len: usize) -> Result<u64, CoreError> {
-    u64::try_from(len).map_err(|_| CoreError::new(ErrorCode::ECapacity, "condemned size overflows u64"))
+    u64::try_from(len)
+        .map_err(|_| CoreError::new(ErrorCode::ECapacity, "condemned size overflows u64"))
 }
 
 /// Reserves `bytes` from `books` before the bytes exist.
 fn reserve_before(books: &Arc<ByteBudget>, bytes: u64) -> Result<ByteReservation, CoreError> {
     books.reserve(bytes).map_err(|refused| {
-        CoreError::new(ErrorCode::ELimit, format!("condemned budget refused: {refused}"))
+        CoreError::new(
+            ErrorCode::ELimit,
+            format!("condemned budget refused: {refused}"),
+        )
     })
 }
 
@@ -98,7 +102,10 @@ impl CondemnedBuilder {
     /// Appends one root identity, reserving its exact record bytes first.
     pub(crate) fn push(&mut self, head: &Head) -> Result<(), CoreError> {
         if self.failed {
-            return Err(CoreError::new(ErrorCode::EInvalid, "condemned builder already failed"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "condemned builder already failed",
+            ));
         }
         let record_charge = charge_len(RECORD_LEN)?;
         match reserve_before(&self.books, record_charge) {
@@ -124,7 +131,10 @@ impl CondemnedBuilder {
     /// block index. File I/O runs here, outside any registry lock.
     pub(crate) fn seal(mut self, cycle: u64) -> Result<CondemnedSet, CoreError> {
         if self.failed {
-            return Err(CoreError::new(ErrorCode::EInvalid, "condemned builder already failed"));
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "condemned builder already failed",
+            ));
         }
         self.records.sort_unstable();
         self.records.dedup();
@@ -161,27 +171,44 @@ impl CondemnedBuilder {
 /// Writes sorted records to a uniquely named scratch file.
 fn write_sealed_file(dir: &Path, records: &[[u8; RECORD_LEN]]) -> Result<PathBuf, CoreError> {
     fs::create_dir_all(dir).map_err(|err| {
-        CoreError::new(ErrorCode::EIo, format!("condemned scratch dir failed: {err}"))
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("condemned scratch dir failed: {err}"),
+        )
     })?;
     for _ in 0..8 {
         let path = dir.join(format!("{CONDEMNED_PREFIX}{}.tmp", Uuid::new_v4().simple()));
-        let mut file = match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
-                return Err(CoreError::new(ErrorCode::EIo, format!("condemned file create failed: {err}")));
+                return Err(CoreError::new(
+                    ErrorCode::EIo,
+                    format!("condemned file create failed: {err}"),
+                ));
             }
         };
         use std::io::Write as _;
         for record in records {
             if let Err(err) = file.write_all(record) {
                 let _ = fs::remove_file(&path);
-                return Err(CoreError::new(ErrorCode::EIo, format!("condemned file write failed: {err}")));
+                return Err(CoreError::new(
+                    ErrorCode::EIo,
+                    format!("condemned file write failed: {err}"),
+                ));
             }
         }
         return Ok(path);
     }
-    Err(CoreError::new(ErrorCode::EIo, "condemned file could not take a unique name"))
+    Err(CoreError::new(
+        ErrorCode::EIo,
+        "condemned file could not take a unique name",
+    ))
 }
 
 /// Immutable sealed condemned set: scratch file plus charged block index.
@@ -259,16 +286,23 @@ impl CondemnedSet {
         };
         let block_u64 = u64::try_from(block)
             .map_err(|_| CoreError::new(ErrorCode::ECapacity, "condemned block overflows u64"))?;
-        let block_len = u64::try_from(BLOCK_LEN)
-            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "condemned block size overflows u64"))?;
+        let block_len = u64::try_from(BLOCK_LEN).map_err(|_| {
+            CoreError::new(ErrorCode::ECapacity, "condemned block size overflows u64")
+        })?;
         let offset = block_u64.checked_mul(block_len).ok_or_else(|| {
             CoreError::new(ErrorCode::ECapacity, "condemned block offset overflows")
         })?;
         let mut file = std::fs::File::open(&self.path).map_err(|err| {
-            CoreError::new(ErrorCode::EIo, format!("condemned block open failed: {err}"))
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("condemned block open failed: {err}"),
+            )
         })?;
         file.seek(SeekFrom::Start(offset)).map_err(|err| {
-            CoreError::new(ErrorCode::EIo, format!("condemned block seek failed: {err}"))
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("condemned block seek failed: {err}"),
+            )
         })?;
         let file_len = file
             .metadata()
@@ -276,8 +310,9 @@ impl CondemnedSet {
             .len();
         // Fail closed on any truncation or extension: a partial trailing
         // record must never read as absent and grant a condemned root.
-        let record_len = u64::try_from(RECORD_LEN)
-            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "condemned record size overflows u64"))?;
+        let record_len = u64::try_from(RECORD_LEN).map_err(|_| {
+            CoreError::new(ErrorCode::ECapacity, "condemned record size overflows u64")
+        })?;
         let expected = self.len.checked_mul(record_len).ok_or_else(|| {
             CoreError::new(ErrorCode::ECapacity, "condemned file size overflows u64")
         })?;
@@ -288,11 +323,15 @@ impl CondemnedSet {
             ));
         }
         let want = file_len.saturating_sub(offset).min(block_len);
-        let want = usize::try_from(want)
-            .map_err(|_| CoreError::new(ErrorCode::ECapacity, "condemned block size overflows usize"))?;
+        let want = usize::try_from(want).map_err(|_| {
+            CoreError::new(ErrorCode::ECapacity, "condemned block size overflows usize")
+        })?;
         let mut buf = vec![0_u8; want];
         file.read_exact(&mut buf).map_err(|err| {
-            CoreError::new(ErrorCode::EIo, format!("condemned block read failed: {err}"))
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("condemned block read failed: {err}"),
+            )
         })?;
         Ok(buf.chunks_exact(RECORD_LEN).any(|chunk| chunk == needle))
     }

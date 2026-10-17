@@ -39,7 +39,10 @@ use super::pack::{IngestLimits, Links, StagedPack, ingest_pack, object_links};
 use super::pktline::{self, Packet, PktReader, RemoteMessages, SidebandReader, send};
 use super::refadv::{self, Advertisement, Capabilities, Initial};
 use super::session::Duplex;
-use super::{Interrupt, PromisorRow, has_object, promisor_clear, promisor_mutation, read_object, shallow_insert, shallow_remove};
+use super::{
+    Interrupt, PromisorRow, has_object, promisor_clear, promisor_mutation, read_object,
+    shallow_insert, shallow_remove,
+};
 use crate::GitError;
 
 /// OIDs requested per prefetch connection.
@@ -176,7 +179,10 @@ fn receive_v0<R: Read + Write>(
     let filter = match req.filter {
         Some(filter) if caps.has("filter") => Some(filter),
         Some(filter) => {
-            warnings.push(format!("server lacks filter; fetched full objects instead of {}", filter.spec()));
+            warnings.push(format!(
+                "server lacks filter; fetched full objects instead of {}",
+                filter.spec()
+            ));
             None
         }
         None => None,
@@ -192,7 +198,11 @@ fn receive_v0<R: Read + Write>(
     let mut out = Vec::new();
     let mut caps_list = vec!["multi_ack_detailed", "thin-pack", "ofs-delta"];
     if server_sideband(caps).is_some() {
-        caps_list.push(if caps.has("side-band-64k") { "side-band-64k" } else { "side-band" });
+        caps_list.push(if caps.has("side-band-64k") {
+            "side-band-64k"
+        } else {
+            "side-band"
+        });
     }
     if filter.is_some() {
         caps_list.push("filter");
@@ -335,7 +345,10 @@ fn receive_v2<R: Read + Write>(
         let request = refadv::ls_refs_request(
             &caps,
             kind,
-            &req.ref_prefixes.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &req.ref_prefixes
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>(),
         )?;
         send(pkt.get_mut(), &request)?;
         refs = refadv::read_ls_refs(pkt, kind)?;
@@ -344,7 +357,10 @@ fn receive_v2<R: Read + Write>(
     let filter = match req.filter {
         Some(filter) if caps.feature("fetch", "filter") => Some(filter),
         Some(filter) => {
-            warnings.push(format!("server lacks filter; fetched full objects instead of {}", filter.spec()));
+            warnings.push(format!(
+                "server lacks filter; fetched full objects instead of {}",
+                filter.spec()
+            ));
             None
         }
         None => None,
@@ -409,14 +425,16 @@ fn receive_v2<R: Read + Write>(
                     b"wanted-refs" => read_section_lines(pkt, &mut Vec::new())?,
                     b"packfile" => {
                         if sideband_all {
-                            let mut band = SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
+                            let mut band =
+                                SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
                             let pack = ingest_pack(&mut band, kind, store, limits, interrupt)?;
                             progress = band.drain_to_end()?;
                             staged = Some(pack);
                         } else {
                             // A raw packfile section ends at its trailer; the
                             // connection is not reused afterwards.
-                            staged = Some(ingest_pack(pkt.get_mut(), kind, store, limits, interrupt)?);
+                            staged =
+                                Some(ingest_pack(pkt.get_mut(), kind, store, limits, interrupt)?);
                         }
                     }
                     _ => read_section_lines(pkt, &mut Vec::new())?,
@@ -439,7 +457,10 @@ fn receive_v2<R: Read + Write>(
     })
 }
 
-fn read_section_lines<R: Read>(pkt: &mut PktReader<R>, lines: &mut Vec<Vec<u8>>) -> Result<(), GitError> {
+fn read_section_lines<R: Read>(
+    pkt: &mut PktReader<R>,
+    lines: &mut Vec<Vec<u8>>,
+) -> Result<(), GitError> {
     loop {
         match pkt.read_packet()? {
             Packet::Flush | Packet::ResponseEnd => return Ok(()),
@@ -651,7 +672,11 @@ pub fn collect_haves(
 }
 
 /// Builds promisor-row insertions for blobs the filter omitted.
-pub fn promisor_facts(remote: &[u8], filter: Filter, missing: &[Oid]) -> Result<Vec<FactMutation>, GitError> {
+pub fn promisor_facts(
+    remote: &[u8],
+    filter: Filter,
+    missing: &[Oid],
+) -> Result<Vec<FactMutation>, GitError> {
     missing
         .iter()
         .map(|oid| {
@@ -777,9 +802,11 @@ pub fn publish_fetch(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::pktline as pkt;
-    use crate::transport::session::test_support::{ScriptedPeer, receive_from_script, store_with_pack, test_store};
+    use super::*;
+    use crate::transport::session::test_support::{
+        ScriptedPeer, receive_from_script, store_with_pack, test_store,
+    };
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
     const THREE: &str = "7a4943e466a7ce4f4c56d9eeb89c8909b1c43d22";
@@ -796,7 +823,12 @@ mod tests {
 
     fn v0_script(tip: &str, pack: &[u8]) -> Vec<u8> {
         let mut script = Vec::new();
-        script.extend(frame(format!("{tip} HEAD\0multi_ack thin-pack ofs-delta filter object-format=sha1 agent=git/2\n").as_bytes()));
+        script.extend(frame(
+            format!(
+                "{tip} HEAD\0multi_ack thin-pack ofs-delta filter object-format=sha1 agent=git/2\n"
+            )
+            .as_bytes(),
+        ));
         script.extend(frame(format!("{tip} refs/heads/main\n").as_bytes()));
         script.extend(b"0000");
         script.extend(frame(b"NAK\n"));
@@ -811,21 +843,33 @@ mod tests {
         let store = test_store(HashKind::Sha1);
         let pack = include_bytes!("fixtures/basic.pack");
         let req = FetchWireRequest::native(vec![oid(FOUR)], Vec::new());
-        let (received, written) = receive_from_script(v0_script(FOUR, pack), HashKind::Sha1, &store, &req);
+        let (received, written) =
+            receive_from_script(v0_script(FOUR, pack), HashKind::Sha1, &store, &req);
         let text = String::from_utf8_lossy(&written);
         assert!(text.contains(FOUR), "sends the want");
         assert!(text.contains("filter blob:none"), "sends the filter");
         assert!(text.contains("done\n"), "terminates negotiation with done");
         assert!(received.warnings.is_empty());
         assert_eq!(received.staged.oids().len(), 16);
-        let report = verify_closure(&store, &received.staged, &req.wants, req.filter, &[], &Interrupt::none())
-            .expect("complete pack verifies");
+        let report = verify_closure(
+            &store,
+            &received.staged,
+            &req.wants,
+            req.filter,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("complete pack verifies");
         assert!(report.missing_promisor.is_empty());
-        let mut facts = promisor_facts(b"origin", Filter::BlobNone, &report.missing_promisor).expect("facts");
+        let mut facts =
+            promisor_facts(b"origin", Filter::BlobNone, &report.missing_promisor).expect("facts");
         facts.extend(observation_mutations(b"origin", &[]));
         let publication = publish_fetch(&store, received.staged, &facts).expect("publish");
         assert_eq!(publication.objects.len(), 16);
-        assert!(store.read(oid(FOUR)).is_ok(), "tip is readable after publish");
+        assert!(
+            store.read(oid(FOUR)).is_ok(),
+            "tip is readable after publish"
+        );
     }
 
     #[test]
@@ -837,7 +881,12 @@ mod tests {
         let pack = include_bytes!("fixtures/basic.pack");
         let two = THREE;
         let mut script = Vec::new();
-        script.extend(frame(format!("{FOUR} HEAD\0multi_ack_detailed thin-pack ofs-delta filter object-format=sha1\n").as_bytes()));
+        script.extend(frame(
+            format!(
+                "{FOUR} HEAD\0multi_ack_detailed thin-pack ofs-delta filter object-format=sha1\n"
+            )
+            .as_bytes(),
+        ));
         script.extend(b"0000");
         script.extend(frame(format!("ACK {two} common\n").as_bytes()));
         script.extend(frame(format!("ACK {two} ready\n").as_bytes()));
@@ -858,8 +907,15 @@ mod tests {
         assert!(text.contains(two), "offers the have");
         assert!(text.contains("done\n"), "sends done once the round ends");
         assert_eq!(received.staged.oids().len(), 16);
-        verify_closure(&store, &received.staged, &req.wants, None, &[], &Interrupt::none())
-            .expect("complete pack verifies");
+        verify_closure(
+            &store,
+            &received.staged,
+            &req.wants,
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("complete pack verifies");
     }
 
     #[test]
@@ -871,8 +927,15 @@ mod tests {
         script.extend(frame(b"GARBAGE\n"));
         let req = FetchWireRequest::native(vec![oid(FOUR)], Vec::new());
         let mut peer = ScriptedPeer::new(script);
-        let err = receive(&mut peer, HashKind::Sha1, &store, &req, IngestLimits::default(), &Interrupt::none())
-            .expect_err("garbage ack");
+        let err = receive(
+            &mut peer,
+            HashKind::Sha1,
+            &store,
+            &req,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect_err("garbage ack");
         assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
     }
 
@@ -885,11 +948,21 @@ mod tests {
         let direct = |o| RefTarget::Direct(o);
         // Remote unmoved: observation only.
         assert_eq!(
-            plan_tracking(name.clone(), Some(&direct(oid_a)), Some(&direct(oid_a)), &direct(oid_a)),
+            plan_tracking(
+                name.clone(),
+                Some(&direct(oid_a)),
+                Some(&direct(oid_a)),
+                &direct(oid_a)
+            ),
             TrackingDecision::Unchanged
         );
         // Clean advance: local matches observed.
-        match plan_tracking(name.clone(), Some(&direct(oid_a)), Some(&direct(oid_a)), &direct(oid_b)) {
+        match plan_tracking(
+            name.clone(),
+            Some(&direct(oid_a)),
+            Some(&direct(oid_a)),
+            &direct(oid_b),
+        ) {
             TrackingDecision::Advance { update } => {
                 assert_eq!(update.expected, RefExpect::Present(direct(oid_a)));
                 assert_eq!(update.change, RefChange::Set(direct(oid_b)));
@@ -904,15 +977,32 @@ mod tests {
         // Both moved: conflict with terms, no invented merge. The new value
         // must differ from both local and observed for a true conflict.
         let oid_c = Oid::from_bytes(&[7u8; 20]).expect("oid c");
-        match plan_tracking(name.clone(), Some(&direct(oid_b)), Some(&direct(oid_a)), &direct(oid_c)) {
-            TrackingDecision::Conflict { local, observed, new } => {
-                assert_eq!((local, observed, new), (Some(oid_b), Some(oid_a), Some(oid_c)));
+        match plan_tracking(
+            name.clone(),
+            Some(&direct(oid_b)),
+            Some(&direct(oid_a)),
+            &direct(oid_c),
+        ) {
+            TrackingDecision::Conflict {
+                local,
+                observed,
+                new,
+            } => {
+                assert_eq!(
+                    (local, observed, new),
+                    (Some(oid_b), Some(oid_a), Some(oid_c))
+                );
             }
             other => panic!("expected conflict, got {other:?}"),
         }
         // Local already at new: unchanged even when observed lags.
         assert_eq!(
-            plan_tracking(name, Some(&direct(oid_b)), Some(&direct(oid_a)), &direct(oid_b)),
+            plan_tracking(
+                name,
+                Some(&direct(oid_b)),
+                Some(&direct(oid_a)),
+                &direct(oid_b)
+            ),
             TrackingDecision::Unchanged
         );
     }
@@ -923,9 +1013,12 @@ mod tests {
 
     impl Reconnectable for ScriptConnector {
         fn reconnect(&mut self) -> Result<Box<dyn Duplex>, GitError> {
-            self.batches.pop_front().map(|p| Box::new(p) as Box<dyn Duplex>).ok_or_else(|| GitError::Io {
-                detail: "no more scripted batches".to_owned(),
-            })
+            self.batches
+                .pop_front()
+                .map(|p| Box::new(p) as Box<dyn Duplex>)
+                .ok_or_else(|| GitError::Io {
+                    detail: "no more scripted batches".to_owned(),
+                })
         }
     }
 
@@ -941,7 +1034,11 @@ mod tests {
             &promisor_facts(b"origin", Filter::BlobNone, &[missing]).expect("row"),
         )
         .expect("promise the blob");
-        assert!(super::super::promisor_row(&dest, missing).expect("read").is_some());
+        assert!(
+            super::super::promisor_row(&dest, missing)
+                .expect("read")
+                .is_some()
+        );
         // One batch: advertisement, NAK, and a pack holding just the blob.
         let (obj_kind, bytes) = read_object(&src, missing, 1 << 20).expect("blob");
         let entry = super::super::pack::PackEntry {
@@ -951,17 +1048,29 @@ mod tests {
             base: None,
         };
         let mut pack = Vec::new();
-        super::super::pack::write_pack(&mut pack, kind, &[entry], &Interrupt::none()).expect("pack");
+        super::super::pack::write_pack(&mut pack, kind, &[entry], &Interrupt::none())
+            .expect("pack");
         let script = v0_script(&missing.to_hex(), &pack);
         let mut connector = ScriptConnector {
             batches: [ScriptedPeer::new(script)].into_iter().collect(),
         };
-        let report = prefetch(&mut connector, kind, &dest, &[missing], IngestLimits::default(), &Interrupt::none())
-            .expect("prefetch");
+        let report = prefetch(
+            &mut connector,
+            kind,
+            &dest,
+            &[missing],
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("prefetch");
         assert_eq!(report.delivered, vec![missing]);
         assert_eq!(report.batches, 1);
         assert!(dest.read(missing).is_ok());
-        assert!(super::super::promisor_row(&dest, missing).expect("read").is_none());
+        assert!(
+            super::super::promisor_row(&dest, missing)
+                .expect("read")
+                .is_none()
+        );
     }
 
     #[test]
@@ -970,13 +1079,21 @@ mod tests {
         let dest = test_store(kind);
         let missing = oid("51e57698a4ba83f75f80aadb52854e18e00cba6e");
         let mut pack = Vec::new();
-        super::super::pack::write_pack(&mut pack, kind, &[], &Interrupt::none()).expect("empty pack");
+        super::super::pack::write_pack(&mut pack, kind, &[], &Interrupt::none())
+            .expect("empty pack");
         let script = v0_script(&missing.to_hex(), &pack);
         let mut connector = ScriptConnector {
             batches: [ScriptedPeer::new(script)].into_iter().collect(),
         };
-        let err = prefetch(&mut connector, kind, &dest, &[missing], IngestLimits::default(), &Interrupt::none())
-            .expect_err("empty delivery");
+        let err = prefetch(
+            &mut connector,
+            kind,
+            &dest,
+            &[missing],
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect_err("empty delivery");
         assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
     }
 }

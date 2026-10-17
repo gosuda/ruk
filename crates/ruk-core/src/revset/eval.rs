@@ -229,12 +229,12 @@ impl RevsetCursor {
     pub(crate) fn from_opaque(bytes: &[u8]) -> Result<Self, CoreError> {
         let text = core::str::from_utf8(bytes)
             .map_err(|_| CoreError::new(ErrorCode::EInvalid, "revset cursor is not UTF-8"))?;
-        let digits = text
-            .strip_prefix(CURSOR_TAG)
-            .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "revset cursor has the wrong tag"))?;
-        let offset = digits
-            .parse::<usize>()
-            .map_err(|_| CoreError::new(ErrorCode::EInvalid, "revset cursor offset is not a number"))?;
+        let digits = text.strip_prefix(CURSOR_TAG).ok_or_else(|| {
+            CoreError::new(ErrorCode::EInvalid, "revset cursor has the wrong tag")
+        })?;
+        let offset = digits.parse::<usize>().map_err(|_| {
+            CoreError::new(ErrorCode::EInvalid, "revset cursor offset is not a number")
+        })?;
         Ok(Self { offset })
     }
 }
@@ -277,8 +277,13 @@ pub(crate) fn eval_page(
     let limit = resolve_limit(limit.unwrap_or(ctx.default_limit))?;
     let offset = cursor.map_or(0, |c| c.offset);
     let total = matched.len();
-    let positions: Vec<GlobalPosition> =
-        matched.positions().iter().skip(offset).take(limit).copied().collect();
+    let positions: Vec<GlobalPosition> = matched
+        .positions()
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .copied()
+        .collect();
     let heads = positions
         .iter()
         .map(|pos| ctx.graph.pos_to_head(*pos))
@@ -415,7 +420,10 @@ impl<'a> Eval<'a> {
             self.children = Some(children);
         }
         self.children.as_deref().ok_or_else(|| {
-            CoreError::new(ErrorCode::ECorrupt, "revset children map vanished after build")
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                "revset children map vanished after build",
+            )
         })
     }
 
@@ -510,9 +518,8 @@ impl<'a> Eval<'a> {
                 continue;
             }
             let children = self.children_map()?;
-            let fresh: Vec<GlobalPosition> = children
-                .get(pos.as_usize())
-                .map_or_else(Vec::new, |list| {
+            let fresh: Vec<GlobalPosition> =
+                children.get(pos.as_usize()).map_or_else(Vec::new, |list| {
                     list.iter().copied().filter(|p| !out.contains(p)).collect()
                 });
             stack.extend(fresh);
@@ -522,7 +529,11 @@ impl<'a> Eval<'a> {
 
     // -- node evaluation ----------------------------------------------------
 
-    fn node(&mut self, arena: &AstArena, id: NodeId) -> Result<BTreeSet<GlobalPosition>, CoreError> {
+    fn node(
+        &mut self,
+        arena: &AstArena,
+        id: NodeId,
+    ) -> Result<BTreeSet<GlobalPosition>, CoreError> {
         match &arena.node(id).kind {
             NodeKind::At => self.heads_to_positions(&self.ctx.wc_heads, "working-copy"),
             NodeKind::AtMinus => self.at_minus(),
@@ -553,23 +564,33 @@ impl<'a> Eval<'a> {
                 self.files_glob(&glob)
             }
             NodeKind::Attested { kind, result } => {
-                let (kind_text, result_text) =
-                    (arena.string(*kind).to_owned(), arena.string(*result).to_owned());
+                let (kind_text, result_text) = (
+                    arena.string(*kind).to_owned(),
+                    arena.string(*result).to_owned(),
+                );
                 self.attested(&kind_text, &result_text)
             }
             NodeKind::Heads(inner) => {
-                let members: Vec<GlobalPosition> =
-                    self.node(arena, *inner)?.into_iter().collect();
-                Ok(find_heads(self.ctx.graph, &members, &never_cancel(), self.walk_budget())?
-                    .into_iter()
-                    .collect())
+                let members: Vec<GlobalPosition> = self.node(arena, *inner)?.into_iter().collect();
+                Ok(find_heads(
+                    self.ctx.graph,
+                    &members,
+                    &never_cancel(),
+                    self.walk_budget(),
+                )?
+                .into_iter()
+                .collect())
             }
             NodeKind::Roots(inner) => {
-                let members: Vec<GlobalPosition> =
-                    self.node(arena, *inner)?.into_iter().collect();
-                Ok(find_roots(self.ctx.graph, &members, &never_cancel(), self.walk_budget())?
-                    .into_iter()
-                    .collect())
+                let members: Vec<GlobalPosition> = self.node(arena, *inner)?.into_iter().collect();
+                Ok(find_roots(
+                    self.ctx.graph,
+                    &members,
+                    &never_cancel(),
+                    self.walk_budget(),
+                )?
+                .into_iter()
+                .collect())
             }
             NodeKind::Ancestors(inner) => {
                 let set = self.node(arena, *inner)?;
@@ -807,7 +828,11 @@ impl<'a> Eval<'a> {
         if !text.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(IndexHit::None);
         }
-        match self.ctx.graph.resolve_head_prefix(&text.to_ascii_lowercase())? {
+        match self
+            .ctx
+            .graph
+            .resolve_head_prefix(&text.to_ascii_lowercase())?
+        {
             PrefixResolution::NoMatch => Ok(IndexHit::None),
             PrefixResolution::SingleMatch(head) => Ok(IndexHit::One(head)),
             PrefixResolution::AmbiguousMatch => Ok(IndexHit::Ambiguous),
@@ -839,7 +864,11 @@ impl<'a> Eval<'a> {
                 prefix.push(idx);
             }
         }
-        if exact.is_empty() { Ok(prefix) } else { Ok(exact) }
+        if exact.is_empty() {
+            Ok(prefix)
+        } else {
+            Ok(exact)
+        }
     }
 
     /// Candidate listing for cross-category ambiguity errors.
@@ -853,7 +882,12 @@ impl<'a> Eval<'a> {
     ) -> String {
         let mut names: Vec<String> = Vec::new();
         if let Ok(index) = self.refs() {
-            for idx in bookmarks.iter().chain(tags).chain(remotes).take(MAX_CANDIDATES) {
+            for idx in bookmarks
+                .iter()
+                .chain(tags)
+                .chain(remotes)
+                .take(MAX_CANDIDATES)
+            {
                 if let Some(entry) = index.entries.get(*idx) {
                     names.push(String::from_utf8_lossy(entry.name.as_bytes()).into_owned());
                 }
@@ -890,7 +924,11 @@ impl<'a> Eval<'a> {
                 format!("revset {what} {text:?} is ambiguous: {}", names.join(", ")),
             ));
         }
-        let oid = self.refs()?.entries.get(hits[0]).and_then(|entry| entry.oid);
+        let oid = self
+            .refs()?
+            .entries
+            .get(hits[0])
+            .and_then(|entry| entry.oid);
         let mut out = BTreeSet::new();
         if let Some(oid) = oid
             && let Some(pos) = self.ctx.graph.head_to_pos(&Head::Git { oid })
@@ -917,7 +955,7 @@ impl<'a> Eval<'a> {
 
     /// `change(prefix)`: exactly one change id, then all its positions.
     fn change_prefix(&self, prefix: &str) -> Result<BTreeSet<GlobalPosition>, CoreError> {
-                    match self.change_hit(prefix)? {
+        match self.change_hit(prefix)? {
             IndexHit::One(id) => self.change_id_positions(&id),
             IndexHit::None => Err(CoreError::new(
                 ErrorCode::EInvalid,
@@ -965,7 +1003,9 @@ impl<'a> Eval<'a> {
         }
         let wanted = matching.values().next().expect("exactly one session");
         self.scan_records(|record| {
-            Ok(record.provenance().is_some_and(|prov| prov.session() == *wanted))
+            Ok(record
+                .provenance()
+                .is_some_and(|prov| prov.session() == *wanted))
         })
     }
 
@@ -1037,7 +1077,11 @@ impl<'a> Eval<'a> {
     /// Commits with a retained verified statement matching kind/result, via
     /// the injected query. Git heads only; conflicted heads have no OID
     /// subject and never match.
-    fn attested(&self, kind_text: &str, result_text: &str) -> Result<BTreeSet<GlobalPosition>, CoreError> {
+    fn attested(
+        &self,
+        kind_text: &str,
+        result_text: &str,
+    ) -> Result<BTreeSet<GlobalPosition>, CoreError> {
         let kind = AttestKind::new(kind_text)?;
         let result = AttestResult::new(result_text)?;
         let Some(query) = self.ctx.attested_query else {
@@ -1278,7 +1322,10 @@ fn parse_tree_entries(
             b"100644" | b"100664" | b"100755" | b"120000" | b"160000"
         );
         if !dir && !blob {
-            return Err(corrupt(format!("unknown mode {}", String::from_utf8_lossy(mode))));
+            return Err(corrupt(format!(
+                "unknown mode {}",
+                String::from_utf8_lossy(mode)
+            )));
         }
         let after_mode = &rest[space + 1..];
         let nul = after_mode
@@ -1453,7 +1500,9 @@ mod tests {
         }
 
         fn publish_facts(&self, facts: &[FactMutation]) {
-            self.store.publish(Vec::new(), facts).expect("publish facts");
+            self.store
+                .publish(Vec::new(), facts)
+                .expect("publish facts");
         }
 
         fn publish_commits(&self, rows: &[(Head, CommitRecord)]) {
@@ -1503,7 +1552,9 @@ mod tests {
                 .store
                 .prepare(kind, bytes.len() as u64, std::io::Cursor::new(bytes), None)
                 .expect("prepare object");
-            self.store.publish(vec![prepared], &[]).expect("publish object");
+            self.store
+                .publish(vec![prepared], &[])
+                .expect("publish object");
             oid
         }
     }
@@ -1566,7 +1617,9 @@ mod tests {
         fn new() -> Self {
             let kind = HashKind::Sha1;
             let scratch = Scratch::new("diamond", kind);
-            let tree = kind.hash_git_object("blob", b"fixture").expect("tree stand-in");
+            let tree = kind
+                .hash_git_object("blob", b"fixture")
+                .expect("tree stand-in");
             let s1 = SessionId::from_bytes([
                 0x11, 0x00, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
                 0x0F, 0x10,
@@ -1584,21 +1637,42 @@ mod tests {
                 0xEE, 0xFE,
             ]);
             let (a, ra) = make_record(kind, [1; 16], vec![], tree, "root commit", None);
-            let (b, rb) =
-                make_record(kind, *change_b.as_bytes(), vec![a], tree, "feature work", Some(s1));
-            let (c, rc) =
-                make_record(kind, *change_c.as_bytes(), vec![a], tree, "other work", Some(s2));
+            let (b, rb) = make_record(
+                kind,
+                *change_b.as_bytes(),
+                vec![a],
+                tree,
+                "feature work",
+                Some(s1),
+            );
+            let (c, rc) = make_record(
+                kind,
+                *change_c.as_bytes(),
+                vec![a],
+                tree,
+                "other work",
+                Some(s2),
+            );
             let (d, rd) = make_record(kind, [4; 16], vec![b, c], tree, "merge both", Some(s1));
             let (b2, rb2) = make_record(kind, [6; 16], vec![b], tree, "feature rewrite", None);
             scratch.publish_commits(&[(a, ra), (b, rb), (c, rc), (d, rd), (b2, rb2)]);
             let mut entry_b = ChangeEntry::new(ChangeState::Active, b);
             entry_b.add_head(b2).expect("divergent head");
             scratch.publish_changes(&[
-                (ChangeId::from_bytes([1; 16]), ChangeEntry::new(ChangeState::Active, a)),
+                (
+                    ChangeId::from_bytes([1; 16]),
+                    ChangeEntry::new(ChangeState::Active, a),
+                ),
                 (change_b, entry_b),
                 (change_c, ChangeEntry::new(ChangeState::Active, c)),
-                (ChangeId::from_bytes([4; 16]), ChangeEntry::new(ChangeState::Active, d)),
-                (ChangeId::from_bytes([6; 16]), ChangeEntry::new(ChangeState::Active, b2)),
+                (
+                    ChangeId::from_bytes([4; 16]),
+                    ChangeEntry::new(ChangeState::Active, d),
+                ),
+                (
+                    ChangeId::from_bytes([6; 16]),
+                    ChangeEntry::new(ChangeState::Active, b2),
+                ),
             ]);
             scratch.publish_ref("refs/heads/main", RefTarget::Direct(git_oid(&d)));
             scratch.publish_ref("refs/heads/feat", RefTarget::Direct(git_oid(&b)));
@@ -1613,13 +1687,34 @@ mod tests {
             scratch.publish_ref("refs/remotes/origin/main", RefTarget::Direct(git_oid(&c)));
 
             let mut builder = GraphIndexBuilder::new(GraphIndex::empty(kind));
-            builder.add_commit(a, ChangeId::from_bytes([1; 16]), &[], vec![]).expect("add a");
-            builder.add_commit(b, change_b, &[a], vec![]).expect("add b");
-            builder.add_commit(c, change_c, &[a], vec![]).expect("add c");
-            builder.add_commit(d, ChangeId::from_bytes([4; 16]), &[b, c], vec![]).expect("add d");
-            builder.add_commit(b2, ChangeId::from_bytes([6; 16]), &[b], vec![]).expect("add b2");
+            builder
+                .add_commit(a, ChangeId::from_bytes([1; 16]), &[], vec![])
+                .expect("add a");
+            builder
+                .add_commit(b, change_b, &[a], vec![])
+                .expect("add b");
+            builder
+                .add_commit(c, change_c, &[a], vec![])
+                .expect("add c");
+            builder
+                .add_commit(d, ChangeId::from_bytes([4; 16]), &[b, c], vec![])
+                .expect("add d");
+            builder
+                .add_commit(b2, ChangeId::from_bytes([6; 16]), &[b], vec![])
+                .expect("add b2");
             let graph = builder.finish(&ByteBudget::new(1 << 20)).expect("graph");
-            Self { scratch, graph, a, b, c, d, b2, change_b, s1, s2 }
+            Self {
+                scratch,
+                graph,
+                a,
+                b,
+                c,
+                d,
+                b2,
+                change_b,
+                s1,
+                s2,
+            }
         }
 
         fn ctx(&self) -> EvalContext<'_> {
@@ -1669,11 +1764,20 @@ mod tests {
     fn dag_range_and_range() {
         let fx = Diamond::new();
         let ctx = fx.ctx();
-        let dag = eval(&ctx, r#"description("feature work")::description("merge both")"#);
+        let dag = eval(
+            &ctx,
+            r#"description("feature work")::description("merge both")"#,
+        );
         assert_eq!(heads_of(&dag), BTreeSet::from([fx.b, fx.d]));
-        let range = eval(&ctx, r#"description("root commit")..description("merge both")"#);
+        let range = eval(
+            &ctx,
+            r#"description("root commit")..description("merge both")"#,
+        );
         assert_eq!(heads_of(&range), BTreeSet::from([fx.b, fx.c, fx.d]));
-        let empty_range = eval(&ctx, r#"description("merge both")..description("root commit")"#);
+        let empty_range = eval(
+            &ctx,
+            r#"description("merge both")..description("root commit")"#,
+        );
         assert!(heads_of(&empty_range).is_empty());
     }
 
@@ -1710,14 +1814,20 @@ mod tests {
         let fx = Diamond::new();
         let ctx = fx.ctx();
         let full = fx.change_b.to_reverse_hex();
-        assert_eq!(heads_of(&eval(&ctx, &format!("change({full})"))), BTreeSet::from([fx.b]));
+        assert_eq!(
+            heads_of(&eval(&ctx, &format!("change({full})"))),
+            BTreeSet::from([fx.b])
+        );
         let short = &full[..8];
         assert_eq!(
             heads_of(&eval(&ctx, &format!("change({short})"))),
             BTreeSet::from([fx.b])
         );
         let missing = eval_str(&ctx, "change(zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz)");
-        assert_eq!(missing.expect_err("no such change").code, ErrorCode::EInvalid);
+        assert_eq!(
+            missing.expect_err("no such change").code,
+            ErrorCode::EInvalid
+        );
     }
 
     #[test]
@@ -1739,13 +1849,19 @@ mod tests {
         // Bookmark and tag both named "dup".
         let err = eval_str(&ctx, "dup").expect_err("cross-category ambiguity");
         assert_eq!(err.code, ErrorCode::EInvalid);
-        assert!(err.message.contains("ambiguous"), "message names ambiguity: {err}");
+        assert!(
+            err.message.contains("ambiguous"),
+            "message names ambiguity: {err}"
+        );
         // An exact bookmark wins over longer names sharing the prefix.
         assert_eq!(heads_of(&eval(&ctx, "feat")), BTreeSet::from([fx.b]));
         // A pure prefix of two bookmarks is ambiguous with candidates.
         let err = eval_str(&ctx, "fea").expect_err("same-namespace ambiguity");
         assert_eq!(err.code, ErrorCode::EInvalid);
-        assert!(err.message.contains("refs/heads/feat"), "candidates listed: {err}");
+        assert!(
+            err.message.contains("refs/heads/feat"),
+            "candidates listed: {err}"
+        );
     }
 
     #[test]
@@ -1764,7 +1880,10 @@ mod tests {
             heads_of(&eval(&ctx, "bookmarks()")),
             BTreeSet::from([fx.d, fx.b, fx.b2])
         );
-        assert_eq!(heads_of(&eval(&ctx, r#"bookmarks("feat")"#)), BTreeSet::from([fx.b]));
+        assert_eq!(
+            heads_of(&eval(&ctx, r#"bookmarks("feat")"#)),
+            BTreeSet::from([fx.b])
+        );
         assert_eq!(
             heads_of(&eval(&ctx, r#"bookmarks("feat*")"#)),
             BTreeSet::from([fx.b, fx.b2])
@@ -1797,13 +1916,18 @@ mod tests {
         let key = CommitKey::from_bytes(&[0xEE; 32]).expect("key");
         let conflicted = Head::Conflicted { key };
         let mut builder = GraphIndexBuilder::new(GraphIndex::empty(kind));
-        builder.add_commit(a, ChangeId::from_bytes([1; 16]), &[], vec![]).expect("a");
+        builder
+            .add_commit(a, ChangeId::from_bytes([1; 16]), &[], vec![])
+            .expect("a");
         builder
             .add_commit(conflicted, ChangeId::from_bytes([2; 16]), &[a], vec![])
             .expect("e");
         let graph = builder.finish(&ByteBudget::new(1 << 20)).expect("graph");
         let ctx = EvalContext::new(&scratch.store, &graph);
-        assert_eq!(heads_of(&eval(&ctx, "conflicted()")), BTreeSet::from([conflicted]));
+        assert_eq!(
+            heads_of(&eval(&ctx, "conflicted()")),
+            BTreeSet::from([conflicted])
+        );
         // Ancestor walks need no commit records.
         assert_eq!(
             heads_of(&eval(&ctx, "ancestors(conflicted())")),
@@ -1815,7 +1939,10 @@ mod tests {
     fn divergent_lists_multi_head_changes() {
         let fx = Diamond::new();
         let ctx = fx.ctx();
-        assert_eq!(heads_of(&eval(&ctx, "divergent()")), BTreeSet::from([fx.b, fx.b2]));
+        assert_eq!(
+            heads_of(&eval(&ctx, "divergent()")),
+            BTreeSet::from([fx.b, fx.b2])
+        );
     }
 
     #[test]
@@ -1823,7 +1950,10 @@ mod tests {
         let fx = Diamond::new();
         let mut ctx = fx.ctx();
         ctx.mine_sessions = vec![fx.s1];
-        assert_eq!(heads_of(&eval(&ctx, "mine()")), BTreeSet::from([fx.b, fx.d]));
+        assert_eq!(
+            heads_of(&eval(&ctx, "mine()")),
+            BTreeSet::from([fx.b, fx.d])
+        );
         let bare = fx.ctx();
         assert!(heads_of(&eval(&bare, "mine()")).is_empty());
         let s2_prefix = &fx.s2.to_string()[..8];
@@ -1844,7 +1974,10 @@ mod tests {
         // Both fixture sessions share the "11" UUID prefix.
         let err = eval_str(&ctx, "session(11)").expect_err("ambiguous session");
         assert_eq!(err.code, ErrorCode::EInvalid);
-        assert!(err.message.contains("ambiguous"), "candidates listed: {err}");
+        assert!(
+            err.message.contains("ambiguous"),
+            "candidates listed: {err}"
+        );
         let err = eval_str(&ctx, "session(00)").expect_err("unknown session");
         assert_eq!(err.code, ErrorCode::EInvalid);
     }
@@ -1880,7 +2013,9 @@ mod tests {
         let ast = parse_str("@").expect("parse");
         for bad in [Some(0), Some(1001)] {
             assert_eq!(
-                eval_page(&ctx, &ast, bad, None).expect_err("bad limit").code,
+                eval_page(&ctx, &ast, bad, None)
+                    .expect_err("bad limit")
+                    .code,
                 ErrorCode::EInvalid
             );
         }
@@ -1919,7 +2054,11 @@ mod tests {
             (b"a", b"", false),
         ];
         for (pattern, path, want) in cases {
-            assert_eq!(glob_match(pattern, path), *want, "pattern {pattern:?} path {path:?}");
+            assert_eq!(
+                glob_match(pattern, path),
+                *want,
+                "pattern {pattern:?} path {path:?}"
+            );
         }
         assert_eq!(literal_dir_prefix(b"src/**/*.rs"), b"src");
         assert_eq!(literal_dir_prefix(b"*.rs"), b"");
@@ -1968,8 +2107,7 @@ mod tests {
             let root_oid = scratch.put_object(ObjectKind::Tree, root);
             let empty_oid = scratch.put_object(ObjectKind::Tree, Vec::new());
             let (r0, rr0) = make_record(kind, [0xA0; 16], vec![], empty_oid, "empty root", None);
-            let (r1, rr1) =
-                make_record(kind, [0xA1; 16], vec![r0], root_oid, "add src", None);
+            let (r1, rr1) = make_record(kind, [0xA1; 16], vec![r0], root_oid, "add src", None);
             scratch.publish_commits(&[(r0, rr0), (r1, rr1)]);
             let mut builder = GraphIndexBuilder::new(GraphIndex::empty(kind));
             builder
@@ -1979,7 +2117,12 @@ mod tests {
                 .add_commit(r1, ChangeId::from_bytes([0xA1; 16]), &[r0], changed.clone())
                 .expect("r1");
             let graph = builder.finish(&ByteBudget::new(1 << 20)).expect("graph");
-            Self { scratch, graph, r1, changed }
+            Self {
+                scratch,
+                graph,
+                r1,
+                changed,
+            }
         }
     }
 
@@ -2004,7 +2147,10 @@ mod tests {
             heads_of(&eval(&ctx, r#"files("**/*.rs")"#)),
             BTreeSet::from([fx.r1])
         );
-        assert_eq!(heads_of(&eval(&ctx, r#"files("src/**")"#)), BTreeSet::from([fx.r1]));
+        assert_eq!(
+            heads_of(&eval(&ctx, r#"files("src/**")"#)),
+            BTreeSet::from([fx.r1])
+        );
         assert_eq!(
             heads_of(&eval(&ctx, r#"files("src/main.rs")"#)),
             BTreeSet::from([fx.r1])
@@ -2022,17 +2168,26 @@ mod tests {
     fn attested_hook_and_missing_source() {
         let fx = Diamond::new();
         let ctx = fx.ctx();
-        let err = eval_str(&ctx, r#"attested("review", "approved")"#)
-            .expect_err("no attestation source");
+        let err =
+            eval_str(&ctx, r#"attested("review", "approved")"#).expect_err("no attestation source");
         assert_eq!(err.code, ErrorCode::ENotFound);
-        assert!(err.message.contains("no attestation source"), "message: {err}");
+        assert!(
+            err.message.contains("no attestation source"),
+            "message: {err}"
+        );
 
         let mut approvals: HashMap<(Oid, String, String), ()> = HashMap::new();
-        approvals.insert((git_oid(&fx.b), "review".to_owned(), "approved".to_owned()), ());
-        let query =
-            |_store: &Store, oid: &Oid, kind: &AttestKind, result: &AttestResult| -> Result<bool, CoreError> {
-                Ok(approvals.contains_key(&(*oid, kind.to_string(), result.to_string())))
-            };
+        approvals.insert(
+            (git_oid(&fx.b), "review".to_owned(), "approved".to_owned()),
+            (),
+        );
+        let query = |_store: &Store,
+                     oid: &Oid,
+                     kind: &AttestKind,
+                     result: &AttestResult|
+         -> Result<bool, CoreError> {
+            Ok(approvals.contains_key(&(*oid, kind.to_string(), result.to_string())))
+        };
         let hooked = EvalContext {
             store: &fx.scratch.store,
             graph: &fx.graph,

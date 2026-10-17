@@ -326,7 +326,11 @@ pub(crate) fn unexpected_eof(what: &str) -> CoreError {
 }
 
 /// Helper to validate table count without overflowing `usize`.
-pub(crate) fn validate_count(count: u32, max_allowed: usize, what: &str) -> Result<usize, CoreError> {
+pub(crate) fn validate_count(
+    count: u32,
+    max_allowed: usize,
+    what: &str,
+) -> Result<usize, CoreError> {
     let count_usize = usize::try_from(count).map_err(|_| {
         CoreError::new(
             ErrorCode::ECapacity,

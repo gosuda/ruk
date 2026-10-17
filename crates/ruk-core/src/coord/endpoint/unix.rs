@@ -22,10 +22,10 @@ use std::path::{Path, PathBuf};
 
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::StoreId;
 use crate::coord::lock::EndpointAddress;
 use crate::error::{CoreError, ErrorCode};
 use crate::ids::hex_byte;
-use crate::StoreId;
 
 /// Largest socket pathname, in native bytes, that this endpoint will bind.
 const MAX_SOCKET_PATH_BYTES: usize = 103;
@@ -118,10 +118,7 @@ impl UnixEndpoint {
             return Ok(());
         }
         self.cleaned = true;
-        let socket = tolerate_absent(
-            &self.socket_path,
-            std::fs::remove_file(&self.socket_path),
-        );
+        let socket = tolerate_absent(&self.socket_path, std::fs::remove_file(&self.socket_path));
         let dir = tolerate_absent(&self.dir, std::fs::remove_dir(&self.dir));
         socket.and(dir)
     }
@@ -142,7 +139,10 @@ fn try_create_and_bind(
 ) -> Result<Option<UnixEndpoint>, CoreError> {
     let mut random = [0u8; RANDOM_BYTES];
     getrandom::fill(&mut random).map_err(|err| {
-        CoreError::new(ErrorCode::EIo, format!("endpoint generation randomness: {err}"))
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("endpoint generation randomness: {err}"),
+        )
     })?;
     let dir = temp_base.join(format!("r{store_hex}-{}", hex_string(&random)));
     let socket_path = dir.join(SOCKET_LEAF_NAME);
@@ -164,7 +164,11 @@ fn try_create_and_bind(
         return if err.kind() == ErrorKind::AlreadyExists {
             Ok(None)
         } else {
-            Err(io_failure(&dir, "create endpoint generation directory", err))
+            Err(io_failure(
+                &dir,
+                "create endpoint generation directory",
+                err,
+            ))
         };
     }
 
@@ -210,7 +214,10 @@ fn verify_generation_dir(dir: &Path) -> Result<(), CoreError> {
     let stat = rustix::fs::fstat(&fd)
         .map_err(|err| io_failure(dir, "fstat endpoint generation directory", err))?;
     if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() {
-        return Err(forbidden(dir, "endpoint generation path is not a directory"));
+        return Err(forbidden(
+            dir,
+            "endpoint generation path is not a directory",
+        ));
     }
     if stat.st_uid != rustix::process::geteuid().as_raw() {
         return Err(forbidden(
@@ -398,7 +405,10 @@ fn io_failure(path: &Path, op: &'static str, err: impl core::fmt::Display) -> Co
 }
 
 fn forbidden(path: &Path, reason: &str) -> CoreError {
-    CoreError::new(ErrorCode::EForbidden, format!("{reason}: {}", path.display()))
+    CoreError::new(
+        ErrorCode::EForbidden,
+        format!("{reason}: {}", path.display()),
+    )
 }
 
 fn byte_len(path: &Path) -> usize {
@@ -417,8 +427,8 @@ fn hex_string(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::{
         DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _,
     };
@@ -477,7 +487,10 @@ mod tests {
             let socket_type = std::fs::symlink_metadata(unix_path(&address))
                 .expect("socket metadata")
                 .file_type();
-            assert!(socket_type.is_socket(), "published path must be a unix socket");
+            assert!(
+                socket_type.is_socket(),
+                "published path must be a unix socket"
+            );
 
             let (uid_tx, uid_rx) = oneshot::channel();
             let server = tokio::spawn(async move {
@@ -519,10 +532,15 @@ mod tests {
 
             let address = second.address().clone();
             let server = tokio::spawn(async move {
-                let stream = second.accept().await.expect("accept on surviving generation");
+                let stream = second
+                    .accept()
+                    .await
+                    .expect("accept on surviving generation");
                 (stream, second)
             });
-            let _client = connect(&address).await.expect("connect surviving generation");
+            let _client = connect(&address)
+                .await
+                .expect("connect surviving generation");
             let (_accepted, second) = server.await.expect("join");
             second.close().expect("close surviving generation");
             assert!(!second_socket.exists() && !second_dir.exists());
@@ -549,7 +567,10 @@ mod tests {
             std::fs::create_dir(&at_limit_base).expect("create boundary base");
             let at_limit =
                 UnixEndpoint::bind_in(&at_limit_base, store).expect("path at the limit binds");
-            assert_eq!(byte_len(unix_path(at_limit.address())), MAX_SOCKET_PATH_BYTES);
+            assert_eq!(
+                byte_len(unix_path(at_limit.address())),
+                MAX_SOCKET_PATH_BYTES
+            );
             at_limit.close().expect("close boundary endpoint");
 
             // One byte longer must be refused, and nothing may be created inside.
@@ -559,7 +580,9 @@ mod tests {
                 .expect_err("path over the limit must be refused");
             assert_eq!(err.code, ErrorCode::ELimit);
             assert_eq!(
-                std::fs::read_dir(&over_base).expect("read over-limit base").count(),
+                std::fs::read_dir(&over_base)
+                    .expect("read over-limit base")
+                    .count(),
                 0,
                 "refusal must not create a generation directory"
             );
@@ -577,7 +600,10 @@ mod tests {
             let socket = endpoint.socket_path.clone();
             endpoint.close().expect("close endpoint");
             assert!(!socket.exists() && !generation.exists());
-            assert!(base.path.exists(), "the caller's base directory is never removed");
+            assert!(
+                base.path.exists(),
+                "the caller's base directory is never removed"
+            );
         });
     }
 
@@ -703,7 +729,10 @@ mod tests {
             0x00C3_6400,
             0x0102_1997,
         ] {
-            assert!(classify_linux_remote_magic(remote).is_some(), "0x{remote:x}");
+            assert!(
+                classify_linux_remote_magic(remote).is_some(),
+                "0x{remote:x}"
+            );
         }
         for local in [
             0xEF53_i128, // ext2/3/4

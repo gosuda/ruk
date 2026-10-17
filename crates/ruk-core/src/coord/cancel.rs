@@ -111,8 +111,8 @@ impl Cancel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::runtime::Builder;
     use tokio::time::{sleep, timeout};
@@ -203,7 +203,10 @@ mod tests {
 
             assert!(waiter_finished.load(Ordering::Acquire));
             assert_eq!(
-                cancel.check().expect_err("should be cancelled after drop").code,
+                cancel
+                    .check()
+                    .expect_err("should be cancelled after drop")
+                    .code,
                 ErrorCode::ECancelled
             );
 
@@ -269,7 +272,10 @@ mod tests {
             // Late-created clone after cancellation also immediately sees cancelled
             let mut late_clone = cancel.clone();
             assert_eq!(
-                late_clone.check().expect_err("expected ECancelled on late clone").code,
+                late_clone
+                    .check()
+                    .expect_err("expected ECancelled on late clone")
+                    .code,
                 ErrorCode::ECancelled
             );
 
@@ -280,7 +286,10 @@ mod tests {
             // Repeated cancel calls are idempotent and never reset false
             handle_arc.cancel();
             assert_eq!(
-                late_clone.check().expect_err("expected ECancelled after idempotent cancel").code,
+                late_clone
+                    .check()
+                    .expect_err("expected ECancelled after idempotent cancel")
+                    .code,
                 ErrorCode::ECancelled
             );
         });
@@ -349,9 +358,7 @@ mod tests {
                 rx.await.expect("channel stays open")
             };
 
-            let task = tokio::spawn(async move {
-                cancel.until(work).await
-            });
+            let task = tokio::spawn(async move { cancel.until(work).await });
 
             // Allow the work future to start and enter rx.await
             sleep(Duration::from_millis(30)).await;
@@ -396,9 +403,7 @@ mod tests {
             let (handle, cancel) = cancellation();
             let (tx, rx) = tokio::sync::oneshot::channel::<&'static str>();
 
-            let work = async move {
-                rx.await.expect("channel receive")
-            };
+            let work = async move { rx.await.expect("channel receive") };
 
             tx.send("finished").expect("send to channel");
 

@@ -25,9 +25,7 @@ use super::rows::{corrupt, decode_row, load_group, read_statement};
 use super::status;
 use super::verify::VerifiedStatement;
 use super::work::{RowScan, Work};
-use super::{
-    Checkpoint, MAX_LAND_REQUIREMENTS, MAX_SUBJECT_STATEMENTS, MAX_TRUSTED_SIGNERS,
-};
+use super::{Checkpoint, MAX_LAND_REQUIREMENTS, MAX_SUBJECT_STATEMENTS, MAX_TRUSTED_SIGNERS};
 
 /// Index rows one `list` page may scan before it returns a short page with a
 /// continuation position.
@@ -107,7 +105,10 @@ pub struct LandEvaluation {
 }
 
 /// The reply record of one verified statement with its derived status.
-pub(super) fn record_of(verified: &VerifiedStatement, status: AttestationStatus) -> AttestationRecord {
+pub(super) fn record_of(
+    verified: &VerifiedStatement,
+    status: AttestationStatus,
+) -> AttestationRecord {
     let statement = verified.statement();
     AttestationRecord {
         subject: statement.subject,
@@ -235,9 +236,7 @@ pub fn attested(
     let records = subject_statements(store, subject, Some(kind), checkpoint)?;
     Ok(records
         .into_iter()
-        .filter(|record| {
-            record.result == *result && record.status != AttestationStatus::Superseded
-        })
+        .filter(|record| record.result == *result && record.status != AttestationStatus::Superseded)
         .collect())
 }
 

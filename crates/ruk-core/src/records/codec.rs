@@ -9,17 +9,17 @@
 //! All reads validate decoded semantic invariants and call [`Store::observe`]
 //! on committed corruption to latch quarantine.
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use super::types::{ChangeEntry, ChangeHistoryEntry, ImportedChangeEntry};
+use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::change::ChangeId;
 use crate::commit::CommitRecord;
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::store::{Store, StoreError};
-use crate::MAX_CONTROL_FRAME_BYTES;
 
 /// Encodes a value with the store's postcard metadata encoder.
 fn encode<T: Serialize>(what: &'static str, value: &T) -> Result<Vec<u8>, CoreError> {
