@@ -15,9 +15,11 @@
 //!   `flatten`, `untagged`, or `skip_serializing_if`. A typed reply is
 //!   stored durably in receipts through postcard, which cannot decode
 //!   self-describing shapes; the digest input is postcard too.
-//! * Only a major-version mismatch is rejected ([`decode_request`] fails
-//!   `E_VERSION` before looking at the body). A newer minor is accepted:
-//!   readers ignore unknown optional fields.
+//! * Only a major-version mismatch is rejected on version grounds: once a
+//!   frame passes the size, JSON syntax, and nesting checks and carries a
+//!   readable `schema_version`, [`decode_request`] fails `E_VERSION` before
+//!   interpreting the rest of the body. A newer minor is accepted: readers
+//!   ignore unknown optional fields.
 //! * Every mutation carries a `request_id` (the [`Mutation`] wrapper makes
 //!   its absence unrepresentable) and its expected stamps inside `args`, so
 //!   the idempotency digest ([`Request::digest_input_v1`]) covers each
@@ -36,6 +38,7 @@ use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::{self, DeserializeOwned, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sonic_rs::{Array, Number, Object, Value, from_slice, json, to_string, to_vec};
 use thiserror::Error;
 
 use crate::MAX_CONTROL_FRAME_BYTES;
@@ -656,9 +659,9 @@ impl JsonSchema for InlineBytes {
         let mut schema = generator.subschema_for::<ByteString>();
         schema.insert(
             "description".to_owned(),
-            serde_json::Value::String(
-                "At most 1 MiB once decoded; larger content is a staged object.".to_owned(),
-            ),
+            "At most 1 MiB once decoded; larger content is a staged object."
+                .to_owned()
+                .into(),
         );
         schema
     }
@@ -1139,20 +1142,20 @@ pub struct SchemaArgs {
     pub method: Option<Method>,
 }
 
-/// A JSON Schema document.
+/// A JSON Schema document: any JSON value, backed by [`sonic_rs::Value`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SchemaDocument(serde_json::Value);
+pub struct SchemaDocument(sonic_rs::Value);
 
 impl SchemaDocument {
     /// Wraps a schema document.
     #[must_use]
-    pub const fn new(document: serde_json::Value) -> Self {
+    pub const fn new(document: sonic_rs::Value) -> Self {
         Self(document)
     }
 
     /// The document.
     #[must_use]
-    pub const fn value(&self) -> &serde_json::Value {
+    pub const fn value(&self) -> &sonic_rs::Value {
         &self.0
     }
 }
@@ -1162,8 +1165,7 @@ impl Serialize for SchemaDocument {
         if serializer.is_human_readable() {
             return self.0.serialize(serializer);
         }
-        let text =
-            serde_json::to_string(&self.0).map_err(<S::Error as serde::ser::Error>::custom)?;
+        let text = to_string(&self.0).map_err(<S::Error as serde::ser::Error>::custom)?;
         serializer.serialize_str(&text)
     }
 }
@@ -1171,13 +1173,106 @@ impl Serialize for SchemaDocument {
 impl<'de> Deserialize<'de> for SchemaDocument {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
-            return serde_json::Value::deserialize(deserializer).map(Self);
+            return deserialize_sonic_value(deserializer).map(Self);
         }
         let text = String::deserialize(deserializer)?;
-        serde_json::from_str(&text)
-            .map(Self)
-            .map_err(de::Error::custom)
+        decode_json::<Self>(text.as_bytes()).map_err(de::Error::custom)
     }
+}
+
+/// Deserializes any JSON value into a [`sonic_rs::Value`] through the
+/// portable visitor protocol.
+///
+/// `Value`'s own `Deserialize` rides a sonic-private token channel that
+/// foreign deserializers (serde's buffered `Content` behind internally
+/// tagged, untagged, and flatten containers, or postcard) do not implement,
+/// so those replays must go through this standard visitor instead.
+///
+/// Every nested value re-enters this function, which runs the deserializer on
+/// a fresh stack segment when less than [`VISITOR_RED_ZONE`] bytes remain.
+/// The recursion therefore has no depth cap of its own.
+fn deserialize_sonic_value<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<sonic_rs::Value, D::Error> {
+    #[derive(Debug)]
+    struct PortableValue(sonic_rs::Value);
+
+    impl<'de> Deserialize<'de> for PortableValue {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserialize_sonic_value(deserializer).map(PortableValue)
+        }
+    }
+
+    struct SonicValueVisitor;
+
+    impl<'de> Visitor<'de> for SonicValueVisitor {
+        type Value = sonic_rs::Value;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("any JSON value")
+        }
+
+        fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(Value::from(v))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Value::from(v))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Value::from(v))
+        }
+
+        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+            let number = Number::from_f64(v)
+                .map(Value::from)
+                .unwrap_or_else(Value::new_null);
+            Ok(number)
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Value::from(v))
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Value::from(&v))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Value::new_null())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Value::new_null())
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            deserialize_sonic_value(d)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut array = Array::new();
+            while let Some(PortableValue(value)) = seq.next_element::<PortableValue>()? {
+                array.push(value);
+            }
+            Ok(array.into_value())
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut object = Object::new();
+            while let Some((key, PortableValue(value))) =
+                map.next_entry::<String, PortableValue>()?
+            {
+                object.insert(&key, value);
+            }
+            Ok(object.into_value())
+        }
+    }
+
+    stacker::maybe_grow(VISITOR_RED_ZONE, VISITOR_STACK_SEGMENT, || {
+        deserializer.deserialize_any(SonicValueVisitor)
+    })
 }
 
 impl JsonSchema for SchemaDocument {
@@ -3180,9 +3275,9 @@ macro_rules! method_table {
             }
         }
 
-        fn method_entries(generator: &mut SchemaGenerator) -> Vec<serde_json::Value> {
+        fn method_entries(generator: &mut SchemaGenerator) -> Vec<Value> {
             vec![$(
-                serde_json::json!({
+                json!({
                     "method": $name,
                     "kind": MethodKind::$kind,
                     "params": generator.subschema_for::<$params>().to_value(),
@@ -3194,11 +3289,11 @@ macro_rules! method_table {
         fn method_params_result(
             method: Method,
             generator: &mut SchemaGenerator,
-        ) -> (serde_json::Value, serde_json::Value) {
+        ) -> (Value, Value) {
             match method {
                 $(Method::$variant => (
-                    generator.subschema_for::<$params>().to_value(),
-                    generator.subschema_for::<$result>().to_value(),
+                    json!(generator.subschema_for::<$params>().to_value()),
+                    json!(generator.subschema_for::<$result>().to_value()),
                 ),)+
             }
         }
@@ -3341,13 +3436,107 @@ fn push_field(out: &mut Vec<u8>, field: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Maximum open arrays/objects accepted in one untrusted JSON document; the
+/// root value counts. Sonic's recursive ignored-field and DOM parsers have
+/// no depth control, so nesting is bounded before they run.
+pub const MAX_JSON_NESTING: usize = 128;
+
+/// Validates that `bytes` holds at most [`MAX_JSON_NESTING`] open JSON
+/// containers at any point, before a recursive parser touches the input.
+///
+/// The scan is allocation-free and quote/escape-aware; it counts opening
+/// and closing delimiters outside strings and never underflows on malformed
+/// closers (a stray `}` or `]` is left for the real parser to reject).
+/// Full syntax validation stays with sonic.
+///
+/// # Errors
+/// `E_INVALID` when the nesting bound is exceeded.
+pub fn check_json_nesting(bytes: &[u8]) -> Result<(), CoreError> {
+    scan_json_depth(bytes).map(|_| ())
+}
+
+fn scan_json_depth(bytes: &[u8]) -> Result<usize, CoreError> {
+    let mut depth: usize = 0;
+    let mut deepest: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > MAX_JSON_NESTING {
+                    return Err(invalid(format!(
+                        "input nests more than {MAX_JSON_NESTING} levels; \
+                         the bound protects the recursive parser"
+                    )));
+                }
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(deepest)
+}
+
+/// Parses `bytes` as one JSON document into `T` with sonic, after bounding
+/// the document's nesting.
+///
+/// The input is scanned once under the [`check_json_nesting`] rule, then
+/// parsed with stack room for the scanned depth: a thread that lacks it gets
+/// an extra stack segment for the duration of the call. No byte-length limit
+/// applies and no protocol version is inspected.
+///
+/// # Preconditions
+/// The stack provision covers sonic's parser and the [`SchemaDocument`]
+/// visitor. Recursion inside a custom `Deserialize` implementation of `T` is
+/// outside it.
+///
+/// # Errors
+/// `E_INVALID` when the input nests more than [`MAX_JSON_NESTING`] levels, is
+/// not valid JSON, or does not match `T`; the message is the diagnostic.
+///
+/// # Panics
+/// When the operating system refuses the extra stack segment.
+pub fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
+    let depth = scan_json_depth(bytes)?;
+    with_parse_stack(depth, || from_slice(bytes)).map_err(|err| invalid(err.to_string()))
+}
+
+const PARSE_STACK_BASE: usize = 128 * 1024;
+const PARSE_STACK_PER_CONTAINER: usize = 128 * 1024;
+const VISITOR_RED_ZONE: usize = 128 * 1024;
+const VISITOR_STACK_SEGMENT: usize = 1024 * 1024;
+
+/// Runs `parse` with stack room for `depth` open containers, which
+/// `scan_json_depth` bounds by [`MAX_JSON_NESTING`]. The reserve is a policy
+/// of 128 KiB plus 128 KiB per container, more than twice the 53,760 bytes per
+/// container measured in a debug build, not an exact frame size. A thread that
+/// already has the reserve keeps its own stack; otherwise `parse` runs on a
+/// new segment of twice the reserve.
+fn with_parse_stack<R>(depth: usize, parse: impl FnOnce() -> R) -> R {
+    let reserve = PARSE_STACK_BASE + depth * PARSE_STACK_PER_CONTAINER;
+    stacker::maybe_grow(reserve, 2 * reserve, parse)
+}
+
 fn version_probe(bytes: &[u8]) -> Result<(), CoreError> {
     #[derive(Deserialize)]
     struct Probe {
         schema_version: SchemaVersion,
     }
-    let probe: Probe = serde_json::from_slice(bytes)
-        .map_err(|err| invalid(format!("malformed control frame: {err}")))?;
+    let probe: Probe =
+        from_slice(bytes).map_err(|err| invalid(format!("malformed control frame: {err}")))?;
     validate_schema_version(probe.schema_version)?;
     Ok(())
 }
@@ -3359,13 +3548,15 @@ fn decode_envelope<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
             bytes.len()
         )));
     }
-    version_probe(bytes)?;
-    serde_json::from_slice(bytes).map_err(|err| invalid(format!("invalid message: {err}")))
+    let depth = scan_json_depth(bytes)?;
+    with_parse_stack(depth, || -> Result<T, CoreError> {
+        version_probe(bytes)?;
+        from_slice(bytes).map_err(|err| invalid(format!("invalid message: {err}")))
+    })
 }
 
 fn encode_envelope<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|err| invalid(format!("message is not encodable: {err}")))?;
+    let bytes = to_vec(value).map_err(|err| invalid(format!("message is not encodable: {err}")))?;
     if bytes.len() > MAX_CONTROL_FRAME_BYTES {
         return Err(limit_exceeded(format!(
             "message is {} bytes; a control frame holds at most {MAX_CONTROL_FRAME_BYTES}",
@@ -3375,14 +3566,15 @@ fn encode_envelope<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
     Ok(bytes)
 }
 
-/// Decodes and validates one request frame body. The version is checked
-/// before the body is interpreted, so a request from an unsupported major
-/// fails `E_VERSION` whatever its shape.
+/// Decodes and validates one request frame body. The frame size, JSON syntax,
+/// and nesting bound are checked first; the version is then checked before
+/// the rest of the body is interpreted, so a well-formed frame from an
+/// unsupported major fails `E_VERSION` whatever its shape.
 ///
 /// # Errors
 /// `E_LIMIT` above [`MAX_CONTROL_FRAME_BYTES`], `E_VERSION` for an
-/// unsupported major, `E_INVALID` for anything malformed or violating a
-/// request invariant.
+/// unsupported major, `E_INVALID` for anything malformed, nested deeper than
+/// [`MAX_JSON_NESTING`], or violating a request invariant.
 pub fn decode_request(bytes: &[u8]) -> Result<RequestEnvelope, CoreError> {
     let envelope: RequestEnvelope = decode_envelope(bytes)?;
     envelope.validate()?;
@@ -3505,18 +3697,18 @@ const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema"
 /// registry, the root request and reply types, every method's parameter and
 /// result schema, and the shared definitions they reference.
 #[must_use]
-pub fn model_schema_json() -> serde_json::Value {
+pub fn model_schema_json() -> Value {
     let mut generator = SchemaSettings::draft2020_12().into_generator();
     let request = generator.subschema_for::<RequestEnvelope>().to_value();
     let reply = generator.subschema_for::<ReplyEnvelope>().to_value();
     let capabilities = generator.subschema_for::<Capabilities>().to_value();
     let methods = method_entries(&mut generator);
     let definitions = generator.take_definitions(true);
-    let error_codes: Vec<serde_json::Value> = ErrorCode::ALL
+    let error_codes: Vec<Value> = ErrorCode::ALL
         .iter()
-        .map(|code| serde_json::json!({ "code": code.as_str(), "exit_status": code.exit_code() }))
+        .map(|code| json!({ "code": code.as_str(), "exit_status": code.exit_code() }))
         .collect();
-    serde_json::json!({
+    json!({
         "$schema": JSON_SCHEMA_DIALECT,
         "title": "Ruk core protocol",
         "schema_version": SchemaVersion::current(),
@@ -3548,11 +3740,11 @@ pub fn model_schema_json() -> serde_json::Value {
 /// The schema document restricted to one method: its parameter and result
 /// schemas and the definitions they reference.
 #[must_use]
-pub fn method_schema_json(method: Method) -> serde_json::Value {
+pub fn method_schema_json(method: Method) -> Value {
     let mut generator = SchemaSettings::draft2020_12().into_generator();
     let (params, result) = method_params_result(method, &mut generator);
     let definitions = generator.take_definitions(true);
-    serde_json::json!({
+    json!({
         "$schema": JSON_SCHEMA_DIALECT,
         "schema_version": SchemaVersion::current(),
         "method": method.as_str(),
@@ -3569,7 +3761,8 @@ mod tests {
 
     use super::*;
     use crate::commit::Provenance;
-    use serde_json::{Value, json};
+    use sonic_rs::json;
+    use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait as _};
 
     fn session() -> SessionId {
         "11111111-1111-4111-8111-111111111111"
@@ -3679,7 +3872,7 @@ mod tests {
     }
 
     fn to_frame(value: &Value) -> Vec<u8> {
-        serde_json::to_vec(value).expect("json")
+        sonic_rs::to_vec(value).expect("json")
     }
 
     fn fails(bytes: &[u8]) -> ErrorCode {
@@ -3712,7 +3905,7 @@ mod tests {
     #[test]
     fn newer_minor_and_unknown_fields_are_accepted() {
         let original = envelope(pin_request());
-        let mut value = serde_json::to_value(&original).expect("value");
+        let mut value = sonic_rs::to_value(&original).expect("value");
         value["schema_version"]["minor"] = json!(99);
         value["future_envelope_field"] = json!({ "anything": [1, 2] });
         value["request"]["pin"]["args"]["future_arg"] = json!(true);
@@ -3819,11 +4012,11 @@ mod tests {
 
     #[test]
     fn a_mutation_without_a_request_id_cannot_be_decoded() {
-        let mut value = serde_json::to_value(envelope(pin_request())).expect("value");
+        let mut value = sonic_rs::to_value(&envelope(pin_request())).expect("value");
         value["request"]["pin"]
             .as_object_mut()
             .expect("params object")
-            .remove("request_id");
+            .remove(&"request_id");
         assert_eq!(fails(&to_frame(&value)), ErrorCode::EInvalid);
         assert_eq!(pin_request().request_id(), Some(request_id(1)));
         assert_eq!(log_request(PageRequest::default()).request_id(), None);
@@ -3841,13 +4034,13 @@ mod tests {
             assert!(PageLimit::new(bad).is_err(), "{bad}");
         }
         for bad in ["0", "1001", "-1", "1.5", "\"100\""] {
-            assert!(serde_json::from_str::<PageLimit>(bad).is_err(), "{bad}");
+            assert!(sonic_rs::from_str::<PageLimit>(bad).is_err(), "{bad}");
         }
-        let page: PageRequest = serde_json::from_str("{\"limit\":1000}").expect("page");
+        let page: PageRequest = sonic_rs::from_str("{\"limit\":1000}").expect("page");
         assert_eq!(page.effective_limit(), MAX_PAGE_SIZE);
         for limit in [0, 1001] {
             let mut value =
-                serde_json::to_value(envelope(log_request(PageRequest::default()))).expect("value");
+                sonic_rs::to_value(&envelope(log_request(PageRequest::default()))).expect("value");
             value["request"]["log"]["page"]["limit"] = json!(limit);
             assert_eq!(
                 fails(&to_frame(&value)),
@@ -3933,7 +4126,7 @@ mod tests {
     #[test]
     fn inline_edits_are_capped_at_one_mebibyte_of_decoded_bytes() {
         let content =
-            |data: Value| serde_json::from_value::<Content>(json!({ "inline": { "data": data } }));
+            |data: Value| sonic_rs::from_value::<Content>(&json!({ "inline": { "data": data } }));
         assert!(content(json!("a".repeat(MAX_INLINE_EDIT_BYTES))).is_ok());
         assert!(content(json!("a".repeat(MAX_INLINE_EDIT_BYTES + 1))).is_err());
         // The hex form is measured in decoded bytes, not characters.
@@ -3948,11 +4141,8 @@ mod tests {
                 size: 10 * 1024 * 1024,
             },
         };
-        let json = serde_json::to_string(&staged).expect("json");
-        assert_eq!(
-            serde_json::from_str::<Content>(&json).expect("parse"),
-            staged
-        );
+        let json = sonic_rs::to_string(&staged).expect("json");
+        assert_eq!(sonic_rs::from_str::<Content>(&json).expect("parse"), staged);
     }
 
     // ----- request invariants ---------------------------------------------
@@ -4187,8 +4377,8 @@ mod tests {
         assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS).is_ok());
         assert!(ClaimTtl::new(0).is_err());
         assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS + 1).is_err());
-        assert!(serde_json::from_str::<ClaimTtl>("3600").is_ok());
-        assert!(serde_json::from_str::<ClaimTtl>("3601").is_err());
+        assert!(sonic_rs::from_str::<ClaimTtl>("3600").is_ok());
+        assert!(sonic_rs::from_str::<ClaimTtl>("3601").is_err());
         let acquire = |paths: Vec<RepoPath>| {
             Request::ClaimAcquire(mutation(
                 1,
@@ -4240,7 +4430,7 @@ mod tests {
     #[test]
     fn session_claims_and_commit_provenance_share_one_claim_grammar() {
         let open = |claims: Value| {
-            let mut value = serde_json::to_value(RequestEnvelope {
+            let mut value = sonic_rs::to_value(&RequestEnvelope {
                 session: None,
                 ..envelope(Request::SessionOpen(Box::default()))
             })
@@ -4249,10 +4439,10 @@ mod tests {
             to_frame(&value)
         };
         let kept = |claims: Value| {
-            serde_json::from_value::<Provenance>(json!({ "session": session(), "claims": claims }))
+            sonic_rs::from_value::<Provenance>(&json!({ "session": session(), "claims": claims }))
         };
         let one = |key: &str, value: &str| {
-            serde_json::to_value(BTreeMap::from([(key, value)])).expect("claims")
+            sonic_rs::to_value(&BTreeMap::from([(key, value)])).expect("claims")
         };
 
         // Printable-ASCII keys a looser commit-side grammar once admitted, and
@@ -4295,9 +4485,9 @@ mod tests {
         .expect("record");
         let packed = postcard::to_allocvec(&record).expect("postcard");
         let expected: BTreeMap<String, String> =
-            serde_json::from_value(declared()).expect("claims map");
+            sonic_rs::from_value(&declared()).expect("claims map");
         for back in [
-            serde_json::from_slice::<CommitRecord>(&serde_json::to_vec(&record).expect("json"))
+            sonic_rs::from_slice::<CommitRecord>(&sonic_rs::to_vec(&record).expect("json"))
                 .expect("json back"),
             postcard::from_bytes::<CommitRecord>(&packed).expect("postcard back"),
         ] {
@@ -4311,7 +4501,7 @@ mod tests {
 
     #[test]
     fn requested_capabilities_are_validated_when_a_session_opens() {
-        let mut value = serde_json::to_value(RequestEnvelope {
+        let mut value = sonic_rs::to_value(&RequestEnvelope {
             session: None,
             ..envelope(Request::SessionOpen(Box::default()))
         })
@@ -4504,7 +4694,7 @@ mod tests {
         let ts = timestamp("2026-10-17T12:00:00Z");
         assert_eq!(ts.to_string(), "2026-10-17T12:00:00Z");
         assert_eq!(
-            serde_json::to_string(&ts).expect("json"),
+            sonic_rs::to_string(&ts).expect("json"),
             "\"2026-10-17T12:00:00Z\""
         );
         for bad in [
@@ -4516,7 +4706,7 @@ mod tests {
         ] {
             assert!(Timestamp::parse(bad).is_err(), "{bad}");
             assert!(
-                serde_json::from_value::<Timestamp>(json!(bad)).is_err(),
+                sonic_rs::from_value::<Timestamp>(&json!(bad)).is_err(),
                 "{bad}"
             );
         }
@@ -4533,7 +4723,7 @@ mod tests {
     fn digests_are_strict_lowercase_hex_and_secrets_do_not_print() {
         let digest = RequestDigest::from_bytes([0xab; 32]);
         assert_eq!(
-            serde_json::to_string(&digest).expect("json"),
+            sonic_rs::to_string(&digest).expect("json"),
             format!("\"{}\"", "ab".repeat(32))
         );
         let packed = postcard::to_allocvec(&digest).expect("postcard");
@@ -4550,7 +4740,7 @@ mod tests {
         ] {
             assert!(RequestDigest::from_hex(&bad).is_err(), "{bad}");
             assert!(
-                serde_json::from_value::<RequestDigest>(json!(bad)).is_err(),
+                sonic_rs::from_value::<RequestDigest>(&json!(bad)).is_err(),
                 "{bad}"
             );
         }
@@ -4654,7 +4844,7 @@ mod tests {
             },
         ));
         let terms: Merge<Option<Oid>> =
-            serde_json::from_value(json!([oid(1).to_hex(), Value::Null, oid(2).to_hex()]))
+            sonic_rs::from_value(&json!([oid(1).to_hex(), null, oid(2).to_hex()]))
                 .expect("conflict terms");
         let resolve_bookmark = Request::BookmarkResolve(mutation(
             4,
@@ -4727,6 +4917,234 @@ mod tests {
         }
     }
 
+    /// Internally tagged, so serde buffers `document` through its private
+    /// `Content` and replays it into [`SchemaDocument`]. The real externally
+    /// tagged `Reply` does not buffer; this carrier stands in for containers
+    /// that do (internally tagged, untagged, flatten).
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum BufferedCarry {
+        Document { document: SchemaDocument },
+    }
+
+    #[test]
+    fn schema_document_replays_through_buffered_content_and_json_bytes() {
+        let doc = SchemaDocument::new(json!({
+            "z": [true, null, -1, 1.5],
+            "a": { "nested": [1, 2, 3] },
+        }));
+        let carry = BufferedCarry::Document {
+            document: doc.clone(),
+        };
+        let wire = sonic_rs::to_vec(&carry).expect("encode carry");
+        let decoded: BufferedCarry = sonic_rs::from_slice(&wire).expect("buffered replay");
+        assert_eq!(decoded, carry);
+        let flattened = sonic_rs::to_value(&doc).expect("flatten document");
+        assert_eq!(
+            decoded,
+            BufferedCarry::Document {
+                document: SchemaDocument::new(flattened),
+            }
+        );
+
+        let bytes = sonic_rs::to_vec(&doc).expect("encode document");
+        let back: SchemaDocument = sonic_rs::from_slice(&bytes).expect("decode document");
+        assert_eq!(back, doc);
+    }
+
+    #[test]
+    fn schema_document_postcard_text_survives_a_binary_round_trip() {
+        let doc = SchemaDocument::new(json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+        }));
+        let packed = postcard::to_allocvec(&doc).expect("postcard");
+        let unpacked: SchemaDocument = postcard::from_bytes(&packed).expect("unpack");
+        assert_eq!(unpacked, doc);
+        // The binary form carries the document as JSON text, so the text is
+        // recoverable and stable across encodes.
+        let text = sonic_rs::to_string(&unpacked.value()).expect("render");
+        let rendered: SchemaDocument = sonic_rs::from_str(&text).expect("reparse");
+        assert_eq!(rendered, doc);
+
+        // Binary postcard deserialization applies the nesting bound:
+        // 128 open brackets succeed and decode through the portable visitor.
+        let valid_128 = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING),
+            "]".repeat(MAX_JSON_NESTING)
+        );
+        let packed_128 = postcard::to_allocvec(&valid_128).expect("postcard 128");
+        let unpacked_128: SchemaDocument = postcard::from_bytes(&packed_128).expect("unpack 128");
+        let rendered_128 = sonic_rs::to_string(&unpacked_128.value()).expect("render 128");
+        assert_eq!(rendered_128, valid_128);
+        let repacked_128 = postcard::to_allocvec(&unpacked_128).expect("repack 128");
+        assert_eq!(repacked_128, packed_128);
+        let roundtrip_128: SchemaDocument =
+            postcard::from_bytes(&repacked_128).expect("roundtrip unpack 128");
+        assert_eq!(roundtrip_128, unpacked_128);
+
+        // 129 open brackets exceed the bound and fail before reaching the parser.
+        let over_129 = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING + 1),
+            "]".repeat(MAX_JSON_NESTING + 1)
+        );
+        let packed_129 = postcard::to_allocvec(&over_129).expect("postcard 129");
+        assert!(postcard::from_bytes::<SchemaDocument>(&packed_129).is_err());
+    }
+
+    #[test]
+    fn nesting_guard_rejects_deep_unknown_fields_at_the_codec() {
+        let original = envelope(pin_request());
+        let mut base = sonic_rs::to_string(&original).expect("json");
+        assert!(base.ends_with('}'));
+        base.pop();
+
+        // Root container counts as depth 1; 127 nested containers inside an
+        // unknown field reach exactly depth 128 and genuinely decode.
+        let mut valid_128 = base.clone();
+        valid_128.push_str(&format!(
+            ",\"future\":{}{}}}",
+            "[".repeat(MAX_JSON_NESTING - 1),
+            "]".repeat(MAX_JSON_NESTING - 1)
+        ));
+        let decoded = decode_request(valid_128.as_bytes()).expect("genuinely valid 128 decode");
+        assert_eq!(decoded.request, original.request);
+
+        // 128 nested containers inside the root reach depth 129 and are rejected
+        // with E_INVALID before the recursive sonic parser touches them.
+        let mut over_129 = base.clone();
+        over_129.push_str(&format!(
+            ",\"future\":{}{}}}",
+            "[".repeat(MAX_JSON_NESTING),
+            "]".repeat(MAX_JSON_NESTING)
+        ));
+        assert_eq!(fails(over_129.as_bytes()), ErrorCode::EInvalid);
+
+        // An unclosed deep unknown field past 128 is likewise rejected at the boundary.
+        let mut unclosed = base.clone();
+        unclosed.push_str(&format!(",\"future\":{}", "[".repeat(MAX_JSON_NESTING)));
+        assert_eq!(fails(unclosed.as_bytes()), ErrorCode::EInvalid);
+
+        // Quoted and escaped brackets inside strings do not count as structure;
+        // premature closers do not underflow the counter.
+        let mut quoted = base;
+        quoted.push_str(&format!(
+            ",\"junk\":\"\\\"}}}}}}[[[]]\\\\\\\\\",\"bracket_string\":\"{}\"}}",
+            "[".repeat(MAX_JSON_NESTING + 50)
+        ));
+        let decoded_quoted = decode_request(quoted.as_bytes()).expect("quoted brackets ignored");
+        assert_eq!(decoded_quoted.request, original.request);
+    }
+
+    #[test]
+    fn nesting_guard_holds_as_a_public_boundary() {
+        assert!(check_json_nesting(b"{}").is_ok());
+        let ok = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING),
+            "]".repeat(MAX_JSON_NESTING)
+        );
+        assert!(check_json_nesting(ok.as_bytes()).is_ok());
+        let over = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING + 1),
+            "]".repeat(MAX_JSON_NESTING + 1)
+        );
+        assert_eq!(
+            invalid_code(check_json_nesting(over.as_bytes())),
+            ErrorCode::EInvalid
+        );
+        let unclosed = "[".repeat(MAX_JSON_NESTING);
+        assert!(check_json_nesting(unclosed.as_bytes()).is_ok());
+        let stray = b"]]]}{".repeat(40);
+        assert!(
+            check_json_nesting(stray.as_slice()).is_ok(),
+            "closers never underflow"
+        );
+        let quoted = b"{\"a\":\"}}]]}{[[\"}";
+        assert!(check_json_nesting(quoted.as_slice()).is_ok());
+        let escaped = b"{\"a\":\"edge\\\\\\\"case\"}";
+        assert!(check_json_nesting(escaped.as_slice()).is_ok());
+    }
+
+    fn nested_objects(depth: usize, innermost: &str) -> String {
+        let wrappers = depth - 1;
+        format!(
+            "{}{innermost}{}",
+            "{\"a\":".repeat(wrappers),
+            "}".repeat(wrappers)
+        )
+    }
+
+    #[test]
+    fn object_nesting_holds_the_bound_through_every_decoder() {
+        let at_bound = nested_objects(MAX_JSON_NESTING, "{}");
+        let document: SchemaDocument = decode_json(at_bound.as_bytes()).expect("128 objects");
+        assert_eq!(
+            sonic_rs::to_string(document.value()).expect("render"),
+            at_bound
+        );
+        let packed = postcard::to_allocvec(&at_bound).expect("postcard");
+        let unpacked: SchemaDocument = postcard::from_bytes(&packed).expect("binary 128 objects");
+        assert_eq!(unpacked, document);
+
+        let over = nested_objects(MAX_JSON_NESTING + 1, "{}");
+        assert_eq!(
+            invalid_code(decode_json::<SchemaDocument>(over.as_bytes()).map(drop)),
+            ErrorCode::EInvalid
+        );
+        let packed_over = postcard::to_allocvec(&over).expect("postcard over");
+        assert!(postcard::from_bytes::<SchemaDocument>(&packed_over).is_err());
+
+        let original = envelope(pin_request());
+        let mut base = sonic_rs::to_string(&original).expect("json");
+        base.pop();
+        let future = nested_objects(MAX_JSON_NESTING - 1, "{}");
+        let framed = format!("{base},\"future\":{future}}}");
+        let decoded = decode_request(framed.as_bytes()).expect("128 objects in a frame");
+        assert_eq!(decoded.request, original.request);
+        let future_over = nested_objects(MAX_JSON_NESTING, "{}");
+        let framed_over = format!("{base},\"future\":{future_over}}}");
+        assert_eq!(fails(framed_over.as_bytes()), ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn deep_duplicate_keys_collapse_identically_through_every_decoder() {
+        let duplicated = nested_objects(MAX_JSON_NESTING - 1, r#"{"k":1,"z":0,"k":2}"#);
+        let collapsed = nested_objects(MAX_JSON_NESTING - 1, r#"{"k":2,"z":0}"#);
+
+        let direct: SchemaDocument = decode_json(duplicated.as_bytes()).expect("direct");
+        assert_eq!(
+            sonic_rs::to_string(direct.value()).expect("render"),
+            collapsed
+        );
+        let packed = postcard::to_allocvec(&duplicated).expect("postcard");
+        let binary: SchemaDocument = postcard::from_bytes(&packed).expect("binary");
+        assert_eq!(binary, direct);
+
+        let carried = format!(r#"{{"kind":"document","document":{duplicated}}}"#);
+        let buffered: BufferedCarry = decode_json(carried.as_bytes()).expect("buffered");
+        assert_eq!(buffered, BufferedCarry::Document { document: direct });
+    }
+
+    #[test]
+    fn decode_json_reports_syntax_and_type_failures_as_invalid() {
+        assert_eq!(
+            decode_json::<Vec<u32>>(b"[1,2]").expect("decode"),
+            vec![1, 2]
+        );
+        for bad in [&b"[1,"[..], &b"{\"a\":1}"[..], &b"[-1]"[..]] {
+            assert_eq!(
+                invalid_code(decode_json::<Vec<u32>>(bad).map(drop)),
+                ErrorCode::EInvalid,
+                "{}",
+                bad.escape_ascii()
+            );
+        }
+    }
+
     #[test]
     fn error_replies_use_contract_codes_and_survive_both_encodings() {
         let reply = ErrorReply::from_core(
@@ -4745,10 +5163,22 @@ mod tests {
             }])
             .expect("refs"),
         });
-        let wire = serde_json::to_value(&reply).expect("json");
-        assert_eq!(wire["code"], "E_STALE");
-        assert_eq!(wire["fixes"][1], "new_request_id");
-        assert_eq!(wire["hints"][0], "re-read");
+        let wire = sonic_rs::to_value(&reply).expect("json");
+        assert_eq!(wire.get("code").and_then(Value::as_str), Some("E_STALE"));
+        assert_eq!(
+            wire.get("fixes")
+                .and_then(Value::as_array)
+                .and_then(|fixes| fixes.get(1))
+                .and_then(Value::as_str),
+            Some("new_request_id")
+        );
+        assert_eq!(
+            wire.get("hints")
+                .and_then(Value::as_array)
+                .and_then(|hints| hints.first())
+                .and_then(Value::as_str),
+            Some("re-read")
+        );
         let envelope = ReplyEnvelope::failure(Some(request_id(1)), reply);
         let json = encode_reply(&envelope).expect("encode");
         assert_eq!(decode_reply(&json).expect("decode"), envelope);
@@ -4758,7 +5188,7 @@ mod tests {
             envelope
         );
 
-        let mut future = serde_json::to_value(&envelope).expect("value");
+        let mut future = sonic_rs::to_value(&envelope).expect("value");
         future["schema_version"]["major"] = json!(SCHEMA_MAJOR + 1);
         assert_eq!(
             decode_reply(&to_frame(&future))
@@ -4771,44 +5201,46 @@ mod tests {
     // ----- the model document ---------------------------------------------
 
     fn collect_refs(value: &Value, out: &mut Vec<String>) {
-        match value {
-            Value::Object(map) => {
-                out.extend(map.get("$ref").and_then(Value::as_str).map(str::to_owned));
-                map.values().for_each(|child| collect_refs(child, out));
+        match (value.as_object(), value.as_array()) {
+            (Some(map), _) => {
+                out.extend(map.get(&"$ref").and_then(Value::as_str).map(str::to_owned));
+                map.iter().for_each(|(_, child)| collect_refs(child, out));
             }
-            Value::Array(items) => items.iter().for_each(|item| collect_refs(item, out)),
+            (None, Some(items)) => items.iter().for_each(|item| collect_refs(item, out)),
             _ => {}
         }
     }
 
-    fn untyped_member(map: &serde_json::Map<String, Value>) -> Option<String> {
-        let permissive = |key: &str| map.get(key) == Some(&Value::Bool(true));
+    fn untyped_member(map: &sonic_rs::Object) -> Option<String> {
+        let permissive = |key: &str| map.get(&key).and_then(Value::as_bool) == Some(true);
         if permissive("additionalProperties") || permissive("items") {
             return Some("additionalProperties or items accepts any value".to_owned());
         }
-        let members = map.get("properties").and_then(Value::as_object)?;
+        let members = map.get(&"properties")?.as_object()?;
         members
             .iter()
-            .find(|(_, schema)| **schema == Value::Bool(true))
+            .find(|(_, schema)| schema.as_bool() == Some(true))
             .map(|(key, _)| format!("property `{key}` accepts any value"))
     }
 
     fn find_untyped(value: &Value) -> Option<String> {
-        match value {
-            Value::Object(map) => {
-                untyped_member(map).or_else(|| map.values().find_map(find_untyped))
-            }
-            Value::Array(items) => items.iter().find_map(find_untyped),
+        match (value.as_object(), value.as_array()) {
+            (Some(map), _) => untyped_member(map)
+                .or_else(|| map.iter().find_map(|(_, child)| find_untyped(child))),
+            (None, Some(items)) => items.iter().find_map(find_untyped),
             _ => None,
         }
     }
 
     fn resolve<'a>(defs: &'a Value, schema: &Value) -> &'a Value {
-        let reference = schema["$ref"].as_str().expect("a $ref schema");
+        let reference = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .expect("a $ref schema");
         let name = reference
             .strip_prefix("#/$defs/")
             .expect("a local reference");
-        &defs[name]
+        defs.get(name).expect("a referenced definition")
     }
 
     #[test]
@@ -4822,7 +5254,7 @@ mod tests {
             let target = reference
                 .strip_prefix("#/$defs/")
                 .unwrap_or_else(|| panic!("unexpected reference form {reference}"));
-            assert!(defs.contains_key(target), "dangling reference {reference}");
+            assert!(defs.contains_key(&target), "dangling reference {reference}");
         }
         assert_eq!(doc["request"]["$ref"], "#/$defs/RequestEnvelope");
         assert_eq!(doc["reply"]["$ref"], "#/$defs/ReplyEnvelope");
@@ -4833,7 +5265,7 @@ mod tests {
             assert_eq!(entry["method"], method.as_str());
             assert_eq!(
                 entry["kind"],
-                serde_json::to_value(method.kind()).expect("kind")
+                sonic_rs::to_value(&method.kind()).expect("kind")
             );
         }
         assert_eq!(
@@ -4870,7 +5302,7 @@ mod tests {
             "attest",
             "read_intents",
         ] {
-            assert!(capability_fields.contains_key(field), "{field}");
+            assert!(capability_fields.contains_key(&field), "{field}");
         }
     }
 
@@ -4879,20 +5311,26 @@ mod tests {
         let doc = model_schema_json();
         let defs = &doc["$defs"];
         for entry in doc["methods"].as_array().expect("methods") {
-            let method: Method = serde_json::from_value(entry["method"].clone()).expect("method");
+            let method: Method =
+                sonic_rs::from_value(entry.get("method").expect("method")).expect("method");
             let params = resolve(defs, &entry["params"]);
             let result = resolve(defs, &entry["result"]);
-            let has_request_id = params["properties"]
-                .as_object()
-                .is_some_and(|properties| properties.contains_key("request_id"));
+            let has_request_id = params
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| properties.contains_key(&"request_id"));
             assert_eq!(has_request_id, method.is_mutation(), "{}", method.as_str());
             let result_fields = result["properties"].as_object().expect("result fields");
             match method.kind() {
                 MethodKind::Mutation => {
-                    assert!(result_fields.contains_key("outcome"), "{}", method.as_str());
+                    assert!(
+                        result_fields.contains_key(&"outcome"),
+                        "{}",
+                        method.as_str()
+                    );
                 }
                 MethodKind::Read => {
-                    assert!(result_fields.contains_key("view"), "{}", method.as_str());
+                    assert!(result_fields.contains_key(&"view"), "{}", method.as_str());
                 }
                 MethodKind::Anonymous | MethodKind::Bootstrap => {}
             }
@@ -4921,10 +5359,10 @@ mod tests {
         collect_refs(&doc, &mut references);
         for reference in &references {
             let target = reference.strip_prefix("#/$defs/").expect("local reference");
-            assert!(defs.contains_key(target), "dangling reference {reference}");
+            assert!(defs.contains_key(&target), "dangling reference {reference}");
         }
-        assert!(defs.contains_key("WriteArgs"));
-        assert!(!defs.contains_key("BlameArgs"));
+        assert!(defs.contains_key(&"WriteArgs"));
+        assert!(!defs.contains_key(&"BlameArgs"));
     }
 
     #[test]
@@ -4936,9 +5374,9 @@ mod tests {
                 "duplicate {}",
                 method.as_str()
             );
-            let wire = serde_json::to_value(method).expect("json");
+            let wire = sonic_rs::to_value(&method).expect("json");
             assert_eq!(wire, json!(method.as_str()));
-            let back: Method = serde_json::from_value(wire).expect("parse");
+            let back: Method = sonic_rs::from_value(&wire).expect("parse");
             assert_eq!(&back, method);
             assert_eq!(method.is_mutation(), method.kind() == MethodKind::Mutation);
         }

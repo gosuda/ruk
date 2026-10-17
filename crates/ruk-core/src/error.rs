@@ -334,13 +334,10 @@ mod tests {
     #[test]
     fn serde_and_display_forms_are_the_contract_spelling_for_every_code() {
         for code in ErrorCode::ALL {
-            let json = serde_json::to_string(&code).expect("json");
+            let json = sonic_rs::to_string(&code).expect("json");
             assert_eq!(json, format!("\"{}\"", code.as_str()));
             assert_eq!(code.to_string(), code.as_str());
-            assert_eq!(
-                serde_json::from_str::<ErrorCode>(&json).expect("parse"),
-                code
-            );
+            assert_eq!(sonic_rs::from_str::<ErrorCode>(&json).expect("parse"), code);
             assert_eq!(code.as_str().parse::<ErrorCode>().expect("from_str"), code);
         }
     }
@@ -358,9 +355,9 @@ mod tests {
     fn unknown_or_variant_spellings_are_rejected() {
         for bad in ["EStale", "e_stale", "E_STALE ", "E_UNKNOWN", "", "STALE"] {
             assert!(bad.parse::<ErrorCode>().is_err(), "accepted {bad:?}");
-            let json = serde_json::to_string(bad).expect("json");
+            let json = sonic_rs::to_string(bad).expect("json");
             assert!(
-                serde_json::from_str::<ErrorCode>(&json).is_err(),
+                sonic_rs::from_str::<ErrorCode>(&json).is_err(),
                 "accepted {json}"
             );
         }

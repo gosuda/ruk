@@ -845,9 +845,9 @@ mod tests {
         assert_eq!(merged.entries()[0].occurrences(), 2);
         assert!(merged.entries().len() <= MAX_NOTICES);
         // The set a plain round trip would validate.
-        let json = serde_json::to_string(&merged).expect("serialize");
+        let json = sonic_rs::to_string(&merged).expect("serialize");
         assert_eq!(
-            serde_json::from_str::<MergeNotices>(&json).expect("parse"),
+            sonic_rs::from_str::<MergeNotices>(&json).expect("parse"),
             merged
         );
     }
@@ -887,9 +887,9 @@ mod tests {
             "info string",
         )
         .expect("notice");
-        let json = serde_json::to_string(&built).expect("serialize");
+        let json = sonic_rs::to_string(&built).expect("serialize");
         assert!(json.contains("\"hex\""), "{json}");
-        let back: MergeNotice = serde_json::from_str(&json).expect("parse");
+        let back: MergeNotice = sonic_rs::from_str(&json).expect("parse");
         assert_eq!(back.path().as_bytes(), path.as_slice());
         assert_eq!(back, built);
     }
@@ -905,7 +905,7 @@ mod tests {
             "cells c1",
         )
         .expect("notice");
-        let value: serde_json::Value = serde_json::to_value(finish(vec![built])).expect("value");
+        let value: sonic_rs::Value = sonic_rs::to_value(&finish(vec![built])).expect("value");
         assert_eq!(value["notices_truncated"], false);
         assert_eq!(value["total_occurrences"], 1);
         let entry = &value["entries"][0];
@@ -929,7 +929,7 @@ mod tests {
                  \"total_occurrences\":{total}}}"
             )
         };
-        let parse = |json: &str| serde_json::from_str::<MergeNotices>(json);
+        let parse = |json: &str| sonic_rs::from_str::<MergeNotices>(json);
 
         assert!(parse(&set(&entry("a", 2), false, 2)).is_ok());
         assert!(parse(&set(&entry("a", 2), true, 5)).is_ok());
@@ -963,13 +963,13 @@ mod tests {
     fn metadata_and_report_enforce_their_contract() {
         assert!(MergeMetadata::new(MergeMode::Syntax, 0).is_err());
         assert!(
-            serde_json::from_str::<MergeMetadata>(
+            sonic_rs::from_str::<MergeMetadata>(
                 "{\"effective_mode\":\"syntax\",\"language_set_version\":0}"
             )
             .is_err()
         );
         assert!(
-            serde_json::from_str::<MergeMetadata>(
+            sonic_rs::from_str::<MergeMetadata>(
                 "{\"effective_mode\":\"auto\",\"language_set_version\":1}"
             )
             .is_err()
@@ -983,9 +983,9 @@ mod tests {
         assert!(MergeReport::new(git, some.clone()).is_err());
 
         let report = MergeReport::new(syntax, some).expect("report");
-        let json = serde_json::to_string(&report).expect("serialize");
+        let json = sonic_rs::to_string(&report).expect("serialize");
         assert_eq!(
-            serde_json::from_str::<MergeReport>(&json).expect("parse"),
+            sonic_rs::from_str::<MergeReport>(&json).expect("parse"),
             report
         );
         let stored = postcard::to_allocvec(&report).expect("postcard serialize");
@@ -994,7 +994,7 @@ mod tests {
             report
         );
         let forged = json.replace("\"syntax\"", "\"git\"");
-        assert!(serde_json::from_str::<MergeReport>(&forged).is_err());
+        assert!(sonic_rs::from_str::<MergeReport>(&forged).is_err());
     }
 
     #[test]
@@ -1102,8 +1102,8 @@ mod tests {
                     );
                 }
             }
-            let json = serde_json::to_string(&merged).expect("serialize");
-            prop_assert_eq!(serde_json::from_str::<MergeNotices>(&json).expect("parse"), merged);
+            let json = sonic_rs::to_string(&merged).expect("serialize");
+            prop_assert_eq!(sonic_rs::from_str::<MergeNotices>(&json).expect("parse"), merged);
         }
 
         #[test]
@@ -1120,8 +1120,8 @@ mod tests {
             prop_assert!(merged.entries().len() <= MAX_NOTICES);
             prop_assert_eq!(merged.total_occurrences(), count);
             prop_assert_eq!(merged.notices_truncated(), merged.total_occurrences() > retained(&merged));
-            let json = serde_json::to_string(&merged).expect("serialize");
-            prop_assert_eq!(serde_json::from_str::<MergeNotices>(&json).expect("parse"), merged);
+            let json = sonic_rs::to_string(&merged).expect("serialize");
+            prop_assert_eq!(sonic_rs::from_str::<MergeNotices>(&json).expect("parse"), merged);
         }
     }
 }

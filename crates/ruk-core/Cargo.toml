@@ -9,7 +9,8 @@ description = "Ruk native model, merge algebra, and typed schemas"
 [dependencies]
 gix-hash.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+sonic-rs.workspace = true
+stacker.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 smallvec.workspace = true

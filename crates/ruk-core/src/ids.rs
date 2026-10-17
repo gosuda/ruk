@@ -479,12 +479,12 @@ mod tests {
     #[test]
     fn oid_json_is_a_hex_string_and_round_trips() {
         let oid = Oid::from_hex(SHA1_HEX).expect("sha1");
-        let json = serde_json::to_string(&oid).expect("json");
+        let json = sonic_rs::to_string(&oid).expect("json");
         assert_eq!(json, format!("\"{SHA1_HEX}\""));
-        assert_eq!(serde_json::from_str::<Oid>(&json).expect("parse"), oid);
-        assert!(serde_json::from_str::<Oid>("\"ABCDEF\"").is_err());
-        assert!(serde_json::from_str::<Oid>("[1,2,3]").is_err());
-        assert!(serde_json::from_str::<Oid>("{\"Sha1\":[0]}").is_err());
+        assert_eq!(sonic_rs::from_str::<Oid>(&json).expect("parse"), oid);
+        assert!(sonic_rs::from_str::<Oid>("\"ABCDEF\"").is_err());
+        assert!(sonic_rs::from_str::<Oid>("[1,2,3]").is_err());
+        assert!(sonic_rs::from_str::<Oid>("{\"Sha1\":[0]}").is_err());
     }
 
     #[test]
@@ -563,14 +563,14 @@ mod tests {
     #[test]
     fn hash_kind_wire_and_text_forms() {
         assert_eq!(
-            serde_json::to_string(&HashKind::Sha256).expect("json"),
+            sonic_rs::to_string(&HashKind::Sha256).expect("json"),
             "\"sha256\""
         );
         assert_eq!(
-            serde_json::from_str::<HashKind>("\"sha1\"").expect("parse"),
+            sonic_rs::from_str::<HashKind>("\"sha1\"").expect("parse"),
             HashKind::Sha1
         );
-        assert!(serde_json::from_str::<HashKind>("\"SHA1\"").is_err());
+        assert!(sonic_rs::from_str::<HashKind>("\"SHA1\"").is_err());
         assert_eq!(
             "sha256".parse::<HashKind>().expect("parse"),
             HashKind::Sha256
@@ -596,10 +596,10 @@ mod tests {
         assert_eq!(CommitKey::from_hex(&sha1.to_hex()).expect("hex"), sha1);
         assert!(sha1.expect_kind(HashKind::Sha1).is_ok());
         assert!(sha1.expect_kind(HashKind::Sha256).is_err());
-        let json = serde_json::to_string(&sha256).expect("json");
+        let json = sonic_rs::to_string(&sha256).expect("json");
         assert_eq!(json, format!("\"{}\"", sha256.to_hex()));
         assert_eq!(
-            serde_json::from_str::<CommitKey>(&json).expect("parse"),
+            sonic_rs::from_str::<CommitKey>(&json).expect("parse"),
             sha256
         );
     }

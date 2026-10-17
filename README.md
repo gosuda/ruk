@@ -151,6 +151,9 @@ On POSIX, initialization synchronizes the existing ancestor chain before creatin
 * **Exit codes**: Process exit codes correspond to Ruk's closed `ErrorCode` classification (e.g. status 1 for `E_INVALID`, `E_LIMIT`, and `E_IO`; status 2 for conflict states; status 3 for concurrency/lease conflicts; status 4 for transport/push rejections; status 5 for corruption).
 * **String-or-hex byte encoding**: Git commit messages, paths, author names, and header values are arbitrary byte strings. When encoded as JSON, valid UTF-8 sequences render as standard JSON strings. Non-UTF-8 bytes render as `{"hex": "<lowercase hex>"}` objects. Both representations are accepted on input; valid UTF-8 strings are emitted whenever possible.
 * **Bounded 16 MiB CLI input**: The CLI enforces `MAX_CONTROL_FRAME_BYTES` (16 MiB, or 16,777,216 bytes). Input streams (`--input`, standard input, files, or FIFOs) are bounded by reading at most `limit + 1` bytes (`read.take(limit + 1)`). If an input exceeds 16 MiB, Ruk terminates consumption immediately with `E_LIMIT` (`exit status 1`). A FIFO that exceeds the limit is rejected without waiting for its writer to close. A shorter stream still needs an end-of-file signal.
+* **JSON nesting**: CLI conflict input, protocol envelope decoders, `ruk_core::protocol::decode_json`, and JSON text inside binary `SchemaDocument` values accept at most 128 open arrays or objects, counting the root. Deeper input fails with `E_INVALID`. The CLI and control-frame byte limits remain unchanged. The generic `decode_json` function does not impose a byte limit.
+* **Rust JSON values**: Public value APIs use `sonic_rs::Value`. `SchemaDocument` accepts any JSON root and retains its postcard JSON-string representation. Use `protocol::decode_json` for bounded JSON parsing, including tagged, untagged, and flattened Serde containers. The parser adds stack space when needed. Direct third-party Serde decoding does not enforce Ruk's nesting limit or protect recursion outside the `SchemaDocument` visitor.
+* **Negative zero**: Parsing normalizes `-0` and `-0.0` to positive zero, including JSON text embedded in binary `SchemaDocument` values. Exact floating-point parsing equivalence with other JSON libraries is not guaranteed.
 
 ## Verification Instructions
 
@@ -165,6 +168,8 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
 Formatting, strict Clippy, and workspace tests passed on Linux. The CLI smoke covered both hash kinds, byte-preserving round trips, malformed input, and bounded file/FIFO reads. An external Rust consumer exercised the store's public APIs with independent byte and object-ID oracles, concurrent readers and writers, resource limits, and reopen cycles. Process-kill tests cover atomic publication and recovery at segment-sealing boundaries; they do not prove hardware power-loss durability.
+
+An external JSON consumer verified bounded decoding, Serde replay, and binary document round trips on a standard Linux worker thread. Separate probes exercised 128-level array, object, and mixed documents on requested 1 MiB and 2 MiB worker stacks. The generated model and conflict outputs matched the saved pre-migration bytes.
 
 The workspace, including Windows-only code and tests, also passed cross-compilation checks for `x86_64-pc-windows-gnu`. The [CI workflow](.github/workflows/ci.yml) defines macOS and Windows jobs. Those jobs were not executed during local verification, so runtime behavior on those platforms remains unverified.
 

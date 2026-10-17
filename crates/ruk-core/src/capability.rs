@@ -957,13 +957,13 @@ mod tests {
         for text in ["refs/heads/agent/**", "refs/heads/*/x", "refs/**"] {
             let parsed = rp(text);
             assert_eq!(parsed.to_string(), text);
-            let json = serde_json::to_string(&parsed).expect("json");
+            let json = sonic_rs::to_string(&parsed).expect("json");
             assert_eq!(json, format!("\"{text}\""));
-            let back: RefPattern = serde_json::from_str(&json).expect("parse");
+            let back: RefPattern = sonic_rs::from_str(&json).expect("parse");
             assert_eq!(back, parsed);
         }
-        assert!(serde_json::from_str::<RefPattern>("\"refs/heads/a*b\"").is_err());
-        assert!(serde_json::from_str::<PathPattern>("7").is_err());
+        assert!(sonic_rs::from_str::<RefPattern>("\"refs/heads/a*b\"").is_err());
+        assert!(sonic_rs::from_str::<PathPattern>("7").is_err());
     }
 
     #[test]
@@ -1434,12 +1434,12 @@ mod tests {
 
     #[test]
     fn json_shape_defaults_to_no_authority_and_rejects_invalid_members() {
-        let empty: Capabilities = serde_json::from_str("{}").expect("empty");
+        let empty: Capabilities = sonic_rs::from_str("{}").expect("empty");
         assert_eq!(empty, Capabilities::default());
         assert!(empty.write_changes.is_none() && empty.undo.is_none());
         // Unknown fields (a later minor version) are ignored and grant nothing.
         let future: Capabilities =
-            serde_json::from_str("{\"write_changes\":\"own\",\"future_power\":true}")
+            sonic_rs::from_str("{\"write_changes\":\"own\",\"future_power\":true}")
                 .expect("future");
         assert_eq!(future.write_changes, Some(WriteScope::Own));
         assert!(future.push_refs.is_empty());
@@ -1453,13 +1453,13 @@ mod tests {
             "{\"read_intents\":{\"provenance\":\"yes\"}}",
         ] {
             assert!(
-                serde_json::from_str::<Capabilities>(bad).is_err(),
+                sonic_rs::from_str::<Capabilities>(bad).is_err(),
                 "accepted {bad}"
             );
         }
         let round = policy();
-        let json = serde_json::to_string(&round).expect("json");
-        let back: Capabilities = serde_json::from_str(&json).expect("parse");
+        let json = sonic_rs::to_string(&round).expect("json");
+        let back: Capabilities = sonic_rs::from_str(&json).expect("parse");
         assert_eq!(back, round);
     }
 
@@ -1474,9 +1474,9 @@ mod tests {
         assert!(long.len() > 256);
         assert!(AttestKind::new(long.as_str()).is_ok());
         assert!(AttestResult::new(long.as_str()).is_ok());
-        let wire = serde_json::to_string(&long).expect("json");
-        assert!(serde_json::from_str::<AttestKind>(&wire).is_ok());
-        assert!(serde_json::from_str::<AttestResult>(&wire).is_ok());
+        let wire = sonic_rs::to_string(&long).expect("json");
+        assert!(sonic_rs::from_str::<AttestKind>(&wire).is_ok());
+        assert!(sonic_rs::from_str::<AttestResult>(&wire).is_ok());
         // The boundary is the frame size exactly.
         assert!(AttestKind::new("a".repeat(limit)).is_ok());
         assert!(AttestKind::new("a".repeat(limit + 1)).is_err());
@@ -1506,7 +1506,10 @@ mod tests {
                 AttestResult::MAX_BYTES,
             ),
         ] {
-            assert_eq!(schema.to_value()["maxLength"], serde_json::json!(max));
+            assert_eq!(
+                schema.to_value()["maxLength"].as_u64(),
+                Some(u64::try_from(max).expect("fits u64"))
+            );
         }
     }
 

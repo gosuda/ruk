@@ -951,10 +951,10 @@ mod tests {
     #[test]
     fn utf8_path_serializes_as_a_string_and_round_trips() {
         let original = path("dir/\u{e4}.txt");
-        let json = serde_json::to_string(&original).expect("json");
+        let json = sonic_rs::to_string(&original).expect("json");
         assert_eq!(json, "\"dir/\u{e4}.txt\"");
         assert_eq!(
-            serde_json::from_str::<RepoPath>(&json).expect("parse"),
+            sonic_rs::from_str::<RepoPath>(&json).expect("parse"),
             original
         );
     }
@@ -965,12 +965,15 @@ mod tests {
         assert!(matches!(original, CoreModelError::Invalid { .. }));
         let original = RepoPath::new(&b"dir/\xff\xfez"[..]).expect("valid");
         assert!(original.to_utf8().is_none());
-        let json = serde_json::to_value(&original).expect("value");
-        assert!(
-            json.is_object(),
-            "non-UTF-8 must use the hex object: {json}"
-        );
-        let back: RepoPath = serde_json::from_value(json).expect("parse");
+        let json = sonic_rs::to_value(&original).expect("value");
+        {
+            use sonic_rs::JsonValueTrait;
+            assert!(
+                json.is_object(),
+                "non-UTF-8 must use the hex object: {json}"
+            );
+        }
+        let back: RepoPath = sonic_rs::from_value(&json).expect("parse");
         assert_eq!(back.as_bytes(), original.as_bytes());
         let bytes = postcard::to_allocvec(&original).expect("encode");
         let back: RepoPath = postcard::from_bytes(&bytes).expect("decode");
@@ -992,7 +995,7 @@ mod tests {
             "null",
         ] {
             assert!(
-                serde_json::from_str::<RepoPath>(bad).is_err(),
+                sonic_rs::from_str::<RepoPath>(bad).is_err(),
                 "accepted {bad}"
             );
         }
@@ -1006,9 +1009,9 @@ mod tests {
     #[test]
     fn stage_is_an_integer_zero_to_three() {
         for stage in Stage::ALL {
-            let json = serde_json::to_string(&stage).expect("json");
+            let json = sonic_rs::to_string(&stage).expect("json");
             assert_eq!(json, stage.as_u8().to_string());
-            assert_eq!(serde_json::from_str::<Stage>(&json).expect("parse"), stage);
+            assert_eq!(sonic_rs::from_str::<Stage>(&json).expect("parse"), stage);
             let bytes = postcard::to_allocvec(&stage).expect("encode");
             assert_eq!(
                 postcard::from_bytes::<Stage>(&bytes).expect("decode"),
@@ -1016,10 +1019,7 @@ mod tests {
             );
         }
         for bad in ["4", "255", "-1", "\"1\"", "1.5", "null"] {
-            assert!(
-                serde_json::from_str::<Stage>(bad).is_err(),
-                "accepted {bad}"
-            );
+            assert!(sonic_rs::from_str::<Stage>(bad).is_err(), "accepted {bad}");
         }
         assert!(Stage::from_u8(4).is_err());
     }
@@ -1181,13 +1181,12 @@ mod tests {
         ];
         for text in bad {
             assert!(
-                serde_json::from_str::<IndexEntry>(&text).is_err(),
+                sonic_rs::from_str::<IndexEntry>(&text).is_err(),
                 "accepted {text}"
             );
         }
         let minimal = format!("{{\"oid\":\"{HELLO_BLOB_SHA1}\",\"mode\":\"executable\"}}");
-        let entry: IndexEntry =
-            serde_json::from_str(&minimal).expect("defaults fill stat and flags");
+        let entry: IndexEntry = sonic_rs::from_str(&minimal).expect("defaults fill stat and flags");
         assert_eq!(entry.stat(), None);
         assert_eq!(entry.flags(), IndexFlags::default());
         assert_eq!(entry.mode(), FileMode::Executable);
@@ -1282,8 +1281,8 @@ mod tests {
         let entry = format!("{{\"oid\":\"{HELLO_BLOB_SHA1}\",\"mode\":\"regular\"}}");
         let good_merged = format!("{{\"merged\":{entry}}}");
         let good_unmerged = format!("{{\"unmerged\":{{\"ours\":{entry},\"theirs\":null}}}}");
-        assert!(serde_json::from_str::<PathEntries>(&good_merged).is_ok());
-        assert!(serde_json::from_str::<PathEntries>(&good_unmerged).is_ok());
+        assert!(sonic_rs::from_str::<PathEntries>(&good_merged).is_ok());
+        assert!(sonic_rs::from_str::<PathEntries>(&good_unmerged).is_ok());
         for bad in [
             "{\"unmerged\":{}}".to_owned(),
             "{\"unmerged\":{\"base\":null,\"ours\":null,\"theirs\":null}}".to_owned(),
@@ -1293,7 +1292,7 @@ mod tests {
             "\"merged\"".to_owned(),
         ] {
             assert!(
-                serde_json::from_str::<PathEntries>(&bad).is_err(),
+                sonic_rs::from_str::<PathEntries>(&bad).is_err(),
                 "accepted {bad}"
             );
         }
@@ -1310,9 +1309,9 @@ mod tests {
         ])
         .expect("unmerged");
         for value in [PathEntries::Merged(with_stat), unmerged] {
-            let json = serde_json::to_string(&value).expect("json");
+            let json = sonic_rs::to_string(&value).expect("json");
             assert_eq!(
-                serde_json::from_str::<PathEntries>(&json).expect("parse"),
+                sonic_rs::from_str::<PathEntries>(&json).expect("parse"),
                 value
             );
             let bytes = postcard::to_allocvec(&value).expect("encode");
@@ -1408,9 +1407,6 @@ mod tests {
             IndexGeneration(u64::MAX).next(),
             Err(CoreModelError::Capacity(_))
         ));
-        assert_eq!(
-            serde_json::to_string(&IndexGeneration(7)).expect("json"),
-            "7"
-        );
+        assert_eq!(sonic_rs::to_string(&IndexGeneration(7)).expect("json"), "7");
     }
 }

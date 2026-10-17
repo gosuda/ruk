@@ -494,10 +494,10 @@ mod tests {
     #[test]
     fn change_id_serde_forms() {
         let id = ChangeId::from_bytes(JJ_CHANGE_BYTES);
-        let json = serde_json::to_string(&id).expect("json");
+        let json = sonic_rs::to_string(&id).expect("json");
         assert_eq!(json, format!("\"{JJ_CHANGE_ID}\""));
-        assert_eq!(serde_json::from_str::<ChangeId>(&json).expect("parse"), id);
-        assert!(serde_json::from_str::<ChangeId>("[1,2,3]").is_err());
+        assert_eq!(sonic_rs::from_str::<ChangeId>(&json).expect("parse"), id);
+        assert!(sonic_rs::from_str::<ChangeId>("[1,2,3]").is_err());
         let binary = postcard::to_allocvec(&id).expect("postcard");
         assert_eq!(binary.len(), 1 + ChangeId::LEN);
         assert_eq!(
@@ -545,8 +545,8 @@ mod tests {
 
     #[test]
     fn operation_ids_are_bare_integers_and_ordered() {
-        assert_eq!(serde_json::to_string(&OperationId(7)).expect("json"), "7");
-        assert!(serde_json::from_str::<OperationId>("-1").is_err());
+        assert_eq!(sonic_rs::to_string(&OperationId(7)).expect("json"), "7");
+        assert!(sonic_rs::from_str::<OperationId>("-1").is_err());
         assert!(OperationId(1) < OperationId(2));
         let mut counter = CheckedOperationId::new(0, u64::MAX);
         let first = counter.allocate().expect("first");
@@ -563,9 +563,9 @@ mod tests {
         let text = "123e4567-e89b-42d3-a456-426614174000";
         assert_eq!(id.to_string(), text);
         assert_eq!(text.parse::<SessionId>().expect("parse"), id);
-        let json = serde_json::to_string(&id).expect("json");
+        let json = sonic_rs::to_string(&id).expect("json");
         assert_eq!(json, format!("\"{text}\""));
-        assert_eq!(serde_json::from_str::<SessionId>(&json).expect("parse"), id);
+        assert_eq!(sonic_rs::from_str::<SessionId>(&json).expect("parse"), id);
         for bad in [
             "123E4567-E89B-42D3-A456-426614174000",
             "123e4567e89b42d3a456426614174000",
@@ -578,9 +578,9 @@ mod tests {
             "",
         ] {
             assert!(bad.parse::<SessionId>().is_err(), "accepted {bad:?}");
-            let quoted = serde_json::to_string(bad).expect("json");
+            let quoted = sonic_rs::to_string(bad).expect("json");
             assert!(
-                serde_json::from_str::<SessionId>(&quoted).is_err(),
+                sonic_rs::from_str::<SessionId>(&quoted).is_err(),
                 "accepted {quoted}"
             );
         }

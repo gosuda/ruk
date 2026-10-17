@@ -520,8 +520,8 @@ fn arbitrary_bytes_survive_exactly() {
     assert_eq!(decoded.author().name.as_bytes(), [0xe9, b' ', 0xff]);
     assert_eq!(decoded.key().expect("key"), rec.key().expect("key"));
     // The JSON form carries the same bytes (hex objects for non-UTF-8).
-    let json = serde_json::to_string(&rec.to_input()).expect("json");
-    let back: ConflictRecordInput = serde_json::from_str(&json).expect("parse");
+    let json = sonic_rs::to_string(&rec.to_input()).expect("json");
+    let back: ConflictRecordInput = sonic_rs::from_str(&json).expect("parse");
     assert_eq!(
         ConflictRecord::from_input(&back, kind).expect("record"),
         rec
@@ -563,22 +563,24 @@ fn empty_extra_headers_survive_postcard_round_trip() {
 
 #[test]
 fn input_json_shape_and_strictness() {
-    let json = serde_json::to_value(sample_input(HashKind::Sha1)).expect("value");
+    use sonic_rs::JsonValueMutTrait;
+
+    let json = sonic_rs::to_value(&sample_input(HashKind::Sha1)).expect("value");
     assert_eq!(json["author"]["offset"], "+0100");
     assert_eq!(json["committer"]["offset"], "-0000");
     assert_eq!(json["parents"][0]["type"], "git");
     assert_eq!(json["parents"][1]["type"], "conflicted");
     assert_eq!(json["message"], "resolve later\n");
     assert_eq!(json["extra_headers"][1]["name"], "change-id");
-    let back: ConflictRecordInput = serde_json::from_value(json.clone()).expect("round trip");
+    let back: ConflictRecordInput = sonic_rs::from_value(&json).expect("round trip");
     assert_eq!(back, sample_input(HashKind::Sha1));
     // Unlisted optional extra_headers default to empty.
     let mut without = json;
     without
         .as_object_mut()
         .expect("object")
-        .remove("extra_headers");
-    let parsed: ConflictRecordInput = serde_json::from_value(without).expect("optional");
+        .remove(&"extra_headers");
+    let parsed: ConflictRecordInput = sonic_rs::from_value(&without).expect("optional");
     assert!(parsed.extra_headers.is_empty());
 }
 
@@ -588,11 +590,11 @@ fn tz_offset_preserves_sign_and_digits() {
         let tz = TzOffset::parse(text.as_bytes()).expect("parse");
         assert_eq!(tz.to_string(), text);
         assert_eq!(
-            serde_json::to_string(&tz).expect("json"),
+            sonic_rs::to_string(&tz).expect("json"),
             format!("\"{text}\"")
         );
         assert_eq!(
-            serde_json::from_str::<TzOffset>(&format!("\"{text}\"")).expect("parse"),
+            sonic_rs::from_str::<TzOffset>(&format!("\"{text}\"")).expect("parse"),
             tz
         );
     }

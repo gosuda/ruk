@@ -226,19 +226,16 @@ mod tests {
     #[test]
     fn utf8_bytes_serialize_as_plain_json_string() {
         let value = ByteString::from("src/lib.rs");
-        assert_eq!(
-            serde_json::to_string(&value).expect("json"),
-            "\"src/lib.rs\""
-        );
+        assert_eq!(sonic_rs::to_string(&value).expect("json"), "\"src/lib.rs\"");
     }
 
     #[test]
     fn non_utf8_bytes_survive_json_round_trip_via_hex_form() {
         let raw = vec![b'a', 0xff, 0xfe, b'/', 0x80, 0x00];
         let value = ByteString::new(raw.clone());
-        let json = serde_json::to_string(&value).expect("json");
+        let json = sonic_rs::to_string(&value).expect("json");
         assert_eq!(json, "{\"hex\":\"61fffe2f8000\"}");
-        let back: ByteString = serde_json::from_str(&json).expect("parse");
+        let back: ByteString = sonic_rs::from_str(&json).expect("parse");
         assert_eq!(back.as_bytes(), raw.as_slice());
     }
 
@@ -246,15 +243,15 @@ mod tests {
     fn embedded_nul_and_newline_are_exact() {
         let value = ByteString::from("a\0b\nc");
         let back: ByteString =
-            serde_json::from_str(&serde_json::to_string(&value).expect("json")).expect("parse");
+            sonic_rs::from_str(&sonic_rs::to_string(&value).expect("json")).expect("parse");
         assert_eq!(back, value);
     }
 
     #[test]
     fn hex_form_accepts_valid_utf8_but_string_form_is_emitted() {
-        let from_hex: ByteString = serde_json::from_str("{\"hex\":\"6162\"}").expect("hex");
+        let from_hex: ByteString = sonic_rs::from_str("{\"hex\":\"6162\"}").expect("hex");
         assert_eq!(from_hex.as_bytes(), b"ab");
-        assert_eq!(serde_json::to_string(&from_hex).expect("json"), "\"ab\"");
+        assert_eq!(sonic_rs::to_string(&from_hex).expect("json"), "\"ab\"");
     }
 
     #[test]
@@ -270,7 +267,7 @@ mod tests {
             "[1,2]",
         ] {
             assert!(
-                serde_json::from_str::<ByteString>(bad).is_err(),
+                sonic_rs::from_str::<ByteString>(bad).is_err(),
                 "accepted {bad}"
             );
         }

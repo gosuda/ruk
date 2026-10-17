@@ -654,15 +654,15 @@ fn same_change_default_is_keep() {
 #[test]
 fn same_change_wire_form() {
     assert_eq!(
-        serde_json::to_string(&SameChange::Keep).expect("json"),
+        sonic_rs::to_string(&SameChange::Keep).expect("json"),
         "\"keep\""
     );
     assert_eq!(
-        serde_json::to_string(&SameChange::Accept).expect("json"),
+        sonic_rs::to_string(&SameChange::Accept).expect("json"),
         "\"accept\""
     );
-    let keep: SameChange = serde_json::from_str("\"keep\"").expect("keep");
-    let accept: SameChange = serde_json::from_str("\"accept\"").expect("accept");
+    let keep: SameChange = sonic_rs::from_str("\"keep\"").expect("keep");
+    let accept: SameChange = sonic_rs::from_str("\"accept\"").expect("accept");
     assert_eq!(keep, SameChange::Keep);
     assert_eq!(accept, SameChange::Accept);
 }
@@ -670,34 +670,34 @@ fn same_change_wire_form() {
 #[test]
 fn merge_wire_shape_is_bare_array() {
     let merge = Merge::from_vec(vec![1, 2, 3]);
-    assert_eq!(serde_json::to_string(&merge).expect("json"), "[1,2,3]");
+    assert_eq!(sonic_rs::to_string(&merge).expect("json"), "[1,2,3]");
     let resolved = Merge::resolved(42_u32);
-    assert_eq!(serde_json::to_string(&resolved).expect("json"), "[42]");
+    assert_eq!(sonic_rs::to_string(&resolved).expect("json"), "[42]");
 }
 
 #[test]
 fn merge_deserializes_odd_arrays() {
-    let merge: Merge<u32> = serde_json::from_str("[7]").expect("resolved");
+    let merge: Merge<u32> = sonic_rs::from_str("[7]").expect("resolved");
     assert_eq!(merge, Merge::resolved(7));
-    let conflicted: Merge<u32> = serde_json::from_str("[1,2,3]").expect("conflict");
+    let conflicted: Merge<u32> = sonic_rs::from_str("[1,2,3]").expect("conflict");
     assert_eq!(conflicted, Merge::from_vec(vec![1, 2, 3]));
 }
 
 #[test]
 fn merge_rejects_empty_and_even_arrays() {
-    let empty: Result<Merge<u32>, _> = serde_json::from_str("[]");
+    let empty: Result<Merge<u32>, _> = sonic_rs::from_str("[]");
     assert!(empty.is_err(), "empty term array must be rejected");
-    let even: Result<Merge<u32>, _> = serde_json::from_str("[1,2]");
+    let even: Result<Merge<u32>, _> = sonic_rs::from_str("[1,2]");
     assert!(even.is_err(), "even term array must be rejected");
-    let even5: Result<Merge<u32>, _> = serde_json::from_str("[1,2,3,4]");
+    let even5: Result<Merge<u32>, _> = sonic_rs::from_str("[1,2,3,4]");
     assert!(even5.is_err());
 }
 
 #[test]
 fn merge_round_trips_through_wire() {
     let original = Merge::from_vec(vec![10_u64, 20, 30, 40, 50]);
-    let json = serde_json::to_string(&original).expect("serialize");
-    let back: Merge<u64> = serde_json::from_str(&json).expect("deserialize");
+    let json = sonic_rs::to_string(&original).expect("serialize");
+    let back: Merge<u64> = sonic_rs::from_str(&json).expect("deserialize");
     assert_eq!(back, original);
 }
 

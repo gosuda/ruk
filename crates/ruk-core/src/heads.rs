@@ -174,19 +174,19 @@ mod tests {
 
     #[test]
     fn wire_form_is_tagged_with_hex_digests() {
-        let json = serde_json::to_string(&git_head()).expect("json");
+        let json = sonic_rs::to_string(&git_head()).expect("json");
         assert_eq!(json, format!("{{\"type\":\"git\",\"oid\":\"{SHA1}\"}}"));
         assert_eq!(
-            serde_json::from_str::<Head>(&json).expect("parse"),
+            sonic_rs::from_str::<Head>(&json).expect("parse"),
             git_head()
         );
         let native = conflicted(HashKind::Sha256);
-        let json = serde_json::to_string(&native).expect("json");
+        let json = sonic_rs::to_string(&native).expect("json");
         assert!(
             json.starts_with("{\"type\":\"conflicted\",\"key\":\""),
             "{json}"
         );
-        assert_eq!(serde_json::from_str::<Head>(&json).expect("parse"), native);
+        assert_eq!(sonic_rs::from_str::<Head>(&json).expect("parse"), native);
     }
 
     #[test]
@@ -198,10 +198,7 @@ mod tests {
             "{\"type\":\"git\"}".to_owned(),
             "{\"type\":\"conflicted\",\"key\":\"00\"}".to_owned(),
         ] {
-            assert!(
-                serde_json::from_str::<Head>(&bad).is_err(),
-                "accepted {bad}"
-            );
+            assert!(sonic_rs::from_str::<Head>(&bad).is_err(), "accepted {bad}");
         }
     }
 

@@ -1038,7 +1038,7 @@ mod tests {
     #[test]
     fn symbolic_head_stores_a_name_and_no_oid() {
         let state = WorkspaceState::GitCompat(git_compat());
-        let json = serde_json::to_string(&state).expect("json");
+        let json = sonic_rs::to_string(&state).expect("json");
         assert!(
             json.contains("{\"symbolic\":\"refs/heads/main\"}"),
             "{json}"
@@ -1052,7 +1052,7 @@ mod tests {
             Scope::Full,
         ));
         assert!(has_hex_run(
-            &serde_json::to_string(&detached).expect("json"),
+            &sonic_rs::to_string(&detached).expect("json"),
             40
         ));
     }
@@ -1169,11 +1169,10 @@ mod tests {
 
     #[test]
     fn head_ref_wire_forms_validate() {
-        let sym: HeadRef =
-            serde_json::from_str("{\"symbolic\":\"refs/heads/x\"}").expect("symbolic");
+        let sym: HeadRef = sonic_rs::from_str("{\"symbolic\":\"refs/heads/x\"}").expect("symbolic");
         assert_eq!(sym, HeadRef::Symbolic(name("refs/heads/x")));
         let det: HeadRef =
-            serde_json::from_str(&format!("{{\"detached\":\"{:040x}\"}}", 3)).expect("detached");
+            sonic_rs::from_str(&format!("{{\"detached\":\"{:040x}\"}}", 3)).expect("detached");
         assert_eq!(
             det,
             HeadRef::Detached(Oid::from_hex(&format!("{:040x}", 3)).expect("oid"))
@@ -1187,7 +1186,7 @@ mod tests {
             "{}".to_owned(),
         ] {
             assert!(
-                serde_json::from_str::<HeadRef>(&bad).is_err(),
+                sonic_rs::from_str::<HeadRef>(&bad).is_err(),
                 "accepted {bad}"
             );
         }
@@ -1265,16 +1264,12 @@ mod tests {
 
     #[test]
     fn scope_wire_forms_canonicalize_and_reject_bad_paths() {
-        assert_eq!(
-            serde_json::to_string(&Scope::Full).expect("json"),
-            "\"full\""
-        );
+        assert_eq!(sonic_rs::to_string(&Scope::Full).expect("json"), "\"full\"");
         let cone = Scope::cone([path("b/c"), path("a")]);
-        let json = serde_json::to_string(&cone).expect("json");
+        let json = sonic_rs::to_string(&cone).expect("json");
         assert_eq!(json, "{\"cone\":[\"a\",\"b/c\"]}");
-        let messy: Scope =
-            serde_json::from_str("{\"cone\":[\"b/c/d\",\"b/c\",\"a\",\"a/x\",\"a\"]}")
-                .expect("parse");
+        let messy: Scope = sonic_rs::from_str("{\"cone\":[\"b/c/d\",\"b/c\",\"a\",\"a/x\",\"a\"]}")
+            .expect("parse");
         assert_eq!(messy, cone);
         for bad in [
             "{\"cone\":[\"\"]}",
@@ -1286,10 +1281,7 @@ mod tests {
             "\"cone\"",
             "null",
         ] {
-            assert!(
-                serde_json::from_str::<Scope>(bad).is_err(),
-                "accepted {bad}"
-            );
+            assert!(sonic_rs::from_str::<Scope>(bad).is_err(), "accepted {bad}");
         }
         for scope in [Scope::Full, cone, Scope::cone([])] {
             let bytes = postcard::to_allocvec(&scope).expect("encode");
@@ -1303,8 +1295,8 @@ mod tests {
     #[test]
     fn non_utf8_scope_directories_round_trip() {
         let scope = Scope::cone([RepoPath::new(&b"d\xff/e"[..]).expect("path")]);
-        let json = serde_json::to_string(&scope).expect("json");
-        assert_eq!(serde_json::from_str::<Scope>(&json).expect("parse"), scope);
+        let json = sonic_rs::to_string(&scope).expect("json");
+        assert_eq!(sonic_rs::from_str::<Scope>(&json).expect("parse"), scope);
         assert!(scope.includes_file(&RepoPath::new(&b"d\xff/e/f"[..]).expect("path")));
         assert!(!scope.includes_file(&RepoPath::new(&b"d/e/f"[..]).expect("path")));
     }
@@ -1360,13 +1352,13 @@ mod tests {
             stamp: stamp(7, 1),
             ..git_compat()
         });
-        let native_json = serde_json::to_string(&native_state).expect("json");
-        let git_json = serde_json::to_string(&git_state).expect("json");
+        let native_json = sonic_rs::to_string(&native_state).expect("json");
+        let git_json = sonic_rs::to_string(&git_state).expect("json");
         assert!(native_json.starts_with("{\"native\":{"), "{native_json}");
         assert!(git_json.starts_with("{\"git_compat\":{"), "{git_json}");
         for (state, json) in [(native_state, native_json), (git_state, git_json)] {
             assert_eq!(
-                serde_json::from_str::<WorkspaceState>(&json).expect("parse"),
+                sonic_rs::from_str::<WorkspaceState>(&json).expect("parse"),
                 state
             );
             let bytes = postcard::to_allocvec(&state).expect("encode");
@@ -1386,12 +1378,10 @@ mod tests {
         );
         let git_body = "{\"head\":{\"symbolic\":\"refs/heads/main\"},\"index_generation\":0,\"scope\":\"full\",\"stamp\":{\"sequence\":0,\"lease_epoch\":0}}";
         assert!(
-            serde_json::from_str::<WorkspaceState>(&format!("{{\"native\":{native_body}}}"))
-                .is_ok()
+            sonic_rs::from_str::<WorkspaceState>(&format!("{{\"native\":{native_body}}}")).is_ok()
         );
         assert!(
-            serde_json::from_str::<WorkspaceState>(&format!("{{\"git_compat\":{git_body}}}"))
-                .is_ok()
+            sonic_rs::from_str::<WorkspaceState>(&format!("{{\"git_compat\":{git_body}}}")).is_ok()
         );
         let as_native = |body: &str| format!("{{\"native\":{body}}}");
         let bad = [
@@ -1417,7 +1407,7 @@ mod tests {
         ];
         for text in bad {
             assert!(
-                serde_json::from_str::<WorkspaceState>(&text).is_err(),
+                sonic_rs::from_str::<WorkspaceState>(&text).is_err(),
                 "accepted {text}"
             );
         }
@@ -1429,13 +1419,13 @@ mod tests {
             stamp: stamp(u64::MAX, u64::MAX - 1),
             ..native()
         });
-        let json = serde_json::to_string(&state).expect("json");
+        let json = sonic_rs::to_string(&state).expect("json");
         assert!(
             json.contains("18446744073709551615") && json.contains("18446744073709551614"),
             "{json}"
         );
         assert_eq!(
-            serde_json::from_str::<WorkspaceState>(&json).expect("parse"),
+            sonic_rs::from_str::<WorkspaceState>(&json).expect("parse"),
             state
         );
         let bytes = postcard::to_allocvec(&state).expect("encode");

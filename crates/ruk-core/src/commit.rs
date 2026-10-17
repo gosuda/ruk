@@ -946,8 +946,8 @@ mod tests {
     }
 
     fn json_round_trip(record: &CommitRecord) -> CommitRecord {
-        let json = serde_json::to_string(record).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
+        let json = sonic_rs::to_string(record).expect("serialize");
+        sonic_rs::from_str(&json).expect("deserialize")
     }
 
     fn postcard_round_trip(record: &CommitRecord) -> CommitRecord {
@@ -1406,9 +1406,9 @@ mod tests {
         // Deserialization is the same single check, not a second grammar.
         for bad in ["{\"\":\"v\"}", "{\"Bad\":\"x\"}", "{\"k\":1}"] {
             let json = format!("{{\"session\":\"{session}\",\"claims\":{bad}}}");
-            assert!(serde_json::from_str::<Provenance>(&json).is_err(), "{bad}");
+            assert!(sonic_rs::from_str::<Provenance>(&json).is_err(), "{bad}");
             assert!(
-                serde_json::from_str::<ProvenanceClaims>(bad).is_err(),
+                sonic_rs::from_str::<ProvenanceClaims>(bad).is_err(),
                 "{bad}"
             );
         }
@@ -1447,11 +1447,11 @@ mod tests {
             }
             for (key, value) in refused {
                 assert!(claims(&[(key, value)]).is_err(), "{key:?}");
-                let mut forged = serde_json::to_value(&record).expect("value");
+                let mut forged = sonic_rs::to_value(&record).expect("value");
                 forged["provenance"]["claims"] =
-                    serde_json::to_value(BTreeMap::from([(key, value)])).expect("claims");
+                    sonic_rs::to_value(&BTreeMap::from([(key, value)])).expect("claims");
                 assert!(
-                    serde_json::from_value::<CommitRecord>(forged).is_err(),
+                    sonic_rs::from_value::<CommitRecord>(&forged).is_err(),
                     "{key:?}"
                 );
             }
@@ -1466,17 +1466,17 @@ mod tests {
         native_input.tree = conflicted_tree(kind);
         let native = CommitRecord::create(native_input, kind).expect("native");
 
-        let value = |record: &CommitRecord| serde_json::to_value(record).expect("value");
+        let value = |record: &CommitRecord| sonic_rs::to_value(record).expect("value");
 
         // Wrong change ID for the header inside the bytes.
         let mut forged = value(&exportable);
-        forged["change_id"] = serde_json::to_value(change(8)).expect("id");
-        assert!(serde_json::from_value::<CommitRecord>(forged).is_err());
+        forged["change_id"] = sonic_rs::to_value(&change(8)).expect("id");
+        assert!(sonic_rs::from_value::<CommitRecord>(&forged).is_err());
 
         // A hash kind that does not match the bytes.
         let mut forged = value(&exportable);
-        forged["kind"] = serde_json::json!("sha256");
-        assert!(serde_json::from_value::<CommitRecord>(forged).is_err());
+        forged["kind"] = sonic_rs::json!("sha256");
+        assert!(sonic_rs::from_value::<CommitRecord>(&forged).is_err());
 
         // A native frame for a commit that has a Git form.
         let frame = ConflictRecord::from_input(
@@ -1493,20 +1493,20 @@ mod tests {
         .expect("frame input")
         .encode();
         let mut forged = value(&exportable);
-        forged["encoded"] = serde_json::json!({ "native": ByteString::from(frame) });
-        assert!(serde_json::from_value::<CommitRecord>(forged).is_err());
+        forged["encoded"] = sonic_rs::json!({ "native": ByteString::from(frame) });
+        assert!(sonic_rs::from_value::<CommitRecord>(&forged).is_err());
 
         // A tampered native frame (length no longer matches).
         let mut frame = native.native_record().expect("native").encode();
         frame.push(b'x');
         let mut forged = value(&native);
-        forged["encoded"] = serde_json::json!({ "native": ByteString::from(frame) });
-        assert!(serde_json::from_value::<CommitRecord>(forged).is_err());
+        forged["encoded"] = sonic_rs::json!({ "native": ByteString::from(frame) });
+        assert!(sonic_rs::from_value::<CommitRecord>(&forged).is_err());
 
         // A predecessor of the wrong width.
         let mut forged = value(&exportable);
-        forged["predecessor"] = serde_json::to_value(git(HashKind::Sha256, 5)).expect("head");
-        assert!(serde_json::from_value::<CommitRecord>(forged).is_err());
+        forged["predecessor"] = sonic_rs::to_value(&git(HashKind::Sha256, 5)).expect("head");
+        assert!(sonic_rs::from_value::<CommitRecord>(&forged).is_err());
 
         // The untouched values still decode.
         assert_eq!(json_round_trip(&exportable), exportable);

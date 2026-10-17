@@ -818,19 +818,19 @@ mod tests {
     #[test]
     fn names_serialize_as_strings_or_hex_and_round_trip() {
         let plain = name("refs/heads/\u{e4}");
-        let json = serde_json::to_string(&plain).expect("json");
+        let json = sonic_rs::to_string(&plain).expect("json");
         assert_eq!(json, "\"refs/heads/\u{e4}\"");
-        assert_eq!(
-            serde_json::from_str::<RefName>(&json).expect("parse"),
-            plain
-        );
+        assert_eq!(sonic_rs::from_str::<RefName>(&json).expect("parse"), plain);
 
         let binary = RefName::new(&b"refs/heads/\xff\xfe"[..]).expect("valid");
         assert!(binary.to_utf8().is_none());
-        let value = serde_json::to_value(&binary).expect("value");
-        assert!(value.is_object(), "{value}");
+        let value = sonic_rs::to_value(&binary).expect("value");
+        {
+            use sonic_rs::JsonValueTrait;
+            assert!(value.is_object(), "{value}");
+        }
         assert_eq!(
-            serde_json::from_value::<RefName>(value).expect("parse"),
+            sonic_rs::from_value::<RefName>(&value).expect("parse"),
             binary
         );
         for original in [plain, binary] {
@@ -853,7 +853,7 @@ mod tests {
             "7",
         ] {
             assert!(
-                serde_json::from_str::<RefName>(bad).is_err(),
+                sonic_rs::from_str::<RefName>(bad).is_err(),
                 "accepted {bad}"
             );
         }
@@ -865,18 +865,18 @@ mod tests {
 
     #[test]
     fn target_wire_forms_are_externally_tagged() {
-        let json = serde_json::to_string(&direct(0)).expect("json");
+        let json = sonic_rs::to_string(&direct(0)).expect("json");
         assert_eq!(json, format!("{{\"direct\":\"{:040x}\"}}", 1));
-        let json = serde_json::to_string(&sym("refs/heads/main")).expect("json");
+        let json = sonic_rs::to_string(&sym("refs/heads/main")).expect("json");
         assert_eq!(json, "{\"symbolic\":\"refs/heads/main\"}");
         for target in [
             direct(3),
             sym("refs/heads/x"),
             RefTarget::Symbolic(RefName::new(&b"refs/\xff"[..]).expect("name")),
         ] {
-            let json = serde_json::to_string(&target).expect("json");
+            let json = sonic_rs::to_string(&target).expect("json");
             assert_eq!(
-                serde_json::from_str::<RefTarget>(&json).expect("parse"),
+                sonic_rs::from_str::<RefTarget>(&json).expect("parse"),
                 target
             );
             let bytes = postcard::to_allocvec(&target).expect("encode");
@@ -901,7 +901,7 @@ mod tests {
             "{}".to_owned(),
         ] {
             assert!(
-                serde_json::from_str::<RefTarget>(&bad).is_err(),
+                sonic_rs::from_str::<RefTarget>(&bad).is_err(),
                 "accepted {bad}"
             );
         }
@@ -910,12 +910,12 @@ mod tests {
     #[test]
     fn update_wire_form_cannot_express_delete_by_omission() {
         let missing_change = "{\"name\":\"refs/a\",\"expected\":\"any\"}";
-        assert!(serde_json::from_str::<RefUpdate>(missing_change).is_err());
+        assert!(sonic_rs::from_str::<RefUpdate>(missing_change).is_err());
         let missing_expected = "{\"name\":\"refs/a\",\"change\":\"delete\"}";
-        assert!(serde_json::from_str::<RefUpdate>(missing_expected).is_err());
+        assert!(sonic_rs::from_str::<RefUpdate>(missing_expected).is_err());
         let ok = "{\"name\":\"refs/a\",\"expected\":\"absent\",\"change\":\"delete\"}";
         assert_eq!(
-            serde_json::from_str::<RefUpdate>(ok).expect("parse").change,
+            sonic_rs::from_str::<RefUpdate>(ok).expect("parse").change,
             RefChange::Delete
         );
     }

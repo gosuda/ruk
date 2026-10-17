@@ -143,10 +143,10 @@ fn io_error(err: std::io::Error) -> CoreError {
 }
 
 fn encode_conflict(bytes: &[u8], kind: HashKind) -> Result<Vec<u8>, CoreError> {
-    let input: ConflictRecordInput = serde_json::from_slice(bytes).map_err(|err| {
+    let input: ConflictRecordInput = ruk_core::protocol::decode_json(bytes).map_err(|err| {
         CoreError::new(
-            ErrorCode::EInvalid,
-            format!("malformed conflict input: {err}"),
+            err.code,
+            format!("malformed conflict input: {}", err.message),
         )
     })?;
     let record = ConflictRecord::from_input(&input, kind).map_err(CoreError::from)?;
@@ -158,13 +158,13 @@ fn decode_conflict(bytes: &[u8], kind: HashKind) -> Result<Vec<u8>, CoreError> {
     // Canonical JSON is the validated input projection itself: byte fields
     // serialize through the core ByteString contract with no CLI-side copy
     // of the encoding logic.
-    serde_json::to_vec(&record.to_input())
+    sonic_rs::to_vec(&record.to_input())
         .map_err(|err| CoreError::new(ErrorCode::EIo, format!("schema render: {err}")))
 }
 
 fn model_schema_document() -> Result<Vec<u8>, CoreError> {
     let doc = ruk_core::protocol::model_schema_json();
-    serde_json::to_vec(&doc)
+    sonic_rs::to_vec(&doc)
         .map_err(|err| CoreError::new(ErrorCode::EIo, format!("schema render: {err}")))
 }
 
