@@ -38,6 +38,7 @@ use super::lane::{
 use super::oplog::read_header;
 use super::policy::PolicySource;
 pub use super::policy::Principal;
+use super::retention::{RetentionClock, SweepTable, sweep_page};
 use super::rows::{
     CoordinatorHead, OP_HEAD_KEY, RECEIPT_HORIZON, SessionRow, decode_head, decode_session,
     session_key,
@@ -118,6 +119,7 @@ pub struct HostedCoordinator {
     lane: PublicationLane,
     runner: Mutex<Option<PublicationLaneRunner>>,
     clock: Clock,
+    retention_clock: RetentionClock,
     shutdown_handle: CancelHandle,
     shutdown: Cancel,
 }
@@ -149,6 +151,10 @@ impl HostedCoordinator {
             Arc::clone(&policies),
             clock.clone(),
         );
+        // The conservative pruning clock is process-local: one instance per
+        // coordinator, anchored at the initial clock sample of this process.
+        // A restart samples a fresh anchor; monotonic time never crosses it.
+        let retention_clock = RetentionClock::new(clock.sample()?);
         let (shutdown_handle, shutdown) = cancellation();
         Ok(Self {
             store,
@@ -159,6 +165,7 @@ impl HostedCoordinator {
             lane,
             runner: Mutex::new(Some(runner)),
             clock,
+            retention_clock,
             shutdown_handle,
             shutdown,
         })
@@ -609,6 +616,115 @@ impl HostedCoordinator {
             )
             .await
     }
+
+    async fn admit_maintenance(
+        &self,
+        payload_bytes: usize,
+        cancel: &Cancel,
+    ) -> Result<Admitted, CoreError> {
+        self.admission
+            .admit(
+                &self.repo,
+                AdmissionRequest {
+                    class: RequestClass::Maintenance,
+                    resources: WorkResources::Storage,
+                    payload_bytes,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+                cancel,
+            )
+            .await
+    }
+}
+
+/// Rows examined and rows deleted per sweepable table by one
+/// [`HostedCoordinator::retention_sweep`] pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    /// Receipt rows scanned in this pass.
+    pub receipts_examined: usize,
+    /// Expired receipt rows deleted through the lane in this pass.
+    pub receipts_deleted: usize,
+    /// Session rows scanned in this pass.
+    pub sessions_examined: usize,
+    /// Expired session rows deleted through the lane in this pass.
+    pub sessions_deleted: usize,
+}
+
+impl RetentionReport {
+    /// True when the pass deleted nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.receipts_deleted == 0 && self.sessions_deleted == 0
+    }
+}
+
+impl HostedCoordinator {
+    /// Sweeps one bounded expiry page per sweepable table through the lane.
+    ///
+    /// Loads the persisted `head.sweep` cursors from the `OpHead` singleton
+    /// (the same `decode_head` load path `read_oplog` uses; no second cursor
+    /// store exists), evaluates `sweep_page` for receipts then sessions under
+    /// the coordinator's conservative [`RetentionClock`], and publishes the
+    /// exact-CAS deletions plus the merged next cursors as one
+    /// `InternalPayload::Sweep` candidate admitted under
+    /// [`RequestClass::Maintenance`]. The lane commit installs the cursors
+    /// into `head.sweep` under sole publication ownership and adjusts the
+    /// retention ledger through `apply_facts`.
+    ///
+    /// Idle passes (no deletions and cursors unchanged) skip lane publication
+    /// entirely so the head row is not rewritten every interval.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ECancelled`] when `cancel` or shutdown fired.
+    /// - [`ErrorCode::EIo`] on clock sampling or pruning-time overflow.
+    /// - [`ErrorCode::ECorrupt`] on malformed rows or ledger contradiction.
+    /// - [`ErrorCode::ELimit`] when admission sheds the sweep or the first
+    ///   row exceeds the sweep page byte budget.
+    pub async fn retention_sweep(&self, cancel: &Cancel) -> Result<RetentionReport, CoreError> {
+        cancel.check()?;
+        self.shutdown.check()?;
+        let current = self.clock.sample()?;
+        let now = self.retention_clock.now(&current)?;
+        let loaded = match self.store.fact(FactTable::OpHead, OP_HEAD_KEY)? {
+            Some(bytes) => decode_head(&self.store, &bytes)?,
+            None => CoordinatorHead::default(),
+        };
+        let receipts_page = sweep_page(&self.store, SweepTable::Receipts, loaded.sweep, now)?;
+        let sessions_page = sweep_page(
+            &self.store,
+            SweepTable::Sessions,
+            receipts_page.cursors,
+            now,
+        )?;
+        let report = RetentionReport {
+            receipts_examined: receipts_page.examined_rows,
+            receipts_deleted: receipts_page.deletions.len(),
+            sessions_examined: sessions_page.examined_rows,
+            sessions_deleted: sessions_page.deletions.len(),
+        };
+        if report.is_empty() && sessions_page.cursors == loaded.sweep {
+            return Ok(report);
+        }
+        let mut facts = receipts_page.deletions;
+        facts.extend(sessions_page.deletions);
+        let mut payload_bytes: usize = 0;
+        for fact in &facts {
+            payload_bytes = payload_bytes.saturating_add(fact.key.len());
+            payload_bytes = payload_bytes.saturating_add(fact.value.as_ref().map_or(0, Vec::len));
+        }
+        let admitted = self.admit_maintenance(payload_bytes, cancel).await?;
+        let candidate = InternalCandidate::new(
+            InternalPayload::Sweep {
+                cursors: sessions_page.cursors,
+            },
+            facts,
+            cancel.clone(),
+            Some(admitted),
+        )?;
+        self.lane.submit_internal(candidate).await?;
+        Ok(report)
+    }
 }
 
 /// Reads the operation log newest-first from the coordinator head.
@@ -666,6 +782,8 @@ mod tests {
 
     use super::*;
     use crate::change::RequestId;
+    use crate::commit::ProvenanceClaims;
+    use crate::coord::rows::{Retained, SweepCursors, Usage, encode};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{
@@ -673,6 +791,7 @@ mod tests {
     };
     use crate::refdata::{RefExpect, RefName};
     use crate::store::PreparationBudget;
+    use crate::store::types::FactExpectation;
 
     static SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -793,6 +912,116 @@ mod tests {
             .expect_err("claim.list names its missing implementation");
         assert_eq!(err.code, ErrorCode::EHosted);
         assert!(err.message.contains("no read implementation"));
+
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_deletes_expired_session_through_the_lane() {
+        let (_temp, coord, _) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+
+        // Fabricate one ReceiptsOnly session row already past its horizon.
+        // The fixed id sorts after the stale cursor below, so the sweep page
+        // must examine it rather than skip past it.
+        let session = SessionId::from_bytes([0xAA; 16]);
+        let past = Timestamp::new(
+            jiff::Timestamp::now()
+                .checked_sub(jiff::SignedDuration::from_hours(1))
+                .expect("past horizon"),
+        );
+        let row = SessionRow {
+            principal: Principal::from_peer_uid(1000),
+            identity: None,
+            claims: ProvenanceClaims::default(),
+            capabilities: Capabilities::default(),
+            secret_hash: [0x55; 32],
+            authority: SessionAuthority::ReceiptsOnly {
+                receipts_until: past,
+            },
+        };
+        let key = session_key(session);
+        let encoded = encode("session row", &row).expect("encode session");
+        // The direct store seeding below bypasses the lane, so the seeded
+        // head must carry the matching ledger: one session row of
+        // `key.len() + encoded.len()` stored bytes. Otherwise the lane's
+        // `apply_facts` would report the sweep deletion as ledger underflow.
+        // 16-byte key plus one small row: far below u64 range on any target.
+        let stored_bytes =
+            u64::try_from(key.len() + encoded.len()).expect("session row size fits u64");
+        let seeded = CoordinatorHead {
+            last_op: None,
+            retained: Retained {
+                receipts: Usage::default(),
+                sessions: Usage {
+                    rows: 1,
+                    stored_bytes,
+                },
+                ops: Usage::default(),
+            },
+            sweep: SweepCursors {
+                receipts: None,
+                sessions: Some([0x00; 16]),
+            },
+        };
+        let encoded_head = encode("coordinator head", &seeded).expect("encode head");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[
+                    FactMutation {
+                        table: FactTable::Sessions,
+                        key: key.to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(encoded.clone()),
+                    },
+                    FactMutation {
+                        table: FactTable::OpHead,
+                        key: OP_HEAD_KEY.to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(encoded_head),
+                    },
+                ],
+            )
+            .expect("seed expired session and ledger");
+
+        let report = coord
+            .retention_sweep(&cancel)
+            .await
+            .expect("sweep publishes through the lane");
+        assert_eq!(report.receipts_examined, 0);
+        assert_eq!(report.receipts_deleted, 0);
+        assert_eq!(report.sessions_examined, 1);
+        assert_eq!(report.sessions_deleted, 1);
+
+        assert!(
+            coord
+                .store()
+                .fact(FactTable::Sessions, &key)
+                .expect("read session")
+                .is_none(),
+            "expired session row must delete through the lane, not a direct publish"
+        );
+        let head_bytes = coord
+            .store()
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("read head")
+            .expect("head row");
+        let head = decode_head(coord.store(), &head_bytes).expect("decode head");
+        assert_eq!(
+            head.sweep.sessions, None,
+            "stale cursor must persist as drained through the lane"
+        );
+        assert_eq!(
+            head.retained.sessions,
+            Usage::default(),
+            "ledger must return to empty after the sweep deletion"
+        );
 
         coord.shutdown();
         let _ = runner.abort();

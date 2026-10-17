@@ -52,6 +52,9 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 /// Default per-frame deadline in milliseconds.
 pub const DEFAULT_FRAME_TIMEOUT_MS: u64 = 60_000;
 
+/// Default interval between periodic retention sweeps in milliseconds.
+pub const DEFAULT_RETENTION_INTERVAL_MS: u64 = 60_000;
+
 /// Configuration of one `ruk forgejo serve` process.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -71,6 +74,9 @@ pub struct DaemonConfig {
     frame_timeout: Duration,
     /// Starting credit window of each stream direction.
     stream_window_bytes: u64,
+    /// Interval between periodic retention sweeps of every opened
+    /// coordinator; zero disables them.
+    retention_interval: Duration,
 }
 
 impl DaemonConfig {
@@ -85,6 +91,7 @@ impl DaemonConfig {
             handshake_timeout: Duration::from_millis(DEFAULT_HANDSHAKE_TIMEOUT_MS),
             frame_timeout: Duration::from_millis(DEFAULT_FRAME_TIMEOUT_MS),
             stream_window_bytes: ipc::INITIAL_STREAM_WINDOW_BYTES,
+            retention_interval: Duration::from_millis(DEFAULT_RETENTION_INTERVAL_MS),
         }
     }
 
@@ -130,6 +137,14 @@ impl DaemonConfig {
         self
     }
 
+    /// Sets the interval between periodic retention sweeps of every opened
+    /// coordinator. Zero disables them.
+    #[must_use]
+    pub fn with_retention_interval(mut self, interval: Duration) -> Self {
+        self.retention_interval = interval;
+        self
+    }
+
     /// Returns the socket path.
     #[must_use]
     pub fn socket_path(&self) -> &std::path::Path {
@@ -142,11 +157,18 @@ impl DaemonConfig {
         &self.repo_roots
     }
 
+    /// Returns the interval between periodic retention sweeps; zero disables them.
+    #[must_use]
+    pub fn retention_interval(&self) -> Duration {
+        self.retention_interval
+    }
+
     /// Loads a TOML daemon configuration document.
     ///
     /// Keys: `socket_path`, `repo_roots` (required), `allowed_uids`,
     /// `max_connections`, `blocking_pool_size`, `handshake_timeout_ms`,
-    /// `frame_timeout_ms`, `stream_window_bytes` (optional).
+    /// `frame_timeout_ms`, `stream_window_bytes`, `retention_interval_ms`
+    /// (optional; zero disables periodic retention sweeps).
     ///
     /// # Errors
     /// `Error::Config` on malformed TOML, missing required keys, or bounds
@@ -163,6 +185,7 @@ impl DaemonConfig {
             handshake_timeout_ms: Option<u64>,
             frame_timeout_ms: Option<u64>,
             stream_window_bytes: Option<u64>,
+            retention_interval_ms: Option<u64>,
         }
         let text = std::str::from_utf8(doc)
             .map_err(|err| Error::Config(format!("config is not UTF-8: {err}")))?;
@@ -184,6 +207,9 @@ impl DaemonConfig {
         }
         if let Some(v) = doc.stream_window_bytes {
             cfg = cfg.with_stream_window_bytes(v);
+        }
+        if let Some(v) = doc.retention_interval_ms {
+            cfg = cfg.with_retention_interval(Duration::from_millis(v));
         }
         cfg.validate()?;
         Ok(cfg)
@@ -630,6 +656,7 @@ pub fn serve(config: DaemonConfig) -> Result<(), Error> {
     #[cfg(unix)]
     {
         let registry = Arc::new(Registry::new(config.repo_roots.clone())?);
+        registry.set_retention_interval(config.retention_interval);
         let executor = BoundedExecutor::new(config.blocking_pool_size)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)

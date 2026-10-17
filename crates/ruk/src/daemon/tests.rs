@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
 use super::{
-    BoundedExecutor, CommandAccepted, CommandExitReport, ConnectionRefs, ControlReply, ErrorReport,
-    ExitReport, InvocationAccepted, InvocationOpen, OutcomeLedger, Registry, SessionOpened,
-    serve_connection,
+    BoundedExecutor, CommandAccepted, CommandExitReport, ConnectionRefs, ControlReply,
+    DEFAULT_RETENTION_INTERVAL_MS, DaemonConfig, ErrorReport, ExitReport, InvocationAccepted,
+    InvocationOpen, OutcomeLedger, Registry, SessionOpened, serve_connection,
 };
 use ruk_core::change::{RequestId, SessionId};
 use ruk_core::heads::Head;
@@ -299,6 +299,28 @@ fn spawn_pair(root: &PathBuf) -> (Driver, tokio::task::JoinHandle<Result<(), sup
     let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
     let task = tokio::spawn(async move { serve_connection(server, refs).await });
     (Driver { conn: client }, task)
+}
+
+#[test]
+fn retention_interval_defaults_to_sixty_seconds_and_parses() {
+    let cfg = DaemonConfig::new(
+        PathBuf::from("/tmp/ruk-retention.sock"),
+        vec![PathBuf::from("/tmp")],
+    );
+    assert_eq!(
+        cfg.retention_interval(),
+        Duration::from_millis(DEFAULT_RETENTION_INTERVAL_MS)
+    );
+    assert_eq!(cfg.retention_interval(), Duration::from_secs(60));
+
+    let doc = b"socket_path = \"/tmp/ruk-retention.sock\"\nrepo_roots = [\"/tmp\"]\nretention_interval_ms = 5000\n";
+    let parsed = DaemonConfig::from_toml(doc).expect("retention interval parses");
+    assert_eq!(parsed.retention_interval(), Duration::from_millis(5_000));
+
+    let disabled =
+        b"socket_path = \"/tmp/ruk-retention.sock\"\nrepo_roots = [\"/tmp\"]\nretention_interval_ms = 0\n";
+    let parsed = DaemonConfig::from_toml(disabled).expect("zero disables sweeps");
+    assert!(parsed.retention_interval().is_zero());
 }
 
 #[test]
@@ -708,3 +730,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
     drop(driver);
     task.abort();
 }
+
+/// The ops-backed `new` mutation travels the typed path but stays refused:
+/// its protocol args carry no tree object and no timestamped signature, so
+/// no `ops::NewRequest` can be built without inventing the commit.

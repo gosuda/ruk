@@ -5,7 +5,8 @@
 //! a canonical repository path beneath those roots, then hands out the one
 //! hosted coordinator of that repository. Coordinators open lazily on first
 //! open: the store opens on the canonical path, the publication lane runner
-//! spawns once on the daemon runtime bound through `set_runtime`, and idle
+//! spawns once on the daemon runtime bound through `set_runtime`, one periodic
+//! retention task spawns alongside it unless the interval is zero, and idle
 //! eviction or registry drop retires the coordinator through `shutdown`.
 //! Eviction skips entries with invocations still in flight, so retiring
 //! never cancels a live submission.
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ruk_core::coord::{HostedCoordinator, Principal};
+use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::store::{PreparationBudget, Store};
 
@@ -48,6 +49,8 @@ pub struct Registry {
     next_handle: AtomicU64,
     /// The daemon runtime hosting every lane runner; bound before serving.
     runtime: Mutex<Option<tokio::runtime::Handle>>,
+    /// Milliseconds between per-coordinator retention sweeps; zero disables them.
+    retention_interval_ms: AtomicU64,
 }
 
 impl fmt::Debug for Registry {
@@ -97,6 +100,7 @@ impl Registry {
             }),
             next_handle: AtomicU64::new(1),
             runtime: Mutex::new(None),
+            retention_interval_ms: AtomicU64::new(super::DEFAULT_RETENTION_INTERVAL_MS),
         })
     }
 
@@ -114,6 +118,19 @@ impl Registry {
     #[must_use]
     pub fn roots(&self) -> Vec<PathBuf> {
         self.roots.clone()
+    }
+
+    /// Sets the interval between per-coordinator retention sweeps.
+    ///
+    /// `serve` calls this once from the daemon configuration before serving;
+    /// each coordinator opened afterwards sweeps on this period. Zero disables
+    /// the per-coordinator tasks. The atomic read in `coordinator_for` keeps
+    /// opens lock-free with respect to this setting.
+    pub fn set_retention_interval(&self, interval: Duration) {
+        self.retention_interval_ms.store(
+            u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Resolves `requested` to a canonical path beneath a configured root.
@@ -219,9 +236,15 @@ impl Registry {
             canonical.to_path_buf(),
         )?);
         let _ = coordinator.spawn_on(&runtime)?;
+        spawn_retention(&runtime, &coordinator, self.retention_interval_ms());
         entry.coordinator = Some(Arc::clone(&coordinator));
         entry.last_used = Instant::now();
         Ok(coordinator)
+    }
+
+    /// Reads the retention sweep period in milliseconds.
+    fn retention_interval_ms(&self) -> u64 {
+        self.retention_interval_ms.load(Ordering::Relaxed)
     }
 
     /// Reads the owner principal of one canonical repository path.
@@ -382,6 +405,43 @@ impl Registry {
     }
 }
 
+/// Spawns one periodic retention task for a freshly opened coordinator.
+///
+/// One task per coordinator means a slow repository stalls only its own
+/// sweeps, never another repository's. The task holds only a [`Weak`]
+/// handle: idle eviction drops the registry's `Arc`, in-flight invocations
+/// drain, and the next tick finds the upgrade failed and exits — so sweeps
+/// never pin a retired coordinator alive. The daemon runtime owns the task
+/// itself, matching the spawned-connection pattern: leaving `serve_async`
+/// drops the runtime and ends every sweep with it. Per-tick failures are
+/// reported to stderr and never end the task.
+fn spawn_retention(
+    runtime: &tokio::runtime::Handle,
+    coordinator: &Arc<HostedCoordinator>,
+    interval_ms: u64,
+) {
+    use std::sync::Weak;
+    if interval_ms == 0 {
+        return;
+    }
+    let weak: Weak<HostedCoordinator> = Arc::downgrade(coordinator);
+    let interval = Duration::from_millis(interval_ms);
+    runtime.spawn(async move {
+        let (_cancel_guard, cancel) = cancellation();
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let Some(coordinator) = weak.upgrade() else {
+                break;
+            };
+            if let Err(err) = coordinator.retention_sweep(&cancel).await {
+                eprintln!("ruk retention: sweep failed: {err}");
+            }
+        }
+    });
+}
+
 impl Drop for Registry {
     /// Retires every hosted coordinator through `shutdown`.
     fn drop(&mut self) {
@@ -531,6 +591,20 @@ mod tests {
             1
         );
         assert!(registry.is_empty().expect("registry lock holds"));
+    }
+
+    #[test]
+    fn retention_interval_defaults_and_disables() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        assert_eq!(
+            registry.retention_interval_ms(),
+            super::super::DEFAULT_RETENTION_INTERVAL_MS
+        );
+        registry.set_retention_interval(Duration::from_millis(250));
+        assert_eq!(registry.retention_interval_ms(), 250);
+        registry.set_retention_interval(Duration::ZERO);
+        assert_eq!(registry.retention_interval_ms(), 0);
     }
 
     #[test]
