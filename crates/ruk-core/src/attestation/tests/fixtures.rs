@@ -18,11 +18,11 @@ use ssh_key::private::Ed25519Keypair;
 use ssh_key::{HashAlg, LineEnding, PrivateKey};
 
 use crate::attestation::{ATTEST_NAMESPACE, PreparedAttestations, Progress, verify_statement};
+use crate::capability::{AttestKind, AttestResult};
 use crate::error::CoreError;
 use crate::ids::{HashKind, Oid};
 use crate::protocol::{
-    AttestAddArgs, AttestKind, AttestResult, AttestSignature, AttestStatement, StatementDigest,
-    Timestamp,
+    AttestAddArgs, AttestSignature, AttestStatement, StatementDigest, Timestamp,
 };
 use crate::store::{ObjectKind, PreparationBudget, Store};
 

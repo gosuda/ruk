@@ -17,6 +17,7 @@
 /// attestation text field are limited by it and by nothing narrower.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+pub mod attestation;
 mod budget;
 pub mod bytes;
 pub mod capability;

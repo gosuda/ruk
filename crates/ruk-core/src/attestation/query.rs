@@ -9,11 +9,11 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+use crate::capability::{AttestKind, AttestResult};
 use crate::error::{CoreError, ErrorCode};
 use crate::ids::Oid;
 use crate::protocol::{
-    AttestKind, AttestRequirement, AttestResult, AttestationRecord, AttestationStatus, PageLimit,
-    SignerFingerprint,
+    AttestRequirement, AttestationRecord, AttestationStatus, PageLimit, SignerFingerprint,
 };
 use crate::store::{FactRow, Store};
 
