@@ -321,6 +321,22 @@ impl SessionLive {
         self.current_authority(times) == Authority::Active
     }
 
+    /// Authorizes a read against the session's negotiated capabilities.
+    ///
+    /// Ordinary object reads always succeed; another session's private
+    /// provenance or claim details need the matching `read_intents` flag.
+    /// Claim list and provenance handlers check this before serving.
+    ///
+    /// # Errors
+    /// `E_FORBIDDEN` for private provenance or claim details without the
+    /// matching `read_intents` flag.
+    pub(crate) fn authorize_read(
+        &self,
+        access: crate::capability::ReadAccess,
+    ) -> Result<(), CoreError> {
+        self.row().capabilities.authorize_read(access)
+    }
+
     fn start_in_flight_with_table(
         self: &Arc<Self>,
         table: &Weak<SessionTableInner>,
@@ -435,6 +451,22 @@ impl BoundSession {
     #[must_use]
     pub(crate) fn current_authority(&self, times: &Times) -> Authority {
         self.session.current_authority(times)
+    }
+
+    /// Authorizes a read against the bound session's negotiated capabilities.
+    ///
+    /// Ordinary object reads always succeed; another session's private
+    /// provenance or claim details need the matching `read_intents` flag.
+    /// Claim list and provenance handlers check this before serving.
+    ///
+    /// # Errors
+    /// `E_FORBIDDEN` for private provenance or claim details without the
+    /// matching `read_intents` flag.
+    pub(crate) fn authorize_read(
+        &self,
+        access: crate::capability::ReadAccess,
+    ) -> Result<(), CoreError> {
+        self.session.authorize_read(access)
     }
 
     /// Begins in-flight work on this session, returning an RAII guard that keeps

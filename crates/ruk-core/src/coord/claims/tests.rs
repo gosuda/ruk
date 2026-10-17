@@ -3,9 +3,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::capability::{Capabilities, ReadIntents};
+use crate::coord::leases::{AcquireArgs, CursorWant, LeaseKind, LeaseRegistry};
 use crate::ids::HashKind;
 use crate::protocol::ClaimTtl;
+use crate::protocol::{
+    ClaimHolderFilter, ClaimListArgs, EditAction, Mutation, PageCursor, QueryDigest, Request,
+    WriteArgs, WriteEdit,
+};
 use crate::store::PreparationBudget;
+use crate::{ByteString, OperationId, RequestId, StoreId, WorkspaceId};
 
 struct Root(PathBuf);
 
@@ -313,24 +320,59 @@ fn filtered_claim_page_preserves_continuation_to_live_records() {
         .advance_injected(Duration::from_secs(60), None)
         .expect("expire first");
     fixture.acquire(holder(1), claim(2), &["new"], ClaimMode::Enforce);
-    let first = list_page(
-        &fixture.store,
-        &fixture.claims,
-        ClaimListing::Mine(holder(1)),
-        None,
-        FactPageBudget::new(1, 4096),
-    )
-    .expect("first page");
+    let scratch =
+        std::env::temp_dir().join(format!("ruk-claim-lease-filtered-{}", ClaimId::generate()));
+    let leases = LeaseRegistry::new(fixture.clock.clone(), scratch.clone());
+    let start = fixture.clock.sample().expect("sample").mono;
+    let store_id = StoreId::from_bytes([1; 16]);
+    let view = OperationId(7);
+    let query = QueryDigest::from_bytes([3; 32]);
+    let (lease, _cancel, _guard) = leases
+        .acquire(
+            AcquireArgs {
+                kind: LeaseKind::Interactive,
+                store: store_id,
+                session: holder(1),
+                view,
+                query,
+                roots: Vec::new(),
+                op_floor: None,
+                position_bytes: 64,
+                view_retained: true,
+            },
+            start,
+        )
+        .expect("acquire");
+    let cursor = PageCursor {
+        store: store_id,
+        view,
+        query,
+        lease,
+        position: ByteString::from(Vec::new()),
+    };
+    let want = CursorWant {
+        store: store_id,
+        session: holder(1),
+        view,
+        query,
+    };
+    let page = |cursor: &PageCursor, listing: ClaimListing, now: Instant| {
+        list_page(LeasedClaimPage {
+            store: &fixture.store,
+            clock: &fixture.claims,
+            leases: &leases,
+            listing,
+            cursor,
+            want: &want,
+            now,
+            budget: FactPageBudget::new(1, 4096),
+        })
+    };
+    let (first, _) = page(&cursor, ClaimListing::Mine(holder(1)), start).expect("first page");
     assert!(first.records.is_empty());
-    let next = first.next.expect("filtered row must not end the listing");
-    let second = list_page(
-        &fixture.store,
-        &fixture.claims,
-        ClaimListing::Mine(holder(1)),
-        Some(&next),
-        FactPageBudget::new(1, 4096),
-    )
-    .expect("second page");
+    let resume =
+        next_claim_cursor(&cursor, first.next).expect("filtered row must not end the listing");
+    let (second, _) = page(&resume, ClaimListing::Mine(holder(1)), start).expect("second page");
     assert_eq!(
         second
             .records
@@ -339,16 +381,8 @@ fn filtered_claim_page_preserves_continuation_to_live_records() {
             .collect::<Vec<_>>(),
         vec![claim(2)]
     );
-    assert!(
-        list_page(
-            &fixture.store,
-            &fixture.claims,
-            ClaimListing::Mine(holder(2)),
-            Some(&next),
-            FactPageBudget::new(1, 4096)
-        )
-        .is_err()
-    );
+    assert!(page(&resume, ClaimListing::Mine(holder(2)), start).is_err());
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
@@ -430,4 +464,297 @@ fn stale_expired_cleanup_cannot_remove_a_replaced_record() {
         )),
         ErrorCode::EClaimed
     );
+}
+
+fn list_args(filter: ClaimHolderFilter) -> ClaimListArgs {
+    ClaimListArgs {
+        holder: filter,
+        page: crate::protocol::PageRequest::default(),
+    }
+}
+
+fn grant_claims() -> Capabilities {
+    Capabilities {
+        read_intents: ReadIntents {
+            claims: true,
+            ..ReadIntents::default()
+        },
+        ..Capabilities::default()
+    }
+}
+
+fn grant_provenance() -> Capabilities {
+    Capabilities {
+        read_intents: ReadIntents {
+            provenance: true,
+            ..ReadIntents::default()
+        },
+        ..Capabilities::default()
+    }
+}
+
+fn write_request(paths: &[&str]) -> Request {
+    Request::Write(Box::new(Mutation {
+        request_id: RequestId::generate(),
+        args: WriteArgs {
+            binding: crate::protocol::WorkspaceBinding {
+                workspace: WorkspaceId::generate(),
+                expected: crate::workspace::WorkspaceStamp::INITIAL,
+            },
+            edits: paths
+                .iter()
+                .map(|text| WriteEdit {
+                    path: path(text),
+                    action: EditAction::Delete,
+                })
+                .collect(),
+        },
+    }))
+}
+
+#[test]
+fn claim_list_authorization_denies_and_grants() {
+    let viewer = holder(1);
+    let bare = Capabilities::default();
+    assert_eq!(
+        authorize_claim_list_args(&bare, viewer, &list_args(ClaimHolderFilter::Any))
+            .err()
+            .expect("any without intent")
+            .code,
+        ErrorCode::EForbidden
+    );
+    match authorize_claim_list_args(&bare, viewer, &list_args(ClaimHolderFilter::Mine))
+        .expect("own listing")
+    {
+        ClaimListing::Mine(seen) => assert_eq!(seen, viewer),
+        ClaimListing::AllAuthorized => panic!("mine resolved to all"),
+    }
+    match authorize_claim_list_args(&grant_claims(), viewer, &list_args(ClaimHolderFilter::Any))
+        .expect("granted listing")
+    {
+        ClaimListing::AllAuthorized => (),
+        ClaimListing::Mine(_) => panic!("any resolved to mine"),
+    }
+    assert_eq!(
+        authorize_claim_listing(&bare, viewer, &ClaimListing::Mine(holder(2)))
+            .err()
+            .expect("another holder without intent")
+            .code,
+        ErrorCode::EForbidden
+    );
+}
+
+#[test]
+fn provenance_read_authorization_denies_and_grants() {
+    let viewer = holder(1);
+    let bare = Capabilities::default();
+    authorize_provenance_read(&bare, viewer, viewer).expect("own provenance");
+    assert_eq!(
+        authorize_provenance_read(&bare, viewer, holder(2))
+            .err()
+            .expect("other without intent")
+            .code,
+        ErrorCode::EForbidden
+    );
+    authorize_provenance_read(&grant_provenance(), viewer, holder(2)).expect("granted provenance");
+}
+
+#[test]
+fn seal_envelope_settles_on_publish_and_aborts_on_drop() {
+    let fixture = Fixture::new();
+    let guard = ClaimSealGuard::new(
+        ClaimSealEnvelope::for_acquire(
+            &fixture.store,
+            &fixture.claims,
+            holder(1),
+            claim(1),
+            args(&["src"], ClaimMode::Enforce),
+        )
+        .expect("seal acquire"),
+    );
+    assert!(guard.envelope().is_some());
+    let (facts, _, record) = guard.settle().expect("settle");
+    assert!(record.is_some());
+    fixture
+        .store
+        .publish(Vec::new(), &facts)
+        .expect("publish seal");
+    assert_eq!(
+        write_error(seal_write(
+            &fixture.store,
+            &fixture.claims,
+            holder(2),
+            &[path("src/a")]
+        )),
+        ErrorCode::EClaimed
+    );
+    let aborted = ClaimSealGuard::new(
+        ClaimSealEnvelope::for_acquire(
+            &fixture.store,
+            &fixture.claims,
+            holder(1),
+            claim(9),
+            args(&["aborted"], ClaimMode::Enforce),
+        )
+        .expect("seal aborted"),
+    );
+    aborted.abort();
+    seal_write(
+        &fixture.store,
+        &fixture.claims,
+        holder(2),
+        &[path("aborted/x")],
+    )
+    .expect("aborted seal leaves no claim");
+    let dropped = ClaimSealGuard::new(
+        ClaimSealEnvelope::for_acquire(
+            &fixture.store,
+            &fixture.claims,
+            holder(1),
+            claim(8),
+            args(&["dropped"], ClaimMode::Enforce),
+        )
+        .expect("seal dropped"),
+    );
+    drop(dropped);
+    seal_write(
+        &fixture.store,
+        &fixture.claims,
+        holder(2),
+        &[path("dropped/x")],
+    )
+    .expect("dropped seal leaves no claim");
+    let released =
+        ClaimSealEnvelope::for_release(&fixture.store, &fixture.claims, holder(1), claim(1))
+            .expect("seal release");
+    let (facts, _, _) = released.settle();
+    fixture
+        .store
+        .publish(Vec::new(), &facts)
+        .expect("publish release");
+    seal_write(&fixture.store, &fixture.claims, holder(2), &[path("src/a")])
+        .expect("released write");
+}
+
+#[test]
+fn mutation_seal_covers_declared_write_paths() {
+    let fixture = Fixture::new();
+    fixture.acquire(holder(1), claim(1), &["src"], ClaimMode::Enforce);
+    assert_eq!(
+        ClaimSealEnvelope::mutation_paths(&write_request(&["src/lib.rs"])),
+        vec![path("src/lib.rs")]
+    );
+    assert!(ClaimSealEnvelope::mutation_paths(&write_request(&[])).is_empty());
+    assert_eq!(
+        ClaimSealEnvelope::for_mutation(
+            &fixture.store,
+            &fixture.claims,
+            holder(2),
+            &write_request(&["src/lib.rs"])
+        )
+        .err()
+        .expect("blocked write")
+        .code,
+        ErrorCode::EClaimed
+    );
+    let envelope = ClaimSealEnvelope::for_mutation(
+        &fixture.store,
+        &fixture.claims,
+        holder(2),
+        &write_request(&["docs/a"]),
+    )
+    .expect("free write");
+    let (facts, _, _) = envelope.settle();
+    fixture
+        .store
+        .publish(Vec::new(), &facts)
+        .expect("publish fence");
+}
+
+#[test]
+fn leased_claim_pages_refuse_stale_views() {
+    let fixture = Fixture::new();
+    fixture.acquire(holder(1), claim(1), &["a"], ClaimMode::Enforce);
+    fixture.acquire(holder(1), claim(2), &["b"], ClaimMode::Enforce);
+    let scratch = std::env::temp_dir().join(format!("ruk-claim-lease-{}", ClaimId::generate()));
+    let leases = LeaseRegistry::new(fixture.clock.clone(), scratch.clone());
+    let start = fixture.clock.sample().expect("sample").mono;
+    let store_id = StoreId::from_bytes([1; 16]);
+    let view = OperationId(7);
+    let query = QueryDigest::from_bytes([3; 32]);
+    let (lease, _cancel, _guard) = leases
+        .acquire(
+            AcquireArgs {
+                kind: LeaseKind::Interactive,
+                store: store_id,
+                session: holder(1),
+                view,
+                query,
+                roots: Vec::new(),
+                op_floor: None,
+                position_bytes: 64,
+                view_retained: true,
+            },
+            start,
+        )
+        .expect("acquire");
+    let cursor = PageCursor {
+        store: store_id,
+        view,
+        query,
+        lease,
+        position: ByteString::from(Vec::new()),
+    };
+    let want = CursorWant {
+        store: store_id,
+        session: holder(1),
+        view,
+        query,
+    };
+    let page = |cursor: &PageCursor, want: &CursorWant, now: Instant| {
+        list_page(LeasedClaimPage {
+            store: &fixture.store,
+            clock: &fixture.claims,
+            leases: &leases,
+            listing: listing_for_filter(ClaimHolderFilter::Mine, holder(1)),
+            cursor,
+            want,
+            now,
+            budget: FactPageBudget::new(1, 4096),
+        })
+    };
+    let (first, binding) = page(&cursor, &want, start).expect("first page");
+    assert_eq!(binding.lease, lease);
+    assert_eq!(binding.kind, LeaseKind::Interactive);
+    assert_eq!(first.records.len(), 1);
+    let resume = next_claim_cursor(&cursor, first.next).expect("continuation");
+    assert_eq!(resume.store, store_id);
+    assert_eq!(resume.view, view);
+    assert_eq!(resume.query, query);
+    assert_eq!(resume.lease, lease);
+    let (second, _) = page(&resume, &want, start).expect("second page");
+    assert_eq!(second.records.len(), 1);
+    assert_ne!(first.records, second.records);
+    let stale = CursorWant {
+        store: store_id,
+        session: holder(1),
+        view: OperationId(8),
+        query,
+    };
+    assert_eq!(
+        page(&resume, &stale, start).err().expect("stale view").code,
+        ErrorCode::EForbidden
+    );
+    assert_eq!(
+        page(
+            &resume,
+            &want,
+            start + crate::coord::leases::INTERACTIVE_TTL
+        )
+        .err()
+        .expect("expired lease")
+        .code,
+        ErrorCode::ELeaseLost
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
 }

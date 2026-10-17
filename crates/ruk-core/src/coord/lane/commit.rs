@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 
 use crate::change::{CheckedOperationId, OperationId, RequestId, SessionId};
 use crate::coord::cancel::Cancel;
+use crate::coord::claims;
 use crate::coord::clock::{Clock, Times};
 use crate::coord::lane::batch::BatchItem;
 use crate::coord::lane::candidate::{InternalPayload, MutationCandidate};
@@ -199,10 +200,34 @@ pub(crate) fn commit_batch(
 
     // 3. Pre-validate each candidate individually; fail the one candidate on error without aborting survivors.
     let policy = policy_source.load()?;
+    let claim_clock = claims::ClaimClock::open(store, clock.clone())?;
+    // The claim-clock fence fact is one row per publication; every seal in
+    // the batch emits it, so only the first candidate may carry it.
+    let mut claim_clock_fenced = false;
     let mut active_mutations: Vec<ActiveMutation> = Vec::with_capacity(candidate_mutations.len());
 
     for mut m in candidate_mutations {
-        let validation_res = validate_candidate(store, &policy, &m.candidate, &times);
+        let validation_res =
+            validate_candidate(store, &policy, &m.candidate, &times).and_then(|()| {
+                claims::ClaimSealEnvelope::for_mutation(
+                    store,
+                    &claim_clock,
+                    m.candidate.session.id(),
+                    &m.candidate.request,
+                )
+                .map(|envelope| {
+                    let (facts, _warnings, _record) = envelope.settle();
+                    for fact in facts {
+                        let is_clock =
+                            fact.table == FactTable::Claims && fact.key == claims::CLOCK_KEY;
+                        if is_clock && claim_clock_fenced {
+                            continue;
+                        }
+                        claim_clock_fenced |= is_clock;
+                        m.candidate.facts.push(fact);
+                    }
+                })
+            });
         if let Err(err) = validation_res {
             if let Some(duplicates) =
                 coalesced_duplicates.remove(&(m.candidate.session.id(), m.candidate.request_id))

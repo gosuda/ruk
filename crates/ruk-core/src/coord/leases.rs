@@ -1069,3 +1069,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(scratch_dir("concurrent"));
     }
 }
+
+impl LeaseRegistry {
+    /// Checks a claim-list page cursor against its leased view.
+    ///
+    /// Claim paging entry over [`LeaseRegistry::check_cursor`]: binding
+    /// mismatch is `E_FORBIDDEN`, correct binding on expired authority is
+    /// `E_LEASE_LOST`. The caller lists from the cursor position only after
+    /// this check succeeds, so paged claim lists stay bound to the immutable
+    /// leased view.
+    ///
+    /// # Errors
+    /// `E_FORBIDDEN` when the cursor binding differs from the request;
+    /// `E_LEASE_LOST` when the lease is unknown, retired, or expired.
+    pub(crate) fn check_claim_page_cursor(
+        &self,
+        cursor: &PageCursor,
+        want: &CursorWant,
+        now: Instant,
+    ) -> Result<LeaseBinding, CoreError> {
+        self.check_cursor(cursor, want, now)
+    }
+}

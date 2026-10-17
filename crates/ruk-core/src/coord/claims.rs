@@ -15,7 +15,7 @@ use crate::{CoreError, ErrorCode, MAX_CONTROL_FRAME_BYTES};
 #[cfg(test)]
 mod tests;
 
-const CLOCK_KEY: &[u8] = b"T";
+pub(crate) const CLOCK_KEY: &[u8] = b"T";
 
 #[derive(Serialize, Deserialize)]
 struct ClaimRow {
@@ -391,9 +391,11 @@ fn indexed_claim(
     Ok((raw.len(), row))
 }
 
-/// AllAuthorized is valid only after current read_intents.claims authorization.
-/// The caller binds the returned position to an immutable leased view.
-pub(crate) fn list_page(
+/// Pages raw claim records without lease binding.
+///
+/// Only [`list_page`] calls this, after verifying the presented cursor
+/// against its leased view.
+fn list_page_raw(
     store: &Store,
     clock: &ClaimClock,
     listing: ClaimListing,
@@ -693,4 +695,412 @@ fn limit() -> CoreError {
 fn corrupt(store: &Store, detail: &str) -> CoreError {
     let _ = store.observe::<()>(Err(StoreError::Corrupt(detail.to_owned())));
     CoreError::new(ErrorCode::ECorrupt, detail)
+}
+
+/// How one lane operation seals against concurrent claim changes.
+///
+/// Named operations replace a boolean flag: each variant selects the seal
+/// function the lane runs before mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimSealKind {
+    /// Checks paths and fences the claim clock without creating a record.
+    Write,
+    /// Creates a claim record.
+    Acquire,
+    /// Removes a claim record.
+    Release,
+}
+
+/// One seal envelope per lane mutation.
+///
+/// The lane builds the envelope before mutation with
+/// [`ClaimSealEnvelope::for_mutation`], publishes the envelope facts
+/// atomically with the operation on settle, and drops them on abort.
+/// Path-carrying operations cover their declared paths; operations without
+/// declared paths seal the claim clock only until the lane threads
+/// change-ID-scoped keys through.
+#[derive(Debug)]
+pub(crate) struct ClaimSealEnvelope {
+    /// Which seal function produced this envelope.
+    pub(crate) kind: ClaimSealKind,
+    /// Facts the lane publishes with the operation on settle.
+    pub(crate) facts: Vec<FactMutation>,
+    /// Advisory warnings for the operation reply.
+    pub(crate) warnings: BoundedList<Warning>,
+    /// The acquired or released record, when the envelope changed a claim.
+    pub(crate) record: Option<ClaimRecord>,
+}
+
+impl ClaimSealEnvelope {
+    /// Seals a write of `paths` for `holder`.
+    ///
+    /// Non-empty sets pass through `canonical_paths`; the empty set seals the
+    /// claim clock only.
+    ///
+    /// # Errors
+    /// `E_CLAIMED` on an enforced overlap, `E_CORRUPT` on a damaged index,
+    /// `E_INVALID` on an uncanonical path set, `E_LIMIT` past the work budget.
+    pub(crate) fn for_write(
+        store: &Store,
+        clock: &ClaimClock,
+        holder: SessionId,
+        paths: &[RepoPath],
+    ) -> Result<Self, CoreError> {
+        let canonical;
+        let sealed: &[RepoPath] = if paths.is_empty() {
+            paths
+        } else {
+            canonical = canonical_paths(paths.to_vec())?;
+            canonical.as_slice()
+        };
+        let check = seal_write(store, clock, holder, sealed)?;
+        Ok(Self {
+            kind: ClaimSealKind::Write,
+            facts: check.facts,
+            warnings: check.warnings,
+            record: None,
+        })
+    }
+
+    /// Seals a claim acquisition of `claim` for `holder`.
+    ///
+    /// # Errors
+    /// `E_CLAIMED` on an enforced overlap, `E_STALE` when the claim identity
+    /// or an index already exists, `E_INVALID` on bad identities, paths, or
+    /// lifetimes, `E_LIMIT` past the work budget.
+    pub(crate) fn for_acquire(
+        store: &Store,
+        clock: &ClaimClock,
+        holder: SessionId,
+        claim: ClaimId,
+        args: ClaimAcquireArgs,
+    ) -> Result<Self, CoreError> {
+        let change = seal_acquire(store, clock, holder, claim, args)?;
+        Ok(Self {
+            kind: ClaimSealKind::Acquire,
+            facts: change.facts,
+            warnings: change.warnings,
+            record: Some(change.record),
+        })
+    }
+
+    /// Seals a claim release of `claim` for `holder`.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for an unknown claim, `E_FORBIDDEN` for another
+    /// holder's claim, `E_CORRUPT` on a damaged record.
+    pub(crate) fn for_release(
+        store: &Store,
+        clock: &ClaimClock,
+        holder: SessionId,
+        claim: ClaimId,
+    ) -> Result<Self, CoreError> {
+        let change = seal_release(store, clock, holder, claim)?;
+        Ok(Self {
+            kind: ClaimSealKind::Release,
+            facts: change.facts,
+            warnings: change.warnings,
+            record: Some(change.record),
+        })
+    }
+
+    /// Declares the path set one request seals.
+    ///
+    /// Write operations name their edit paths, resolve names its path,
+    /// recovery names its discarded paths; every other operation declares no
+    /// paths and seals the claim clock only.
+    #[must_use]
+    pub(crate) fn mutation_paths(request: &crate::protocol::Request) -> Vec<RepoPath> {
+        match request {
+            crate::protocol::Request::Write(inner) => inner
+                .args
+                .edits
+                .iter()
+                .map(|edit| edit.path.clone())
+                .collect(),
+            crate::protocol::Request::Resolve(inner) => vec![inner.args.path.clone()],
+            crate::protocol::Request::WsRecover(inner) => match &inner.args.action {
+                crate::protocol::RecoverAction::Resume => Vec::new(),
+                crate::protocol::RecoverAction::Abort => Vec::new(),
+                crate::protocol::RecoverAction::Discard { paths } => paths.clone(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Seals one lane mutation for `holder`.
+    ///
+    /// Claim acquire operations seal a fresh record, claim release operations
+    /// seal the named record's removal, and every other operation seals its
+    /// declared paths. The lane publishes the envelope facts with the
+    /// operation on settle and drops them on abort; see [`ClaimSealGuard`].
+    ///
+    /// # Errors
+    /// Forwards `E_CLAIMED`, `E_CORRUPT`, `E_INVALID`, `E_LIMIT`,
+    /// `E_NOT_FOUND`, `E_FORBIDDEN`, and `E_STALE` from the underlying seal.
+    pub(crate) fn for_mutation(
+        store: &Store,
+        clock: &ClaimClock,
+        holder: SessionId,
+        request: &crate::protocol::Request,
+    ) -> Result<Self, CoreError> {
+        match request {
+            crate::protocol::Request::ClaimAcquire(inner) => Self::for_acquire(
+                store,
+                clock,
+                holder,
+                ClaimId::generate(),
+                inner.args.clone(),
+            ),
+            crate::protocol::Request::ClaimRelease(inner) => {
+                Self::for_release(store, clock, holder, inner.args.claim)
+            }
+            _ => {
+                let paths = Self::mutation_paths(request);
+                Self::for_write(store, clock, holder, &paths)
+            }
+        }
+    }
+
+    /// Settles the envelope into lane publication parts.
+    ///
+    /// The lane publishes the facts atomically with the operation and reports
+    /// the warnings and the changed record on the reply.
+    #[must_use]
+    pub(crate) fn settle(self) -> (Vec<FactMutation>, BoundedList<Warning>, Option<ClaimRecord>) {
+        let Self {
+            facts,
+            warnings,
+            record,
+            kind: _,
+        } = self;
+        (facts, warnings, record)
+    }
+
+    /// Aborts the envelope without publication.
+    ///
+    /// Dropping the envelope aborts the same way; this spelling names the
+    /// abort at the lane failure site.
+    pub(crate) fn abort(self) {}
+}
+
+/// RAII seal guard releasing on settle and on abort.
+///
+/// The lane holds the guard across mutation: [`ClaimSealGuard::settle`]
+/// publishes on success, while [`ClaimSealGuard::abort`] and [`Drop`] discard
+/// on failure, so a seal never survives its operation either way.
+#[derive(Debug)]
+pub(crate) struct ClaimSealGuard {
+    /// The held envelope until settle or abort.
+    envelope: Option<ClaimSealEnvelope>,
+}
+
+impl ClaimSealGuard {
+    /// Holds `envelope` until settle or abort.
+    #[must_use]
+    pub(crate) fn new(envelope: ClaimSealEnvelope) -> Self {
+        Self {
+            envelope: Some(envelope),
+        }
+    }
+
+    /// Settles the held envelope into lane publication parts.
+    ///
+    /// # Errors
+    /// `E_INVALID` when the guard no longer holds its envelope; construction
+    /// plus the consuming signatures make that unreachable in the lane.
+    pub(crate) fn settle(
+        mut self,
+    ) -> Result<(Vec<FactMutation>, BoundedList<Warning>, Option<ClaimRecord>), CoreError> {
+        match self.envelope.take() {
+            Some(envelope) => Ok(envelope.settle()),
+            None => Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "claim seal guard no longer holds its envelope",
+            )),
+        }
+    }
+
+    /// Aborts the held envelope without publication.
+    ///
+    /// Dropping the guard aborts the same way; this spelling names the abort
+    /// at the lane failure site.
+    pub(crate) fn abort(mut self) {
+        let _ = self.envelope.take();
+    }
+
+    /// Borrows the held envelope, when still held.
+    #[must_use]
+    pub(crate) fn envelope(&self) -> Option<&ClaimSealEnvelope> {
+        self.envelope.as_ref()
+    }
+}
+
+impl Drop for ClaimSealGuard {
+    fn drop(&mut self) {
+        let _ = self.envelope.take();
+    }
+}
+
+/// Maps a wire holder filter to the internal listing for `viewer`.
+///
+/// `Mine` lists the viewer's own claims; `Any` lists every session's claims
+/// and needs `read_intents.claims` at authorization.
+#[must_use]
+pub(crate) fn listing_for_filter(
+    filter: crate::protocol::ClaimHolderFilter,
+    viewer: SessionId,
+) -> ClaimListing {
+    match filter {
+        crate::protocol::ClaimHolderFilter::Mine => ClaimListing::Mine(viewer),
+        crate::protocol::ClaimHolderFilter::Any => ClaimListing::AllAuthorized,
+    }
+}
+
+/// Authorizes a claim listing against the viewer's negotiated capabilities.
+///
+/// A session always reads its own claims; reading another holder's claims or
+/// the whole table needs `read_intents.claims`.
+///
+/// # Errors
+/// `E_FORBIDDEN` for another session's claims without `read_intents.claims`.
+pub(crate) fn authorize_claim_listing(
+    caps: &crate::capability::Capabilities,
+    viewer: SessionId,
+    listing: &ClaimListing,
+) -> Result<(), CoreError> {
+    match listing {
+        ClaimListing::Mine(holder) => {
+            if *holder == viewer {
+                Ok(())
+            } else {
+                caps.authorize_read(crate::capability::ReadAccess::PrivateClaims)
+            }
+        }
+        ClaimListing::AllAuthorized => {
+            caps.authorize_read(crate::capability::ReadAccess::PrivateClaims)
+        }
+    }
+}
+
+/// Authorizes one `claim.list` request and resolves its listing.
+///
+/// Binds the `ClaimListArgs.holder` schema row to the internal listing and
+/// enforces `authorize_read` before any page is served.
+///
+/// # Errors
+/// `E_FORBIDDEN` for `Any` without `read_intents.claims`.
+pub(crate) fn authorize_claim_list_args(
+    caps: &crate::capability::Capabilities,
+    viewer: SessionId,
+    args: &crate::protocol::ClaimListArgs,
+) -> Result<ClaimListing, CoreError> {
+    let listing = listing_for_filter(args.holder, viewer);
+    authorize_claim_listing(caps, viewer, &listing)?;
+    Ok(listing)
+}
+
+/// Authorizes a provenance read against the viewer's negotiated capabilities.
+///
+/// A session always reads its own provenance; reading another session's
+/// commit or session provenance needs `read_intents.provenance`.
+///
+/// # Errors
+/// `E_FORBIDDEN` for another session's provenance without
+/// `read_intents.provenance`.
+pub(crate) fn authorize_provenance_read(
+    caps: &crate::capability::Capabilities,
+    viewer: SessionId,
+    owner: SessionId,
+) -> Result<(), CoreError> {
+    if viewer == owner {
+        Ok(())
+    } else {
+        caps.authorize_read(crate::capability::ReadAccess::PrivateProvenance)
+    }
+}
+
+/// One leased claim page read.
+///
+/// Groups the values that travel together from a `claim.list` handler into
+/// the lease-bound view: the store, the claim clock, the lease registry, the
+/// authorized listing, the presented cursor with its expected binding, the
+/// sampled instant, and the page budget.
+pub(crate) struct LeasedClaimPage<'a> {
+    /// The store holding the claim facts.
+    pub(crate) store: &'a Store,
+    /// The claim clock fencing the read instant.
+    pub(crate) clock: &'a ClaimClock,
+    /// The registry verifying the cursor binding.
+    pub(crate) leases: &'a super::leases::LeaseRegistry,
+    /// The authorized listing; see [`authorize_claim_list_args`].
+    pub(crate) listing: ClaimListing,
+    /// The presented cursor carrying the resume position.
+    pub(crate) cursor: &'a crate::protocol::PageCursor,
+    /// The binding the request must match.
+    pub(crate) want: &'a super::leases::CursorWant,
+    /// The parent-sampled monotonic instant.
+    pub(crate) now: Instant,
+    /// The page budget bounding the read.
+    pub(crate) budget: FactPageBudget,
+}
+
+/// Lists one claim page bound to an immutable leased view.
+///
+/// `AllAuthorized` is valid only after current `read_intents.claims`
+/// authorization; authorize first with [`authorize_claim_list_args`]. The
+/// cursor is verified against its expected binding before any row is read:
+/// binding mismatch is `E_FORBIDDEN`, correct binding on expired authority is
+/// `E_LEASE_LOST`. The caller mints the next protocol cursor with
+/// [`next_claim_cursor`].
+///
+/// # Errors
+/// `E_FORBIDDEN` on cursor mismatch or a continuation outside the listing
+/// scope; `E_LEASE_LOST` on expired authority; `E_LIMIT` past the page budget.
+pub(crate) fn list_page(
+    read: LeasedClaimPage<'_>,
+) -> Result<(ClaimPage, super::leases::LeaseBinding), CoreError> {
+    let LeasedClaimPage {
+        store,
+        clock,
+        leases,
+        listing,
+        cursor,
+        want,
+        now,
+        budget,
+    } = read;
+    let binding = leases.check_claim_page_cursor(cursor, want, now)?;
+    let position = cursor.position.as_bytes();
+    let after = if position.is_empty() {
+        None
+    } else {
+        Some(position)
+    };
+    let page = list_page_raw(store, clock, listing, after, budget)?;
+    Ok((page, binding))
+}
+
+/// Mints the next protocol cursor preserving the lease binding.
+///
+/// Carries the store, view, query, and lease of the served page onto the
+/// opaque resume position, so the next `claim.list` page stays bound to the
+/// same immutable leased view. Absent position ends the listing.
+///
+/// Binds the `ClaimListReply.claims.next` schema row to the lease.
+#[must_use]
+pub(crate) fn next_claim_cursor(
+    cursor: &crate::protocol::PageCursor,
+    next: Option<Vec<u8>>,
+) -> Option<crate::protocol::PageCursor> {
+    match next {
+        Some(position) => Some(crate::protocol::PageCursor {
+            store: cursor.store,
+            view: cursor.view,
+            query: cursor.query,
+            lease: cursor.lease,
+            position: crate::ByteString::from(position),
+        }),
+        None => None,
+    }
 }
