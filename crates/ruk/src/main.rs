@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod cli;
 mod daemon;
 
 use ruk_core::MAX_CONTROL_FRAME_BYTES;
@@ -276,6 +277,21 @@ fn main() -> ExitCode {
                 ExitCode::from(err.code().exit_code())
             }
         };
+    }
+    // Git-compatibility dispatch: invoked as `git`, or `ruk git <verb>`.
+    let argv: Vec<String> = std::env::args().collect();
+    let invoked_as_git = argv
+        .first()
+        .and_then(|arg0| std::path::Path::new(arg0).file_name())
+        .is_some_and(|name| name == "git");
+    let git_verb = argv.get(1).is_some_and(|arg| arg == "git");
+    if invoked_as_git || git_verb {
+        let rest = if invoked_as_git {
+            argv.clone()
+        } else {
+            argv[1..].to_vec()
+        };
+        return cli::run(rest, cli::CliEnv::capture());
     }
     let cli = Cli::parse();
     match run(cli) {
