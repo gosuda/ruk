@@ -56,8 +56,24 @@ pub(crate) fn init(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: Some('q'),
             takes_value: false,
         },
+        // Accepted: names the unborn `HEAD` branch, defaulting to `main`.
+        FlagSpec {
+            long: "initial-branch",
+            short: Some('b'),
+            takes_value: true,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let initial = match opts.single("initial-branch")? {
+        None => DEFAULT_BRANCH.to_owned(),
+        Some(name) => {
+            let full = format!("refs/heads/{name}");
+            RefName::new(full.as_str()).map_err(|err| GitError::Invalid {
+                detail: format!("initial branch refused: {err}"),
+            })?;
+            full
+        }
+    };
     let kind = match opts.single("object-format")? {
         None => HashKind::Sha1,
         Some(value) => match value.as_str() {
@@ -88,7 +104,7 @@ pub(crate) fn init(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         Store::create(&store_dir, kind, budget).map_err(GitError::from)?
     };
     if load_workspace(&store)?.is_none() {
-        let name = RefName::new(DEFAULT_BRANCH).map_err(|err| GitError::Invalid {
+        let name = RefName::new(initial.as_str()).map_err(|err| GitError::Invalid {
             detail: format!("default branch refused: {err}"),
         })?;
         let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(name), Scope::Full);
@@ -100,15 +116,20 @@ pub(crate) fn init(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     if opts.is_set("quiet") {
         return Ok(Vec::new());
     }
+    let display = if dir == "." {
+        ctx.env.cwd.clone()
+    } else {
+        path
+    };
     let message = if reinit {
         format!(
             "Reinitialized existing Ruk repository in {}/.ruk/\n",
-            path.display()
+            display.display()
         )
     } else {
         format!(
             "Initialized empty Ruk repository in {}/.ruk/\n",
-            path.display()
+            display.display()
         )
     };
     Ok(message.into_bytes())
@@ -583,7 +604,13 @@ pub(crate) fn remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     let store = ctx.store()?;
     let sub = opts.positionals.first().map(String::as_str);
     match sub {
-        None => list_remote_names(store),
+        None => {
+            if opts.is_set("verbose") {
+                list_remote_urls(store)
+            } else {
+                list_remote_names(store)
+            }
+        }
         Some("-v") => list_remote_urls(store),
         Some("add") => {
             let tail = sub_tail(&opts);

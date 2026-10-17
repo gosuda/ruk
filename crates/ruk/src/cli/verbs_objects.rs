@@ -70,8 +70,15 @@ pub(crate) fn hash_object(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
         inputs.push(super::read_stdin_bytes(&ctx.env)?);
     }
     for file in &opts.positionals {
-        let path = std::path::Path::new(file);
-        let handle = std::fs::File::open(path).map_err(|err| GitError::Io {
+        // Relative paths resolve against the invocation directory (`-C`),
+        // not the process root, the way the oracle honors `-C` globally.
+        let full = std::path::Path::new(file);
+        let full = if full.is_absolute() {
+            full.to_path_buf()
+        } else {
+            ctx.env.cwd.join(full)
+        };
+        let handle = std::fs::File::open(&full).map_err(|err| GitError::Io {
             detail: format!("opening {file}: {err}"),
         })?;
         inputs.push(read_bounded(handle, super::state::MAX_OBJECT_BYTES)?);
@@ -207,7 +214,10 @@ pub(crate) fn cat_file(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             detail: "usage: cat-file (-p|-t|-s|-e) <object>".to_owned(),
         });
     };
-    let oid = ruk_git::parse_oid_for(rev, kind)?;
+    // Resolve refs, `HEAD`, and ancestry suffixes the way the oracle does;
+    // raw object ids still parse when no ref matches.
+    let oid = super::state::resolve_rev(store, kind, rev)
+        .or_else(|_| ruk_git::parse_oid_for(rev, kind))?;
     let modes = [
         opts.is_set("pretty"),
         opts.is_set("type"),

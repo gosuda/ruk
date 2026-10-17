@@ -185,6 +185,8 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         let subject = message.lines().next().unwrap_or_default().to_owned();
         return finish(format!("Would commit on {label}: {subject}\n").into_bytes());
     }
+    let old_tree = parents_tree(ctx, &parents)?;
+    let root = parents.is_empty();
     let request = NewRequest {
         tree,
         parents,
@@ -205,7 +207,87 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     advance_head_to(ctx, new_oid)?;
     let label = branch_label_of(ctx)?;
     let subject = message.lines().next().unwrap_or_default().to_owned();
-    finish(format!("[{label} {}] {subject}\n", short_hex(&new_oid)).into_bytes())
+    let summary = if root {
+        root_commit_summary(ctx, old_tree, tree, &new_oid, &label, &subject)?
+    } else {
+        commit_summary(ctx, old_tree, tree, &new_oid, &label, &subject)?
+    };
+    finish(summary)
+}
+
+/// Reads the tree behind `parents`: the first parent's tree, or `None`
+/// for a root commit, the way the oracle diffs against the empty tree.
+fn parents_tree(ctx: &Ctx, parents: &[Head]) -> Result<Option<Oid>, GitError> {
+    let Some(first) = parents.first().and_then(|head| head.as_git().copied()) else {
+        return Ok(None);
+    };
+    let store = ctx.store()?;
+    Ok(Some(commit_tree_oid(&commit_record(store, first)?)?))
+}
+
+/// Renders `[branch short] subject` plus the diffstat block for a
+/// non-root commit.
+fn commit_summary(
+    ctx: &Ctx,
+    old_tree: Option<Oid>,
+    new_tree: Oid,
+    new_oid: &Oid,
+    label: &str,
+    subject: &str,
+) -> Result<Vec<u8>, GitError> {
+    summary_with_header(
+        ctx,
+        old_tree,
+        new_tree,
+        format!("[{label} {}] {subject}\n", short_hex(new_oid)),
+    )
+}
+
+/// Renders `[branch (root-commit) short] subject` plus the diffstat block
+/// for the first commit on a branch.
+fn root_commit_summary(
+    ctx: &Ctx,
+    old_tree: Option<Oid>,
+    new_tree: Oid,
+    new_oid: &Oid,
+    label: &str,
+    subject: &str,
+) -> Result<Vec<u8>, GitError> {
+    summary_with_header(
+        ctx,
+        old_tree,
+        new_tree,
+        format!("[{label} (root-commit) {}] {subject}\n", short_hex(new_oid)),
+    )
+}
+
+/// Renders one header line plus the commit diffstat block: the `N files
+/// changed` summary with git's singular/plural rules, then `create mode`/
+/// `delete mode`/`rename ... (100%)` lines per file. Unlike `--stat`, the
+/// short commit report has no per-file lines.
+fn summary_with_header(
+    ctx: &Ctx,
+    old_tree: Option<Oid>,
+    new_tree: Oid,
+    header: String,
+) -> Result<Vec<u8>, GitError> {
+    let mut out = header.into_bytes();
+    let changes = tree_file_changes(ctx, old_tree, new_tree)?;
+    let (added, removed) = stat_totals(&changes);
+    out.extend_from_slice(&stat_summary(changes.len(), added, removed));
+    out.extend_from_slice(&render_mode_lines(&changes));
+    Ok(out)
+}
+
+/// Totals added/removed lines across file changes for summary lines.
+fn stat_totals(changes: &[FileChange]) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for change in changes {
+        added += change.added;
+        removed += change.removed;
+    }
+    (added, removed)
 }
 
 /// Refreshes every tracked stage-zero row from its worktree file.
@@ -313,6 +395,7 @@ fn commit_amend(
 ) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let tip = head_oid(store)?;
+    let old_tree = commit_tree_oid(&commit_record(store, tip)?)?;
     let result = ops_edit(
         store,
         EditRequest {
@@ -333,7 +416,8 @@ fn commit_amend(
         })?;
     advance_head_to(ctx, new_oid)?;
     let label = branch_label_of(ctx)?;
-    Ok(format!("[{label} {}] {message}\n", short_hex(&new_oid)).into_bytes())
+    let subject = message.lines().next().unwrap_or_default().to_owned();
+    commit_summary(ctx, Some(old_tree), tree, &new_oid, &label, &subject)
 }
 
 /// Moves the current branch tip, or a detached `HEAD`, to a new commit.
@@ -367,15 +451,19 @@ fn advance_head_to(ctx: &Ctx, new_oid: Oid) -> Result<(), GitError> {
     }
 }
 
-/// Names the current branch for commit output, or `HEAD` when detached.
+/// Names the current branch for commit output, shortened the way the
+/// oracle prints `main` instead of `refs/heads/main`, or `detached HEAD`
+/// when detached.
 fn branch_label_of(ctx: &Ctx) -> Result<String, GitError> {
     let store = ctx.store()?;
     let (workspace, _) = load_or_default(store)?;
     match workspace.head {
         HeadRef::Symbolic(name) => Ok(name
             .to_utf8()
-            .map_or_else(|| format!("{name}"), str::to_owned)),
-        HeadRef::Detached(_) => Ok("HEAD".to_owned()),
+            .map_or_else(|| format!("{name}"), str::to_owned)
+            .trim_start_matches("refs/heads/")
+            .to_owned()),
+        HeadRef::Detached(_) => Ok("detached HEAD".to_owned()),
     }
 }
 
@@ -871,7 +959,7 @@ fn format_git_date(stamp: i64, offset: ruk_core::conflict::TzOffset) -> String {
     let weekday = usize::try_from(days.rem_euclid(7)).expect("weekday remainder fits in seven");
     let month_index = usize::try_from(month - 1).expect("parsed month 1..=12 gives index 0..=11");
     format!(
-        "{} {} {:02} {:02}:{:02}:{:02} {full_year} {offset}",
+        "{} {} {} {:02}:{:02}:{:02} {full_year} {offset}",
         WEEKDAYS[weekday],
         MONTHS[month_index],
         day,
@@ -1103,13 +1191,18 @@ fn render_commit_line(
         detail: format!("bad {role} ident"),
     };
     let author = record.author().map_err(|_| broken("author"))?;
-    let committer = record.committer().map_err(|_| broken("committer"))?;
     out.extend_from_slice(b"Author: ");
-    out.extend_from_slice(&author.render());
-    out.push(b'\n');
-    out.extend_from_slice(b"Commit: ");
-    out.extend_from_slice(&committer.render());
-    out.push(b'\n');
+    out.extend_from_slice(author.name.as_bytes());
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(author.email.as_bytes());
+    out.extend_from_slice(b">\n");
+    out.extend_from_slice(
+        format!(
+            "Date:   {}\n",
+            format_git_date(author.timestamp, author.offset)
+        )
+        .as_bytes(),
+    );
     out.push(b'\n');
     for message_line in record.message().split(|byte| *byte == b'\n') {
         out.extend_from_slice(b"    ");
@@ -1271,6 +1364,18 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: None,
             takes_value: false,
         },
+        // Accepted: fast-forward is the only merge this slice performs, so
+        // `--ff` (the oracle default) is already the behavior.
+        FlagSpec {
+            long: "ff",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
         FlagSpec {
             long: "no-ff",
             short: None,
@@ -1302,22 +1407,32 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     let kind = ctx.kind()?;
     let tip = resolve_rev(store, kind, rev)?;
     let _ = opts.single("message")?;
+    let quiet = opts.is_set("quiet");
     let current = match head_oid(store) {
         Ok(tip) => tip,
-        Err(_) => return merge_into_unborn(ctx, rev, tip),
+        Err(_) => {
+            let out = merge_into_unborn(ctx, rev, tip)?;
+            return Ok(hush_merge(out, quiet));
+        }
     };
     if current == tip {
-        return Ok(b"Already up to date.\n".to_vec());
+        return Ok(hush_merge(b"Already up to date.\n".to_vec(), quiet));
     }
     if is_ancestor(store, current, tip)? {
-        return merge_fast_forward(ctx, rev, tip);
+        let out = merge_fast_forward(ctx, rev, current, tip)?;
+        return Ok(hush_merge(out, quiet));
     }
     if is_ancestor(store, tip, current)? {
-        return Ok(b"Already up to date.\n".to_vec());
+        return Ok(hush_merge(b"Already up to date.\n".to_vec(), quiet));
     }
     Err(GitError::Unsupported {
         command: "non-fast-forward merge needs the merge lane".to_owned(),
     })
+}
+
+/// Drops merge output for `--quiet`, keeping the exit status as the signal.
+fn hush_merge(out: Vec<u8>, quiet: bool) -> Vec<u8> {
+    if quiet { Vec::new() } else { out }
 }
 
 /// Reports the absence of sequencer state for `--abort` and friends.
@@ -1360,15 +1475,33 @@ fn fast_forward_to(ctx: &Ctx, tip: Oid) -> Result<(), GitError> {
     super::verbs_branch::sync_worktree_to_index(ctx)
 }
 
-/// Fast-forwards the current branch to a descendant tip.
-pub(crate) fn merge_fast_forward(ctx: &Ctx, rev: &str, tip: Oid) -> Result<Vec<u8>, GitError> {
+/// Fast-forwards the current branch to a descendant tip, reporting
+/// `Updating <old>..<new>` plus the file stat the way the oracle does.
+pub(crate) fn merge_fast_forward(
+    ctx: &Ctx,
+    rev: &str,
+    before: Oid,
+    tip: Oid,
+) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let (workspace, _) = load_or_default(store)?;
     match workspace.head {
         HeadRef::Symbolic(_) => {
+            let old_tree = commit_tree_oid(&commit_record(store, before)?)?;
+            let new_tree = commit_tree_oid(&commit_record(store, tip)?)?;
+            let changes = tree_file_changes(ctx, Some(old_tree), new_tree)?;
             super::verbs_branch::move_branch_to(ctx, tip)?;
             fast_forward_to(ctx, tip)?;
-            Ok(format!("Fast-forwarded to {rev}\n").into_bytes())
+            let _ = rev;
+            let mut out = format!(
+                "Updating {}..{}\nFast-forward\n",
+                short_hex(&before),
+                short_hex(&tip)
+            )
+            .into_bytes();
+            out.extend_from_slice(&render_file_stat(&changes));
+            out.extend_from_slice(&render_mode_lines(&changes));
+            Ok(out)
         }
         HeadRef::Detached(_) => Err(GitError::Unsupported {
             command: "merge into a detached HEAD needs the merge lane".to_owned(),
@@ -2410,12 +2543,8 @@ fn render_pairs(
     let mut hunks: Vec<CountedHunk> = Vec::new();
     for pair in pairs {
         let (old_body, new_body) = pair_bodies(ctx, pair)?;
-        let (text, added, removed) = unified_pair(
-            &pair.path,
-            old_body.as_deref(),
-            new_body.as_deref(),
-            context,
-        )?;
+        let (text, added, removed) =
+            unified_pair(pair, old_body.as_deref(), new_body.as_deref(), context)?;
         hunks.push(CountedHunk {
             path: pair.path.clone(),
             text,
@@ -2452,6 +2581,305 @@ fn parse_unified_arg(opts: &super::Collected) -> Result<Option<usize>, GitError>
         .transpose()
 }
 
+/// One changed file between two stored trees, with line counts for the
+/// stat block. Exact-blob renames pair into one entry, the way the oracle
+/// reports `rename a.txt => aa.txt (100%)` for identical content.
+pub(crate) struct FileChange {
+    /// Old path, mode, and blob; absent for additions.
+    pub(crate) old: Option<(Vec<u8>, ruk_core::index::FileMode, Oid)>,
+    /// New path, mode, and blob; absent for deletions.
+    pub(crate) new: Option<(Vec<u8>, ruk_core::index::FileMode, Oid)>,
+    /// Added lines (zero for renames, binaries, and mode-only changes).
+    pub(crate) added: usize,
+    /// Removed lines.
+    pub(crate) removed: usize,
+    /// Either side holds NUL bytes.
+    pub(crate) binary: bool,
+    /// Old and new blob sizes for `Bin` stat lines.
+    pub(crate) sizes: (usize, usize),
+}
+
+/// Diffs two stored trees path by path with line counts, pairing
+/// additions and deletions of identical blobs into renames.
+pub(crate) fn tree_file_changes(
+    ctx: &Ctx,
+    old_tree: Option<Oid>,
+    new_tree: Oid,
+) -> Result<Vec<FileChange>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let mut old_map = BTreeMap::new();
+    if let Some(tree) = old_tree {
+        for (path, mode, oid) in flatten_tree(store, kind, tree)? {
+            old_map.insert(path, (mode, oid));
+        }
+    }
+    let mut new_map = BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, new_tree)? {
+        new_map.insert(path, (mode, oid));
+    }
+    let mut union: Vec<Vec<u8>> = old_map.keys().cloned().collect();
+    for path in new_map.keys() {
+        if !union.contains(path) {
+            union.push(path.clone());
+        }
+    }
+    union.sort();
+    let mut added_paths: Vec<(Vec<u8>, ruk_core::index::FileMode, Oid)> = Vec::new();
+    let mut removed_paths: Vec<(Vec<u8>, ruk_core::index::FileMode, Oid)> = Vec::new();
+    let mut changes: Vec<FileChange> = Vec::new();
+    for path in union {
+        let old_entry = old_map.remove(&path);
+        let new_entry = new_map.remove(&path);
+        match (old_entry, new_entry) {
+            (None, None) => {}
+            (Some(old), Some(new)) if old == new => {}
+            (Some((old_mode, old_oid)), Some((new_mode, new_oid))) => {
+                let (old_body, new_body) = stored_pair(store, old_oid, new_oid)?;
+                let (added, removed, binary) = count_diff(&old_body, &new_body);
+                changes.push(FileChange {
+                    old: Some((path.clone(), old_mode, old_oid)),
+                    new: Some((path, new_mode, new_oid)),
+                    added,
+                    removed,
+                    binary,
+                    sizes: (old_body.len(), new_body.len()),
+                });
+            }
+            (None, Some((mode, oid))) => added_paths.push((path, mode, oid)),
+            (Some((mode, oid)), None) => removed_paths.push((path, mode, oid)),
+        }
+    }
+    // Pair identical blobs first, the way similarity-100% renames collapse.
+    let mut taken_new = vec![false; added_paths.len()];
+    let mut orphans: Vec<(Vec<u8>, ruk_core::index::FileMode, Oid)> = Vec::new();
+    for (old_path, old_mode, old_oid) in removed_paths {
+        let mut paired = None;
+        for (index, (new_path, new_mode, new_oid)) in added_paths.iter().enumerate() {
+            if !taken_new[index] && *new_oid == old_oid {
+                paired = Some((index, new_path.clone(), *new_mode, *new_oid));
+                break;
+            }
+        }
+        match paired {
+            Some((index, new_path, new_mode, new_oid)) => {
+                taken_new[index] = true;
+                let (_, body) = read_object_bytes(store, old_oid)?;
+                changes.push(FileChange {
+                    old: Some((old_path, old_mode, old_oid)),
+                    new: Some((new_path, new_mode, new_oid)),
+                    added: 0,
+                    removed: 0,
+                    binary: body.contains(&0),
+                    sizes: (body.len(), body.len()),
+                });
+            }
+            None => orphans.push((old_path, old_mode, old_oid)),
+        }
+    }
+    for (path, mode, oid) in orphans {
+        let (_, body) = read_object_bytes(store, oid)?;
+        changes.push(FileChange {
+            old: Some((path, mode, oid)),
+            new: None,
+            added: 0,
+            removed: split_lines(&body).len(),
+            binary: body.contains(&0),
+            sizes: (body.len(), 0),
+        });
+    }
+    for (index, (path, mode, oid)) in added_paths.into_iter().enumerate() {
+        if taken_new[index] {
+            continue;
+        }
+        let (_, body) = read_object_bytes(store, oid)?;
+        changes.push(FileChange {
+            old: None,
+            new: Some((path, mode, oid)),
+            added: split_lines(&body).len(),
+            removed: 0,
+            binary: body.contains(&0),
+            sizes: (0, body.len()),
+        });
+    }
+    changes.sort_by(|left, right| display_path(left).cmp(&display_path(right)));
+    Ok(changes)
+}
+
+/// Reads both blobs behind one stored pair.
+fn stored_pair(store: &Store, old: Oid, new: Oid) -> Result<(Vec<u8>, Vec<u8>), GitError> {
+    let (_, old_body) = read_object_bytes(store, old)?;
+    let (_, new_body) = read_object_bytes(store, new)?;
+    Ok((old_body, new_body))
+}
+
+/// Counts added/removed lines between two bodies with the shared LCS
+/// differ. Either side holding NUL bytes is binary: no line counts.
+fn count_diff(old_body: &[u8], new_body: &[u8]) -> (usize, usize, bool) {
+    if old_body.contains(&0) || new_body.contains(&0) {
+        return (0, 0, true);
+    }
+    let old_lines = split_lines(old_body);
+    let new_lines = split_lines(new_body);
+    let mut added = 0;
+    let mut removed = 0;
+    for op in lcs_script(&old_lines, &new_lines) {
+        match op {
+            DiffOp::Keep(_) => {}
+            DiffOp::Delete(_) => removed += 1,
+            DiffOp::Insert(_) => added += 1,
+        }
+    }
+    (added, removed, false)
+}
+
+/// Sorts and displays one change under its new path, old path for deletes.
+fn display_path(change: &FileChange) -> Vec<u8> {
+    match (&change.old, &change.new) {
+        (_, Some((path, _, _))) => path.clone(),
+        (Some((path, _, _)), None) => path.clone(),
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Renders the per-file stat lines plus the summary, the block `commit`,
+/// `show --stat`, and fast-forward merges share.
+pub(crate) fn render_file_stat(changes: &[FileChange]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let width = changes
+        .iter()
+        .map(|change| stat_name(change).len())
+        .max()
+        .unwrap_or(0);
+    let (added_total, removed_total) = stat_totals(changes);
+    for change in changes {
+        let name = stat_name(change);
+        let padded = format!("{name:<width$}");
+        if change.binary {
+            out.extend_from_slice(
+                format!(
+                    " {padded} | Bin {} -> {} bytes\n",
+                    change.sizes.0, change.sizes.1
+                )
+                .as_bytes(),
+            );
+        } else if change.added == 0 && change.removed == 0 {
+            out.extend_from_slice(format!(" {padded} | 0\n").as_bytes());
+        } else {
+            out.extend_from_slice(
+                format!(
+                    " {padded} | {} {}{}\n",
+                    change.added + change.removed,
+                    "+".repeat(change.added),
+                    "-".repeat(change.removed)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    out.extend_from_slice(&stat_summary(changes.len(), added_total, removed_total));
+    out
+}
+
+/// Names one change for stat lines: `old => new` for renames.
+fn stat_name(change: &FileChange) -> String {
+    match (&change.old, &change.new) {
+        (Some((old_path, _, _)), Some((new_path, _, _))) if old_path != new_path => format!(
+            "{} => {}",
+            String::from_utf8_lossy(old_path),
+            String::from_utf8_lossy(new_path)
+        ),
+        _ => String::from_utf8_lossy(&display_path(change)).into_owned(),
+    }
+}
+
+/// Renders the `N files changed, ...` summary with git's rules: singular
+/// `file`/`insertion`/`deletion`, and both zero counters shown only when
+/// nothing changed at all.
+pub(crate) fn stat_summary(files: usize, added: usize, removed: usize) -> Vec<u8> {
+    let mut line = format!(
+        " {files} {} changed",
+        if files == 1 { "file" } else { "files" }
+    );
+    if added > 0 || removed == 0 {
+        line.push_str(&format!(
+            ", {added} {}",
+            if added == 1 {
+                "insertion(+)"
+            } else {
+                "insertions(+)"
+            }
+        ));
+    }
+    if removed > 0 || added == 0 {
+        line.push_str(&format!(
+            ", {removed} {}",
+            if removed == 1 {
+                "deletion(-)"
+            } else {
+                "deletions(-)"
+            }
+        ));
+    }
+    line.push('\n');
+    line.into_bytes()
+}
+
+/// Renders `create mode`/`delete mode`/`rename ... (100%)` lines plus pure
+/// mode changes, in display-path order.
+pub(crate) fn render_mode_lines(changes: &[FileChange]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for change in changes {
+        match (&change.old, &change.new) {
+            (None, Some((path, mode, _))) => {
+                out.extend_from_slice(
+                    format!(
+                        " create mode {:o} {}\n",
+                        mode.octal(),
+                        String::from_utf8_lossy(path)
+                    )
+                    .as_bytes(),
+                );
+            }
+            (Some((path, mode, _)), None) => {
+                out.extend_from_slice(
+                    format!(
+                        " delete mode {:o} {}\n",
+                        mode.octal(),
+                        String::from_utf8_lossy(path)
+                    )
+                    .as_bytes(),
+                );
+            }
+            (Some((old_path, old_mode, _)), Some((new_path, new_mode, _))) => {
+                if old_path != new_path {
+                    out.extend_from_slice(
+                        format!(
+                            " rename {} => {} (100%)\n",
+                            String::from_utf8_lossy(old_path),
+                            String::from_utf8_lossy(new_path)
+                        )
+                        .as_bytes(),
+                    );
+                }
+                if old_mode != new_mode {
+                    out.extend_from_slice(
+                        format!(
+                            " mode change {:o} => {:o} {}\n",
+                            old_mode.octal(),
+                            new_mode.octal(),
+                            String::from_utf8_lossy(new_path)
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
 /// Renders `--stat` from counted hunks.
 fn render_stat(hunks: &[CountedHunk]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -2462,7 +2890,7 @@ fn render_stat(hunks: &[CountedHunk]) -> Vec<u8> {
         removed_total += hunk.removed;
         out.extend_from_slice(
             format!(
-                " {} | {}{}{}\n",
+                " {} | {} {}{}\n",
                 String::from_utf8_lossy(&hunk.path),
                 hunk.added + hunk.removed,
                 "+".repeat(hunk.added),
@@ -2471,13 +2899,7 @@ fn render_stat(hunks: &[CountedHunk]) -> Vec<u8> {
             .as_bytes(),
         );
     }
-    out.extend_from_slice(
-        format!(
-            " {} files changed, {added_total} insertions(+), {removed_total} deletions(-)\n",
-            hunks.len()
-        )
-        .as_bytes(),
-    );
+    out.extend_from_slice(&stat_summary(hunks.len(), added_total, removed_total));
     out
 }
 
@@ -2498,28 +2920,94 @@ fn pair_bodies(ctx: &Ctx, pair: &TreePair) -> Result<(Option<Vec<u8>>, Option<Ve
     Ok((old_body, new_body))
 }
 
+/// Formats one hunk range the way the oracle does: the `,count` suffix is
+/// omitted for single-line hunks (`@@ -1 +1 @@`), kept otherwise.
+fn hunk_range(start: usize, count: usize) -> String {
+    if count == 1 {
+        format!("{start}")
+    } else {
+        format!("{start},{count}")
+    }
+}
+
 /// Diffs one path pair into unified text with added/removed counts,
 /// collapsing unchanged runs to `context` lines around each change when
-/// set. `None` keeps the historical show-everything form.
+/// set. `None` keeps the historical show-everything form. The extended
+/// header (`new file mode`, `index <old>..<new>`, `/dev/null` sides)
+/// follows the oracle's `diff.c` layout exactly.
 fn unified_pair(
-    path: &[u8],
+    pair: &TreePair,
     old: Option<&[u8]>,
     new: Option<&[u8]>,
     context: Option<usize>,
 ) -> Result<(Vec<u8>, usize, usize), GitError> {
-    let name = String::from_utf8_lossy(path);
+    let name = String::from_utf8_lossy(&pair.path);
     let mut out = format!("diff --git a/{name} b/{name}\n").into_bytes();
-    match (old, new) {
-        (None, Some(_)) => out.extend_from_slice(b"new file\n"),
-        (Some(_), None) => out.extend_from_slice(b"deleted file\n"),
+    let old_mode = pair.old.map(|(mode, _)| mode);
+    let new_mode = pair.new.map(|(mode, _)| mode);
+    match (old_mode, new_mode) {
+        (None, Some(mode)) => {
+            out.extend_from_slice(format!("new file mode {:o}\n", mode.octal()).as_bytes());
+        }
+        (Some(mode), None) => {
+            out.extend_from_slice(format!("deleted file mode {:o}\n", mode.octal()).as_bytes());
+        }
+        (Some(before), Some(after)) if before != after => {
+            out.extend_from_slice(
+                format!(
+                    "old mode {:o}\nnew mode {:o}\n",
+                    before.octal(),
+                    after.octal()
+                )
+                .as_bytes(),
+            );
+        }
         _ => {}
+    }
+    let old_oid = pair.old.map(|(_, oid)| oid);
+    let new_oid = pair.new.map(|(_, oid)| oid);
+    let content_changed = old_oid != new_oid;
+    if content_changed {
+        let old_short = old_oid.map_or_else(|| "0000000".to_owned(), |oid| short_hex(&oid));
+        let new_short = new_oid.map_or_else(|| "0000000".to_owned(), |oid| short_hex(&oid));
+        match (old_mode, new_mode) {
+            (Some(before), Some(after)) if before == after => {
+                out.extend_from_slice(
+                    format!("index {old_short}..{new_short} {:o}\n", before.octal()).as_bytes(),
+                );
+            }
+            _ => {
+                out.extend_from_slice(format!("index {old_short}..{new_short}\n").as_bytes());
+            }
+        }
     }
     let old_lines = old.map(split_lines).unwrap_or_default();
     let new_lines = new.map(split_lines).unwrap_or_default();
     if old_lines.iter().any(|line| line.contains(&b'\0'))
         || new_lines.iter().any(|line| line.contains(&b'\0'))
     {
-        out.extend_from_slice(b"Binary files differ\n");
+        let old_side = pair
+            .old
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("a/{name}"));
+        let new_side = pair
+            .new
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("b/{name}"));
+        out.extend_from_slice(
+            format!("Binary files {old_side} and {new_side} differ\n").as_bytes(),
+        );
+        return Ok((out, 0, 0));
+    }
+    if pair.old.is_none() {
+        out.extend_from_slice(b"--- /dev/null\n");
+    } else {
+        out.extend_from_slice(format!("--- a/{name}\n").as_bytes());
+    }
+    if pair.new.is_none() {
+        out.extend_from_slice(b"+++ /dev/null\n");
+    } else {
+        out.extend_from_slice(format!("+++ b/{name}\n").as_bytes());
+    }
+    if !content_changed {
         return Ok((out, 0, 0));
     }
     let product = old_lines.len().saturating_mul(new_lines.len());
@@ -2537,18 +3025,17 @@ fn unified_pair(
     let script = lcs_script(&old_lines, &new_lines);
     let mut added = 0;
     let mut removed = 0;
-    out.extend_from_slice(format!("--- a/{name}\n+++ b/{name}\n").as_bytes());
     if let Some(radius) = context {
         let (added, removed) = emit_context_hunks(&mut out, &script, radius);
         return Ok((out, added, removed));
     }
     let mut hunk_start = 0;
-    let mut old_line_number = 1;
-    let mut new_line_number = 1;
+    let mut old_line_number: usize = 1;
+    let mut new_line_number: usize = 1;
     while hunk_start < script.len() {
         let hunk_end = script.len().min(hunk_start + 20);
-        let hunk_old_start = old_line_number;
-        let hunk_new_start = new_line_number;
+        let range_old_start = old_line_number;
+        let range_new_start = new_line_number;
         let mut old_count = 0;
         let mut new_count = 0;
         for op in &script[hunk_start..hunk_end] {
@@ -2569,9 +3056,16 @@ fn unified_pair(
                 }
             }
         }
+        // Git numbers an empty side at the line before the hunk.
+        let hunk_old_start = range_old_start.saturating_sub(usize::from(old_count == 0));
+        let hunk_new_start = range_new_start.saturating_sub(usize::from(new_count == 0));
         out.extend_from_slice(
-            format!("@@ -{hunk_old_start},{old_count} +{hunk_new_start},{new_count} @@\n")
-                .as_bytes(),
+            format!(
+                "@@ -{} +{} @@\n",
+                hunk_range(hunk_old_start, old_count),
+                hunk_range(hunk_new_start, new_count)
+            )
+            .as_bytes(),
         );
         for op in &script[hunk_start..hunk_end] {
             match op {
@@ -2655,7 +3149,12 @@ fn emit_context_hunks(out: &mut Vec<u8>, script: &[DiffOp<'_>], radius: usize) -
             new_number
         };
         out.extend_from_slice(
-            format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n").as_bytes(),
+            format!(
+                "@@ -{} +{} @@\n",
+                hunk_range(old_start, old_count),
+                hunk_range(new_start, new_count)
+            )
+            .as_bytes(),
         );
         for op in &script[start..end] {
             match op {

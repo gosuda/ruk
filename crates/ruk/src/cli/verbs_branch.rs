@@ -22,9 +22,10 @@
 //! `git/builtin/show-ref.c`, `git/builtin/for-each-ref.c`,
 //! `git/builtin/tag.c`, `git/builtin/stash.c`.
 
+use ruk_core::commit::CommitRecord;
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
-use ruk_core::ids::Oid;
+use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::ops::{NewRequest, new as ops_new};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
@@ -614,11 +615,11 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
     }
     if let Some(name) = opts.single("branch")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, false);
+        return checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"));
     }
     if let Some(name) = opts.single("force-branch")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, true);
+        return checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"));
     }
     // `collect` strips `--`, so a lone positional after `--` must read as a
     // path, not a revision to switch to.
@@ -642,7 +643,7 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             if saw_dashdash {
                 return checkout_paths(ctx, &opts);
             }
-            switch_to_rev(ctx, rev)
+            switch_to_rev(ctx, rev, opts.is_set("quiet"))
         }
         _ => checkout_paths(ctx, &opts),
     }
@@ -650,8 +651,10 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
 
 /// Creates and checks out a branch that tracks its start point, recording
 /// `branch.<name>.remote`/`branch.<name>.merge` the way `--track` does.
-fn checkout_new_branch_tracked(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
-    let store = ctx.store()?;
+fn checkout_new_branch_tracked(
+    ctx: &mut Ctx,
+    opts: &super::Collected,
+) -> Result<Vec<u8>, GitError> {
     let branch = opts.single("branch")?;
     let force_branch = opts.single("force-branch")?;
     let (name, start, force) = match (branch, force_branch) {
@@ -680,10 +683,12 @@ fn checkout_new_branch_tracked(ctx: &Ctx, opts: &super::Collected) -> Result<Vec
         detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
     })?;
     // Validate the upstream before creating anything, so a bad start point
-    // leaves no half-made branch behind.
-    parse_upstream(store, start)?;
-    let out = checkout_new_branch(ctx, &name, Some(start), force)?;
-    record_tracking(store, &name, start)?;
+    // leaves no half-made branch behind. Each store borrow ends before the
+    // mutable branch creation below.
+    parse_upstream(ctx.store()?, start)?;
+    let quiet = opts.is_set("quiet");
+    let out = checkout_new_branch(ctx, &name, Some(start), force, quiet)?;
+    record_tracking(ctx.store()?, &name, start)?;
     Ok(out)
 }
 
@@ -695,12 +700,14 @@ fn record_tracking(store: &Store, name: &str, start: &str) -> Result<(), GitErro
     Ok(())
 }
 
-/// Creates and checks out a branch from a start point.
+/// Creates and checks out a branch from a start point, reporting the
+/// switch on stderr like the oracle (`-q` hushes it).
 fn checkout_new_branch(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     name: &str,
     start: Option<&str>,
     force: bool,
+    quiet: bool,
 ) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -725,16 +732,25 @@ fn checkout_new_branch(
             change: RefChange::Set(RefTarget::Direct(target)),
         }],
     )?;
-    switch_head_to(ctx, HeadRef::Symbolic(refname))
+    switch_head_to(ctx, HeadRef::Symbolic(refname))?;
+    if !quiet {
+        ctx.emit_stderr(format!("Switched to a new branch '{name}'\n").as_bytes());
+    }
+    Ok(Vec::new())
 }
 
-/// Switches `HEAD` to a branch or detaches at an object.
-fn switch_to_rev(ctx: &Ctx, rev: &str) -> Result<Vec<u8>, GitError> {
+/// Switches `HEAD` to a branch or detaches at an object, reporting branch
+/// switches on stderr like the oracle.
+fn switch_to_rev(ctx: &mut Ctx, rev: &str, quiet: bool) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     if let Ok(name) = branch_name(rev) {
         if super::state::read_ref(store, &name)?.is_some() {
-            return switch_head_to(ctx, HeadRef::Symbolic(name));
+            switch_head_to(ctx, HeadRef::Symbolic(name))?;
+            if !quiet {
+                ctx.emit_stderr(format!("Switched to branch '{rev}'\n").as_bytes());
+            }
+            return Ok(Vec::new());
         }
     }
     let oid = resolve_rev(store, kind, rev)?;
@@ -900,11 +916,11 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     ctx.require_worktree()?;
     if let Some(name) = opts.single("create")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, false);
+        return checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"));
     }
     if let Some(name) = opts.single("force-create")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, true);
+        return checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"));
     }
     match opts.positionals.as_slice() {
         [] => {
@@ -922,7 +938,7 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 let tip = resolve_rev(store, ctx.kind()?, branch)?;
                 return detach_at(ctx, tip);
             }
-            switch_guessing(ctx, branch, !opts.is_set("no-guess"))
+            switch_guessing(ctx, branch, !opts.is_set("no-guess"), opts.is_set("quiet"))
         }
         _ => Err(GitError::Invalid {
             detail: "usage: switch [-c <new>] [<branch>]".to_owned(),
@@ -930,13 +946,23 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     }
 }
 
-/// Switches to a branch, guessing a remote-tracking start when missing.
-fn switch_guessing(ctx: &Ctx, branch: &str, guess: bool) -> Result<Vec<u8>, GitError> {
+/// Switches to a branch, guessing a remote-tracking start when missing,
+/// reporting the switch on stderr like the oracle.
+fn switch_guessing(
+    ctx: &mut Ctx,
+    branch: &str,
+    guess: bool,
+    quiet: bool,
+) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     if let Ok(name) = branch_name(branch) {
         if super::state::read_ref(store, &name)?.is_some() {
-            return switch_head_to(ctx, HeadRef::Symbolic(name));
+            switch_head_to(ctx, HeadRef::Symbolic(name))?;
+            if !quiet {
+                ctx.emit_stderr(format!("Switched to branch '{branch}'\n").as_bytes());
+            }
+            return Ok(Vec::new());
         }
     }
     if guess {
@@ -947,7 +973,11 @@ fn switch_guessing(ctx: &Ctx, branch: &str, guess: bool) -> Result<Vec<u8>, GitE
             });
             if let Some(target) = target {
                 create_branch(store, kind, branch, target)?;
-                return switch_head_to(ctx, HeadRef::Symbolic(branch_name(branch)?));
+                switch_head_to(ctx, HeadRef::Symbolic(branch_name(branch)?))?;
+                if !quiet {
+                    ctx.emit_stderr(format!("Switched to branch '{branch}'\n").as_bytes());
+                }
+                return Ok(Vec::new());
             }
         }
     }
@@ -1185,6 +1215,7 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         });
     }
     move_branch_to(ctx, target)?;
+    let quiet = opts.is_set("quiet");
     if opts.is_set("soft") {
         return Ok(Vec::new());
     }
@@ -1193,8 +1224,44 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     reset_index_tree(ctx, tree)?;
     if opts.is_set("hard") {
         sync_worktree_to_index(ctx)?;
+        if quiet {
+            return Ok(Vec::new());
+        }
+        return Ok(reset_head_line(&record, target));
     }
-    Ok(Vec::new())
+    if quiet {
+        return Ok(Vec::new());
+    }
+    reset_unstaged_report(ctx, store, kind)
+}
+
+/// Renders `HEAD is now at <short> <subject>` after a hard reset.
+fn reset_head_line(record: &CommitRecord, target: Oid) -> Vec<u8> {
+    let message = record.message();
+    let end = message
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(message.len());
+    format!(
+        "HEAD is now at {} {}\n",
+        target.to_hex().chars().take(7).collect::<String>(),
+        String::from_utf8_lossy(&message[..end])
+    )
+    .into_bytes()
+}
+
+/// Renders `Unstaged changes after reset:` plus worktree differences when
+/// a mixed reset leaves any, silent otherwise like the oracle.
+fn reset_unstaged_report(ctx: &Ctx, store: &Store, kind: HashKind) -> Result<Vec<u8>, GitError> {
+    let plan = super::verbs_stage::status_plan(ctx, store, kind)?;
+    if plan.unstaged.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::from(b"Unstaged changes after reset:\n".as_slice());
+    for (path, code) in &plan.unstaged {
+        out.extend_from_slice(format!("{code}\t{}\n", String::from_utf8_lossy(path)).as_bytes());
+    }
+    Ok(out)
 }
 
 /// Moves the current branch tip (or detaches state) to `target`.
@@ -2900,7 +2967,7 @@ fn stash_branch(ctx: &Ctx, name: &str, slot: u64) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {
-        detail: format!("no such stash slot: stash@{slot}"),
+        detail: format!("no such stash slot: stash@{{{slot}}}"),
     })?;
     if entry.base_hex.is_empty() {
         return Err(GitError::Invalid {
@@ -2940,9 +3007,30 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     }
     let base = head_oid(store).ok();
     let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
-    let message = opts
-        .single("message")?
-        .unwrap_or_else(|| "stash".to_owned());
+    let branch = stash_branch_label(store)?;
+    // The slot subject doubles as the stash commit message, the way the
+    // oracle records `On <branch>: <msg>` (or `WIP on ...` without `-m`).
+    let message = match opts.single("message")? {
+        Some(given) => format!("On {branch}: {given}"),
+        None => {
+            let Some(tip) = base else {
+                return Err(GitError::Invalid {
+                    detail: "You do not have the initial commit yet".to_owned(),
+                });
+            };
+            let record = super::state::commit_record(store, tip)?;
+            let body = record.message();
+            let end = body
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(body.len());
+            format!(
+                "WIP on {branch}: {} {}",
+                tip.to_hex().chars().take(7).collect::<String>(),
+                String::from_utf8_lossy(&body[..end])
+            )
+        }
+    };
     let author = super::state::identity(ctx, super::state::IdentityRole::Author)?;
     let committer = super::state::identity(ctx, super::state::IdentityRole::Committer)?;
     let parents = base
@@ -3003,7 +3091,21 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
             None => clear_index(ctx)?,
         }
     }
-    Ok(format!("Saved working directory as stash@{slot}\n").into_bytes())
+    Ok(format!("Saved working directory and index state {message}\n").into_bytes())
+}
+
+/// Names the stashed branch shortened, `(no branch)` when detached, for
+/// the `On <branch>: <msg>` stash subject.
+fn stash_branch_label(store: &Store) -> Result<String, GitError> {
+    let (workspace, _) = load_or_default(store)?;
+    match &workspace.head {
+        HeadRef::Symbolic(name) => Ok(name
+            .to_utf8()
+            .unwrap_or_default()
+            .trim_start_matches("refs/heads/")
+            .to_owned()),
+        HeadRef::Detached(_) => Ok("(no branch)".to_owned()),
+    }
 }
 
 /// Empties every index row, for stashes on an unborn branch.
@@ -3032,7 +3134,7 @@ fn stash_list(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         let Some(entry) = stash_read(store, slot)? else {
             continue;
         };
-        out.extend_from_slice(format!("stash@{slot}: {}\n", entry.message).as_bytes());
+        out.extend_from_slice(format!("stash@{{{slot}}}: {}\n", entry.message).as_bytes());
     }
     Ok(out)
 }
@@ -3058,14 +3160,13 @@ fn stash_show(ctx: &Ctx, slot: Option<u64>) -> Result<Vec<u8>, GitError> {
 fn stash_drop_slot(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    if stash_read(store, slot)?.is_none() {
-        return Err(GitError::NotFound {
-            detail: format!("no such stash slot: stash@{slot}"),
-        });
-    }
+    let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {
+        detail: format!("no such stash slot: stash@{{{slot}}}"),
+    })?;
+    let commit_hex = entry.commit_hex.clone();
     stash_drop(store, slot)?;
     repoint_stash_ref(ctx)?;
-    Ok(format!("Dropped stash@{slot}\n").into_bytes())
+    Ok(format!("Dropped refs/stash@{{{slot}}} ({commit_hex})\n").into_bytes())
 }
 
 /// Points `refs/stash` at the newest live slot, deleting it when empty.
@@ -3125,7 +3226,7 @@ fn stash_apply(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {
-        detail: format!("no such stash slot: stash@{slot}"),
+        detail: format!("no such stash slot: stash@{{{slot}}}"),
     })?;
     let base = head_oid(store)
         .ok()
@@ -3192,15 +3293,28 @@ fn stash_apply(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     store
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;
-    Ok(format!("Applied stash@{slot}\n").into_bytes())
+    let plan = super::verbs_stage::status_plan(ctx, store, kind)?;
+    let branch = super::verbs_stage::long_branch_label(store)?;
+    Ok(super::verbs_stage::render_long(store, &branch, &plan))
 }
 
-/// Applies one slot and drops it.
+/// Applies one slot and drops it, reporting the worktree status plus the
+/// `Dropped refs/stash@{n} (<oid>)` line like the oracle.
 fn stash_pop(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     stash_apply(ctx, slot)?;
-    stash_drop(ctx.store()?, slot)?;
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {
+        detail: format!("no such stash slot: stash@{{{slot}}}"),
+    })?;
+    let commit_hex = entry.commit_hex.clone();
+    stash_drop(store, slot)?;
     repoint_stash_ref(ctx)?;
-    Ok(format!("Dropped stash@{slot}\n").into_bytes())
+    let plan = super::verbs_stage::status_plan(ctx, store, kind)?;
+    let branch = super::verbs_stage::long_branch_label(store)?;
+    let mut out = super::verbs_stage::render_long(store, &branch, &plan);
+    out.extend_from_slice(format!("Dropped refs/stash@{{{slot}}} ({commit_hex})\n").as_bytes());
+    Ok(out)
 }
 
 /// Deletes every stash slot and the stash ref.

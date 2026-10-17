@@ -73,6 +73,7 @@ fn repo_ctx(root: &PathBuf, mut env: CliEnv) -> Ctx {
         env,
         bare: false,
         cli_config: Vec::new(),
+        stderr: Vec::new(),
     }
 }
 
@@ -88,6 +89,7 @@ fn seeded_repo(case: &str, file: &str, body: &[u8]) -> (PathBuf, CliEnv) {
         env: env.clone(),
         bare: false,
         cli_config: Vec::new(),
+        stderr: Vec::new(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -394,9 +396,12 @@ fn tag_stash_remote_config_cycle() {
     std::fs::write(root.join("m.txt"), b"m2\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["m.txt"]).expect("stage");
     let out = run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
-    assert!(String::from_utf8_lossy(&out).contains("stash@0"));
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "Saved working directory and index state On main: wip\n"
+    );
     let out = run(verbs_branch::stash, &mut ctx, &["list"]).expect("stash list");
-    assert!(String::from_utf8_lossy(&out).contains("wip"));
+    assert_eq!(String::from_utf8_lossy(&out), "stash@{0}: On main: wip\n");
     run(verbs_branch::stash, &mut ctx, &["pop"]).expect("stash pop");
     let out = run(verbs_stage::ls_files, &mut ctx, &["-s"]).expect("ls-files");
     assert!(String::from_utf8_lossy(&out).contains("m.txt"));
@@ -416,6 +421,7 @@ fn clone_fetch_push_local_cycle() {
         env: env.clone(),
         bare: false,
         cli_config: Vec::new(),
+        stderr: Vec::new(),
     };
     run(
         verbs_repo::clone,
@@ -451,6 +457,7 @@ fn unsupported_verbs_report_closed_codes() {
         env,
         bare: false,
         cli_config: Vec::new(),
+        stderr: Vec::new(),
     };
     for verb in [
         verbs_objects::pack_objects
@@ -549,6 +556,67 @@ fn serve_verbs_round_trip_scripted_stdin() {
 
     let _ = std::fs::remove_dir_all(root_a.parent().expect("parent"));
     let _ = std::fs::remove_dir_all(root_b.parent().expect("parent"));
+}
+
+#[test]
+fn parity_cosmetic_output_shapes() {
+    let (root, env) = seeded_repo("shapes", "a.txt", b"hello\n");
+    let mut ctx = repo_ctx(&root, env);
+    // Second commit on a modified file: short branch, diffstat, no
+    // per-file lines, no create/delete lines for pure modifications.
+    std::fs::write(root.join("a.txt"), b"hello world\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["a.txt"]).expect("add");
+    let out = run(verbs_history::commit, &mut ctx, &["-m", "two"]).expect("commit");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.starts_with("[main "), "header: {text}");
+    assert!(text.contains(" 1 file changed, 1 insertion(+), 1 deletion(-)\n"));
+    assert!(!text.contains("create mode"), "no mode lines: {text}");
+    // Dirty long status carries the oracle hint lines and aligned entries.
+    std::fs::write(root.join("a.txt"), b"hello again\n").expect("dirty");
+    let out = run(verbs_stage::status, &mut ctx, &[]).expect("status");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.starts_with("On branch main\n"), "branch: {text}");
+    assert!(text.contains("  (use \"git add <file>...\" to update what will be committed)\n"));
+    assert!(text.contains("\tmodified:   a.txt\n"), "entry: {text}");
+    assert!(
+        text.contains("no changes added to commit (use \"git add\" and/or \"git commit -a\")\n")
+    );
+    // Unstaged diff carries the index line and the compact hunk header.
+    let out = run(verbs_history::diff, &mut ctx, &[]).expect("diff");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("diff --git a/a.txt b/a.txt\n"));
+    assert!(text.contains("index "), "index line: {text}");
+    assert!(text.contains("@@ -1 +1 @@\n"), "hunk: {text}");
+    // Branch switches report on stderr, leaving stdout empty.
+    ctx.stderr.clear();
+    let out = run(verbs_branch::checkout, &mut ctx, &["-b", "feat"]).expect("checkout -b");
+    assert!(out.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&ctx.stderr),
+        "Switched to a new branch 'feat'\n"
+    );
+    ctx.stderr.clear();
+    let out = run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout");
+    assert!(out.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&ctx.stderr),
+        "Switched to branch 'main'\n"
+    );
+    // Remote verbose lists fetch and push lines; rm names each file.
+    run(
+        verbs_repo::remote,
+        &mut ctx,
+        &["add", "origin", "https://example.com/x.git"],
+    )
+    .expect("remote add");
+    let out = run(verbs_repo::remote, &mut ctx, &["-v"]).expect("remote -v");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "origin\thttps://example.com/x.git (fetch)\norigin\thttps://example.com/x.git (push)\n"
+    );
+    let out = run(verbs_stage::rm, &mut ctx, &["a.txt"]).expect("rm");
+    assert_eq!(String::from_utf8_lossy(&out), "rm 'a.txt'\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
 #[test]

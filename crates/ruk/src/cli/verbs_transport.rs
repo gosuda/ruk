@@ -458,7 +458,8 @@ pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         ctx.kind()?,
         &format!("refs/remotes/{remote_label}/{wanted}"),
     )?;
-    super::verbs_history::merge_fast_forward(ctx, &wanted, tip)
+    let before = super::state::head_oid(store)?;
+    super::verbs_history::merge_fast_forward(ctx, &wanted, before, tip)
 }
 
 /// Pushes refs to a local repository through a persisted plan.

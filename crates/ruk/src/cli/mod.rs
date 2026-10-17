@@ -105,6 +105,9 @@ pub(crate) struct Ctx {
     pub(crate) bare: bool,
     /// `-c` / `--config-env` overrides, in order given.
     pub(crate) cli_config: Vec<(String, String)>,
+    /// Advisory bytes for standard error (e.g. `Switched to branch ...`),
+    /// kept off the stdout return the way git splits its descriptors.
+    pub(crate) stderr: Vec<u8>,
 }
 
 impl Ctx {
@@ -132,6 +135,12 @@ impl Ctx {
         self.store
             .as_ref()
             .and_then(|store| state::config_read(store, name).ok().flatten())
+    }
+
+    /// Queues advisory bytes for standard error, the way `checkout` and
+    /// `switch` report branch moves off the stdout channel.
+    pub(crate) fn emit_stderr(&mut self, text: &[u8]) {
+        self.stderr.extend_from_slice(text);
     }
 
     /// Refuses worktree verbs on bare repositories.
@@ -182,9 +191,9 @@ pub(crate) struct CliOutcome {
 /// exit status.
 pub(crate) fn run_captured(argv: Vec<String>, env: CliEnv) -> CliOutcome {
     match run_inner(&argv, env) {
-        Ok(stdout) => CliOutcome {
+        Ok((stdout, stderr)) => CliOutcome {
             stdout,
-            stderr: Vec::new(),
+            stderr,
             code: 0,
         },
         Err(err) => CliOutcome {
@@ -235,7 +244,7 @@ pub fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
 }
 
 /// Parses globals, discovers the repository, and dispatches the verb.
-pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<Vec<u8>, GitError> {
+pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8>), GitError> {
     let rest = argv.first().map_or(&[][..], |_| &argv[1.min(argv.len())..]);
     let (globals, verb, verb_args) = split_globals(rest)?;
     let mut env = env;
@@ -270,19 +279,20 @@ pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<Vec<u8>, GitErro
         });
     };
     if verb == "--help" || verb == "-h" {
-        return Ok(dispatch::help_text(None));
+        return Ok((dispatch::help_text(None), Vec::new()));
     }
     if verb == "--version" || verb == "-v" {
-        return Ok(dispatch::version_text());
+        return Ok((dispatch::version_text(), Vec::new()));
     }
     let entry = dispatch::lookup(&verb).ok_or_else(|| GitError::Unsupported {
         command: verb.clone(),
     })?;
     if verb_args.iter().any(|arg| arg == "--help") {
-        return Ok(dispatch::help_text(Some(entry)));
+        return Ok((dispatch::help_text(Some(entry)), Vec::new()));
     }
     let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, entry.needs_repo)?;
-    (entry.run)(&mut ctx, &verb_args)
+    let stdout = (entry.run)(&mut ctx, &verb_args)?;
+    Ok((stdout, std::mem::take(&mut ctx.stderr)))
 }
 
 /// Splits leading global options from the verb and its arguments.
@@ -417,6 +427,7 @@ fn open_ctx(
             env,
             bare,
             cli_config,
+            stderr: Vec::new(),
         });
     }
     let root = find_root(&env.cwd, git_dir.as_deref(), bare)?;
@@ -438,6 +449,7 @@ fn open_ctx(
         env,
         bare,
         cli_config,
+        stderr: Vec::new(),
     })
 }
 

@@ -355,6 +355,7 @@ pub(crate) fn rm(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
     for positional in &opts.positionals {
         let path = repo_path_of(ctx, positional.as_bytes())?;
         let before = read_path_rows(store, kind, &path)?;
@@ -374,11 +375,13 @@ pub(crate) fn rm(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
                 let nested_before = read_path_rows(store, kind, &nested_path)?;
                 mutations.extend(path_row_mutations(&nested_path, &nested_before, &[])?);
                 files.push(join_base(&ctx.file_base, nested_path.as_bytes())?);
+                removed.push(String::from_utf8_lossy(nested_path.as_bytes()).into_owned());
             }
             continue;
         }
         mutations.extend(path_row_mutations(&path, &before, &[])?);
         files.push(join_base(&ctx.file_base, path.as_bytes())?);
+        removed.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
@@ -398,7 +401,11 @@ pub(crate) fn rm(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             }
         }
     }
-    Ok(Vec::new())
+    let mut out = Vec::new();
+    for path in removed {
+        out.extend_from_slice(format!("rm '{path}'\n").as_bytes());
+    }
+    Ok(out)
 }
 
 /// Collects every tracked path below a directory prefix. Callers re-read
@@ -735,28 +742,35 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if opts.is_set("porcelain") || opts.is_set("short") {
         let branch = opts
             .is_set("branch")
-            .then(|| branch_label(store))
+            .then(|| porcelain_branch(store))
             .transpose()?;
         return Ok(render_porcelain(&plan, branch.as_deref()));
     }
-    let branch = branch_label(store)?;
-    Ok(render_long(&branch, &plan))
+    let branch = long_branch_label(store)?;
+    Ok(render_long(store, &branch, &plan))
 }
 
 /// One computed status: staged, unstaged, unmerged, and untracked paths.
-struct StatusPlan {
-    /// `(path, staged code)` in path order.
-    staged: Vec<(Vec<u8>, char)>,
+pub(crate) struct StatusPlan {
+    /// `(path, staged code, index/head identity)` in path order. The
+    /// identity backs exact-rename pairing; `None` for modified/unmerged.
+    pub(crate) staged: Vec<(Vec<u8>, char, Option<(FileMode, ruk_core::ids::Oid)>)>,
+    /// `(old path, new path)` additions/deletions of identical blobs.
+    pub(crate) renames: Vec<(Vec<u8>, Vec<u8>)>,
     /// `(path, worktree code)` in path order.
-    unstaged: Vec<(Vec<u8>, char)>,
+    pub(crate) unstaged: Vec<(Vec<u8>, char)>,
     /// Unmerged paths in path order.
-    unmerged: Vec<Vec<u8>>,
+    pub(crate) unmerged: Vec<Vec<u8>>,
     /// Untracked paths in path order.
-    untracked: Vec<Vec<u8>>,
+    pub(crate) untracked: Vec<Vec<u8>>,
 }
 
 /// Compares `HEAD` tree, index rows, and worktree files.
-fn status_plan(ctx: &Ctx, store: &Store, kind: HashKind) -> Result<StatusPlan, GitError> {
+pub(crate) fn status_plan(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+) -> Result<StatusPlan, GitError> {
     let head_tree = head_tree_map(ctx, store)?;
     let rows = scan_index(store, kind)?;
     let mut index_merged: BTreeMap<Vec<u8>, (FileMode, ruk_core::ids::Oid)> = BTreeMap::new();
@@ -769,26 +783,27 @@ fn status_plan(ctx: &Ctx, store: &Store, kind: HashKind) -> Result<StatusPlan, G
     let mut staged = Vec::new();
     let mut known: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     for (path, _) in unmerged.iter() {
-        staged.push((path.clone(), 'U'));
+        staged.push((path.clone(), 'U', None));
         known.insert(path.clone(), true);
     }
     for (path, mode_oid) in &index_merged {
         known.insert(path.clone(), true);
         match head_tree.get(path) {
-            None => staged.push((path.clone(), 'A')),
+            None => staged.push((path.clone(), 'A', Some(*mode_oid))),
             Some(head_mode_oid) => {
                 if head_mode_oid != mode_oid {
-                    staged.push((path.clone(), 'M'));
+                    staged.push((path.clone(), 'M', None));
                 }
             }
         }
     }
-    for (path, _) in &head_tree {
+    for (path, mode_oid) in &head_tree {
         if !known.contains_key(path) {
-            staged.push((path.clone(), 'D'));
+            staged.push((path.clone(), 'D', Some(*mode_oid)));
         }
     }
     staged.sort();
+    let renames = pair_exact_renames(&mut staged);
     let mut blobs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut unstaged = Vec::new();
     let mut untracked = Vec::new();
@@ -823,10 +838,67 @@ fn status_plan(ctx: &Ctx, store: &Store, kind: HashKind) -> Result<StatusPlan, G
     unmerged_paths_sorted.sort();
     Ok(StatusPlan {
         staged,
+        renames,
         unstaged,
         unmerged: unmerged_paths_sorted,
         untracked,
     })
+}
+
+/// Pairs staged additions with staged deletions of identical blobs into
+/// `(old, new)` renames, removing both sides from `staged`. The oracle
+/// reports similarity-100% moves as `R  old -> new`; content-exact
+/// pairing reproduces that without a similarity engine.
+fn pair_exact_renames(
+    staged: &mut Vec<(Vec<u8>, char, Option<(FileMode, ruk_core::ids::Oid)>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut renames = Vec::new();
+    let mut kept = Vec::new();
+    let mut unmatched_adds: Vec<(Vec<u8>, FileMode, ruk_core::ids::Oid)> = Vec::new();
+    for (path, code, identity) in staged.drain(..) {
+        if code == 'A' {
+            if let Some((mode, oid)) = identity {
+                unmatched_adds.push((path, mode, oid));
+                continue;
+            }
+        }
+        kept.push((path, code, identity));
+    }
+    let mut taken = vec![false; unmatched_adds.len()];
+    let mut restaged = Vec::new();
+    for (path, code, identity) in kept {
+        if code != 'D' {
+            restaged.push((path, code, identity));
+            continue;
+        }
+        let (Some((mode, oid))) = identity else {
+            restaged.push((path, code, identity));
+            continue;
+        };
+        let mut paired = None;
+        for (index, (new_path, new_mode, new_oid)) in unmatched_adds.iter().enumerate() {
+            if !taken[index] && *new_mode == mode && *new_oid == oid {
+                paired = Some((index, new_path.clone()));
+                break;
+            }
+        }
+        match paired {
+            Some((index, new_path)) => {
+                taken[index] = true;
+                renames.push((path, new_path));
+            }
+            None => restaged.push((path, code, Some((mode, oid)))),
+        }
+    }
+    for (index, (path, mode, oid)) in unmatched_adds.into_iter().enumerate() {
+        if !taken[index] {
+            restaged.push((path, 'A', Some((mode, oid))));
+        }
+    }
+    restaged.sort();
+    renames.sort();
+    *staged = restaged;
+    renames
 }
 
 /// Maps every path of the `HEAD` tree to its mode and oid. Unborn `HEAD`
@@ -874,36 +946,66 @@ fn read_entry_bytes(ctx: &Ctx, entry: &WorktreeEntry) -> Result<Vec<u8>, GitErro
     }
 }
 
-/// Renders porcelain v1 lines (`XY <path>`, `?? <path>`).
+/// Renders porcelain v1 lines (`XY <path>`, `R  <old> -> <new>`,
+/// `?? <path>`).
 fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some(branch) = branch {
         out.extend_from_slice(format!("## {branch}\n").as_bytes());
     }
     let mut staged_map: BTreeMap<&Vec<u8>, char> = BTreeMap::new();
-    for (path, code) in &plan.staged {
+    for (path, code, _) in &plan.staged {
         staged_map.insert(path, *code);
     }
     let mut unstaged_map: BTreeMap<&Vec<u8>, char> = BTreeMap::new();
     for (path, code) in &plan.unstaged {
         unstaged_map.insert(path, *code);
     }
-    let mut paths: Vec<&Vec<u8>> = staged_map
-        .keys()
-        .chain(unstaged_map.keys())
-        .copied()
-        .collect();
-    paths.sort();
-    paths.dedup();
-    for path in paths {
+    let mut rename_new: BTreeMap<&Vec<u8>, &Vec<u8>> = BTreeMap::new();
+    for (old, new) in &plan.renames {
+        rename_new.insert(new, old);
+    }
+    let mut lines: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for path in staged_map.keys().chain(unstaged_map.keys()) {
+        if plan.renames.iter().any(|(old, _)| old == *path) {
+            continue;
+        }
         let staged_code = staged_map.get(path).copied().unwrap_or(' ');
         let unstaged_code = unstaged_map.get(path).copied().unwrap_or(' ');
         if staged_code == ' ' && unstaged_code == ' ' {
             continue;
         }
-        out.extend_from_slice(format!("{staged_code}{unstaged_code} ").as_bytes());
-        out.extend_from_slice(path);
-        out.push(b'\n');
+        match rename_new.get(path) {
+            Some(old) => {
+                let line = format!(
+                    "R{unstaged_code} {} -> {}\n",
+                    String::from_utf8_lossy(old),
+                    String::from_utf8_lossy(path)
+                );
+                lines.insert((*path).clone(), line.into_bytes());
+            }
+            None => {
+                let line = format!(
+                    "{staged_code}{unstaged_code} {}\n",
+                    String::from_utf8_lossy(path)
+                );
+                lines.insert((*path).clone(), line.into_bytes());
+            }
+        }
+    }
+    for (new, old) in &rename_new {
+        if lines.contains_key(*new) {
+            continue;
+        }
+        let line = format!(
+            "R  {} -> {}\n",
+            String::from_utf8_lossy(old),
+            String::from_utf8_lossy(new)
+        );
+        lines.insert((*new).clone(), line.into_bytes());
+    }
+    for line in lines.into_values() {
+        out.extend_from_slice(&line);
     }
     for path in &plan.unmerged {
         if !staged_map.contains_key(&path) {
@@ -920,53 +1022,182 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
     out
 }
 
-/// Names the checked-out branch, or the detached oid, for long status.
-fn branch_label(store: &Store) -> Result<String, GitError> {
-    let (workspace, _) = load_or_default(store)?;
-    match &workspace.head {
-        ruk_core::workspace::HeadRef::Symbolic(name) => Ok(name
-            .to_utf8()
-            .map_or_else(|| format!("{name}"), str::to_owned)),
-        ruk_core::workspace::HeadRef::Detached(oid) => Ok(format!("detached at {}", oid.to_hex())),
+/// Names the checked-out branch shortened (`main`, not `refs/heads/main`),
+/// for porcelain's `##` header (`HEAD (no branch)` when detached).
+fn porcelain_branch(store: &Store) -> Result<String, GitError> {
+    match current_short_branch(store)? {
+        Some(name) => Ok(name),
+        None => Ok("HEAD (no branch)".to_owned()),
     }
 }
 
-/// Renders the default long status from one plan.
-fn render_long(branch: &str, plan: &StatusPlan) -> Vec<u8> {
+/// Names the checked-out branch for long status, shortened like the
+/// oracle (`HEAD detached at <short>` when detached).
+pub(crate) fn long_branch_label(store: &Store) -> Result<String, GitError> {
+    match current_short_branch(store)? {
+        Some(name) => Ok(name),
+        None => {
+            let tip = super::state::head_oid(store)?;
+            Ok(format!("HEAD detached at {}", short_oid(&tip)))
+        }
+    }
+}
+
+/// Reads the checked-out branch shortened, or `None` when detached.
+fn current_short_branch(store: &Store) -> Result<Option<String>, GitError> {
+    let (workspace, _) = load_or_default(store)?;
+    match &workspace.head {
+        ruk_core::workspace::HeadRef::Symbolic(name) => Ok(Some(
+            name.to_utf8()
+                .map_or_else(|| format!("{name}"), str::to_owned)
+                .trim_start_matches("refs/heads/")
+                .to_owned(),
+        )),
+        ruk_core::workspace::HeadRef::Detached(_) => Ok(None),
+    }
+}
+
+/// Shortens one object id for status output.
+fn short_oid(oid: &ruk_core::ids::Oid) -> String {
+    oid.to_hex().chars().take(7).collect()
+}
+
+/// Reports whether `HEAD` is unborn (a branch with no commit yet), which
+/// selects the `No commits yet` status block and the `rm --cached` hint.
+fn head_unborn(store: &Store) -> Result<bool, GitError> {
+    let (workspace, _) = load_or_default(store)?;
+    Ok(match super::state::resolve_head(store, &workspace.head)? {
+        super::state::ResolvedHead::Detached(_) => false,
+        super::state::ResolvedHead::Symbolic(resolved) => resolved.oid.is_none(),
+    })
+}
+
+/// Renders the default long status from one plan, matching the oracle's
+/// section order, hint text, blank lines, and footers exactly.
+pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec<u8> {
+    let unborn = head_unborn(store).unwrap_or(false);
     let mut out = Vec::new();
     out.extend_from_slice(format!("On branch {branch}\n").as_bytes());
-    if plan.staged.is_empty() && plan.unstaged.is_empty() && plan.untracked.is_empty() {
-        out.extend_from_slice(b"nothing to commit, working tree clean\n");
+    if unborn {
+        out.extend_from_slice(b"\nNo commits yet\n");
+    }
+    if plan.staged.is_empty()
+        && plan.renames.is_empty()
+        && plan.unstaged.is_empty()
+        && plan.untracked.is_empty()
+    {
+        if unborn {
+            out.extend_from_slice(
+                b"\nnothing to commit (create/copy files and use \"git add\" to track)\n",
+            );
+        } else {
+            out.extend_from_slice(b"nothing to commit, working tree clean\n");
+        }
         return line(out);
     }
-    if !plan.staged.is_empty() {
-        out.extend_from_slice(b"Changes to be committed:\n");
-        for (path, code) in &plan.staged {
-            let word = match code {
-                'A' => "new file",
-                'D' => "deleted",
-                'U' => "unmerged",
-                _ => "modified",
-            };
-            out.extend_from_slice(
-                format!("\t{word}: {}\n", String::from_utf8_lossy(path)).as_bytes(),
-            );
+    let mut sections: Vec<Vec<u8>> = Vec::new();
+    let staged_lines = staged_status_lines(plan);
+    if !staged_lines.is_empty() {
+        let mut section = Vec::from(b"Changes to be committed:\n".as_slice());
+        if unborn {
+            section.extend_from_slice(b"  (use \"git rm --cached <file>...\" to unstage)\n");
+        } else {
+            section.extend_from_slice(b"  (use \"git restore --staged <file>...\" to unstage)\n");
         }
+        for entry in staged_lines {
+            section.extend_from_slice(&entry);
+        }
+        sections.push(section);
     }
     if !plan.unstaged.is_empty() {
-        out.extend_from_slice(b"Changes not staged for commit:\n");
-        for (path, code) in &plan.unstaged {
-            let word = if *code == 'D' { "deleted" } else { "modified" };
-            out.extend_from_slice(
-                format!("\t{word}: {}\n", String::from_utf8_lossy(path)).as_bytes(),
+        let mut section = Vec::from(b"Changes not staged for commit:\n".as_slice());
+        if plan.unstaged.iter().any(|(_, code)| *code == 'D') {
+            section.extend_from_slice(
+                b"  (use \"git add/rm <file>...\" to update what will be committed)\n",
+            );
+        } else {
+            section.extend_from_slice(
+                b"  (use \"git add <file>...\" to update what will be committed)\n",
             );
         }
+        section.extend_from_slice(
+            b"  (use \"git restore <file>...\" to discard changes in working directory)\n",
+        );
+        for (path, code) in &plan.unstaged {
+            let word = if *code == 'D' { "deleted" } else { "modified" };
+            section.extend_from_slice(&status_entry(word, path));
+        }
+        sections.push(section);
     }
     if !plan.untracked.is_empty() {
-        out.extend_from_slice(b"Untracked files:\n");
+        let mut section = Vec::from(b"Untracked files:\n".as_slice());
+        section.extend_from_slice(
+            b"  (use \"git add <file>...\" to include in what will be committed)\n",
+        );
         for path in &plan.untracked {
-            out.extend_from_slice(format!("\t{}\n", String::from_utf8_lossy(path)).as_bytes());
+            section.extend_from_slice(format!("\t{}\n", String::from_utf8_lossy(path)).as_bytes());
         }
+        sections.push(section);
+    }
+    let footer: &[u8] = if !plan.staged.is_empty() || !plan.renames.is_empty() {
+        b""
+    } else if !plan.unstaged.is_empty() {
+        b"\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n"
+    } else {
+        b"\nnothing added to commit but untracked files present (use \"git add\" to track)\n"
+    };
+    if unborn {
+        out.push(b'\n');
+    }
+    for (index, section) in sections.iter().enumerate() {
+        if index > 0 {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(section);
+    }
+    if footer.is_empty() {
+        out.push(b'\n');
+    } else {
+        out.extend_from_slice(footer);
     }
     line(out)
+}
+
+/// Renders staged entries plus exact renames as aligned `\t<word>:  <path>`
+/// lines, sorted by display path.
+fn staged_status_lines(plan: &StatusPlan) -> Vec<Vec<u8>> {
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (path, code, _) in &plan.staged {
+        let word = match code {
+            'A' => "new file",
+            'D' => "deleted",
+            'U' => "unmerged",
+            _ => "modified",
+        };
+        rows.push((path.clone(), status_entry(word, path)));
+    }
+    for (old, new) in &plan.renames {
+        let display = format!(
+            "{} -> {}",
+            String::from_utf8_lossy(old),
+            String::from_utf8_lossy(new)
+        );
+        rows.push((
+            new.clone(),
+            format!("\t{:11} {}\n", "renamed:", display).into_bytes(),
+        ));
+    }
+    rows.sort();
+    rows.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// Renders one aligned status entry: the `word:` label padded so the path
+/// always starts in the same column (`modified:   `, `deleted:    `).
+fn status_entry(word: &str, path: &[u8]) -> Vec<u8> {
+    format!(
+        "\t{:11} {}\n",
+        format!("{word}:"),
+        String::from_utf8_lossy(path)
+    )
+    .into_bytes()
 }
