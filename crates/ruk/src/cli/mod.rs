@@ -38,6 +38,7 @@ pub(crate) mod verbs_transport;
 mod tests;
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -58,6 +59,10 @@ pub struct CliEnv {
     pub(crate) vars: HashMap<String, String>,
     /// Working directory the command starts in.
     pub(crate) cwd: PathBuf,
+    /// Captured standard input for verbs reading stdin. `None` reads the
+    /// live process stdin; the IPC daemon sets `Some` so verbs run without
+    /// touching the daemon's own descriptors.
+    pub(crate) stdin: Option<Vec<u8>>,
 }
 
 impl CliEnv {
@@ -67,6 +72,7 @@ impl CliEnv {
         Self {
             vars: std::env::vars().collect(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            stdin: None,
         }
     }
 
@@ -156,28 +162,80 @@ enum Global {
 /// `--help` and `--version` short-circuit before repository discovery, also
 /// as in `git.c`. Every failure maps to its native exit status through
 /// [`GitError::exit_code`].
-#[must_use]
-pub fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
+/// The captured output of one interpreter run, for callers that cannot use
+/// the process descriptors (the IPC daemon serves command streams on its
+/// socket and must return bytes, not write the daemon's stdout).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CliOutcome {
+    /// Bytes for standard output; empty when the verb prints nothing.
+    pub(crate) stdout: Vec<u8>,
+    /// Bytes for standard error; empty on success.
+    pub(crate) stderr: Vec<u8>,
+    /// Native process exit status: zero on success.
+    pub(crate) code: u8,
+}
+
+/// Runs one argv against `env` without touching process descriptors.
+///
+/// Success carries the verb's stdout bytes with code zero; failure renders
+/// the same `ruk: {err}` line [`run`] would print, with the error's native
+/// exit status.
+pub(crate) fn run_captured(argv: Vec<String>, env: CliEnv) -> CliOutcome {
     match run_inner(&argv, env) {
-        Ok(out) => {
-            let stdout = std::io::stdout();
-            let mut lock = stdout.lock();
-            if lock.write_all(&out).is_err() || lock.flush().is_err() {
-                return ExitCode::from(1);
-            }
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            let stderr = std::io::stderr();
-            let mut lock = stderr.lock();
-            let _ = writeln!(lock, "ruk: {err}");
-            ExitCode::from(err.exit_code())
-        }
+        Ok(stdout) => CliOutcome {
+            stdout,
+            stderr: Vec::new(),
+            code: 0,
+        },
+        Err(err) => CliOutcome {
+            stdout: Vec::new(),
+            stderr: format!("ruk: {err}\n").into_bytes(),
+            code: err.exit_code(),
+        },
     }
 }
 
+/// Reads standard input bytes for `env`: the captured buffer when the
+/// caller supplied one, else the live process stdin.
+pub(crate) fn read_stdin_bytes(env: &CliEnv) -> Result<Vec<u8>, GitError> {
+    if let Some(bytes) = env.stdin.as_deref() {
+        return Ok(bytes.to_vec());
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|err| GitError::Io {
+            detail: format!("reading stdin: {err}"),
+        })?;
+    Ok(buf)
+}
+
+/// Reads standard input as text, tolerating non-UTF-8 bytes the way a
+/// byte-oriented daemon transport must.
+pub(crate) fn read_stdin_text(env: &CliEnv) -> Result<String, GitError> {
+    Ok(String::from_utf8_lossy(&read_stdin_bytes(env)?).into_owned())
+}
+
+#[must_use]
+pub fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
+    let outcome = run_captured(argv, env);
+    if !outcome.stdout.is_empty() {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        if lock.write_all(&outcome.stdout).is_err() || lock.flush().is_err() {
+            return ExitCode::from(1);
+        }
+    }
+    if !outcome.stderr.is_empty() {
+        let stderr = std::io::stderr();
+        let mut lock = stderr.lock();
+        let _ = lock.write_all(&outcome.stderr);
+    }
+    ExitCode::from(outcome.code)
+}
+
 /// Parses globals, discovers the repository, and dispatches the verb.
-fn run_inner(argv: &[String], env: CliEnv) -> Result<Vec<u8>, GitError> {
+pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<Vec<u8>, GitError> {
     let rest = argv.first().map_or(&[][..], |_| &argv[1.min(argv.len())..]);
     let (globals, verb, verb_args) = split_globals(rest)?;
     let mut env = env;

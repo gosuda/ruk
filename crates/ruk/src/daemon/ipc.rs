@@ -407,7 +407,10 @@ impl StreamCredits {
 pub struct HandshakeHello {
     /// The client's protocol major version.
     pub protocol_major: u32,
-    /// The client's protocol minor version.
+    /// The client's protocol minor version. The Forgejo Go backend omits
+    /// this field, so it defaults to zero (unknown) instead of rejecting
+    /// the handshake.
+    #[serde(default)]
     pub protocol_minor: u32,
     /// The requested service profile, such as `forgejo`.
     pub profile: String,

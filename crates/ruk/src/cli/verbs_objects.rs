@@ -67,10 +67,7 @@ pub(crate) fn hash_object(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
     }
     let mut inputs: Vec<Vec<u8>> = Vec::new();
     if opts.positionals.is_empty() || opts.is_set("stdin") {
-        let stdin = std::io::read_to_string(std::io::stdin()).map_err(|err| GitError::Io {
-            detail: format!("reading stdin: {err}"),
-        })?;
-        inputs.push(stdin.into_bytes());
+        inputs.push(super::read_stdin_bytes(&ctx.env)?);
     }
     for file in &opts.positionals {
         let path = std::path::Path::new(file);
@@ -264,9 +261,7 @@ pub(crate) fn mktree(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let _ = opts.is_set("missing-ok");
-    let stdin = std::io::read_to_string(std::io::stdin()).map_err(|err| GitError::Io {
-        detail: format!("reading stdin: {err}"),
-    })?;
+    let stdin = super::read_stdin_text(&ctx.env)?;
     let mut entries = Vec::new();
     for stdin_line in stdin.lines() {
         entries.push(parse_mktree_line(kind, stdin_line)?);

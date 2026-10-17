@@ -486,9 +486,7 @@ pub(crate) fn update_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     }
     let mut cacheinfos = opts.all("cacheinfo")?;
     if opts.is_set("stdin") {
-        let stdin = std::io::read_to_string(std::io::stdin()).map_err(|err| GitError::Io {
-            detail: format!("reading stdin: {err}"),
-        })?;
+        let stdin = super::read_stdin_text(&ctx.env)?;
         for stdin_line in stdin.lines() {
             if !stdin_line.is_empty() {
                 cacheinfos.push(stdin_line.to_owned());

@@ -13,10 +13,13 @@ pub mod executor;
 pub mod ipc;
 pub mod registry;
 
-use std::collections::HashMap;
+#[cfg(test)]
+mod tests;
+
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -336,6 +339,225 @@ pub struct ErrorReport {
     pub message: String,
 }
 
+/// Cap of outcome records held per daemon process; older invocations evict
+/// first so reconnect lookups stay bounded.
+const MAX_OUTCOME_RECORDS: usize = 10_000;
+
+/// Cap of stdin bytes collected for one command stream.
+const MAX_COMMAND_STDIN_BYTES: usize = 256 * 1024 * 1024;
+
+/// Outcome of a command that ran to its terminal report.
+const OUTCOME_COMPLETED: &str = "Completed";
+
+/// Outcome of a command cancelled before (or during) its run.
+const OUTCOME_CANCELLED: &str = "CancelledBeforeCommit";
+
+/// The `Open` payload of one argv-style command stream, mirroring the Go
+/// backend's `RukOpenRequest`. `argv` holds command args without `argv[0]`
+/// (for example `["rev-parse", "--git-dir"]`); the daemon prepends its own
+/// program name before running the interpreter.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOpen {
+    /// The Forgejo service session; accepted and ignored, reserved for the
+    /// day the service session becomes a coordinator session.
+    pub session_id: String,
+    /// The authorized repository path, canonicalized under the roots.
+    pub repository: String,
+    /// The idempotency key: reconnects replaying it observe the recorded
+    /// terminal report instead of running the command twice.
+    pub request_id: String,
+    /// Command args without `argv[0]`.
+    pub argv: Vec<String>,
+    /// Working directory the command starts in.
+    pub dir: String,
+    /// Environment as `KEY=value` entries; the command sees only these.
+    pub env: Vec<String>,
+    /// Digest over argv, directory, and environment: a reused request id
+    /// with a different digest is refused, never executed.
+    pub command_digest: String,
+    /// Initial outbound credit for stdout, added to the default window.
+    pub stdout_credit: u64,
+    /// Initial outbound credit for stderr, added to the default window.
+    pub stderr_credit: u64,
+}
+
+/// The `Accepted` payload answering one command `Open`, mirroring the Go
+/// backend's `RukAcceptedReply`. `stdin_credit` carries the inbound window
+/// granted; it is always positive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandAccepted {
+    /// The accepted stream identifier.
+    pub stream_id: u64,
+    /// The stdin credit bytes granted to the client.
+    pub stdin_credit: u64,
+    /// The invocation identity, echoing the open's request id.
+    pub invocation_id: String,
+}
+
+/// The `Exit` payload ending one command stream, mirroring the Go
+/// backend's `RukExitReport`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandExitReport {
+    /// The native process exit status: zero on success.
+    pub exit_code: i32,
+    /// The terminating signal name; empty for a normal exit.
+    pub signal: String,
+    /// True when cancellation ended the invocation.
+    pub cancelled: bool,
+    /// The durable outcome: `Completed` or `CancelledBeforeCommit`.
+    pub outcome: String,
+    /// Operation identities of the run; empty for CLI verbs.
+    pub operation_ids: Vec<String>,
+    /// The invocation identity, echoing the open's request id.
+    pub invocation_id: String,
+}
+
+impl CommandExitReport {
+    /// Builds the terminal report of a command that ran to completion.
+    fn success(invocation: &str, code: u8) -> Self {
+        Self {
+            exit_code: i32::from(code),
+            signal: String::new(),
+            cancelled: false,
+            outcome: OUTCOME_COMPLETED.to_string(),
+            operation_ids: Vec::new(),
+            invocation_id: invocation.to_string(),
+        }
+    }
+
+    /// Builds the terminal report of a failed command.
+    fn failure(invocation: &str) -> Self {
+        Self::success(invocation, 1)
+    }
+
+    /// Builds the terminal report of a cancelled command.
+    fn cancelled(invocation: &str) -> Self {
+        Self {
+            exit_code: 130,
+            signal: String::new(),
+            cancelled: true,
+            outcome: OUTCOME_CANCELLED.to_string(),
+            operation_ids: Vec::new(),
+            invocation_id: invocation.to_string(),
+        }
+    }
+}
+
+/// One stream-zero typed control query, mirroring the Go backend's
+/// `RukControlRequest`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRequest {
+    /// The query type; the daemon answers `outcome-lookup`.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// The invocation identity to look up.
+    pub invocation_id: String,
+}
+
+/// The answer to one control query, mirroring the Go backend's
+/// `RukControlReply`. It travels on an `Accepted` frame with no terminal
+/// `Exit`: the connection stays open for further streams.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlReply {
+    /// The query type echoed back.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// True when the ledger holds the invocation's terminal report.
+    pub found: bool,
+    /// The recorded terminal report; absent when `found` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<CommandExitReport>,
+}
+
+/// One daemon-to-client stdin credit grant. The field names match the Go
+/// backend's `RukWindowUpdate` exactly (`bytes`, not the daemon's
+/// `credit_bytes`), so the client's credit window observes the grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StdinGrant {
+    /// The granted direction: always `stdin` from the daemon.
+    direction: String,
+    /// The credit bytes granted.
+    bytes: u64,
+}
+
+/// The ledger state of one invocation identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OutcomeState {
+    /// The first open is still running; reconnects wait or fail loudly.
+    Running {
+        /// The digest the running command opened with.
+        digest: String,
+    },
+    /// The terminal report; replays observe it without re-running.
+    Done(CommandExitReport),
+}
+
+/// One ledger row: the digest that claimed the identity plus its state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutcomeEntry {
+    /// The digest of the command holding this identity.
+    digest: String,
+    /// Running or terminal.
+    state: OutcomeState,
+}
+
+/// The process-wide outcome ledger behind reconnect lookups.
+///
+/// Every connection task shares one ledger through [`ConnectionRefs`], so
+/// an outcome lookup arriving on a fresh connection observes commands that
+/// ran on any other connection of this process.
+#[derive(Debug, Default)]
+struct OutcomeLedger {
+    /// Invocation identity to its row.
+    records: HashMap<String, OutcomeEntry>,
+    /// Insertion order for oldest-first eviction; may hold stale names of
+    /// removed rows, which eviction skips.
+    order: VecDeque<String>,
+}
+
+impl OutcomeLedger {
+    /// Claims `id` for a fresh command, evicting oldest-first past the cap.
+    fn insert_running(&mut self, id: &str, digest: &str) {
+        while self.records.len() >= MAX_OUTCOME_RECORDS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.records.remove(&oldest);
+        }
+        self.order.push_back(id.to_string());
+        self.records.insert(
+            id.to_string(),
+            OutcomeEntry {
+                digest: digest.to_string(),
+                state: OutcomeState::Running {
+                    digest: digest.to_string(),
+                },
+            },
+        );
+    }
+
+    /// Records the terminal report of `id`, keeping its digest.
+    fn complete(&mut self, id: &str, report: CommandExitReport) {
+        if let Some(entry) = self.records.get_mut(id) {
+            entry.state = OutcomeState::Done(report);
+            return;
+        }
+        self.order.push_back(id.to_string());
+        self.records.insert(
+            id.to_string(),
+            OutcomeEntry {
+                digest: String::new(),
+                state: OutcomeState::Done(report),
+            },
+        );
+    }
+
+    /// Forgets `id` without a terminal report, so a retry may run fresh.
+    fn remove(&mut self, id: &str) {
+        self.records.remove(id);
+    }
+}
+
 /// The `session.open` answer: the durable session identity plus the secret
 /// resuming it, without invented authority.
 ///
@@ -431,6 +653,13 @@ struct ConnectionRefs {
     registry: Arc<Registry>,
     /// The shared blocking pool.
     executor: BoundedExecutor,
+    /// The process-wide outcome ledger. Every connection task shares one
+    /// ledger (linearizable through one mutex, held only for map
+    /// probes), so an outcome lookup on a fresh connection observes
+    /// commands that ran on any other connection. Consumers stay
+    /// idempotent: a replayed request id observes the recorded terminal
+    /// report instead of running the command twice.
+    outcomes: Arc<Mutex<OutcomeLedger>>,
     /// The starting credit window of each stream direction.
     window_bytes: u64,
     /// The stream-zero handshake deadline.
@@ -456,6 +685,7 @@ async fn serve_async(
     let refs = ConnectionRefs {
         registry,
         executor,
+        outcomes: Arc::new(Mutex::new(OutcomeLedger::default())),
         window_bytes: config.stream_window_bytes,
         handshake_timeout: config.handshake_timeout,
         frame_timeout: config.frame_timeout,
@@ -533,12 +763,16 @@ async fn serve_connection(
         let frame_deadline = tokio::time::Instant::now() + refs.frame_timeout;
         let frame = ipc::read_frame(&mut stream, frame_deadline).await?;
         if frame.stream_id == ipc::CONTROL_STREAM_ID {
-            if handle_control_frame(&mut stream, &frame, &mut streams, frame_deadline).await? {
+            if handle_control_frame(&mut stream, &frame, &mut streams, frame_deadline, &refs)
+                .await?
+            {
                 return Ok(());
             }
             continue;
         }
-        handle_stream_frame(&mut stream, frame, &mut streams, &mut credits, &refs, peer).await?;
+        if handle_stream_frame(&mut stream, frame, &mut streams, &mut credits, &refs, peer).await? {
+            return Ok(());
+        }
     }
 }
 
@@ -548,6 +782,7 @@ async fn handle_control_frame(
     frame: &ipc::Frame,
     streams: &mut HashMap<u64, StreamState>,
     deadline: tokio::time::Instant,
+    refs: &ConnectionRefs,
 ) -> Result<bool, Error> {
     match frame.kind {
         ipc::FrameKind::Cancel => {
@@ -562,17 +797,16 @@ async fn handle_control_frame(
             Ok(false)
         }
         ipc::FrameKind::Exit | ipc::FrameKind::Error => Ok(true),
-        ipc::FrameKind::Open
-        | ipc::FrameKind::Accepted
+        ipc::FrameKind::Open => answer_control_open(stream, frame, deadline, refs).await,
+        ipc::FrameKind::Accepted
         | ipc::FrameKind::Stdin
         | ipc::FrameKind::StdinEof
         | ipc::FrameKind::Stdout
         | ipc::FrameKind::Stderr
-        | ipc::FrameKind::WindowUpdate
         | ipc::FrameKind::MergeNotices => {
             let report = ErrorReport {
                 code: ErrorCode::EInvalid.as_str().to_string(),
-                message: String::from("stream-zero carries only the handshake and global cancel"),
+                message: String::from("stream-zero carries only the handshake and control queries"),
             };
             let bytes = ipc::encode_control(&report)?;
             ipc::write_frame(
@@ -588,6 +822,92 @@ async fn handle_control_frame(
     }
 }
 
+/// Answers one stream-zero `Open` control query without ending the
+/// connection: `outcome-lookup` reads the shared ledger and replies on an
+/// `Accepted` frame, anything else gets an `Error` frame.
+#[cfg(unix)]
+async fn answer_control_open(
+    stream: &mut tokio::net::UnixStream,
+    frame: &ipc::Frame,
+    deadline: tokio::time::Instant,
+    refs: &ConnectionRefs,
+) -> Result<bool, Error> {
+    let query: ControlRequest = match ipc::decode_control(&frame.payload) {
+        Ok(query) => query,
+        Err(err) => {
+            write_control_error(stream, &err, deadline).await?;
+            return Ok(false);
+        }
+    };
+    if query.type_ != "outcome-lookup" {
+        let err = CoreError::new(
+            ErrorCode::EInvalid,
+            format!("unknown control query `{}`", query.type_),
+        );
+        write_control_error(stream, &err, deadline).await?;
+        return Ok(false);
+    }
+    let reply = {
+        let ledger = lock_outcomes(refs)?;
+        let exit = ledger
+            .records
+            .get(&query.invocation_id)
+            .and_then(|entry| match &entry.state {
+                OutcomeState::Done(report) => Some(report.clone()),
+                OutcomeState::Running { .. } => None,
+            });
+        ControlReply {
+            type_: query.type_.clone(),
+            found: exit.is_some(),
+            exit,
+        }
+    };
+    let bytes = ipc::encode_control(&reply)?;
+    ipc::write_frame(
+        stream,
+        ipc::FrameKind::Accepted,
+        ipc::CONTROL_STREAM_ID,
+        &bytes,
+        deadline,
+    )
+    .await?;
+    Ok(false)
+}
+
+/// Writes one stream-zero `Error` frame for a rejected control query.
+#[cfg(unix)]
+async fn write_control_error(
+    stream: &mut tokio::net::UnixStream,
+    err: &CoreError,
+    deadline: tokio::time::Instant,
+) -> Result<(), Error> {
+    let report = ErrorReport {
+        code: err.code.as_str().to_string(),
+        message: err.message.clone(),
+    };
+    let bytes = ipc::encode_control(&report)?;
+    ipc::write_frame(
+        stream,
+        ipc::FrameKind::Error,
+        ipc::CONTROL_STREAM_ID,
+        &bytes,
+        deadline,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Locks the shared outcome ledger for one brief probe.
+#[cfg(unix)]
+fn lock_outcomes(refs: &ConnectionRefs) -> Result<std::sync::MutexGuard<'_, OutcomeLedger>, Error> {
+    refs.outcomes.lock().map_err(|_| {
+        Error::Core(CoreError::new(
+            ErrorCode::EIo,
+            "outcome ledger lock is poisoned",
+        ))
+    })
+}
+
 #[cfg(unix)]
 async fn handle_stream_frame(
     stream: &mut tokio::net::UnixStream,
@@ -596,7 +916,7 @@ async fn handle_stream_frame(
     credits: &mut ipc::StreamCredits,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     match frame.kind {
         ipc::FrameKind::Open => handle_open(stream, frame, streams, credits, refs, peer).await,
         ipc::FrameKind::Stdin => {
@@ -608,7 +928,7 @@ async fn handle_stream_frame(
             })?;
             if let Err(err) = credits.consume_inbound(frame.stream_id, width) {
                 send_error_exit(stream, frame.stream_id, &Error::from(err), refs).await?;
-                return Ok(());
+                return Ok(false);
             }
             let state = streams.entry(frame.stream_id).or_insert(StreamState {
                 stdin_bytes: 0,
@@ -625,41 +945,12 @@ async fn handle_stream_frame(
                 .await?;
                 credits.close_stream(frame.stream_id);
             }
-            Ok(())
+            Ok(false)
         }
-        ipc::FrameKind::StdinEof => Ok(()),
+        ipc::FrameKind::StdinEof => Ok(false),
         ipc::FrameKind::WindowUpdate => {
-            let credit: WindowCredit = ipc::decode_control(&frame.payload)?;
-            let granted = if credit.direction.is_empty() || credit.direction == "stdin" {
-                credits.grant_inbound(frame.stream_id, credit.credit_bytes)
-            } else if credit.direction == "stdout" || credit.direction == "stderr" {
-                credits.grant_outbound(frame.stream_id, credit.credit_bytes)
-            } else {
-                send_error_exit(
-                    stream,
-                    frame.stream_id,
-                    &Error::Core(CoreError::new(
-                        ErrorCode::EInvalid,
-                        "credit update names an unknown direction",
-                    )),
-                    refs,
-                )
-                .await?;
-                return Ok(());
-            };
-            if granted.is_err() {
-                send_error_exit(
-                    stream,
-                    frame.stream_id,
-                    &Error::Core(CoreError::new(
-                        ErrorCode::EInvalid,
-                        "credit update names an unknown stream",
-                    )),
-                    refs,
-                )
-                .await?;
-            }
-            Ok(())
+            apply_window_update(stream, &frame, credits, refs).await?;
+            Ok(false)
         }
         ipc::FrameKind::Cancel => {
             if let Some(state) = streams.get_mut(&frame.stream_id) {
@@ -674,7 +965,8 @@ async fn handle_stream_frame(
                 "CancelledBeforeCommit",
                 refs,
             )
-            .await
+            .await?;
+            Ok(false)
         }
         ipc::FrameKind::Accepted
         | ipc::FrameKind::Stdout
@@ -691,9 +983,61 @@ async fn handle_stream_frame(
                 )),
                 refs,
             )
-            .await
+            .await?;
+            Ok(false)
         }
     }
+}
+
+/// Routes one client credit grant to the inbound or outbound window of its
+/// stream, refusing unknown directions and unknown streams.
+#[cfg(unix)]
+async fn apply_window_update(
+    stream: &mut tokio::net::UnixStream,
+    frame: &ipc::Frame,
+    credits: &mut ipc::StreamCredits,
+    refs: &ConnectionRefs,
+) -> Result<(), Error> {
+    let credit: WindowCredit = ipc::decode_control(&frame.payload)?;
+    if route_credit(credits, frame.stream_id, &credit).is_ok() {
+        return Ok(());
+    }
+    if credit.direction.is_empty()
+        || credit.direction == "stdin"
+        || credit.direction == "stdout"
+        || credit.direction == "stderr"
+    {
+        return unknown_stream_credit(stream, frame.stream_id, refs).await;
+    }
+    send_error_exit(
+        stream,
+        frame.stream_id,
+        &Error::Core(CoreError::new(
+            ErrorCode::EInvalid,
+            "credit update names an unknown direction",
+        )),
+        refs,
+    )
+    .await
+}
+
+/// Reports a credit grant for a stream the daemon does not track.
+#[cfg(unix)]
+async fn unknown_stream_credit(
+    stream: &mut tokio::net::UnixStream,
+    stream_id: u64,
+    refs: &ConnectionRefs,
+) -> Result<(), Error> {
+    send_error_exit(
+        stream,
+        stream_id,
+        &Error::Core(CoreError::new(
+            ErrorCode::EInvalid,
+            "credit update names an unknown stream",
+        )),
+        refs,
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -704,13 +1048,26 @@ async fn handle_open(
     credits: &mut ipc::StreamCredits,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let stream_id = frame.stream_id;
+    if let Ok(command) = ipc::decode_control::<CommandOpen>(&frame.payload) {
+        streams.insert(
+            stream_id,
+            StreamState {
+                stdin_bytes: 0,
+                cancelled: false,
+            },
+        );
+        credits.open_stream(stream_id);
+        let close = command_inner(stream, stream_id, command, streams, credits, refs, peer).await?;
+        credits.close_stream(stream_id);
+        return Ok(close);
+    }
     let open: InvocationOpen = match ipc::decode_control(&frame.payload) {
         Ok(open) => open,
         Err(err) => {
             send_error_exit(stream, stream_id, &Error::Core(err), refs).await?;
-            return Ok(());
+            return Ok(false);
         }
     };
     streams.insert(
@@ -723,7 +1080,848 @@ async fn handle_open(
     credits.open_stream(stream_id);
     let _ = open_inner(stream, stream_id, &open, credits, refs, peer).await;
     credits.close_stream(stream_id);
-    Ok(())
+    Ok(false)
+}
+
+/// The claim of one invocation identity against the shared ledger.
+#[cfg(unix)]
+enum RequestSlot {
+    /// Fresh identity, claimed as running by this open.
+    Run,
+    /// Terminal report recorded: replay it without running.
+    Replay(CommandExitReport),
+    /// Another connection is running this identity now.
+    Busy,
+    /// The identity is taken by a different command digest.
+    DigestMismatch,
+}
+
+/// Claims one invocation identity: fresh ids become `Run`, terminal ids
+/// replay, live ids and digest conflicts refuse. The ledger lock is held
+/// only for this probe, never across an await.
+#[cfg(unix)]
+fn claim_request_slot(
+    refs: &ConnectionRefs,
+    request_id: &str,
+    command_digest: &str,
+) -> Result<RequestSlot, Error> {
+    let mut ledger = lock_outcomes(refs)?;
+    let Some(entry) = ledger.records.get(request_id) else {
+        ledger.insert_running(request_id, command_digest);
+        return Ok(RequestSlot::Run);
+    };
+    if entry.digest != command_digest {
+        return Ok(RequestSlot::DigestMismatch);
+    }
+    match &entry.state {
+        OutcomeState::Running { .. } => Ok(RequestSlot::Busy),
+        OutcomeState::Done(report) => Ok(RequestSlot::Replay(report.clone())),
+    }
+}
+
+/// The mutable serving state of one connection, threaded through command
+/// handling so every helper takes a narrow slice of it.
+#[cfg(unix)]
+struct CommandServing<'a> {
+    /// The connection socket; one command owns it while running inline.
+    stream: &'a mut tokio::net::UnixStream,
+    /// Per-stream bookkeeping of the connection.
+    streams: &'a mut HashMap<u64, StreamState>,
+    /// Directional credit windows of the connection.
+    credits: &'a mut ipc::StreamCredits,
+    /// Shared registry, executor, ledger, and timeouts.
+    refs: &'a ConnectionRefs,
+    /// The authenticated peer of the connection.
+    peer: ipc::PeerIdentity,
+}
+
+/// One validated command ready to collect stdin and run.
+#[cfg(unix)]
+struct ReadyCommand {
+    /// The invocation identity claiming the ledger row.
+    invocation: String,
+    /// Command args without `argv[0]`.
+    argv: Vec<String>,
+    /// The hermetic variable map the command runs with.
+    vars: HashMap<String, String>,
+    /// The canonical working directory under the roots.
+    cwd: PathBuf,
+}
+
+/// Serves one argv-style command stream to its terminal frame, inline.
+///
+/// A long-running command blocks sibling streams on the same connection:
+/// `serve_connection` cannot read the next frame while this future owns
+/// the socket. That is the documented v1 limitation; frames for other
+/// streams arriving mid-command are buffered and replayed after the
+/// terminal frame instead of being dropped.
+///
+/// Returns true when the connection must close (stream-zero teardown).
+#[cfg(unix)]
+async fn command_inner(
+    stream: &mut tokio::net::UnixStream,
+    stream_id: u64,
+    req: CommandOpen,
+    streams: &mut HashMap<u64, StreamState>,
+    credits: &mut ipc::StreamCredits,
+    refs: &ConnectionRefs,
+    peer: ipc::PeerIdentity,
+) -> Result<bool, Error> {
+    let CommandOpen {
+        session_id: _,
+        repository,
+        request_id: invocation,
+        argv,
+        dir,
+        env,
+        command_digest,
+        stdout_credit,
+        stderr_credit,
+    } = req;
+    let mut serving = CommandServing {
+        stream,
+        streams,
+        credits,
+        refs,
+        peer,
+    };
+    if invocation.is_empty() {
+        refuse_unclaimed(
+            &mut serving,
+            stream_id,
+            CoreError::new(ErrorCode::EInvalid, "command open carries no request id"),
+        )
+        .await?;
+        return Ok(false);
+    }
+    match claim_request_slot(serving.refs, &invocation, &command_digest)? {
+        RequestSlot::Run => {}
+        RequestSlot::Replay(report) => {
+            return replay_command(&mut serving, stream_id, &invocation, &report).await;
+        }
+        RequestSlot::Busy => {
+            refuse_unclaimed(
+                &mut serving,
+                stream_id,
+                CoreError::new(
+                    ErrorCode::EInvalid,
+                    "invocation is still in progress on another stream",
+                ),
+            )
+            .await?;
+            return Ok(false);
+        }
+        RequestSlot::DigestMismatch => {
+            refuse_unclaimed(
+                &mut serving,
+                stream_id,
+                CoreError::new(
+                    ErrorCode::EInvalid,
+                    "request id is taken by a different command digest",
+                ),
+            )
+            .await?;
+            return Ok(false);
+        }
+    }
+    let validated = {
+        let registry = Arc::clone(&serving.refs.registry);
+        serving
+            .refs
+            .executor
+            .run(move || validate_command_fs(&registry, &repository, &dir, &env))
+            .await
+    };
+    let (canonical_dir, vars) = match validated {
+        Ok(Ok(valid)) => valid,
+        Ok(Err(err)) | Err(err) => {
+            refuse_command(&mut serving, stream_id, &invocation, err).await?;
+            return Ok(false);
+        }
+    };
+    let accepted = CommandAccepted {
+        stream_id,
+        stdin_credit: serving.refs.window_bytes,
+        invocation_id: invocation.clone(),
+    };
+    let accepted_bytes = ipc::encode_control(&accepted).map_err(Error::Core)?;
+    if serving
+        .credits
+        .grant_outbound(stream_id, stdout_credit.saturating_add(stderr_credit))
+        .is_err()
+    {
+        refuse_command(
+            &mut serving,
+            stream_id,
+            &invocation,
+            CoreError::new(ErrorCode::EInvalid, "command stream is not tracked"),
+        )
+        .await?;
+        return Ok(false);
+    }
+    if send_frame(
+        serving.stream,
+        ipc::FrameKind::Accepted,
+        stream_id,
+        &accepted_bytes,
+        serving.refs,
+    )
+    .await
+    .is_err()
+    {
+        lock_outcomes(serving.refs)?.complete(&invocation, CommandExitReport::failure(&invocation));
+        return Ok(false);
+    }
+    let ready = ReadyCommand {
+        invocation,
+        argv,
+        vars,
+        cwd: canonical_dir,
+    };
+    serve_ready_command(&mut serving, stream_id, ready).await
+}
+
+/// Collects stdin, runs the interpreter on the blocking pool, and streams
+/// the captured output to the terminal frame.
+///
+/// Returns true when the connection must close (stream-zero teardown).
+#[cfg(unix)]
+async fn serve_ready_command(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    ready: ReadyCommand,
+) -> Result<bool, Error> {
+    let ReadyCommand {
+        invocation,
+        argv,
+        vars,
+        cwd,
+    } = ready;
+    let mut pending: Vec<ipc::Frame> = Vec::new();
+    let stdin_bytes = match collect_command_stdin(serving, stream_id, &mut pending).await {
+        Ok(CollectFate::Ready(bytes)) => bytes,
+        Ok(CollectFate::Cancelled { close_connection }) => {
+            return cancel_command(serving, stream_id, &invocation, pending, close_connection)
+                .await;
+        }
+        Ok(CollectFate::Teardown) => {
+            return teardown_command(serving, &invocation).await;
+        }
+        Ok(CollectFate::Rejected(err)) => {
+            refuse_command(serving, stream_id, &invocation, err).await?;
+            return Ok(false);
+        }
+        Err(err) => {
+            lock_outcomes(serving.refs)?.remove(&invocation);
+            return Err(err);
+        }
+    };
+    let mut full_argv = Vec::with_capacity(argv.len() + 1);
+    full_argv.push("git".to_string());
+    full_argv.extend(argv);
+    let outcome = serving
+        .refs
+        .executor
+        .run(move || {
+            crate::cli::run_captured(
+                full_argv,
+                crate::cli::CliEnv {
+                    vars,
+                    cwd,
+                    stdin: Some(stdin_bytes),
+                },
+            )
+        })
+        .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            refuse_command(serving, stream_id, &invocation, err).await?;
+            return Ok(false);
+        }
+    };
+    let report = CommandExitReport::success(&invocation, outcome.code);
+    lock_outcomes(serving.refs)?.complete(&invocation, report.clone());
+    for (kind, bytes) in [
+        (ipc::FrameKind::Stdout, outcome.stdout),
+        (ipc::FrameKind::Stderr, outcome.stderr),
+    ] {
+        match write_cmd_data(serving, stream_id, kind, &bytes, &mut pending).await? {
+            WriteFate::Done => {}
+            WriteFate::Cancelled { close_connection } => {
+                return cancel_command(serving, stream_id, &invocation, pending, close_connection)
+                    .await;
+            }
+            WriteFate::Teardown => {
+                return teardown_command(serving, &invocation).await;
+            }
+        }
+    }
+    let exit_bytes = ipc::encode_control(&report).map_err(Error::Core)?;
+    send_frame(
+        serving.stream,
+        ipc::FrameKind::Exit,
+        stream_id,
+        &exit_bytes,
+        serving.refs,
+    )
+    .await?;
+    replay_pending(serving, pending).await
+}
+
+/// Records a stream-zero teardown failure and closes the connection.
+#[cfg(unix)]
+async fn teardown_command(
+    serving: &mut CommandServing<'_>,
+    invocation: &str,
+) -> Result<bool, Error> {
+    lock_outcomes(serving.refs)?.complete(invocation, CommandExitReport::failure(invocation));
+    Ok(true)
+}
+
+/// Replays one recorded terminal report: `Accepted` with the invocation
+/// identity, then the recorded `Exit`, without running the command again.
+#[cfg(unix)]
+async fn replay_command(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    invocation: &str,
+    report: &CommandExitReport,
+) -> Result<bool, Error> {
+    let accepted = CommandAccepted {
+        stream_id,
+        stdin_credit: serving.refs.window_bytes,
+        invocation_id: invocation.to_string(),
+    };
+    let accepted_bytes = ipc::encode_control(&accepted).map_err(Error::Core)?;
+    send_frame(
+        serving.stream,
+        ipc::FrameKind::Accepted,
+        stream_id,
+        &accepted_bytes,
+        serving.refs,
+    )
+    .await?;
+    let exit_bytes = ipc::encode_control(report).map_err(Error::Core)?;
+    send_frame(
+        serving.stream,
+        ipc::FrameKind::Exit,
+        stream_id,
+        &exit_bytes,
+        serving.refs,
+    )
+    .await?;
+    Ok(false)
+}
+
+/// Records the failure of a claimed `invocation` and reports it as `Error`
+/// plus the legacy terminal frame, so a later outcome lookup observes the
+/// failure instead of uncertainty.
+#[cfg(unix)]
+async fn refuse_command(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    invocation: &str,
+    err: CoreError,
+) -> Result<(), Error> {
+    lock_outcomes(serving.refs)?.complete(invocation, CommandExitReport::failure(invocation));
+    send_error_exit(serving.stream, stream_id, &Error::Core(err), serving.refs).await
+}
+
+/// Reports a refusal without touching the ledger: the identity is empty or
+/// belongs to another command, so recording a failure would poison a row
+/// this open never claimed.
+#[cfg(unix)]
+async fn refuse_unclaimed(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    err: CoreError,
+) -> Result<(), Error> {
+    send_error_exit(serving.stream, stream_id, &Error::Core(err), serving.refs).await
+}
+
+/// Ends one cancelled command with its terminal report, then replays
+/// frames buffered for sibling streams. A stream-zero cancel also closes
+/// the connection, since no further frame can arrive on it.
+#[cfg(unix)]
+async fn cancel_command(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    invocation: &str,
+    pending: Vec<ipc::Frame>,
+    close_connection: bool,
+) -> Result<bool, Error> {
+    let report = CommandExitReport::cancelled(invocation);
+    lock_outcomes(serving.refs)?.complete(invocation, report.clone());
+    if close_connection {
+        return Ok(true);
+    }
+    let exit_bytes = ipc::encode_control(&report).map_err(Error::Core)?;
+    send_frame(
+        serving.stream,
+        ipc::FrameKind::Exit,
+        stream_id,
+        &exit_bytes,
+        serving.refs,
+    )
+    .await?;
+    replay_pending(serving, pending).await
+}
+
+/// Replays frames buffered for other streams while a command owned the
+/// socket, in arrival order.
+#[cfg(unix)]
+async fn replay_pending(
+    serving: &mut CommandServing<'_>,
+    pending: Vec<ipc::Frame>,
+) -> Result<bool, Error> {
+    for frame in pending {
+        // Boxed: replaying may serve another command inline, which recurses
+        // through `handle_stream_frame`; boxing breaks the async cycle.
+        if Box::pin(handle_stream_frame(
+            serving.stream,
+            frame,
+            serving.streams,
+            serving.credits,
+            serving.refs,
+            serving.peer,
+        ))
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Validates one command open against the filesystem, on the blocking
+/// pool: resolves `dir` (and `repository` when it names another path)
+/// under the configured roots and parses `env` into the hermetic variable
+/// map the command runs with. The command inherits nothing from the
+/// daemon's own environment.
+#[cfg(unix)]
+fn validate_command_fs(
+    registry: &Registry,
+    repository: &str,
+    dir: &str,
+    env: &[String],
+) -> Result<(PathBuf, HashMap<String, String>), CoreError> {
+    let canonical = registry.resolve(Path::new(dir))?;
+    if !repository.is_empty() && repository != dir {
+        let repo_path = registry.resolve(Path::new(repository))?;
+        if repo_path != canonical {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "command repository and directory disagree",
+            ));
+        }
+    }
+    let mut vars = HashMap::with_capacity(env.len());
+    for entry in env {
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            CoreError::new(ErrorCode::EInvalid, "command environment must be KEY=value")
+        })?;
+        if key.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "command environment names an empty variable",
+            ));
+        }
+        vars.insert(key.to_string(), value.to_string());
+    }
+    for key in ["GIT_DIR", "GIT_WORK_TREE"] {
+        if let Some(value) = vars.get(key) {
+            check_env_path_under_roots(registry, &canonical, value)?;
+        }
+    }
+    Ok((canonical, vars))
+}
+
+/// Confines one `GIT_DIR`/`GIT_WORK_TREE` value beneath the roots.
+/// Absolute values resolve through the registry; relative values join the
+/// command directory first. A missing path falls back to a lexical prefix
+/// check so a not-yet-created directory cannot smuggle an escape.
+#[cfg(unix)]
+fn check_env_path_under_roots(
+    registry: &Registry,
+    base: &Path,
+    value: &str,
+) -> Result<(), CoreError> {
+    let raw = Path::new(value);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        base.join(raw)
+    };
+    match registry.resolve(&candidate) {
+        Ok(_) => Ok(()),
+        Err(err) if err.code == ErrorCode::ENotFound => {
+            let normalized = normalize_lexical(&candidate);
+            let inside = registry
+                .roots()
+                .iter()
+                .any(|root| normalized.starts_with(root));
+            if inside {
+                Ok(())
+            } else {
+                Err(CoreError::new(
+                    ErrorCode::EForbidden,
+                    "command path escapes the configured roots",
+                ))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Collapses `.` and `..` lexically, without touching the filesystem.
+#[cfg(unix)]
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Routes one client credit grant to the inbound or outbound window of its
+/// stream.
+///
+/// # Errors
+/// `E_INVALID` for an unknown direction or an unknown stream.
+#[cfg(unix)]
+fn route_credit(
+    credits: &mut ipc::StreamCredits,
+    stream_id: u64,
+    credit: &WindowCredit,
+) -> Result<(), CoreError> {
+    if credit.direction.is_empty() || credit.direction == "stdin" {
+        return credits.grant_inbound(stream_id, credit.credit_bytes);
+    }
+    if credit.direction == "stdout" || credit.direction == "stderr" {
+        return credits.grant_outbound(stream_id, credit.credit_bytes);
+    }
+    Err(CoreError::new(
+        ErrorCode::EInvalid,
+        "credit update names an unknown direction",
+    ))
+}
+
+/// The end of one stdin collection loop.
+#[cfg(unix)]
+enum CollectFate {
+    /// `StdinEof` arrived with the collected bytes.
+    Ready(Vec<u8>),
+    /// Cancellation arrived; only a stream-zero cancel closes the
+    /// connection.
+    Cancelled {
+        /// True when stream zero carried the cancel.
+        close_connection: bool,
+    },
+    /// The client tore the connection down.
+    Teardown,
+    /// A protocol violation; the caller records a failure and refuses.
+    Rejected(CoreError),
+}
+
+/// Collects stdin for one command stream, inline on the connection.
+/// `Stdin` chunks are credit-checked and acknowledged with a `stdin`
+/// grant each, so a client larger than one window keeps flowing.
+/// Stream-zero teardown maps to [`CollectFate::Cancelled`] (close) or
+/// [`CollectFate::Teardown`]; frames for other streams buffer into
+/// `pending` for replay after the terminal frame.
+#[cfg(unix)]
+async fn collect_command_stdin(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    pending: &mut Vec<ipc::Frame>,
+) -> Result<CollectFate, Error> {
+    let mut stdin_bytes: Vec<u8> = Vec::new();
+    loop {
+        let deadline = tokio::time::Instant::now() + serving.refs.frame_timeout;
+        let frame = ipc::read_frame(serving.stream, deadline)
+            .await
+            .map_err(Error::Core)?;
+        if frame.stream_id != stream_id && frame.stream_id != ipc::CONTROL_STREAM_ID {
+            pending.push(frame);
+            continue;
+        }
+        if frame.stream_id == ipc::CONTROL_STREAM_ID {
+            match control_during_command(serving, &frame, deadline).await? {
+                ControlFate::Continue => continue,
+                ControlFate::Cancelled => {
+                    return Ok(CollectFate::Cancelled {
+                        close_connection: true,
+                    });
+                }
+                ControlFate::Teardown => return Ok(CollectFate::Teardown),
+            }
+        }
+        match frame.kind {
+            ipc::FrameKind::Stdin => {
+                match absorb_stdin_chunk(
+                    serving.credits,
+                    stream_id,
+                    &mut stdin_bytes,
+                    &frame.payload,
+                ) {
+                    Ok(width) => {
+                        let grant = StdinGrant {
+                            direction: "stdin".to_string(),
+                            bytes: width,
+                        };
+                        let bytes = ipc::encode_control(&grant).map_err(Error::Core)?;
+                        send_frame(
+                            serving.stream,
+                            ipc::FrameKind::WindowUpdate,
+                            stream_id,
+                            &bytes,
+                            serving.refs,
+                        )
+                        .await?;
+                    }
+                    Err(err) => return Ok(CollectFate::Rejected(err)),
+                }
+            }
+            ipc::FrameKind::StdinEof => return Ok(CollectFate::Ready(stdin_bytes)),
+            ipc::FrameKind::Cancel => {
+                return Ok(CollectFate::Cancelled {
+                    close_connection: false,
+                });
+            }
+            ipc::FrameKind::WindowUpdate => {
+                let credit: WindowCredit =
+                    ipc::decode_control(&frame.payload).map_err(Error::Core)?;
+                if let Err(err) = route_credit(serving.credits, stream_id, &credit) {
+                    return Ok(CollectFate::Rejected(err));
+                }
+            }
+            ipc::FrameKind::Open
+            | ipc::FrameKind::Accepted
+            | ipc::FrameKind::Stdout
+            | ipc::FrameKind::Stderr
+            | ipc::FrameKind::MergeNotices
+            | ipc::FrameKind::Exit
+            | ipc::FrameKind::Error => {
+                return Ok(CollectFate::Rejected(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "daemon never receives this frame kind from a client",
+                )));
+            }
+        }
+    }
+}
+
+/// Absorbs one stdin chunk under the inbound window and the stream cap,
+/// returning the width the daemon grants back to the client.
+///
+/// # Errors
+/// `E_LIMIT` past the stream cap or the inbound window.
+#[cfg(unix)]
+fn absorb_stdin_chunk(
+    credits: &mut ipc::StreamCredits,
+    stream_id: u64,
+    stdin_bytes: &mut Vec<u8>,
+    payload: &[u8],
+) -> Result<u64, CoreError> {
+    let width = u64::try_from(payload.len())
+        .map_err(|_| CoreError::new(ErrorCode::ELimit, "stdin chunk exceeds its bound"))?;
+    if stdin_bytes.len().saturating_add(payload.len()) > MAX_COMMAND_STDIN_BYTES {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            "command stdin exceeds its bound",
+        ));
+    }
+    credits.consume_inbound(stream_id, width)?;
+    stdin_bytes.extend_from_slice(payload);
+    credits.grant_inbound(stream_id, width)?;
+    Ok(width)
+}
+
+/// The end of one stream-zero frame seen while a command owns the socket.
+#[cfg(unix)]
+enum ControlFate {
+    /// An answered query or ignored grant; keep collecting.
+    Continue,
+    /// Stream-zero cancel; the command ends cancelled and the connection
+    /// closes.
+    Cancelled,
+    /// Stream-zero teardown; the command records a failure and closes.
+    Teardown,
+}
+
+/// Handles one stream-zero frame arriving mid-command: global cancel and
+/// teardown end the command, outcome lookups answer inline, grants are
+/// ignored.
+#[cfg(unix)]
+async fn control_during_command(
+    serving: &mut CommandServing<'_>,
+    frame: &ipc::Frame,
+    deadline: tokio::time::Instant,
+) -> Result<ControlFate, Error> {
+    match frame.kind {
+        ipc::FrameKind::Cancel => Ok(ControlFate::Cancelled),
+        ipc::FrameKind::Exit | ipc::FrameKind::Error => Ok(ControlFate::Teardown),
+        ipc::FrameKind::WindowUpdate => {
+            let credit: WindowCredit = ipc::decode_control(&frame.payload).map_err(Error::Core)?;
+            let _ = credit;
+            Ok(ControlFate::Continue)
+        }
+        ipc::FrameKind::Open => {
+            answer_control_open(serving.stream, frame, deadline, serving.refs).await?;
+            Ok(ControlFate::Continue)
+        }
+        ipc::FrameKind::Accepted
+        | ipc::FrameKind::Stdin
+        | ipc::FrameKind::StdinEof
+        | ipc::FrameKind::Stdout
+        | ipc::FrameKind::Stderr
+        | ipc::FrameKind::MergeNotices => {
+            let err = CoreError::new(
+                ErrorCode::EInvalid,
+                "stream-zero carries only the handshake and control queries",
+            );
+            write_control_error(serving.stream, &err, deadline).await?;
+            Ok(ControlFate::Continue)
+        }
+    }
+}
+
+/// The end of one output write loop.
+#[cfg(unix)]
+enum WriteFate {
+    /// Every byte reached the socket.
+    Done,
+    /// Cancellation arrived mid-write; only stream-zero closes.
+    Cancelled {
+        /// True when stream zero carried the cancel.
+        close_connection: bool,
+    },
+    /// The client tore the connection down.
+    Teardown,
+}
+
+/// Writes one output direction in window-sized chunks. When the outbound
+/// window exhausts, the loop reads frames until the client grants more
+/// credit, so outputs larger than the initial window still complete as
+/// long as the client keeps granting per chunk, the way the Go backend
+/// does.
+#[cfg(unix)]
+async fn write_cmd_data(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    kind: ipc::FrameKind,
+    bytes: &[u8],
+    pending: &mut Vec<ipc::Frame>,
+) -> Result<WriteFate, Error> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + ipc::MAX_DATA_CHUNK_BYTES).min(bytes.len());
+        let width = u64::try_from(end - offset).map_err(|_| {
+            Error::Core(CoreError::new(
+                ErrorCode::ELimit,
+                "data chunk exceeds its bound",
+            ))
+        })?;
+        if serving.credits.consume_outbound(stream_id, width).is_ok() {
+            send_frame(
+                serving.stream,
+                kind,
+                stream_id,
+                &bytes[offset..end],
+                serving.refs,
+            )
+            .await?;
+            offset = end;
+            continue;
+        }
+        match await_outbound_credit(serving, stream_id, pending).await? {
+            CreditFate::Granted => {}
+            CreditFate::Cancelled { close_connection } => {
+                return Ok(WriteFate::Cancelled { close_connection });
+            }
+            CreditFate::Teardown => return Ok(WriteFate::Teardown),
+        }
+    }
+    Ok(WriteFate::Done)
+}
+
+/// The end of one credit wait.
+#[cfg(unix)]
+enum CreditFate {
+    /// A grant landed; retry the chunk.
+    Granted,
+    /// Cancellation arrived; only stream-zero closes the connection.
+    Cancelled {
+        /// True when stream zero carried the cancel.
+        close_connection: bool,
+    },
+    /// The client tore the connection down.
+    Teardown,
+}
+
+/// Reads frames until the client grants outbound credit for `stream_id`.
+/// Late stdin endings are ignored; other streams buffer into `pending`.
+#[cfg(unix)]
+async fn await_outbound_credit(
+    serving: &mut CommandServing<'_>,
+    stream_id: u64,
+    pending: &mut Vec<ipc::Frame>,
+) -> Result<CreditFate, Error> {
+    loop {
+        let deadline = tokio::time::Instant::now() + serving.refs.frame_timeout;
+        let frame = ipc::read_frame(serving.stream, deadline)
+            .await
+            .map_err(Error::Core)?;
+        if frame.stream_id != stream_id && frame.stream_id != ipc::CONTROL_STREAM_ID {
+            pending.push(frame);
+            continue;
+        }
+        if frame.stream_id == ipc::CONTROL_STREAM_ID {
+            match control_during_command(serving, &frame, deadline).await? {
+                ControlFate::Continue => continue,
+                ControlFate::Cancelled => {
+                    return Ok(CreditFate::Cancelled {
+                        close_connection: true,
+                    });
+                }
+                ControlFate::Teardown => return Ok(CreditFate::Teardown),
+            }
+        }
+        match frame.kind {
+            ipc::FrameKind::WindowUpdate => {
+                let credit: WindowCredit =
+                    ipc::decode_control(&frame.payload).map_err(Error::Core)?;
+                route_credit(serving.credits, stream_id, &credit).map_err(Error::Core)?;
+                return Ok(CreditFate::Granted);
+            }
+            ipc::FrameKind::Cancel => {
+                return Ok(CreditFate::Cancelled {
+                    close_connection: false,
+                });
+            }
+            ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof => {}
+            ipc::FrameKind::Open
+            | ipc::FrameKind::Accepted
+            | ipc::FrameKind::Stdout
+            | ipc::FrameKind::Stderr
+            | ipc::FrameKind::MergeNotices
+            | ipc::FrameKind::Exit
+            | ipc::FrameKind::Error => {
+                return Err(Error::Core(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "daemon never receives this frame kind from a client",
+                )));
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
