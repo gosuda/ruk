@@ -709,28 +709,42 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     if positionals.first().is_some_and(|first| *first == "--") {
         positionals = &positionals[1..];
     }
-    let (rev, paths) = match positionals {
-        [] => (None, &[][..]),
-        [single] => match resolve_rev(store, kind, single) {
-            Ok(_) => (Some(single.clone()), &[][..]),
-            Err(GitError::NotFound { .. }) => (None, positionals),
-            Err(other) => return Err(other),
+    let try_rev = |text: &str| match resolve_rev(store, kind, text) {
+        Ok(_) => Ok(Some(text.to_owned())),
+        Err(GitError::NotFound { .. }) => Ok(None),
+        Err(other) => Err(other),
+    };
+    let (rev, rev_b, paths) = match positionals {
+        [] => (None, None, &[][..]),
+        [single] => match try_rev(single)? {
+            Some(rev) => (Some(rev), None, &[][..]),
+            None => (None, None, positionals),
         },
-        [first, rest @ ..] => match resolve_rev(store, kind, first) {
-            Ok(_) => (Some(first.clone()), rest),
-            Err(GitError::NotFound { .. }) => (None, positionals),
-            Err(other) => return Err(other),
+        [first, second, rest @ ..] => match try_rev(first)? {
+            Some(one) => match try_rev(second)? {
+                Some(two) => (Some(one), Some(two), rest),
+                None => (Some(one), None, &positionals[1..]),
+            },
+            None => (None, None, positionals),
         },
     };
     let paths: Vec<RepoPath> = paths
         .iter()
         .map(|text| super::verbs_stage::repo_path_of(ctx, text.as_bytes()))
         .collect::<Result<_, _>>()?;
-    let pairs = match (rev, opts.is_set("cached")) {
-        (None, false) => worktree_pairs(ctx)?,
-        (None, true) => staged_pairs(ctx)?,
-        (Some(rev), false) => rev_worktree_pairs(ctx, &rev)?,
-        (Some(rev), true) => rev_staged_pairs(ctx, &rev)?,
+    let pairs = match (rev, rev_b) {
+        (Some(one), Some(two)) => {
+            let old_tree = peel_to_tree(store, kind, resolve_rev(store, kind, &one)?)?;
+            let new_tree = peel_to_tree(store, kind, resolve_rev(store, kind, &two)?)?;
+            tree_pairs(ctx, Some(old_tree), Some(new_tree))?
+        }
+        (rev, None) => match (rev, opts.is_set("cached")) {
+            (None, false) => worktree_pairs(ctx)?,
+            (None, true) => staged_pairs(ctx)?,
+            (Some(one), false) => rev_worktree_pairs(ctx, &one)?,
+            (Some(one), true) => rev_staged_pairs(ctx, &one)?,
+        },
+        (None, Some(_)) => unreachable!("a second rev never outlives a missing first"),
     };
     let pairs: Vec<TreePair> = pairs
         .into_iter()
@@ -752,6 +766,9 @@ struct TreePair {
     old: Option<(ruk_core::index::FileMode, Oid)>,
     /// New mode and oid, when present after.
     new: Option<(ruk_core::index::FileMode, Oid)>,
+    /// New-side bytes when the content has no stored object (worktree
+    /// edits). Overrides the object read keyed by `new`'s oid.
+    new_bytes: Option<Vec<u8>>,
 }
 
 /// Pairs two optional trees path by path.
@@ -788,12 +805,16 @@ fn tree_pairs(ctx: &Ctx, old: Option<Oid>, new: Option<Oid>) -> Result<Vec<TreeP
             path,
             old: old_entry,
             new: new_entry,
+            new_bytes: None,
         });
     }
     Ok(pairs)
 }
 
 /// Pairs worktree files against index blobs.
+///
+/// Worktree content is carried as inline bytes: unstaged edits have no
+/// stored object, so a hash-only side would read as `not found`.
 fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -817,6 +838,7 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                     path: entry.path,
                     old: None,
                     new: Some((mode, oid)),
+                    new_bytes: Some(bytes),
                 });
             }
             Some((mode, oid)) => {
@@ -829,6 +851,7 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                         path: entry.path,
                         old: Some((mode, oid)),
                         new: Some((mode, fresh)),
+                        new_bytes: Some(bytes),
                     });
                 }
             }
@@ -839,6 +862,7 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
             path,
             old: Some((mode, oid)),
             new: None,
+            new_bytes: None,
         });
     }
     pairs.sort_by(|left, right| left.path.cmp(&right.path));
@@ -908,6 +932,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                     path: entry.path,
                     old: None,
                     new: Some((mode, fresh)),
+                    new_bytes: Some(bytes),
                 });
             }
             Some((mode, oid)) => {
@@ -920,6 +945,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                         path: entry.path,
                         old: Some((mode, oid)),
                         new: Some((mode, fresh)),
+                        new_bytes: Some(bytes),
                     });
                 }
             }
@@ -930,6 +956,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
             path,
             old: Some((mode, oid)),
             new: None,
+            new_bytes: None,
         });
     }
     pairs.sort_by(|left, right| left.path.cmp(&right.path));
@@ -983,6 +1010,7 @@ fn tree_pairs_index(
             path,
             old: old_entry,
             new: new_entry,
+            new_bytes: None,
         });
     }
     Ok(pairs)
@@ -1072,10 +1100,13 @@ fn pair_bodies(ctx: &Ctx, pair: &TreePair) -> Result<(Option<Vec<u8>>, Option<Ve
         .old
         .map(|(_, oid)| read_object_bytes(store, oid).map(|(_, body)| body))
         .transpose()?;
-    let new_body = pair
-        .new
-        .map(|(_, oid)| read_object_bytes(store, oid).map(|(_, body)| body))
-        .transpose()?;
+    let new_body = match &pair.new_bytes {
+        Some(bytes) => Some(bytes.clone()),
+        None => pair
+            .new
+            .map(|(_, oid)| read_object_bytes(store, oid).map(|(_, body)| body))
+            .transpose()?,
+    };
     Ok((old_body, new_body))
 }
 
@@ -1184,12 +1215,17 @@ enum DiffOp<'a> {
     Insert(&'a [u8]),
 }
 
-/// Splits bytes into lines without terminators. Empty input is no lines.
+/// Splits bytes into lines without terminators. Empty input is no lines;
+/// a trailing newline never invents a phantom empty line.
 fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    bytes.split(|byte| *byte == b'\n').collect()
+    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    if lines.last() == Some(&b"".as_slice()) {
+        lines.pop();
+    }
+    lines
 }
 
 /// Aligns two line lists with a classic LCS table.
