@@ -14,6 +14,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::ids::Oid;
 use crate::protocol::{
     AttestRequirement, AttestationRecord, AttestationStatus, PageLimit, SignerFingerprint,
+    Timestamp,
 };
 use crate::store::{FactRow, Store};
 
@@ -65,6 +66,32 @@ pub enum Gap {
         /// The trusted signers whose matching statements are ambiguous.
         signers: Vec<SignerFingerprint>,
     },
+    /// Trusted signers have matching live statements, but every match is signed
+    /// after the requirement's validity bound, so none of them counts. Only
+    /// [`evaluate_bounded_requirements`] reports this gap; the unbounded
+    /// [`evaluate_requirements`] never expires a statement. Expired statements
+    /// stay live in storage: unlike invalid signatures (which refuse with an
+    /// error) expiry is an evaluation outcome, never corruption.
+    Expired {
+        /// The trusted signers whose matching statements are all expired.
+        signers: Vec<SignerFingerprint>,
+    },
+}
+
+/// One land requirement with the latest signing time it accepts.
+///
+/// The signed schema carries no expiry field, so the bound travels with the
+/// requirement instead: a live match counts only when its signed `signed_at`
+/// is at or before [`BoundedRequirement::valid_until`]. A later-signed match
+/// is expired for this requirement. This mirrors the planned
+/// `AttestRequirement::valid_until` protocol bound; when the protocol gains
+/// that field this wrapper folds into it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedRequirement {
+    /// The kind and result a trusted signer's live statement must carry.
+    pub requirement: AttestRequirement,
+    /// The latest `signed_at` this requirement accepts.
+    pub valid_until: Timestamp,
 }
 
 /// Whether one requirement is met, and by what.
@@ -247,6 +274,8 @@ pub fn attested(
 /// `subject` with the requirement's kind and result. Another signer's conflicting
 /// statement does not negate it; a conflict within one signer's own live
 /// statements makes that signer's statements ambiguous and does not count.
+/// This form never expires a statement; [`evaluate_bounded_requirements`]
+/// enforces per-requirement validity bounds.
 ///
 /// # Errors
 /// `E_POLICY` when requirements exist and no trusted signer is named; `E_LIMIT`
@@ -260,25 +289,7 @@ pub fn evaluate_requirements(
     trusted: &[SignerFingerprint],
     checkpoint: &Checkpoint<'_>,
 ) -> Result<LandEvaluation, CoreError> {
-    if requirements.len() > MAX_LAND_REQUIREMENTS {
-        return Err(CoreError::new(
-            ErrorCode::ELimit,
-            format!("a land policy names at most {MAX_LAND_REQUIREMENTS} requirements"),
-        ));
-    }
-    if trusted.len() > MAX_TRUSTED_SIGNERS {
-        return Err(CoreError::new(
-            ErrorCode::ELimit,
-            format!("a land policy trusts at most {MAX_TRUSTED_SIGNERS} signers"),
-        ));
-    }
-    let signers: BTreeSet<&SignerFingerprint> = trusted.iter().collect();
-    if !requirements.is_empty() && signers.is_empty() {
-        return Err(CoreError::new(
-            ErrorCode::EPolicy,
-            "required attestations need at least one trusted signer",
-        ));
-    }
+    let signers = check_land_policy(requirements.len(), trusted)?;
     let mut work = Work::new(checkpoint);
     let mut groups = HashMap::new();
     let mut outcomes = Vec::with_capacity(requirements.len());
@@ -288,6 +299,7 @@ pub fn evaluate_requirements(
             store,
             subject,
             requirement,
+            None,
             &signers,
             &mut groups,
             &mut work,
@@ -305,16 +317,100 @@ pub fn evaluate_requirements(
     })
 }
 
+/// Evaluates each validity-bounded requirement against the exact `subject`
+/// and the explicit `trusted` signers.
+///
+/// Like [`evaluate_requirements`], except a live match counts only when its
+/// signed `signed_at` is at or before the requirement's `valid_until`. A
+/// later-signed match is expired for that requirement: with no other outcome
+/// the requirement reports [`Gap::Expired`], naming the signers whose matches
+/// are all expired. Ambiguity still outranks expiry, and expiry never changes
+/// stored statuses: the same statements read [`AttestationStatus::Live`]
+/// through [`subject_statements`].
+///
+/// # Errors
+/// As [`evaluate_requirements`].
+pub fn evaluate_bounded_requirements(
+    store: &Store,
+    subject: &Oid,
+    requirements: &[BoundedRequirement],
+    trusted: &[SignerFingerprint],
+    checkpoint: &Checkpoint<'_>,
+) -> Result<LandEvaluation, CoreError> {
+    let signers = check_land_policy(requirements.len(), trusted)?;
+    let mut work = Work::new(checkpoint);
+    let mut groups = HashMap::new();
+    let mut outcomes = Vec::with_capacity(requirements.len());
+    let mut satisfied = true;
+    for bounded in requirements {
+        let outcome = evaluate_one(
+            store,
+            subject,
+            &bounded.requirement,
+            Some(bounded.valid_until),
+            &signers,
+            &mut groups,
+            &mut work,
+        )?;
+        satisfied &= matches!(outcome, RequirementOutcome::Satisfied { .. });
+        outcomes.push(RequirementEvaluation {
+            requirement: bounded.requirement.clone(),
+            outcome,
+        });
+    }
+    Ok(LandEvaluation {
+        subject: *subject,
+        satisfied,
+        requirements: outcomes,
+    })
+}
+
+/// Rejects over-limit or trustless land evaluations before any store read.
+fn check_land_policy(
+    requirement_count: usize,
+    trusted: &[SignerFingerprint],
+) -> Result<BTreeSet<&SignerFingerprint>, CoreError> {
+    if requirement_count > MAX_LAND_REQUIREMENTS {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            format!("a land policy names at most {MAX_LAND_REQUIREMENTS} requirements"),
+        ));
+    }
+    if trusted.len() > MAX_TRUSTED_SIGNERS {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            format!("a land policy trusts at most {MAX_TRUSTED_SIGNERS} signers"),
+        ));
+    }
+    let signers: BTreeSet<&SignerFingerprint> = trusted.iter().collect();
+    if requirement_count > 0 && signers.is_empty() {
+        return Err(CoreError::new(
+            ErrorCode::EPolicy,
+            "required attestations need at least one trusted signer",
+        ));
+    }
+    Ok(signers)
+}
+
+/// Whether a live match falls after the requirement's validity bound. With no
+/// bound every live match counts; the signed `signed_at` is compared only
+/// here, never in status derivation.
+fn is_expired(member: &VerifiedStatement, valid_until: Option<Timestamp>) -> bool {
+    valid_until.is_some_and(|bound| member.statement().signed_at > bound)
+}
+
 fn evaluate_one(
     store: &Store,
     subject: &Oid,
     requirement: &AttestRequirement,
+    valid_until: Option<Timestamp>,
     signers: &BTreeSet<&SignerFingerprint>,
     groups: &mut HashMap<Vec<u8>, Group>,
     work: &mut Work<'_>,
 ) -> Result<RequirementOutcome, CoreError> {
     let mut evidence = Vec::new();
     let mut ambiguous: Vec<SignerFingerprint> = Vec::new();
+    let mut expired: Vec<SignerFingerprint> = Vec::new();
     for signer in signers {
         let group = group_entry(
             store,
@@ -329,6 +425,11 @@ fn evaluate_one(
                 continue;
             }
             match status {
+                AttestationStatus::Live if is_expired(member, valid_until) => {
+                    if !expired.contains(*signer) {
+                        expired.push((*signer).clone());
+                    }
+                }
                 AttestationStatus::Live => evidence.push(member.clone()),
                 AttestationStatus::Ambiguous => {
                     if !ambiguous.contains(*signer) {
@@ -342,10 +443,12 @@ fn evaluate_one(
     if !evidence.is_empty() {
         return Ok(RequirementOutcome::Satisfied { evidence });
     }
-    let gap = if ambiguous.is_empty() {
-        Gap::NoLiveMatch
-    } else {
+    let gap = if !ambiguous.is_empty() {
         Gap::Ambiguous { signers: ambiguous }
+    } else if !expired.is_empty() {
+        Gap::Expired { signers: expired }
+    } else {
+        Gap::NoLiveMatch
     };
     Ok(RequirementOutcome::Unsatisfied { gap })
 }

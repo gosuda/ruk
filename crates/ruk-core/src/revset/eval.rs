@@ -64,14 +64,17 @@
 //!
 //! # `attested()` wiring
 //!
-//! The `attestation` module exists on disk but is not wired into `lib.rs`
-//! (parent-owned integration), so this evaluator cannot name it. The query
-//! arrives as an [`AttestedQuery`] hook on the context — the same seam as
-//! [`ExactPathVerifier`](crate::graph::types::ExactPathVerifier): tests
-//! inject an in-memory map, production injects `attestation::attested`
-//! (which exposes per-signer ambiguity) once the module lands. A query with
-//! no hook configured is an explicit [`ErrorCode::ENotFound`]
-//! ("no attestation source"), never a fake empty set.
+//! The query arrives as an [`AttestedQuery`] hook on the context — the same
+//! seam as [`ExactPathVerifier`](crate::graph::types::ExactPathVerifier):
+//! tests inject an in-memory map, production uses [`production_attested`],
+//! which adapts [`crate::attestation::attested`] (open checkpoint; true when
+//! at least one retained live-or-ambiguous statement matches) to the hook's
+//! boolean shape. [`EvalContext::with_attestation`] builds that production
+//! context; [`EvalContext::new`] leaves the hook unset. A query with no hook
+//! configured is an explicit [`ErrorCode::ENotFound`] ("no attestation
+//! source"), never a fake empty set. The hook carries no validity bound:
+//! expiry-bounded land policy lives in the attestation query layer, not in
+//! the revset grammar.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read as _;
@@ -128,11 +131,30 @@ const CURSOR_TAG: &str = "ruk-revset-v1:";
 /// kind/result for `attested(kind,result)`.
 ///
 /// Same seam as `ExactPathVerifier`: tests inject an in-memory map,
-/// production injects `attestation::attested` once that module is wired into
-/// `lib.rs`. The subject is the exact commit OID; Git heads only
-/// (conflicted heads have no OID subject and never match).
+/// production injects [`production_attested`]. The subject is the exact
+/// commit OID; Git heads only (conflicted heads have no OID subject and
+/// never match).
 pub(crate) type AttestedQuery<'a> =
     dyn Fn(&Store, &Oid, &AttestKind, &AttestResult) -> Result<bool, CoreError> + Send + Sync + 'a;
+
+/// Production `attested(kind,result)` lookup over retained verified statements.
+///
+/// Adapts [`crate::attestation::attested`] to the [`AttestedQuery`] boolean
+/// shape: true when at least one retained live-or-ambiguous statement
+/// matches, false otherwise. Superseded statements never match; per-signer
+/// ambiguity collapses to true here (the vector form keeps the detail for
+/// land authorization). Runs under an open checkpoint: revset evaluation is
+/// synchronous and unadmitted, so cancellation never fires.
+pub(crate) fn production_attested(
+    store: &Store,
+    subject: &Oid,
+    kind: &AttestKind,
+    result: &AttestResult,
+) -> Result<bool, CoreError> {
+    let open = |_progress: crate::attestation::Progress| Ok::<(), CoreError>(());
+    let retained = crate::attestation::attested(store, subject, kind, result, &open)?;
+    Ok(!retained.is_empty())
+}
 
 /// Everything the evaluator needs that it must not look up itself.
 ///
@@ -173,6 +195,24 @@ impl<'a> EvalContext<'a> {
             shallow: Vec::new(),
             default_limit: DEFAULT_PAGE_SIZE,
             attested_query: None,
+        }
+    }
+
+    /// Builds a production context: like [`EvalContext::new`], but
+    /// `attested(kind,result)` resolves against stored verified statements
+    /// through [`production_attested`]. The op that serves `log` and `query`
+    /// builds its contexts here; tests needing isolation keep `new()` and
+    /// inject their own hook.
+    #[must_use]
+    pub(crate) fn with_attestation(store: &'a Store, graph: &'a GraphIndex) -> Self {
+        Self {
+            store,
+            graph,
+            wc_heads: Vec::new(),
+            mine_sessions: Vec::new(),
+            shallow: Vec::new(),
+            default_limit: DEFAULT_PAGE_SIZE,
+            attested_query: Some(&production_attested),
         }
     }
 }
@@ -1463,6 +1503,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::attestation::{ATTEST_NAMESPACE, Progress, prepare_add};
     use crate::budget::ByteBudget;
     use crate::bytes::ByteString;
     use crate::commit::{NativeCommitInput, Provenance, ProvenanceClaims};
@@ -1472,11 +1513,14 @@ mod tests {
     use crate::graph::types::BloomMatch;
     use crate::ids::{CommitKey, HashKind};
     use crate::merge::Merge;
+    use crate::protocol::{AttestAddArgs, AttestSignature, AttestStatement, Timestamp};
     use crate::records::codec::{encode_change_entry, encode_commit_record};
     use crate::records::keys::{change_key, head_key};
     use crate::records::types::{ChangeEntry, ChangeState};
-    use crate::store::types::{FactExpectation, FactMutation, FactTable};
+    use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind};
     use crate::store::{PreparationBudget, Store};
+    use ssh_key::private::Ed25519Keypair;
+    use ssh_key::{HashAlg, LineEnding};
 
     /// Scratch store; removed on drop.
     struct Scratch {
@@ -2204,5 +2248,74 @@ mod tests {
         assert!(heads_of(&eval(&hooked, r#"attested("review", "rejected")"#)).is_empty());
         let err = eval_str(&hooked, r#"attested("", "approved")"#).expect_err("bad kind");
         assert_eq!(err.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn with_attestation_resolves_stored_verified_statements() {
+        let kind = HashKind::Sha1;
+        let scratch = Scratch::new("production-attested", kind);
+        let body = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nproduction subject\n";
+        let prepared = scratch
+            .store
+            .prepare(
+                ObjectKind::Commit,
+                u64::try_from(body.len()).expect("object length"),
+                body.as_slice(),
+                None,
+            )
+            .expect("store commit object");
+        let oid = prepared.oid();
+        scratch
+            .store
+            .publish(vec![prepared], &[])
+            .expect("publish commit");
+
+        let private = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[0x11; 32]));
+        let statement = AttestStatement {
+            subject: oid,
+            kind: AttestKind::new("review").expect("kind"),
+            result: AttestResult::new("pass").expect("result"),
+            signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
+            supersedes: None,
+        };
+        let payload = statement
+            .canonical_payload_v1(kind)
+            .expect("canonical payload");
+        let armor = private
+            .sign(ATTEST_NAMESPACE, HashAlg::Sha256, &payload)
+            .expect("sign")
+            .to_pem(LineEnding::LF)
+            .expect("armor");
+        let args = AttestAddArgs {
+            statement,
+            signature: AttestSignature::new(armor).expect("signature"),
+        };
+        let open = |_: Progress| Ok::<(), CoreError>(());
+        let attestations = prepare_add(&scratch.store, &args, &open).expect("prepare attestation");
+        scratch
+            .store
+            .publish(Vec::new(), &attestations.mutations)
+            .expect("publish attestation");
+
+        let review = AttestKind::new("review").expect("kind");
+        let pass = AttestResult::new("pass").expect("result");
+        let fail = AttestResult::new("fail").expect("result");
+        assert!(production_attested(&scratch.store, &oid, &review, &pass).expect("query match"));
+        assert!(
+            !production_attested(&scratch.store, &oid, &review, &fail).expect("query mismatch")
+        );
+
+        let head = Head::Git { oid };
+        let mut builder = GraphIndexBuilder::new(GraphIndex::empty(kind));
+        builder
+            .add_commit(head, ChangeId::from_bytes([7; 16]), &[], vec![])
+            .expect("index commit");
+        let graph = builder.finish(&ByteBudget::new(1 << 20)).expect("graph");
+        let ctx = EvalContext::with_attestation(&scratch.store, &graph);
+        assert_eq!(
+            heads_of(&eval(&ctx, r#"attested("review", "pass")"#)),
+            BTreeSet::from([head])
+        );
+        assert!(heads_of(&eval(&ctx, r#"attested("review", "fail")"#)).is_empty());
     }
 }
