@@ -898,6 +898,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// The build-generated manifest digest: SHA-256 over
+/// [`manifest_digest_input`]. Reported beside `language_set_version` on
+/// mergeability and merge results so callers distinguish catalogue
+/// revisions; same version with a different digest is a build-contract
+/// error, not a cache-compatible revision.
+#[must_use]
+pub fn manifest_digest() -> String {
+    sha256_hex(&manifest_digest_input())
+}
+
 /// Deterministic manifest-digest input pinning `language_set_version = 1`.
 ///
 /// The returned bytes are the exact, stable input the parent build hashes

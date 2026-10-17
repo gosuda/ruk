@@ -34,7 +34,8 @@ pub use adapters::{Adapter, Decline, DeclineReason, SourceUnit, UnitKey, adapter
 pub use alignment::merge_triplet;
 pub use grammar::{
     Cancel, Grammar, GrammarPin, GrammarRegistry, Language, ParsedNode, ParsedTree,
-    SyntaxError, dispatch, manifest_digest_input, sha256_hex, LANGUAGE_SET_VERSION,
+    SyntaxError, dispatch, manifest_digest, manifest_digest_input, sha256_hex,
+    LANGUAGE_SET_VERSION,
     MAX_TRIPLET_BYTES,
 };
 pub use treesitter::{TsGrammar, registry_providers};
