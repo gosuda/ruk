@@ -33,7 +33,10 @@ use super::admission::{
     WorkResources,
 };
 pub use super::cancel::{Cancel, CancelHandle, cancellation};
-use super::claims::{ClaimClock, authorize_claim_list_args, list_page_raw};
+use super::claims::{
+    ClaimClock, LeasedClaimPage, authorize_claim_list_args, list_page, list_page_raw,
+    next_claim_cursor,
+};
 use super::clock::Clock;
 use super::lane::{
     InternalCandidate, InternalPayload, MutationCandidate, PublicationLane, PublicationLaneRunner,
@@ -447,25 +450,6 @@ impl HostedCoordinator {
     /// authority is uniformly forbidden here instead of inventing a
     /// receipts-only read.
     ///
-    /// Loads the session, requires active authority, holds an in-flight guard
-    /// across the read, admits it under the interactive class with compute
-    /// resources, authorizes it against the session's negotiated capabilities,
-    /// and runs the read implementation. `op.log`, `claim.list`, and
-    /// `attest.list` have implementations; every other read runs the same
-    /// session checks and then names its missing implementation with
-    /// [`ErrorCode::EHosted`], so an unknown session still reports
-    /// `E_FORBIDDEN` rather than a missing-impl error.
-    ///
-    /// Capability mapping follows the existing handlers rather than a
-    /// blanket table: ordinary reads authorize as [`ReadAccess::Objects`],
-    /// which always succeeds. `claim.list` additionally uses the claims
-    /// module's listing authorization (a session always reads its own
-    /// claims; anything wider needs `read_intents.claims`), and the
-    /// attestation queries carry no capability gate of their own. Receipts
-    /// of an expired session have no read path either: without one, expired
-    /// authority is uniformly forbidden here instead of inventing a
-    /// receipts-only read.
-    ///
     /// `claim.list`, `attest.list`, and `op.log` page through interactive
     /// read leases. A first page that does not exhaust its listing mints a
     /// 30-second lease-bound cursor instead of truncating; a presented
@@ -677,11 +661,17 @@ impl HostedCoordinator {
             view: view_before.view,
             query,
         };
-        self.leases.check_cursor(cursor, &want, now)?;
-        let after = cursor.position.as_bytes();
-        let after = (!after.is_empty()).then_some(after);
         let claim_clock = ClaimClock::open(&self.store, self.clock.clone())?;
-        let page = list_page_raw(&self.store, &claim_clock, listing, after, budget)?;
+        let (page, _binding) = list_page(LeasedClaimPage {
+            store: &self.store,
+            clock: &claim_clock,
+            leases: &self.leases,
+            listing,
+            cursor,
+            want: &want,
+            now,
+            budget,
+        })?;
         let view_after = current_view(&self.store)?;
         if view_after.view != cursor.view {
             return Err(CoreError::new(
@@ -689,22 +679,10 @@ impl HostedCoordinator {
                 "claim.list cursor names a stale view: open a fresh first page",
             ));
         }
-        let Some(position) = page.next else {
-            return Ok(ClaimListReply {
-                view: view_after,
-                claims: Page::new(page.records, None)?,
-            });
-        };
-        let next = PageCursor {
-            store: cursor.store,
-            view: cursor.view,
-            query: cursor.query,
-            lease: cursor.lease,
-            position: ByteString::from(position),
-        };
+        let next = next_claim_cursor(cursor, page.next);
         Ok(ClaimListReply {
             view: view_after,
-            claims: Page::new(page.records, Some(next))?,
+            claims: Page::new(page.records, next)?,
         })
     }
 
