@@ -1,6 +1,6 @@
 # CLI verb status
 
-56 verbs, one row each. Statuses: **implemented** (real native-store
+57 verbs, one row each. Statuses: **implemented** (real native-store
 transitions), **partial** (resolves and validates, then completes only the
 cases its backing covers), **unsupported** (typed `Unsupported` with the
 reason; exit code 1 through `GitError::exit_code`).
@@ -68,6 +68,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | ls-tree | implemented | `-r`, `--name-only`; gitlinks report as commits |
 | merge | implemented | fast-forward only; anything needing content resolution is `Unsupported` and writes no state |
 | merge-base | implemented | pairwise paint-down; `--is-ancestor` exits 1 when false |
+| migrate | implemented | exact import of a real `.git` (loose, packs, refs, `HEAD`); `--force` replaces an existing `.ruk`; no checkout/config/hooks |
 | mktree | implemented | canonical sort, mode/type agreement checks |
 | mv | implemented | all stages renamed, worktree file renamed; `-f` allows overwrite |
 | pack-objects | unsupported | declared absent for this slice |

@@ -111,11 +111,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_56_names() {
-    assert_eq!(VERBS.len(), 56);
+    assert_eq!(VERBS.len(), 57);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 56);
+    assert_eq!(names.len(), 57);
     for name in [
         "add",
         "archive",
@@ -145,6 +145,7 @@ fn verb_table_covers_56_names() {
         "ls-tree",
         "merge",
         "merge-base",
+        "migrate",
         "mktree",
         "mv",
         "pack-objects",
@@ -459,28 +460,12 @@ fn unsupported_verbs_report_closed_codes() {
         verbs_transport::gc,
         verbs_transport::archive,
         verbs_transport::bundle,
-        verbs_transport::receive_pack,
-        verbs_transport::upload_pack,
         verbs_repo::worktree,
     ] {
         let err = run(verb, &mut ctx, &[]).expect_err("unsupported");
         assert_eq!(err.exit_code(), 1, "{err}");
     }
     let _ = std::fs::remove_dir_all(&base);
-}
-
-#[test]
-fn sequencer_absent_reads_clean() {
-    let (root, env) = seeded_repo("seq", "s.txt", b"s\n");
-    let mut ctx = repo_ctx(&root, env);
-    assert!(
-        super::state::sequencer_read(ctx.store().expect("store"), "merge")
-            .expect("read")
-            .is_none()
-    );
-    let err = run(verbs_history::rebase, &mut ctx, &["--abort"]).expect_err("abort");
-    assert!(err.to_string().contains("no rebase in progress"));
-    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
 #[test]
@@ -564,4 +549,18 @@ fn serve_verbs_round_trip_scripted_stdin() {
 
     let _ = std::fs::remove_dir_all(root_a.parent().expect("parent"));
     let _ = std::fs::remove_dir_all(root_b.parent().expect("parent"));
+}
+
+#[test]
+fn sequencer_absent_reads_clean() {
+    let (root, env) = seeded_repo("seq", "s.txt", b"s\n");
+    let mut ctx = repo_ctx(&root, env);
+    assert!(
+        super::state::sequencer_read(ctx.store().expect("store"), "merge")
+            .expect("read")
+            .is_none()
+    );
+    let err = run(verbs_history::rebase, &mut ctx, &["--abort"]).expect_err("abort");
+    assert!(err.to_string().contains("no rebase in progress"));
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

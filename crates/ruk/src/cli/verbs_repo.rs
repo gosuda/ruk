@@ -1,9 +1,10 @@
-//! Repository lifecycle verbs: `init`, `clone`, `config`, `remote`.
+//! Repository lifecycle verbs: `init`, `clone`, `migrate`, `config`, `remote`.
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
 //! | `init` | `Store::create` + workspace row + unborn `HEAD` | implemented |
 //! | `clone` | `Store::create` + `session::local_fetch` + ref copy | implemented for local paths; network sources are `Offline` |
+//! | `migrate` | `Store::create` + `import::import_repository` + workspace row | implemented; worktree checkout, config conversion, and hooks are out of scope |
 //! | `config` | `Pins` records under `cli/config/` | implemented, `--local` scope only |
 //! | `remote` | `remote.<name>.*` config records | implemented |
 //! | `worktree` | absent workcopy lane | unsupported |
@@ -13,12 +14,18 @@
 
 use std::sync::Arc;
 
+use ruk_core::change::OperationId;
+use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::ids::HashKind;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::StoreRefs;
 use ruk_core::store::{PreparationBudget, Store};
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
+use ruk_git::import::objects::source_hash_kind;
+use ruk_git::import::{
+    DirectPublish, ImportLimits, ImportProgress, ImportRequest, SourceHead, import_repository,
+};
 use ruk_git::transport::Interrupt;
 use ruk_git::transport::session::{LocalFetchRequest, advertise, local_fetch};
 
@@ -269,6 +276,136 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         &format!("+refs/heads/*:refs/remotes/{origin}/*"),
     )?;
     Ok(format!("Cloned into {}\n", dst.display()).into_bytes())
+}
+
+/// Imports an existing Git repository into a fresh `.ruk` store.
+///
+/// Git has no `migrate` builtin; the object and ref motion reuses the
+/// exact-import lane (`ruk_git::import::import_repository`), which reads
+/// loose zlib objects, pack v2/v3 with idx v1/v2, and alternates, verifying
+/// every OID by re-hashing.
+///
+/// `<git-dir>` is a worktree root (holding `.git/`) or a bare repository /
+/// `.git` directory; `<dest-dir>` defaults to `<git-dir>` itself and the
+/// store lands at `<dest>/.ruk`. `--bare` is accepted for `git clone`
+/// familiarity and changes nothing (no checkout lane exists either way).
+/// `<dest>/.ruk` must not exist unless `--force` replaces it.
+///
+/// Objects publish in bounded batches and refs only in the final batch, so
+/// a mid-import failure may leave a partial `.ruk`: retry with `--force`.
+/// Worktree checkout, config conversion, and hooks are out of scope.
+pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [
+        FlagSpec {
+            long: "bare",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "force",
+            short: Some('f'),
+            takes_value: false,
+        },
+    ];
+    let opts = collect(args, &specs)?;
+    let src_arg = opts.positionals.first().ok_or_else(|| GitError::Invalid {
+        detail: "usage: migrate [--bare] [--force] <git-dir> [<dest-dir>]".to_owned(),
+    })?;
+    let resolve = |arg: &str| -> std::path::PathBuf {
+        let path = std::path::Path::new(arg);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            ctx.env.cwd.join(path)
+        }
+    };
+    let src = resolve(src_arg);
+    let git_dir = resolve_source_git_dir(&src)?;
+    let dest = opts
+        .positionals
+        .get(1)
+        .map_or_else(|| src.clone(), |arg| resolve(arg));
+    std::fs::create_dir_all(&dest).map_err(|err| GitError::Io {
+        detail: format!("creating {}: {err}", dest.display()),
+    })?;
+    let store_dir = dest.join(".ruk");
+    if store_dir.exists() {
+        if !opts.is_set("force") {
+            return Err(GitError::Invalid {
+                detail: format!(
+                    "{} already exists; pass --force to replace it",
+                    store_dir.display()
+                ),
+            });
+        }
+        std::fs::remove_dir_all(&store_dir).map_err(|err| GitError::Io {
+            detail: format!("removing {}: {err}", store_dir.display()),
+        })?;
+    }
+    let kind = source_hash_kind(&git_dir)?;
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::create(&store_dir, kind, budget).map_err(GitError::from)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| i64::try_from(span.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let request = ImportRequest {
+        git_dir: &git_dir,
+        observation_source: b"migrate",
+        operation: OperationId(1),
+        committer: Signature {
+            name: "ruk migrate".into(),
+            email: "migrate@example.com".into(),
+            timestamp: now,
+            offset: TzOffset::UTC,
+        },
+        message: "migrate".into(),
+        limits: ImportLimits::default(),
+    };
+    let progress = ImportProgress::new();
+    let mut sink = DirectPublish(&store);
+    let report = import_repository(&store, &request, &progress, &mut sink)?;
+    let head = match &report.head {
+        Some(SourceHead::Symbolic { name, .. }) => HeadRef::Symbolic(name.clone()),
+        Some(SourceHead::Detached(oid)) => HeadRef::Detached(*oid),
+        None => {
+            let name = RefName::new(DEFAULT_BRANCH).map_err(|err| GitError::Invalid {
+                detail: format!("default branch refused: {err}"),
+            })?;
+            HeadRef::Symbolic(name)
+        }
+    };
+    let workspace = GitCompatWorkspace::new(head, Scope::Full);
+    let mutation = workspace_mutation(None, &workspace)?;
+    store
+        .publish(Vec::new(), &[mutation])
+        .map_err(GitError::from)?;
+    Ok(format!(
+        "Migrated {} objects and {} refs from {} [{kind}]\n",
+        report.objects,
+        report.refs_seen,
+        git_dir.display(),
+    )
+    .into_bytes())
+}
+
+/// Maps a migrate source argument to the Git directory it names: a
+/// worktree root through its `.git/`, else the directory itself when it
+/// holds `objects/`.
+fn resolve_source_git_dir(src: &std::path::Path) -> Result<std::path::PathBuf, GitError> {
+    let dotted = src.join(".git");
+    if dotted.is_dir() {
+        return Ok(dotted);
+    }
+    if src.join("objects").is_dir() {
+        return Ok(src.to_path_buf());
+    }
+    Err(GitError::Invalid {
+        detail: format!(
+            "{} is not a git repository (no .git/ or objects/)",
+            src.display()
+        ),
+    })
 }
 
 /// Derives the destination directory name from the source path.
