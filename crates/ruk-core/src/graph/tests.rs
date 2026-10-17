@@ -740,3 +740,134 @@ fn measure_object_and_row_work() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The change IDs table must binary-search under both orders the readers
+/// use: reverse-hex ascending for prefix resolution and the same physical
+/// order for exact-id page lookup. Regression: a byte-ascending table made
+/// `resolve_change_id_prefix` mis-resolve full-hex symbols and prefixes.
+#[test]
+fn change_id_table_searches_in_reverse_hex_order() {
+
+    let kind = HashKind::Sha1;
+    let budget = Arc::new(ByteBudget::new(64 * 1024 * 1024));
+
+    // Bytes chosen so reverse-hex prefixes are known: reverse-hex of byte
+    // 0xAB is "kj", of 0x00 is "zz", of 0xFF is "00".
+    let cid_unique = ChangeId::from_bytes([
+        0xAB, 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67, 0x89,
+        0xAB, 0xCD,
+    ]);
+    let cid_dup_a = ChangeId::from_bytes([
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+        0xEE, 0xF0,
+    ]);
+    let cid_dup_b = ChangeId::from_bytes([
+        0x00, 0x21, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+        0xEE, 0xF0,
+    ]);
+    assert!(cid_dup_a.to_reverse_hex().starts_with("zz"));
+    assert!(cid_dup_b.to_reverse_hex().starts_with("zz"));
+    let unique_hex = cid_unique.to_reverse_hex();
+    assert!(!unique_hex.starts_with("zz"));
+
+    let mut builder = GraphIndexBuilder::new(GraphIndex::empty(kind));
+    // One change owns two commits (divergent); third commit is unique.
+    builder
+        .add_commit(
+            make_git_head(0x01, kind),
+            cid_dup_a,
+            &[],
+            vec![b"src/a.rs".to_vec()],
+        )
+        .expect("add a");
+    builder
+        .add_commit(
+            make_git_head(0x02, kind),
+            cid_dup_b,
+            &[make_git_head(0x01, kind)],
+            vec![b"src/b.rs".to_vec()],
+        )
+        .expect("add b");
+    let pos_unique = builder
+        .add_commit(
+            make_git_head(0x03, kind),
+            cid_unique,
+            &[make_git_head(0x01, kind)],
+            vec![b"src/c.rs".to_vec()],
+        )
+        .expect("add c");
+    let index = builder.finish(&budget).expect("finish");
+
+    // Exact full-hex symbol resolves to exactly one change id.
+    let full = unique_hex.clone();
+    match index
+        .resolve_change_id_prefix(&full)
+        .expect("resolve full hex")
+    {
+        PrefixResolution::SingleMatch(id) => assert_eq!(id, cid_unique),
+        other => panic!("full-hex prefix mis-resolved: {other:?}"),
+    }
+
+    // A shared two-nibble prefix is ambiguous across cid_dup_a/cid_dup_b.
+    match index.resolve_change_id_prefix("zz").expect("resolve zz") {
+        PrefixResolution::AmbiguousMatch => {}
+        other => panic!("shared prefix should be ambiguous: {other:?}"),
+    }
+
+    // Distinct shared prefix narrowing to one change still resolves.
+    let narrower = format!("zz{}", &cid_dup_a.to_reverse_hex()[2..5]);
+    match index
+        .resolve_change_id_prefix(&narrower)
+        .expect("resolve narrow")
+    {
+        PrefixResolution::SingleMatch(id) => assert_eq!(id, cid_dup_a),
+        other => panic!("narrow prefix mis-resolved: {other:?}"),
+    }
+
+    // A prefix that matches only the unique change resolves to it alone.
+    match index
+        .resolve_change_id_prefix(&unique_hex[..6])
+        .expect("resolve unique prefix")
+    {
+        PrefixResolution::SingleMatch(id) => assert_eq!(id, cid_unique),
+        other => panic!("unique prefix mis-resolved: {other:?}"),
+    }
+
+    // No-match and empty-prefix behavior.
+    assert_eq!(
+        index.resolve_change_id_prefix("qq").expect("qq"),
+        PrefixResolution::NoMatch
+    );
+    assert_eq!(
+        index.resolve_change_id_prefix("").expect("empty"),
+        PrefixResolution::AmbiguousMatch
+    );
+
+    // Exact-id lookup still finds the right positions through the same
+    // descending table: unique change has one position; the two divergent
+    // changes page their own position each.
+    let page = index
+        .change_id_to_positions_page(&cid_unique, None, 4)
+        .expect("page unique");
+    assert_eq!(page.items.as_slice(), &[pos_unique]);
+    assert!(page.next_cursor.is_none());
+
+    let page_a = index
+        .change_id_to_positions_page(&cid_dup_a, None, 4)
+        .expect("page dup a");
+    assert_eq!(page_a.items.len(), 1);
+    let pos_a = page_a.items[0];
+    assert_eq!(
+        index.pos_to_head(pos_a).expect("head a"),
+        make_git_head(0x01, kind)
+    );
+
+    let page_b = index
+        .change_id_to_positions_page(&cid_dup_b, None, 4)
+        .expect("page dup b");
+    assert_eq!(page_b.items.len(), 1);
+    assert_eq!(
+        index.pos_to_head(page_b.items[0]).expect("head b"),
+        make_git_head(0x02, kind)
+    );
+}

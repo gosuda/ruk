@@ -27,14 +27,15 @@
 //!     generation: u32
 //!     parent1_raw: u32 (inlined global pos, or OVERFLOW_FLAG | offset)
 //!     parent2_raw: u32 (inlined global pos, or OVERFLOW_FLAG | count)
-//!     change_id_pos: u32 (offset in sorted change IDs table)
+//!     change_id_pos: u32 (offset in change IDs table)
 //!     head_tag: u8 (0 = Git, 1 = Conflicted)
 //!     head_digest: [u8; 32]
 //!     reserved: [u8; 3]
 //! [Head Lookup Table: 4 * num_local_commits bytes]
 //!   sorted by (head_tag, head_digest), storing u32 local positions
 //! [Change IDs Table: 16 * num_local_change_ids bytes]
-//!   sorted lexicographically
+//!   sorted by reverse-hex ascending, equivalently raw bytes descending,
+//!   so exact-id and prefix lookups binary-search the same order
 //! [Change ID Positions Table: 4 * num_local_change_ids bytes]
 //!   inlined local pos or OVERFLOW_FLAG | offset
 //! [Overflow Parents Table: 4 * num_overflow_parents bytes]
@@ -623,6 +624,7 @@ impl GraphSegment {
             });
         }
 
+        // The table runs descending in raw bytes, ascending in reverse-hex.
         let target_bytes = change_id.as_bytes();
         let change_ids_slice = &self.data[self.change_ids_offset..];
         let mut low = 0usize;
@@ -637,8 +639,8 @@ impl GraphSegment {
                     found_idx = Some(mid);
                     break;
                 }
-                Ordering::Less => low = mid + 1,
-                Ordering::Greater => high = mid,
+                Ordering::Less => high = mid,
+                Ordering::Greater => low = mid + 1,
             }
         }
 
@@ -923,10 +925,25 @@ impl GraphSegmentWriter {
         let mut overflow_parents = Vec::new();
         let mut entries = Vec::with_capacity(self.commits.len());
 
+        // The on-disk change IDs table is emitted in reverse map order, so
+        // each commit's change_pos is its rank in that reversed order.
+        let change_rank: std::collections::BTreeMap<ChangeId, u32> = change_map
+            .keys()
+            .rev()
+            .enumerate()
+            .map(|(rank, cid)| {
+                (
+                    *cid,
+                    u32::try_from(rank).expect("bounded by num_local_change_ids check"),
+                )
+            })
+            .collect();
+
         for commit in &self.commits {
-            let change_pos = change_map
-                .range(..commit.change_id)
-                .count() as u32;
+            let change_pos = change_rank
+                .get(&commit.change_id)
+                .copied()
+                .expect("rank covers every staged change id");
 
             let (p1_raw, p2_raw) = match commit.parents.len() {
                 0 => (NO_PARENT, NO_PARENT),
@@ -1001,7 +1018,7 @@ impl GraphSegmentWriter {
         let mut change_id_positions = Vec::with_capacity(change_map.len());
         let mut overflow_change_ids = Vec::new();
 
-        for (cid, positions) in &change_map {
+        for (cid, positions) in change_map.iter().rev() {
             change_id_bytes.extend_from_slice(cid.as_bytes());
             if positions.len() == 1 {
                 change_id_positions.push(positions[0]);
