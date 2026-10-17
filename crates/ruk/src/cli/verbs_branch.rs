@@ -34,10 +34,10 @@ use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
 use super::state::{
-    AppliedRef, StashSlot, apply_refs, branch_name, commit_record, create_branch, head_oid,
-    is_ancestor, list_refs, load_or_default, merged_rows, path_row_mutations, read_path_rows,
-    reflog_alloc, resolve_branch_target, resolve_rev, scan_index, stash_alloc, stash_drop,
-    stash_read, stash_write, workspace_mutation,
+    AppliedRef, StashSlot, apply_refs, branch_name, config_read, config_unset, config_write,
+    create_branch, head_oid, is_ancestor, list_refs, load_or_default, merged_rows,
+    path_row_mutations, read_path_rows, reflog_alloc, resolve_branch_target, resolve_rev,
+    scan_index, stash_alloc, stash_drop, stash_read, stash_write, workspace_mutation,
 };
 use super::tree::{
     WorktreeType, build_index_tree, commit_tree_oid, flatten_tree, join_base, peel_to_tree,
@@ -95,13 +95,40 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "remotes",
+            short: Some('r'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "set-upstream-to",
+            short: Some('u'),
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "unset-upstream",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted for script compatibility: branch output is already quiet
+        // except for the delete notice, which this suppresses.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let store = ctx.store()?;
     if opts.is_set("show-current") {
-        return Ok(line(
-            current_branch_name(store)?.unwrap_or_default().into_bytes(),
-        ));
+        let current = current_branch_name(store)?.unwrap_or_default();
+        return Ok(line(shorten_refname(&current).as_bytes().to_vec()));
+    }
+    if opts.single("set-upstream-to")?.is_some() {
+        return set_branch_upstream(ctx, &opts);
+    }
+    if opts.is_set("unset-upstream") {
+        return unset_branch_upstream(ctx, &opts);
     }
     if opts.is_set("delete") || opts.is_set("force-delete") {
         return delete_branches(ctx, &opts);
@@ -111,12 +138,22 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     }
     match opts.positionals.as_slice() {
         [] => list_branches(ctx, &opts),
+        _ if opts.is_set("list") => list_branches(ctx, &opts),
+        _ if opts.is_set("remotes") || opts.is_set("all") => Err(GitError::Invalid {
+            detail: "the -a, and -r, options to 'git branch' do not take a branch name.\nDid you mean to use: -a|-r --list <pattern>?".to_owned(),
+        }),
         [name] => {
-            let existing = branch_name(name)?;
-            if super::state::read_ref(store, &existing)?.is_some() {
-                return Err(GitError::Invalid {
-                    detail: format!("branch {name:?} already exists"),
-                });
+            let refname = branch_name(name)?;
+            if super::state::read_ref(store, &refname)?.is_some() {
+                if !opts.is_set("force") {
+                    return Err(GitError::Invalid {
+                        detail: format!("branch {name:?} already exists"),
+                    });
+                }
+                refuse_checked_out_branch(store, name)?;
+                let target = resolve_branch_target(store, ctx.kind()?, None)?;
+                force_branch(store, ctx.kind()?, name, target)?;
+                return Ok(Vec::new());
             }
             let target = resolve_branch_target(store, ctx.kind()?, None)?;
             create_branch(store, ctx.kind()?, name, target)?;
@@ -131,6 +168,8 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                         detail: format!("branch {name:?} already exists"),
                     });
                 }
+            } else {
+                refuse_checked_out_branch(store, name)?;
             }
             force_branch(store, ctx.kind()?, name, target)?;
             Ok(Vec::new())
@@ -141,28 +180,153 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     }
 }
 
+/// Refuses to force-move the checked-out branch, the way the oracle
+/// protects the worktree's branch from `branch -f`.
+fn refuse_checked_out_branch(store: &Store, name: &str) -> Result<(), GitError> {
+    let current = current_branch_name(store)?;
+    let wanted = format!("refs/heads/{name}");
+    if current.as_deref() == Some(wanted.as_str()) || current.as_deref() == Some(name) {
+        return Err(GitError::Invalid {
+            detail: format!("cannot force update the checked-out branch {name:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Resolves `<remote>/<branch>` or a local branch into the
+/// `(remote, merge)` config pair `git branch -u` records.
+fn parse_upstream(store: &Store, upstream: &str) -> Result<(String, String), GitError> {
+    if let Some(local) = upstream.strip_prefix("refs/heads/") {
+        let name = branch_name(local)?;
+        if super::state::read_ref(store, &name)?.is_some() {
+            return Ok((".".to_owned(), format!("refs/heads/{local}")));
+        }
+    } else {
+        let short = upstream.strip_prefix("refs/remotes/").unwrap_or(upstream);
+        if let Some((remote, rest)) = short.split_once('/') {
+            let full = format!("refs/remotes/{remote}/{rest}");
+            let name = RefName::new(full).map_err(|err| GitError::Invalid {
+                detail: format!("bad upstream name: {err}"),
+            })?;
+            if super::state::read_ref(store, &name)?.is_some() {
+                return Ok((remote.to_owned(), format!("refs/heads/{rest}")));
+            }
+        } else {
+            let name = branch_name(short)?;
+            if super::state::read_ref(store, &name)?.is_some() {
+                return Ok((".".to_owned(), format!("refs/heads/{short}")));
+            }
+        }
+    }
+    Err(GitError::NotFound {
+        detail: format!("upstream {upstream:?} does not exist"),
+    })
+}
+
+/// Resolves the branch `-u`/`--unset-upstream` acts on: the positional or
+/// the checked-out branch, as a full ref name plus its config short name.
+fn upstream_branch(ctx: &Ctx, opts: &super::Collected) -> Result<(String, String), GitError> {
+    let store = ctx.store()?;
+    let full = match opts.positionals.as_slice() {
+        [] => current_branch_name(store)?.ok_or_else(|| GitError::Invalid {
+            detail: "not on a branch".to_owned(),
+        })?,
+        [name] => {
+            if name.starts_with("refs/") {
+                name.clone()
+            } else {
+                format!("refs/heads/{name}")
+            }
+        }
+        _ => {
+            return Err(GitError::Invalid {
+                detail: "usage: branch [-u <upstream> | --unset-upstream] [<branch>]".to_owned(),
+            });
+        }
+    };
+    let short = full
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| GitError::Invalid {
+            detail: "can only track a local branch".to_owned(),
+        })?
+        .to_owned();
+    Ok((full, short))
+}
+
+/// Records `branch.<name>.remote`/`branch.<name>.merge` for one branch.
+///
+/// Oracle: `git/builtin/branch.c` (`setup_tracking`).
+fn set_branch_upstream(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let upstream = opts
+        .single("set-upstream-to")?
+        .ok_or_else(|| GitError::Invalid {
+            detail: "option --set-upstream-to requires a value".to_owned(),
+        })?;
+    let (full, short) = upstream_branch(ctx, opts)?;
+    let target = RefName::new(full).map_err(|err| GitError::Invalid {
+        detail: format!("bad branch name: {err}"),
+    })?;
+    if super::state::read_ref(store, &target)?.is_none() {
+        return Err(GitError::NotFound {
+            detail: format!("branch {short:?} does not exist"),
+        });
+    }
+    let (remote, merge) = parse_upstream(store, &upstream)?;
+    config_write(store, &format!("branch.{short}.remote"), &remote)?;
+    config_write(store, &format!("branch.{short}.merge"), &merge)?;
+    Ok(Vec::new())
+}
+
+/// Drops `branch.<name>.remote`/`branch.<name>.merge` for one branch.
+fn unset_branch_upstream(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let (_, short) = upstream_branch(ctx, opts)?;
+    let remote_key = format!("branch.{short}.remote");
+    let merge_key = format!("branch.{short}.merge");
+    if config_read(store, &remote_key)?.is_none() && config_read(store, &merge_key)?.is_none() {
+        return Err(GitError::Invalid {
+            detail: format!("branch {short:?} has no upstream configured"),
+        });
+    }
+    if config_read(store, &remote_key)?.is_some() {
+        config_unset(store, &remote_key)?;
+    }
+    if config_read(store, &merge_key)?.is_some() {
+        config_unset(store, &merge_key)?;
+    }
+    Ok(Vec::new())
+}
+
 /// Lists local branches, current marked, with optional remotes and oids.
 fn list_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let current = current_branch_name(store)?;
-    let pattern = opts.positionals.first();
+    let remotes_only = opts.is_set("remotes");
     let mut out = Vec::new();
     for (name, target) in list_refs(store)? {
         let text = name.to_utf8().unwrap_or_default().to_owned();
         let is_branch = text.starts_with("refs/heads/");
         let is_remote = text.starts_with("refs/remotes/");
-        if !is_branch && !(opts.is_set("all") && is_remote) {
+        let visible = if remotes_only {
+            is_remote
+        } else {
+            is_branch || (opts.is_set("all") && is_remote)
+        };
+        if !visible {
             continue;
-        }
-        if let Some(want) = pattern {
-            if !glob_match(want, &text) && !glob_match(want, text.trim_start_matches("refs/heads/"))
-            {
-                continue;
-            }
         }
         let short = text
             .trim_start_matches("refs/heads/")
             .trim_start_matches("refs/remotes/");
+        if !opts.positionals.is_empty()
+            && !opts
+                .positionals
+                .iter()
+                .any(|want| glob_match(want, &text) || glob_match(want, short))
+        {
+            continue;
+        }
         let mark = if Some(text.clone()) == current {
             '*'
         } else {
@@ -244,10 +408,17 @@ fn delete_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     }
     let current = current_branch_name(store)?;
     let head = head_oid(store).ok();
+    let remote = opts.is_set("remotes");
     let mut out = Vec::new();
     for name in &opts.positionals {
-        let refname = branch_name(name)?;
-        if Some(refname.to_utf8().unwrap_or_default().to_owned()) == current {
+        let refname = if remote {
+            RefName::new(format!("refs/remotes/{name}")).map_err(|err| GitError::Invalid {
+                detail: format!("bad branch name: {err}"),
+            })?
+        } else {
+            branch_name(name)?
+        };
+        if !remote && Some(refname.to_utf8().unwrap_or_default().to_owned()) == current {
             return Err(GitError::Invalid {
                 detail: format!("cannot delete the checked-out branch {name:?}"),
             });
@@ -279,7 +450,22 @@ fn delete_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
                 change: RefChange::Delete,
             }],
         )?;
-        out.extend_from_slice(format!("Deleted branch {name}\n").as_bytes());
+        // Deleting a branch drops its config section the way the oracle
+        // prunes `branch.<name>.*` with the ref.
+        let short = name
+            .trim_start_matches("refs/heads/")
+            .trim_start_matches("refs/remotes/");
+        for key in [
+            format!("branch.{short}.remote"),
+            format!("branch.{short}.merge"),
+        ] {
+            if config_read(store, &key)?.is_some() {
+                config_unset(store, &key)?;
+            }
+        }
+        if !opts.is_set("quiet") {
+            out.extend_from_slice(format!("Deleted branch {name}\n").as_bytes());
+        }
     }
     Ok(out)
 }
@@ -400,7 +586,7 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         },
         FlagSpec {
             long: "detach",
-            short: None,
+            short: Some('d'),
             takes_value: false,
         },
         FlagSpec {
@@ -408,9 +594,24 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             short: Some('f'),
             takes_value: false,
         },
+        // Accepted for script compatibility: switches never print progress,
+        // and worktree updates already overwrite, so both are satisfied.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "track",
+            short: Some('t'),
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
+    if opts.is_set("track") {
+        return checkout_new_branch_tracked(ctx, &opts);
+    }
     if let Some(name) = opts.single("branch")? {
         let start = opts.positionals.first().map(String::as_str);
         return checkout_new_branch(ctx, &name, start, false);
@@ -419,6 +620,9 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         let start = opts.positionals.first().map(String::as_str);
         return checkout_new_branch(ctx, &name, start, true);
     }
+    // `collect` strips `--`, so a lone positional after `--` must read as a
+    // path, not a revision to switch to.
+    let saw_dashdash = args.iter().any(|arg| arg == "--");
     match opts.positionals.as_slice() {
         [] => {
             if opts.is_set("detach") {
@@ -435,10 +639,60 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
                 let tip = resolve_rev(store, ctx.kind()?, rev)?;
                 return detach_at(ctx, tip);
             }
+            if saw_dashdash {
+                return checkout_paths(ctx, &opts);
+            }
             switch_to_rev(ctx, rev)
         }
         _ => checkout_paths(ctx, &opts),
     }
+}
+
+/// Creates and checks out a branch that tracks its start point, recording
+/// `branch.<name>.remote`/`branch.<name>.merge` the way `--track` does.
+fn checkout_new_branch_tracked(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let branch = opts.single("branch")?;
+    let force_branch = opts.single("force-branch")?;
+    let (name, start, force) = match (branch, force_branch) {
+        (Some(name), None) => (name, opts.positionals.first().map(String::as_str), false),
+        (None, Some(name)) => (name, opts.positionals.first().map(String::as_str), true),
+        (None, None) => {
+            let [guess] = opts.positionals.as_slice() else {
+                return Err(GitError::Invalid {
+                    detail: "usage: checkout --track (-b <new> [<start>] | <remote>/<branch>)"
+                        .to_owned(),
+                });
+            };
+            let bare = guess.strip_prefix("refs/remotes/").unwrap_or(guess);
+            let (_, short) = bare.split_once('/').ok_or_else(|| GitError::Invalid {
+                detail: format!("cannot guess a local name from {guess:?}; pass -b <name>"),
+            })?;
+            (short.to_owned(), Some(guess.as_str()), false)
+        }
+        (Some(_), Some(_)) => {
+            return Err(GitError::Invalid {
+                detail: "cannot combine -b and -B".to_owned(),
+            });
+        }
+    };
+    let start = start.ok_or_else(|| GitError::Invalid {
+        detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
+    })?;
+    // Validate the upstream before creating anything, so a bad start point
+    // leaves no half-made branch behind.
+    parse_upstream(store, start)?;
+    let out = checkout_new_branch(ctx, &name, Some(start), force)?;
+    record_tracking(store, &name, start)?;
+    Ok(out)
+}
+
+/// Records `branch.<name>.remote`/`branch.<name>.merge` for a start point.
+fn record_tracking(store: &Store, name: &str, start: &str) -> Result<(), GitError> {
+    let (remote, merge) = parse_upstream(store, start)?;
+    config_write(store, &format!("branch.{name}.remote"), &remote)?;
+    config_write(store, &format!("branch.{name}.merge"), &merge)?;
+    Ok(())
 }
 
 /// Creates and checks out a branch from a start point.
@@ -624,6 +878,23 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             short: None,
             takes_value: false,
         },
+        // Accepted for script compatibility: switches never print progress,
+        // and worktree updates already overwrite, so both are satisfied.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "force",
+            short: Some('f'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "discard-changes",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
@@ -636,9 +907,15 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         return checkout_new_branch(ctx, &name, start, true);
     }
     match opts.positionals.as_slice() {
-        [] => Err(GitError::Invalid {
-            detail: "usage: switch [-c <new>] [<branch>]".to_owned(),
-        }),
+        [] => {
+            if opts.is_set("detach") {
+                let tip = head_oid(ctx.store()?)?;
+                return detach_at(ctx, tip);
+            }
+            Err(GitError::Invalid {
+                detail: "usage: switch [-c <new>] [<branch>]".to_owned(),
+            })
+        }
         [branch] => {
             if opts.is_set("detach") {
                 let store = ctx.store()?;
@@ -711,8 +988,14 @@ pub(crate) fn restore(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
         },
         FlagSpec {
             long: "source",
-            short: None,
+            short: Some('s'),
             takes_value: true,
+        },
+        // Accepted for script compatibility: restores print nothing already.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
         },
     ];
     let opts = collect(args, &specs)?;
@@ -840,9 +1123,30 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: None,
             takes_value: false,
         },
+        // Accepted for script compatibility: resets print nothing already.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "merge",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "keep",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
+    if opts.is_set("merge") || opts.is_set("keep") {
+        return Err(GitError::Unsupported {
+            command: "reset --merge and --keep need the merge lane".to_owned(),
+        });
+    }
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let (rev, paths) = match opts.positionals.as_slice() {
@@ -1089,11 +1393,29 @@ pub(crate) fn update_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "stdin",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "z",
+            short: Some('z'),
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let _ = opts.is_set("no-deref");
+    if opts.is_set("stdin") {
+        if !opts.positionals.is_empty() {
+            return Err(GitError::Invalid {
+                detail: "usage: update-ref --stdin [-z] [-m <msg>]".to_owned(),
+            });
+        }
+        return update_ref_stdin(ctx, &opts);
+    }
     if opts.is_set("delete") {
         let (name, old) = match opts.positionals.as_slice() {
             [name] => (name.clone(), None),
@@ -1118,8 +1440,17 @@ pub(crate) fn update_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
     let refname = RefName::new(name.clone()).map_err(|err| GitError::Invalid {
         detail: format!("bad ref name: {err}"),
     })?;
+    let zero = kind.zero_oid().to_hex();
     let new_oid = ruk_git::parse_oid_for(&value, kind)?;
+    // A zero new value deletes the ref, and a zero old value means the ref
+    // must not exist, the way the oracle treats the all-zero object id.
+    let change = if value == zero {
+        RefChange::Delete
+    } else {
+        RefChange::Set(RefTarget::Direct(new_oid))
+    };
     let expected = match old {
+        Some(hex) if hex == zero => RefExpect::Absent,
         Some(hex) => {
             let oid = ruk_git::parse_oid_for(&hex, kind)?;
             RefExpect::Present(RefTarget::Direct(oid))
@@ -1130,11 +1461,147 @@ pub(crate) fn update_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
         store,
         kind,
         vec![RefUpdate {
-            name: refname.clone(),
+            name: refname,
             expected,
-            change: RefChange::Set(RefTarget::Direct(new_oid)),
+            change,
         }],
     )?;
+    append_reflog(ctx, &applied, opts.single("message")?)?;
+    Ok(Vec::new())
+}
+
+/// Applies a batch of `update`/`create`/`delete`/`verify` lines from stdin.
+///
+/// Oracle: `git/builtin/update-ref.c` (`update_refs_stdin`).
+fn update_ref_stdin(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let raw = super::read_stdin_bytes(&ctx.env)?;
+    let zero = kind.zero_oid().to_hex();
+    let mut updates = Vec::new();
+    let split_nul = opts.is_set("z");
+    let chunks: Vec<String> = if split_nul {
+        raw.split(|byte| *byte == 0)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect()
+    } else {
+        String::from_utf8_lossy(&raw)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    for chunk in &chunks {
+        let text = chunk.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut parts = text.split(' ');
+        let verb = parts.next().unwrap_or_default();
+        if verb == "option" {
+            let name = parts.next().unwrap_or_default();
+            if name != "no-deref" {
+                return Err(GitError::Invalid {
+                    detail: format!("unknown update-ref option {name:?}"),
+                });
+            }
+            if parts.next().is_some() {
+                return Err(GitError::Invalid {
+                    detail: format!("bad update-ref line {text:?}"),
+                });
+            }
+            continue;
+        }
+        let name = parts.next().ok_or_else(|| GitError::Invalid {
+            detail: format!("bad update-ref line {text:?}"),
+        })?;
+        let refname = RefName::new(name.to_owned()).map_err(|err| GitError::Invalid {
+            detail: format!("bad ref name: {err}"),
+        })?;
+        let expect_old = |old: Option<&str>| -> Result<RefExpect, GitError> {
+            match old {
+                None => Ok(RefExpect::Any),
+                Some(hex) if hex == zero => Ok(RefExpect::Absent),
+                Some(hex) => Ok(RefExpect::Present(RefTarget::Direct(
+                    ruk_git::parse_oid_for(hex, kind)?,
+                ))),
+            }
+        };
+        match verb {
+            "update" | "create" => {
+                let hex = parts.next().ok_or_else(|| GitError::Invalid {
+                    detail: format!("bad update-ref line {text:?}"),
+                })?;
+                if hex == zero {
+                    return Err(GitError::Invalid {
+                        detail: format!("{verb} refuses the zero object id (use delete)"),
+                    });
+                }
+                let oid = ruk_git::parse_oid_for(hex, kind)?;
+                let old = parts.next();
+                if verb == "create" && old.is_some() {
+                    return Err(GitError::Invalid {
+                        detail: format!("bad update-ref line {text:?}"),
+                    });
+                }
+                if parts.next().is_some() {
+                    return Err(GitError::Invalid {
+                        detail: format!("bad update-ref line {text:?}"),
+                    });
+                }
+                updates.push(RefUpdate {
+                    name: refname,
+                    expected: if verb == "create" {
+                        RefExpect::Absent
+                    } else {
+                        expect_old(old)?
+                    },
+                    change: RefChange::Set(RefTarget::Direct(oid)),
+                });
+            }
+            "delete" => {
+                let old = parts.next();
+                let expected = expect_old(old)?;
+                if parts.next().is_some() {
+                    return Err(GitError::Invalid {
+                        detail: format!("bad update-ref line {text:?}"),
+                    });
+                }
+                updates.push(RefUpdate {
+                    name: refname,
+                    expected,
+                    change: RefChange::Delete,
+                });
+            }
+            "verify" => {
+                let held = super::state::read_ref(store, &refname)?;
+                let wanted = expect_old(parts.next())?;
+                if parts.next().is_some() {
+                    return Err(GitError::Invalid {
+                        detail: format!("bad update-ref line {text:?}"),
+                    });
+                }
+                let good = match wanted {
+                    RefExpect::Any => held.is_some(),
+                    RefExpect::Absent => held.is_none(),
+                    RefExpect::Present(target) => held.as_ref() == Some(&target),
+                };
+                if !good {
+                    return Err(GitError::Invalid {
+                        detail: format!("cannot verify {name:?}"),
+                    });
+                }
+            }
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("unknown update-ref command {verb:?}"),
+                });
+            }
+        }
+    }
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let applied = apply_refs(store, kind, updates)?;
     append_reflog(ctx, &applied, opts.single("message")?)?;
     Ok(Vec::new())
 }
@@ -1152,6 +1619,7 @@ fn delete_ref_logged(
         detail: format!("bad ref name: {err}"),
     })?;
     let expected = match old {
+        Some(hex) if hex == kind.zero_oid().to_hex() => RefExpect::Absent,
         Some(hex) => {
             let oid = ruk_git::parse_oid_for(&hex, kind)?;
             RefExpect::Present(RefTarget::Direct(oid))
@@ -1229,6 +1697,18 @@ pub(crate) fn symbolic_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
             short: Some('m'),
             takes_value: true,
         },
+        // Accepted for script compatibility: reads print only the target,
+        // and the exit status already signals a non-symbolic ref.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "short",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let _ = opts.single("message")?;
@@ -1239,6 +1719,10 @@ pub(crate) fn symbolic_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
         [name] => {
             if opts.is_set("delete") {
                 return delete_symbolic(ctx, name);
+            }
+            if opts.is_set("short") {
+                let target = symbolic_target(ctx, name)?;
+                return Ok(line(shorten_refname(&target).as_bytes().to_vec()));
             }
             read_symbolic(ctx, name)
         }
@@ -1256,14 +1740,27 @@ pub(crate) fn symbolic_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     }
 }
 
+/// Shortens `refs/heads/main` to `main` for `--short` listings.
+fn shorten_refname(name: &str) -> &str {
+    name.strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .or_else(|| name.strip_prefix("refs/remotes/"))
+        .unwrap_or_else(|| name.strip_prefix("refs/").unwrap_or(name))
+}
+
 /// Reads one symbolic ref's target.
 fn read_symbolic(ctx: &Ctx, name: &str) -> Result<Vec<u8>, GitError> {
+    symbolic_target(ctx, name).map(|target| line(target.into_bytes()))
+}
+
+/// Resolves one symbolic ref to its target name.
+fn symbolic_target(ctx: &Ctx, name: &str) -> Result<String, GitError> {
     let store = ctx.store()?;
     if name == "HEAD" {
         let (workspace, _) = load_or_default(store)?;
         match workspace.head {
             HeadRef::Symbolic(target) => {
-                return Ok(line(target.as_bytes().to_vec()));
+                return Ok(target.to_utf8().unwrap_or_default().to_owned());
             }
             HeadRef::Detached(_) => {
                 return Err(GitError::Invalid {
@@ -1276,7 +1773,7 @@ fn read_symbolic(ctx: &Ctx, name: &str) -> Result<Vec<u8>, GitError> {
         detail: format!("bad ref name: {err}"),
     })?;
     match super::state::read_ref(store, &refname)? {
-        Some(RefTarget::Symbolic(target)) => Ok(line(target.as_bytes().to_vec())),
+        Some(RefTarget::Symbolic(target)) => Ok(target.to_utf8().unwrap_or_default().to_owned()),
         Some(RefTarget::Direct(_)) => Err(GitError::Invalid {
             detail: format!("ref {name} is not a symbolic ref"),
         }),
@@ -1352,40 +1849,129 @@ pub(crate) fn show_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "branches",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "dereference",
+            short: Some('d'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "hash",
+            short: Some('s'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "abbrev",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted for `--verify`: the exit status already carries the
+        // answer, so nothing is printed.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "exclude-existing",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "exists",
+            short: None,
+            takes_value: false,
+        },
     ];
-    let opts = collect(args, &specs)?;
+    // `--abbrev[=<n>]` and `--hash[=<n>]` take an optional value, which the
+    // shared parser cannot express: normalize the valued form to the bare
+    // flag and remember the width.
+    let mut abbrev_digits: Option<usize> = None;
+    let mut rewritten = Vec::with_capacity(args.len());
+    for arg in args {
+        if let Some(width) = arg.strip_prefix("--abbrev=") {
+            abbrev_digits = Some(parse_oid_width(width)?);
+            rewritten.push("--abbrev".to_owned());
+        } else if let Some(width) = arg.strip_prefix("--hash=") {
+            abbrev_digits = Some(parse_oid_width(width)?);
+            rewritten.push("--hash".to_owned());
+        } else {
+            rewritten.push(arg.clone());
+        }
+    }
+    let opts = collect(&rewritten, &specs)?;
     let store = ctx.store()?;
     let mut out = Vec::new();
+    if opts.is_set("exists") {
+        for name in &opts.positionals {
+            let refname = RefName::new(name.clone()).map_err(|err| GitError::Invalid {
+                detail: format!("bad ref name: {err}"),
+            })?;
+            if super::state::read_ref(store, &refname)?.is_none() {
+                return Err(GitError::NotFound {
+                    detail: format!("reference does not exist: {name}"),
+                });
+            }
+        }
+        return Ok(out);
+    }
+    if opts.is_set("exclude-existing") {
+        return show_ref_exclude_existing(ctx);
+    }
     if opts.is_set("verify") {
-        let [name] = opts.positionals.as_slice() else {
+        if opts.positionals.is_empty() {
             return Err(GitError::Invalid {
                 detail: "usage: show-ref --verify <ref>".to_owned(),
             });
-        };
-        let refname = RefName::new(name.clone()).map_err(|err| GitError::Invalid {
-            detail: format!("bad ref name: {err}"),
-        })?;
-        let target =
-            super::state::read_ref(store, &refname)?.ok_or_else(|| GitError::NotFound {
-                detail: format!("ref {name} does not exist"),
+        }
+        let quiet = opts.is_set("quiet");
+        for name in &opts.positionals {
+            let refname = RefName::new(name.clone()).map_err(|err| GitError::Invalid {
+                detail: format!("bad ref name: {err}"),
             })?;
-        let oid = peel_target_oid(ctx, &target)?.ok_or_else(|| GitError::NotFound {
-            detail: format!("ref {name} is unborn"),
-        })?;
-        out.extend_from_slice(format!("{} {}\n", oid.to_hex(), name).as_bytes());
+            let target =
+                super::state::read_ref(store, &refname)?.ok_or_else(|| GitError::NotFound {
+                    detail: format!("ref {name} does not exist"),
+                })?;
+            let oid = peel_target_oid(ctx, &target)?.ok_or_else(|| GitError::NotFound {
+                detail: format!("ref {name} is unborn"),
+            })?;
+            if !quiet {
+                out.extend_from_slice(format!("{} {}\n", oid.to_hex(), name).as_bytes());
+            }
+        }
         return Ok(out);
     }
+    let digits = abbrev_digits.or(opts.is_set("abbrev").then_some(7));
+    let hash_only = opts.is_set("hash");
+    let render_oid = |oid: &Oid| {
+        let hex = oid.to_hex();
+        match digits {
+            Some(width) => hex[..width.min(hex.len())].to_owned(),
+            None => hex,
+        }
+    };
     if opts.is_set("head") {
         if let Ok(tip) = head_oid(store) {
-            out.extend_from_slice(format!("{} HEAD\n", tip.to_hex()).as_bytes());
+            let shown = render_oid(&tip);
+            if hash_only {
+                out.extend_from_slice(format!("{shown}\n").as_bytes());
+            } else {
+                out.extend_from_slice(format!("{shown} HEAD\n").as_bytes());
+            }
         }
     }
+    let heads_only = opts.is_set("heads") || opts.is_set("branches");
     for (name, target) in list_refs(store)? {
         let text = name.to_utf8().unwrap_or_default().to_owned();
         if opts.is_set("tags") && !text.starts_with("refs/tags/") {
             continue;
         }
-        if opts.is_set("heads") && !text.starts_with("refs/heads/") {
+        if heads_only && !text.starts_with("refs/heads/") {
             continue;
         }
         if !opts.positionals.is_empty()
@@ -1396,11 +1982,89 @@ pub(crate) fn show_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         {
             continue;
         }
-        if let Some(oid) = peel_target_oid(ctx, &target)? {
-            out.extend_from_slice(format!("{} {text}\n", oid.to_hex()).as_bytes());
+        let Some(oid) = peel_target_oid(ctx, &target)? else {
+            continue;
+        };
+        let shown = render_oid(&oid);
+        if hash_only {
+            out.extend_from_slice(format!("{shown}\n").as_bytes());
+        } else {
+            out.extend_from_slice(format!("{shown} {text}\n").as_bytes());
+        }
+        if opts.is_set("dereference") {
+            let peeled = peel_tag_target(ctx, &target)?;
+            if peeled.is_some_and(|peeled| peeled != oid) {
+                let shown = render_oid(&peeled.unwrap_or(oid));
+                if hash_only {
+                    out.extend_from_slice(format!("{shown}\n").as_bytes());
+                } else {
+                    out.extend_from_slice(format!("{shown} {text}^{{}}\n").as_bytes());
+                }
+            }
         }
     }
     Ok(out)
+}
+
+/// Parses an `--abbrev=<n>` / `--hash=<n>` width.
+fn parse_oid_width(text: &str) -> Result<usize, GitError> {
+    let width: usize = text.parse().map_err(|_| GitError::Invalid {
+        detail: format!("bad object width {text:?}"),
+    })?;
+    if width == 0 {
+        return Err(GitError::Invalid {
+            detail: format!("bad object width {text:?}"),
+        });
+    }
+    Ok(width)
+}
+
+/// Prints stdin `<oid> <ref>` lines whose ref is absent locally.
+///
+/// Oracle: `git/builtin/show-ref.c` (`--exclude-existing`).
+fn show_ref_exclude_existing(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let stdin = super::read_stdin_text(&ctx.env)?;
+    let mut out = Vec::new();
+    for raw in stdin.lines() {
+        let text = raw.trim_end();
+        if text.is_empty() {
+            continue;
+        }
+        let refpart = text.split_once(' ').map_or(text, |(_, name)| name);
+        let missing = match RefName::new(refpart.to_owned()) {
+            Err(_) => true,
+            Ok(refname) => super::state::read_ref(store, &refname)?.is_none(),
+        };
+        if missing {
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
+}
+
+/// Follows an annotated tag object to the object it points at.
+fn peel_tag_target(ctx: &Ctx, target: &RefTarget) -> Result<Option<Oid>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let RefTarget::Direct(oid) = target else {
+        return Ok(peel_target_oid(ctx, target)?);
+    };
+    let (object_kind, body) = read_object_bytes(store, *oid)?;
+    if object_kind != ruk_core::store::ObjectKind::Tag {
+        return Ok(Some(*oid));
+    }
+    let first = body.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let hex = first
+        .strip_prefix(b"object ")
+        .ok_or_else(|| GitError::Invalid {
+            detail: format!("tag {} has no object header", oid.to_hex()),
+        })?;
+    let text = std::str::from_utf8(hex).map_err(|_| GitError::Invalid {
+        detail: format!("tag {} has a non-UTF-8 object header", oid.to_hex()),
+    })?;
+    ruk_git::parse_oid_for(text, kind).map(Some)
 }
 
 /// Peels one ref target to its object id for listings.
@@ -1419,21 +2083,45 @@ fn peel_target_oid(ctx: &Ctx, target: &RefTarget) -> Result<Option<Oid>, GitErro
 /// Prints one line per ref with caller-chosen fields.
 ///
 /// Oracle: `git/builtin/for-each-ref.c`. The implemented fields are
-/// `%(refname)`, `%(objectname)`, and `%(objecttype)`; anything else fails
-/// instead of printing a blank.
+/// `%(refname)`, `%(refname:short)`, `%(objectname)`, `%(objectname:short)`,
+/// `%(objecttype)`, `%(subject)`, `%(authorname)`, `%(committername)`, and
+/// `%(creatordate)` / `%(creatordate:iso)`; anything else fails instead of
+/// printing a blank.
 pub(crate) fn for_each_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [FlagSpec {
-        long: "format",
-        short: None,
-        takes_value: true,
-    }];
+    let specs = [
+        FlagSpec {
+            long: "format",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "count",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "sort",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "points-at",
+            short: None,
+            takes_value: true,
+        },
+    ];
     let opts = collect(args, &specs)?;
     let store = ctx.store()?;
+    let kind = ctx.kind()?;
     let format = opts
         .single("format")?
         .unwrap_or_else(|| "%(objectname) %(refname)".to_owned());
     let fields = parse_format(&format)?;
-    let mut out = Vec::new();
+    let mut points = Vec::new();
+    for hex in opts.all("points-at")? {
+        points.push(ruk_git::parse_oid_for(&hex, kind)?);
+    }
+    let mut refs: Vec<(String, RefTarget)> = Vec::new();
     for (name, target) in list_refs(store)? {
         let text = name.to_utf8().unwrap_or_default().to_owned();
         if !opts.positionals.is_empty()
@@ -1444,20 +2132,73 @@ pub(crate) fn for_each_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
         {
             continue;
         }
+        if !points.is_empty() {
+            let direct = matches!(&target, RefTarget::Direct(oid) if points.contains(oid));
+            let peeled = peel_target_oid(ctx, &target)?.is_some_and(|oid| points.contains(&oid));
+            // Annotated tags point at tag objects but read as their commit,
+            // so `--points-at` matches the peeled target too.
+            let tag_peeled =
+                peel_tag_target(ctx, &target)?.is_some_and(|oid| points.contains(&oid));
+            if !direct && !peeled && !tag_peeled {
+                continue;
+            }
+        }
+        refs.push((text, target));
+    }
+    sort_refs(ctx, &mut refs, &opts.all("sort")?)?;
+    if let Some(count) = opts.single("count")? {
+        let count: usize = count.parse().map_err(|_| GitError::Invalid {
+            detail: format!("bad --count value {count:?}"),
+        })?;
+        refs.truncate(count);
+    }
+    let mut out = Vec::new();
+    for (text, target) in &refs {
+        let info = ref_commit_info(ctx, target)?;
         let mut rendered_line = Vec::new();
         for field in &fields {
             match field {
-                FormatField::Text(text) => rendered_line.extend_from_slice(text.as_bytes()),
+                FormatField::Text(literal) => {
+                    rendered_line.extend_from_slice(literal.as_bytes());
+                }
                 FormatField::RefName => rendered_line.extend_from_slice(text.as_bytes()),
+                FormatField::RefNameShort => {
+                    rendered_line.extend_from_slice(shorten_refname(text).as_bytes());
+                }
                 FormatField::ObjectName => {
-                    let oid = peel_target_oid(ctx, &target)?.ok_or_else(|| GitError::NotFound {
+                    let oid = peel_target_oid(ctx, target)?.ok_or_else(|| GitError::NotFound {
                         detail: format!("ref {text} is unborn"),
                     })?;
                     rendered_line.extend_from_slice(oid.to_hex().as_bytes());
                 }
+                FormatField::ObjectNameShort => {
+                    let oid = peel_target_oid(ctx, target)?.ok_or_else(|| GitError::NotFound {
+                        detail: format!("ref {text} is unborn"),
+                    })?;
+                    let hex = oid.to_hex();
+                    rendered_line.extend_from_slice(hex[..7.min(hex.len())].as_bytes());
+                }
                 FormatField::ObjectType => {
-                    let kind_name = ref_object_type(ctx, &target)?;
+                    let kind_name = ref_object_type(ctx, target)?;
                     rendered_line.extend_from_slice(kind_name.as_bytes());
+                }
+                FormatField::Subject => {
+                    let subject = info.as_ref().map(|known| known.subject.clone());
+                    rendered_line.extend_from_slice(subject.unwrap_or_default().as_bytes());
+                }
+                FormatField::AuthorName => {
+                    let name = info.as_ref().map(|known| known.author_name.clone());
+                    rendered_line.extend_from_slice(name.unwrap_or_default().as_bytes());
+                }
+                FormatField::CommitterName => {
+                    let name = info.as_ref().map(|known| known.committer_name.clone());
+                    rendered_line.extend_from_slice(name.unwrap_or_default().as_bytes());
+                }
+                FormatField::CreatorDate => {
+                    let date = info
+                        .as_ref()
+                        .map(|known| iso_datetime(known.committer_ts, known.committer_offset));
+                    rendered_line.extend_from_slice(date.unwrap_or_default().as_bytes());
                 }
             }
         }
@@ -1467,6 +2208,78 @@ pub(crate) fn for_each_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     Ok(out)
 }
 
+/// Sorts ref rows by `--sort` keys (`-` prefixes reverse), the way
+/// `git/builtin/for-each-ref.c` orders its ref array.
+fn sort_refs(ctx: &Ctx, refs: &mut [(String, RefTarget)], keys: &[String]) -> Result<(), GitError> {
+    let mut parsed = Vec::with_capacity(keys.len());
+    for key in keys {
+        let (name, reverse) = key
+            .strip_prefix('-')
+            .map_or((key.as_str(), false), |rest| (rest, true));
+        match name {
+            "refname" | "objectname" | "objecttype" | "authordate" | "committerdate"
+            | "creatordate" => parsed.push((name, reverse)),
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("unknown --sort key {key:?}"),
+                });
+            }
+        }
+    }
+    if parsed.is_empty() {
+        return Ok(());
+    }
+    let mut decorated = Vec::with_capacity(refs.len());
+    for (text, target) in refs.iter() {
+        let info = ref_commit_info(ctx, target)?;
+        let oid = peel_target_oid(ctx, target)?
+            .map(|oid| oid.to_hex())
+            .unwrap_or_default();
+        decorated.push((
+            text.clone(),
+            ref_object_type_or_empty(ctx, target)?,
+            oid,
+            info.as_ref().map(|info| info.author_ts).unwrap_or(0),
+            info.as_ref().map(|info| info.committer_ts).unwrap_or(0),
+        ));
+    }
+    let mut order: Vec<usize> = (0..refs.len()).collect();
+    order.sort_by(|&left, &right| {
+        let (lname, ltype, loid, lauthor, lcommitter) = &decorated[left];
+        let (rname, rtype, roid, rauthor, rcommitter) = &decorated[right];
+        let mut verdict = std::cmp::Ordering::Equal;
+        for (name, reverse) in &parsed {
+            let next = match *name {
+                "refname" => lname.cmp(rname),
+                "objectname" => loid.cmp(roid),
+                "objecttype" => ltype.cmp(rtype),
+                "authordate" => lauthor.cmp(rauthor),
+                _ => lcommitter.cmp(rcommitter),
+            };
+            if next != std::cmp::Ordering::Equal {
+                verdict = if *reverse { next.reverse() } else { next };
+                break;
+            }
+        }
+        verdict
+    });
+    let mut sorted = Vec::with_capacity(refs.len());
+    for index in order {
+        let (text, target) = &refs[index];
+        sorted.push((text.clone(), target.clone()));
+    }
+    refs.clone_from_slice(&sorted);
+    Ok(())
+}
+
+/// Names the peeled object type behind one ref target, or empty when unborn.
+fn ref_object_type_or_empty(ctx: &Ctx, target: &RefTarget) -> Result<String, GitError> {
+    if peel_target_oid(ctx, target)?.is_none() {
+        return Ok(String::new());
+    }
+    ref_object_type(ctx, target)
+}
+
 /// One parsed `--format` piece.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FormatField {
@@ -1474,10 +2287,22 @@ enum FormatField {
     Text(String),
     /// The full ref name.
     RefName,
+    /// The ref name without its `refs/*/` prefix.
+    RefNameShort,
     /// The peeled object id in hex.
     ObjectName,
+    /// The first seven digits of the peeled object id.
+    ObjectNameShort,
     /// The peeled object type name.
     ObjectType,
+    /// The first line of the peeled commit message.
+    Subject,
+    /// The peeled commit author name.
+    AuthorName,
+    /// The peeled commit committer name.
+    CommitterName,
+    /// The peeled commit committer date in `iso` mode.
+    CreatorDate,
 }
 
 /// Parses a `--format` string into literal and field pieces.
@@ -1497,8 +2322,14 @@ fn parse_format(format: &str) -> Result<Vec<FormatField>, GitError> {
         }
         match &after[..end] {
             "refname" => fields.push(FormatField::RefName),
+            "refname:short" => fields.push(FormatField::RefNameShort),
             "objectname" => fields.push(FormatField::ObjectName),
+            "objectname:short" => fields.push(FormatField::ObjectNameShort),
             "objecttype" => fields.push(FormatField::ObjectType),
+            "subject" => fields.push(FormatField::Subject),
+            "authorname" => fields.push(FormatField::AuthorName),
+            "committername" => fields.push(FormatField::CommitterName),
+            "creatordate" | "creatordate:iso" => fields.push(FormatField::CreatorDate),
             other => {
                 return Err(GitError::Invalid {
                     detail: format!("unsupported --format field %({other})"),
@@ -1512,6 +2343,95 @@ fn parse_format(format: &str) -> Result<Vec<FormatField>, GitError> {
         fields.push(FormatField::Text(literal));
     }
     Ok(fields)
+}
+
+/// Commit facts behind one ref for `%(subject)` and name/date fields.
+struct PeeledCommit {
+    author_name: String,
+    committer_name: String,
+    author_ts: i64,
+    committer_ts: i64,
+    committer_offset: ruk_core::conflict::TzOffset,
+    subject: String,
+}
+
+/// Peels a ref to its commit record for informational format fields.
+/// Non-commit targets read as absent, the way the oracle prints blanks.
+fn ref_commit_info(ctx: &Ctx, target: &RefTarget) -> Result<Option<PeeledCommit>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let Some(peeled) = peel_target_oid(ctx, target)? else {
+        return Ok(None);
+    };
+    let (object_kind, body) = read_object_bytes(store, peeled)?;
+    let commit_oid = if object_kind == ruk_core::store::ObjectKind::Tag {
+        let Some(first) = body.split(|byte| *byte == b'\n').next() else {
+            return Ok(None);
+        };
+        let Some(hex) = first.strip_prefix(b"object ") else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(hex).map_err(|_| GitError::Invalid {
+            detail: "tag object header is not valid UTF-8".to_owned(),
+        })?;
+        ruk_git::parse_oid_for(text, kind)?
+    } else {
+        peeled
+    };
+    let record = match super::state::commit_record(store, commit_oid) {
+        Ok(record) => record,
+        Err(GitError::NotFound { .. }) => return Ok(None),
+        Err(other) => return Err(other),
+    };
+    let author = record
+        .author()
+        .map_err(|err| GitError::from(CoreError::from(err)))?;
+    let committer = record
+        .committer()
+        .map_err(|err| GitError::from(CoreError::from(err)))?;
+    Ok(Some(PeeledCommit {
+        author_name: String::from_utf8_lossy(author.name.as_bytes()).into_owned(),
+        committer_name: String::from_utf8_lossy(committer.name.as_bytes()).into_owned(),
+        author_ts: author.timestamp,
+        committer_ts: committer.timestamp,
+        committer_offset: committer.offset,
+        subject: first_message_line(record.message()),
+    }))
+}
+
+/// Renders `YYYY-MM-DD HH:MM:SS +HH:MM` in the committer's zone for
+/// `%(creatordate:iso)`, matching the oracle's `iso` date mode.
+fn iso_datetime(timestamp: i64, offset: ruk_core::conflict::TzOffset) -> String {
+    let digits = u32::from(offset.hhmm());
+    let minutes = i64::from(digits / 100) * 60 + i64::from(digits % 100);
+    let shift = minutes * 60;
+    let local = timestamp + if offset.is_negative() { -shift } else { shift };
+    let days = local.div_euclid(86_400);
+    let clock = local.rem_euclid(86_400) as u64;
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let display_year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{display_year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} {}{:02}:{:02}",
+        clock / 3_600,
+        (clock % 3_600) / 60,
+        clock % 60,
+        if offset.is_negative() { '-' } else { '+' },
+        minutes / 60,
+        minutes % 60,
+    )
 }
 
 /// Names the peeled object type behind one ref target.
@@ -1560,10 +2480,53 @@ pub(crate) fn tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             short: Some('f'),
             takes_value: false,
         },
+        FlagSpec {
+            long: "verify",
+            short: Some('v'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "sign",
+            short: Some('s'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "local-user",
+            short: Some('u'),
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "file",
+            short: Some('F'),
+            takes_value: true,
+        },
     ];
-    let opts = collect(args, &specs)?;
+    // `-n[<num>]` takes an optional attached value, which the shared parser
+    // cannot express: normalize to a remembered line count.
+    let mut annotation_lines: Option<usize> = None;
+    let mut rewritten = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "-n" {
+            annotation_lines = Some(1);
+        } else if let Some(digits) = arg.strip_prefix("-n") {
+            annotation_lines = Some(digits.parse().map_err(|_| GitError::Invalid {
+                detail: format!("bad -n value {arg:?}"),
+            })?);
+        } else {
+            rewritten.push(arg.clone());
+        }
+    }
+    let opts = collect(&rewritten, &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
+    if opts.is_set("sign") || opts.single("local-user")?.is_some() {
+        return Err(GitError::Unsupported {
+            command: "tag signing needs GPG, which this store does not implement".to_owned(),
+        });
+    }
+    if opts.is_set("verify") {
+        return verify_tags(ctx, &opts);
+    }
     if opts.is_set("delete") {
         if opts.positionals.is_empty() {
             return Err(GitError::Invalid {
@@ -1591,9 +2554,13 @@ pub(crate) fn tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         }
         return Ok(out);
     }
+    // `-n` implies `-l` in the oracle, and the no-arg form already lists.
+    let lines = annotation_lines.unwrap_or(0);
     match opts.positionals.as_slice() {
-        [] => list_tags(ctx, &opts, None),
-        [pattern] if opts.is_set("list") => list_tags(ctx, &opts, Some(pattern)),
+        [] => list_tags(ctx, &opts, None, lines),
+        [pattern] if opts.is_set("list") || annotation_lines.is_some() => {
+            list_tags(ctx, &opts, Some(pattern), lines)
+        }
         [name] => create_tag(ctx, name, None, &opts),
         [name, target] => create_tag(ctx, name, Some(target), &opts),
         _ => Err(GitError::Invalid {
@@ -1602,8 +2569,44 @@ pub(crate) fn tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
 }
 
+/// Verifies annotated tags structurally: the tag object must exist and its
+/// target must resolve. The store holds no GPG signatures to check.
+fn verify_tags(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    if opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: tag -v <name>...".to_owned(),
+        });
+    }
+    let mut out = Vec::new();
+    for name in &opts.positionals {
+        let refname = tag_name(name)?;
+        let target =
+            super::state::read_ref(ctx.store()?, &refname)?.ok_or_else(|| GitError::NotFound {
+                detail: format!("tag {name:?} does not exist"),
+            })?;
+        let RefTarget::Direct(oid) = target else {
+            return Err(GitError::Invalid {
+                detail: format!("tag {name:?} is not a tag object"),
+            });
+        };
+        let (object_kind, body) = read_object_bytes(ctx.store()?, oid)?;
+        if object_kind != ruk_core::store::ObjectKind::Tag {
+            return Err(GitError::Invalid {
+                detail: format!("tag {name:?} is lightweight: cannot verify"),
+            });
+        }
+        out.extend_from_slice(&line(body));
+    }
+    Ok(out)
+}
+
 /// Lists tags, optionally filtered by a glob.
-fn list_tags(ctx: &Ctx, opts: &super::Collected, extra: Option<&str>) -> Result<Vec<u8>, GitError> {
+fn list_tags(
+    ctx: &Ctx,
+    opts: &super::Collected,
+    extra: Option<&str>,
+    lines: usize,
+) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let patterns: Vec<String> = opts
         .positionals
@@ -1612,7 +2615,7 @@ fn list_tags(ctx: &Ctx, opts: &super::Collected, extra: Option<&str>) -> Result<
         .chain(extra.map(str::to_owned))
         .collect();
     let mut out = Vec::new();
-    for (name, _) in list_refs(store)? {
+    for (name, target) in list_refs(store)? {
         let text = name.to_utf8().unwrap_or_default().to_owned();
         if !text.starts_with("refs/tags/") {
             continue;
@@ -1621,9 +2624,53 @@ fn list_tags(ctx: &Ctx, opts: &super::Collected, extra: Option<&str>) -> Result<
         if !patterns.is_empty() && !patterns.iter().any(|pattern| glob_match(pattern, short)) {
             continue;
         }
-        out.extend_from_slice(format!("{short}\n").as_bytes());
+        if lines == 0 {
+            out.extend_from_slice(format!("{short}\n").as_bytes());
+            continue;
+        }
+        let shown = tag_message_lines(ctx, &target, lines)?;
+        if shown.is_empty() {
+            out.extend_from_slice(format!("{short}\n").as_bytes());
+        } else {
+            out.extend_from_slice(format!("{short:<16}{}\n", shown[0]).as_bytes());
+            for extra in &shown[1..] {
+                out.extend_from_slice(format!("    {extra}\n").as_bytes());
+            }
+        }
     }
     Ok(out)
+}
+
+/// Reads up to `lines` annotation lines: the tag message for annotated
+/// tags, the target commit message for lightweight ones.
+fn tag_message_lines(ctx: &Ctx, target: &RefTarget, lines: usize) -> Result<Vec<String>, GitError> {
+    let store = ctx.store()?;
+    let Some(oid) = peel_target_oid(ctx, target)? else {
+        return Ok(Vec::new());
+    };
+    let (object_kind, body) = read_object_bytes(store, oid)?;
+    if object_kind == ruk_core::store::ObjectKind::Tag {
+        let message = body
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .map(|at| body[at + 2..].to_vec())
+            .unwrap_or_default();
+        return Ok(String::from_utf8_lossy(&message)
+            .lines()
+            .take(lines)
+            .map(str::to_owned)
+            .collect());
+    }
+    let record = match super::state::commit_record(store, oid) {
+        Ok(record) => record,
+        Err(GitError::NotFound { .. }) => return Ok(Vec::new()),
+        Err(other) => return Err(other),
+    };
+    Ok(String::from_utf8_lossy(record.message())
+        .lines()
+        .take(lines)
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Creates a lightweight or annotated tag at a target revision.
@@ -1645,11 +2692,22 @@ fn create_tag(
         Some(rev) => resolve_rev(store, kind, rev)?,
         None => head_oid(store)?,
     };
-    let pointed = if opts.is_set("annotate") || opts.single("message")?.is_some() {
-        let message = opts
-            .single("message")?
-            .map(|text| text.into_bytes())
-            .unwrap_or_else(|| format!("tag {name}\n").into_bytes());
+    let pointed = if opts.is_set("annotate")
+        || opts.single("message")?.is_some()
+        || opts.single("file")?.is_some()
+    {
+        let message = match opts.single("message")? {
+            Some(text) => text.into_bytes(),
+            None => match opts.single("file")? {
+                Some(path) => {
+                    let full = ctx.env.cwd.join(&path);
+                    std::fs::read(&full).map_err(|err| GitError::Io {
+                        detail: format!("reading {}: {err}", full.display()),
+                    })?
+                }
+                None => format!("tag {name}\n").into_bytes(),
+            },
+        };
         let (object_kind, _) = read_object_bytes(store, oid)?;
         let type_name = match object_kind {
             ruk_core::store::ObjectKind::Blob => "blob",
@@ -1691,26 +2749,124 @@ fn tag_name(name: &str) -> Result<RefName, GitError> {
 ///
 /// Oracle: `git/builtin/stash.c`.
 pub(crate) fn stash(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [FlagSpec {
-        long: "message",
-        short: Some('m'),
-        takes_value: true,
-    }];
+    let specs = [
+        FlagSpec {
+            long: "message",
+            short: Some('m'),
+            takes_value: true,
+        },
+        // `--keep-index` leaves the index alone; the rest need lanes this
+        // store does not have, so they fail loudly instead of half-working.
+        FlagSpec {
+            long: "keep-index",
+            short: Some('k'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "include-untracked",
+            short: Some('u'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "all",
+            short: Some('a'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "staged",
+            short: Some('S'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "patch",
+            short: Some('p'),
+            takes_value: false,
+        },
+        // Accepted for script compatibility: output is the only effect.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+        // Accepted: restoring the index rows already is the `--index`
+        // behavior, the only apply mode this store has.
+        FlagSpec {
+            long: "index",
+            short: None,
+            takes_value: false,
+        },
+    ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
+    let sub = opts.positionals.first().map(String::as_str);
+    let pushing = sub.is_none_or(|word| word == "push" || word == "save");
+    if pushing {
+        for flag in ["include-untracked", "all", "staged", "patch"] {
+            if opts.is_set(flag) {
+                return Err(GitError::Unsupported {
+                    command: format!("stash --{flag} needs the worktree snapshot lane"),
+                });
+            }
+        }
+    } else {
+        for flag in ["keep-index", "include-untracked", "all", "staged", "patch"] {
+            if !opts.is_set(flag) {
+                continue;
+            }
+            if flag == "patch" && sub == Some("show") {
+                return Err(GitError::Unsupported {
+                    command: "stash show --patch needs the diff lane".to_owned(),
+                });
+            }
+            // `show -u` is valid in the oracle; stashes here never record
+            // untracked files, so the plain listing already is the answer.
+            if flag == "include-untracked" && sub == Some("show") {
+                continue;
+            }
+            return Err(GitError::Invalid {
+                detail: format!(
+                    "option --{flag} does not apply to stash {}",
+                    sub.unwrap_or("push")
+                ),
+            });
+        }
+    }
+    let quiet = opts.is_set("quiet");
     match opts.positionals.as_slice() {
-        [] => stash_push(ctx, &opts),
-        [sub] if sub == "push" => stash_push(ctx, &opts),
+        [] => hush_result(stash_push(ctx, &opts), quiet),
+        [sub] if sub == "push" => hush_result(stash_push(ctx, &opts), quiet),
+        [sub] if sub == "save" => hush_result(stash_push(ctx, &opts), quiet),
+        [sub, first, rest @ ..] if sub == "save" => {
+            if opts.is_set("message") {
+                return Err(GitError::Invalid {
+                    detail: "cannot combine -m with a save message".to_owned(),
+                });
+            }
+            let mut saved = opts.clone();
+            let mut message = first.clone();
+            for extra in rest {
+                message.push(' ');
+                message.push_str(extra);
+            }
+            saved
+                .present
+                .insert("message".to_owned(), vec![Some(message)]);
+            hush_result(stash_push(ctx, &saved), quiet)
+        }
         [sub] if sub == "list" => stash_list(ctx),
         [sub] if sub == "show" => stash_show(ctx, None),
         [sub, slot] if sub == "show" => stash_show(ctx, Some(parse_slot(slot)?)),
-        [sub] if sub == "drop" => stash_drop_slot(ctx, 0),
-        [sub, slot] if sub == "drop" => stash_drop_slot(ctx, parse_slot(slot)?),
-        [sub] if sub == "pop" => stash_pop(ctx, 0),
-        [sub, slot] if sub == "pop" => stash_pop(ctx, parse_slot(slot)?),
-        [sub] if sub == "apply" => stash_apply(ctx, 0),
-        [sub, slot] if sub == "apply" => stash_apply(ctx, parse_slot(slot)?),
+        [sub] if sub == "drop" => hush_result(stash_drop_slot(ctx, 0), quiet),
+        [sub, slot] if sub == "drop" => hush_result(stash_drop_slot(ctx, parse_slot(slot)?), quiet),
+        [sub] if sub == "pop" => hush_result(stash_pop(ctx, 0), quiet),
+        [sub, slot] if sub == "pop" => hush_result(stash_pop(ctx, parse_slot(slot)?), quiet),
+        [sub] if sub == "apply" => hush_result(stash_apply(ctx, 0), quiet),
+        [sub, slot] if sub == "apply" => hush_result(stash_apply(ctx, parse_slot(slot)?), quiet),
         [sub] if sub == "clear" => stash_clear(ctx),
+        [sub, name] if sub == "branch" => hush_result(stash_branch(ctx, name, 0), quiet),
+        [sub, name, slot] if sub == "branch" => {
+            hush_result(stash_branch(ctx, name, parse_slot(slot)?), quiet)
+        }
         [other] => Err(GitError::Invalid {
             detail: format!("unknown stash subcommand {other:?}"),
         }),
@@ -1720,11 +2876,49 @@ pub(crate) fn stash(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     }
 }
 
-/// Parses a stash slot number.
+/// Drops verb output for `--quiet`, keeping the exit status as the signal.
+fn hush_result(result: Result<Vec<u8>, GitError>, quiet: bool) -> Result<Vec<u8>, GitError> {
+    result.map(|out| if quiet { Vec::new() } else { out })
+}
+
+/// Parses a stash slot number, accepting `stash@{n}` like the oracle.
 fn parse_slot(text: &str) -> Result<u64, GitError> {
-    text.parse().map_err(|_| GitError::Invalid {
+    let inner = text
+        .strip_prefix("stash@{")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(text);
+    inner.parse().map_err(|_| GitError::Invalid {
         detail: format!("bad stash slot {text:?}"),
     })
+}
+
+/// Creates a branch at a stash's base commit, checks it out, and applies
+/// the stash there, dropping the slot on success.
+///
+/// Oracle: `git/builtin/stash.c` (`do_branch`).
+fn stash_branch(ctx: &Ctx, name: &str, slot: u64) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {
+        detail: format!("no such stash slot: stash@{slot}"),
+    })?;
+    if entry.base_hex.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "cannot branch a stash created on an unborn branch".to_owned(),
+        });
+    }
+    let base = ruk_git::parse_oid_for(&entry.base_hex, kind)?;
+    if super::state::read_ref(store, &branch_name(name)?)?.is_some() {
+        return Err(GitError::Invalid {
+            detail: format!("branch {name:?} already exists"),
+        });
+    }
+    create_branch(store, kind, name, base)?;
+    switch_head_to(ctx, HeadRef::Symbolic(branch_name(name)?))?;
+    stash_apply(ctx, slot)?;
+    stash_drop(store, slot)?;
+    repoint_stash_ref(ctx)?;
+    Ok(format!("Switched to a new branch '{name}'\n").into_bytes())
 }
 
 /// Records the current index in a stash commit and resets the index.
@@ -1798,12 +2992,16 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
             change: RefChange::Set(RefTarget::Direct(commit_oid)),
         }],
     )?;
-    match base {
-        Some(tip) => {
-            let record = super::state::commit_record(store, tip)?;
-            reset_index_tree(ctx, commit_tree_oid(&record)?)?;
+    // `--keep-index` records the slot without resetting, leaving the
+    // stashed changes staged the way the oracle does.
+    if !opts.is_set("keep-index") {
+        match base {
+            Some(tip) => {
+                let record = super::state::commit_record(store, tip)?;
+                reset_index_tree(ctx, commit_tree_oid(&record)?)?;
+            }
+            None => clear_index(ctx)?,
         }
-        None => clear_index(ctx)?,
     }
     Ok(format!("Saved working directory as stash@{slot}\n").into_bytes())
 }
