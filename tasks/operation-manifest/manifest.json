@@ -1,0 +1,3508 @@
+{
+  "schema_version": 1,
+  "source_commit": "acd7bc15db65b7a4b9a216b3e1a8772fe7d4d128",
+  "inventory": "~/.omp/agent/sessions/-rewrite-git-renewed/2026-10-16T13-23-15-006Z_01a144e1-8dbe-72f5-8d58-445ba769d439/local/ruk-forgejo-command-inventory.md",
+  "verb_count": 56,
+  "verbs": [
+    {
+      "verb": "add",
+      "category": "mainporcelain worktree",
+      "inventory_ref": "inventory §2 `add` row",
+      "forgejo_callsites": [
+        "modules/git/commit.go:88 (AddChangesWithArgs, verb follows TrustedCmdArgs globals)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-add mainporcelain worktree",
+        "git/builtin/add.c"
+      ],
+      "option_families": [
+        {
+          "family": "add-forgejo-pinned",
+          "options": [
+            "--all",
+            "--"
+          ],
+          "source": "inventory §2 `add` row; modules/git/commit.go:88-96"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Empty on success.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "Updates index entries for the listed paths (or all with --all).",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "No worktree file mutation; index only."
+      },
+      "argv_shape": "git add --all -- <path>...",
+      "notes": "Global args precede the verb (NewCommandContextNoGlobals + globalArgs, dynamic site D10)."
+    },
+    {
+      "verb": "apply",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `apply` row; §3 site 9",
+      "forgejo_callsites": [
+        "services/repository/files/patch.go:166 (dynamic --git-dir prefix, §3.9)",
+        "routers/services diffpatch callsites (inventory §2)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-apply plumbingmanipulators",
+        "git/builtin/apply.c"
+      ],
+      "option_families": [
+        {
+          "family": "apply-forgejo-pinned",
+          "options": [
+            "--index",
+            "--recount",
+            "--cached",
+            "--ignore-whitespace",
+            "--whitespace=fix",
+            "--binary",
+            "-3"
+          ],
+          "source": "inventory §2 `apply` row; patch.go:163-166"
+        },
+        {
+          "family": "apply-git-dir-prefix",
+          "options": [
+            "--git-dir <path>"
+          ],
+          "source": "dynamic site D09; patch.go:163-166, sets repo without changing cwd"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Patch does not apply; with --index the index is left unmodified on failure."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Unified diff bytes on stdin.",
+        "stdout": "Empty on success; conflict hunks described on stderr.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "With --index/--cached: applies patch to index. Without: worktree files only.",
+        "sequencer": "No sequencer state; -3 falls back to three-way blob merge, not a sequencer.",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "May write worktree files when --index is absent; with --cached index only. patch.go isolates bare-repo runs in a temp working dir."
+      },
+      "argv_shape": "git --git-dir <path> apply --index --recount --cached --ignore-whitespace --whitespace=fix --binary -3 < stdin.patch",
+      "notes": ""
+    },
+    {
+      "verb": "archive",
+      "category": "mainporcelain",
+      "inventory_ref": "inventory §2 `archive` row",
+      "forgejo_callsites": [
+        "modules/git/repo_archive.go:59"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-archive mainporcelain",
+        "git/builtin/archive.c"
+      ],
+      "option_families": [
+        {
+          "family": "archive-forgejo-pinned",
+          "options": [
+            "--prefix=<p>",
+            "--format=<fmt>"
+          ],
+          "source": "inventory §2 `archive` row; repo_archive.go:59"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Raw tar/zip archive bytes on stdout.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git archive --prefix=<p> --format=<fmt> <tree>",
+      "notes": ""
+    },
+    {
+      "verb": "blame",
+      "category": "ancillaryinterrogators",
+      "inventory_ref": "inventory §2 `blame` row; §4 blame.go:198",
+      "forgejo_callsites": [
+        "modules/git/repo_blame.go:23,89",
+        "modules/git/blame.go:139"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-blame ancillaryinterrogators",
+        "git/builtin/blame.c"
+      ],
+      "option_families": [
+        {
+          "family": "blame-forgejo-pinned",
+          "options": [
+            "--porcelain",
+            "-L <range>",
+            "-p",
+            "--reverse",
+            "--ignore-revs-file <file>"
+          ],
+          "source": "inventory §2 `blame` row; blame.go:198 temp ignore-revs file via os.CreateTemp"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Porcelain blame lines (--porcelain/-p) or human blame; --ignore-revs-file read from temp file.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git blame --porcelain -L <start>,<end> -- <path>",
+      "notes": "Temp ignore-revs file is a harness-side os.CreateTemp, not a git side effect (inventory §4)."
+    },
+    {
+      "verb": "branch",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `branch` row",
+      "forgejo_callsites": [
+        "modules/git/repo.go:343",
+        "modules/git/repo_branch.go:107,123,156",
+        "services/pull/merge_prepare.go:240",
+        "services/agit/agit.go:155"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-branch mainporcelain history",
+        "git/builtin/branch.c"
+      ],
+      "option_families": [
+        {
+          "family": "branch-forgejo-pinned",
+          "options": [
+            "-m <old> <new>",
+            "-d <branch>",
+            "-D <branch>",
+            "--contains <commit>"
+          ],
+          "source": "inventory §2 `branch` row"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Branch exists / not found / not merged (for -d)."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Branch list or operation result lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none.",
+        "config": "none",
+        "refs": "Creates/renames/deletes refs/heads/* entries (-m/-d/-D).",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git branch -m <old> <new>",
+      "notes": ""
+    },
+    {
+      "verb": "bundle",
+      "category": "mainporcelain",
+      "inventory_ref": "inventory §2 `bundle` row",
+      "forgejo_callsites": [
+        "modules/git/repo.go:349"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-bundle mainporcelain",
+        "git/builtin/bundle.c"
+      ],
+      "option_families": [
+        {
+          "family": "bundle-forgejo-pinned",
+          "options": [
+            "create <file> bundle HEAD"
+          ],
+          "source": "inventory §2 `bundle` row; repo.go:349"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Progress/result text; bundle pack written to <file>.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Reads objects; writes bundle file at given path (outside repo).",
+        "worktree": "none"
+      },
+      "argv_shape": "git bundle create <file> bundle HEAD",
+      "notes": ""
+    },
+    {
+      "verb": "cat-file",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `cat-file` row",
+      "forgejo_callsites": [
+        "modules/git/batch_reader.go:64,116",
+        "modules/git/pipeline/catfile.go:28,46,67",
+        "modules/git/repo_commit.go:577 (-e)",
+        "routers/private/hook_verification.go:88 (commit)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-cat-file plumbinginterrogators",
+        "git/builtin/cat-file.c"
+      ],
+      "option_families": [
+        {
+          "family": "cat-file-batch",
+          "options": [
+            "--batch",
+            "--batch-check",
+            "--batch-all-objects"
+          ],
+          "source": "inventory §2; batch_reader.go persistent framing"
+        },
+        {
+          "family": "cat-file-single",
+          "options": [
+            "-e <object>",
+            "-t <object>",
+            "-p <object>",
+            "commit <oid>"
+          ],
+          "source": "inventory §2; repo_commit.go:577; hook_verification.go:88"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "-e/existence check fails or object missing."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "For --batch: oid lines on stdin. Otherwise none.",
+        "stdout": "For --batch/--batch-check: '<oid> <type> <size>' headers + raw object bytes; single: raw object bytes or type name.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Read-only; --batch-all-objects walks all objects.",
+        "worktree": "none"
+      },
+      "argv_shape": "git cat-file --batch / git cat-file --batch-check / git cat-file -e <oid>",
+      "notes": "Batch framing contract owned by batch_reader.go; compat surface must preserve exact header grammar."
+    },
+    {
+      "verb": "check-attr",
+      "category": "purehelpers",
+      "inventory_ref": "inventory §2 `check-attr` row",
+      "forgejo_callsites": [
+        "modules/git/repo_attribute.go:143"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-check-attr purehelpers",
+        "git/builtin/check-attr.c"
+      ],
+      "option_families": [
+        {
+          "family": "check-attr-forgejo-pinned",
+          "options": [
+            "-z",
+            "--cached"
+          ],
+          "source": "inventory §2; repo_attribute.go:143; runs under GIT_INDEX_FILE/GIT_WORK_TREE (dynamic site D11)"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Path list (NUL-delimited with -z).",
+        "stdout": "NUL-delimited '<path> NUL <attr> NUL <value> NUL' records with -z.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "Reads index via GIT_INDEX_FILE; no mutation.",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git check-attr -z --cached -- <path>",
+      "notes": ""
+    },
+    {
+      "verb": "checkout",
+      "category": "mainporcelain",
+      "inventory_ref": "inventory §2 `checkout` row",
+      "forgejo_callsites": [
+        "services/pull/merge_prepare.go:289,310",
+        "services/pull/merge_rebase.go:108"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-checkout mainporcelain",
+        "git/builtin/checkout.c"
+      ],
+      "option_families": [
+        {
+          "family": "checkout-forgejo-pinned",
+          "options": [
+            "<branch>"
+          ],
+          "source": "inventory §2; merge_prepare.go:289,310 positional branch only"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Branch missing or worktree conflict."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Switch status lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Detaches or moves HEAD to branch.",
+        "index": "Resets index to target tree.",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "Checks out target tree files."
+      },
+      "argv_shape": "git checkout <branch>",
+      "notes": ""
+    },
+    {
+      "verb": "clone",
+      "category": "mainporcelain init",
+      "inventory_ref": "inventory §2 `clone` row; §3 site 2",
+      "forgejo_callsites": [
+        "modules/git/repo.go:165 (AddArguments clone, args from CloneWithArgs callers)",
+        "services/repository/files/temp_repo.go:56",
+        "services/repository/create.go:66",
+        "models repo/fork.go:144",
+        "services/repository/generate_repo_commit.go"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-clone mainporcelain init",
+        "git/builtin/clone.c"
+      ],
+      "option_families": [
+        {
+          "family": "clone-forgejo-pinned",
+          "options": [
+            "--mirror",
+            "--bare",
+            "--quiet",
+            "-s",
+            "--no-checkout",
+            "--depth <n>",
+            "--filter <spec>",
+            "-b <branch>",
+            "-c http.sslVerify=false",
+            "-c http.followRedirects=false"
+          ],
+          "source": "inventory §2; CloneWithArgs dynamic site D01; repo.go:143-200"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Transport/auth failure or remote ref missing."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none (credentials via helper/file, command.go:462 temp credential file).",
+        "stdout": "Progress lines; --quiet suppresses.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Initializes HEAD in new repo.",
+        "index": "none",
+        "sequencer": "none",
+        "config": "Writes origin + -c overrides into new repo config.",
+        "refs": "Copies remote refs per --mirror/--bare/-b/--depth/--filter.",
+        "objects": "Fetches reachable objects; partial when --filter.",
+        "worktree": "Checked out unless --no-checkout/--bare/--mirror."
+      },
+      "argv_shape": "git clone [--mirror|--bare] [--quiet] [-s] [--no-checkout] [--depth N] [--filter F] [-b B] [-c k=v]... <from> <to>",
+      "notes": "Leading global args come from CloneWithArgs callers (dynamic site D01)."
+    },
+    {
+      "verb": "commit",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `commit` row; §3 site 1",
+      "forgejo_callsites": [
+        "modules/git/commit.go:120 (verb follows TrustedCmdArgs globals)",
+        "services/pull/merge.go:422",
+        "services/pull/merge_squash.go:66",
+        "services/pull/merge_rebase.go:76",
+        "services/repository/init.go:43"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-commit mainporcelain history",
+        "git/builtin/commit.c"
+      ],
+      "option_families": [
+        {
+          "family": "commit-forgejo-pinned",
+          "options": [
+            "--file=-",
+            "--amend",
+            "--no-gpg-sign",
+            "-S<key>",
+            "--author=<a>",
+            "--message=<m>",
+            "-c user.name=/-c user.email="
+          ],
+          "source": "inventory §2; commit.go:115-130"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "Nothing to commit / hook rejection."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Message bytes on stdin with --file=-.",
+        "stdout": "Commit summary lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Advances HEAD (or amends tip).",
+        "index": "Consumes staged index into new tree.",
+        "sequencer": "none (merge commits record parents directly).",
+        "config": "none",
+        "refs": "Updates current branch ref.",
+        "objects": "Writes commit + tree objects.",
+        "worktree": "none"
+      },
+      "argv_shape": "git -c user.name=N -c user.email=E commit --author='A <a>' --message=M [--amend] [--no-gpg-sign]",
+      "notes": "Leading -c identity flags precede the verb (dynamic site D10)."
+    },
+    {
+      "verb": "commit-graph",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `commit-graph` row",
+      "forgejo_callsites": [
+        "modules/git/repo_commitgraph.go:14"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-commit-graph plumbingmanipulators",
+        "git/builtin/commit-graph.c"
+      ],
+      "option_families": [
+        {
+          "family": "commit-graph-forgejo-pinned",
+          "options": [
+            "write"
+          ],
+          "source": "inventory §2; repo_commitgraph.go:14"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Status text.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Writes objects/info/commit-graph* files.",
+        "worktree": "none"
+      },
+      "argv_shape": "git commit-graph write",
+      "notes": ""
+    },
+    {
+      "verb": "commit-tree",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `commit-tree` row",
+      "forgejo_callsites": [
+        "modules/git/repo_tree.go:38",
+        "services/repository/files/temp_repo.go:238"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-commit-tree plumbingmanipulators",
+        "git/builtin/commit-tree.c"
+      ],
+      "option_families": [
+        {
+          "family": "commit-tree-forgejo-pinned",
+          "options": [
+            "-p <parent>",
+            "-m <msg>"
+          ],
+          "source": "inventory §2; repo_tree.go:38; temp_repo.go:238 cherry-pick emulation"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Tree oid on stdin/command line; message via -m.",
+        "stdout": "New commit oid + newline.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none by itself; callers move refs with update-ref.",
+        "objects": "Writes one commit object; does not move refs.",
+        "worktree": "none"
+      },
+      "argv_shape": "git commit-tree <tree> -p <parent> -m <msg>",
+      "notes": "Core of cherry-pick/revert emulation (inventory §1 absent-verbs note)."
+    },
+    {
+      "verb": "config",
+      "category": "ancillarymanipulators",
+      "inventory_ref": "inventory §2 `config` row",
+      "forgejo_callsites": [
+        "modules/git/git.go:359,368,378,387,394,405,412,422,425",
+        "modules/git/repo_gpg.go:35,43,50",
+        "services/pull/merge_prepare.go:138",
+        "services/repository/mirror_push.go:78,89,94,104,202",
+        "services/repository/migrate.go:232",
+        "services/asymkey/sign.go:101,107,108,109",
+        "services/doctor/misc.go:76,80"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-config ancillarymanipulators",
+        "git/builtin/config.c"
+      ],
+      "option_families": [
+        {
+          "family": "config-forgejo-pinned",
+          "options": [
+            "--global",
+            "--local",
+            "--get <k>",
+            "--add <k> <v>",
+            "--unset-all <k>"
+          ],
+          "source": "inventory §2; git.go:359-425"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "--get on missing key."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Value lines for --get; empty otherwise.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "Reads/writes system/global/local repo config; only command-mediated config mutation (inventory §4 invariant).",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git config --local --get <key> / git config --global --add <key> <value>",
+      "notes": ""
+    },
+    {
+      "verb": "diff",
+      "category": "mainporcelain info",
+      "inventory_ref": "inventory §2 `diff` row",
+      "forgejo_callsites": [
+        "modules/git/commit.go:431",
+        "modules/git/diff.go:64,72,431",
+        "modules/git/diff_compare.go:23",
+        "modules/git/repo_compare.go:159,270,281,295,349",
+        "services/gitdiff/gitdiff.go:1079,1268",
+        "services/repository/files/temp_repo.go:338"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-diff mainporcelain info",
+        "git/builtin/diff.c"
+      ],
+      "option_families": [
+        {
+          "family": "diff-forgejo-pinned",
+          "options": [
+            "--name-only",
+            "-z",
+            "-M",
+            "-C",
+            "--full-index",
+            "--binary",
+            "--raw",
+            "-p",
+            "--histogram",
+            "--src-prefix=",
+            "--dst-prefix=",
+            "--cached"
+          ],
+          "source": "inventory §2 `diff` row"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "Only with --exit-code/--quiet when differences exist (not used by pinned callsites; recorded for compat)."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Patch bytes (-p/--binary/--full-index), --raw lines, or --name-only paths; NUL-delimited with -z.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git diff --src-prefix=a/ --dst-prefix=b/ --full-index --binary -p <a> <b>",
+      "notes": ""
+    },
+    {
+      "verb": "diff-index",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `diff-index` row",
+      "forgejo_callsites": [
+        "modules/git/repo_compare.go:229",
+        "services/repository/files/temp_repo.go:338"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-diff-index plumbinginterrogators",
+        "git/builtin/diff-index.c"
+      ],
+      "option_families": [
+        {
+          "family": "diff-index-forgejo-pinned",
+          "options": [
+            "--cached",
+            "--shortstat",
+            "-p",
+            "--src-prefix=",
+            "--dst-prefix="
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Shortstat line or patch bytes against index.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "Read-only against index.",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git diff-index --cached --shortstat -p HEAD --",
+      "notes": ""
+    },
+    {
+      "verb": "diff-tree",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `diff-tree` row",
+      "forgejo_callsites": [
+        "modules/git/repo_compare.go:189,214,321",
+        "services/pull/merge_prepare.go:208"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-diff-tree plumbinginterrogators",
+        "git/builtin/diff-tree.c"
+      ],
+      "option_families": [
+        {
+          "family": "diff-tree-forgejo-pinned",
+          "options": [
+            "--shortstat",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            "--root",
+            "--find-renames"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Shortstat/name-only/tree-diff lines; NUL-delimited with -z.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git diff-tree --no-commit-id --name-only -r <a> <b>",
+      "notes": ""
+    },
+    {
+      "verb": "fetch",
+      "category": "mainporcelain remote",
+      "inventory_ref": "inventory §2 `fetch` row; §3 sites 3-5",
+      "forgejo_callsites": [
+        "modules/git/fetch.go:31 (Fetch, --porcelain/--end-of-options)",
+        "services/pull/temp_repo.go:139,177 (fetchArgs caller-supplied)",
+        "services/repository/mirror_pull.go:351",
+        "services/migrations/dump.go:518",
+        "modules/git/repo_compare.go:60 (fetch --no-tags dynamic remote)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-fetch mainporcelain remote",
+        "git/builtin/fetch.c"
+      ],
+      "option_families": [
+        {
+          "family": "fetch-forgejo-pinned",
+          "options": [
+            "--porcelain",
+            "--prune",
+            "--tags",
+            "--no-tags",
+            "--force",
+            "--no-write-commit-graph",
+            "--no-write-fetch-head",
+            "--end-of-options"
+          ],
+          "source": "inventory §2; fetch.go:31; temp_repo.go:106 fetchArgs"
+        },
+        {
+          "family": "fetch-refspec-positional",
+          "options": [
+            "<remote> <refspec>..."
+          ],
+          "source": "dynamic sites D02/D03; fetch.go:31; temp_repo.go:139,177"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Transport failure or remote ref missing (stderr prefix 'fatal: couldn't find remote ref ' maps to ErrRemoteRefNotFound)."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "With --porcelain: '<flag> <old> <new> <local-ref>' lines of exact byte length (fetch.go validates); else progress text.",
+        "stderr": "fatal: couldn't find remote ref <r> (parsed); Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "Updates FETCH_HEAD and/or destination refs per refspec.",
+        "objects": "Fetches missing objects.",
+        "worktree": "none"
+      },
+      "argv_shape": "git fetch [--porcelain] [--tags|--no-tags] [--prune] [--force] --end-of-options <url> <refspec>",
+      "notes": "Porcelain byte-length contract enforced by fetch.go; SupportFetchPorcelain gates shape."
+    },
+    {
+      "verb": "for-each-ref",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `for-each-ref` row; §3 site 4",
+      "forgejo_callsites": [
+        "modules/git/repo.go:104",
+        "modules/git/repo_branch.go:216,225,227,253 (+extraArgs)",
+        "modules/git/repo_tag.go:252",
+        "modules/git/repo_object.go",
+        "modules/git/repo_ref.go"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-for-each-ref plumbinginterrogators",
+        "git/builtin/for-each-ref.c"
+      ],
+      "option_families": [
+        {
+          "family": "for-each-ref-forgejo-pinned",
+          "options": [
+            "--count=<n>",
+            "--format=<fmt>",
+            "--sort=<k>",
+            "--contains <c>",
+            "--points-at <o>"
+          ],
+          "source": "inventory §2"
+        },
+        {
+          "family": "for-each-ref-extra-args",
+          "options": [
+            "<caller extraArgs...>"
+          ],
+          "source": "dynamic site D04; repo_branch.go:253-255 WalkShowRef appends"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Formatted ref lines, e.g. '%(objectname) %(refname)'; '--count=1 --format=found' emptiness probe (repo.go:104).",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git for-each-ref [--count=N] [--format=F] [--sort=K] [--contains C] [--points-at O] [<pattern>]",
+      "notes": ""
+    },
+    {
+      "verb": "format-patch",
+      "category": "mainporcelain",
+      "inventory_ref": "inventory §2 `format-patch` row",
+      "forgejo_callsites": [
+        "modules/git/diff.go:77,79,86",
+        "modules/git/repo_compare.go:304,311"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-format-patch mainporcelain",
+        "git/builtin/log.c (format-patch)"
+      ],
+      "option_families": [
+        {
+          "family": "format-patch-forgejo-pinned",
+          "options": [
+            "--no-signature",
+            "--stdout",
+            "--root",
+            "--binary"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Mbox patch bytes on stdout with --stdout.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git format-patch --no-signature --stdout --root --binary <range>",
+      "notes": ""
+    },
+    {
+      "verb": "fsck",
+      "category": "ancillaryinterrogators",
+      "inventory_ref": "inventory §2 `fsck` row",
+      "forgejo_callsites": [
+        "modules/git/git.go:440 (configurable TrustedCmdArgs)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-fsck ancillaryinterrogators",
+        "git/builtin/fsck.c"
+      ],
+      "option_families": [
+        {
+          "family": "fsck-dynamic",
+          "options": [
+            "<setting-derived TrustedCmdArgs>"
+          ],
+          "source": "dynamic site D08-class; git.go:440 configurable args, no fixed flags"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Corruption/unreachable-object errors reported."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Dangling/unreachable/corrupt object report lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Read-only verification.",
+        "worktree": "none"
+      },
+      "argv_shape": "git fsck [<configured args>...]",
+      "notes": "Option family is entirely setting-driven; compat surface must accept the configured argv verbatim."
+    },
+    {
+      "verb": "gc",
+      "category": "mainporcelain",
+      "inventory_ref": "inventory §2 `gc` row; §3 site 8",
+      "forgejo_callsites": [
+        "services/repository/check.go:88 (gc + setting.Git.GCArgs)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-gc mainporcelain",
+        "git/builtin/gc.c"
+      ],
+      "option_families": [
+        {
+          "family": "gc-dynamic",
+          "options": [
+            "<setting.Git.GCArgs...>"
+          ],
+          "source": "dynamic site D08; check.go:88; defined at modules/setting/git.go:26 GCArgs"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Prune/pack failure."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Progress/status text.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none.",
+        "refs": "none.",
+        "objects": "Repacks/prunes objects; writes packs.",
+        "worktree": "none"
+      },
+      "argv_shape": "git gc [<GCArgs>...]",
+      "notes": "No fixed flags; argv shape is deployment configuration."
+    },
+    {
+      "verb": "grep",
+      "category": "mainporcelain",
+      "inventory_ref": "inventory §2 `grep` row",
+      "forgejo_callsites": [
+        "modules/git/grep.go:92"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-grep mainporcelain",
+        "git/builtin/grep.c"
+      ],
+      "option_families": [
+        {
+          "family": "grep-forgejo-pinned",
+          "options": [
+            "-I",
+            "--null",
+            "--break",
+            "--heading",
+            "--line-number",
+            "--ignore-case",
+            "--full-name"
+          ],
+          "source": "inventory §2; grep.go:92"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "No matches."
+        },
+        {
+          "code": 2,
+          "meaning": "Error (bad revision, binary misuse)."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Grep hits with heading/break/line-number formatting; NUL-delimited with --null.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git grep -I --null --break --heading --line-number --ignore-case --full-name <pattern> <rev> -- <path>",
+      "notes": ""
+    },
+    {
+      "verb": "hash-object",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `hash-object` row",
+      "forgejo_callsites": [
+        "modules/git/repo_object.go:67-75 (hashObject)",
+        "services/pull/patch.go:312"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-hash-object plumbingmanipulators",
+        "git/builtin/hash-object.c"
+      ],
+      "option_families": [
+        {
+          "family": "hash-object-forgejo-pinned",
+          "options": [
+            "-w",
+            "--stdin",
+            "--path=<p>"
+          ],
+          "source": "inventory §2; repo_object.go:67-75 -w --stdin / --stdin"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Blob bytes on stdin with --stdin.",
+        "stdout": "Hex oid + newline.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "With -w: writes blob object; without: hash only.",
+        "worktree": "none"
+      },
+      "argv_shape": "git hash-object -w --stdin --path=<p> < stdin.bytes",
+      "notes": "Anchor correction: repo_object.go:67-75 (inventory §1)."
+    },
+    {
+      "verb": "init",
+      "category": "mainporcelain init",
+      "inventory_ref": "inventory §2 `init` row",
+      "forgejo_callsites": [
+        "modules/git/repo.go:80,333",
+        "services/wiki/wiki.go:43",
+        "services/repository/generate_repo_commit.go:137"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-init mainporcelain init",
+        "git/builtin/init-db.c"
+      ],
+      "option_families": [
+        {
+          "family": "init-forgejo-pinned",
+          "options": [
+            "--template <dir>",
+            "--bare",
+            "--object-format=<sha1|sha256>"
+          ],
+          "source": "inventory §2; repo.go:80,333"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Init result lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Creates HEAD/symbolic default.",
+        "index": "none",
+        "sequencer": "none",
+        "config": "Writes initial config incl. object-format.",
+        "refs": "Creates refs skeleton.",
+        "objects": "Creates objects/info skeleton.",
+        "worktree": "Creates working tree unless --bare."
+      },
+      "argv_shape": "git init --template <dir> [--bare] [--object-format=sha1|sha256] <path>",
+      "notes": ""
+    },
+    {
+      "verb": "log",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `log` row",
+      "forgejo_callsites": [
+        "modules/git/commit.go:438",
+        "modules/git/repo_compare.go:103",
+        "modules/git/repo_commit.go:66,142",
+        "modules/git/repo_stats.go:43,63",
+        "services/repository/gitgraph/graph.go:25",
+        "services/repository/contributors_graph.go:128"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-log mainporcelain history",
+        "git/builtin/log.c"
+      ],
+      "option_families": [
+        {
+          "family": "log-forgejo-pinned",
+          "options": [
+            "--name-status",
+            "--numstat",
+            "--no-merges",
+            "--date=iso",
+            "--since=<d>",
+            "--first-parent",
+            "--graph",
+            "--decorate=full",
+            "--pretty=format:<fmt>"
+          ],
+          "source": "inventory §2 `log` row"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Pretty-format commit records + name-status/numstat/graph/decorate sections.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git log --pretty=format:<fmt> --date=iso [--no-merges] [--first-parent] [--graph] [--decorate=full] <range> --",
+      "notes": ""
+    },
+    {
+      "verb": "ls-files",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `ls-files` row",
+      "forgejo_callsites": [
+        "modules/git/repo_index.go:94",
+        "services/pull/patch.go:475",
+        "services/pull/patch_unmerged.go:75",
+        "services/repository/files/temp_repo.go:119"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-ls-files plumbinginterrogators",
+        "git/builtin/ls-files.c"
+      ],
+      "option_families": [
+        {
+          "family": "ls-files-forgejo-pinned",
+          "options": [
+            "-u",
+            "-z",
+            "--stage"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Staged/unmerged entries; NUL-delimited with -z; --stage shows mode/oid/stage.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "Read-only against index.",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git ls-files -u -z --stage",
+      "notes": ""
+    },
+    {
+      "verb": "ls-remote",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `ls-remote` row",
+      "forgejo_callsites": [
+        "modules/git ls-remote callsites (inventory §2)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-ls-remote plumbinginterrogators",
+        "git/builtin/ls-remote.c"
+      ],
+      "option_families": [
+        {
+          "family": "ls-remote-pinned",
+          "options": [
+            "--heads",
+            "--tags",
+            "<url> [<pattern>...]"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Transport failure."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "'<oid> TAB <ref>' lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git ls-remote [--heads] [--tags] <url> [<pattern>]",
+      "notes": ""
+    },
+    {
+      "verb": "ls-tree",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `ls-tree` row",
+      "forgejo_callsites": [
+        "modules/git/tree.go:88,114,172",
+        "modules/git/repo_tree.go:172"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-ls-tree plumbinginterrogators",
+        "git/builtin/ls-tree.c"
+      ],
+      "option_families": [
+        {
+          "family": "ls-tree-forgejo-pinned",
+          "options": [
+            "-l",
+            "-t",
+            "-r",
+            "-z",
+            "--name-only"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Tree entry lines '<mode> <type> <oid> <size?> <name>'; NUL-delimited with -z.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git ls-tree -l -t -r -z --name-only <tree>",
+      "notes": ""
+    },
+    {
+      "verb": "merge",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `merge` row",
+      "forgejo_callsites": [
+        "services/pull/merge_rebase.go:45,87",
+        "services/pull/merge_ff_only.go:14",
+        "services/pull/merge_merge.go:14",
+        "services/pull/merge_squash.go:60"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-merge mainporcelain history",
+        "git/builtin/merge.c"
+      ],
+      "option_families": [
+        {
+          "family": "merge-forgejo-pinned",
+          "options": [
+            "--ff-only",
+            "--no-ff",
+            "--no-commit",
+            "--squash"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "Conflicts; index holds unmerged stages, worktree holds markers."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Merge result summary.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "On success advances HEAD/branch; on conflict HEAD unchanged.",
+        "index": "Conflict stages on failure; merged tree staged on success.",
+        "sequencer": "MERGE_HEAD written during merge.",
+        "config": "none",
+        "refs": "Branch ref updated on success.",
+        "objects": "none",
+        "worktree": "Conflict markers on failure."
+      },
+      "argv_shape": "git merge [--ff-only|--no-ff] [--no-commit] [--squash] <commit>",
+      "notes": ""
+    },
+    {
+      "verb": "merge-base",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `merge-base` row; §3 site 5",
+      "forgejo_callsites": [
+        "modules/git/commit.go:214",
+        "modules/git/repo_compare.go:32,54",
+        "services/pull/check.go:217,245",
+        "services/pull/patch.go:169",
+        "services/pull/update_rebase.go:30",
+        "models/gitea_migrations/v1_12/v128.go:85,107"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-merge-base plumbinginterrogators",
+        "git/builtin/merge-base.c"
+      ],
+      "option_families": [
+        {
+          "family": "merge-base-forgejo-pinned",
+          "options": [
+            "--is-ancestor <a> <b>",
+            "<a> <b> (plain)"
+          ],
+          "source": "inventory §2; compare switch dynamic site D05"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "With --is-ancestor: <a> is not an ancestor of <b>; no output. Without: no common ancestor."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Merge-base oid lines, or empty with --is-ancestor.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git merge-base [--is-ancestor] <a> <b>",
+      "notes": "Exit 1 is a normal negative answer, not an error; harness must not treat it as failure."
+    },
+    {
+      "verb": "merge-file",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `merge-file` row",
+      "forgejo_callsites": [
+        "services/pull/patch.go:306"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-merge-file plumbingmanipulators",
+        "git/builtin/merge-file.c"
+      ],
+      "option_families": [
+        {
+          "family": "merge-file-forgejo-pinned",
+          "options": [
+            "positional <current> <base> <other>"
+          ],
+          "source": "inventory §2; patch.go:306 three-way file merge"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "Conflicts; markers written into <current> file."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Merge result notices.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none.",
+        "sequencer": "none.",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "Rewrites <current> file in place (markers on conflict)."
+      },
+      "argv_shape": "git merge-file <current> <base> <other>",
+      "notes": ""
+    },
+    {
+      "verb": "merge-tree",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `merge-tree` row",
+      "forgejo_callsites": [
+        "services/pull/patch.go:402"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-merge-tree plumbingmanipulators",
+        "git/builtin/merge-tree.c"
+      ],
+      "option_families": [
+        {
+          "family": "merge-tree-forgejo-pinned",
+          "options": [
+            "--write-tree",
+            "-z",
+            "--name-only",
+            "--no-messages",
+            "--merge-base=<oid>"
+          ],
+          "source": "inventory §2; patch.go:402 modern --write-tree form"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "Conflicts present; result tree still written with --write-tree."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Result tree oid line + --name-only conflict paths (NUL with -z).",
+        "stderr": "Suppressed detail with --no-messages; Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Writes result tree object(s) with --write-tree; no ref/index mutation.",
+        "worktree": "none"
+      },
+      "argv_shape": "git merge-tree --write-tree --no-messages --merge-base=<oid> -z --name-only <branch1> <branch2>",
+      "notes": "Modern --write-tree form only; compat surface must not emit the legacy three-tree stdout form."
+    },
+    {
+      "verb": "name-rev",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 (name-rev in 56-list; callsites via describe paths)",
+      "forgejo_callsites": [
+        "modules/git name-rev callsites (inventory §1 56-list)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-name-rev plumbinginterrogators",
+        "git/builtin/name-rev.c"
+      ],
+      "option_families": [
+        {
+          "family": "name-rev-pinned",
+          "options": [
+            "--name-only",
+            "--refs=<pattern>",
+            "--tags",
+            "--no-undefined"
+          ],
+          "source": "inventory §1 verb membership; git/builtin/name-rev.c"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "'<oid> <name>' lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git name-rev --name-only --tags <oid>",
+      "notes": "Low-call-volume verb; membership required, exact flags from builtin."
+    },
+    {
+      "verb": "notes",
+      "category": "mainporcelain",
+      "inventory_ref": "inventory §2 `notes` row; §1 anchor correction",
+      "forgejo_callsites": [
+        "modules/git/notes.go:106 (add -f -m)",
+        "modules/git/notes.go:119 (remove)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-notes mainporcelain",
+        "git/builtin/notes.c"
+      ],
+      "option_families": [
+        {
+          "family": "notes-forgejo-pinned",
+          "options": [
+            "add -f -m <msg> <object>",
+            "remove <object>"
+          ],
+          "source": "inventory §2; §1 anchor correction notes.go:106/:119"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Note exists without -f / object missing."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Operation result lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "Updates refs/notes/*.",
+        "objects": "Writes note blob + notes commit objects.",
+        "worktree": "none"
+      },
+      "argv_shape": "git notes add -f -m <msg> <object> / git notes remove <object>",
+      "notes": ""
+    },
+    {
+      "verb": "push",
+      "category": "mainporcelain remote",
+      "inventory_ref": "inventory §2 `push` row",
+      "forgejo_callsites": [
+        "modules/git/repo.go:237",
+        "services/pull/merge.go:392",
+        "services/pull/update_rebase.go:65",
+        "services/repository/init.go:75"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-push mainporcelain remote",
+        "git/builtin/push.c"
+      ],
+      "option_families": [
+        {
+          "family": "push-forgejo-pinned",
+          "options": [
+            "-f",
+            "--mirror",
+            "--atomic",
+            "-u",
+            "--all"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Non-fast-forward rejected / remote hook declined / transport failure."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Push summary lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "Updates remote refs per refspec/--all/--mirror.",
+        "objects": "Transfers missing objects to remote.",
+        "worktree": "none"
+      },
+      "argv_shape": "git push [-f] [--mirror] [--atomic] [-u] [--all] [<remote> [<refspec>]]",
+      "notes": ""
+    },
+    {
+      "verb": "read-tree",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `read-tree` row",
+      "forgejo_callsites": [
+        "modules/git/repo_index.go:45",
+        "services/pull/merge_prepare.go:171",
+        "services/pull/patch.go:337",
+        "services/repository/files/temp_repo.go:100"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-read-tree plumbingmanipulators",
+        "git/builtin/read-tree.c"
+      ],
+      "option_families": [
+        {
+          "family": "read-tree-forgejo-pinned",
+          "options": [
+            "-m HEAD <tree>...",
+            "--reset",
+            "--empty"
+          ],
+          "source": "inventory §2; repo_index.go:45; merge_prepare.go:171 -m HEAD <trees>"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Unmerged paths would be overwritten."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Empty on success.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none.",
+        "index": "Replaces index content with given tree(s); -m performs two/three-way index merge.",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git read-tree -m HEAD <tree>...",
+      "notes": ""
+    },
+    {
+      "verb": "rebase",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `rebase` row",
+      "forgejo_callsites": [
+        "services/pull/merge_prepare.go:318"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-rebase mainporcelain history",
+        "git/builtin/rebase.c"
+      ],
+      "option_families": [
+        {
+          "family": "rebase-forgejo-pinned",
+          "options": [
+            "<upstream> [<branch>]"
+          ],
+          "source": "inventory §2; merge_prepare.go:318 positional upstream"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "Conflicts; sequencer holds rebase state."
+        },
+        {
+          "code": 2,
+          "meaning": "Sequencer error."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Rebase progress lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Rewritten on success.",
+        "index": "Conflict stages on failure.",
+        "sequencer": "rebase-merge/rebase-apply state dir on conflict; caller resolves/aborts.",
+        "config": "none",
+        "refs": "Branch ref rewritten on success.",
+        "objects": "none",
+        "worktree": "Conflict markers on failure."
+      },
+      "argv_shape": "git rebase <upstream>",
+      "notes": ""
+    },
+    {
+      "verb": "receive-pack",
+      "category": "synchingrepositories",
+      "inventory_ref": "inventory §2 row; §3 sites 6-7",
+      "forgejo_callsites": [
+        "routers/web/repo/githttp.go:399,402 (via prepareGitCmdWithAllowedService)",
+        "forgejo/cmd/serv.go:335,342,347 (git-receive-pack SSH dispatch)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-receive-pack synchingrepositories",
+        "git/builtin/receive-pack.c"
+      ],
+      "option_families": [
+        {
+          "family": "receive-pack-forgejo-pinned",
+          "options": [
+            "--stateless-rpc",
+            "--advertise-refs"
+          ],
+          "source": "inventory §2; githttp.go:397-405; protocol v0/v1 receive-pack only (plan grounded findings)"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Update declined by hook or ref-update failure."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Smart-HTTP/SSH pkt-line push stream (update lines + pack; gitprotocol-pack.adoc grammar).",
+        "stdout": "Pkt-line advertisement (--advertise-refs) or report-status(-v2) result lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "Updates refs per accepted update lines (subject to hooks).",
+        "objects": "Stores received pack (thin packs fixed via index-pack --fix-thin above receive.unpackLimit).",
+        "worktree": "none"
+      },
+      "argv_shape": "git receive-pack --stateless-rpc <repo> < stdin.pktline > stdout.pktline",
+      "notes": "Push is v0/v1 receive-pack only; no v2 push path exists."
+    },
+    {
+      "verb": "remote",
+      "category": "mainporcelain remote",
+      "inventory_ref": "inventory §2 `remote` row",
+      "forgejo_callsites": [
+        "modules/git/remote.go:15",
+        "modules/git/repo_branch.go:133,145",
+        "services/pull/temp_repo.go:132,159",
+        "services/repository/generate_repo_commit.go:132",
+        "services/repository/mirror_pull.go:38,48,194,458,485",
+        "services/repository/mirror_push.go:40,42,120"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-remote mainporcelain remote",
+        "git/builtin/remote.c"
+      ],
+      "option_families": [
+        {
+          "family": "remote-forgejo-pinned",
+          "options": [
+            "add -f -t <branch> -m <branch> <name> <url>",
+            "rm <name>",
+            "set-url <name> <url>",
+            "get-url <name>",
+            "prune <name>",
+            "update --prune"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Remote exists / missing."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Remote list / get-url value lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "Mutates remotes in repo config (command-mediated, inventory §4).",
+        "refs": "add -f may fetch remote-tracking refs.",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git remote add -f -t <b> -m <b> <name> <url>",
+      "notes": ""
+    },
+    {
+      "verb": "replay",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `replay` row; §6 version gate",
+      "forgejo_callsites": [
+        "services/pull/merge_prepare.go:267 (gated CheckGitVersionAtLeast 2.54)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-replay plumbingmanipulators",
+        "git/builtin/replay.c (new in 2.54)"
+      ],
+      "option_families": [
+        {
+          "family": "replay-forgejo-pinned",
+          "options": [
+            "--onto <base> <base..staging>"
+          ],
+          "source": "inventory §2; merge_prepare.go:267"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "Conflicts during replay."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Replay progress lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Rewrites staging branch.",
+        "index": "Conflict stages on failure.",
+        "sequencer": "Uses sequencer machinery for conflicted picks.",
+        "config": "none",
+        "refs": "Updates staging ref on success.",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git replay --onto <base> <base..staging>",
+      "notes": "Requires real git >= 2.54 string (inventory §6); version must not be faked."
+    },
+    {
+      "verb": "reset",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `reset` row",
+      "forgejo_callsites": [
+        "modules/git/repo.go:338"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-reset mainporcelain history",
+        "git/builtin/reset.c"
+      ],
+      "option_families": [
+        {
+          "family": "reset-forgejo-pinned",
+          "options": [
+            "--soft <commit>"
+          ],
+          "source": "inventory §2; repo.go:338"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Empty/summary on success.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Moves HEAD/branch to <commit>; --soft leaves index+worktree.",
+        "index": "--soft: untouched.",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "--soft: untouched."
+      },
+      "argv_shape": "git reset --soft <commit>",
+      "notes": ""
+    },
+    {
+      "verb": "rev-list",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `rev-list` row",
+      "forgejo_callsites": [
+        "modules/git/commit.go:140,167",
+        "modules/git/pipeline/revlist.go:25",
+        "modules/git/repo_commit.go:238,301,329,342,364",
+        "services/pull/check.go:245",
+        "routers/private/hook_pre_receive.go:306"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-rev-list plumbinginterrogators",
+        "git/builtin/rev-list.c"
+      ],
+      "option_families": [
+        {
+          "family": "rev-list-forgejo-pinned",
+          "options": [
+            "--count",
+            "--objects",
+            "--all",
+            "--not",
+            "--reverse",
+            "--max-count=<n>",
+            "--skip=<n>",
+            "--since=<d>",
+            "--branches=<p>",
+            "--ancestry-path",
+            "--merges",
+            "--parents"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Oid lines (--count: single number; --objects: oid+path; --parents: oid+parents).",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git rev-list [--count] [--objects] [--max-count=N] [--skip=N] <revs> --",
+      "notes": ""
+    },
+    {
+      "verb": "rev-parse",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `rev-parse` row",
+      "forgejo_callsites": [
+        "modules/git/batch_reader.go:28",
+        "modules/git/commit.go:510",
+        "modules/git/repo_branch.go:341",
+        "models/gitea_migrations/v1_12/v128.go:88"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-rev-parse plumbinginterrogators",
+        "git/builtin/rev-parse.c"
+      ],
+      "option_families": [
+        {
+          "family": "rev-parse-forgejo-pinned",
+          "options": [
+            "--verify",
+            "--short",
+            "--quiet"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "With --verify --quiet: revision does not resolve."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Resolved oid (shortened with --short); empty with --quiet on failure.",
+        "stderr": "Suppressed with --quiet; Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git rev-parse --verify --short --quiet <rev>",
+      "notes": ""
+    },
+    {
+      "verb": "show",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `show` row",
+      "forgejo_callsites": [
+        "modules/git/commit.go:494",
+        "modules/git/diff.go:38,66",
+        "services/pull/merge_rebase.go:19"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-show mainporcelain history",
+        "git/builtin/log.c (show)"
+      ],
+      "option_families": [
+        {
+          "family": "show-forgejo-pinned",
+          "options": [
+            "--name-status",
+            "--pretty=format:<fmt>",
+            "-R",
+            "-s",
+            "--format=%B",
+            "--diff-filter=R"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Formatted object body + name-status/diff sections.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git show --name-status --pretty=format:<fmt> -R -s <object>",
+      "notes": ""
+    },
+    {
+      "verb": "show-ref",
+      "category": "plumbinginterrogators",
+      "inventory_ref": "inventory §2 `show-ref` row",
+      "forgejo_callsites": [
+        "modules/git/repo_branch.go:24",
+        "modules/git/repo_tag.go:41,64",
+        "services/pull/merge_prepare.go:60"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-show-ref plumbinginterrogators",
+        "git/builtin/show-ref.c"
+      ],
+      "option_families": [
+        {
+          "family": "show-ref-forgejo-pinned",
+          "options": [
+            "--verify",
+            "--quiet",
+            "--tags",
+            "--hash",
+            "--heads",
+            "-d"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "With --verify --quiet: ref does not exist."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "'<oid> <ref>' lines, oid only with --hash; empty with --quiet.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git show-ref --verify --quiet <ref>",
+      "notes": "Exit 1 is a normal negative answer; harness must not treat as failure."
+    },
+    {
+      "verb": "symbolic-ref",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `symbolic-ref` row; §4 HEAD invariant",
+      "forgejo_callsites": [
+        "modules/git/repo_branch.go:40,58,379,421,491",
+        "modules/git/repo_ref.go:37",
+        "services/pull/temp_repo.go:146",
+        "services/wiki/wiki.go:45"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-symbolic-ref plumbingmanipulators",
+        "git/builtin/symbolic-ref.c"
+      ],
+      "option_families": [
+        {
+          "family": "symbolic-ref-forgejo-pinned",
+          "options": [
+            "--short",
+            "-q",
+            "HEAD <ref>"
+          ],
+          "source": "inventory §2; sole command-mediated HEAD writer (inventory §4)"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 1,
+          "meaning": "With -q: HEAD not symbolic / ref missing."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Ref target (shortened with --short); empty with -q on failure.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "Writes HEAD symref (only HEAD writer with init/clone, inventory §4).",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git symbolic-ref HEAD <ref> / git symbolic-ref --short -q HEAD",
+      "notes": ""
+    },
+    {
+      "verb": "tag",
+      "category": "mainporcelain history",
+      "inventory_ref": "inventory §2 `tag` row",
+      "forgejo_callsites": [
+        "modules/git/repo_tag.go:31",
+        "services/release/release.go:398"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-tag mainporcelain history",
+        "git/builtin/tag.c"
+      ],
+      "option_families": [
+        {
+          "family": "tag-forgejo-pinned",
+          "options": [
+            "-a",
+            "-m <msg>",
+            "-d <tag>",
+            "-s"
+          ],
+          "source": "inventory §2"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Tag exists / missing."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Tag list or creation lines.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "Creates/deletes refs/tags/*.",
+        "objects": "Annotated (-a/-s) writes tag objects.",
+        "worktree": "none"
+      },
+      "argv_shape": "git tag -a -m <msg> <tag> <object>",
+      "notes": ""
+    },
+    {
+      "verb": "unpack-file",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `unpack-file` row",
+      "forgejo_callsites": [
+        "services/pull/patch.go:279,288,297"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-unpack-file plumbingmanipulators",
+        "git/builtin/unpack-file.c"
+      ],
+      "option_families": [
+        {
+          "family": "unpack-file-forgejo-pinned",
+          "options": [
+            "<blob-oid>"
+          ],
+          "source": "inventory §2; patch.go:279,288,297 positional blob oid"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Temp file path of unpacked blob content.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "Writes blob bytes to temp file (caller-owned path); no repo mutation."
+      },
+      "argv_shape": "git unpack-file <blob-oid>",
+      "notes": ""
+    },
+    {
+      "verb": "update-index",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `update-index` row",
+      "forgejo_callsites": [
+        "modules/git/repo_index.go:131,137",
+        "services/repository/files/temp_repo.go:108,145,190"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-update-index plumbingmanipulators",
+        "git/builtin/update-index.c"
+      ],
+      "option_families": [
+        {
+          "family": "update-index-forgejo-pinned",
+          "options": [
+            "--refresh",
+            "--add",
+            "--replace",
+            "--remove",
+            "--cacheinfo <mode>,<oid>,<path>",
+            "--index-info",
+            "-z"
+          ],
+          "source": "inventory §2; temp_repo cherry-pick emulation"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "With --index-info: index-info lines on stdin (NUL with -z).",
+        "stdout": "Empty; --refresh reports.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "Direct index mutation: refresh/add/replace/remove/cacheinfo entries.",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git update-index --add --replace --remove --cacheinfo <mode>,<oid>,<path>",
+      "notes": ""
+    },
+    {
+      "verb": "update-ref",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `update-ref` row; §4 refs invariant",
+      "forgejo_callsites": [
+        "modules/git/repo_commit.go:561,567",
+        "modules/git/repo_branch.go:391,461",
+        "services/pull/merge_prepare.go:279",
+        "services/pull/pull.go:465",
+        "services/migrations/dump.go:453,483,542"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-update-ref plumbingmanipulators",
+        "git/builtin/update-ref.c"
+      ],
+      "option_families": [
+        {
+          "family": "update-ref-forgejo-pinned",
+          "options": [
+            "-d <ref>",
+            "--no-deref",
+            "--stdin"
+          ],
+          "source": "inventory §2; sole command-mediated ref writer with symbolic-ref (inventory §4)"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Non-fast-forward without force / lock contention / stdin line error."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "With --stdin: update/create/delete/verify lines on stdin.",
+        "stdout": "Empty on success.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none directly (HEAD only via symbolic-ref).",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "Creates/updates/deletes refs (with -d delete).",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git update-ref <ref> <new> <old> / git update-ref -d <ref> / git update-ref --no-deref --stdin < lines",
+      "notes": ""
+    },
+    {
+      "verb": "update-server-info",
+      "category": "synchingrepositories",
+      "inventory_ref": "inventory §2 row; §6 dumb HTTP",
+      "forgejo_callsites": [
+        "forgejo/cmd/hook.go:308",
+        "forgejo/routers/web/repo/githttp.go:493",
+        "services/repository/adopt.go:94",
+        "services/repository/create.go:301",
+        "services/repository/fork.go:160",
+        "services/repository/generate.go:248",
+        "services/repository/migrate.go:131"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-update-server-info synchingrepositories",
+        "git/builtin/update-server-info.c"
+      ],
+      "option_families": [
+        {
+          "family": "update-server-info-pinned",
+          "options": [
+            "(no flags)"
+          ],
+          "source": "inventory §2; zero-flag argv"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Empty.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Refreshes objects/info/packs + info/refs for dumb HTTP (inventory §6 sendFile serves these bytes).",
+        "worktree": "none"
+      },
+      "argv_shape": "git update-server-info",
+      "notes": "Dumb-HTTP correctness depends on this verb's files; CLI-only adapter cannot skip it."
+    },
+    {
+      "verb": "upload-archive",
+      "category": "synchingrepositories",
+      "inventory_ref": "inventory §2 row; §3 site 7",
+      "forgejo_callsites": [
+        "forgejo/routers/web/repo/githttp.go:399,402 area (allowed-service set)",
+        "forgejo/cmd/serv.go:335,342,347 (git-upload-archive SSH dispatch)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-upload-archive synchingrepositories",
+        "git/builtin/upload-archive.c"
+      ],
+      "option_families": [
+        {
+          "family": "upload-archive-pinned",
+          "options": [
+            "<repo> (SSH dispatch positional)"
+          ],
+          "source": "inventory §2; serv.go:333-347 git-upload-archive form"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Archive request bytes on stdin (SSH/HTTP).",
+        "stdout": "Archive bytes on stdout.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git-upload-archive <repo> (SSH) / git upload-archive <repo>",
+      "notes": ""
+    },
+    {
+      "verb": "upload-pack",
+      "category": "synchingrepositories",
+      "inventory_ref": "inventory §2 row; §3 sites 6-7",
+      "forgejo_callsites": [
+        "forgejo/routers/web/repo/githttp.go:399,402 (via prepareGitCmdWithAllowedService)",
+        "forgejo/cmd/serv.go:335,342,347 (git-upload-pack SSH dispatch)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-upload-pack synchingrepositories",
+        "git/builtin/upload-pack.c"
+      ],
+      "option_families": [
+        {
+          "family": "upload-pack-forgejo-pinned",
+          "options": [
+            "--stateless-rpc",
+            "--advertise-refs"
+          ],
+          "source": "inventory §2; githttp.go:397-405"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Negotiation/pack-generation failure."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "Smart-HTTP/SSH pkt-line fetch/clone request stream.",
+        "stdout": "Pkt-line advertisement (--advertise-refs) or pack stream.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Read-only (packs generated, not stored).",
+        "worktree": "none"
+      },
+      "argv_shape": "git upload-pack --stateless-rpc <repo> < stdin.pktline > stdout.pktline",
+      "notes": ""
+    },
+    {
+      "verb": "version",
+      "category": "ancillaryinterrogators",
+      "inventory_ref": "inventory §6 version constraint",
+      "forgejo_callsites": [
+        "modules/git/git.go:55-68 (parsed)",
+        "modules/git/git.go:27 (minimum 2.34.1)"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-version ancillaryinterrogators",
+        "git/git.c (version builtin)"
+      ],
+      "option_families": [
+        {
+          "family": "version-pinned",
+          "options": [
+            "(no flags)"
+          ],
+          "source": "inventory §6; git.go:55-68 parses 'git version <semver>'"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "Single line 'git version <semver>' (real version; gates 2.38/2.40/2.41/2.42/2.43.1/2.54 keyed on it).",
+        "stderr": ""
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "none",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "none",
+        "worktree": "none"
+      },
+      "argv_shape": "git version",
+      "notes": "Must be a REAL version string >= 2.34.1; faking it mis-enables feature gates (inventory §6)."
+    },
+    {
+      "verb": "write-tree",
+      "category": "plumbingmanipulators",
+      "inventory_ref": "inventory §2 `write-tree` row",
+      "forgejo_callsites": [
+        "modules/git/repo_index.go:159",
+        "services/pull/patch.go:473",
+        "services/repository/files/temp_repo.go:208"
+      ],
+      "git_sources": [
+        "git/command-list.txt: git-write-tree plumbingmanipulators",
+        "git/builtin/write-tree.c"
+      ],
+      "option_families": [
+        {
+          "family": "write-tree-pinned",
+          "options": [
+            "(no flags)"
+          ],
+          "source": "inventory §2; zero-flag argv"
+        }
+      ],
+      "exit_codes": [
+        {
+          "code": 0,
+          "meaning": "Success."
+        },
+        {
+          "code": "non-zero",
+          "meaning": "Unmerged index entries present."
+        },
+        {
+          "code": 128,
+          "meaning": "Fatal error (bad repo, bad revision, I/O failure)."
+        },
+        {
+          "code": 129,
+          "meaning": "Usage error (unknown flag, bad combination). Per git/parse-options.c conventions."
+        }
+      ],
+      "byte_shape": {
+        "stdin": "none",
+        "stdout": "New tree oid + newline.",
+        "stderr": "Human-readable diagnostics on stderr under LC_ALL=C (forgejo/modules/git/command.go:271 CommonGitCmdEnvs); never parsed except fetch/fetch-porcelain fatal prefix."
+      },
+      "side_effects": {
+        "head": "none",
+        "index": "Read-only against index (fails on unmerged stages).",
+        "sequencer": "none",
+        "config": "none",
+        "refs": "none",
+        "objects": "Writes one tree object.",
+        "worktree": "none"
+      },
+      "argv_shape": "git write-tree",
+      "notes": "Cherry-pick/revert emulation sink (temp_repo.go:208; patch.go:473)."
+    }
+  ],
+  "dynamic_sites": [
+    {
+      "site": "D01",
+      "verb": "clone",
+      "inventory_ref": "inventory §3 site 1 + §2 `clone` row",
+      "anchors": [
+        "forgejo/modules/git/repo.go:143-200 (CloneWithArgs)",
+        "forgejo/modules/git/repo.go:130-131 (Clone passes globalCommandArgs)"
+      ],
+      "family": "clone-args",
+      "options": [
+        "--mirror",
+        "--bare",
+        "--quiet",
+        "-s",
+        "--no-checkout",
+        "--depth <n>",
+        "--filter <spec>",
+        "-b <branch>",
+        "-c http.sslVerify=false",
+        "-c http.followRedirects=false"
+      ],
+      "expansion_source": "CloneRepoOptions fields (Mirror/Bare/Quiet/Shared/NoCheckout/Depth/Filter/Branch/SkipTLSVerify/ProhibitHTTPRedirect) plus caller-supplied TrustedCmdArgs prefix (globalCommandArgs).",
+      "argv_shape": "git <globalArgs...> clone [-c k=v]... [--mirror] [--bare] [--quiet] [-s] [--no-checkout] [--depth N] [--filter F] [-b B] <fromURL> <to>",
+      "exit_semantics": "0 success; 128 transport/auth failure (enrichCloneError maps redirect stderr).",
+      "observable_bytes": "Progress text on stdout/stderr (--quiet suppresses); new repo skeleton at <to>."
+    },
+    {
+      "site": "D02",
+      "verb": "fetch",
+      "inventory_ref": "inventory §3 site 1 (temp_repo fetchArgs)",
+      "anchors": [
+        "forgejo/services/pull/temp_repo.go:106 (fetchArgs definition)",
+        "forgejo/services/pull/temp_repo.go:139,177 (fetch origin / fetch <remote>)"
+      ],
+      "family": "fetch-args-temp-repo",
+      "options": [
+        "--no-tags",
+        "--no-write-commit-graph"
+      ],
+      "expansion_source": "Local fetchArgs variable at temp_repo.go:106, extended with caller refspecs '<baseBranch>:<base>' and '<headBranch>:tracking'.",
+      "argv_shape": "git fetch origin --no-tags --no-write-commit-graph <baseBranch>:<base> <baseBranch>:original_<base> / git fetch --no-tags --no-write-commit-graph <remote> <headBranch>:tracking",
+      "exit_semantics": "0 success; non-zero aborts temp-repo setup with 'Unable to fetch' error.",
+      "observable_bytes": "Updated refs base/original_base/tracking in temp repo; no porcelain parse (plain fetch)."
+    },
+    {
+      "site": "D03",
+      "verb": "fetch",
+      "inventory_ref": "inventory §3 + §2 `fetch` row; modules/git/fetch.go:31",
+      "anchors": [
+        "forgejo/modules/git/fetch.go:25-80 (Repository.Fetch)"
+      ],
+      "family": "fetch-porcelain",
+      "options": [
+        "--porcelain (when SupportFetchPorcelain)",
+        "--end-of-options",
+        "<remoteURL> <refspec>"
+      ],
+      "expansion_source": "SupportFetchPorcelain version gate; refspec extended with ':refs/tmp/<rand>' when it lacks ':' on old versions.",
+      "argv_shape": "git fetch [--porcelain] --end-of-options <remoteURL> <refspec>",
+      "exit_semantics": "0 success; stderr prefix 'fatal: couldn't find remote ref ' maps to ErrRemoteRefNotFound.",
+      "observable_bytes": "With --porcelain: exactly 1+1+L+1+L+1+len(localRef)+1 bytes '<flag> <old> <new> <localRef>\\n' (length-validated); without: FETCH_HEAD/tmp-ref read via ResolveReference then removed."
+    },
+    {
+      "site": "D04",
+      "verb": "for-each-ref",
+      "inventory_ref": "inventory §3 site 1 (repo_branch extraArgs)",
+      "anchors": [
+        "forgejo/modules/git/repo_branch.go:253-255 (WalkShowRef appends extraArgs)"
+      ],
+      "family": "for-each-ref-extra-args",
+      "options": [
+        "--format=%(objectname) %(refname)",
+        "<caller extraArgs...>"
+      ],
+      "expansion_source": "WalkShowRef callers pass skip/limit-derived TrustedCmdArgs tails (--sort/--count/patterns).",
+      "argv_shape": "git for-each-ref --format=%(objectname) %(refname) [<extraArgs>...]",
+      "exit_semantics": "0 success; stderr piped through io.Pipe to walkfn; empty stderr closes clean.",
+      "observable_bytes": "Streamed '<sha> <refname>' lines consumed by walkfn; countAll returned."
+    },
+    {
+      "site": "D05",
+      "verb": "merge-base/fetch (compare switch)",
+      "inventory_ref": "inventory §3 site 1 (repo_compare switch)",
+      "anchors": [
+        "forgejo/modules/git/repo_compare.go:32-70 (GetMergeBase tmp-remote fetch + merge-base)",
+        "forgejo/modules/git/repo_compare.go:100-105 (log range switch ... vs ..)"
+      ],
+      "family": "compare-switch",
+      "options": [
+        "fetch --no-tags <tmpRemote> <base>:<tmp> (conditional)",
+        "merge-base <base> <head>",
+        "log <base>...<head> vs <base>..<head>"
+      ],
+      "expansion_source": "Runtime branch: tmpRemote != 'origin' triggers fetch; directComparison flag selects '..' vs '...' log range.",
+      "argv_shape": "[git fetch --no-tags <tmpRemote> <base>:<tmp>] ; git merge-base <base> <head> ; git log <base><sep><head> --",
+      "exit_semantics": "Fetch failure is tolerated (falls back to base name); merge-base non-zero yields empty commit list path.",
+      "observable_bytes": "Merge-base oid string; pretty-log bytes parsed by parsePrettyFormatLogToList."
+    },
+    {
+      "site": "D06",
+      "verb": "receive-pack/upload-pack (HTTP)",
+      "inventory_ref": "inventory §3 sites 6 + §2 rows; githttp.go:397-405",
+      "anchors": [
+        "forgejo/routers/web/repo/githttp.go:397-405 (prepareGitCmdWithAllowedService)",
+        "forgejo/routers/web/repo/githttp.go:493 (update-server-info dumb path)"
+      ],
+      "family": "http-service-dispatch",
+      "options": [
+        "receive-pack (service=receive-pack)",
+        "upload-pack (service=upload-pack)",
+        "reject otherwise"
+      ],
+      "expansion_source": "HTTP ?service=<name> query value; any other string errors 'service %q is not allowed'.",
+      "argv_shape": "git <receive-pack|upload-pack>  (argv has NO --stateless-rpc at this layer; serviceRPC adds stateless flags downstream)",
+      "exit_semantics": "Unknown service = immediate Go error (no process spawned); allowed service inherits verb exit semantics.",
+      "observable_bytes": "Content-Type must be 'application/x-git-<service>-request' else HTTP 401; stdout is pkt-line pack/advertisement stream."
+    },
+    {
+      "site": "D07",
+      "verb": "upload-pack/receive-pack/upload-archive (SSH)",
+      "inventory_ref": "inventory §3 site 7; cmd/serv.go:333-347",
+      "anchors": [
+        "forgejo/cmd/serv.go:333-347 (gitBinVerb stat + verbFields split)"
+      ],
+      "family": "ssh-serv-dispatch",
+      "options": [
+        "git-upload-pack",
+        "git-receive-pack",
+        "git-upload-archive (+ LFS authenticate verb)"
+      ],
+      "expansion_source": "SSH original-command verb string, checked against allowedCommands; filesystem probe for <bindir>/git-<verb>, else split 'git-upload-pack' -> ['git','upload-pack'].",
+      "argv_shape": "<bindir>/git-<verb> <repoPath>  OR  <gitBin> <verb-suffix> <repoPath>  (repoPath positional; env carries repo/user/pusher IDs)",
+      "exit_semantics": "Disallowed verb = fail() before exec; missing binary falls through to split form; child is process-group managed (SIGTERM group, inventory §5).",
+      "observable_bytes": "stdin/stdout/stderr wired straight to the SSH channel (os.Stdin/Stdout/Stderr); pkt-line protocol bytes flow through."
+    },
+    {
+      "site": "D08",
+      "verb": "gc/fsck",
+      "inventory_ref": "inventory §3 site 8 + §2 `gc`/`fsck` rows",
+      "anchors": [
+        "forgejo/services/repository/check.go:88 (gc + args)",
+        "forgejo/modules/setting/git.go:26 (GCArgs ini GC_ARGS)",
+        "forgejo/modules/git/git.go:440 (fsck TrustedCmdArgs)"
+      ],
+      "family": "gc-args",
+      "options": [
+        "<setting.Git.GCArgs...> (gc)",
+        "<configured TrustedCmdArgs> (fsck)"
+      ],
+      "expansion_source": "Deployment configuration: ini GC_ARGS (space-delimited) for gc; caller-supplied TrustedCmdArgs for fsck.",
+      "argv_shape": "git gc [<GCArgs>...]  /  git fsck [<configured>...]",
+      "exit_semantics": "0 success; non-zero logs 'Repository garbage collection failed' with stdout captured.",
+      "observable_bytes": "Progress/status text captured to stdout string; no fixed flags to assert."
+    },
+    {
+      "site": "D09",
+      "verb": "apply",
+      "inventory_ref": "inventory §3 site 9; patch.go:163-166",
+      "anchors": [
+        "forgejo/services/repository/files/patch.go:163-166 (--git-dir prefix + apply flags)"
+      ],
+      "family": "apply-git-dir-prefix",
+      "options": [
+        "--git-dir <basePath>",
+        "apply --index --recount --cached --ignore-whitespace --whitespace=fix --binary -3"
+      ],
+      "expansion_source": "t.basePath of the temporary upload repository; patch bytes arrive on stdin from opts.Content.",
+      "argv_shape": "git --git-dir <basePath> apply --index --recount --cached --ignore-whitespace --whitespace=fix --binary -3 < stdin.patch  (cwd = temp working dir isolating bare-repo droppings)",
+      "exit_semantics": "Non-zero returns 'Error: Stdout/Stderr/Err' composite; index untouched on failure.",
+      "observable_bytes": "Empty stdout on success; stderr carries apply diagnostics; conflicting files may land in temp cwd (deleted after)."
+    },
+    {
+      "site": "D10",
+      "verb": "add/commit (globals prefix)",
+      "inventory_ref": "inventory §3 site 1; commit.go:88,115-120",
+      "anchors": [
+        "forgejo/modules/git/commit.go:88 (add with globalArgs...)",
+        "forgejo/modules/git/commit.go:115-130 (commit with -c identity + globals)"
+      ],
+      "family": "add-commit-globals",
+      "options": [
+        "<globalCommandArgs...> (opaque prefix)",
+        "add --all -- <files>",
+        "commit -c user.name= -c user.email= --author= --message="
+      ],
+      "expansion_source": "globalCommandArgs (command.go global tail, e.g. -c safe.directory / --git-dir forms) supplied by each caller.",
+      "argv_shape": "git <globalArgs...> add [--all] -- <files...>  /  git <globalArgs...> [-c user.name=N -c user.email=E] commit [--author=A] --message=M",
+      "exit_semantics": "add: 0/128/129; commit: 0 success, 1 nothing-to-commit/hook reject.",
+      "observable_bytes": "add: empty; commit: summary lines; message may arrive via --message (no --file=- in this family)."
+    },
+    {
+      "site": "D11",
+      "verb": "(env) all verbs",
+      "inventory_ref": "inventory §3 site 2 (env-var object locations) + §5 env",
+      "anchors": [
+        "forgejo/modules/git/repo.go:332 + cmd/hook.go:205 (GIT_OBJECT_DIRECTORY)",
+        "forgejo/services/pull/patch.go:104 + routers/private/hook_pre_receive.go:636 (GIT_ALTERNATE_OBJECT_DIRECTORIES)",
+        "forgejo/routers/private/hook_pre_receive.go:642 + cmd/hook.go:206,351 (GIT_QUARANTINE_PATH)",
+        "forgejo/modules/git/repo_attribute.go:135 + repo_index.go:43 (GIT_INDEX_FILE/GIT_WORK_TREE)",
+        "forgejo/modules/git/command.go:251,271,338 (commonBaseEnvs/CommonGitCmdEnvs injection)"
+      ],
+      "family": "env-object-locations",
+      "options": [
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_QUARANTINE_PATH",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "HOME/GIT_NO_REPLACE_OBJECTS=1/GNUPGHOME/LC_ALL=C/GIT_TERMINAL_PROMPT=0"
+      ],
+      "expansion_source": "Process environment set by Forgejo callers (quarantine on pre-receive, alternate dirs on patch merge, temp GIT_INDEX_FILE on index ops).",
+      "argv_shape": "(no argv change) env GIT_OBJECT_DIRECTORY=<d> GIT_ALTERNATE_OBJECT_DIRECTORIES=<ds> GIT_QUARANTINE_PATH=<q> GIT_INDEX_FILE=<f> GIT_WORK_TREE=<w> git <verb> ...",
+      "exit_semantics": "Unset/mis-set env changes object visibility, not exit codes; compat surface MUST honor all five vars.",
+      "observable_bytes": "Same verb bytes, resolved against alternate/quarantine object stores; quarantine objects visible pre-commit."
+    }
+  ]
+}
