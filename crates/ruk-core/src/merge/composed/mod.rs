@@ -34,6 +34,7 @@ pub mod host;
 pub mod markdown;
 pub mod mdx;
 pub mod notebook;
+pub mod route;
 
 use core::fmt::{self, Write as _};
 use core::str::FromStr;
