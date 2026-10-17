@@ -23,6 +23,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::merge::Merge;
+use crate::ops::PreparedOp;
 use crate::records::{RecordBatchPreparer, Records};
 use crate::store::types::ObjectKind;
 use crate::store::{Store, StoreError};
@@ -79,6 +80,21 @@ pub struct InvertResult {
 /// - `E_INVALID` if `tree` is not a tree object, or if `message` contains a NUL byte.
 /// - Store failures map by their own error code.
 pub fn revert(store: &Store, request: RevertRequest) -> Result<RevertResult, CoreError> {
+    let prepared = prepare_revert(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one revert and stages its publication parts without publishing.
+///
+/// Runs every check [`revert`] runs and returns the staged objects,
+/// exact-expectation facts, and the output publication will produce.
+pub fn prepare_revert(
+    store: &Store,
+    request: RevertRequest,
+) -> Result<PreparedOp<RevertResult>, CoreError> {
     let kind = store.hash_kind();
     request.head.validate(kind)?;
     request.tree.expect_kind(kind, "tree")?;
@@ -122,14 +138,14 @@ pub fn revert(store: &Store, request: RevertRequest) -> Result<RevertResult, Cor
 
     let prepared = records.prepare_native_commit(input)?;
     let head = prepared.head;
-    store
-        .publish(vec![prepared.prepared_object], &prepared.mutations)
-        .map_err(store_error)?;
-
-    Ok(RevertResult {
-        head,
-        change_id: prepared.record.change_id(),
-        reverted: request.head,
+    Ok(PreparedOp {
+        objects: vec![prepared.prepared_object],
+        facts: prepared.mutations,
+        output: RevertResult {
+            head,
+            change_id: prepared.record.change_id(),
+            reverted: request.head,
+        },
     })
 }
 

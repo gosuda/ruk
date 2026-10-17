@@ -23,6 +23,21 @@
 //!   need object preparation, claim sealing, workspace fencing, or plan
 //!   evaluation that no caller on this path supplies.
 //!
+//! The nine `crate::ops`-adjacent methods were evaluated one by one against
+//! their protocol args and stay refused, each arm naming its missing piece:
+//! `new` carries parents, a description, an optional name/email identity, and
+//! an optional workspace switch, but no tree object and no timestamped
+//! signature, so no `NewRequest` can be built without inventing the commit;
+//! protocol `describe` rewrites a change's description while `ops::describe`
+//! is a pure read of a commit or change with a different request shape, so
+//! no description-rewrite producer exists on this path and there are no lane
+//! parts for it here; protocol `edit` checks a change out into a workspace while
+//! `ops::edit` rewrites a commit's message/tree/identities; and `split`,
+//! `squash`, `rebase`, `abandon`, `resolve`, and `revert` all need
+//! ChangeRef resolution, merge/content evaluation, descendant handling, or
+//! workspace fencing that no caller on this path supplies, while their
+//! `ops::*` counterparts need caller-resolved trees or heads.
+//!
 //! Ref safety: each helper checks its transaction against the store before
 //! returning, and the lane keeps ref mutations safe after that. The batch
 //! accumulator never admits two items touching refs into one batch, so a
@@ -95,6 +110,60 @@ pub fn prepare_mutation(
         }
         Request::TagSet(m) => tag_set_parts(store, session, m.request_id, &m.args)?,
         Request::TagDelete(m) => tag_delete_parts(store, session, m.request_id, &m.args)?,
+        Request::New(_) => {
+            return Err(uncovered(
+                "new",
+                "`new` carries no tree object and its identity claim is name/email only, so no `ops::NewRequest` can be built without inventing the commit; the workspace switch also needs a fence no caller supplies",
+            ));
+        }
+        Request::Describe(_) => {
+            return Err(uncovered(
+                "describe",
+                "protocol `describe` rewrites a change's description while `ops::describe` is a pure read of a commit or change with a different request shape; no description-rewrite producer exists on this path",
+            ));
+        }
+        Request::Edit(_) => {
+            return Err(uncovered(
+                "edit",
+                "protocol `edit` checks a change out into a workspace while `ops::edit` rewrites a commit's message/tree/identities; the names match but the operations do not",
+            ));
+        }
+        Request::Split(_) => {
+            return Err(uncovered(
+                "split",
+                "`split` partitions by path selection with merge evaluation and workspace fences that have no producer on this path; `ops::split` needs a caller-resolved intermediate tree instead",
+            ));
+        }
+        Request::Squash(_) => {
+            return Err(uncovered(
+                "squash",
+                "`squash` moves path selections between changes with merge evaluation and workspace fences that have no producer on this path; `ops::squash` needs caller-resolved heads plus a tree instead",
+            ));
+        }
+        Request::Rebase(_) => {
+            return Err(uncovered(
+                "rebase",
+                "`rebase` resolves ChangeRefs, derives descendants by scope, and computes per-commit trees with no backing on this path; `ops::rebase` needs explicit heads plus a mandatory caller-resolved tree",
+            ));
+        }
+        Request::Abandon(_) => {
+            return Err(uncovered(
+                "abandon",
+                "protocol `abandon` resolves ChangeRefs, re-parents descendants, and fences workspaces; `ops::abandon` drops heads without re-parenting, so mapping heads alone would silently drop those semantics",
+            ));
+        }
+        Request::Resolve(_) => {
+            return Err(uncovered(
+                "resolve",
+                "turning a path Resolution into a resolved tree needs conflict/merge evaluation with no backing on this path; `ops::resolve` needs a caller-resolved tree instead",
+            ));
+        }
+        Request::Revert(_) => {
+            return Err(uncovered(
+                "revert",
+                "computing the reverse-delta tree needs merge evaluation with no backing on this path; `ops::revert` needs a caller-resolved tree instead",
+            ));
+        }
         _ => {
             return Err(CoreError::new(
                 ErrorCode::EHosted,
@@ -322,15 +391,21 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::change::{ClaimId, SessionId};
+    use crate::bytes::ByteString;
+    use crate::change::{ChangeId, ClaimId, SessionId, WorkspaceId};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
+    use crate::index::RepoPath;
     use crate::protocol::{
-        AttestListArgs, BookmarkDeleteArgs, ClaimListArgs, ClaimReleaseArgs,
-        Mutation as WireMutation, OpLogArgs, PinArgs, TagAnnotation, UnpinArgs,
+        AbandonArgs, AttestListArgs, BookmarkDeleteArgs, ChangeRef, ClaimListArgs,
+        ClaimReleaseArgs, DescribeArgs, EditArgs, MergeSelection, Mutation as WireMutation,
+        NewArgs, OpLogArgs, PathSelection, PinArgs, RebaseArgs, RebaseScope, Resolution,
+        ResolveArgs, RevertArgs, SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs,
+        WorkspaceBinding,
     };
     use crate::refdata::RefName;
     use crate::store::PreparationBudget;
+    use crate::workspace::WorkspaceStamp;
 
     static SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -526,6 +601,140 @@ mod tests {
         }));
         let err = prepare_mutation(&store, session, unpin).expect_err("unpin stays refused");
         assert_eq!(err.code, ErrorCode::EHosted);
+    }
+
+    fn change_target() -> ChangeRef {
+        ChangeRef {
+            change: ChangeId::from_bytes([0x22; 16]),
+            head: None,
+        }
+    }
+
+    fn workspace_binding() -> WorkspaceBinding {
+        WorkspaceBinding {
+            workspace: WorkspaceId::generate(),
+            expected: WorkspaceStamp {
+                sequence: 0,
+                lease_epoch: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn ops_backed_mutations_name_their_missing_preparation() {
+        let (_temp, store, session) = fixture();
+        let target = change_target();
+        let other = ChangeRef {
+            change: ChangeId::from_bytes([0x33; 16]),
+            head: None,
+        };
+        let parent = Head::Git { oid: oid(0x11) };
+        let requests = [
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("new change"),
+                    identity: None,
+                    workspace: None,
+                },
+            })),
+            Request::Describe(Box::new(WireMutation {
+                request_id: request_id(),
+                args: DescribeArgs {
+                    target,
+                    description: ByteString::from("rewritten"),
+                    identity: None,
+                    workspaces: Vec::new(),
+                },
+            })),
+            Request::Edit(Box::new(WireMutation {
+                request_id: request_id(),
+                args: EditArgs {
+                    binding: workspace_binding(),
+                    target,
+                },
+            })),
+            Request::Split(Box::new(WireMutation {
+                request_id: request_id(),
+                args: SplitArgs {
+                    source: target,
+                    paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
+                    placement: SplitPlacement::SelectedFirst,
+                    description: ByteString::from("part"),
+                    identity: None,
+                    merge: MergeSelection::default(),
+                    workspaces: Vec::new(),
+                },
+            })),
+            Request::Squash(Box::new(WireMutation {
+                request_id: request_id(),
+                args: SquashArgs {
+                    source: target,
+                    destination: other,
+                    paths: PathSelection::All,
+                    description: None,
+                    keep_empty: false,
+                    identity: None,
+                    merge: MergeSelection::default(),
+                    workspaces: Vec::new(),
+                },
+            })),
+            Request::Rebase(Box::new(WireMutation {
+                request_id: request_id(),
+                args: RebaseArgs {
+                    sources: vec![target],
+                    scope: RebaseScope::SourceAndDescendants,
+                    onto: vec![parent],
+                    merge: MergeSelection::default(),
+                    keep_empty: false,
+                    workspaces: Vec::new(),
+                },
+            })),
+            Request::Abandon(Box::new(WireMutation {
+                request_id: request_id(),
+                args: AbandonArgs {
+                    targets: vec![target],
+                    merge: MergeSelection::default(),
+                    workspaces: Vec::new(),
+                },
+            })),
+            Request::Resolve(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ResolveArgs {
+                    target,
+                    path: RepoPath::new("x").expect("test path"),
+                    resolution: Resolution::AcceptSame,
+                    workspaces: Vec::new(),
+                },
+            })),
+            Request::Revert(Box::new(WireMutation {
+                request_id: request_id(),
+                args: RevertArgs {
+                    target,
+                    onto: vec![parent],
+                    mainline: None,
+                    description: None,
+                    identity: None,
+                    merge: MergeSelection::default(),
+                },
+            })),
+        ];
+        for request in requests {
+            let method = request.method();
+            request
+                .validate()
+                .expect("refused requests stay daemon-reachable");
+            let err = prepare_mutation(&store, session, request)
+                .expect_err("ops-backed mutation stays refused");
+            assert_eq!(err.code, ErrorCode::EHosted, "method `{}`", method.as_str());
+            assert!(
+                err.message.contains("does not cover preparation"),
+                "method `{}` names its missing preparation: {}",
+                method.as_str(),
+                err.message
+            );
+        }
     }
 
     #[test]

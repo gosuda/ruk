@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::change::ChangeId;
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
+use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::change_key;
@@ -49,6 +50,22 @@ pub struct AbandonResult {
 /// own code. CAS mismatch (`E_STALE`) is returned if any change was concurrently
 /// modified.
 pub fn abandon(store: &Store, request: AbandonRequest) -> Result<AbandonResult, CoreError> {
+    let prepared = prepare_abandon(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one abandon and stages its publication parts without publishing.
+///
+/// Runs every check [`abandon`] runs and returns the staged objects (none:
+/// abandoning writes facts only), the exact-expectation facts, and the
+/// output publication will produce.
+pub fn prepare_abandon(
+    store: &Store,
+    request: AbandonRequest,
+) -> Result<PreparedOp<AbandonResult>, CoreError> {
     let kind = store.hash_kind();
     for head in &request.heads {
         head.validate(kind)?;
@@ -106,11 +123,13 @@ pub fn abandon(store: &Store, request: AbandonRequest) -> Result<AbandonResult, 
         }
     }
 
-    store.publish(Vec::new(), &mutations).map_err(store_error)?;
-
-    Ok(AbandonResult {
-        abandoned,
-        remaining,
+    Ok(PreparedOp {
+        objects: Vec::new(),
+        facts: mutations,
+        output: AbandonResult {
+            abandoned,
+            remaining,
+        },
     })
 }
 

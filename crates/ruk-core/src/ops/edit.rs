@@ -14,6 +14,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::merge::Merge;
+use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
 use crate::store::{Store, StoreError};
@@ -58,7 +59,37 @@ pub struct EditResult {
 /// - `E_NOT_FOUND` when `head` or `tree` is not stored in the repository.
 /// - `E_STALE` when `head` is not a current head of its change.
 /// - Store failures propagate their respective error code.
+///
+/// Publishing runs [`prepare_edit`] first, so validation and staging are
+/// shared, not duplicated. Publication failures map by the store's own code.
 pub fn edit(store: &Store, request: EditRequest) -> Result<EditResult, CoreError> {
+    let prepared = prepare_edit(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one commit rewrite and stages its publication parts without
+/// publishing.
+///
+/// Runs every check [`edit`] runs and returns the staged objects,
+/// exact-expectation facts, and the output publication will produce.
+///
+/// # Preconditions
+/// - At least one of `tree`, `message`, `author`, or `committer` is provided.
+/// - `head` names a stored commit.
+/// - When provided, `tree` names a stored tree object of this repository's hash kind.
+///
+/// # Errors
+/// - `E_INVALID` when no fields to edit are provided, or message contains a NUL byte.
+/// - `E_NOT_FOUND` when `head` or `tree` is not stored in the repository.
+/// - `E_STALE` when `head` is not a current head of its change.
+/// - Store failures propagate their respective error code.
+pub fn prepare_edit(
+    store: &Store,
+    request: EditRequest,
+) -> Result<PreparedOp<EditResult>, CoreError> {
     if request.tree.is_none()
         && request.message.is_none()
         && request.author.is_none()
@@ -132,13 +163,13 @@ pub fn edit(store: &Store, request: EditRequest) -> Result<EditResult, CoreError
 
     let prepared = records.prepare_native_commit(input)?;
     let head = prepared.head;
-    store
-        .publish(vec![prepared.prepared_object], &prepared.mutations)
-        .map_err(store_error)?;
-
-    Ok(EditResult {
-        head,
-        change_id: prepared.record.change_id(),
+    Ok(PreparedOp {
+        objects: vec![prepared.prepared_object],
+        facts: prepared.mutations,
+        output: EditResult {
+            head,
+            change_id: prepared.record.change_id(),
+        },
     })
 }
 

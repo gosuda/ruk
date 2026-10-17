@@ -15,6 +15,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::merge::Merge;
+use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
 use crate::store::{Store, StoreError};
@@ -60,6 +61,22 @@ pub struct ResolveResult {
 /// message contains a NUL byte, and `E_STALE` when `head` is not a current
 /// head of the change. Store failures map by their own code.
 pub fn resolve(store: &Store, request: ResolveRequest) -> Result<ResolveResult, CoreError> {
+    let prepared = prepare_resolve(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one conflict resolution and stages its publication parts
+/// without publishing.
+///
+/// Runs every check [`resolve`] runs and returns the staged objects,
+/// exact-expectation facts, and the output publication will produce.
+pub fn prepare_resolve(
+    store: &Store,
+    request: ResolveRequest,
+) -> Result<PreparedOp<ResolveResult>, CoreError> {
     let kind = store.hash_kind();
     request.head.validate(kind)?;
     request.resolved_tree.expect_kind(kind, "tree")?;
@@ -123,11 +140,11 @@ pub fn resolve(store: &Store, request: ResolveRequest) -> Result<ResolveResult, 
     let prepared = records.prepare_native_commit(input)?;
     let head = prepared.head;
     let change_id = prepared.record.change_id();
-    store
-        .publish(vec![prepared.prepared_object], &prepared.mutations)
-        .map_err(store_error)?;
-
-    Ok(ResolveResult { head, change_id })
+    Ok(PreparedOp {
+        objects: vec![prepared.prepared_object],
+        facts: prepared.mutations,
+        output: ResolveResult { head, change_id },
+    })
 }
 
 /// Refuses a tree that is not a stored tree of this repository.

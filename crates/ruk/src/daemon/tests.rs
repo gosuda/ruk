@@ -18,11 +18,13 @@ use super::{
     DEFAULT_RETENTION_INTERVAL_MS, DaemonConfig, ErrorReport, ExitReport, InvocationAccepted,
     InvocationOpen, OutcomeLedger, Registry, SessionOpened, serve_connection,
 };
+use ruk_core::bytes::ByteString;
 use ruk_core::change::{RequestId, SessionId};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
 use ruk_core::protocol::{
-    BookmarkSetArgs, BookmarkTarget, Method, PinArgs, Reply, ReplyBody, ReplyEnvelope, TagSetArgs,
+    BookmarkSetArgs, BookmarkTarget, Method, NewArgs, PinArgs, Reply, ReplyBody, ReplyEnvelope,
+    TagSetArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName};
 
@@ -734,3 +736,76 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
 /// The ops-backed `new` mutation travels the typed path but stays refused:
 /// its protocol args carry no tree object and no timestamped signature, so
 /// no `ops::NewRequest` can be built without inventing the commit.
+#[tokio::test]
+async fn typed_new_names_its_missing_preparation() {
+    let root = temp_root("typed-new");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-new",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-new",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let new_args = NewArgs {
+        parents: Vec::new(),
+        description: ByteString::from("typed new"),
+        identity: None,
+        workspace: None,
+    };
+    let args_json = sonic_rs::to_string(&new_args).expect("new args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "new",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(5, &payload).await;
+    assert_eq!(report.code, "E_HOSTED");
+    assert!(
+        report.message.contains("does not cover preparation"),
+        "unexpected message: {}",
+        report.message
+    );
+
+    // The refusal published nothing: the log stays empty.
+    let payload = Driver::typed_open(
+        &store_repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(reply)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert!(reply.entries.items.is_empty());
+
+    drop(driver);
+    task.abort();
+}

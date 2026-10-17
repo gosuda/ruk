@@ -18,12 +18,31 @@ pub mod squash;
 #[cfg(test)]
 mod tests;
 
-pub use abandon::{AbandonRequest, AbandonResult, abandon};
+use crate::store::types::{FactMutation, PreparedObject};
+
+pub use abandon::{AbandonRequest, AbandonResult, abandon, prepare_abandon};
 pub use describe::{ChangeDescription, CommitDescription, DescribeRequest, Description, describe};
-pub use edit::{EditRequest, EditResult, edit};
-pub use new::{NewRequest, NewResult, new};
-pub use rebase::{RebaseRequest, RebaseResult, rebase};
-pub use resolve::{ResolveRequest, ResolveResult, resolve};
-pub use revert::{RevertRequest, RevertResult, revert};
-pub use split::{SplitRequest, SplitResult, split};
-pub use squash::{SquashRequest, SquashResult, squash};
+pub use edit::{EditRequest, EditResult, edit, prepare_edit};
+pub use new::{NewRequest, NewResult, new, prepare_new};
+pub use rebase::{RebaseRequest, RebaseResult, prepare_rebase, rebase};
+pub use resolve::{ResolveRequest, ResolveResult, prepare_resolve, resolve};
+pub use revert::{RevertRequest, RevertResult, prepare_revert, revert};
+pub use split::{SplitRequest, SplitResult, prepare_split, split};
+pub use squash::{SquashRequest, SquashResult, prepare_squash, squash};
+
+/// One operation's pre-publication parts: the staged objects, the
+/// exact-expectation fact mutations, and the output publication will produce.
+///
+/// `prepare_*` validates and stages without touching the store; the `<op>`
+/// wrapper publishes the parts atomically and returns the output, so the
+/// CLI keeps its byte-identical behavior while the hosted lane can submit
+/// the same parts through its own publication path.
+#[derive(Debug)]
+pub struct PreparedOp<Output> {
+    /// Staged object spools to publish.
+    pub objects: Vec<PreparedObject>,
+    /// Exact-expectation fact mutations to publish.
+    pub facts: Vec<FactMutation>,
+    /// The output publication will produce.
+    pub output: Output,
+}

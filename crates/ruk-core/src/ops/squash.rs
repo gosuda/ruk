@@ -15,6 +15,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::merge::Merge;
+use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
 use crate::store::{Store, StoreError};
@@ -59,6 +60,21 @@ pub struct SquashResult {
 /// Store failures map by their own code. Nothing is published unless every
 /// check passes.
 pub fn squash(store: &Store, request: SquashRequest) -> Result<SquashResult, CoreError> {
+    let prepared = prepare_squash(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one squash and stages its publication parts without publishing.
+///
+/// Runs every check [`squash`] runs and returns the staged objects,
+/// exact-expectation facts, and the output publication will produce.
+pub fn prepare_squash(
+    store: &Store,
+    request: SquashRequest,
+) -> Result<PreparedOp<SquashResult>, CoreError> {
     if request.heads.len() < 2 {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
@@ -118,14 +134,14 @@ pub fn squash(store: &Store, request: SquashRequest) -> Result<SquashResult, Cor
 
     let prepared = records.prepare_native_commit(input)?;
     let head = prepared.head;
-    store
-        .publish(vec![prepared.prepared_object], &prepared.mutations)
-        .map_err(store_error)?;
-
-    Ok(SquashResult {
-        head,
-        change_id,
-        absorbed: request.heads,
+    Ok(PreparedOp {
+        objects: vec![prepared.prepared_object],
+        facts: prepared.mutations,
+        output: SquashResult {
+            head,
+            change_id,
+            absorbed: request.heads,
+        },
     })
 }
 

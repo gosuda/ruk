@@ -15,6 +15,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::merge::Merge;
+use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
 use crate::store::{Store, StoreError};
@@ -65,7 +66,34 @@ pub struct NewResult {
 /// stored commit or a message carrying NUL, and `E_STALE` when the
 /// predecessor is not a current head of the change. Store failures map by
 /// their own code. Nothing is published unless every check passes.
+///
+/// Publishing runs [`prepare_new`] first, so validation and staging are
+/// shared, not duplicated.
+///
+/// # Errors
+/// Same as [`prepare_new`], plus the store's own publication failures.
 pub fn new(store: &Store, request: NewRequest) -> Result<NewResult, CoreError> {
+    let prepared = prepare_new(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one commit creation and stages its publication parts without
+/// publishing.
+///
+/// Runs every check [`new`] runs — tree and parent storage, change
+/// resolution, and record preparation — and returns the staged objects,
+/// exact-expectation facts, and the output publication will produce.
+///
+/// # Errors
+/// `E_OBJECT_FORMAT` for a digest of the wrong width, `E_NOT_FOUND` for a
+/// tree that is not a stored tree, `E_INVALID` for a parent that is not a
+/// stored commit or a message carrying NUL, and `E_STALE` when the
+/// predecessor is not a current head of the change. Store failures map by
+/// their own code.
+pub fn prepare_new(store: &Store, request: NewRequest) -> Result<PreparedOp<NewResult>, CoreError> {
     let kind = store.hash_kind();
     request.tree.expect_kind(kind, "tree")?;
     for parent in &request.parents {
@@ -93,14 +121,15 @@ pub fn new(store: &Store, request: NewRequest) -> Result<NewResult, CoreError> {
     };
     let prepared = records.prepare_native_commit(input)?;
     let head = prepared.head;
-    store
-        .publish(vec![prepared.prepared_object], &prepared.mutations)
-        .map_err(store_error)?;
     let oid = head.as_git().copied();
-    Ok(NewResult {
-        head,
-        change_id: prepared.record.change_id(),
-        oid,
+    Ok(PreparedOp {
+        objects: vec![prepared.prepared_object],
+        facts: prepared.mutations,
+        output: NewResult {
+            head,
+            change_id: prepared.record.change_id(),
+            oid,
+        },
     })
 }
 

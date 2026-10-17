@@ -22,6 +22,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::merge::Merge;
+use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
 use crate::store::{Store, StoreError};
@@ -89,6 +90,22 @@ pub struct RebaseResult {
 /// parent; `E_NOT_FOUND` when `tree`, `head`, `onto`, or any descendant is not stored;
 /// `E_OBJECT_FORMAT` for an object ID of the wrong width.
 pub fn rebase(store: &Store, request: RebaseRequest) -> Result<RebaseResult, CoreError> {
+    let prepared = prepare_rebase(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one rebase and stages its publication parts without publishing.
+///
+/// Runs every check [`rebase`] runs — every rewrite in the chain is staged
+/// in memory — and returns the staged objects, exact-expectation facts, and
+/// the output publication will produce.
+pub fn prepare_rebase(
+    store: &Store,
+    request: RebaseRequest,
+) -> Result<PreparedOp<RebaseResult>, CoreError> {
     let Some(tree) = request.tree else {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
@@ -266,14 +283,14 @@ pub fn rebase(store: &Store, request: RebaseRequest) -> Result<RebaseResult, Cor
     }
 
     let batch = preparer.finish()?;
-    store
-        .publish(batch.prepared_objects, &batch.mutations)
-        .map_err(store_error)?;
-
-    Ok(RebaseResult {
-        head: new_root_head,
-        rewritten,
-        change_id: head_record.change_id(),
+    Ok(PreparedOp {
+        objects: batch.prepared_objects,
+        facts: batch.mutations,
+        output: RebaseResult {
+            head: new_root_head,
+            rewritten,
+            change_id: head_record.change_id(),
+        },
     })
 }
 

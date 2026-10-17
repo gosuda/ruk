@@ -15,6 +15,7 @@ use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
 use crate::merge::Merge;
+use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
 use crate::store::{Store, StoreError};
@@ -61,6 +62,23 @@ pub struct SplitResult {
 /// - `E_STALE` if `head` is not a current head of its change.
 /// - Store failures propagate their respective error code.
 pub fn split(store: &Store, request: SplitRequest) -> Result<SplitResult, CoreError> {
+    let prepared = prepare_split(store, request)?;
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .map_err(store_error)?;
+    Ok(prepared.output)
+}
+
+/// Validates one commit split and stages its publication parts without
+/// publishing.
+///
+/// Runs every check [`split`] runs — both commits are staged in memory —
+/// and returns the staged objects, exact-expectation facts, and the output
+/// publication will produce.
+pub fn prepare_split(
+    store: &Store,
+    request: SplitRequest,
+) -> Result<PreparedOp<SplitResult>, CoreError> {
     let kind = store.hash_kind();
     request.head.validate(kind)?;
     request.first_tree.expect_kind(kind, "tree")?;
@@ -142,14 +160,14 @@ pub fn split(store: &Store, request: SplitRequest) -> Result<SplitResult, CoreEr
     let second = preparer.add_native_commit(input_second)?;
     let batch = preparer.finish()?;
 
-    store
-        .publish(batch.prepared_objects, &batch.mutations)
-        .map_err(store_error)?;
-
-    Ok(SplitResult {
-        first,
-        second,
-        change_id,
+    Ok(PreparedOp {
+        objects: batch.prepared_objects,
+        facts: batch.mutations,
+        output: SplitResult {
+            first,
+            second,
+            change_id,
+        },
     })
 }
 
