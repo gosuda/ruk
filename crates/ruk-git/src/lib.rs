@@ -9,6 +9,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod export;
+pub mod import;
+pub mod transport;
+
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::ids::{HashKind, Oid};
 use thiserror::Error;
@@ -40,6 +44,90 @@ pub enum GitError {
         /// Which OID clashed with which repository kind.
         detail: String,
     },
+    /// Stored bytes disagree with their own framing or declared format.
+    #[error("corrupt: {detail}")]
+    Corrupt {
+        /// What failed validation.
+        detail: String,
+    },
+    /// Filesystem or store I/O failure.
+    #[error("io: {detail}")]
+    Io {
+        /// The failed operation.
+        detail: String,
+    },
+    /// A named object, ref, or row does not exist.
+    #[error("not found: {detail}")]
+    NotFound {
+        /// What is absent.
+        detail: String,
+    },
+    /// Malformed or contradictory input.
+    #[error("invalid: {detail}")]
+    Invalid {
+        /// What is invalid.
+        detail: String,
+    },
+    /// A configured resource limit rejected the request.
+    #[error("limit: {detail}")]
+    Limit {
+        /// The exceeded limit.
+        detail: String,
+    },
+    /// A checked fixed-width space is exhausted.
+    #[error("capacity: {detail}")]
+    Capacity {
+        /// The exhausted space.
+        detail: String,
+    },
+    /// The on-disk or wire format is not one this build reads.
+    #[error("version: {detail}")]
+    Version {
+        /// The rejected format.
+        detail: String,
+    },
+    /// A conditional expectation failed before mutation.
+    #[error("stale: {detail}")]
+    Stale {
+        /// What moved.
+        detail: String,
+    },
+    /// The remote could not be reached.
+    #[error("offline: {detail}")]
+    Offline {
+        /// The failed endpoint or transport.
+        detail: String,
+    },
+    /// The operation needs ancestors above the shallow boundary.
+    #[error("shallow: {detail}")]
+    Shallow {
+        /// The blocked traversal.
+        detail: String,
+    },
+    /// The remote definitively refused the push.
+    #[error("push rejected: {detail}")]
+    PushRejected {
+        /// The remote's refusal.
+        detail: String,
+    },
+    /// The push outcome is unknowable; retrying may duplicate.
+    #[error("push uncertain: {detail}")]
+    PushUncertain {
+        /// Where the outcome was lost.
+        detail: String,
+    },
+    /// The remote moved between negotiation and update.
+    #[error("remote moved: {detail}")]
+    RemoteMoved {
+        /// The displaced expectation.
+        detail: String,
+    },
+    /// The caller cancelled the operation.
+    #[error("cancelled: {detail}")]
+    Cancelled {
+        /// What was in flight.
+        detail: String,
+    },
 }
 
 impl GitError {
@@ -48,8 +136,21 @@ impl GitError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Unsupported { .. } => ErrorCode::EUnsupportedGitCommand,
-            Self::InvalidOid { .. } => ErrorCode::EInvalid,
+            Self::InvalidOid { .. } | Self::Invalid { .. } => ErrorCode::EInvalid,
             Self::ObjectFormat { .. } => ErrorCode::EObjectFormat,
+            Self::Corrupt { .. } => ErrorCode::ECorrupt,
+            Self::Io { .. } => ErrorCode::EIo,
+            Self::NotFound { .. } => ErrorCode::ENotFound,
+            Self::Limit { .. } => ErrorCode::ELimit,
+            Self::Capacity { .. } => ErrorCode::ECapacity,
+            Self::Version { .. } => ErrorCode::EVersion,
+            Self::Stale { .. } => ErrorCode::EStale,
+            Self::Offline { .. } => ErrorCode::EOffline,
+            Self::Shallow { .. } => ErrorCode::EShallow,
+            Self::PushRejected { .. }
+            | Self::PushUncertain { .. }
+            | Self::RemoteMoved { .. } => ErrorCode::EStale,
+            Self::Cancelled { .. } => ErrorCode::ECancelled,
         }
     }
 
@@ -69,6 +170,53 @@ impl GitError {
 impl From<GitError> for CoreError {
     fn from(err: GitError) -> Self {
         err.to_core_error()
+    }
+}
+
+impl From<CoreError> for GitError {
+    fn from(err: CoreError) -> Self {
+        let detail = err.to_string();
+        match err.code {
+            ErrorCode::ECorrupt => Self::Corrupt { detail },
+            ErrorCode::EIo => Self::Io { detail },
+            ErrorCode::ENotFound => Self::NotFound { detail },
+            ErrorCode::ELimit => Self::Limit { detail },
+            ErrorCode::ECapacity => Self::Capacity { detail },
+            ErrorCode::EVersion => Self::Version { detail },
+            ErrorCode::EStale => Self::Stale { detail },
+            ErrorCode::EOffline => Self::Offline { detail },
+            ErrorCode::EShallow => Self::Shallow { detail },
+            ErrorCode::ECancelled => Self::Cancelled { detail },
+            ErrorCode::EObjectFormat => Self::ObjectFormat { detail },
+            code => Self::Io {
+                detail: format!("{code:?}: {err}"),
+            },
+        }
+    }
+}
+
+impl From<ruk_core::store::StoreError> for GitError {
+    fn from(err: ruk_core::store::StoreError) -> Self {
+        use ruk_core::store::StoreError as SE;
+        match err {
+            SE::Io(e) => Self::Io {
+                detail: e.to_string(),
+            },
+            SE::Corrupt(detail) => Self::Corrupt { detail },
+            SE::NotFound(detail) => Self::NotFound { detail },
+            SE::Invalid(detail) => Self::Invalid { detail },
+            SE::Limit(detail) => Self::Limit { detail },
+            SE::Capacity(detail) => Self::Capacity { detail },
+            SE::Version(detail) => Self::Version { detail },
+            SE::ObjectFormat(detail) => Self::ObjectFormat { detail },
+            SE::StaleFact { table, key } => Self::Stale {
+                detail: format!("fact {table} {key} moved"),
+            },
+            SE::Model(e) => Self::from(CoreError::from(e)),
+            other => Self::Io {
+                detail: other.to_string(),
+            },
+        }
     }
 }
 

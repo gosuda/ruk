@@ -9,6 +9,20 @@ description = "Exact Git import/export and the strict Git command interpreter"
 [dependencies]
 ruk-core = { path = "../ruk-core", version = "0.1.0" }
 thiserror.workspace = true
+gix-hash.workspace = true
+gix-object.workspace = true
+gix-pack.workspace = true
+gix-protocol.workspace = true
+gix-transport.workspace = true
+gix-ref.workspace = true
+gix-url.workspace = true
+flate2.workspace = true
+memmap2.workspace = true
+bstr.workspace = true
+tracing.workspace = true
+serde.workspace = true
+sonic-rs.workspace = true
+postcard.workspace = true
 
 [lints]
 workspace = true
