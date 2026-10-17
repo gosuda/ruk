@@ -37,6 +37,7 @@
 //! The license text is retained in `crates/ruk-core/licenses/`.
 
 pub mod composed;
+pub mod syntax;
 
 use core::fmt;
 use core::hash::Hash;

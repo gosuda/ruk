@@ -1,0 +1,35 @@
+# Vendored tree-sitter-vue: deterministic import manifest
+#
+# Source: https://github.com/tree-sitter-grammars/tree-sitter-vue
+# Pinned revision: ce8011a414fdf8091f4e4071752efc376f4afb08
+# (upstream HEAD at fetch time; verified with `git ls-remote ... HEAD`.)
+#
+# Import method: read-only `git fetch <sha>` + `checkout FETCH_HEAD`
+# into scratch, then byte-copy of the six generated/scanner/header files
+# plus LICENSE listed below. No other upstream file is vendored; in
+# particular the upstream Cargo.toml is NOT used (it still depends on
+# tree-sitter ~0.20.10, outside the 0.27.1 core ABI interval 13..=15).
+#
+# Generated parser ABI: parser.c line 9 declares LANGUAGE_VERSION 15,
+# within tree-sitter core 0.27.1's accepted interval 13 through 15.
+# Language entry point: `const TSLanguage *tree_sitter_vue(void)`
+# (parser.c line 4383, TS_PUBLIC).
+#
+# Build (parent-owned build.rs): cc::Build C11 over src/parser.c and
+# src/scanner.c with the vendored src/ include directory.
+# License: MIT, Amaan Qureshi; full text retained verbatim in LICENSE.
+#
+# File hashes (SHA-256, deterministic `sha256sum` order):
+#
+# 91ebb180e4e2e34628c45e405584d0faac6863660b69e8139da96290e58c14dd  LICENSE (1078 bytes)
+# b639821160ac0e1a70d1dc2fe206380da945bd65be7a010ffdb90694a0fef2b8  src/tag.h (8310 bytes)
+# 9c2147fe2de1ede71f3ef5fd3ba54d12dbb6c2f71bce5735358fdbd4f8d19a32  src/scanner.c (14856 bytes)
+# 770f6ec24e908a30adf26056cc20375d94e2918bc79c0bdff4331d1dbd5577ce  src/parser.c (126009 bytes)
+# 180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2  src/tree_sitter/parser.h (7624 bytes)
+# b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea  src/tree_sitter/alloc.h (985 bytes)
+# 5bdf6ed1a78e3409fd443e085ca967a64c188a5d082aaf7f819bccd53a471c94  src/tree_sitter/array.h (10431 bytes)
+
+revision=ce8011a414fdf8091f4e4071752efc376f4afb08
+source=https://github.com/tree-sitter-grammars/tree-sitter-vue
+language_symbol=tree_sitter_vue
+language_abi=15
