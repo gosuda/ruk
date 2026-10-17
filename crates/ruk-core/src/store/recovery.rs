@@ -87,7 +87,7 @@ impl Committed<'_> {
         File::open(self.segment_path(id)).map_err(|err| missing_is_corrupt(err, id))
     }
 
-    fn check_width(&self, oid: Oid) -> Result<(), StoreError> {
+    pub(super) fn check_width(&self, oid: Oid) -> Result<(), StoreError> {
         if oid.kind() == self.kind {
             return Ok(());
         }

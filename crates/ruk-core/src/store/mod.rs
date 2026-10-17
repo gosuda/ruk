@@ -58,7 +58,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use error::StoreError;
@@ -92,10 +92,46 @@ const MAX_FORMAT_BYTES: u64 = 128;
 /// `Store` is `Sync`: reads and fact lookups run concurrently with each
 /// other and with publication, and publications serialize on one writer.
 /// Reads release every metadata transaction before payload I/O.
+/// Lock-free counters of observable I/O work issued through [`Store`].
+///
+/// Diagnostic only: a snapshot is not transactional, and callers must not
+/// branch on these numbers. Capacity verification and measurements read
+/// them; nothing else does.
+#[derive(Debug, Default)]
+struct IoCounters {
+    /// Completed [`Store::read`] object decodes.
+    object_reads: AtomicU64,
+    /// Decoded bytes those reads produced.
+    object_decoded_bytes: AtomicU64,
+    /// [`Store::object_len`] locator lookups.
+    locator_lookups: AtomicU64,
+    /// [`Store::fact`] lookups.
+    fact_lookups: AtomicU64,
+    /// Rows returned by fact lookups and pages.
+    fact_rows: AtomicU64,
+    /// [`Store::fact_page`] calls.
+    fact_page_calls: AtomicU64,
+    /// Payload reads that reached the metadata chain.
+    metadata_calls: AtomicU64,
+}
+
+/// A copy of [`Store`]'s I/O counters at one instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoStats {
+    pub object_reads: u64,
+    pub object_decoded_bytes: u64,
+    pub locator_lookups: u64,
+    pub fact_lookups: u64,
+    pub fact_rows: u64,
+    pub fact_page_calls: u64,
+    pub metadata_calls: u64,
+}
+
 pub struct Store {
     root: PathBuf,
     format: StoreFormat,
     meta: Metadata,
+    io: IoCounters,
     budget: Arc<PreparationBudget>,
     guards: Arc<GenerationRegistry>,
     writer: Mutex<WriterState>,
@@ -310,6 +346,7 @@ impl Store {
             root: root.to_path_buf(),
             format,
             meta,
+            io: IoCounters::default(),
             budget,
             guards,
             writer: Mutex::new(WriterState {
@@ -454,9 +491,76 @@ impl Store {
     /// for any damage, which also latches quarantine.
     pub fn read(&self, oid: Oid) -> Result<ReadObject, StoreError> {
         self.refuse_if_quarantined()?;
-        self.observe(self.committed().read(oid))
+        self.io.metadata_calls.fetch_add(1, Ordering::Relaxed);
+        let result = self.observe(self.committed().read(oid));
+        if let Ok(object) = &result {
+            self.io.object_reads.fetch_add(1, Ordering::Relaxed);
+            self.io
+                .object_decoded_bytes
+                .fetch_add(object.bytes.len(), Ordering::Relaxed);
+        }
+        result
     }
 
+    /// The committed decoded length of `oid`, or `None` when it was never
+    /// published. No payload I/O.
+    ///
+    /// # Errors
+    /// [`StoreError::ObjectFormat`] for a digest of the wrong width;
+    /// [`StoreError::Corrupt`] for storage damage, which also latches
+    /// quarantine; quarantine refuses.
+    pub fn object_len(&self, oid: Oid) -> Result<Option<u64>, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.io.locator_lookups.fetch_add(1, Ordering::Relaxed);
+        self.committed().check_width(oid)?;
+        self.observe(self.meta.get_object(&oid).map(|location| {
+            location.map(|location| location.decoded_len)
+        }))
+    }
+
+    /// Decodes a prepared, not yet committed object and verifies its
+    /// identity, the same proof publication and readers get later. A delta
+    /// decodes over its committed base.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] for a delta whose base is not committed;
+    /// [`StoreError::Corrupt`] when the payload does not round-trip to the
+    /// object identity; preparation budget limits and quarantine.
+    pub(crate) fn decode_prepared(&self, object: &PreparedObject) -> Result<Spool, StoreError> {
+        self.refuse_if_quarantined()?;
+        let base = match (object.encoding(), object.base()) {
+            (Encoding::Delta, Some(base)) => Some((base, self.read(base)?.bytes)),
+            _ => None,
+        };
+        prepare::decode_record(
+            self.format.kind,
+            object.kind(),
+            &object.oid(),
+            object.encoding(),
+            object.payload.view(),
+            object.payload.len(),
+            object.decoded_len(),
+            base.as_ref().map(|(oid, spool)| (*oid, spool.view())),
+            &self.budget,
+            &self.root,
+        )
+    }
+
+    /// A snapshot of the I/O work counters. Relaxed ordering: these numbers
+    /// are diagnostics and never publish or gate anything, so no acquire
+    /// ordering is needed.
+    #[must_use]
+    pub fn io_stats(&self) -> IoStats {
+        IoStats {
+            object_reads: self.io.object_reads.load(Ordering::Relaxed),
+            object_decoded_bytes: self.io.object_decoded_bytes.load(Ordering::Relaxed),
+            locator_lookups: self.io.locator_lookups.load(Ordering::Relaxed),
+            fact_lookups: self.io.fact_lookups.load(Ordering::Relaxed),
+            fact_rows: self.io.fact_rows.load(Ordering::Relaxed),
+            fact_page_calls: self.io.fact_page_calls.load(Ordering::Relaxed),
+            metadata_calls: self.io.metadata_calls.load(Ordering::Relaxed),
+        }
+    }
     /// A bounded page of raw fact rows strictly after `after` in key order.
     ///
     /// # Errors
@@ -471,7 +575,14 @@ impl Store {
         budget: FactPageBudget,
     ) -> Result<FactPage, StoreError> {
         self.refuse_if_quarantined()?;
-        self.observe(self.meta.fact_page(table, after, budget))
+        self.io.fact_page_calls.fetch_add(1, Ordering::Relaxed);
+        let result = self.observe(self.meta.fact_page(table, after, budget));
+        if let Ok(page) = &result {
+            self.io
+                .fact_rows
+                .fetch_add(page.rows.len() as u64, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Reads one fact value.
@@ -481,7 +592,12 @@ impl Store {
     /// also latches quarantine; quarantine refuses.
     pub fn fact(&self, table: FactTable, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         self.refuse_if_quarantined()?;
-        self.observe(self.meta.fact(table, key))
+        self.io.fact_lookups.fetch_add(1, Ordering::Relaxed);
+        let result = self.observe(self.meta.fact(table, key));
+        if let Ok(Some(_)) = &result {
+            self.io.fact_rows.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Publishes prepared objects and conditional fact mutations atomically.
