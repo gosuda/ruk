@@ -1885,6 +1885,7 @@ dependencies = [
  "clap",
  "ruk-core",
  "ruk-git",
+ "serde",
  "sonic-rs",
 ]
 

@@ -7,6 +7,8 @@ use ruk_core::MAX_CONTROL_FRAME_BYTES;
 use ruk_core::conflict::{ConflictRecord, ConflictRecordInput};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::ids::HashKind;
+use ruk_core::ops::{DescribeRequest, NewRequest};
+use ruk_core::store::{PreparationBudget, Store};
 
 /// Ruk: an agent-native version control system with exact Git interoperability.
 #[derive(Parser, Debug)]
@@ -61,6 +63,31 @@ enum Command {
         #[arg(long, default_value = "-")]
         input: String,
     },
+    /// Create one native commit from a JSON request and print its identity.
+    ///
+    /// Reads a [`NewRequest`] document from `--input` (`-` for stdin) and
+    /// publishes the commit atomically. Nothing is published when any
+    /// precondition fails.
+    New {
+        /// Repository root holding a Ruk store.
+        #[arg(long)]
+        repo: std::path::PathBuf,
+        /// Input path, or `-` for stdin.
+        #[arg(long, default_value = "-")]
+        input: String,
+    },
+    /// Describe one commit or one change from a JSON request.
+    ///
+    /// Reads a [`DescribeRequest`] document from `--input` (`-` for stdin)
+    /// and writes the typed description as JSON.
+    Describe {
+        /// Repository root holding a Ruk store.
+        #[arg(long)]
+        repo: std::path::PathBuf,
+        /// Input path, or `-` for stdin.
+        #[arg(long, default_value = "-")]
+        input: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -100,7 +127,37 @@ fn run(cli: Cli) -> Result<Vec<u8>, CoreError> {
             let bytes = read_input(&input)?;
             decode_conflict(&bytes, HashKind::from(object_format))
         }
+        Command::New { repo, input } => {
+            let request: NewRequest = decode_document(&read_input(&input)?)?;
+            let store = open_store(&repo)?;
+            let result = ruk_core::ops::new(&store, request)?;
+            render(&result)
+        }
+        Command::Describe { repo, input } => {
+            let request: DescribeRequest = decode_document(&read_input(&input)?)?;
+            let store = open_store(&repo)?;
+            let description = ruk_core::ops::describe(&store, request)?;
+            render(&description)
+        }
     }
+}
+
+/// Opens the store rooted at `path` under the reference preparation budget.
+fn open_store(path: &std::path::Path) -> Result<Store, CoreError> {
+    Store::open(
+        path,
+        std::sync::Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .map_err(|err| CoreError::new(err.code(), err.to_string()))
+}
+
+fn decode_document<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
+    ruk_core::protocol::decode_json(bytes)
+}
+
+fn render<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
+    sonic_rs::to_vec(value)
+        .map_err(|err| CoreError::new(ErrorCode::EIo, format!("schema render: {err}")))
 }
 
 /// Reads one input document from a file path or stdin (`-`), bounded by
@@ -211,6 +268,97 @@ mod tests {
             self.pulled += n as u64;
             Ok(n)
         }
+    }
+
+    #[test]
+    fn new_and_describe_round_trip_through_the_cli() {
+        use std::io::Cursor;
+        use std::sync::Arc;
+
+        use ruk_core::bytes::ByteString;
+        use ruk_core::change::ChangeId;
+        use ruk_core::conflict::{Signature, TzOffset};
+        use ruk_core::store::types::ObjectKind;
+
+        let root = std::env::temp_dir().join(format!("ruk-cli-ops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::create(
+            &root,
+            HashKind::Sha1,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create store");
+        let mut tree_bytes = Vec::from(b"100644 xa".as_slice());
+        tree_bytes.push(0);
+        tree_bytes.extend_from_slice(&[0x11; 20]);
+        let prepared = store
+            .prepare(
+                ObjectKind::Tree,
+                u64::try_from(tree_bytes.len()).expect("test tree fits u64"),
+                Cursor::new(&tree_bytes),
+                None,
+            )
+            .expect("prepare tree");
+        let tree = prepared.oid();
+        store.publish(vec![prepared], &[]).expect("publish tree");
+        drop(store);
+
+        let signature = Signature {
+            name: ByteString::from("Ada"),
+            email: ByteString::from("ada@example.invalid"),
+            timestamp: 1_700_000_000,
+            offset: TzOffset::UTC,
+        };
+        let change_id = ChangeId::generate();
+        let request = NewRequest {
+            tree,
+            parents: Vec::new(),
+            author: signature.clone(),
+            committer: signature,
+            message: ByteString::from("root\n"),
+            change_id: Some(change_id),
+            predecessor: None,
+            provenance: None,
+        };
+        let new_path = root.join("new.json");
+        std::fs::write(
+            &new_path,
+            sonic_rs::to_vec(&request).expect("encode request"),
+        )
+        .expect("write request");
+        let out = run(Cli {
+            command: Command::New {
+                repo: root.clone(),
+                input: new_path.display().to_string(),
+            },
+        })
+        .expect("run new");
+        let created: ruk_core::ops::NewResult =
+            ruk_core::protocol::decode_json(&out).expect("decode new result");
+        assert_eq!(created.change_id, change_id);
+
+        let describe_path = root.join("describe.json");
+        std::fs::write(
+            &describe_path,
+            sonic_rs::to_vec(&DescribeRequest::commit(created.head)).expect("encode request"),
+        )
+        .expect("write request");
+        let out = run(Cli {
+            command: Command::Describe {
+                repo: root.clone(),
+                input: describe_path.display().to_string(),
+            },
+        })
+        .expect("run describe");
+        let described: ruk_core::ops::Description =
+            ruk_core::protocol::decode_json(&out).expect("decode description");
+        let ruk_core::ops::Description::Commit(described) = described else {
+            panic!("a commit request must answer with a commit");
+        };
+        assert_eq!(described.head, created.head);
+        assert_eq!(described.change_id, change_id);
+        assert_eq!(described.message, "root\n");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
