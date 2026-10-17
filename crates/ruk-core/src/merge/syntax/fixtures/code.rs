@@ -271,5 +271,193 @@ pub fn fixtures() -> Vec<Fixture> {
             theirs: "func a() -> Int {\n  return 3\n}\n",
             expect: Expectation::Decline(DeclineReason::SameUnitChanged),
         },
+        // Rust: opposite edits to distinct methods in an impl block coexist.
+        Fixture {
+            language: Language::Rust,
+            name: "rust/disjoint-impl-methods",
+            base: "struct S;\nimpl S {\n    fn a(&self) -> u32 {\n        1\n    }\n    fn b(&self) -> u32 {\n        2\n    }\n}\n",
+            ours: "struct S;\nimpl S {\n    fn a(&self) -> u32 {\n        10\n    }\n    fn b(&self) -> u32 {\n        2\n    }\n}\n",
+            theirs: "struct S;\nimpl S {\n    fn a(&self) -> u32 {\n        1\n    }\n    fn b(&self) -> u32 {\n        20\n    }\n}\n",
+            expect: Expectation::Merge(
+                "struct S;\nimpl S {\n    fn a(&self) -> u32 {\n        10\n    }\n    fn b(&self) -> u32 {\n        20\n    }\n}\n",
+            ),
+        },
+        // Rust: moving a method across impl blocks is a cross-boundary move.
+        Fixture {
+            language: Language::Rust,
+            name: "rust/move-changed-key",
+            base: "struct A;\nimpl A {\n    fn m(&self) -> u32 {\n        1\n    }\n}\nstruct B;\nimpl B {}\n",
+            ours: "struct A;\nimpl A {}\nstruct B;\nimpl B {\n    fn m(&self) -> u32 {\n        1\n    }\n}\n",
+            theirs: "struct A;\nimpl A {\n    fn m(&self) -> u32 {\n        2\n    }\n}\nstruct B;\nimpl B {}\n",
+            expect: Expectation::Decline(DeclineReason::ChangedKey),
+        },
+        // Go: an import edit is an opaque gap change and declines.
+        Fixture {
+            language: Language::Go,
+            name: "go/import-edit",
+            base: "package p\n\nimport \"fmt\"\n\nfunc A() int {\n\treturn 1\n}\n",
+            ours: "package p\n\nimport \"os\"\n\nfunc A() int {\n\treturn 1\n}\n",
+            theirs: "package p\n\nimport \"fmt\"\n\nfunc A() int {\n\treturn 2\n}\n",
+            expect: Expectation::Decline(DeclineReason::UnsupportedConstruct),
+        },
+        // Go: duplicate methods on the same receiver with differing bytes decline.
+        Fixture {
+            language: Language::Go,
+            name: "go/duplicate-receiver-methods",
+            base: "package p\n\ntype S struct{}\n\nfunc (s S) M() int {\n\treturn 1\n}\nfunc (s S) M() int {\n\treturn 2\n}\nfunc A() int {\n\treturn 0\n}\n",
+            ours: "package p\n\ntype S struct{}\n\nfunc (s S) M() int {\n\treturn 1\n}\nfunc (s S) M() int {\n\treturn 2\n}\nfunc A() int {\n\treturn 1\n}\n",
+            theirs: "package p\n\ntype S struct{}\n\nfunc (s S) M() int {\n\treturn 1\n}\nfunc (s S) M() int {\n\treturn 2\n}\nfunc A() int {\n\treturn 2\n}\n",
+            expect: Expectation::Decline(DeclineReason::DuplicateKey),
+        },
+        // C: the same function edited on both sides declines.
+        Fixture {
+            language: Language::C,
+            name: "c/same-func",
+            base: "int a(void) {\n  return 1;\n}\n",
+            ours: "int a(void) {\n  return 2;\n}\n",
+            theirs: "int a(void) {\n  return 3;\n}\n",
+            expect: Expectation::Decline(DeclineReason::SameUnitChanged),
+        },
+        // C: a macro-body edit is an opaque gap change and declines.
+        Fixture {
+            language: Language::C,
+            name: "c/macro-body",
+            base: "#define LIMIT 10\n\nint a(void) {\n  return 1;\n}\n",
+            ours: "#define LIMIT 20\n\nint a(void) {\n  return 1;\n}\n",
+            theirs: "#define LIMIT 10\n\nint a(void) {\n  return 2;\n}\n",
+            expect: Expectation::Decline(DeclineReason::UnsupportedConstruct),
+        },
+        // C++: one-sided function edit carries.
+        Fixture {
+            language: Language::Cpp,
+            name: "cpp/one-sided",
+            base: "int a() {\n  return 1;\n}\n",
+            ours: "int a() {\n  return 2;\n}\n",
+            theirs: "int a() {\n  return 1;\n}\n",
+            expect: Expectation::Merge("int a() {\n  return 2;\n}\n"),
+        },
+        // C++: a macro-body edit declines; macro definitions stay opaque.
+        Fixture {
+            language: Language::Cpp,
+            name: "cpp/macro-body",
+            base: "#define LIMIT 10\n\nint a() {\n  return 1;\n}\n",
+            ours: "#define LIMIT 20\n\nint a() {\n  return 1;\n}\n",
+            theirs: "#define LIMIT 10\n\nint a() {\n  return 2;\n}\n",
+            expect: Expectation::Decline(DeclineReason::UnsupportedConstruct),
+        },
+        // Java: one-sided method edit carries.
+        Fixture {
+            language: Language::Java,
+            name: "java/one-sided",
+            base: "class C {\n  int m() {\n    return 1;\n  }\n}\n",
+            ours: "class C {\n  int m() {\n    return 2;\n  }\n}\n",
+            theirs: "class C {\n  int m() {\n    return 1;\n  }\n}\n",
+            expect: Expectation::Merge("class C {\n  int m() {\n    return 2;\n  }\n}\n"),
+        },
+        // Java: an annotation edit on a class boundary is a gap change and declines.
+        Fixture {
+            language: Language::Java,
+            name: "java/boundary-annotation",
+            base: "class C {\n  int m() {\n    return 1;\n  }\n}\n",
+            ours: "@Deprecated\nclass C {\n  int m() {\n    return 1;\n  }\n}\n",
+            theirs: "class C {\n  int m() {\n    return 2;\n  }\n}\n",
+            expect: Expectation::Decline(DeclineReason::UnsupportedConstruct),
+        },
+        // C#: one-sided member edit carries.
+        Fixture {
+            language: Language::CSharp,
+            name: "csharp/one-sided",
+            base: "class C {\n  int M() {\n    return 1;\n  }\n}\n",
+            ours: "class C {\n  int M() {\n    return 2;\n  }\n}\n",
+            theirs: "class C {\n  int M() {\n    return 1;\n  }\n}\n",
+            expect: Expectation::Merge("class C {\n  int M() {\n    return 2;\n  }\n}\n"),
+        },
+        // C#: distinct overloads keyed by parameter list merge.
+        Fixture {
+            language: Language::CSharp,
+            name: "csharp/distinct-overloads",
+            base: "class C {\n  int F(int x) {\n    return x;\n  }\n  int F(string x) {\n    return 0;\n  }\n}\n",
+            ours: "class C {\n  int F(int x) {\n    return x + 1;\n  }\n  int F(string x) {\n    return 0;\n  }\n}\n",
+            theirs: "class C {\n  int F(int x) {\n    return x;\n  }\n  int F(string x) {\n    return 1;\n  }\n}\n",
+            expect: Expectation::Merge(
+                "class C {\n  int F(int x) {\n    return x + 1;\n  }\n  int F(string x) {\n    return 1;\n  }\n}\n",
+            ),
+        },
+        // C#: an attribute edit on an enclosing class is a gap change and declines.
+        Fixture {
+            language: Language::CSharp,
+            name: "csharp/boundary-attribute",
+            base: "class C {\n  int M() {\n    return 1;\n  }\n}\n",
+            ours: "[System.Serializable]\nclass C {\n  int M() {\n    return 1;\n  }\n}\n",
+            theirs: "class C {\n  int M() {\n    return 2;\n  }\n}\n",
+            expect: Expectation::Decline(DeclineReason::UnsupportedConstruct),
+        },
+        // Kotlin: one-sided function edit carries.
+        Fixture {
+            language: Language::Kotlin,
+            name: "kotlin/one-sided",
+            base: "fun a(): Int {\n  return 1\n}\n",
+            ours: "fun a(): Int {\n  return 2\n}\n",
+            theirs: "fun a(): Int {\n  return 1\n}\n",
+            expect: Expectation::Merge("fun a(): Int {\n  return 2\n}\n"),
+        },
+        // Kotlin: same-name functions in different class scopes coexist.
+        Fixture {
+            language: Language::Kotlin,
+            name: "kotlin/distinct-scopes",
+            base: "class A {\n  fun m(): Int {\n    return 1\n  }\n}\nclass B {\n  fun m(): Int {\n    return 2\n  }\n}\n",
+            ours: "class A {\n  fun m(): Int {\n    return 10\n  }\n}\nclass B {\n  fun m(): Int {\n    return 2\n  }\n}\n",
+            theirs: "class A {\n  fun m(): Int {\n    return 1\n  }\n}\nclass B {\n  fun m(): Int {\n    return 20\n  }\n}\n",
+            expect: Expectation::Merge(
+                "class A {\n  fun m(): Int {\n    return 10\n  }\n}\nclass B {\n  fun m(): Int {\n    return 20\n  }\n}\n",
+            ),
+        },
+        // Kotlin: moving a function between classes is a cross-scope move and declines.
+        Fixture {
+            language: Language::Kotlin,
+            name: "kotlin/move-changed-key",
+            base: "class A {\n  fun m(): Int {\n    return 1\n  }\n}\nclass B {}\n",
+            ours: "class A {}\nclass B {\n  fun m(): Int {\n    return 1\n  }\n}\n",
+            theirs: "class A {\n  fun m(): Int {\n    return 2\n  }\n}\nclass B {}\n",
+            expect: Expectation::Decline(DeclineReason::ChangedKey),
+        },
+        // Kotlin: same-name extension functions on different types collide as duplicate keys.
+        Fixture {
+            language: Language::Kotlin,
+            name: "kotlin/extension-duplicate",
+            base: "fun String.ext(): Int {\n  return 1\n}\nfun Int.ext(): Int {\n  return 2\n}\nfun c(): Int {\n  return 0\n}\n",
+            ours: "fun String.ext(): Int {\n  return 1\n}\nfun Int.ext(): Int {\n  return 2\n}\nfun c(): Int {\n  return 10\n}\n",
+            theirs: "fun String.ext(): Int {\n  return 1\n}\nfun Int.ext(): Int {\n  return 2\n}\nfun c(): Int {\n  return 20\n}\n",
+            expect: Expectation::Decline(DeclineReason::DuplicateKey),
+        },
+        // Swift: one-sided function edit carries.
+        Fixture {
+            language: Language::Swift,
+            name: "swift/one-sided",
+            base: "func a() -> Int {\n  return 1\n}\n",
+            ours: "func a() -> Int {\n  return 2\n}\n",
+            theirs: "func a() -> Int {\n  return 1\n}\n",
+            expect: Expectation::Merge("func a() -> Int {\n  return 2\n}\n"),
+        },
+        // Swift: same-name functions in different class scopes coexist.
+        Fixture {
+            language: Language::Swift,
+            name: "swift/distinct-scopes",
+            base: "class A {\n  func m() -> Int {\n    return 1\n  }\n}\nclass B {\n  func m() -> Int {\n    return 2\n  }\n}\n",
+            ours: "class A {\n  func m() -> Int {\n    return 10\n  }\n}\nclass B {\n  func m() -> Int {\n    return 2\n  }\n}\n",
+            theirs: "class A {\n  func m() -> Int {\n    return 1\n  }\n}\nclass B {\n  func m() -> Int {\n    return 20\n  }\n}\n",
+            expect: Expectation::Merge(
+                "class A {\n  func m() -> Int {\n    return 10\n  }\n}\nclass B {\n  func m() -> Int {\n    return 20\n  }\n}\n",
+            ),
+        },
+        // Swift: duplicate methods across class and extension blocks with differing bytes decline.
+        Fixture {
+            language: Language::Swift,
+            name: "swift/extension-duplicate",
+            base: "class C {\n  func m() -> Int {\n    return 1\n  }\n}\nextension C {\n  func m() -> Int {\n    return 2\n  }\n}\nclass H {\n  func v() -> Int {\n    return 0\n  }\n}\n",
+            ours: "class C {\n  func m() -> Int {\n    return 1\n  }\n}\nextension C {\n  func m() -> Int {\n    return 2\n  }\n}\nclass H {\n  func v() -> Int {\n    return 1\n  }\n}\n",
+            theirs: "class C {\n  func m() -> Int {\n    return 1\n  }\n}\nextension C {\n  func m() -> Int {\n    return 2\n  }\n}\nclass H {\n  func v() -> Int {\n    return 2\n  }\n}\n",
+            expect: Expectation::Decline(DeclineReason::DuplicateKey),
+        },
     ]
 }

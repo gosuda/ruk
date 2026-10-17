@@ -226,6 +226,17 @@ fn model_schema_document() -> Result<Vec<u8>, CoreError> {
 }
 
 fn main() -> ExitCode {
+    // A re-executed syntax worker is not a user command: it owns stdin and
+    // stdout as a framed stream, so it is dispatched before any CLI parsing.
+    if std::env::args().nth(1).as_deref() == Some(ruk_core::merge::syntax::pool::WORKER_ARG) {
+        return match ruk_core::merge::syntax::pool::run_worker_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                let _ = writeln!(std::io::stderr(), "ruk syntax worker: {err}");
+                ExitCode::from(err.code().exit_code())
+            }
+        };
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(out) => {

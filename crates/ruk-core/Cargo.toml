@@ -51,6 +51,8 @@ tree-sitter-php.workspace = true
 tree-sitter-bash.workspace = true
 tree-sitter-ocaml.workspace = true
 tree-sitter-lua.workspace = true
+mdxjs.workspace = true
+markdown.workspace = true
 
 [build-dependencies]
 cc = "=1.8.0"

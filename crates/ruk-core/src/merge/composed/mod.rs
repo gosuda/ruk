@@ -30,6 +30,11 @@
 //! No field uses `skip_serializing_if`: these values are also stored through
 //! the non-self-describing postcard codec.
 
+pub mod host;
+pub mod markdown;
+pub mod mdx;
+pub mod notebook;
+
 use core::fmt::{self, Write as _};
 use core::str::FromStr;
 
@@ -606,6 +611,19 @@ impl NoticeCollector {
             self.record(entry);
         }
         self.total = self.total.saturating_add(dropped);
+    }
+
+    /// Extracts the accumulated notices, resetting this collector to empty.
+    #[must_use]
+    pub fn take(&mut self) -> MergeNotices {
+        let entries = core::mem::take(&mut self.entries);
+        let notices_truncated = core::mem::take(&mut self.truncated);
+        let total_occurrences = core::mem::take(&mut self.total);
+        MergeNotices {
+            entries,
+            notices_truncated,
+            total_occurrences,
+        }
     }
 
     #[must_use]

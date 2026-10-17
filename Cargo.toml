@@ -5,6 +5,11 @@ exclude = ["crates/ruk-core/vendor/redb"]
 
 [patch.crates-io]
 redb = { path = "crates/ruk-core/vendor/redb" }
+# swc_common 12.0.1 (via mdxjs -> swc_core) re-exports serde::__private, which
+# the pinned serde 1.0.229 facade no longer has. The vendored copy removes that
+# one dead alias; nothing in the crate reads it. Keep this pin until the mdxjs
+# graph reaches swc_common >= 15.0.0.
+swc_common = { path = "crates/ruk-core/vendor/swc_common" }
 
 [workspace.package]
 edition = "2024"
@@ -75,6 +80,8 @@ tree-sitter-php = "=0.25.1"
 tree-sitter-bash = "=0.25.1"
 tree-sitter-ocaml = "=0.26.0"
 tree-sitter-lua = "=0.5.0"
+mdxjs = "=1.0.4"
+markdown = "=1.0.0"
 
 # Property tests for the ported jj algebra.
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }

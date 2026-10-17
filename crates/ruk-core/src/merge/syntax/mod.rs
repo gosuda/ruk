@@ -27,6 +27,7 @@ pub mod fixtures;
 pub mod grammar;
 #[cfg(test)]
 mod harness;
+pub mod pool;
 pub mod treesitter;
 pub mod vue_ffi;
 
