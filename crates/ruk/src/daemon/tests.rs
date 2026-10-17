@@ -19,12 +19,12 @@ use super::{
     InvocationOpen, OutcomeLedger, Registry, SessionOpened, serve_connection,
 };
 use ruk_core::bytes::ByteString;
-use ruk_core::change::{RequestId, SessionId};
+use ruk_core::change::{LeaseId, OperationId, RequestId, SessionId, StoreId};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
 use ruk_core::protocol::{
-    BookmarkSetArgs, BookmarkTarget, Method, NewArgs, PinArgs, Reply, ReplyBody, ReplyEnvelope,
-    TagSetArgs,
+    BookmarkSetArgs, BookmarkTarget, Method, NewArgs, PageCursor, PageRequest, PinArgs,
+    QueryDigest, Reply, ReplyBody, ReplyEnvelope, StatusArgs, TagSetArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName};
 
@@ -679,7 +679,8 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
     assert_eq!(reply.entries.items[1].method, Method::TagSet);
     assert_eq!(reply.oldest_retained, Some(reply.entries.items[1].id));
 
-    // A read outside the covered subset names its missing implementation.
+    // A newly covered read answers over the socket pair: the claim listing
+    // starts empty on this store.
     let payload = Driver::typed_open(
         &repo,
         "claim.list",
@@ -687,13 +688,71 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some("{}".to_string()),
         Some(&session),
     );
-    let (report, _) = driver.expect_typed_refused(17, &payload).await;
+    let (stdout, _) = driver.run_typed(17, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::ClaimList(list)) = envelope.body else {
+        panic!("claim.list must answer its own reply");
+    };
+    assert!(list.claims.items.is_empty());
+    assert!(list.claims.next.is_none());
+
+    // The attestation listing answers the same way.
+    let payload = Driver::typed_open(
+        &repo,
+        "attest.list",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(19, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::AttestList(attest)) = envelope.body else {
+        panic!("attest.list must answer its own reply");
+    };
+    assert!(attest.records.items.is_empty());
+    assert!(attest.records.next.is_none());
+
+    // A read outside the covered subset names its missing implementation.
+    let payload = Driver::typed_open(
+        &repo,
+        "status",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(23, &payload).await;
     assert_eq!(report.code, "E_HOSTED");
     assert!(
-        report.message.contains("no read implementation"),
+        report.message.contains("autosnapshot"),
         "unexpected message: {}",
         report.message
     );
+
+    // Validation still runs before the coverage check: an uncovered read
+    // with an over-long cursor position refuses as invalid, never hosted.
+    let bad_cursor = PageCursor {
+        store: StoreId::generate(),
+        view: OperationId(0),
+        query: QueryDigest::from_bytes([0x22; 32]),
+        lease: LeaseId::generate(),
+        position: ByteString::from(vec![b'a'; 5000]),
+    };
+    let bad_status = StatusArgs {
+        page: PageRequest {
+            limit: None,
+            cursor: Some(bad_cursor),
+        },
+        ..Default::default()
+    };
+    let payload = Driver::typed_open(
+        &repo,
+        "status",
+        None,
+        Some(sonic_rs::to_string(&bad_status).expect("status args encode")),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(25, &payload).await;
+    assert_eq!(report.code, "E_INVALID");
 
     // A mutation outside the covered subset names its missing preparation.
     let pin_args = PinArgs {
@@ -709,7 +768,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(args_json),
         Some(&session),
     );
-    let (report, _) = driver.expect_typed_refused(19, &payload).await;
+    let (report, _) = driver.expect_typed_refused(27, &payload).await;
     assert_eq!(report.code, "E_HOSTED");
     assert!(
         report.message.contains("does not cover preparation"),
@@ -726,7 +785,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(sonic_rs::to_string(&pin_args).expect("pin args encode")),
         Some(&SessionId::generate().to_string()),
     );
-    let (report, _) = driver.expect_typed_refused(21, &payload).await;
+    let (report, _) = driver.expect_typed_refused(29, &payload).await;
     assert_eq!(report.code, "E_FORBIDDEN");
 
     drop(driver);

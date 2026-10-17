@@ -30,6 +30,7 @@ use super::admission::{
     WorkResources,
 };
 pub use super::cancel::{Cancel, CancelHandle, cancellation};
+use super::claims::{ClaimClock, authorize_claim_list_args, list_page_raw};
 use super::clock::Clock;
 use super::lane::{
     InternalCandidate, InternalPayload, MutationCandidate, PublicationLane, PublicationLaneRunner,
@@ -48,10 +49,12 @@ use crate::capability::{Capabilities, ReadAccess};
 use crate::change::{OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
-    MAX_PAGE_SIZE, OpLogArgs, OpLogReply, Page, ReconnectSecret, Reply, Request, SessionAuthority,
+    AttestListArgs, AttestListReply, ClaimListArgs, ClaimListReply, MAX_PAGE_SIZE, Method,
+    OpLogArgs, OpLogReply, Page, PageLimit, ReconnectSecret, Reply, Request, SessionAuthority,
     SessionOpenArgs, SessionResumeArgs, SessionResumeReply, Timestamp, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
+use crate::store::FactPageBudget;
 use crate::store::Store;
 use crate::store::types::{FactMutation, FactTable, PreparedObject};
 use crate::workspace::WorkspaceStamp;
@@ -411,20 +414,30 @@ impl HostedCoordinator {
     /// Loads the session, requires active authority, holds an in-flight guard
     /// across the read, admits it under the interactive class with compute
     /// resources, authorizes it against the session's negotiated capabilities,
-    /// and runs the read implementation. Only `op.log` has an implementation
-    /// today; every other read runs the same session checks and then names
-    /// its missing implementation with [`ErrorCode::EHosted`], so an unknown
-    /// session still reports `E_FORBIDDEN` rather than a missingimpl error.
+    /// and runs the read implementation. `op.log`, `claim.list`, and
+    /// `attest.list` have implementations; every other read runs the same
+    /// session checks and then names its missing implementation with
+    /// [`ErrorCode::EHosted`], so an unknown session still reports
+    /// `E_FORBIDDEN` rather than a missing-impl error.
     ///
     /// Capability mapping follows the existing handlers rather than a
     /// blanket table: ordinary reads authorize as [`ReadAccess::Objects`],
-    /// which always succeeds. A future `claim.list` implementation must use
-    /// the claims module's listing authorization (a session always reads its
-    /// own claims; anything wider needs `read_intents.claims`), and the
+    /// which always succeeds. `claim.list` additionally uses the claims
+    /// module's listing authorization (a session always reads its own
+    /// claims; anything wider needs `read_intents.claims`), and the
     /// attestation queries carry no capability gate of their own. Receipts
     /// of an expired session have no read path either: without one, expired
     /// authority is uniformly forbidden here instead of inventing a
     /// receipts-only read.
+    ///
+    /// `claim.list` and `attest.list` serve cursor-free first pages only.
+    /// Page continuations arrive as lease-bound cursor values whose binding
+    /// the coordinator cannot verify without a lease registry, and the
+    /// coordinator holds none, so a presented cursor refuses with
+    /// [`ErrorCode::EHosted`] naming the lease gap instead of inventing
+    /// lease internals. A first page that does not exhaust its listing
+    /// refuses with [`ErrorCode::ELimit`] rather than truncating, mirroring
+    /// the single-page bound of [`read_oplog`].
     ///
     /// The caller principal must match the session holder, mirroring the
     /// resume path: `op.log` entries name session identities, so the
@@ -485,11 +498,22 @@ impl HostedCoordinator {
         bound.authorize_read(ReadAccess::Objects)?;
         match request {
             Request::OpLog(args) => Ok(Reply::OpLog(Box::new(read_oplog(&self.store, &args)?))),
+            Request::ClaimList(args) => {
+                let row = bound.row();
+                let reply =
+                    read_claims(&self.store, &self.clock, session, &row.capabilities, &args)?;
+                Ok(Reply::ClaimList(Box::new(reply)))
+            }
+            Request::AttestList(args) => Ok(Reply::AttestList(Box::new(read_attestations(
+                &self.store,
+                &args,
+            )?))),
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
-                    "method `{}` has no read implementation on the coordinator: only `op.log` is served",
+                    "method `{}` has no read implementation on the coordinator: {}",
                     other.method().as_str(),
+                    read_gap(other.method()),
                 ),
             )),
         }
@@ -727,6 +751,139 @@ impl HostedCoordinator {
     }
 }
 
+/// Names the missing read path of one uncovered method for its refusal.
+///
+/// Every arm names the absent producer rather than gesturing at coverage,
+/// so a caller learns which machinery would serve the method.
+fn read_gap(method: Method) -> &'static str {
+    match method {
+        Method::Status => {
+            "status needs a workspace autosnapshot plus a workcopy crawl, and the read path publishes nothing"
+        }
+        Method::Log | Method::Query => {
+            "log and query need a production graph index over store segments, and revset evaluation builds its graph only in tests"
+        }
+        Method::Diff | Method::Show | Method::File | Method::Blame => {
+            "diff, show, file, and blame need tree and object readers over resolved revisions with no pure producer on the coordinator"
+        }
+        _ => "only `op.log`, `claim.list`, and `attest.list` first pages are served",
+    }
+}
+
+/// Loads the store and operation snapshot one read is served from.
+///
+/// Mirrors the head load of [`read_oplog`] so every read reports the same
+/// view of the same head.
+///
+/// # Errors
+/// `E_CORRUPT` for a damaged head row.
+fn current_view(store: &Store) -> Result<ViewInfo, CoreError> {
+    let head = match store.fact(FactTable::OpHead, OP_HEAD_KEY)? {
+        Some(bytes) => decode_head(store, &bytes)?,
+        None => CoordinatorHead::default(),
+    };
+    Ok(ViewInfo {
+        store: store.store_id(),
+        view: head.last_op.unwrap_or(OperationId(0)),
+    })
+}
+
+/// Reads the first page of one authorized claim listing.
+///
+/// The caller authorizes `args` first with [`authorize_claim_list_args`];
+/// this runs the raw store scan without minting or verifying any
+/// lease-bound cursor. A presented cursor refuses with `E_HOSTED`
+/// naming the lease gap, and a first page that does not exhaust its listing
+/// refuses with `E_LIMIT` rather than truncating.
+///
+/// # Errors
+/// `E_HOSTED` for a presented cursor (no lease registry verifies its
+/// binding); `E_LIMIT` past the single-page bound; `E_CORRUPT` for a claim
+/// row disagreeing with its index.
+fn read_claims(
+    store: &Store,
+    clock: &Clock,
+    viewer: SessionId,
+    caps: &Capabilities,
+    args: &ClaimListArgs,
+) -> Result<ClaimListReply, CoreError> {
+    if args.page.cursor.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::EHosted,
+            "claim.list continuation needs a lease-bound cursor and the hosted coordinator holds no lease registry: open a fresh first page instead",
+        ));
+    }
+    let listing = authorize_claim_list_args(caps, viewer, args)?;
+    let claim_clock = ClaimClock::open(store, clock.clone())?;
+    let limit = args.page.effective_limit();
+    let page = list_page_raw(
+        store,
+        &claim_clock,
+        listing,
+        None,
+        FactPageBudget::new(limit, 1024 * 1024),
+    )?;
+    if page.next.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            "claim.list exceeds its single-page bound and continuations need a lease-bound cursor the hosted coordinator does not mint",
+        ));
+    }
+    // The view loads after the scan, never before: a concurrent publication
+    // may then date the reply newer than its rows (ordinary staleness), but
+    // the rows can never come from a snapshot newer than the reported view.
+    let view = current_view(store)?;
+    Ok(ClaimListReply {
+        view,
+        claims: Page::new(page.records, None)?,
+    })
+}
+
+/// Reads the first page of attestation statements matching `args`.
+///
+/// Runs the bounded attestation query with an open checkpoint: the read
+/// already passed admission, so no progress gate applies. Cursor and
+/// exhaustion handling mirror [`read_claims`]: no lease registry verifies a
+/// presented cursor, and a non-exhausting first page refuses rather than
+/// truncating.
+///
+/// # Errors
+/// `E_HOSTED` for a presented cursor (no lease registry verifies its
+/// binding); `E_LIMIT` past the single-page bound or the verification
+/// budget; `E_CORRUPT` for a row that fails re-verification.
+fn read_attestations(store: &Store, args: &AttestListArgs) -> Result<AttestListReply, CoreError> {
+    if args.page.cursor.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::EHosted,
+            "attest.list continuation needs a lease-bound cursor and the hosted coordinator holds no lease registry: open a fresh first page instead",
+        ));
+    }
+    let filter = crate::attestation::StatementFilter {
+        subject: args.subject,
+        kind: args.kind.clone(),
+        signer: args.signer.clone(),
+        include_superseded: args.include_superseded,
+    };
+    let limit_rows = u32::try_from(args.page.effective_limit())
+        .map_err(|_| CoreError::new(ErrorCode::EInvalid, "page limit exceeds its bound"))?;
+    let limit = PageLimit::new(limit_rows).map_err(CoreError::from)?;
+    let open = |_: crate::attestation::Progress| Ok::<(), CoreError>(());
+    let page = crate::attestation::list(store, &filter, limit, None, &open)?;
+    if page.next.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            "attest.list exceeds its single-page bound and continuations need a lease-bound cursor the hosted coordinator does not mint",
+        ));
+    }
+    // The view loads after the scan, never before: see `read_claims` for why
+    // this order keeps rows committed at or before the reported view.
+    let view = current_view(store)?;
+    Ok(AttestListReply {
+        view,
+        records: Page::new(page.records, None)?,
+    })
+}
+
 /// Reads the operation log newest-first from the coordinator head.
 ///
 /// Walks the parent chain from the last operation, keeping every entry whose
@@ -781,13 +938,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::change::RequestId;
+    use crate::ByteString;
+    use crate::change::{LeaseId, RequestId, StoreId};
     use crate::commit::ProvenanceClaims;
     use crate::coord::rows::{Retained, SweepCursors, Usage, encode};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{
-        ClaimListArgs, Method, Mutation as WireMutation, OpLogArgs, PinArgs, TagSetArgs,
+        AttestListArgs, ClaimHolderFilter, ClaimListArgs, Method, Mutation as WireMutation,
+        OpLogArgs, PageCursor, PageRequest, PinArgs, QueryDigest, StatusArgs, TagSetArgs,
     };
     use crate::refdata::{RefExpect, RefName};
     use crate::store::PreparationBudget;
@@ -838,8 +997,18 @@ mod tests {
         Principal::from_peer_uid(2000)
     }
 
+    fn presented_cursor() -> PageCursor {
+        PageCursor {
+            store: StoreId::generate(),
+            view: OperationId(0),
+            query: QueryDigest::from_bytes([0x11; 32]),
+            lease: LeaseId::generate(),
+            position: ByteString::from(Vec::new()),
+        }
+    }
+
     #[tokio::test]
-    async fn session_bound_read_serves_oplog_and_refuses_the_rest() {
+    async fn session_bound_read_serves_covered_first_pages_and_refuses_the_rest() {
         let (_temp, coord, owner) = coordinator();
         let runner = coord
             .spawn_on(&tokio::runtime::Handle::current())
@@ -901,7 +1070,7 @@ mod tests {
             .expect_err("unknown session fails verification");
         assert_eq!(err.code, ErrorCode::EForbidden);
 
-        let err = coord
+        let reply = coord
             .read(
                 &owner,
                 session,
@@ -909,9 +1078,136 @@ mod tests {
                 &cancel,
             )
             .await
-            .expect_err("claim.list names its missing implementation");
+            .expect("claim.list serves its first page");
+        let Reply::ClaimList(list) = reply else {
+            panic!("claim.list must answer its own reply");
+        };
+        assert!(list.claims.items.is_empty());
+        assert!(list.claims.next.is_none());
+        assert_eq!(list.view, page.view);
+
+        let reply = coord
+            .read(
+                &owner,
+                session,
+                Request::AttestList(Box::new(AttestListArgs::default())),
+                &cancel,
+            )
+            .await
+            .expect("attest.list serves its first page");
+        let Reply::AttestList(attest) = reply else {
+            panic!("attest.list must answer its own reply");
+        };
+        assert!(attest.records.items.is_empty());
+        assert!(attest.records.next.is_none());
+        assert_eq!(attest.view, page.view);
+
+        // The owner session carries the full ceiling, so `Any` answers here;
+        // the forbidden path needs a session that negotiated the flag away.
+        let (restricted, _) = coord
+            .open_session(
+                &owner,
+                &SessionOpenArgs {
+                    capabilities: Some(Capabilities {
+                        read_intents: crate::capability::ReadIntents {
+                            provenance: false,
+                            claims: false,
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &cancel,
+            )
+            .await
+            .expect("open restricted session");
+
+        let err = coord
+            .read(
+                &owner,
+                restricted,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Any,
+                    page: PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("claim.list for every holder needs read_intents.claims");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        coord
+            .read(
+                &owner,
+                restricted,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect("a session always lists its own claims");
+
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::ClaimList(Box::new(ClaimListArgs {
+                    holder: ClaimHolderFilter::Mine,
+                    page: PageRequest {
+                        limit: None,
+                        cursor: Some(presented_cursor()),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("claim.list continuation names the lease gap");
         assert_eq!(err.code, ErrorCode::EHosted);
-        assert!(err.message.contains("no read implementation"));
+        assert!(
+            err.message.contains("lease"),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::AttestList(Box::new(AttestListArgs {
+                    page: PageRequest {
+                        limit: None,
+                        cursor: Some(presented_cursor()),
+                    },
+                    ..Default::default()
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("attest.list continuation names the lease gap");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("lease"),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::Status(Box::new(StatusArgs::default())),
+                &cancel,
+            )
+            .await
+            .expect_err("status names its missing implementation");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("autosnapshot"),
+            "unexpected message: {}",
+            err.message
+        );
 
         coord.shutdown();
         let _ = runner.abort();

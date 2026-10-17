@@ -609,8 +609,9 @@ pub struct SessionOpened {
 ///
 /// `schema` answers locally and the bootstrap methods run on the
 /// repository coordinator. Session-bound reads run through
-/// `HostedCoordinator::read` (`op.log` is served; every other read names
-/// its missing implementation), and covered mutations run through the
+/// `HostedCoordinator::read` (`op.log`, `claim.list`, and `attest.list`
+/// first pages are served; every other read names its missing
+/// implementation), and covered mutations run through the
 /// per-method preparation layer plus `submit_prepared`.
 #[must_use]
 pub fn coord_call_site(method: Method) -> &'static str {
@@ -620,7 +621,7 @@ pub fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::open_session/resume_session"
         }
         ruk_core::protocol::MethodKind::Read => {
-            "HostedCoordinator::read (op.log served; other reads name their missing implementation)"
+            "HostedCoordinator::read (op.log, claim.list, attest.list first pages served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
             "ruk_core::coord::prepare_mutation plus HostedCoordinator::submit_prepared (ref mutations covered; the rest name their missing preparation)"
@@ -2226,9 +2227,10 @@ fn decode_args<Args: DeserializeOwned>(text: &str) -> Result<Args, CoreError> {
 /// Decodes `args_json` into the typed [`Request`] of `method`.
 ///
 /// Mutation arguments decode as bare parameters; the idempotency key comes
-/// from the invocation frame. The result validates shape only: reads still
-/// lack a coordinator read path and mutations still lack prepared lane
-/// parts, so callers refuse afterwards.
+/// from the invocation frame. The result validates shape only: reads run on
+/// the coordinator afterwards (uncovered ones name their missing
+/// implementation there) and mutations prepare lane parts or name their
+/// missing preparation.
 ///
 /// # Errors
 /// `E_INVALID` for missing arguments, a missing or malformed mutation

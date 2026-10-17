@@ -393,9 +393,13 @@ fn indexed_claim(
 
 /// Pages raw claim records without lease binding.
 ///
-/// Only [`list_page`] calls this, after verifying the presented cursor
-/// against its leased view.
-fn list_page_raw(
+/// [`list_page`] calls this after verifying the presented cursor against
+/// its leased view. The hosted coordinator's cursor-free first-page read
+/// also calls this, with `after` always `None`: it serves the page only
+/// when the scan exhausts its listing (`next` is `None`) and otherwise
+/// refuses instead of minting a lease-bound continuation. No caller may
+/// serve a non-exhausted raw page as a complete answer.
+pub(crate) fn list_page_raw(
     store: &Store,
     clock: &ClaimClock,
     listing: ClaimListing,
