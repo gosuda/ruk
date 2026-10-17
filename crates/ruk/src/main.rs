@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod cli;
 mod daemon;
+mod mcp;
 
 use ruk_core::MAX_CONTROL_FRAME_BYTES;
 use ruk_core::conflict::{ConflictRecord, ConflictRecordInput};
@@ -77,6 +78,15 @@ enum Command {
     /// fields (message, signature names, header values) render as a JSON
     /// string when valid UTF-8, else as `{"hex": "<lowercase hex>"}`,
     /// matching the core byte-string contract.
+    /// Serve the Model Context Protocol over standard input/output.
+    ///
+    /// Exposes the typed operation table as MCP tools against the
+    /// repository at `--repo`.
+    Mcp {
+        /// Repository root.
+        #[arg(long, default_value = ".")]
+        repo: std::path::PathBuf,
+    },
     DecodeConflict {
         /// Object format of the enclosing repository.
         #[arg(long, value_enum, default_value_t = ObjectFormatArg::Sha1)]
@@ -178,6 +188,10 @@ fn run(cli: Cli) -> Result<Vec<u8>, CoreError> {
                 daemon::Error::Core(err) => err,
                 other => CoreError::new(ErrorCode::EHosted, other.to_string()),
             })?;
+            Ok(Vec::new())
+        }
+        Command::Mcp { repo } => {
+            mcp::serve(&repo, std::io::stdin().lock(), std::io::stdout().lock())?;
             Ok(Vec::new())
         }
     }
