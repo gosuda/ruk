@@ -66,7 +66,10 @@ pub enum SmartService {
     UploadPack,
     /// `git-receive-pack`: the server accepts objects.
     ReceivePack,
-    /// `git-upload-archive`: the server streams a tar archive.
+    /// `git-upload-archive`: the server streams a tar archive. Only the
+    /// RPC half uses this name: the oracle probes protocol support through
+    /// `git-upload-pack` (`git/remote-curl.c` `connect_git`), so discovery
+    /// through this name is available but no client here requires it.
     UploadArchive,
 }
 
@@ -636,8 +639,8 @@ pub struct ArchiveWireRequest {
 }
 
 /// Builds the `git-upload-archive` RPC body: one `argument --format=tar`
-/// line, one `argument <rev>` line, and the closing flush — the same
-/// framing `git/builtin/archive.c` (`run_remote_archiver`) sends and
+/// line, one `argument <rev>` line, and the closing flush, the same
+/// framing `git/builtin/archive.c` (`run_remote_archiver`) sends, and
 /// [`crate::transport::archive::serve_upload_archive`] reads.
 pub fn archive_request_body(rev: &str) -> Result<Vec<u8>, GitError> {
     if rev.is_empty() || rev.bytes().any(|byte| byte == b'\n' || byte == 0) {
@@ -663,9 +666,11 @@ pub struct ArchiveOutput {
 }
 
 /// Fetches one tar archive over smart-http: POSTs the argument payload to
-/// `<base>/git-upload-archive` and demuxes the sideband tar. Discovery
-/// works through [`discover`] with [`SmartService::UploadArchive`]; this
-/// POST half needs no advertisement caps, so it takes the base directly.
+/// `<base>/git-upload-archive` and demuxes the sideband tar. This POST half
+/// needs no advertisement caps, so it takes the base directly and skips the
+/// discovery round trip; the oracle likewise probes protocol support
+/// through `git-upload-pack`, not this service (`git/remote-curl.c`
+/// `connect_git`, and protocol v2 over HTTP is already a named gap here).
 ///
 /// A `NACK` line naming an unknown revision is [`GitError::NotFound`]; any
 /// other refusal is [`GitError::Corrupt`]. No verb consumes this yet: the

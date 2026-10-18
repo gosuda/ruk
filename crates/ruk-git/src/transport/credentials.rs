@@ -17,8 +17,8 @@
 //! - URL-scoped sections match by prefix only (see [`scope_matches`]); git
 //!   config `include` directives are not followed.
 //!
-//! Anything missing — no config, no external helper, a refused or timed-out
-//! helper, no username in the answer — is `None`. A helper failure therefore
+//! Anything missing (no config, no external helper, a refused or timed-out
+//! helper, no username in the answer) is `None`. A helper failure therefore
 //! never fails an anonymous attempt; it only skips authenticated ones.
 //!
 //! Every helper hop is bounded: [`HELPER_TIMEOUT`] per attempt through a

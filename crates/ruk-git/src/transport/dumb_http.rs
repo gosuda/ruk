@@ -5,19 +5,22 @@
 //! loose objects at `objects/xx/rest` (the zlib of `<type> <len>\0<body>`)
 //! and packs listed by `objects/info/packs`. This client mirrors what `git`
 //! does on the same fallback: discover refs from the text file, then cover
-//! the wanted closure — pack files first when listed, loose objects for the
-//! rest — walking links with the shared [`super::pack::object_links`]
-//! grammar and staging every raw object once through
-//! [`super::pack::stage_local_objects`], so identity verification and
-//! [`super::pack::IngestLimits`] match the smart path byte for byte.
+//! the wanted closure (pack files first when listed, loose objects for the
+//! rest), walking links with the shared [`super::pack::object_links`]
+//! grammar. Pack objects pass through [`super::pack::ingest_pack`] staging
+//! first (dropped unpublished) and then every raw object stages once
+//! finally through [`super::pack::stage_local_objects`]: double CPU work
+//! for packed objects, a single publication, and identity verification
+//! plus [`super::pack::IngestLimits`] matching the smart path byte for
+//! byte.
 //!
 //! Push over dumb-http stays refused: static files accept no pack, so the
 //! caller reports [`super::net::dumb_http_gap`].
 //!
 //! Every network hop reuses the HTTP client bounds (bounded connect and
 //! I/O timeouts per request); the hop count is bounded by
-//! `max_objects` — the closure walk refuses past it before downloading
-//! more. Auth is the helper-then-environment header from
+//! `max_objects` (the closure walk refuses past it before downloading
+//! more). Auth is the helper-then-environment header from
 //! [`super::credentials::auth_header_for_url`], the same one smart-http
 //! sends.
 //!
@@ -177,9 +180,11 @@ pub fn parse_dumb_info_refs(body: &[u8], kind: HashKind) -> Result<Vec<Advertise
 }
 
 /// Discovers a dumb endpoint's refs: GETs the text file and parses it with
-/// the dumb grammar. The returned advertisement carries no capabilities —
-/// dumb servers negotiate nothing — so filter/depth requests warn and fetch
-/// complete history.
+/// the dumb grammar. The returned advertisement carries no capabilities.
+/// Dumb servers negotiate nothing, so filter/depth requests warn and fetch
+/// complete history. The `HEAD` resource is never requested, so the
+/// advertisement carries no symref/default-branch info; refspec expansion
+/// over explicit refs is unaffected.
 ///
 /// # Errors
 /// Transport failures from the HTTP client and grammar failures from the
