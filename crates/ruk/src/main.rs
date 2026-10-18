@@ -125,9 +125,9 @@ enum Command {
     /// Requires `lfs = "full"` in the store policy. Payloads come from
     /// `--from` (a local directory holding `<oid>` files or
     /// `<aa>/<bb>/<oid>` trees, hash-verified before staging); without
-    /// it, absent payloads are listed in `missing`. Stdout is JSON
-    /// `{"synced": [...], "missing": [...]}`; a remote batch-API adapter
-    /// is the follow-up.
+    /// it, the verb POSTs one git-lfs batch download request to `lfs.url`
+    /// (falling back to `remote.origin.lfsurl`), set via `ruk config`.
+    /// Stdout is JSON `{"synced": [...], "missing": [{"oid","error"}]}`.
     LfsPayloadSync {
         /// Repository root holding a Ruk store.
         #[arg(long)]

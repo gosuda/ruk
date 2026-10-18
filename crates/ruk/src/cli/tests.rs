@@ -5,12 +5,14 @@
 //! observable bytes or store state, never source text.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use ruk_core::ids::HashKind;
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{FactTable, PreparationBudget, Store};
 
 use super::dispatch::{VERBS, lookup};
 use super::verbs_branch;
@@ -1348,5 +1350,231 @@ fn sequencer_absent_reads_clean() {
     );
     let err = run(verbs_history::rebase, &mut ctx, &["--abort"]).expect_err("abort");
     assert!(err.to_string().contains("no rebase in progress"));
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+// ---------------------------------------------------------------------------
+// lfs-payload-sync over the git-lfs batch API
+// ---------------------------------------------------------------------------
+
+/// Payload bytes every batch test points at: sha256 `BATCH_HEX`, 22 bytes.
+const BATCH_PAYLOAD: &[u8] = b"lfs-batch-test-payload";
+const BATCH_HEX: &str = "0f686d73e97c3f05112d032e21b0de1dc3c04986b04d7a41012c89413d9bded0";
+
+/// Builds a Full-mode repo with one committed LFS pointer at `big.bin`.
+fn lfs_pointer_repo(case: &str) -> (PathBuf, CliEnv) {
+    let base = temp_base(case);
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    std::fs::write(
+        root.join(".ruk").join("policy.toml"),
+        "version = 1\nlfs = \"full\"\n",
+    )
+    .expect("policy");
+    let pointer = format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{BATCH_HEX}\nsize {}\n",
+        BATCH_PAYLOAD.len()
+    );
+    std::fs::write(root.join("big.bin"), pointer.as_bytes()).expect("pointer");
+    let env = test_env(&base);
+    let mut ctx = repo_ctx(&root, env.clone());
+    verbs_stage::add(&mut ctx, &["big.bin".to_owned()]).expect("add");
+    verbs_history::commit(&mut ctx, &["-m".to_owned(), "pointer".to_owned()]).expect("commit");
+    (root, env)
+}
+
+/// Reads one HTTP request head plus its declared body from `socket`.
+fn read_http_request(socket: &std::net::TcpStream) -> (String, Vec<u8>) {
+    let mut reader = BufReader::new(socket.try_clone().expect("split"));
+    let mut head = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).expect("request line");
+        if line.is_empty() {
+            panic!("client hung up mid-request");
+        }
+        head.extend_from_slice(&line);
+        if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let length = text
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; length];
+    if length > 0 {
+        reader.read_exact(&mut body).expect("request body");
+    }
+    (text, body)
+}
+
+/// Serves a fake git-lfs endpoint on loopback: the batch POST answers one
+/// object, either with a download `href` to `/dl/<oid>` (`mode == "ok"`)
+/// or with a 404 error entry (`mode == "error"`); `/dl/<oid>` serves
+/// [`BATCH_PAYLOAD`]. Accepts stop at a 10-second deadline, so a client
+/// that never dials cannot hang the suite; returns the port plus the
+/// request paths seen, in order.
+fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let mode = mode.to_owned();
+    let server = std::thread::spawn(move || {
+        let mut paths = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("accept: {err}"),
+            };
+            // Accepted sockets inherit the listener's nonblocking flag on
+            // Linux, which would neuter the read timeout below: force
+            // blocking mode back on before any I/O.
+            socket.set_nonblocking(false).expect("blocking");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let (head, body) = read_http_request(&socket);
+            let path = head
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            paths.push(path.clone());
+            if path.ends_with("/objects/batch") {
+                assert!(head.starts_with("POST "), "batch is a POST: {head:?}");
+                assert!(
+                    body.windows(BATCH_HEX.len())
+                        .any(|window| window == BATCH_HEX.as_bytes()),
+                    "batch must request the pointer oid"
+                );
+                let entry = if mode == "ok" {
+                    format!(
+                        "{{\"oid\":\"{BATCH_HEX}\",\"size\":{},\"actions\":{{\"download\":{{\"href\":\"http://127.0.0.1:{port}/dl/{BATCH_HEX}\"}}}}}}",
+                        BATCH_PAYLOAD.len()
+                    )
+                } else {
+                    format!(
+                        "{{\"oid\":\"{BATCH_HEX}\",\"size\":{},\"error\":{{\"code\":404,\"message\":\"not found\"}}}}",
+                        BATCH_PAYLOAD.len()
+                    )
+                };
+                let reply_body = format!("{{\"objects\":[{entry}]}}");
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.git-lfs+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply_body}",
+                    reply_body.len()
+                );
+                socket.write_all(reply.as_bytes()).expect("batch reply");
+            } else if let Some(oid) = path.strip_prefix("/dl/") {
+                assert_eq!(oid, BATCH_HEX, "payload path carries the oid");
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    BATCH_PAYLOAD.len()
+                );
+                socket.write_all(reply.as_bytes()).expect("payload head");
+                socket.write_all(BATCH_PAYLOAD).expect("payload body");
+            } else {
+                panic!("unexpected path {path:?}");
+            }
+            if paths.len() >= 2 {
+                break;
+            }
+        }
+        paths
+    });
+    (port, server)
+}
+
+#[test]
+fn lfs_payload_sync_downloads_via_batch() {
+    let (root, env) = lfs_pointer_repo("lfs-batch-ok");
+    let (port, server) = lfs_batch_server("ok");
+    let mut ctx = repo_ctx(&root, env);
+    super::state::config_write(
+        ctx.store().expect("store"),
+        "lfs.url",
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+    )
+    .expect("lfs.url");
+    let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &[]).expect("sync");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains(&format!("\"{BATCH_HEX}\"")), "got {text:?}");
+    assert!(text.contains("\"missing\": []"), "got {text:?}");
+    // The payload verifies under its hash and the presence row is latched.
+    let store_root = ctx.store().expect("store").root().to_path_buf();
+    assert!(ruk_core::store::lfs::sidecar_verified(
+        &store_root,
+        BATCH_HEX,
+        BATCH_PAYLOAD.len() as u64
+    ));
+    assert!(
+        ctx.store()
+            .expect("store")
+            .fact(FactTable::LfsObjects, BATCH_HEX.as_bytes())
+            .expect("row read")
+            .is_some()
+    );
+    let paths = server.join().expect("server");
+    assert_eq!(
+        paths,
+        vec![
+            "/repo.git/info/lfs/objects/batch".to_owned(),
+            format!("/dl/{BATCH_HEX}")
+        ]
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn lfs_payload_sync_reports_batch_errors_as_missing() {
+    let (root, env) = lfs_pointer_repo("lfs-batch-error");
+    let (port, server) = lfs_batch_server("error");
+    let mut ctx = repo_ctx(&root, env);
+    super::state::config_write(
+        ctx.store().expect("store"),
+        "lfs.url",
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+    )
+    .expect("lfs.url");
+    // An error entry is reported, never fatal: exit stays 0.
+    let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &[]).expect("sync");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains(&format!("\"oid\": \"{BATCH_HEX}\"")), "got {text:?}");
+    assert!(text.contains("code 404: not found"), "got {text:?}");
+    assert!(text.contains("\"synced\": []"), "got {text:?}");
+    let _ = server.join().expect("server");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn lfs_payload_sync_without_endpoint_reports_a_clear_error() {
+    let (root, env) = lfs_pointer_repo("lfs-batch-no-endpoint");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &[]).expect("sync");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains(&format!("\"oid\": \"{BATCH_HEX}\"")), "got {text:?}");
+    assert!(text.contains("set lfs.url"), "got {text:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

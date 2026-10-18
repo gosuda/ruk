@@ -1454,14 +1454,17 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
 /// republished and counts as synced. Payload bytes come from
 /// `--from <dir>` (a local directory holding `<oid>` files or
 /// `<aa>/<bb>/<oid>` trees, hash-verified before staging); without it,
-/// every absent payload lands in `missing`. Remote batch-API download is
-/// a named gap — HTTP remotes already refuse with one in
-/// `transport::net` — so the HTTP adapter is the follow-up, not this
-/// verb.
+/// the verb POSTs one git-lfs batch download request to the configured
+/// endpoint (`lfs.url`, falling back to `remote.origin.lfsurl`, plus
+/// `/objects/batch`) and streams each answered `actions.download.href`
+/// into staging, echoing per-action headers and the environment Bearer
+/// token only on the endpoint's own authority. Batch error entries and
+/// failed downloads land in `missing` with the server's detail.
 ///
-/// Stdout is JSON `{"synced": [...], "missing": [...]}` with both lists
-/// sorted; exit is 0 even when `missing` is non-empty (absence is
-/// reported, never fatal, matching push admission under `Full`).
+/// Stdout is JSON `{"synced": [...], "missing": [{"oid","error"}]}` with
+/// both lists sorted by oid; exit is 0 even when `missing` is non-empty
+/// (absence is reported, never fatal, matching push admission under
+/// `Full`). Only a refused batch document itself fails the verb.
 pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     use ruk_core::store::lfs as sidecar;
 
@@ -1529,9 +1532,13 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             }
         }
     }
-    let mut synced = Vec::new();
-    let mut missing = Vec::new();
+    let mut synced: Vec<String> = Vec::new();
+    let mut missing: Vec<(String, String)> = Vec::new();
     let mut mutations = Vec::new();
+    // Pointers already verified are no-ops (row repair included); the
+    // rest need bytes from exactly one source below. `pointers` is a
+    // BTreeMap, so both report lists stay sorted by oid.
+    let mut pending: Vec<(String, u64)> = Vec::new();
     for (hex, size) in &pointers {
         if sidecar::sidecar_verified(store.root(), hex, *size) {
             // The file survived; the row may not have (rename committed,
@@ -1551,9 +1558,11 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             }
             continue;
         }
-        let staged = match &from {
-            None => false,
-            Some(dir) => {
+        pending.push((hex.clone(), *size));
+    }
+    match &from {
+        Some(dir) => {
+            for (hex, size) in &pending {
                 let direct = dir.join(hex);
                 let nested = dir.join(&hex[0..2]).join(&hex[2..4]).join(hex);
                 let src = if direct.is_file() {
@@ -1564,23 +1573,29 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
                     None
                 };
                 match src {
-                    None => false,
-                    Some(path) => sidecar::stage_verified(store.root(), hex, *size, &path).is_ok(),
+                    None => missing.push((
+                        hex.clone(),
+                        format!("not present in --from {}", dir.display()),
+                    )),
+                    Some(path) => {
+                        match sidecar::stage_verified(store.root(), hex, *size, &path) {
+                            Ok(_) => {
+                                synced.push(hex.clone());
+                                mutations.push(sidecar::upsert_mutation(
+                                    hex,
+                                    &sidecar::LfsObjectRecord {
+                                        size: *size,
+                                        complete: true,
+                                    },
+                                ));
+                            }
+                            Err(err) => missing.push((hex.clone(), err.to_string())),
+                        }
+                    }
                 }
             }
-        };
-        if staged {
-            synced.push(hex.clone());
-            mutations.push(sidecar::upsert_mutation(
-                hex,
-                &sidecar::LfsObjectRecord {
-                    size: *size,
-                    complete: true,
-                },
-            ));
-        } else {
-            missing.push(hex.clone());
         }
+        None => sync_via_batch(ctx, store, &pending, &mut synced, &mut missing, &mut mutations)?,
     }
     if !mutations.is_empty() {
         store
@@ -1595,14 +1610,191 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
         out.push_str(&format!("\"{hex}\""));
     }
     out.push_str("], \"missing\": [");
-    for (index, hex) in missing.iter().enumerate() {
+    for (index, (hex, error)) in missing.iter().enumerate() {
         if index > 0 {
             out.push_str(", ");
         }
-        out.push_str(&format!("\"{hex}\""));
+        out.push_str(&format!(
+            "{{\"oid\": \"{hex}\", \"error\": \"{}\"}}",
+            json_escape(error)
+        ));
     }
     out.push_str("]}\n");
     Ok(out.into_bytes())
+}
+
+/// Escapes `text` as one JSON string body: quotes, backslashes, and
+/// control characters take their short or `\u00XX` forms, and anything
+/// else passes through verbatim. Server error detail is untrusted bytes;
+/// `{:?}` would emit Rust's `\u{...}` form, which is not JSON.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for char in text.chars() {
+        match char {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            char if (char as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", char as u32));
+            }
+            char => out.push(char),
+        }
+    }
+    out
+}
+
+/// Downloads `pending` payloads through the git-lfs batch API at the
+/// configured endpoint (`lfs.url`, falling back to
+/// `remote.origin.lfsurl`): one `objects/batch` POST for the download
+/// operation, then one payload GET per answered action, streamed to a
+/// temp file beside the sidecar and staged hash-verified. Server error
+/// entries, omitted objects, and failed downloads land in `missing` with
+/// detail; only a refused batch document itself fails the verb.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a malformed endpoint or batch request,
+/// [`GitError::Offline`] when the batch endpoint refuses, plus transport
+/// failures from the HTTP client.
+fn sync_via_batch(
+    ctx: &Ctx,
+    store: &Store,
+    pending: &[(String, u64)],
+    synced: &mut Vec<String>,
+    missing: &mut Vec<(String, String)>,
+    mutations: &mut Vec<FactMutation>,
+) -> Result<(), GitError> {
+    use ruk_core::store::lfs as sidecar;
+    use ruk_git::transport::http::{self, BatchEntry};
+
+    let Some(endpoint) = ctx
+        .config_get("lfs.url")
+        .or_else(|| ctx.config_get("remote.origin.lfsurl"))
+    else {
+        for (hex, _) in pending {
+            missing.push((
+                hex.clone(),
+                "no LFS endpoint configured (set lfs.url) and no --from directory".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
+    let request = http::batch_request_body(pending)?;
+    let mut headers: Vec<(String, String)> = vec![
+        ("Content-Type".to_owned(), http::LFS_JSON.to_owned()),
+        ("Accept".to_owned(), http::LFS_JSON.to_owned()),
+    ];
+    if let Some(auth) = http::auth_header(&ctx.env.vars) {
+        headers.push(auth);
+    }
+    let borrowed: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let reply = http::post_json(&batch_url, &borrowed, &request)?;
+    if !http::is_success(reply.status) {
+        let preview: String = String::from_utf8_lossy(&reply.body).chars().take(200).collect();
+        return Err(GitError::Offline {
+            detail: format!(
+                "lfs batch {batch_url} refused status {}: {preview:?}",
+                reply.status
+            ),
+        });
+    }
+    let batch_authority = http::url_authority(&batch_url).ok();
+    let mut answers: HashMap<String, BatchEntry> = HashMap::new();
+    for entry in http::parse_batch_response(&reply.body)? {
+        let oid = match &entry {
+            BatchEntry::Ready { oid, .. } | BatchEntry::Failed { oid, .. } => oid.clone(),
+        };
+        answers.insert(oid, entry);
+    }
+    // Temp downloads land beside the sidecar (same filesystem) and are
+    // removed after every staging attempt, success or failure.
+    let tmp_dir = store.root().join("lfs").join("tmp");
+    std::fs::create_dir_all(&tmp_dir).map_err(|err| GitError::Io {
+        detail: format!("cannot stage lfs downloads: {err}"),
+    })?;
+    for (hex, size) in pending {
+        match answers.get(hex) {
+            None => missing.push((
+                hex.clone(),
+                "batch response omits this object".to_owned(),
+            )),
+            Some(BatchEntry::Failed { detail, .. }) => {
+                missing.push((hex.clone(), detail.clone()));
+            }
+            Some(BatchEntry::Ready {
+                href,
+                headers: action_headers,
+                ..
+            }) => {
+                let mut get_headers: Vec<(String, String)> = action_headers.clone();
+                if let Some(auth) = http::auth_header(&ctx.env.vars)
+                    && batch_authority.as_deref()
+                        == http::url_authority(href).ok().as_deref()
+                {
+                    get_headers.push(auth);
+                }
+                let tmp = tmp_dir.join(format!("dl-{hex}.{}", std::process::id()));
+                let outcome = download_and_stage(store, href, &get_headers, hex, *size, &tmp);
+                let _ = std::fs::remove_file(&tmp);
+                match outcome {
+                    Ok(()) => {
+                        synced.push(hex.clone());
+                        mutations.push(sidecar::upsert_mutation(
+                            hex,
+                            &sidecar::LfsObjectRecord {
+                                size: *size,
+                                complete: true,
+                            },
+                        ));
+                    }
+                    Err(detail) => missing.push((hex.clone(), detail)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// GETs one payload `href`, streaming the body into `tmp` and staging it
+/// hash-verified, returning the human detail for `missing` on any failure
+/// so one bad object never fails its siblings.
+fn download_and_stage(
+    store: &Store,
+    href: &str,
+    headers: &[(String, String)],
+    hex: &str,
+    size: u64,
+    tmp: &std::path::Path,
+) -> Result<(), String> {
+    use ruk_core::store::lfs as sidecar;
+    use ruk_git::transport::http;
+
+    let borrowed: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let mut file =
+        std::fs::File::create(tmp).map_err(|err| format!("cannot stage download: {err}"))?;
+    let (status, _) = http::get_to_writer(href, &borrowed, &mut file)
+        .map_err(|err| format!("GET {href} failed: {err}"))?;
+    // The staging read opens its own descriptor; flush here so it sees
+    // every byte even though the handle drops at return.
+    std::io::Write::flush(&mut file)
+        .map_err(|err| format!("cannot flush download: {err}"))?;
+    if !http::is_success(status) {
+        return Err(format!("GET {href} failed with status {status}"));
+    }
+    sidecar::stage_verified(store.root(), hex, size, tmp)
+        .map_err(|err| err.to_string())
+        .map(|_| ())
 }
 
 /// Checks one tree and its blobs recursively, recording misses.

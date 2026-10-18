@@ -67,6 +67,18 @@ pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
         .map(|(_, value)| value.as_str())
 }
 
+/// The `host:port` authority of an `http(s)` URL for credential scoping:
+/// the environment Bearer token authenticates the batch endpoint, and a
+/// download `href` receives it only when it stays on the batch endpoint's
+/// authority, so a token never leaks to a presigned-URL host.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a non-HTTP URL.
+pub fn url_authority(url: &str) -> Result<String, GitError> {
+    let parsed = parse_url(url)?;
+    Ok(format!("{}:{}", parsed.host, parsed.port))
+}
+
 /// An `Authorization` header from the LFS auth environment, when set.
 ///
 /// `GIT_LFS_AUTH_BEARER` wins and is sent verbatim as `Bearer <value>`;
@@ -1060,6 +1072,23 @@ mod tests {
             "token leaked: {:?}",
             second_requests[0]
         );
+    }
+
+    #[test]
+    fn authority_scopes_credentials() {
+        assert_eq!(
+            url_authority("http://127.0.0.1:18080/a?x=1").expect("authority"),
+            "127.0.0.1:18080"
+        );
+        assert_eq!(
+            url_authority("https://host.x/lfs").expect("authority"),
+            "host.x:443"
+        );
+        assert_ne!(
+            url_authority("http://127.0.0.1:18080/a").expect("a"),
+            url_authority("http://127.0.0.1:19090/b").expect("b")
+        );
+        assert!(url_authority("ftp://host.x/a").is_err());
     }
 
     #[test]
