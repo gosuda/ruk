@@ -277,6 +277,12 @@ pub(crate) struct SegmentWriter<W> {
     records_crc: u32,
     sealed: bool,
     poisoned: bool,
+    /// Known stream position when `Some`: construction leaves the stream at
+    /// `records_end`, and every successful record or seal write advances it
+    /// in lockstep, so the next write can skip its positioning seek. `None`
+    /// forces a seek. The stream is never exposed mutably (`get_ref` lends
+    /// `&W`), so nothing else can move it behind this record.
+    position: Option<u64>,
     /// Bounded append scratch reused across `append` calls. At most
     /// `IO_CHUNK` bytes; empty until the first record, freed on `seal`.
     scratch: Vec<u8>,
@@ -319,6 +325,8 @@ impl<W: Write + Seek> SegmentWriter<W> {
             records_crc,
             sealed: false,
             poisoned: false,
+            // The length probe above leaves the stream exactly here.
+            position: Some(records_end),
             scratch: Vec::new(),
         })
     }
@@ -420,10 +428,14 @@ impl<W: Write + Seek> SegmentWriter<W> {
             Ok(records_crc) => {
                 self.records_end = new_end;
                 self.records_crc = records_crc;
+                // The record's final byte landed here; the next write
+                // starts exactly at the new extent.
+                self.position = Some(new_end);
                 Ok(RecordAppended { offset, record_len })
             }
             Err(err) => {
                 self.poisoned = true;
+                self.position = None;
                 Err(err)
             }
         }
@@ -449,6 +461,7 @@ impl<W: Write + Seek> SegmentWriter<W> {
             scratch,
             records_end,
             records_crc,
+            position,
             ..
         } = &mut *self;
         if scratch.len() < buf_len {
@@ -458,7 +471,10 @@ impl<W: Write + Seek> SegmentWriter<W> {
         buf[..HEADER_PREFIX_LEN].copy_from_slice(&prefix);
         buf[HEADER_PREFIX_LEN..HEADER_LEN].copy_from_slice(&header_crc.to_le_bytes());
 
-        inner.seek(SeekFrom::Start(*records_end))?;
+        if *position != Some(*records_end) {
+            inner.seek(SeekFrom::Start(*records_end))?;
+            *position = Some(*records_end);
+        }
         let mut next_crc = *records_crc;
         let mut seen_crc = 0_u32;
         let mut remaining = payload_usize(len)?;
@@ -505,13 +521,20 @@ impl<W: Write + Seek> SegmentWriter<W> {
             records_crc: self.records_crc,
         }
         .encode();
-        let written = self
-            .inner
-            .seek(SeekFrom::Start(self.records_end))
-            .and_then(|_| self.inner.write_all(&footer));
+        if self.position != Some(self.records_end) {
+            // A failed positioning seek poisons, exactly as the
+            // unconditional seek did before the position tracking.
+            if let Err(err) = self.inner.seek(SeekFrom::Start(self.records_end)) {
+                self.poisoned = true;
+                return Err(err.into());
+            }
+            self.position = Some(self.records_end);
+        }
+        let written = self.inner.write_all(&footer);
         match written {
             Ok(()) => {
                 self.sealed = true;
+                self.position = Some(committed_end);
                 // `Batch.sealed` retains writers until the manifest commits;
                 // drop the scratch so each historical segment keeps no buffer.
                 self.scratch = Vec::new();
@@ -519,6 +542,7 @@ impl<W: Write + Seek> SegmentWriter<W> {
             }
             Err(err) => {
                 self.poisoned = true;
+                self.position = None;
                 Err(err.into())
             }
         }
