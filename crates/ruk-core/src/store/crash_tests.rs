@@ -34,6 +34,7 @@
 //! | `after_segment_sync` | after fsync of every touched segment (sealed ones included), before directory sync |
 //! | `after_directory_sync` | after fsync of the segments directory, before metadata commit |
 //! | `after_metadata_commit` | first statement after the redb Immediate commit returns |
+//! | `capacity_pending_persisted` | after the capacity-ledger pending commit, before the publication transaction opens |
 //! | `before_ack` | last statement inside `publish`, after in-memory bookkeeping, immediately before `Ok` returns |
 //! | `recovery_after_tail_truncate` | after truncating an uncommitted active tail, before the next segment is examined |
 //! | `recovery_after_detect_corrupt` | after the quarantine latch is set on committed corruption |
@@ -126,6 +127,7 @@ use crate::store::types::{
     FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
     SegmentManifest,
 };
+use crate::store::capacity::{PendingReservation, ReservationState};
 use crate::store::{META_FILE, PreparationBudget, SEGMENTS_DIR, Store, StoreError};
 
 // ---------------------------------------------------------------------------
@@ -261,6 +263,7 @@ fn store_crash_child() {
 fn dispatch_child(routine: &str, args: &[String]) -> i32 {
     match routine {
         "publish_blob_fact" => child_publish_blob_fact(args),
+        "publish_capacity_probe" => child_publish_capacity_probe(args),
         "publish_two_serial" => child_publish_two_serial(args),
         "publish_two_racing" => child_publish_two_racing(args),
         "publish_mixed_conflict" => child_publish_mixed_conflict(args),
@@ -526,6 +529,36 @@ fn acknowledge(root: &Path, name: &str) -> i32 {
 /// Creates a fresh store, prepares [`BLOB_A`], and publishes it with one
 /// `refs` fact row. The fault schedule selects the kill boundary.
 fn child_publish_blob_fact(args: &[String]) -> i32 {
+    let Ok((root, kind)) = store_args(args) else {
+        return EXIT_ARGS;
+    };
+    let Ok(store) = Store::create(&root, kind, test_budget()) else {
+        return EXIT_STORE;
+    };
+    let Ok(prepared) = store.prepare(ObjectKind::Blob, len_u64(BLOB_A), BLOB_A, None) else {
+        return EXIT_STORE;
+    };
+    if prepared.oid() != blob_oid(kind, BLOB_A) {
+        return EXIT_ASSERT;
+    }
+    let oid = prepared.oid();
+    let facts = [fact_mutation(
+        FactTable::Refs,
+        FACT_KEY_A,
+        FactExpectation::Absent,
+        Some(oid.as_bytes()),
+    )];
+    match store.publish(vec![prepared], &facts) {
+        Ok(_) => acknowledge(&root, "a"),
+        Err(_) => EXIT_STORE,
+    }
+}
+
+/// Publishes [`BLOB_A`] with one `refs` fact row for the capacity-ledger
+/// probe. The `capacity_pending_persisted` schedule kills the child after
+/// the pending commit but before any append, leaving a durable `Pending`
+/// row and no committed bytes.
+fn child_publish_capacity_probe(args: &[String]) -> i32 {
     let Ok((root, kind)) = store_args(args) else {
         return EXIT_ARGS;
     };
@@ -1268,6 +1301,123 @@ fn assert_precommit_kill_leaves_absence(kind: HashKind, point: &str) {
         std::fs::read(&orphan_path).expect("crash-left segment file"),
         orphan,
         "{context}: the unknown orphan segment must survive unchanged"
+    );
+    drop(store);
+    cleanup(&root);
+}
+
+/// Death after the capacity-ledger pending commit but before any append
+/// leaves a durable `Pending` row and no committed bytes: the commit that
+/// precedes the first reservation call is already on disk when the process
+/// dies. Reopening reconciles the row to `Released` (re-checked against the
+/// file extents) without latching quarantine, and the next publication
+/// takes the next per-generation sequence and commits normally.
+#[test]
+fn capacity_pending_kill_reconciles_to_released() {
+    for kind in [HashKind::Sha1, HashKind::Sha256] {
+        assert_capacity_pending_reconciles(kind);
+    }
+}
+
+/// One `capacity_pending_persisted` kill and its recovery proof; see
+/// [`capacity_pending_kill_reconciles_to_released`].
+fn assert_capacity_pending_reconciles(kind: HashKind) {
+    let context = format!("capacity_pending_persisted kill with {kind}");
+    let root = fresh_root(&format!("capacity-pending-{}", kind.format_name()));
+    let root_arg = root.to_string_lossy().into_owned();
+    let status = spawn_child(
+        "publish_capacity_probe",
+        "capacity_pending_persisted",
+        &[&root_arg, kind.format_name()],
+    );
+    assert_crashed(&status, &context);
+    assert_unacknowledged(&root, "a", &context);
+    // The pending row committed before the kill: exactly one `Pending` row
+    // for generation 1, with no charges yet, read without running recovery.
+    let meta =
+        Metadata::open(&root.join(META_FILE)).expect("read ledger rows without running recovery");
+    let rows = meta.pending_rows().expect("pending rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "{context}: one pending row must be durable, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].0,
+        PendingReservation::key(1, 0),
+        "{context}: pending row key"
+    );
+    assert_eq!(rows[0].1.generation, 1, "{context}: pending generation");
+    assert_eq!(rows[0].1.seq, 0, "{context}: pending sequence");
+    assert_eq!(
+        rows[0].1.state,
+        ReservationState::Pending,
+        "{context}: pending state"
+    );
+    assert!(
+        rows[0].1.charges.is_empty(),
+        "{context}: killed before any append, so no charges"
+    );
+    drop(meta);
+    let (manifests, objects) = committed_rows(&root);
+    assert!(
+        manifests.is_empty() && objects.is_empty(),
+        "{context}: nothing may be committed, got {manifests:?}"
+    );
+    // Reopen reconciles the dead row and keeps serving.
+    let store = Store::open(&root, test_budget()).expect("reopen must recover and reconcile");
+    assert!(
+        !store.quarantine(),
+        "{context}: a dead pending row must not latch quarantine"
+    );
+    let rows = store
+        .capacity_pending_rows_for_tests()
+        .expect("ledger rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "{context}: the dead row survives as a tombstone, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].1.state,
+        ReservationState::Released,
+        "{context}: reconciled state"
+    );
+    let oid = blob_oid(kind, BLOB_A);
+    match store.read(oid) {
+        Err(StoreError::NotFound(_)) => {}
+        other => panic!(
+            "{context}: uncommitted object must be absent after recovery, got readable={}",
+            other.is_ok()
+        ),
+    }
+    // The retry takes the next sequence and commits with its observed charge.
+    let republished = publish_small_blob(&store, kind, BLOB_A, FACT_KEY_A);
+    assert_eq!(republished, oid, "identity is stable across recovery");
+    assert_bytes(&store, oid, ObjectKind::Blob, BLOB_A).expect("republished object bytes");
+    let rows = store
+        .capacity_pending_rows_for_tests()
+        .expect("ledger rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "{context}: retry adds a second row, got {rows:?}"
+    );
+    assert_eq!(
+        rows[1].0,
+        PendingReservation::key(1, 1),
+        "{context}: retry sequence"
+    );
+    assert_eq!(
+        rows[1].1.state,
+        ReservationState::Committed,
+        "{context}: retry state"
+    );
+    assert_eq!(
+        rows[1].1.charges.len(),
+        1,
+        "{context}: one record reserved exactly once, got {:?}",
+        rows[1].1.charges
     );
     drop(store);
     cleanup(&root);
