@@ -40,6 +40,7 @@
 //! [`RecordPayload::finish`] returns `Ok`: a caller that decompresses and
 //! hashes while reading must still call `finish` before accepting the result.
 
+use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 
 use crc32c::{crc32c, crc32c_append, crc32c_combine};
@@ -632,6 +633,82 @@ impl<R: Read + Seek> RecordPayload<R> {
             truncated: false,
         })
     }
+}
+
+/// A positional (`pread`) read head over a shared segment file.
+///
+/// [`RecordPayload`] seeks its source to the record offset before reading;
+/// seeking a shared [`File`] would move one process-wide cursor under every
+/// concurrent reader, so this head keeps its own position and never touches
+/// the file cursor: every read is one positional read at the head's own
+/// offset. Any number of heads over one cached `File` read concurrently
+/// without disturbing each other.
+///
+/// `Seek` moves only the head's own position; `End` resolves against the
+/// file's current length.
+#[derive(Debug)]
+pub(crate) struct PreadReader<'a> {
+    file: &'a File,
+    pos: u64,
+}
+
+impl<'a> PreadReader<'a> {
+    pub(crate) fn new(file: &'a File) -> Self {
+        Self { file, pos: 0 }
+    }
+}
+
+impl Read for PreadReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let read = read_at(self.file, buf, self.pos)?;
+        self.pos += u64::try_from(read)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pread byte count overflows u64"))?;
+        Ok(read)
+    }
+}
+
+impl Seek for PreadReader<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let next = match pos {
+            SeekFrom::Start(off) => off,
+            SeekFrom::Current(delta) => relative_pos(self.pos, delta, "seek")?,
+            SeekFrom::End(delta) => {
+                let len = self.file.metadata()?.len();
+                relative_pos(len, delta, "seek")?
+            }
+        };
+        self.pos = next;
+        Ok(next)
+    }
+}
+
+/// Resolves a signed seek delta against `base` without wrapping.
+fn relative_pos(base: u64, delta: i64, what: &str) -> io::Result<u64> {
+    u64::try_from(i128::from(base) + i128::from(delta)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} would go before the start of the segment"),
+        )
+    })
+}
+
+/// One positional read: the shared-descriptor primitive. Never moves the
+/// file cursor, so concurrent heads over one cached `File` stay independent.
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+/// One positional read: the shared-descriptor primitive. Never moves the
+/// file cursor, so concurrent heads over one cached `File` stay independent.
+#[cfg(windows)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
 }
 
 impl<R> RecordPayload<R> {
