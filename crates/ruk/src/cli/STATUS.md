@@ -109,7 +109,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 - `status` and `diff` do not detect renames.
 - `stash apply`/`pop` require a clean index on the stashed base and a clean
   worktree on the restored paths instead of merging; the index rows come
-  back only with `--index` (`stash branch` always restores them); dropped
-  slots leave numbering gaps.
+  back only with `--index` (`stash branch` always restores them); bare
+  subcommands address the newest slot; dropped slots leave numbering gaps.
 - `rev-list` order is ancestry-discovery order, not date order.
 - `fetch`/`push`/`clone`/`pull`/`ls-remote` route local paths only.

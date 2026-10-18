@@ -27,7 +27,7 @@ use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
-use ruk_core::ops::{NewRequest, new as ops_new};
+use ruk_core::ops::{NewRequest, prepare_new as ops_prepare_new};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::{ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog};
 use ruk_core::store::{FactMutation, Store};
@@ -2921,20 +2921,26 @@ pub(crate) fn stash(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             hush_result(stash_push(ctx, &saved), quiet)
         }
         [sub] if sub == "list" => stash_list(ctx),
-        [sub] if sub == "show" => stash_show(ctx, None),
+        [sub] if sub == "show" => stash_show(ctx, Some(default_slot(ctx)?)),
         [sub, slot] if sub == "show" => stash_show(ctx, Some(parse_slot(slot)?)),
-        [sub] if sub == "drop" => hush_result(stash_drop_slot(ctx, 0), quiet),
+        [sub] if sub == "drop" => hush_result(stash_drop_slot(ctx, default_slot(ctx)?), quiet),
         [sub, slot] if sub == "drop" => hush_result(stash_drop_slot(ctx, parse_slot(slot)?), quiet),
-        [sub] if sub == "pop" => hush_result(stash_pop_scoped(ctx, 0, &opts), quiet),
+        [sub] if sub == "pop" => {
+            hush_result(stash_pop_scoped(ctx, default_slot(ctx)?, &opts), quiet)
+        }
         [sub, slot] if sub == "pop" => {
             hush_result(stash_pop_scoped(ctx, parse_slot(slot)?, &opts), quiet)
         }
-        [sub] if sub == "apply" => hush_result(stash_apply_scoped(ctx, 0, &opts), quiet),
+        [sub] if sub == "apply" => {
+            hush_result(stash_apply_scoped(ctx, default_slot(ctx)?, &opts), quiet)
+        }
         [sub, slot] if sub == "apply" => {
             hush_result(stash_apply_scoped(ctx, parse_slot(slot)?, &opts), quiet)
         }
         [sub] if sub == "clear" => stash_clear(ctx),
-        [sub, name] if sub == "branch" => hush_result(stash_branch(ctx, name, 0), quiet),
+        [sub, name] if sub == "branch" => {
+            hush_result(stash_branch(ctx, name, default_slot(ctx)?), quiet)
+        }
         [sub, name, slot] if sub == "branch" => {
             hush_result(stash_branch(ctx, name, parse_slot(slot)?), quiet)
         }
@@ -2961,6 +2967,14 @@ fn parse_slot(text: &str) -> Result<u64, GitError> {
     inner.parse().map_err(|_| GitError::Invalid {
         detail: format!("bad stash slot {text:?}"),
     })
+}
+
+/// Resolves a bare stash subcommand (no slot argument) to the newest live
+/// slot, the way the oracle defaults to `stash@{0}`. Falls back to slot
+/// zero when empty so the usual not-found error fires.
+fn default_slot(ctx: &Ctx) -> Result<u64, GitError> {
+    let store = ctx.store()?;
+    Ok(live_slots(store)?.last().copied().unwrap_or(0))
 }
 
 /// Creates a branch at a stash's base commit, checks it out, and applies
@@ -3119,15 +3133,30 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
 
 /// Mints one stash commit through the shared exportable path (no
 /// `change-id` header, so oids match the oracle byte-for-byte) and returns
-/// its object id.
+/// its object id. A byte-identical commit (same tree, parents, message,
+/// and identity, as a repeated push of unchanged state produces) already
+/// lives in the store, so only a missing commit is published — the oracle
+/// likewise deduplicates by oid.
 fn mint_stash_commit(store: &Store, request: NewRequest) -> Result<Oid, GitError> {
-    let result = ops_new(store, request).map_err(GitError::from)?;
-    result
+    let prepared = ops_prepare_new(store, request).map_err(GitError::from)?;
+    let oid = prepared
+        .output
         .oid
-        .or_else(|| result.head.as_git().copied())
+        .or_else(|| prepared.output.head.as_git().copied())
         .ok_or_else(|| GitError::Invalid {
             detail: "stash commit has no git identity".to_owned(),
-        })
+        })?;
+    let missing = match super::state::commit_record(store, oid) {
+        Ok(_) => false,
+        Err(GitError::NotFound { .. }) => true,
+        Err(err) => return Err(err),
+    };
+    if missing {
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .map_err(GitError::from)?;
+    }
+    Ok(oid)
 }
 
 /// Builds `(path, entry)` rows for the stash worktree tree: the tracked

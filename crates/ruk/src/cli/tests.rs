@@ -485,6 +485,34 @@ fn stash_push_mints_oracle_shaped_commits() {
 }
 
 #[test]
+fn stash_pop_index_flag_restores_staged_state() {
+    let (root, env) = seeded_repo("stash-index", "s.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let porcelain = |ctx: &mut Ctx| {
+        String::from_utf8(
+            run(verbs_stage::status, ctx, &["--porcelain"]).expect("status"),
+        )
+        .expect("status utf8")
+    };
+    std::fs::write(root.join("s.txt"), b"one\nwip\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["s.txt"]).expect("stage");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    // Without `--index` a stashed staged change comes back unstaged.
+    run(verbs_branch::stash, &mut ctx, &["pop"]).expect("pop");
+    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\nwip\n");
+    assert_eq!(porcelain(&mut ctx), " M s.txt\n");
+    // With `--index` the staged state comes back staged.
+    run(verbs_stage::add, &mut ctx, &["s.txt"]).expect("stage");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    run(verbs_branch::stash, &mut ctx, &["pop", "--index"]).expect("pop --index");
+    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\nwip\n");
+    assert_eq!(porcelain(&mut ctx), "M  s.txt\n");
+    let out = run(verbs_branch::stash, &mut ctx, &["list"]).expect("stash list");
+    assert!(out.is_empty());
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn clone_fetch_push_local_cycle() {
     let (root, _) = seeded_repo("clone-src", "c.txt", b"c\n");
     let base = root.parent().expect("parent").to_path_buf();
