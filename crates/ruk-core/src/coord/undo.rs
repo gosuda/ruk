@@ -144,12 +144,12 @@ fn undo_ref_transaction(
             )
         })?;
         let expected = match &fact.expected {
-            FactExpectation::Value(after) => RefExpect::Present(decode_ref_target(store, after)?),
+            FactExpectation::Value(after) => RefExpect::Present(decode_ref_target(after)?),
             FactExpectation::Absent => RefExpect::Absent,
             FactExpectation::Any => RefExpect::Any,
         };
         let change = match &fact.value {
-            Some(before) => RefChange::Set(decode_ref_target(store, before)?),
+            Some(before) => RefChange::Set(decode_ref_target(before)?),
             None => RefChange::Delete,
         };
         updates.push(RefUpdate {
@@ -172,7 +172,7 @@ fn undo_ref_transaction(
 ///
 /// # Errors
 /// [`ErrorCode::ECorrupt`] for bytes that are not an encoded [`RefTarget`].
-fn decode_ref_target(store: &Store, bytes: &[u8]) -> Result<RefTarget, CoreError> {
+fn decode_ref_target(bytes: &[u8]) -> Result<RefTarget, CoreError> {
     crate::store::decode("ref target", bytes).map_err(CoreError::from)
 }
 

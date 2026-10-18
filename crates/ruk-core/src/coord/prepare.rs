@@ -1552,38 +1552,13 @@ fn load_rewrite_target(store: &Store, target: &ChangeRef) -> Result<RewriteTarge
     })
 }
 
-/// Reports the identity a rewrite ran under: the call override, else the
-/// session identity, else none. Only arms that synthesize a signature
-/// (`new`, `revert`, native `ws.new`) may report it; arms that preserve the
-/// original committer (`describe`, `split`, `squash`) report
-/// [`preserved_identity`] instead, so the reply never claims an identity the
-/// new commits never record.
-fn report_identity(
-    ctx: &PrepareContext<'_>,
-    over: Option<&IdentityClaim>,
-) -> Result<Option<EffectiveIdentity>, CoreError> {
-    if let Some(claim) = over {
-        claim.validate()?;
-        return Ok(Some(EffectiveIdentity {
-            name: claim.name.clone(),
-            email: claim.email.clone(),
-            source: IdentitySource::OperationOverride,
-        }));
-    }
-    Ok(ctx
-        .session_row
-        .and_then(|row| row.identity.as_ref())
-        .map(|claim| EffectiveIdentity {
-            name: claim.name.clone(),
-            email: claim.email.clone(),
-            source: IdentitySource::SessionClaim,
-        }))
-}
-
 /// Reports the identity a rewrite committed: the committer preserved from the
 /// rewritten commit. Rewrites keep the original signatures — new-style
 /// synthesis from the session or override identity is a documented deviation —
-/// so the reply reports who the new commits actually name.
+/// so the reply reports who the new commits actually name. Arms with no
+/// single primary commit (`rebase` stages every source with its own
+/// committer, `abandon` only re-parents descendants) report `None` instead of
+/// a session identity no new commit records.
 fn preserved_identity(record: &CommitRecord) -> Result<EffectiveIdentity, CoreError> {
     let committer = record.committer()?;
     Ok(EffectiveIdentity {
@@ -2368,10 +2343,12 @@ fn rebase_parts(
         .collect();
     let (mut workspace_facts, fence) = advance_workspaces(gated, session, "rebase", &rewrite_map)?;
     facts.append(&mut workspace_facts);
+    // Every source keeps its own committer, so no single recorded identity
+    // exists to report.
     let reply = rewrite_reply(
         session,
         request_id,
-        report_identity(ctx, None)?,
+        None,
         merge_report_of(args.merge.mode)?,
         &staged,
         Vec::new(),
@@ -3504,10 +3481,12 @@ fn abandon_parts(
         .collect();
     let (mut workspace_facts, fence) = advance_workspaces(gated, session, "abandon", &rewrite_map)?;
     facts.append(&mut workspace_facts);
+    // Only descendants are re-parented, each keeping its own committer, so no
+    // single recorded identity exists to report.
     let reply = rewrite_reply(
         session,
         request_id,
-        report_identity(ctx, None)?,
+        None,
         merge_report_of(args.merge.mode)?,
         &staged,
         drained,
