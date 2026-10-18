@@ -1434,10 +1434,14 @@ fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("addr").port();
     let mode = mode.to_owned();
+    // "ok" serves one batch POST plus one payload GET; "error" serves the
+    // batch POST only. The count breaks the accept loop early so the
+    // error test never sits out the full deadline.
+    let expected = if mode == "ok" { 2 } else { 1 };
     let server = std::thread::spawn(move || {
         let mut paths = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
+        while paths.len() < expected && Instant::now() < deadline {
             let (mut socket, _) = match listener.accept() {
                 Ok(pair) => pair,
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1497,9 +1501,6 @@ fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
                 socket.write_all(BATCH_PAYLOAD).expect("payload body");
             } else {
                 panic!("unexpected path {path:?}");
-            }
-            if paths.len() >= 2 {
-                break;
             }
         }
         paths

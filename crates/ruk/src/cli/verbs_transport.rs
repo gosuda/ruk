@@ -1714,7 +1714,6 @@ fn sync_via_batch(
             ),
         });
     }
-    let batch_authority = http::url_authority(&batch_url).ok();
     let mut answers: HashMap<String, BatchEntry> = HashMap::new();
     for entry in http::parse_batch_response(&reply.body)? {
         let oid = match &entry {
@@ -1739,9 +1738,9 @@ fn sync_via_batch(
                 headers: action_headers,
                 ..
             }) => {
-                let mut get_headers: Vec<(String, String)> = action_headers.clone();
+                                let mut get_headers: Vec<(String, String)> = action_headers.clone();
                 if let Some(auth) = http::auth_header(&ctx.env.vars)
-                    && batch_authority.as_deref() == http::url_authority(href).ok().as_deref()
+                    && http::same_origin(&batch_url, href).unwrap_or(false)
                 {
                     get_headers.push(auth);
                 }
@@ -1767,6 +1766,51 @@ fn sync_via_batch(
     Ok(())
 }
 
+/// A writer that aborts once more than `limit` bytes arrive, so an
+/// over-long response body fails fast with an I/O error instead of
+/// filling the sink.
+struct SizeCapWriter<W: std::io::Write> {
+    inner: W,
+    limit: u64,
+    written: u64,
+}
+
+impl<W: std::io::Write> SizeCapWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            written: 0,
+        }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for SizeCapWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `usize as u64` widens (never truncates); the sum saturates.
+        if self.written.saturating_add(buf.len() as u64) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::QuotaExceeded,
+                format!(
+                    "payload exceeds its declared {} bytes after {}",
+                    self.limit, self.written
+                ),
+            ));
+        }
+        let wrote = self.inner.write(buf)?;
+        self.written = self.written.saturating_add(wrote as u64);
+        Ok(wrote)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// GETs one payload `href`, streaming the body into `tmp` and staging it
 /// hash-verified, returning the human detail for `missing` on any failure
 /// so one bad object never fails its siblings.
@@ -1785,10 +1829,15 @@ fn download_and_stage(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let mut file =
+    let file =
         std::fs::File::create(tmp).map_err(|err| format!("cannot stage download: {err}"))?;
-    let (status, _) = http::get_to_writer(href, &borrowed, &mut file)
+    // Any byte past the pointer's declared size already fails verification,
+    // so abort the stream there: a lying or endless body cannot fill the
+    // disk while we wait for the hash check to reject it.
+    let mut capped = SizeCapWriter::new(file, size);
+    let (status, _) = http::get_to_writer(href, &borrowed, &mut capped)
         .map_err(|err| format!("GET {href} failed: {err}"))?;
+    let mut file = capped.into_inner();
     // The staging read opens its own descriptor; flush here so it sees
     // every byte even though the handle drops at return.
     std::io::Write::flush(&mut file).map_err(|err| format!("cannot flush download: {err}"))?;
