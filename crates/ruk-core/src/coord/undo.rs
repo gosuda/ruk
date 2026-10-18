@@ -137,7 +137,7 @@ fn undo_ref_transaction(
         if fact.table != FactTable::Refs {
             continue;
         }
-        let name = RefName::new(&fact.key).map_err(|err| {
+        let name = RefName::new(fact.key.as_slice()).map_err(|err| {
             CoreError::new(
                 ErrorCode::ECorrupt,
                 format!("undone operation names an invalid ref key: {err}"),
@@ -200,10 +200,6 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
         Method::SessionOpen
         | Method::SessionResume
         | Method::Schema
-        | Method::WsNew
-        | Method::WsScope
-        | Method::WsTake
-        | Method::WsDrop
         | Method::WsRecover
         | Method::Snapshot
         | Method::Write

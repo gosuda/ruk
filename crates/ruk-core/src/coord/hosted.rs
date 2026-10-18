@@ -1514,7 +1514,10 @@ mod tests {
             )
             .expect("publish receipt");
         let checkpoint = |_: Progress| Ok::<(), CoreError>(());
-        match coord.prepare_for_dispatch(session, request, &checkpoint) {
+        match coord
+            .prepare_for_dispatch(session, request, &checkpoint)
+            .expect("dispatch serves the retry")
+        {
             DispatchReady::Replay(replayed) => {
                 assert!(
                     replayed.outcome().expect("outcome").receipt.replayed,
