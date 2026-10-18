@@ -4,16 +4,16 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams | `--prune` drops orphaned remote-tracking refs (pull-mirror parity); `http(s)` is a named gap |
-//! | `pull` | fetch + fast-forward | local and SSH/git remotes (fast-forward only) |
-//! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, both with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); `http(s)` is a named gap |
+//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via `smart_http::fetch_pack` | `--prune` drops orphaned remote-tracking refs (pull-mirror parity); dumb-http is the remaining HTTP gap |
+//! | `pull` | fetch + fast-forward | local, SSH/git and HTTP remotes (fast-forward only) |
+//! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); dumb-http is the remaining HTTP gap |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
 //! | `archive` | no archive writer | unsupported |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
 //! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
-//! | `ls-remote` | local `session::advertise` or one `net::discover` round trip | SSH/git remotes served; `http(s)` is a named gap |
+//! | `ls-remote` | local `session::advertise` or one `net::discover` round trip | SSH/git and smart-http remotes served; dumb-http is the remaining HTTP gap |
 //!
 //! Oracle anchors: `git/builtin/fetch.c`, `git/builtin/pull.c`,
 //! `git/builtin/push.c`, `git/builtin/receive-pack.c`,
@@ -119,17 +119,18 @@ pub(crate) struct FetchPlan {
 }
 
 /// Where a fetch/push/ls-remote target points: a local repository root or
-/// a network endpoint SSH and git-daemon transports serve.
+/// a network endpoint the SSH, git-daemon and smart-http transports serve.
 enum Target {
     /// A local repository root holding `.ruk`.
     Local(PathBuf),
-    /// An SSH or git-daemon endpoint.
+    /// An SSH, git-daemon or HTTP endpoint.
     Net(Endpoint),
 }
 
 /// Resolves a remote name or URL: configured names read their URL first,
-/// then `file://` URLs and bare paths land local, SSH and git-daemon URLs
-/// route network, and HTTP URLs refuse with the named gap.
+/// then `file://` URLs and bare paths land local, and SSH, git-daemon
+/// and HTTP URLs route network (HTTP serves smart-http; dumb-http stays
+/// the named gap and refuses at discovery).
 ///
 /// Oracle: `git/builtin/fetch.c` (remote resolution).
 fn resolve_target(ctx: &Ctx, target: &str) -> Result<Target, GitError> {
@@ -138,8 +139,9 @@ fn resolve_target(ctx: &Ctx, target: &str) -> Result<Target, GitError> {
         .unwrap_or_else(|| target.to_owned());
     match net::parse_endpoint(&url)? {
         Endpoint::Local { .. } => Ok(Target::Local(remote_root(ctx, target)?)),
-        endpoint @ (Endpoint::Ssh { .. } | Endpoint::Git { .. }) => Ok(Target::Net(endpoint)),
-        Endpoint::Http { url, .. } => Err(net::http_gap(&url)),
+        endpoint @ (Endpoint::Ssh { .. } | Endpoint::Git { .. } | Endpoint::Http { .. }) => {
+            Ok(Target::Net(endpoint))
+        }
     }
 }
 
@@ -149,6 +151,15 @@ enum FetchSource {
     Local(Store),
     /// A network endpoint (refs discover over a separate connection).
     Net(Endpoint),
+    /// A smart-http base plus its upload-pack advertisement: discovery
+    /// already ran for refspec expansion, and the fetch POST reuses the
+    /// same caps (stateless, so no connection is held).
+    Http {
+        /// Normalized RPC base URL.
+        base: String,
+        /// The upload-pack advertisement from discovery.
+        adv: ruk_git::transport::refadv::Advertisement,
+    },
 }
 
 /// Expands refspecs, negotiates the pack, and updates refs atomically.
@@ -176,20 +187,34 @@ pub(crate) fn run_fetch(
             let advertised = advertise(&src)?;
             (FetchSource::Local(src), advertised)
         }
-        Target::Net(endpoint) => {
-            let advertised = net::to_local_refs(net::discover_endpoint(
-                &endpoint,
-                Service::UploadPack,
-                dest_kind,
-            )?)?;
-            (FetchSource::Net(endpoint), advertised)
-        }
+        Target::Net(endpoint) => match endpoint {
+            Endpoint::Http { url, .. } => {
+                let base = ruk_git::transport::smart_http::normalize_base(&url)?;
+                let adv = ruk_git::transport::smart_http::discover(
+                    &base,
+                    ruk_git::transport::smart_http::SmartService::UploadPack,
+                    dest_kind,
+                )?;
+                let advertised = net::to_local_refs(adv.refs.clone())?;
+                (FetchSource::Http { base, adv }, advertised)
+            }
+            _ => {
+                let advertised = net::to_local_refs(net::discover_endpoint(
+                    &endpoint,
+                    Service::UploadPack,
+                    dest_kind,
+                )?)?;
+                (FetchSource::Net(endpoint), advertised)
+            }
+        },
     };
     let mut pairs: Vec<FetchedRef> = Vec::new();
     for spec_text in spec_texts {
         match &source {
             FetchSource::Local(src) => pairs.extend(expand_spec(src, &advertised, spec_text)?),
-            FetchSource::Net(_) => pairs.extend(expand_spec_net(&advertised, dest, spec_text)?),
+            FetchSource::Net(_) | FetchSource::Http { .. } => {
+                pairs.extend(expand_spec_net(&advertised, dest, spec_text)?)
+            }
         }
     }
     if plan.fetch_tags {
@@ -302,19 +327,27 @@ pub(crate) fn run_fetch(
         out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
         return Ok(out);
     }
+    let request = FetchWireRequest {
+        wants,
+        haves,
+        filter: None,
+        depth: plan.depth,
+        shallow: Vec::new(),
+        list_refs: false,
+        ref_prefixes: Vec::new(),
+    };
     match &source {
         FetchSource::Local(src) => {
-            let request = LocalFetchRequest {
-                wants,
-                haves,
-                filter: None,
-                depth: plan.depth,
-            };
             local_fetch(
                 dest,
                 src,
                 remote_label.as_bytes(),
-                &request,
+                &LocalFetchRequest {
+                    wants: request.wants.clone(),
+                    haves: request.haves.clone(),
+                    filter: None,
+                    depth: request.depth,
+                },
                 &tracking,
                 &ref_mutations,
                 IngestLimits::default(),
@@ -326,12 +359,13 @@ pub(crate) fn run_fetch(
                 dest,
                 endpoint,
                 remote_label,
-                &wants,
-                &haves,
-                plan.depth,
+                &request,
                 &tracking,
                 &ref_mutations,
             )?;
+        }
+        FetchSource::Http { .. } => {
+            fetch_pack_http(dest, &source, remote_label, &request, &tracking, &ref_mutations)?;
         }
     }
     let mut out = lines.concat().into_bytes();
@@ -349,34 +383,69 @@ fn fetch_pack_net(
     dest: &Store,
     endpoint: &Endpoint,
     remote_label: &str,
-    wants: &[Oid],
-    haves: &[Oid],
-    depth: Option<u32>,
+    request: &FetchWireRequest,
     tracking: &[(RefName, RefTarget)],
     ref_mutations: &[FactMutation],
 ) -> Result<(), GitError> {
-    let request = FetchWireRequest {
-        wants: wants.to_vec(),
-        haves: haves.to_vec(),
-        filter: None,
-        depth,
-        shallow: Vec::new(),
-        list_refs: false,
-        ref_prefixes: Vec::new(),
-    };
     let stream = net::open_stream(endpoint, Service::UploadPack)?;
     let received = fetch::receive(
         stream,
         dest.hash_kind(),
         dest,
-        &request,
+        request,
         IngestLimits::default(),
         &Interrupt::none(),
     )?;
+    publish_received(dest, received, request, remote_label, tracking, ref_mutations)
+}
+
+/// Runs the pack half of a smart-http fetch: POSTs the whole v0 request
+/// and publishes through the same verify-and-publish tail as
+/// [`fetch_pack_net`]. The base and advertisement ride in `source`, which
+/// is always the [`FetchSource::Http`] discovery established.
+///
+/// Oracle: `git/builtin/fetch.c`, `git/remote-curl.c` (`fetch_git`).
+fn fetch_pack_http(
+    dest: &Store,
+    source: &FetchSource,
+    remote_label: &str,
+    request: &FetchWireRequest,
+    tracking: &[(RefName, RefTarget)],
+    ref_mutations: &[FactMutation],
+) -> Result<(), GitError> {
+    let FetchSource::Http { base, adv } = source else {
+        return Err(GitError::Invalid {
+            detail: "smart-http fetch needs an HTTP source".to_owned(),
+        });
+    };
+    let received = ruk_git::transport::smart_http::fetch_pack(
+        base,
+        adv,
+        dest,
+        request,
+        IngestLimits::default(),
+        &Interrupt::none(),
+    )?;
+    publish_received(dest, received, request, remote_label, tracking, ref_mutations)
+}
+
+/// Verifies one received pack's closure and publishes staged objects
+/// together with the caller's ref deltas: the tail every network fetch
+/// shares, however the pack arrived.
+///
+/// Oracle: `git/builtin/fetch.c`.
+fn publish_received(
+    dest: &Store,
+    received: fetch::ReceivedPack,
+    request: &FetchWireRequest,
+    remote_label: &str,
+    tracking: &[(RefName, RefTarget)],
+    ref_mutations: &[FactMutation],
+) -> Result<(), GitError> {
     let report = fetch::verify_closure(
         dest,
         &received.staged,
-        wants,
+        &request.wants,
         None,
         &received.shallow,
         &Interrupt::none(),
@@ -941,7 +1010,8 @@ fn push_local(
 
 /// Pushes to a network endpoint: discovers the remote tips for CAS
 /// expectations, then drives `push_over` over one receive-pack connection
-/// with the same persisted plan local pushes use.
+/// (or one smart-http POST for HTTP endpoints) with the same persisted
+/// plan local pushes use.
 ///
 /// Oracle: `git/builtin/push.c`.
 fn push_net(
@@ -956,11 +1026,31 @@ fn push_net(
 ) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let advertised = net::to_local_refs(net::discover_endpoint(
-        endpoint,
-        Service::ReceivePack,
-        kind,
-    )?)?;
+    // HTTP discovery keeps the full advertisement: the POST half reuses
+    // its capabilities, while the other transports only need the refs.
+    // Stateless, so no connection is held between the two round trips.
+    let http_adv = match endpoint {
+        Endpoint::Http { url, .. } => {
+            let base = ruk_git::transport::smart_http::normalize_base(url)?;
+            Some((
+                base.clone(),
+                ruk_git::transport::smart_http::discover(
+                    &base,
+                    ruk_git::transport::smart_http::SmartService::ReceivePack,
+                    kind,
+                )?,
+            ))
+        }
+        _ => None,
+    };
+    let advertised = match &http_adv {
+        Some((_, adv)) => net::to_local_refs(adv.refs.clone())?,
+        None => net::to_local_refs(net::discover_endpoint(
+            endpoint,
+            Service::ReceivePack,
+            kind,
+        )?)?,
+    };
     let remote: Vec<(Vec<u8>, Oid)> = advertised
         .iter()
         .filter_map(|entry| match &entry.target {
@@ -988,15 +1078,27 @@ fn push_net(
         atomic,
         updates,
     );
-    let stream = net::open_stream(endpoint, Service::ReceivePack)?;
-    push_outcomes(ruk_git::transport::push::push_over(
-        stream,
-        store,
-        kind,
-        &mut plan,
-        &request,
-        &Interrupt::none(),
-    )?)
+    match &http_adv {
+        Some((base, adv)) => push_outcomes(ruk_git::transport::smart_http::push_pack(
+            base,
+            adv,
+            &store,
+            &mut plan,
+            &request,
+            &Interrupt::none(),
+        )?),
+        None => {
+            let stream = net::open_stream(endpoint, Service::ReceivePack)?;
+            push_outcomes(ruk_git::transport::push::push_over(
+                stream,
+                store,
+                kind,
+                &mut plan,
+                &request,
+                &Interrupt::none(),
+            )?)
+        }
+    }
 }
 
 /// Reads the advertised tip behind one destination ref, if it exists: the
@@ -1463,8 +1565,9 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
 ///
 /// With `--upload` the direction flips: the verb POSTs one batch upload
 /// request listing every reachable payload already verified in the
-/// sidecar, then PUTs each answered `actions.upload.href` (objects the
-/// remote already holds answer no actions and need nothing). Pointers
+/// sidecar, then streams each answered `actions.upload.href` straight
+/// from the sidecar file (objects the remote already holds answer no
+/// actions and need nothing). Pointers
 /// with no local payload cannot be offered and land in `missing`.
 /// Successful PUTs land in `uploaded`; `--from` is refused alongside
 /// `--upload`.
@@ -1922,8 +2025,10 @@ fn sync_via_batch_upload(
     Ok(())
 }
 
-/// PUTs one sidecar payload to `href`, returning the human detail for
+/// Streams one sidecar payload to `href`, returning the human detail for
 /// `missing` on any failure so one bad object never fails its siblings.
+/// The file is never buffered: bytes move straight from the sidecar into
+/// the PUT, the way downloads stream into staging.
 fn upload_one(
     store: &Store,
     href: &str,
@@ -1937,19 +2042,26 @@ fn upload_one(
     let Some(path) = sidecar::sidecar_path(store.root(), hex) else {
         return Err(format!("no local payload for {hex}"));
     };
-    let body = std::fs::read(&path).map_err(|err| format!("cannot read local payload: {err}"))?;
-    if body.len() as u64 != size {
+    // Open, never buffer. The lane only offers verified payloads, so a
+    // size skew means the sidecar changed under us and fails before any
+    // byte moves.
+    let mut file =
+        std::fs::File::open(&path).map_err(|err| format!("cannot read local payload: {err}"))?;
+    let actual = file
+        .metadata()
+        .map_err(|err| format!("cannot read local payload: {err}"))?
+        .len();
+    if actual != size {
         return Err(format!(
-            "local payload size {} differs from pointer size {size}",
-            body.len()
+            "local payload size {actual} differs from pointer size {size}"
         ));
     }
     let borrowed: Vec<(&str, &str)> = headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let reply =
-        http::put_bytes(href, &borrowed, &body).map_err(|err| format!("PUT {href} failed: {err}"))?;
+    let reply = http::put_stream(href, &borrowed, size, &mut file)
+        .map_err(|err| format!("PUT {href} failed: {err}"))?;
     if !http::is_success(reply.status) {
         return Err(format!("PUT {href} failed with status {}", reply.status));
     }

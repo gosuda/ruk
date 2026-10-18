@@ -349,14 +349,14 @@ fn connect(parsed: &Url) -> Result<Stream, GitError> {
     Ok(Stream::Tls(tls))
 }
 
-/// Writes one HTTP/1.1 request: method line, Host, caller headers,
-/// `Connection: close`, then the optional body.
-fn send_request(
+/// Writes one HTTP/1.1 request head: method line, Host, caller headers,
+/// `Connection: close`, and `Content-Length` when `content_len` is known.
+fn send_head(
     stream: &mut Stream,
     method: &str,
     parsed: &Url,
     headers: &[(&str, &str)],
-    body: Option<&[u8]>,
+    content_len: Option<u64>,
 ) -> Result<(), GitError> {
     let what = format!("{method} {}", parsed.path);
     let mut head = format!(
@@ -371,15 +371,35 @@ fn send_request(
         }
         head.push_str(&format!("{name}: {value}\r\n"));
     }
-    if let Some(body) = body {
-        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    if let Some(len) = content_len {
+        head.push_str(&format!("Content-Length: {len}\r\n"));
     }
     head.push_str("\r\n");
     stream
         .write_all(head.as_bytes())
         .map_err(|err| GitError::Io {
             detail: format!("cannot send {what}: {err}"),
-        })?;
+        })
+}
+
+/// Writes one HTTP/1.1 request: method line, Host, caller headers,
+/// `Connection: close`, then the optional body.
+fn send_request(
+    stream: &mut Stream,
+    method: &str,
+    parsed: &Url,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Result<(), GitError> {
+    let what = format!("{method} {}", parsed.path);
+    let content_len = body
+        .map(|body| {
+            u64::try_from(body.len()).map_err(|_| GitError::Limit {
+                detail: "request body exceeds addressable length".to_owned(),
+            })
+        })
+        .transpose()?;
+    send_head(stream, method, parsed, headers, content_len)?;
     if let Some(body) = body {
         stream.write_all(body).map_err(|err| GitError::Io {
             detail: format!("cannot send {what} body: {err}"),
@@ -832,7 +852,8 @@ fn open_framing(headers: &[(String, String)]) -> Result<BodyFraming, GitError> {
 /// [`MAX_BUFFERED_BYTES`]: the LFS upload half of [`post_json`].
 /// Single-shot (no redirect follow): upload `href`s are presigned URLs
 /// used immediately, and re-sending a payload to a redirected host would
-/// need fresh credential scoping the caller cannot do blindly.
+/// need fresh credential scoping the caller cannot do blindly. Payloads
+/// that must never sit buffered in memory use [`put_stream`] instead.
 ///
 /// # Errors
 /// Routing, framing, and transport failures as [`GitError`].
@@ -842,6 +863,47 @@ pub fn put_bytes(
     body: &[u8],
 ) -> Result<HttpResponse, GitError> {
     let (mut reader, status, headers) = request_head(url, "PUT", headers, Some(body))?;
+    let mut reply = Vec::new();
+    read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
+    Ok(HttpResponse {
+        status,
+        headers,
+        body: reply,
+    })
+}
+
+/// PUTs `len` bytes streamed from `body` and buffers the reply, capped at
+/// [`MAX_BUFFERED_BYTES`]: the streaming sibling of [`put_bytes`] for
+/// payloads that must never sit buffered in memory. Single-shot (no
+/// redirect follow) for the same reason as [`put_bytes`].
+///
+/// Exactly `len` bytes are sent; a short reader fails the PUT instead of
+/// sending a truncated body under a declared length.
+///
+/// # Errors
+/// Routing, framing, and transport failures as [`GitError`].
+pub fn put_stream(
+    url: &str,
+    headers: &[(&str, &str)],
+    len: u64,
+    body: &mut dyn Read,
+) -> Result<HttpResponse, GitError> {
+    let parsed = parse_url(url)?;
+    let mut stream = connect(&parsed)?;
+    send_head(&mut stream, "PUT", &parsed, headers, Some(len))?;
+    let sent = std::io::copy(&mut body.take(len), &mut stream).map_err(|err| GitError::Io {
+        detail: format!("cannot send PUT {} body: {err}", parsed.path),
+    })?;
+    if sent != len {
+        return Err(GitError::Io {
+            detail: format!("PUT {} body ended after {sent} of {len} bytes", parsed.path),
+        });
+    }
+    stream.flush().map_err(|err| GitError::Io {
+        detail: format!("cannot flush PUT {}: {err}", parsed.path),
+    })?;
+    let mut reader = BufReader::new(stream);
+    let (status, headers) = read_head(&mut reader)?;
     let mut reply = Vec::new();
     read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
     Ok(HttpResponse {
@@ -1634,5 +1696,26 @@ mod tests {
             head.contains("Content-Type: application/octet-stream"),
             "{head:?}"
         );
+    }
+    #[test]
+    fn puts_stream_with_declared_length() {
+        let (port, server) = fake_server(vec![(200, vec![], b"{}".to_vec())]);
+        let url = format!("http://127.0.0.1:{port}/up/stream");
+        let payload = b"streamed-payload-bytes";
+        let mut body: &[u8] = payload;
+        let reply = put_stream(
+            &url,
+            &[("Content-Type", "application/octet-stream")],
+            u64::try_from(payload.len()).expect("payload fits"),
+            &mut body,
+        )
+        .expect("put");
+        assert_eq!(reply.status, 200);
+        assert!(body.is_empty(), "reader is consumed");
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        let head = &requests[0];
+        assert!(head.starts_with("PUT /up/stream HTTP/1.1\r\n"), "{head:?}");
+        assert!(head.contains("Content-Length: 22"), "{head:?}");
     }
 }
