@@ -8,12 +8,14 @@
 //! Covered today: `bookmark.set` (commit and change targets),
 //! `bookmark.delete`, `bookmark.resolve`, `tag.set` (plain and annotated),
 //! `tag.delete`, `pin`, `unpin`, `attest.add`, `new`, `claim.acquire`,
-//! `claim.release`, and `ws.new`. The annotated tag arm needs the
-//! coordinator clock and a tagger identity, `new` and `ws.new` need the
-//! session identity row and the clock for signature synthesis, and
-//! `attest.add` needs the attestation progress gate, so those arms stay
-//! refused on the legacy [`prepare_mutation`] path and serve only through
-//! [`prepare_mutation_with`]. Everything else is honestly refused with
+//! `claim.release`, `ws.new`, `describe`, `rebase`, `squash`, and `abandon`.
+//! The annotated tag arm needs the coordinator clock and a tagger identity,
+//! `new` and `ws.new` need the session identity row and the clock for
+//! signature synthesis, and `attest.add` needs the attestation progress gate,
+//! so those arms stay refused on the legacy [`prepare_mutation`] path and
+//! serve only through [`prepare_mutation_with`]. The history-rewrite arms
+//! preserve existing signatures and need no clock or identity row, so they
+//! serve on both paths. Everything else is honestly refused with
 //! [`ErrorCode::EHosted`]:
 //!
 //! * `claim.acquire` / `claim.release` validate here (path canonicalization
@@ -27,22 +29,31 @@
 //!   preparation, claim sealing, workspace fencing, or plan evaluation that
 //!   no caller on this path supplies.
 //!
-//! The nine `crate::ops`-adjacent methods were evaluated one by one against
-//! their protocol args and stay refused, each arm naming its missing piece:
+//! The `crate::ops`-adjacent methods were evaluated one by one against
+//! their protocol args, each refused arm naming its missing piece:
 //! `new` mints the empty tree and synthesizes its signature from the session
 //! identity row plus the coordinator clock (multi-parent trees need merge
 //! evaluation with no producer here, so they stay refused); `ws.new` builds
 //! on the same mint for native workspaces and writes only the row — no
 //! worktree materialization happens in this call;
-//! protocol `describe` rewrites a change's description while `ops::describe`
-//! is a pure read of a commit or change with a different request shape, so
-//! no description-rewrite producer exists on this path and there are no lane
-//! parts for it here; protocol `edit` checks a change out into a workspace while
-//! `ops::edit` rewrites a commit's message/tree/identities; and `split`,
-//! `squash`, `rebase`, `abandon`, `resolve`, and `revert` all need
-//! ChangeRef resolution, merge/content evaluation, descendant handling, or
-//! workspace fencing that no caller on this path supplies, while their
-//! `ops::*` counterparts need caller-resolved trees or heads.
+//! protocol `describe` rewrites a change's description through
+//! `ops::prepare_edit` with the tree preserved, re-parenting descendants with
+//! unchanged trees in the same batch (a message rewrite moves no content, so
+//! no tree derivation is needed); protocol `edit` checks a change out into a
+//! workspace while `ops::edit` rewrites a commit's message/tree/identities;
+//! `rebase` serves content-less (empty-delta) sources only — a non-empty
+//! source needs per-commit tree re-derivation over the moved base, which is
+//! content-merge work with no producer here (`ops::prepare_rebase` needs one
+//! caller-resolved tree per root and keeps stale descendant trees, so the
+//! translator stages the whole moved set through one record batch preparer
+//! instead); `squash` serves the whole-delta linear case only (all paths, a
+//! single-child source, the emptied source dropped); `abandon` re-parents
+//! descendants onto the abandoned commits' parents in the same batch as the
+//! change-state transitions (merge-commit targets need fan-in parent
+//! replacement with no producer here, so they stay refused); and `split`,
+//! `resolve`, and `revert` need path-subtraction, conflict, or reverse-delta
+//! tree derivation with no producer on this path, while their `ops::*`
+//! counterparts need caller-resolved trees.
 //!
 //! Ref safety: each helper checks its transaction against the store before
 //! returning, and the lane keeps ref mutations safe after that. The batch
@@ -55,37 +66,51 @@
 //! as a second layer.
 
 use super::claims::{ClaimClock, canonical_paths, read_record};
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::clock::Clock;
 use super::hosted::PreparedMutation;
 use super::policy::Policy;
 use super::rows::{self, SessionRow, WorkspaceRow};
-use super::workspace;
+use super::workspace::{self, ObservedWorkspace};
 use crate::attestation::{Checkpoint, prepare_add};
 use crate::bytes::ByteString;
 use crate::change::{ChangeId, ClaimId, RequestId, SessionId, WorkspaceId};
-use crate::conflict::{Signature, TzOffset};
+use crate::commit::{CommitRecord, NativeCommitInput};
+use crate::conflict::{ExtraHeader, Signature, TzOffset};
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
-use crate::ops::{NewRequest, NewResult, PreparedOp, prepare_new};
+use crate::merge::Merge;
+use crate::merge::composed::{MergeMetadata, MergeMode, MergeNotices, MergeReport};
+use crate::merge::syntax::LANGUAGE_SET_VERSION;
+use crate::ops::{
+    AbandonRequest, EditRequest, NewRequest, NewResult, PreparedOp, prepare_abandon, prepare_edit,
+    prepare_new,
+};
+use crate::ops::{children, descendants};
 use crate::protocol::{
-    AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply, BookmarkResolution,
-    BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs, BookmarkSetReply, BookmarkTarget,
-    BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs, ClaimAcquireReply, ClaimRecord,
-    ClaimReleaseArgs, ClaimReleaseReply, EffectiveIdentity, IdentityClaim, IdentitySource,
-    MutationOutcome, NewArgs, NewReply, PinArgs, PinReply, ReceiptRef, Reply, Request,
-    RequestDigest, TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs,
-    UnpinReply, Validate, WorkspaceInit, WsNewArgs, WsNewReply,
+    AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
+    BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
+    BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
+    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs,
+    EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, MutationOutcome, NewArgs,
+    NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
+    RequestDigest, RewriteReply, SquashArgs, TagDeleteArgs, TagDeleteReply, TagSetArgs,
+    TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding, WorkspaceInit,
+    WsNewArgs, WsNewReply,
 };
 use crate::records::Records;
+use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::head_key;
+use crate::records::types::{ChangeEntry, ChangeState};
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
 use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked};
 use crate::store::ObjectKind;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
 use crate::workspace::{
-    GitCompatWorkspace, NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState,
+    GitCompatWorkspace, HeadRef, NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState,
 };
 
 /// Inputs beyond the store that identity synthesis, timestamped signatures,
@@ -197,12 +222,7 @@ pub(crate) fn prepare_mutation_with(
         Request::ClaimAcquire(m) => claim_acquire_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimRelease(m) => claim_release_parts(ctx, m.request_id, &m.args)?,
         Request::WsNew(m) => ws_new_parts(ctx, m.request_id, &m.args)?,
-        Request::Describe(_) => {
-            return Err(uncovered(
-                "describe",
-                "protocol `describe` rewrites a change's description while `ops::describe` is a pure read of a commit or change with a different request shape; no description-rewrite producer exists on this path",
-            ));
-        }
+        Request::Describe(m) => describe_parts(ctx, m.request_id, &m.args)?,
         Request::Edit(_) => {
             return Err(uncovered(
                 "edit",
@@ -212,27 +232,12 @@ pub(crate) fn prepare_mutation_with(
         Request::Split(_) => {
             return Err(uncovered(
                 "split",
-                "`split` partitions by path selection with merge evaluation and workspace fences that have no producer on this path; `ops::split` needs a caller-resolved intermediate tree instead",
+                "`split` partitions one commit by path selection and needs its intermediate tree derived by path subtraction (ops/tree_edit.rs) with no producer on this path; `ops::prepare_split` needs a caller-resolved first_tree instead",
             ));
         }
-        Request::Squash(_) => {
-            return Err(uncovered(
-                "squash",
-                "`squash` moves path selections between changes with merge evaluation and workspace fences that have no producer on this path; `ops::squash` needs caller-resolved heads plus a tree instead",
-            ));
-        }
-        Request::Rebase(_) => {
-            return Err(uncovered(
-                "rebase",
-                "`rebase` resolves ChangeRefs, derives descendants by scope, and computes per-commit trees with no backing on this path; `ops::rebase` needs explicit heads plus a mandatory caller-resolved tree",
-            ));
-        }
-        Request::Abandon(_) => {
-            return Err(uncovered(
-                "abandon",
-                "protocol `abandon` resolves ChangeRefs, re-parents descendants, and fences workspaces; `ops::abandon` drops heads without re-parenting, so mapping heads alone would silently drop those semantics",
-            ));
-        }
+        Request::Squash(m) => squash_parts(ctx, m.request_id, &m.args)?,
+        Request::Rebase(m) => rebase_parts(ctx, m.request_id, &m.args)?,
+        Request::Abandon(m) => abandon_parts(ctx, m.request_id, &m.args)?,
         Request::Resolve(_) => {
             return Err(uncovered(
                 "resolve",
@@ -1150,6 +1155,1219 @@ fn ws_new_parts(
     })
 }
 
+/// Header carrying the native change ID; rewrites preserve every other header.
+const CHANGE_ID_HEADER: &[u8] = b"change-id";
+
+/// One resolved rewrite target: its change, its current head, and its record.
+struct RewriteTarget {
+    change: ChangeId,
+    head: Head,
+    record: CommitRecord,
+}
+
+/// One staged rewrite for the reply: the change, its old and new heads, and
+/// whether the new tree is conflicted.
+struct StagedRewrite {
+    change: ChangeId,
+    old: Head,
+    new: Head,
+    conflicted: bool,
+}
+
+fn describe_head(head: &Head) -> String {
+    match head {
+        Head::Git { oid } => oid.to_string(),
+        Head::Conflicted { .. } => "conflicted head".to_string(),
+    }
+}
+
+fn not_stored(head: &Head) -> CoreError {
+    CoreError::new(
+        ErrorCode::ENotFound,
+        format!("commit {} is not stored", describe_head(head)),
+    )
+}
+
+/// Resolves a [`ChangeRef`] to its change and current head for a rewrite.
+/// Conflicted heads are allowed: rewrites preserve trees, only Git export
+/// forbids them.
+fn resolve_rewrite_head(store: &Store, target: &ChangeRef) -> Result<(ChangeId, Head), CoreError> {
+    let entry = Records::new(store)
+        .get_change(&target.change)?
+        .ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::ENotFound,
+                format!("change {} is not stored", target.change),
+            )
+        })?;
+    let head = match target.head {
+        Some(head) => {
+            if !entry.contains_head(&head) {
+                return Err(CoreError::new(
+                    ErrorCode::EStale,
+                    format!(
+                        "pinned head is not a current head of change {}",
+                        target.change
+                    ),
+                ));
+            }
+            head
+        }
+        None => match entry.heads.as_slice() {
+            [head] => *head,
+            _ => {
+                return Err(CoreError::new(
+                    ErrorCode::EDivergent,
+                    format!(
+                        "change {} has {} current heads; pin one with head",
+                        target.change,
+                        entry.heads.len()
+                    ),
+                ));
+            }
+        },
+    };
+    Ok((target.change, head))
+}
+
+fn load_rewrite_target(store: &Store, target: &ChangeRef) -> Result<RewriteTarget, CoreError> {
+    let (change, head) = resolve_rewrite_head(store, target)?;
+    let record = Records::new(store)
+        .get_commit(&head)?
+        .ok_or_else(|| not_stored(&head))?;
+    Ok(RewriteTarget {
+        change,
+        head,
+        record,
+    })
+}
+
+/// Reports the identity a rewrite ran under: the call override, else the
+/// session identity, else none. Rewrites preserve signatures, so unlike `new`
+/// this never refuses; it only reports.
+fn report_identity(
+    ctx: &PrepareContext<'_>,
+    over: Option<&IdentityClaim>,
+) -> Result<Option<EffectiveIdentity>, CoreError> {
+    if let Some(claim) = over {
+        claim.validate()?;
+        return Ok(Some(EffectiveIdentity {
+            name: claim.name.clone(),
+            email: claim.email.clone(),
+            source: IdentitySource::OperationOverride,
+        }));
+    }
+    Ok(ctx
+        .session_row
+        .and_then(|row| row.identity.as_ref())
+        .map(|claim| EffectiveIdentity {
+            name: claim.name.clone(),
+            email: claim.email.clone(),
+            source: IdentitySource::SessionClaim,
+        }))
+}
+
+/// Echoes an explicit merge-mode request in the reply. No content is merged
+/// on this path, so an absent selection stays absent.
+fn merge_report_of(mode: Option<MergeMode>) -> Result<Option<MergeReport>, CoreError> {
+    let Some(effective_mode) = mode else {
+        return Ok(None);
+    };
+    let metadata = MergeMetadata::new(effective_mode, LANGUAGE_SET_VERSION)?;
+    Ok(Some(MergeReport::new(metadata, MergeNotices::default())?))
+}
+
+/// Observes and fences every listed workspace. The lane carries a single
+/// workspace fence, so more than one binding is refused rather than silently
+/// fencing the first.
+fn gate_workspaces(
+    ctx: &PrepareContext<'_>,
+    method: &str,
+    bindings: &[WorkspaceBinding],
+) -> Result<Vec<(WorkspaceBinding, ObservedWorkspace)>, CoreError> {
+    if bindings.len() > 1 {
+        return Err(uncovered(
+            method,
+            "listing several workspaces needs one lane fence per binding and the lane carries a single workspace fence; list one workspace",
+        ));
+    }
+    let mut gated = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let observed = workspace::observe(ctx.store, binding.workspace)?;
+        observed.fence(ctx.session, binding.expected)?;
+        gated.push((*binding, observed));
+    }
+    Ok(gated)
+}
+
+/// Advances a gated workspace onto its rewritten head. A workspace on an
+/// unaffected change keeps its state; the fence still guards its stamp. A
+/// GitCompat workspace on a rewritten head needs HEAD/index application with
+/// no producer here, so that case is refused.
+fn advance_workspaces(
+    gated: Vec<(WorkspaceBinding, ObservedWorkspace)>,
+    session: SessionId,
+    method: &str,
+    rewrites: &BTreeMap<Head, (ChangeId, Head)>,
+) -> Result<(Vec<FactMutation>, Option<(WorkspaceId, WorkspaceStamp)>), CoreError> {
+    let Some((binding, observed)) = gated.into_iter().next() else {
+        return Ok((Vec::new(), None));
+    };
+    let fence = Some((binding.workspace, binding.expected));
+    match &observed.row.state {
+        WorkspaceState::Native(current) => {
+            let Some((change, new_head)) = rewrites.get(&current.head) else {
+                return Ok((Vec::new(), fence));
+            };
+            let next =
+                WorkspaceState::Native(current.move_to(binding.expected, *change, *new_head)?);
+            let fact = observed.replace(WorkspaceRow {
+                state: next,
+                holder: session,
+            })?;
+            Ok((vec![fact], fence))
+        }
+        WorkspaceState::GitCompat(current) => {
+            if let HeadRef::Detached(oid) = &current.head
+                && rewrites.keys().any(|old| old.as_git() == Some(oid))
+            {
+                return Err(uncovered(
+                    method,
+                    "moving a GitCompat workspace needs HEAD/index application with no producer on this path",
+                ));
+            }
+            Ok((Vec::new(), fence))
+        }
+    }
+}
+
+/// Copies extra headers except the change-id header, which the new record
+/// re-derives from its change.
+fn copy_extra_headers(record: &CommitRecord) -> Vec<ExtraHeader> {
+    record
+        .extra_headers()
+        .iter()
+        .filter(|header| header.name.as_bytes() != CHANGE_ID_HEADER)
+        .cloned()
+        .collect()
+}
+
+/// Builds one rewrite commit input preserving everything but the tree and
+/// parents.
+fn preserved_input(
+    record: &CommitRecord,
+    tree: Merge<Oid>,
+    parents: Vec<Head>,
+    predecessor: Option<Head>,
+) -> Result<NativeCommitInput, CoreError> {
+    Ok(NativeCommitInput {
+        change_id: record.change_id(),
+        tree,
+        parents,
+        predecessor,
+        author: record.author()?,
+        committer: record.committer()?,
+        extra_headers: copy_extra_headers(record),
+        message: ByteString::from(record.message()),
+        provenance: record.provenance().cloned(),
+    })
+}
+
+/// Remaps rewrite parents through staged rewrites, failing closed when a
+/// parent was scheduled for rewrite but is not staged yet: keeping its old
+/// head would fork history onto a superseded commit. Parents outside the
+/// rewritten set are unmoved and kept as they are.
+fn map_strict(
+    parents: &[Head],
+    rewritten: &BTreeSet<Head>,
+    staged: &BTreeMap<Head, Head>,
+) -> Result<Vec<Head>, CoreError> {
+    parents
+        .iter()
+        .map(|parent| {
+            if rewritten.contains(parent) {
+                staged.get(parent).copied().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "internal: rewrite parent staged out of order",
+                    )
+                })
+            } else {
+                Ok(*parent)
+            }
+        })
+        .collect()
+}
+
+/// Refuses a commit with several parents or none where exactly one base is
+/// needed; moving a root grafts a snapshot and moving a merge needs merge
+/// evaluation, neither of which exists on this path.
+fn require_single_parent(
+    record: &CommitRecord,
+    method: &str,
+    noun: &str,
+) -> Result<Head, CoreError> {
+    match record.parents() {
+        [parent] => Ok(*parent),
+        [] => Err(uncovered(
+            method,
+            &format!("{noun} a root commit grafts a full snapshot with no producer on this path"),
+        )),
+        _ => Err(uncovered(
+            method,
+            &format!("{noun} a merge commit needs merge evaluation with no producer on this path"),
+        )),
+    }
+}
+
+/// Refuses a commit carrying content: its resolved tree must equal its single
+/// parent's resolved tree, so the move carries no content across bases.
+fn require_empty_delta(
+    store: &Store,
+    method: &str,
+    record: &CommitRecord,
+    parent: &Head,
+) -> Result<(), CoreError> {
+    let tree = record.tree().as_resolved().ok_or_else(|| {
+        uncovered(
+            method,
+            "moving a conflicted commit needs merge evaluation with no producer on this path",
+        )
+    })?;
+    let parent_record = Records::new(store)
+        .get_commit(parent)?
+        .ok_or_else(|| not_stored(parent))?;
+    let parent_tree = parent_record.tree().as_resolved().ok_or_else(|| {
+        uncovered(
+            method,
+            "moving onto a conflicted base needs merge evaluation with no producer on this path",
+        )
+    })?;
+    if tree != parent_tree {
+        return Err(uncovered(
+            method,
+            "moving a commit with content changes needs per-commit tree re-derivation over the moved base (ops/tree_edit.rs) with no producer on this path; only content-less commits move here",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a kept tree over changed content: the kept tree must equal the new
+/// single base's tree, else re-parenting would silently carry stale content.
+fn require_kept_tree(method: &str, kept: &Oid, base: &Oid) -> Result<(), CoreError> {
+    if kept != base {
+        return Err(uncovered(
+            method,
+            "re-parenting a commit with content changes needs per-commit tree re-derivation over the new base (ops/tree_edit.rs) with no producer on this path; only content-less descendants move here",
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the tree a new base carries: a staged rewrite's tree, else the
+/// stored commit's resolved tree.
+fn new_base_tree(
+    store: &Store,
+    method: &str,
+    new_trees: &BTreeMap<Head, Oid>,
+    base: &Head,
+) -> Result<Oid, CoreError> {
+    if let Some(tree) = new_trees.get(base) {
+        return Ok(*tree);
+    }
+    let record = Records::new(store)
+        .get_commit(base)?
+        .ok_or_else(|| not_stored(base))?;
+    record.tree().as_resolved().copied().ok_or_else(|| {
+        uncovered(
+            method,
+            "re-parenting onto a conflicted base needs merge evaluation with no producer on this path",
+        )
+    })
+}
+
+/// Merges staged Changes-table facts colliding on one change key, returning
+/// the merged facts plus the final entry per touched change.
+///
+/// Two staged batches (an ops root rewrite plus descendant re-parenting, or
+/// rewrites plus abandon transitions) collide when a rewritten descendant
+/// shares the root's change. Both facts carry the same `Value(old)`
+/// expectation from the same committed snapshot; the merged fact keeps it and
+/// unions the head transitions. Anything else colliding is an internal error.
+fn merge_changes_facts(
+    store: &Store,
+    staged: Vec<FactMutation>,
+    extra: Vec<FactMutation>,
+) -> Result<(Vec<FactMutation>, BTreeMap<ChangeId, ChangeEntry>), CoreError> {
+    let mut others = Vec::new();
+    let mut seen_keys = BTreeSet::new();
+    let mut grouped: BTreeMap<Vec<u8>, Vec<FactMutation>> = BTreeMap::new();
+    for fact in staged.into_iter().chain(extra) {
+        if fact.table == FactTable::Changes {
+            grouped.entry(fact.key.clone()).or_default().push(fact);
+        } else {
+            if !seen_keys.insert((fact.table, fact.key.clone())) {
+                return Err(CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "internal: staged batches collide outside the Changes table",
+                ));
+            }
+            others.push(fact);
+        }
+    }
+    let mut facts = others;
+    let mut finals = BTreeMap::new();
+    for (key, group) in grouped {
+        let bytes: [u8; ChangeId::LEN] = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| CoreError::new(ErrorCode::ECorrupt, "internal: malformed change key"))?;
+        let change = ChangeId::from_bytes(bytes);
+        let [first, rest @ ..] = group.as_slice() else {
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "internal: empty change group",
+            ));
+        };
+        let FactExpectation::Value(expected) = &first.expected else {
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "internal: Changes fact without an exact expectation",
+            ));
+        };
+        let old_entry = decode_change_entry(store, &change, expected)?;
+        let final_entry = match rest {
+            [] => decode_value_entry(store, &change, first)?,
+            [second] => {
+                let FactExpectation::Value(second_old) = &second.expected else {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "internal: Changes fact without an exact expectation",
+                    ));
+                };
+                if second_old != expected {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "internal: staged batches disagree on a change entry",
+                    ));
+                }
+                let first_new = decode_value_entry(store, &change, first)?;
+                let second_new = decode_value_entry(store, &change, second)?;
+                union_entries(&old_entry, &first_new, &second_new).ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "internal: staged batches drain a change without abandoning it",
+                    )
+                })?
+            }
+            _ => {
+                return Err(CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "internal: more than two staged batches touch one change",
+                ));
+            }
+        };
+        facts.push(FactMutation {
+            table: FactTable::Changes,
+            key,
+            expected: FactExpectation::Value(expected.clone()),
+            value: Some(encode_change_entry(&final_entry)?),
+        });
+        finals.insert(change, final_entry);
+    }
+    Ok((facts, finals))
+}
+
+fn decode_value_entry(
+    store: &Store,
+    _change: &ChangeId,
+    fact: &FactMutation,
+) -> Result<ChangeEntry, CoreError> {
+    let Some(value) = &fact.value else {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            "internal: Changes fact without a value",
+        ));
+    };
+    decode_staged_entry(store, value)
+}
+
+/// Decodes a staged change value produced in this call. Unlike
+/// [`decode_change_entry`], a drained (abandoned, headless) entry is valid:
+/// staged abandon transitions write exactly that. Staged bytes never come
+/// from the store, so quarantine latching does not apply; non-empty values
+/// still validate exactly like stored ones.
+fn decode_staged_entry(store: &Store, value: &[u8]) -> Result<ChangeEntry, CoreError> {
+    let entry: ChangeEntry = postcard::from_bytes(value).map_err(|err| {
+        CoreError::new(
+            ErrorCode::ECorrupt,
+            format!("internal: staged change entry does not decode: {err}"),
+        )
+    })?;
+    if entry.heads.is_empty() {
+        if entry.state != ChangeState::Abandoned {
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "internal: staged change entry drains without abandoning",
+            ));
+        }
+        return Ok(entry);
+    }
+    entry.validate(store.hash_kind()).map_err(CoreError::from)?;
+    Ok(entry)
+}
+
+/// Unions two head transitions over the same committed entry: a surviving
+/// head must be untouched by both batches (present in each new list — either
+/// batch may have replaced it), heads added by either batch are added in
+/// staged order, and the change drains only when a batch marked it abandoned.
+///
+/// The merged entry is `None` when it would drain without abandoning: an
+/// empty headless active entry must never reach the store, so the caller
+/// fails closed instead of publishing it.
+fn union_entries(
+    old: &ChangeEntry,
+    first: &ChangeEntry,
+    second: &ChangeEntry,
+) -> Option<ChangeEntry> {
+    let mut heads: Vec<Head> = old
+        .heads
+        .iter()
+        .filter(|head| first.contains_head(head) && second.contains_head(head))
+        .copied()
+        .collect();
+    for entry in [first, second] {
+        for head in &entry.heads {
+            if !old.contains_head(head) && !heads.contains(head) {
+                heads.push(*head);
+            }
+        }
+    }
+    heads.sort_unstable();
+    if heads.is_empty() {
+        if first.state == ChangeState::Abandoned || second.state == ChangeState::Abandoned {
+            return Some(ChangeEntry {
+                state: ChangeState::Abandoned,
+                heads,
+            });
+        }
+        return None;
+    }
+    Some(ChangeEntry {
+        state: old.state.clone(),
+        heads,
+    })
+}
+
+/// Builds the shared rewrite reply: staged rewrites in order, drained changes
+/// abandoned, rewritten conflicted heads flagged, and every new head listed
+/// for discovery.
+fn rewrite_reply(
+    session: SessionId,
+    request_id: RequestId,
+    identity: Option<EffectiveIdentity>,
+    merge: Option<MergeReport>,
+    staged: &[StagedRewrite],
+    abandoned: Vec<ChangeId>,
+) -> Result<RewriteReply, CoreError> {
+    let mut outcome = pending_outcome(session, request_id);
+    outcome.identity = identity;
+    outcome.merge = merge;
+    outcome.heads = BoundedList::complete(
+        staged
+            .iter()
+            .map(|rewrite| ChangeHead {
+                change: rewrite.change,
+                head: rewrite.new,
+            })
+            .collect(),
+    )?;
+    Ok(RewriteReply {
+        outcome,
+        rewrites: BoundedList::complete(
+            staged
+                .iter()
+                .map(|rewrite| HeadRewrite {
+                    change: rewrite.change,
+                    old: rewrite.old,
+                    new: rewrite.new,
+                })
+                .collect(),
+        )?,
+        abandoned: BoundedList::complete(abandoned)?,
+        conflicted: BoundedList::complete(
+            staged
+                .iter()
+                .filter(|rewrite| rewrite.conflicted)
+                .map(|rewrite| ChangeHead {
+                    change: rewrite.change,
+                    head: rewrite.new,
+                })
+                .collect(),
+        )?,
+    })
+}
+
+/// Prepares `describe`: rewrites the target's message through
+/// `ops::prepare_edit` with the tree preserved, re-parenting descendants with
+/// unchanged trees in the same batch. A message rewrite moves no content, so
+/// descendants of any shape keep their trees soundly.
+///
+/// # Errors
+/// - [`ErrorCode::EInvalid`] when the description matches the current message.
+/// - [`ErrorCode::ENotFound`], [`ErrorCode::EStale`], or
+///   [`ErrorCode::EDivergent`] from target resolution.
+/// - [`ErrorCode::EHosted`] for several workspace bindings or a GitCompat
+///   workspace on a rewritten head.
+fn describe_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &DescribeArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let target = load_rewrite_target(store, &args.target)?;
+    if args.description.as_bytes() == target.record.message() {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `describe` needs a new description: it is identical to the current message",
+        ));
+    }
+    let prepared = prepare_edit(
+        store,
+        EditRequest {
+            head: target.head,
+            tree: None,
+            message: Some(args.description.clone()),
+            author: None,
+            committer: None,
+        },
+    )?;
+    let mut staged = vec![StagedRewrite {
+        change: target.change,
+        old: target.head,
+        new: prepared.output.head,
+        conflicted: target.record.tree().as_resolved().is_none(),
+    }];
+    let mut head_map = BTreeMap::from([(target.head, prepared.output.head)]);
+    let mut objects = prepared.objects;
+    let root_facts = prepared.facts;
+    let records = Records::new(store);
+    let mut preparer = records.batch_preparer();
+    let closure = descendants(store, &[target.head])?;
+    let rewritten: BTreeSet<Head> = closure
+        .iter()
+        .copied()
+        .chain(std::iter::once(target.head))
+        .collect();
+    for old in closure {
+        let record = records.get_commit(&old)?.ok_or_else(|| not_stored(&old))?;
+        let input = preserved_input(
+            &record,
+            record.tree().clone(),
+            map_strict(record.parents(), &rewritten, &head_map)?,
+            Some(old),
+        )?;
+        let new = preparer.add_native_commit(input)?;
+        head_map.insert(old, new);
+        staged.push(StagedRewrite {
+            change: record.change_id(),
+            old,
+            new,
+            conflicted: record.tree().as_resolved().is_none(),
+        });
+    }
+    let batch = preparer.finish()?;
+    objects.extend(batch.prepared_objects);
+    let (mut facts, _) = merge_changes_facts(store, root_facts, batch.mutations)?;
+    let gated = gate_workspaces(ctx, "describe", &args.workspaces)?;
+    let rewrite_map: BTreeMap<Head, (ChangeId, Head)> = staged
+        .iter()
+        .map(|rewrite| (rewrite.old, (rewrite.change, rewrite.new)))
+        .collect();
+    let (mut workspace_facts, fence) =
+        advance_workspaces(gated, session, "describe", &rewrite_map)?;
+    facts.append(&mut workspace_facts);
+    let reply = rewrite_reply(
+        session,
+        request_id,
+        report_identity(ctx, args.identity.as_ref())?,
+        None,
+        &staged,
+        Vec::new(),
+    )?;
+    Ok(Parts {
+        reply: Reply::Describe(Box::new(reply)),
+        objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// One rebase source with its single original parent.
+struct RebaseSource {
+    change: ChangeId,
+    head: Head,
+    record: CommitRecord,
+    parent: Head,
+}
+
+/// Shared lookup tables for planning one rebase descendant's new parents
+/// and tree.
+struct RebasePlan<'a> {
+    store: &'a Store,
+    scope: RebaseScope,
+    moved: &'a BTreeSet<Head>,
+    head_map: &'a BTreeMap<Head, Head>,
+    parent_map: &'a BTreeMap<Head, Head>,
+    new_trees: &'a BTreeMap<Head, Oid>,
+}
+
+/// Plans one rebase descendant's new parents and tree: under
+/// `SourceAndDescendants` the descendant must be content-less with its single
+/// parent inside the moved set and takes its rewritten parent's tree; under
+/// `RevisionsOnly` it re-parents onto the sources' old parents and keeps its
+/// tree only when the tree still matches the new base.
+fn rebase_descendant_plan(
+    plan: &RebasePlan<'_>,
+    record: &CommitRecord,
+) -> Result<(Vec<Head>, Oid), CoreError> {
+    match plan.scope {
+        RebaseScope::SourceAndDescendants => {
+            let [parent] = record.parents() else {
+                return Err(uncovered(
+                    "rebase",
+                    "rebasing a merge commit needs merge evaluation with no producer on this path",
+                ));
+            };
+            if !plan.moved.contains(parent) {
+                return Err(uncovered(
+                    "rebase",
+                    "rebase moves a commit with a parent outside the moved set and needs merge evaluation with no producer on this path",
+                ));
+            }
+            require_empty_delta(plan.store, "rebase", record, parent)?;
+            let new_parent = plan.head_map.get(parent).copied().ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "internal: rebase parent staged out of order",
+                )
+            })?;
+            let tree = plan.new_trees.get(&new_parent).copied().ok_or_else(|| {
+                CoreError::new(ErrorCode::ECorrupt, "internal: rebase parent tree missing")
+            })?;
+            Ok((vec![new_parent], tree))
+        }
+        RebaseScope::RevisionsOnly => {
+            let new_parents = map_strict(record.parents(), plan.moved, plan.parent_map)?;
+            let [base] = new_parents.as_slice() else {
+                return Err(uncovered(
+                    "rebase",
+                    "re-parenting a merge commit needs merge evaluation with no producer on this path",
+                ));
+            };
+            let base_tree = new_base_tree(plan.store, "rebase", plan.new_trees, base)?;
+            let kept = record.tree().as_resolved().copied().ok_or_else(|| {
+                uncovered(
+                    "rebase",
+                    "re-parenting a conflicted commit needs merge evaluation with no producer on this path",
+                )
+            })?;
+            require_kept_tree("rebase", &kept, &base_tree)?;
+            Ok((new_parents, kept))
+        }
+    }
+}
+
+/// Prepares `rebase`: moves content-less sources onto one new parent,
+/// deriving the descendant closure by scope and staging the whole moved set
+/// through one batch preparer. Sources and `SourceAndDescendants` members
+/// must carry no content (tree equal to their single parent's tree); a
+/// non-empty commit needs per-commit tree re-derivation over the moved base
+/// with no producer here. `RevisionsOnly` descendants keep their trees over
+/// their unchanged old bases only when the kept tree still matches.
+///
+/// # Errors
+/// - [`ErrorCode::EInvalid`] when a source is `onto` or onto a descendant,
+///   or when nothing moves.
+/// - [`ErrorCode::EHosted`] for several onto parents, `keep_empty = false`,
+///   overlapping sources, merge or lateral members of the moved set, and
+///   content-carrying commits.
+fn rebase_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &RebaseArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let [onto] = args.onto.as_slice() else {
+        return Err(uncovered(
+            "rebase",
+            "rebase onto several parents mints a merge commit and needs merge evaluation with no producer on this path; supply exactly one",
+        ));
+    };
+    if !args.keep_empty {
+        return Err(uncovered(
+            "rebase",
+            "rebase with keep_empty=false drops newly-empty commits and needs empty-chain collapsing with no producer on this path",
+        ));
+    }
+    let onto_record = Records::new(store).get_commit(onto)?.ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::ENotFound,
+            format!("rebase destination {} is not stored", describe_head(onto)),
+        )
+    })?;
+    let onto_tree = onto_record.tree().as_resolved().copied().ok_or_else(|| {
+        uncovered(
+            "rebase",
+            "rebase onto a conflicted commit needs merge evaluation with no producer on this path",
+        )
+    })?;
+    let mut sources = Vec::with_capacity(args.sources.len());
+    for source in &args.sources {
+        let target = load_rewrite_target(store, source)?;
+        if target.head == *onto {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "cannot rebase a commit onto itself",
+            ));
+        }
+        let parent = require_single_parent(&target.record, "rebase", "rebasing")?;
+        require_empty_delta(store, "rebase", &target.record, &parent)?;
+        sources.push(RebaseSource {
+            change: target.change,
+            head: target.head,
+            record: target.record,
+            parent,
+        });
+    }
+    if sources.iter().all(|source| source.parent == *onto) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `rebase` moves nothing: every source is already based on onto",
+        ));
+    }
+    let mut moved: BTreeSet<Head> = sources.iter().map(|source| source.head).collect();
+    let mut closures = Vec::with_capacity(sources.len());
+    for source in &sources {
+        let closure = descendants(store, &[source.head])?;
+        if closure.contains(onto) {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                format!("cannot rebase onto descendant {}", describe_head(onto)),
+            ));
+        }
+        for member in &closure {
+            if !moved.insert(*member) {
+                return Err(uncovered(
+                    "rebase",
+                    "rebase sources overlap (one source descends from another, or they share descendants); rebase one source at a time",
+                ));
+            }
+        }
+        closures.push(closure);
+    }
+    let records = Records::new(store);
+    let mut preparer = records.batch_preparer();
+    let mut head_map = BTreeMap::new();
+    // RevisionsOnly descendants re-parent onto the sources' old parents, not
+    // the moved sources, so they map through a separate table seeded here.
+    let mut parent_map: BTreeMap<Head, Head> = BTreeMap::new();
+    let mut new_trees = BTreeMap::from([(*onto, onto_tree)]);
+    let mut staged = Vec::new();
+    let mut objects = Vec::new();
+    for source in &sources {
+        let input = preserved_input(
+            &source.record,
+            Merge::from_vec(vec![onto_tree]),
+            vec![*onto],
+            Some(source.head),
+        )?;
+        let new = preparer.add_native_commit(input)?;
+        head_map.insert(source.head, new);
+        parent_map.insert(source.head, source.parent);
+        new_trees.insert(new, onto_tree);
+        staged.push(StagedRewrite {
+            change: source.change,
+            old: source.head,
+            new,
+            conflicted: false,
+        });
+    }
+    for (_source, closure) in sources.iter().zip(closures) {
+        for old in closure {
+            let record = records.get_commit(&old)?.ok_or_else(|| not_stored(&old))?;
+            let plan = RebasePlan {
+                store,
+                scope: args.scope,
+                moved: &moved,
+                head_map: &head_map,
+                parent_map: &parent_map,
+                new_trees: &new_trees,
+            };
+            let (new_parents, new_tree) = rebase_descendant_plan(&plan, &record)?;
+            let input = preserved_input(
+                &record,
+                Merge::from_vec(vec![new_tree]),
+                new_parents,
+                Some(old),
+            )?;
+            let new = preparer.add_native_commit(input)?;
+            head_map.insert(old, new);
+            parent_map.insert(old, new);
+            new_trees.insert(new, new_tree);
+            staged.push(StagedRewrite {
+                change: record.change_id(),
+                old,
+                new,
+                conflicted: false,
+            });
+        }
+    }
+    let batch = preparer.finish()?;
+    objects.extend(batch.prepared_objects);
+    let (mut facts, _) = merge_changes_facts(store, Vec::new(), batch.mutations)?;
+    let gated = gate_workspaces(ctx, "rebase", &args.workspaces)?;
+    let rewrite_map: BTreeMap<Head, (ChangeId, Head)> = staged
+        .iter()
+        .map(|rewrite| (rewrite.old, (rewrite.change, rewrite.new)))
+        .collect();
+    let (mut workspace_facts, fence) = advance_workspaces(gated, session, "rebase", &rewrite_map)?;
+    facts.append(&mut workspace_facts);
+    let reply = rewrite_reply(
+        session,
+        request_id,
+        report_identity(ctx, None)?,
+        merge_report_of(args.merge.mode)?,
+        &staged,
+        Vec::new(),
+    )?;
+    Ok(Parts {
+        reply: Reply::Rebase(Box::new(reply)),
+        objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// Prepares `squash`: moves the whole delta of a source into its destination
+/// parent, dropping the emptied source. Only the whole-delta linear case is
+/// covered: all paths, the source a direct only child of the destination, and
+/// content-less source descendants. `ops::prepare_squash` absorbs intra-change
+/// chains only (its predecessor must live in the squashed change), so the
+/// cross-change composition stages here through one batch preparer.
+///
+/// # Errors
+/// - [`ErrorCode::EHosted`] for selected paths, `keep_empty = true`,
+///   non-linear placement, siblings, and content-carrying descendants.
+fn squash_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &SquashArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    if !matches!(args.paths, crate::protocol::PathSelection::All) {
+        return Err(uncovered(
+            "squash",
+            "squash of selected paths needs path-delta apply (ops/tree_edit.rs) with no producer on this path; supply all paths",
+        ));
+    }
+    if args.keep_empty {
+        return Err(uncovered(
+            "squash",
+            "squash with keep_empty=true keeps the emptied source and needs remainder-tree derivation with no producer on this path",
+        ));
+    }
+    let source = load_rewrite_target(store, &args.source)?;
+    let destination = load_rewrite_target(store, &args.destination)?;
+    match source.record.parents() {
+        [parent] if *parent == destination.head => {}
+        [_] => {
+            return Err(uncovered(
+                "squash",
+                "squash needs the source to be a direct child of the destination with no producer for general placement on this path",
+            ));
+        }
+        [] => {
+            return Err(uncovered(
+                "squash",
+                "squash of a root source needs merge evaluation with no producer on this path",
+            ));
+        }
+        _ => {
+            return Err(uncovered(
+                "squash",
+                "squash of a merge source needs merge evaluation with no producer on this path",
+            ));
+        }
+    }
+    if children(store, &destination.head)? != vec![source.head] {
+        return Err(uncovered(
+            "squash",
+            "squash with siblings of the source needs sibling tree re-derivation with no producer on this path",
+        ));
+    }
+    let source_tree = source.record.tree().as_resolved().copied().ok_or_else(|| {
+        uncovered(
+            "squash",
+            "squash of a conflicted source needs merge evaluation with no producer on this path",
+        )
+    })?;
+    let message = match &args.description {
+        Some(description) => description.clone(),
+        None => ByteString::from(destination.record.message()),
+    };
+    let records = Records::new(store);
+    let mut preparer = records.batch_preparer();
+    let destination_input = NativeCommitInput {
+        change_id: destination.change,
+        tree: Merge::from_vec(vec![source_tree]),
+        parents: destination.record.parents().to_vec(),
+        predecessor: Some(destination.head),
+        author: destination.record.author()?,
+        committer: source.record.committer()?,
+        extra_headers: copy_extra_headers(&destination.record),
+        message,
+        provenance: destination.record.provenance().cloned(),
+    };
+    let new_destination = preparer.add_native_commit(destination_input)?;
+    if new_destination == destination.head {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `squash` moves nothing: the destination already carries the source content",
+        ));
+    }
+    let mut head_map = BTreeMap::from([
+        (destination.head, new_destination),
+        (source.head, new_destination),
+    ]);
+    let mut new_trees = BTreeMap::from([(new_destination, source_tree)]);
+    let mut staged = vec![StagedRewrite {
+        change: destination.change,
+        old: destination.head,
+        new: new_destination,
+        conflicted: false,
+    }];
+    let closure = descendants(store, &[source.head])?;
+    let rewritten: BTreeSet<Head> = closure
+        .iter()
+        .copied()
+        .chain([destination.head, source.head])
+        .collect();
+    for old in closure {
+        let record = records.get_commit(&old)?.ok_or_else(|| not_stored(&old))?;
+        let new_parents = map_strict(record.parents(), &rewritten, &head_map)?;
+        let [base] = new_parents.as_slice() else {
+            return Err(uncovered(
+                "squash",
+                "re-parenting a merge commit needs merge evaluation with no producer on this path",
+            ));
+        };
+        if *base != new_destination {
+            let base_tree = new_base_tree(store, "squash", &new_trees, base)?;
+            let kept = record.tree().as_resolved().copied().ok_or_else(|| {
+                uncovered(
+                    "squash",
+                    "re-parenting a conflicted commit needs merge evaluation with no producer on this path",
+                )
+            })?;
+            require_kept_tree("squash", &kept, &base_tree)?;
+        }
+        let input = preserved_input(&record, record.tree().clone(), new_parents, Some(old))?;
+        let new = preparer.add_native_commit(input)?;
+        head_map.insert(old, new);
+        if let Some(tree) = record.tree().as_resolved() {
+            new_trees.insert(new, *tree);
+        }
+        staged.push(StagedRewrite {
+            change: record.change_id(),
+            old,
+            new,
+            conflicted: record.tree().as_resolved().is_none(),
+        });
+    }
+    let batch = preparer.finish()?;
+    let abandoned = prepare_abandon(
+        store,
+        AbandonRequest {
+            heads: vec![source.head],
+        },
+    )?;
+    let (mut facts, finals) = merge_changes_facts(store, batch.mutations, abandoned.facts)?;
+    let drained = finals
+        .get(&source.change)
+        .is_none_or(|entry| entry.heads.is_empty());
+    let gated = gate_workspaces(ctx, "squash", &args.workspaces)?;
+    let rewrite_map: BTreeMap<Head, (ChangeId, Head)> = staged
+        .iter()
+        .map(|rewrite| (rewrite.old, (rewrite.change, rewrite.new)))
+        .collect();
+    let (mut workspace_facts, fence) = advance_workspaces(gated, session, "squash", &rewrite_map)?;
+    facts.append(&mut workspace_facts);
+    let reply = rewrite_reply(
+        session,
+        request_id,
+        report_identity(ctx, args.identity.as_ref())?,
+        merge_report_of(args.merge.mode)?,
+        &staged,
+        drained.then_some(source.change).into_iter().collect(),
+    )?;
+    Ok(Parts {
+        reply: Reply::Squash(Box::new(reply)),
+        objects: batch.prepared_objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// Prepares `abandon`: drops target heads and re-parents descendants onto the
+/// abandoned commits' parents, staging rewrites and change-state transitions
+/// through one batch so publication stays atomic. Merge-commit targets need
+/// fan-in parent replacement with no producer here, so they stay refused.
+///
+/// # Errors
+/// - [`ErrorCode::EHosted`] for merge-commit targets, merge descendants, and
+///   content-carrying descendants.
+fn abandon_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &AbandonArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let mut abandoned_parents: BTreeMap<Head, Vec<Head>> = BTreeMap::new();
+    let mut target_heads = Vec::with_capacity(args.targets.len());
+    for target in &args.targets {
+        let resolved = load_rewrite_target(store, target)?;
+        let parents = match resolved.record.parents() {
+            [] => Vec::new(),
+            [parent] => vec![*parent],
+            _ => {
+                return Err(uncovered(
+                    "abandon",
+                    "abandon of a merge commit needs fan-in parent replacement with no producer on this path",
+                ));
+            }
+        };
+        abandoned_parents.insert(resolved.head, parents);
+        target_heads.push(resolved.head);
+    }
+    // One closure over every target: roots are excluded even when nested, and
+    // emission is topological across targets, so a descendant shared by two
+    // targets stages once after every rewritten parent.
+    let closure = descendants(store, &target_heads)?;
+    let records = Records::new(store);
+    let mut preparer = records.batch_preparer();
+    let mut head_map = BTreeMap::new();
+    let mut new_trees = BTreeMap::new();
+    let mut staged = Vec::new();
+    let rewritten: BTreeSet<Head> = closure.iter().copied().collect();
+    for old in closure {
+        let record = records.get_commit(&old)?.ok_or_else(|| not_stored(&old))?;
+        let mut expanded = Vec::with_capacity(record.parents().len());
+        for parent in record.parents() {
+            expand_abandoned(parent, &abandoned_parents, &mut expanded);
+        }
+        if expanded
+            .iter()
+            .any(|parent| abandoned_parents.contains_key(parent))
+        {
+            return Err(CoreError::new(
+                ErrorCode::ECorrupt,
+                "internal: abandoned parent survived expansion",
+            ));
+        }
+        let new_parents = map_strict(&expanded, &rewritten, &head_map)?;
+        if let [base] = new_parents.as_slice() {
+            let base_tree = new_base_tree(store, "abandon", &new_trees, base)?;
+            let kept = record.tree().as_resolved().copied().ok_or_else(|| {
+                uncovered(
+                    "abandon",
+                    "re-parenting a conflicted commit needs merge evaluation with no producer on this path",
+                )
+            })?;
+            require_kept_tree("abandon", &kept, &base_tree)?;
+        } else if !new_parents.is_empty() {
+            return Err(uncovered(
+                "abandon",
+                "re-parenting a merge commit needs merge evaluation with no producer on this path",
+            ));
+        }
+        let input = preserved_input(&record, record.tree().clone(), new_parents, Some(old))?;
+        let new = preparer.add_native_commit(input)?;
+        head_map.insert(old, new);
+        if let Some(tree) = record.tree().as_resolved() {
+            new_trees.insert(new, *tree);
+        }
+        staged.push(StagedRewrite {
+            change: record.change_id(),
+            old,
+            new,
+            conflicted: record.tree().as_resolved().is_none(),
+        });
+    }
+    let batch = preparer.finish()?;
+    let abandoned = prepare_abandon(
+        store,
+        AbandonRequest {
+            heads: target_heads,
+        },
+    )?;
+    let (mut facts, finals) = merge_changes_facts(store, batch.mutations, abandoned.facts)?;
+    let mut drained = Vec::new();
+    for target in &args.targets {
+        if finals
+            .get(&target.change)
+            .is_none_or(|entry| entry.heads.is_empty())
+        {
+            drained.push(target.change);
+        }
+    }
+    let gated = gate_workspaces(ctx, "abandon", &args.workspaces)?;
+    let rewrite_map: BTreeMap<Head, (ChangeId, Head)> = staged
+        .iter()
+        .map(|rewrite| (rewrite.old, (rewrite.change, rewrite.new)))
+        .collect();
+    let (mut workspace_facts, fence) = advance_workspaces(gated, session, "abandon", &rewrite_map)?;
+    facts.append(&mut workspace_facts);
+    let reply = rewrite_reply(
+        session,
+        request_id,
+        report_identity(ctx, None)?,
+        merge_report_of(args.merge.mode)?,
+        &staged,
+        drained,
+    )?;
+    Ok(Parts {
+        reply: Reply::Abandon(Box::new(reply)),
+        objects: batch.prepared_objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// Expands an abandoned parent into its replacement parents, following nested
+/// abandonments. Targets carry at most one parent, so expansion never fans out.
+fn expand_abandoned(parent: &Head, abandoned: &BTreeMap<Head, Vec<Head>>, out: &mut Vec<Head>) {
+    if let Some(replacements) = abandoned.get(parent) {
+        for replacement in replacements {
+            expand_abandoned(replacement, abandoned, out);
+        }
+    } else {
+        out.push(*parent);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1243,7 +2461,10 @@ mod tests {
 
     /// Mints a real commit through `ops::prepare_new` and publishes it, so
     /// change-target, pin, and divergence tests resolve stored facts. Each
-    /// seed carries a distinct message, so heads never collide.
+    /// seed carries a distinct message, so heads never collide; an absent
+    /// change mints a fresh one (`prepare_new` with `None` would resolve the
+    /// tree's stable by-OID mapping and pile every empty-tree seed onto one
+    /// divergent change).
     fn seed_commit(store: &Store, change_id: Option<ChangeId>) -> (Head, ChangeId, Oid) {
         let number = SEQ.fetch_add(1, Ordering::SeqCst);
         let tree = store
@@ -1259,7 +2480,7 @@ mod tests {
                 author: signature(),
                 committer: signature(),
                 message: ByteString::from(format!("seed-{number}")),
-                change_id,
+                change_id: Some(change_id.unwrap_or_else(ChangeId::generate)),
                 predecessor: None,
                 provenance: None,
             },
@@ -1907,35 +3128,32 @@ mod tests {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
         let ctx = full_ctx(&store, session, None, Some(&clock), Some(&open_checkpoint));
-        // `new`, `claim.*`, and `ws.new` now serve through this context; the
-        // next waves still name their missing preparation.
-        for request in [
-            Request::Describe(Box::new(WireMutation {
-                request_id: request_id(),
-                args: DescribeArgs {
-                    target: change_target(),
-                    description: ByteString::from("rewritten"),
-                    identity: None,
-                    workspaces: Vec::new(),
-                },
-            })),
-            Request::Split(Box::new(WireMutation {
-                request_id: request_id(),
-                args: SplitArgs {
-                    source: change_target(),
-                    paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
-                    placement: SplitPlacement::SelectedFirst,
-                    description: ByteString::from("part"),
-                    identity: None,
-                    merge: MergeSelection::default(),
-                    workspaces: Vec::new(),
-                },
-            })),
-        ] {
+        // `new`, `claim.*`, `ws.new`, `describe`, `rebase`, `squash`, and
+        // `abandon` now serve through this context; later waves still name
+        // their missing preparation. `split` needs intermediate-tree
+        // derivation (ops/tree_edit.rs) with no producer here.
+        for request in [Request::Split(Box::new(WireMutation {
+            request_id: request_id(),
+            args: SplitArgs {
+                source: change_target(),
+                paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
+                placement: SplitPlacement::SelectedFirst,
+                description: ByteString::from("part"),
+                identity: None,
+                merge: MergeSelection::default(),
+                workspaces: Vec::new(),
+            },
+        }))] {
             let method = request.method();
             let err = prepare_mutation_with(&ctx, request)
                 .expect_err("future wave stays refused through the context");
             assert_eq!(err.code, ErrorCode::EHosted, "method `{}`", method.as_str());
+            assert!(
+                err.message.contains("ops/tree_edit.rs"),
+                "method `{}` names its missing producer: {}",
+                method.as_str(),
+                err.message
+            );
         }
     }
 
@@ -2516,11 +3734,10 @@ mod tests {
     fn ops_backed_mutations_name_their_missing_preparation() {
         let (_temp, store, session) = fixture();
         let target = change_target();
-        let other = ChangeRef {
-            change: ChangeId::from_bytes([0x33; 16]),
-            head: None,
-        };
         let parent = Head::Git { oid: oid(0x11) };
+        // `describe`, `rebase`, `squash`, and `abandon` preserve signatures
+        // and serve on the legacy path too; they have dedicated tests below.
+        // The rest still name their missing preparation here.
         let requests = [
             Request::New(Box::new(WireMutation {
                 request_id: request_id(),
@@ -2529,15 +3746,6 @@ mod tests {
                     description: ByteString::from("new change"),
                     identity: None,
                     workspace: None,
-                },
-            })),
-            Request::Describe(Box::new(WireMutation {
-                request_id: request_id(),
-                args: DescribeArgs {
-                    target,
-                    description: ByteString::from("rewritten"),
-                    identity: None,
-                    workspaces: Vec::new(),
                 },
             })),
             Request::Edit(Box::new(WireMutation {
@@ -2555,38 +3763,6 @@ mod tests {
                     placement: SplitPlacement::SelectedFirst,
                     description: ByteString::from("part"),
                     identity: None,
-                    merge: MergeSelection::default(),
-                    workspaces: Vec::new(),
-                },
-            })),
-            Request::Squash(Box::new(WireMutation {
-                request_id: request_id(),
-                args: SquashArgs {
-                    source: target,
-                    destination: other,
-                    paths: PathSelection::All,
-                    description: None,
-                    keep_empty: false,
-                    identity: None,
-                    merge: MergeSelection::default(),
-                    workspaces: Vec::new(),
-                },
-            })),
-            Request::Rebase(Box::new(WireMutation {
-                request_id: request_id(),
-                args: RebaseArgs {
-                    sources: vec![target],
-                    scope: RebaseScope::SourceAndDescendants,
-                    onto: vec![parent],
-                    merge: MergeSelection::default(),
-                    keep_empty: false,
-                    workspaces: Vec::new(),
-                },
-            })),
-            Request::Abandon(Box::new(WireMutation {
-                request_id: request_id(),
-                args: AbandonArgs {
-                    targets: vec![target],
                     merge: MergeSelection::default(),
                     workspaces: Vec::new(),
                 },
@@ -2627,6 +3803,933 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// Seeds one child commit on `parent` in its own fresh change unless
+    /// `change` names one, publishing immediately so later prepares resolve it.
+    fn seed_child(
+        store: &Store,
+        parent: Head,
+        change: Option<ChangeId>,
+        message: &str,
+    ) -> (Head, ChangeId) {
+        seed_child_on_tree(
+            store,
+            empty_tree_oid(store),
+            vec![parent],
+            Some(change.unwrap_or_else(ChangeId::generate)),
+            message,
+        )
+    }
+
+    fn seed_child_on_tree(
+        store: &Store,
+        tree: Oid,
+        parents: Vec<Head>,
+        change: Option<ChangeId>,
+        message: &str,
+    ) -> (Head, ChangeId) {
+        let prepared = prepare_new(
+            store,
+            NewRequest {
+                tree,
+                parents,
+                author: signature(),
+                committer: signature(),
+                message: ByteString::from(message),
+                change_id: Some(change.unwrap_or_else(ChangeId::generate)),
+                predecessor: None,
+                provenance: None,
+            },
+        )
+        .expect("prepare child commit");
+        let head = prepared.output.head;
+        let change = prepared.output.change_id;
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish child commit");
+        (head, change)
+    }
+
+    /// Seeds a stored tree holding one file, distinct per marker byte.
+    fn seed_tree(store: &Store, marker: u8) -> Oid {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"100644 f");
+        bytes.push(marker);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0x31; 20]);
+        let staged = store
+            .prepare(
+                ObjectKind::Tree,
+                u64::try_from(bytes.len()).expect("tree fits u64"),
+                std::io::Cursor::new(bytes),
+                None,
+            )
+            .expect("prepare marker tree");
+        let oid = staged.oid();
+        store
+            .publish(vec![staged], &[])
+            .expect("publish marker tree");
+        oid
+    }
+
+    fn commit_message(store: &Store, head: &Head) -> Vec<u8> {
+        Records::new(store)
+            .get_commit(head)
+            .expect("read commit")
+            .expect("commit is stored")
+            .message()
+            .to_vec()
+    }
+
+    fn commit_parents(store: &Store, head: &Head) -> Vec<Head> {
+        Records::new(store)
+            .get_commit(head)
+            .expect("read commit")
+            .expect("commit is stored")
+            .parents()
+            .to_vec()
+    }
+
+    fn change_heads(store: &Store, change: &ChangeId) -> Vec<Head> {
+        Records::new(store)
+            .get_change(change)
+            .expect("read change")
+            .expect("change is stored")
+            .heads
+            .clone()
+    }
+
+    fn describe_request(target: ChangeRef, description: &str) -> Request {
+        Request::Describe(Box::new(WireMutation {
+            request_id: request_id(),
+            args: DescribeArgs {
+                target,
+                description: ByteString::from(description),
+                identity: None,
+                workspaces: Vec::new(),
+            },
+        }))
+    }
+
+    #[test]
+    fn describe_rewrites_message_and_propagates_to_descendants() {
+        let (_temp, store, session) = fixture();
+        let (ahead, achange, _) = seed_commit(&store, None);
+        let (bhead, bchange) = seed_child(&store, ahead, None, "b");
+        let (chead, cchange) = seed_child(&store, bhead, None, "c");
+        // History rewrites preserve signatures, so `describe` serves on the
+        // legacy path with no session row or clock.
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            describe_request(
+                ChangeRef {
+                    change: achange,
+                    head: None,
+                },
+                "a rewritten",
+            ),
+        )
+        .expect("describe prepares");
+        let Reply::Describe(reply) = prepared.reply else {
+            panic!("describe must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 3);
+        assert_eq!(reply.rewrites.items[0].old, ahead);
+        assert_eq!(reply.abandoned.items.len(), 0);
+        assert_eq!(reply.conflicted.items.len(), 0);
+        assert_eq!(reply.outcome.heads.items.len(), 3);
+        let new_a = reply.rewrites.items[0].new;
+        let new_b = reply.rewrites.items[1].new;
+        let new_c = reply.rewrites.items[2].new;
+        assert_eq!(reply.rewrites.items[1].old, bhead);
+        assert_eq!(reply.rewrites.items[2].old, chead);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish describe");
+        assert_eq!(commit_message(&store, &new_a), b"a rewritten");
+        assert_eq!(commit_message(&store, &new_b), b"b");
+        assert_eq!(commit_message(&store, &new_c), b"c");
+        assert_eq!(commit_parents(&store, &new_b), vec![new_a]);
+        assert_eq!(commit_parents(&store, &new_c), vec![new_b]);
+        assert_eq!(change_heads(&store, &achange), vec![new_a]);
+        assert_eq!(change_heads(&store, &bchange), vec![new_b]);
+        assert_eq!(change_heads(&store, &cchange), vec![new_c]);
+    }
+
+    #[test]
+    fn describe_resolves_targets_and_reports_identity() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let (ahead, achange) = seed_child(&store, seed_commit(&store, None).0, None, "a");
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let prepared = prepare_mutation_with(
+            &ctx,
+            describe_request(
+                ChangeRef {
+                    change: achange,
+                    head: Some(ahead),
+                },
+                "a reported",
+            ),
+        )
+        .expect("pinned describe prepares");
+        let Reply::Describe(reply) = prepared.reply else {
+            panic!("describe must answer its own reply");
+        };
+        let identity = reply
+            .outcome
+            .identity
+            .expect("describe reports the session identity");
+        assert_eq!(identity.source, IdentitySource::SessionClaim);
+
+        let missing = ChangeRef {
+            change: ChangeId::from_bytes([0x77; 16]),
+            head: None,
+        };
+        let err = prepare_mutation(&store, session, describe_request(missing, "ghost"))
+            .expect_err("unknown change is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        let foreign = ChangeRef {
+            change: achange,
+            head: Some(Head::Git { oid: oid(0x99) }),
+        };
+        let err = prepare_mutation(&store, session, describe_request(foreign, "stale"))
+            .expect_err("foreign pinned head is stale");
+        assert_eq!(err.code, ErrorCode::EStale);
+
+        let (_, shared) = seed_child(&store, ahead, Some(achange), "divergent");
+        let _ = shared;
+        let bare = ChangeRef {
+            change: achange,
+            head: None,
+        };
+        let err = prepare_mutation(&store, session, describe_request(bare, "split"))
+            .expect_err("divergent change needs a pin");
+        assert_eq!(err.code, ErrorCode::EDivergent);
+
+        let err = prepare_mutation(
+            &store,
+            session,
+            describe_request(
+                ChangeRef {
+                    change: achange,
+                    head: Some(ahead),
+                },
+                "a",
+            ),
+        )
+        .expect_err("identical description is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn describe_merges_same_change_rewrites_into_one_fact() {
+        let (_temp, store, session) = fixture();
+        let (ahead, achange, _) = seed_commit(&store, None);
+        // A divergent head descending from another head of the same change:
+        // the root rewrite and the descendant rewrite collide on the change
+        // key and must merge rather than publish twice.
+        let (bhead, _) = seed_child(&store, ahead, Some(achange), "same-change child");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            describe_request(
+                ChangeRef {
+                    change: achange,
+                    head: Some(ahead),
+                },
+                "root rewritten",
+            ),
+        )
+        .expect("same-change describe prepares");
+        let Reply::Describe(reply) = prepared.reply else {
+            panic!("describe must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 2);
+        let change_facts: Vec<_> = prepared
+            .facts
+            .iter()
+            .filter(|fact| fact.table == crate::store::types::FactTable::Changes)
+            .collect();
+        assert_eq!(change_facts.len(), 1);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish merged describe");
+        assert_eq!(change_heads(&store, &achange).len(), 2);
+        let _ = bhead;
+    }
+
+    #[test]
+    fn describe_remaps_diamond_descendants() {
+        let (_temp, store, session) = fixture();
+        let (ahead, _, _) = seed_commit(&store, None);
+        let (bhead, _) = seed_child(&store, ahead, None, "b");
+        let (chead, _) = seed_child(&store, ahead, None, "c");
+        let (dhead, _) = seed_child_on_tree(
+            &store,
+            empty_tree_oid(&store),
+            vec![bhead, chead],
+            None,
+            "merge child",
+        );
+        // Describe the root: the merge descendant must follow BOTH rewritten
+        // parents, never keep a superseded one.
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::Describe(Box::new(WireMutation {
+                request_id: request_id(),
+                args: DescribeArgs {
+                    target: ChangeRef {
+                        change: change_of(&store, &ahead),
+                        head: Some(ahead),
+                    },
+                    description: ByteString::from("root rewritten"),
+                    identity: None,
+                    workspaces: Vec::new(),
+                },
+            })),
+        )
+        .expect("diamond describe prepares");
+        let Reply::Describe(reply) = prepared.reply else {
+            panic!("describe must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 4);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish diamond describe");
+        let merge_rewrite = reply
+            .rewrites
+            .items
+            .iter()
+            .find(|rewrite| rewrite.old == dhead)
+            .expect("merge child rewritten");
+        let parents = commit_parents(&store, &merge_rewrite.new);
+        assert_eq!(parents.len(), 2);
+        for parent in &parents {
+            assert!(
+                reply
+                    .rewrites
+                    .items
+                    .iter()
+                    .any(|rewrite| rewrite.new == *parent),
+                "merge child follows rewritten parents only"
+            );
+        }
+    }
+
+    fn change_of(store: &Store, head: &Head) -> ChangeId {
+        Records::new(store)
+            .get_commit(head)
+            .expect("read commit")
+            .expect("commit is stored")
+            .change_id()
+    }
+
+    fn rebase_request(
+        sources: Vec<ChangeRef>,
+        scope: RebaseScope,
+        onto: Vec<Head>,
+        keep_empty: bool,
+    ) -> Request {
+        Request::Rebase(Box::new(WireMutation {
+            request_id: request_id(),
+            args: RebaseArgs {
+                sources,
+                scope,
+                onto,
+                merge: crate::protocol::MergeSelection::default(),
+                keep_empty,
+                workspaces: Vec::new(),
+            },
+        }))
+    }
+
+    #[test]
+    fn rebase_moves_an_empty_chain() {
+        let (_temp, store, session) = fixture();
+        let (ohead, _, _) = seed_commit(&store, None);
+        let (phead, _, _) = seed_commit(&store, None);
+        let (shead, schange) = seed_child(&store, phead, None, "source");
+        let (dhead, dchange) = seed_child(&store, shead, None, "child");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![ChangeRef {
+                    change: schange,
+                    head: None,
+                }],
+                RebaseScope::SourceAndDescendants,
+                vec![ohead],
+                true,
+            ),
+        )
+        .expect("empty rebase prepares");
+        let Reply::Rebase(reply) = prepared.reply else {
+            panic!("rebase must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 2);
+        assert_eq!(reply.rewrites.items[0].old, shead);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish rebase");
+        let new_s = reply.rewrites.items[0].new;
+        let new_d = reply.rewrites.items[1].new;
+        assert_eq!(new_d, reply.rewrites.items[1].new);
+        assert_eq!(commit_parents(&store, &new_s), vec![ohead]);
+        assert_eq!(commit_parents(&store, &new_d), vec![new_s]);
+        assert_eq!(change_heads(&store, &schange), vec![new_s]);
+        assert_eq!(change_heads(&store, &dchange), vec![new_d]);
+        let _ = dhead;
+    }
+
+    #[test]
+    fn rebase_revisions_only_reparents_to_old_parents() {
+        let (_temp, store, session) = fixture();
+        let (ohead, _, _) = seed_commit(&store, None);
+        let (phead, _, _) = seed_commit(&store, None);
+        let (shead, _) = seed_child(&store, phead, None, "source");
+        let (dhead, dchange) = seed_child(&store, shead, None, "child");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![ChangeRef {
+                    change: change_of(&store, &shead),
+                    head: Some(shead),
+                }],
+                RebaseScope::RevisionsOnly,
+                vec![ohead],
+                true,
+            ),
+        )
+        .expect("revisions-only rebase prepares");
+        let Reply::Rebase(reply) = prepared.reply else {
+            panic!("rebase must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 2);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish revisions-only rebase");
+        let new_d = reply.rewrites.items[1].new;
+        assert_eq!(commit_parents(&store, &new_d), vec![phead]);
+        assert_eq!(change_heads(&store, &dchange), vec![new_d]);
+        let _ = dhead;
+    }
+
+    #[test]
+    fn rebase_refusals_name_their_reason() {
+        let (_temp, store, session) = fixture();
+        let (ohead, _, _) = seed_commit(&store, None);
+        let (phead, _, _) = seed_commit(&store, None);
+        let (shead, schange) = seed_child(&store, phead, None, "source");
+        let pinned = ChangeRef {
+            change: schange,
+            head: Some(shead),
+        };
+        // A source carrying content needs per-commit tree re-derivation.
+        let full = seed_tree(&store, b'x');
+        let (fhead, fchange) = seed_child_on_tree(&store, full, vec![phead], None, "full");
+        let err = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![ChangeRef {
+                    change: fchange,
+                    head: Some(fhead),
+                }],
+                RebaseScope::SourceAndDescendants,
+                vec![ohead],
+                true,
+            ),
+        )
+        .expect_err("content-carrying source stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("tree re-derivation"),
+            "names derivation: {}",
+            err.message
+        );
+
+        // Several onto parents mint a merge commit.
+        let err = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![pinned],
+                RebaseScope::SourceAndDescendants,
+                vec![ohead, phead],
+                true,
+            ),
+        )
+        .expect_err("multi-onto stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("merge"),
+            "names merge evaluation: {}",
+            err.message
+        );
+
+        // Dropping newly-empty commits needs collapsing.
+        let err = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![pinned],
+                RebaseScope::SourceAndDescendants,
+                vec![ohead],
+                false,
+            ),
+        )
+        .expect_err("keep_empty=false stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("collapsing"),
+            "names collapsing: {}",
+            err.message
+        );
+
+        // Onto a descendant is invalid.
+        let (dhead, _) = seed_child(&store, shead, None, "child");
+        let err = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![pinned],
+                RebaseScope::SourceAndDescendants,
+                vec![dhead],
+                true,
+            ),
+        )
+        .expect_err("onto-descendant is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+
+        // An already-based source moves nothing.
+        let err = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![pinned],
+                RebaseScope::SourceAndDescendants,
+                vec![phead],
+                true,
+            ),
+        )
+        .expect_err("no-op rebase is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+
+        // A merge source needs merge evaluation.
+        let (mhead, mchange) = seed_child_on_tree(
+            &store,
+            empty_tree_oid(&store),
+            vec![ohead, phead],
+            None,
+            "merge",
+        );
+        let err = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![ChangeRef {
+                    change: mchange,
+                    head: Some(mhead),
+                }],
+                RebaseScope::SourceAndDescendants,
+                vec![shead],
+                true,
+            ),
+        )
+        .expect_err("merge source stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("merge"),
+            "names merge evaluation: {}",
+            err.message
+        );
+
+        // Nested sources overlap.
+        let (chead, cchange) = seed_child(&store, shead, None, "nested");
+        let err = prepare_mutation(
+            &store,
+            session,
+            rebase_request(
+                vec![
+                    pinned,
+                    ChangeRef {
+                        change: cchange,
+                        head: Some(chead),
+                    },
+                ],
+                RebaseScope::SourceAndDescendants,
+                vec![ohead],
+                true,
+            ),
+        )
+        .expect_err("nested sources stay refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("overlap"),
+            "names overlap: {}",
+            err.message
+        );
+    }
+
+    fn squash_request(
+        source: ChangeRef,
+        destination: ChangeRef,
+        paths: crate::protocol::PathSelection,
+        keep_empty: bool,
+    ) -> Request {
+        Request::Squash(Box::new(WireMutation {
+            request_id: request_id(),
+            args: SquashArgs {
+                source,
+                destination,
+                paths,
+                description: None,
+                keep_empty,
+                identity: None,
+                merge: crate::protocol::MergeSelection::default(),
+                workspaces: Vec::new(),
+            },
+        }))
+    }
+
+    #[test]
+    fn squash_moves_the_whole_delta_and_drops_the_source() {
+        let (_temp, store, session) = fixture();
+        let (dhead, dchange, _) = seed_commit(&store, None);
+        let moved = seed_tree(&store, b's');
+        let (shead, schange) = seed_child_on_tree(&store, moved, vec![dhead], None, "source");
+        let (ghead, gchange) = seed_child_on_tree(&store, moved, vec![shead], None, "grandchild");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            squash_request(
+                ChangeRef {
+                    change: schange,
+                    head: None,
+                },
+                ChangeRef {
+                    change: dchange,
+                    head: None,
+                },
+                crate::protocol::PathSelection::All,
+                false,
+            ),
+        )
+        .expect("whole-delta squash prepares");
+        let Reply::Squash(reply) = prepared.reply else {
+            panic!("squash must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 2);
+        assert_eq!(reply.rewrites.items[0].old, dhead);
+        assert_eq!(reply.abandoned.items, vec![schange]);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish squash");
+        let new_dest = reply.rewrites.items[0].new;
+        let new_child = reply.rewrites.items[1].new;
+        assert_eq!(commit_parents(&store, &new_child), vec![new_dest]);
+        assert_eq!(change_heads(&store, &dchange), vec![new_dest]);
+        assert_eq!(change_heads(&store, &gchange), vec![new_child]);
+        // The drained source change reads back as a headless abandoned entry,
+        // which stored validation rejects; the staged abandon fact carries
+        // the transition and the reply reports the drain.
+        let _ = (shead, ghead);
+    }
+
+    #[test]
+    fn squash_refusals_name_their_reason() {
+        let (_temp, store, session) = fixture();
+        let (dhead, dchange, _) = seed_commit(&store, None);
+        let (shead, schange) = seed_child(&store, dhead, None, "source");
+        let source = ChangeRef {
+            change: schange,
+            head: Some(shead),
+        };
+        let destination = ChangeRef {
+            change: dchange,
+            head: Some(dhead),
+        };
+        let err = prepare_mutation(
+            &store,
+            session,
+            squash_request(
+                source,
+                destination,
+                crate::protocol::PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
+                false,
+            ),
+        )
+        .expect_err("selected-paths squash stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("ops/tree_edit.rs"),
+            "names derivation: {}",
+            err.message
+        );
+
+        let err = prepare_mutation(
+            &store,
+            session,
+            squash_request(
+                source,
+                destination,
+                crate::protocol::PathSelection::All,
+                true,
+            ),
+        )
+        .expect_err("keep_empty squash stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("remainder"),
+            "names remainder: {}",
+            err.message
+        );
+
+        // A sibling of the source needs sibling re-derivation.
+        let (_sibling, _) = seed_child(&store, dhead, None, "sibling");
+        let err = prepare_mutation(
+            &store,
+            session,
+            squash_request(
+                source,
+                destination,
+                crate::protocol::PathSelection::All,
+                false,
+            ),
+        )
+        .expect_err("sibling squash stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("sibling"),
+            "names siblings: {}",
+            err.message
+        );
+    }
+
+    fn abandon_request(targets: Vec<ChangeRef>) -> Request {
+        Request::Abandon(Box::new(WireMutation {
+            request_id: request_id(),
+            args: AbandonArgs {
+                targets,
+                merge: crate::protocol::MergeSelection::default(),
+                workspaces: Vec::new(),
+            },
+        }))
+    }
+
+    #[test]
+    fn abandon_drops_heads_and_reparents_children() {
+        let (_temp, store, session) = fixture();
+        let (thead, tchange, _) = seed_commit(&store, None);
+        let (dhead, dchange) = seed_child(&store, thead, None, "child");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            abandon_request(vec![ChangeRef {
+                change: tchange,
+                head: None,
+            }]),
+        )
+        .expect("abandon prepares");
+        let Reply::Abandon(reply) = prepared.reply else {
+            panic!("abandon must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 1);
+        assert_eq!(reply.rewrites.items[0].old, dhead);
+        assert_eq!(reply.abandoned.items, vec![tchange]);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish abandon");
+        let new_child = reply.rewrites.items[0].new;
+        assert!(commit_parents(&store, &new_child).is_empty());
+        assert_eq!(change_heads(&store, &dchange), vec![new_child]);
+        let _ = thead;
+    }
+
+    #[test]
+    fn abandon_expands_nested_targets() {
+        let (_temp, store, session) = fixture();
+        let (t1head, t1change, _) = seed_commit(&store, None);
+        let (t2head, t2change) = seed_child(&store, t1head, None, "middle");
+        let (dhead, dchange) = seed_child(&store, t2head, None, "leaf");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            abandon_request(vec![
+                ChangeRef {
+                    change: t1change,
+                    head: None,
+                },
+                ChangeRef {
+                    change: t2change,
+                    head: None,
+                },
+            ]),
+        )
+        .expect("nested abandon prepares");
+        let Reply::Abandon(reply) = prepared.reply else {
+            panic!("abandon must answer its own reply");
+        };
+        assert_eq!(reply.rewrites.items.len(), 1);
+        assert_eq!(reply.rewrites.items[0].old, dhead);
+        assert_eq!(reply.abandoned.items.len(), 2);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish nested abandon");
+        let new_leaf = reply.rewrites.items[0].new;
+        assert!(commit_parents(&store, &new_leaf).is_empty());
+        assert_eq!(change_heads(&store, &dchange), vec![new_leaf]);
+    }
+
+    #[test]
+    fn abandon_refusals_name_their_reason() {
+        let (_temp, store, session) = fixture();
+        let (ahead, _, _) = seed_commit(&store, None);
+        let (bhead, _, _) = seed_commit(&store, None);
+        let (mhead, mchange) = seed_child_on_tree(
+            &store,
+            empty_tree_oid(&store),
+            vec![ahead, bhead],
+            None,
+            "merge",
+        );
+        let err = prepare_mutation(
+            &store,
+            session,
+            abandon_request(vec![ChangeRef {
+                change: mchange,
+                head: Some(mhead),
+            }]),
+        )
+        .expect_err("merge target stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("fan-in"),
+            "names fan-in: {}",
+            err.message
+        );
+
+        // A child carrying content over a surviving base needs re-derivation,
+        // not silent keeping. (Orphaning onto no parents keeps the snapshot
+        // soundly, so the abandoned target here is not a root.)
+        let (phead, _, _) = seed_commit(&store, None);
+        let (thead, tchange) = seed_child(&store, phead, None, "target");
+        let full = seed_tree(&store, b'y');
+        let (dhead, dchange) = seed_child_on_tree(&store, full, vec![thead], None, "content child");
+        let err = prepare_mutation(
+            &store,
+            session,
+            abandon_request(vec![ChangeRef {
+                change: tchange,
+                head: None,
+            }]),
+        )
+        .expect_err("content child stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("tree re-derivation"),
+            "names derivation: {}",
+            err.message
+        );
+        let _ = (dhead, dchange);
+    }
+
+    #[test]
+    fn rewrite_workspace_binding_fences_and_advances() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let ws = prepare_mutation_with(
+            &ctx,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w3-test"),
+                    init: WorkspaceInit::Native {
+                        parents: Vec::new(),
+                    },
+                    scope: None,
+                },
+            })),
+        )
+        .expect("ws.new prepares");
+        store
+            .publish(ws.objects, &ws.facts)
+            .expect("publish workspace");
+        let Reply::WsNew(ws_reply) = ws.reply else {
+            panic!("ws.new must answer its own reply");
+        };
+        let binding = WorkspaceBinding {
+            workspace: ws_reply.workspace,
+            expected: ws_reply.state.stamp(),
+        };
+        let ws_change = match &ws_reply.state {
+            WorkspaceState::Native(native) => native.change,
+            WorkspaceState::GitCompat(_) => panic!("native workspace expected"),
+        };
+        // One binding on the rewritten change fences and advances the row.
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::Describe(Box::new(WireMutation {
+                request_id: request_id(),
+                args: DescribeArgs {
+                    target: ChangeRef {
+                        change: ws_change,
+                        head: None,
+                    },
+                    description: ByteString::from("workspace change rewritten"),
+                    identity: None,
+                    workspaces: vec![binding],
+                },
+            })),
+        )
+        .expect("fenced describe prepares");
+        assert_eq!(
+            prepared.workspace_fence,
+            Some((ws_reply.workspace, binding.expected))
+        );
+        let workspace_facts: Vec<_> = prepared
+            .facts
+            .iter()
+            .filter(|fact| fact.table == crate::store::types::FactTable::Workspaces)
+            .collect();
+        assert_eq!(workspace_facts.len(), 1);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish fenced describe");
+
+        // Two bindings exceed the single lane fence.
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::Describe(Box::new(WireMutation {
+                request_id: request_id(),
+                args: DescribeArgs {
+                    target: ChangeRef {
+                        change: ws_change,
+                        head: None,
+                    },
+                    description: ByteString::from("another rewrite"),
+                    identity: None,
+                    workspaces: vec![binding, workspace_binding()],
+                },
+            })),
+        )
+        .expect_err("two bindings stay refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("single workspace fence"),
+            "names the fence: {}",
+            err.message
+        );
     }
 
     #[test]
