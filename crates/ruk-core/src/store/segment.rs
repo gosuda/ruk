@@ -1015,15 +1015,30 @@ impl<R: Read> RecordPayload<R> {
 pub(crate) fn scan_records<S: Read + Seek>(
     src: &mut S,
     records_end: u64,
+    visit: impl FnMut(u64, &RecordHeader),
+) -> Result<u32, SegmentError> {
+    scan_range(src, 0, records_end, visit)
+}
+
+/// CRC32C over the record bytes in `src[start..end)`, with the same
+/// per-record framing, checksum and extent checks [`scan_records`] applies
+/// to the whole extent. Workers in the sharded validation pass each own one
+/// disjoint range; the caller combines their partial CRCs in offset order
+/// and reports the first failing range's error, so the visible result
+/// matches a single sequential pass exactly.
+fn scan_range<S: Read + Seek>(
+    src: &mut S,
+    start: u64,
+    end: u64,
     mut visit: impl FnMut(u64, &RecordHeader),
 ) -> Result<u32, SegmentError> {
-    src.seek(SeekFrom::Start(0))?;
+    src.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::with_capacity(IO_CHUNK, &mut *src);
     let mut scratch = vec![0_u8; IO_CHUNK];
-    let mut offset = 0_u64;
+    let mut offset = start;
     let mut region_crc = 0_u32;
-    while offset < records_end {
-        let left = records_end - offset;
+    while offset < end {
+        let left = end - offset;
         if left < HEADER_LEN_U64 {
             return Err(corrupt(format!(
                 "{left} stray bytes at offset {offset} cannot hold a record header"
@@ -1035,7 +1050,7 @@ pub(crate) fn scan_records<S: Read + Seek>(
         let record_len = header.record_len();
         if record_len > left {
             return Err(corrupt(format!(
-                "record at offset {offset} spans {record_len} bytes but only {left} remain inside the committed record extent {records_end}"
+                "record at offset {offset} spans {record_len} bytes but only {left} remain inside the committed record extent {end}"
             )));
         }
         let mut record_crc = crc32c(&raw[..HEADER_PREFIX_LEN]);
@@ -1056,7 +1071,7 @@ pub(crate) fn scan_records<S: Read + Seek>(
             )));
         }
         visit(offset, &header);
-        // record_len <= left, so this stays within records_end.
+        // record_len <= left, so this stays within end.
         offset += record_len;
     }
     Ok(region_crc)
@@ -1187,6 +1202,222 @@ pub(crate) fn validate_segment_file<S: Read + Seek>(
         records_crc,
         file_len,
     })
+}
+
+/// Largest fan-out of the sharded validation pass. CRC hashing scales
+/// linearly with workers; eight saturate the scan without spawning a thread
+/// per core on large machines. Each worker holds one 64 KiB read buffer and
+/// one 64 KiB CRC scratch, so the extra residency stays near one megabyte
+/// plus the record-offset table.
+const SCAN_SHARDS_MAX: usize = 8;
+/// Smallest record extent that pays for sharded validation. Below this the
+/// sequential pass is sub-millisecond and thread startup would dominate.
+const SCAN_SHARD_MIN_BYTES: u64 = 1024 * 1024;
+
+/// Verifies a segment file against its manifest extents exactly like
+/// [`validate_segment_file`], sharding the record scan across workers when
+/// the extent is large enough to pay for it.
+///
+/// Every check still runs on every open: layout, file length, the seal
+/// footer, each record's framing and checksum, and the footer's records
+/// CRC. Workers own disjoint record ranges and run the same
+/// [`scan_range`] body as the sequential pass; their partial CRCs combine
+/// in offset order with [`crc32c_combine`], and the first failing range in
+/// offset order decides the error, so the visible result matches the
+/// sequential pass byte for byte. Small extents and single-CPU hosts take
+/// the sequential pass directly.
+pub(crate) fn validate_segment_file_concurrent(
+    file: &File,
+    committed_end: u64,
+    records_end: u64,
+    sealed: bool,
+) -> Result<VerifiedSegment, SegmentError> {
+    if records_end < SCAN_SHARD_MIN_BYTES
+        || std::thread::available_parallelism()
+            .map(|width| width.get())
+            .unwrap_or(1)
+            < 2
+    {
+        let mut src = PreadReader::new(file);
+        return validate_segment_file(&mut src, committed_end, records_end, sealed);
+    }
+    validate_segment_layout(committed_end, records_end, sealed)?;
+    let file_len = file.metadata().map_err(SegmentError::from)?.len();
+    if file_len < committed_end {
+        return Err(corrupt(format!(
+            "committed bytes are missing: the file holds {file_len} of {committed_end} bytes"
+        )));
+    }
+    if sealed && file_len != committed_end {
+        return Err(corrupt(format!(
+            "sealed segment holds {} bytes after its footer",
+            file_len - committed_end
+        )));
+    }
+    let footer = if sealed {
+        Some(read_seal_footer_at(file, records_end)?)
+    } else {
+        None
+    };
+    let records_crc = scan_records_sharded(file, records_end)?;
+    if let Some(footer) = footer {
+        if records_crc != footer.records_crc {
+            return Err(corrupt(format!(
+                "seal footer records checksum {:#010x} does not match the recomputed {records_crc:#010x}",
+                footer.records_crc
+            )));
+        }
+    }
+    Ok(VerifiedSegment {
+        records_crc,
+        file_len,
+    })
+}
+
+/// Reads the seal footer at `records_end` positionally and checks it the
+/// same way [`read_seal_footer`] does for a sequential stream.
+fn read_seal_footer_at(file: &File, records_end: u64) -> Result<SealFooter, SegmentError> {
+    records_end.checked_add(FOOTER_LEN_U64).ok_or_else(|| {
+        corrupt(format!(
+            "records extent {records_end} leaves no room for a seal footer"
+        ))
+    })?;
+    let mut raw = [0_u8; FOOTER_LEN];
+    let mut filled = 0_usize;
+    while filled < FOOTER_LEN {
+        let offset = records_end + u64::try_from(filled).map_err(|_| {
+            SegmentError::Capacity(format!(
+                "seal footer read offset {filled} exceeds the addressable length"
+            ))
+        })?;
+        let read = read_at(file, &mut raw[filled..], offset).map_err(SegmentError::from)?;
+        if read == 0 {
+            return Err(corrupt(format!(
+                "truncated seal footer at offset {records_end}"
+            )));
+        }
+        filled += read;
+    }
+    let footer = SealFooter::decode(&raw)?;
+    if footer.records_extent != records_end {
+        return Err(corrupt(format!(
+            "inconsistent sealed extent: the footer records {} but the manifest records {records_end}",
+            footer.records_extent
+        )));
+    }
+    Ok(footer)
+}
+
+/// CRC32C over all record bytes, sharded across workers for large extents.
+///
+/// A single-threaded walk first collects record-boundary offsets (framing
+/// only, no checksums: workers own every check). Records are dealt across
+/// at most [`SCAN_SHARDS_MAX`] workers in contiguous offset order; each
+/// worker runs [`scan_range`] over its own span through its own positional
+/// reader, so no cursor is shared. Partial CRCs combine in offset order and
+/// the first failing span in offset order decides the error, matching the
+/// sequential pass. When the boundary walk stops early on undecodable
+/// framing, the trailing span still starts exactly where the walk stopped,
+/// so its worker reports the same corruption the sequential pass would.
+fn scan_records_sharded(file: &File, records_end: u64) -> Result<u32, SegmentError> {
+    // The caller routes small extents and single-CPU hosts to the
+    // sequential pass; reaching here means sharding pays.
+    let width = std::thread::available_parallelism()
+        .map(|width| width.get())
+        .unwrap_or(2)
+        .min(SCAN_SHARDS_MAX);
+    let mut edges = vec![0_u64];
+    {
+        // Strictly sequential: payloads are drained through scratch instead
+        // of skipped with seeks, because every seek discards the read buffer
+        // and would turn the walk into one file read per record. Workers
+        // re-read their own spans warm from the page cache.
+        let mut reader = BufReader::with_capacity(IO_CHUNK, PreadReader::new(file));
+        let mut drain = vec![0_u8; IO_CHUNK];
+        let mut offset = 0_u64;
+        while offset < records_end {
+            let left = records_end - offset;
+            if left < HEADER_LEN_U64 {
+                break;
+            }
+            let mut raw = [0_u8; HEADER_LEN];
+            if read_exact_or_corrupt(&mut reader, &mut raw, "record header", offset).is_err() {
+                break;
+            }
+            let header = match RecordHeader::decode(&raw, offset) {
+                Ok(header) => header,
+                Err(_) => break,
+            };
+            let record_len = header.record_len();
+            if record_len > left {
+                break;
+            }
+            let Ok(mut to_drain) = usize::try_from(header.payload_len) else {
+                break;
+            };
+            let mut drained_ok = true;
+            while to_drain > 0 {
+                let take = to_drain.min(drain.len());
+                if read_exact_or_corrupt(&mut reader, &mut drain[..take], "record payload", offset)
+                    .is_err()
+                {
+                    drained_ok = false;
+                    break;
+                }
+                to_drain -= take;
+            }
+            if !drained_ok {
+                break;
+            }
+            offset += record_len;
+            edges.push(offset);
+        }
+    }
+    if *edges.last().expect("edges hold the zero offset") != records_end {
+        edges.push(records_end);
+    }
+    let records = edges.len() - 1;
+    let shards = width.min(records).max(1);
+    if shards < 2 {
+        let mut src = PreadReader::new(file);
+        return scan_records(&mut src, records_end, |_, _| ());
+    }
+    let stride = records.div_ceil(shards);
+    let mut bounds = Vec::with_capacity(shards + 1);
+    let mut index = 0_usize;
+    while index < records {
+        bounds.push(edges[index]);
+        index += stride;
+    }
+    bounds.push(records_end);
+    let mut spans = Vec::with_capacity(bounds.len() - 1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(bounds.len() - 1);
+        for window in bounds.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            handles.push(scope.spawn(move || {
+                let mut src = PreadReader::new(file);
+                scan_range(&mut src, start, end, |_, _| {}).map(|crc| (start, end, crc))
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => spans.push(result),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+    });
+    let mut region_crc = 0_u32;
+    for result in spans {
+        let (start, end, part) = result?;
+        let len = usize::try_from(end - start).map_err(|_| {
+            SegmentError::Capacity(format!(
+                "scan span [{start}, {end}) exceeds the addressable length"
+            ))
+        })?;
+        region_crc = crc32c_combine(region_crc, part, len);
+    }
+    Ok(region_crc)
 }
 
 /// The file name of segment `id`: `seg_` and sixteen lowercase hex digits.

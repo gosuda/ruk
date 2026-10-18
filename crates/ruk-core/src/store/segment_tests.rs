@@ -16,7 +16,7 @@ use super::segment::{
     FOOTER_LEN, HEADER_LEN, MAX_RECORD_PAYLOAD, RecordAppended, RecordHeader, RecordPayload,
     SEAL_MAGIC, SEGMENT_TARGET_BYTES, SegmentError, SegmentWriter, read_record_header,
     record_len_for, scan_records, segment_file_name, validate_segment_file,
-    validate_segment_layout, verify_seal,
+    validate_segment_file_concurrent, validate_segment_layout, verify_seal,
 };
 use super::types::{Encoding, ObjectKind};
 
@@ -1498,6 +1498,88 @@ fn real_file_seal_then_verify_then_read() {
     by_ref.read_to_end(&mut got).expect("read");
     by_ref.finish().expect("finish");
     assert_eq!(got, b"abc");
+}
+
+/// Builds just over one megabyte of records so the sharded validation pass
+/// engages, then demands byte-for-byte equivalence with the sequential
+/// pass: same CRC, same length, same `Corrupt` detail on damage, and the
+/// earliest damage reported when two records are damaged.
+fn large_records() -> Vec<Rec> {
+    let spellings = [(1_u8, 0_u8), (3, 3), (5, 1), (4, 1)];
+    (0..700_usize)
+        .map(|i| {
+            let (kind, flags) = spellings[i % spellings.len()];
+            let seed = u8::try_from(i % 251).expect("below 251");
+            (kind, flags, pattern(1500, seed))
+        })
+        .collect()
+}
+
+#[test]
+fn concurrent_validation_matches_sequential_on_large_extents() {
+    let recs = large_records();
+    let scratch = TempFile::new("concurrent");
+    let mut writer = SegmentWriter::fresh(scratch.create_new()).expect("fresh file writer");
+    append_all(&mut writer, &recs);
+    let sealed_end = writer.seal().expect("seal");
+    writer.get_ref().sync_all().expect("sync");
+    drop(writer);
+    let records_end = sealed_end - u64::try_from(FOOTER_LEN).expect("footer fits u64");
+    assert!(records_end > 1024 * 1024, "sharded pass must engage");
+
+    let bytes = std::fs::read(&scratch.0).expect("read back");
+    let sequential = validate_segment_file(
+        &mut Cursor::new(bytes.clone()),
+        sealed_end,
+        records_end,
+        true,
+    )
+    .expect("sequential validates");
+    let file = File::open(&scratch.0).expect("open shared");
+    let concurrent =
+        validate_segment_file_concurrent(&file, sealed_end, records_end, true)
+            .expect("concurrent validates");
+    assert_eq!(concurrent.records_crc, sequential.records_crc);
+    assert_eq!(concurrent.file_len, sequential.file_len);
+
+    // One damaged payload byte: both passes refuse with the same detail.
+    let mut damaged = bytes.clone();
+    let flip_at = usize::try_from(records_end / 2).expect("extent fits usize");
+    damaged[flip_at] ^= 0x01;
+    let sequential_detail = corrupt_detail(validate_segment_file(
+        &mut Cursor::new(damaged.clone()),
+        sealed_end,
+        records_end,
+        true,
+    ));
+    std::fs::write(&scratch.0, &damaged).expect("write damaged");
+    let file = File::open(&scratch.0).expect("open damaged");
+    let concurrent_detail = corrupt_detail(validate_segment_file_concurrent(
+        &file, sealed_end, records_end, true,
+    ));
+    assert_eq!(concurrent_detail, sequential_detail);
+
+    // Two damaged records: both passes report the earlier one.
+    let mut twice = bytes.clone();
+    twice[100] ^= 0x01;
+    let late = usize::try_from(records_end - 100).expect("extent fits usize");
+    twice[late] ^= 0x01;
+    let sequential_detail = corrupt_detail(validate_segment_file(
+        &mut Cursor::new(twice.clone()),
+        sealed_end,
+        records_end,
+        true,
+    ));
+    std::fs::write(&scratch.0, &twice).expect("write twice damaged");
+    let file = File::open(&scratch.0).expect("open twice damaged");
+    let concurrent_detail = corrupt_detail(validate_segment_file_concurrent(
+        &file, sealed_end, records_end, true,
+    ));
+    assert_eq!(concurrent_detail, sequential_detail);
+    assert!(
+        concurrent_detail.contains("at offset 0"),
+        "earliest damage wins, got: {concurrent_detail}"
+    );
 }
 
 #[test]

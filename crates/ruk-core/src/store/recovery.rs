@@ -63,7 +63,7 @@ use super::prepare;
 use super::segment::{self, PreadReader, RecordPayload};
 use super::spool::{PreparationBudget, Spool};
 use super::types::{ObjectLocation, ReadObject, SegmentManifest};
-use super::{SEGMENTS_DIR, StoreError};
+use super::{ProfileClock, SEGMENTS_DIR, StoreError, profile_enabled};
 use crate::ids::{HashKind, Oid};
 
 /// Locators verified per metadata page during recovery.
@@ -318,7 +318,11 @@ fn missing_is_corrupt(err: io::Error, id: u64) -> StoreError {
 /// Verifies every committed segment, truncates uncommitted open-segment
 /// tails, then verifies every committed object identity.
 pub(super) fn run(committed: &Committed<'_>) -> Result<Recovered, StoreError> {
+    let profiling = profile_enabled();
+    let mut clock = ProfileClock::now(profiling);
     let manifests = committed.meta.all_manifests()?;
+    let manifests_ms = clock.elapsed_ms();
+    clock = ProfileClock::now(profiling);
     let mut next_segment_id = 0_u64;
     let mut open: Option<OpenSegment> = None;
     for manifest in &manifests {
@@ -346,10 +350,33 @@ pub(super) fn run(committed: &Committed<'_>) -> Result<Recovered, StoreError> {
             ));
         }
     }
+    let segments_ms = clock.elapsed_ms();
+    clock = ProfileClock::now(profiling);
     let generation = committed.meta.generation()?;
-    if full_verify_forced() || committed.meta.verified_generation()? != Some(generation) {
+    let cached = committed.meta.verified_generation()?;
+    let gen_ms = clock.elapsed_ms();
+    clock = ProfileClock::now(profiling);
+    let mut verify_ms = 0.0;
+    let mut stamp_ms = 0.0;
+    let skipped = !full_verify_forced() && cached == Some(generation);
+    if !skipped {
         verify_objects(committed, generation)?;
+        verify_ms = clock.elapsed_ms();
+        clock = ProfileClock::now(profiling);
         committed.meta.set_verified_generation(generation)?;
+        stamp_ms = clock.elapsed_ms();
+    }
+    if profiling {
+        eprintln!(
+            "[ruk-profile] recovery manifests={:.2}ms segments={:.2}ms gen={:.2}ms verify={:.2}ms stamp={:.2}ms skipped={} nmanifests={}",
+            manifests_ms,
+            segments_ms,
+            gen_ms,
+            verify_ms,
+            stamp_ms,
+            skipped,
+            manifests.len(),
+        );
     }
     Ok(Recovered {
         next_segment_id,
@@ -367,11 +394,11 @@ fn verify_segment(
     let path = committed.segment_path(manifest.id);
     if manifest.sealed {
         // Sealed segments never change, so the cached read-only handle is
-        // exact; positional reads keep the shared cursor untouched.
+        // exact; workers read through their own positional readers, keeping
+        // the shared cursor untouched.
         let cached = committed.open_committed(manifest.id)?;
-        let mut src = PreadReader::new(&cached);
-        return segment::validate_segment_file(
-            &mut src,
+        return segment::validate_segment_file_concurrent(
+            &cached,
             manifest.committed_end,
             manifest.records_end,
             manifest.sealed,
@@ -380,12 +407,12 @@ fn verify_segment(
     }
     // The open segment needs a read-write handle for tail truncation; it
     // must never come from the read-only cache.
-    let mut file = durability::open_existing(&path).map_err(|err| match err {
+    let file = durability::open_existing(&path).map_err(|err| match err {
         StoreError::Io(io_err) => missing_is_corrupt(io_err, manifest.id),
         other => other,
     })?;
-    let verified = segment::validate_segment_file(
-        &mut file,
+    let verified = segment::validate_segment_file_concurrent(
+        &file,
         manifest.committed_end,
         manifest.records_end,
         manifest.sealed,
