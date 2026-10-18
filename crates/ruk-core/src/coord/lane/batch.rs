@@ -14,7 +14,7 @@ use crate::coord::cancel::Cancel;
 use crate::coord::lane::candidate::{InternalCandidate, MutationCandidate};
 use crate::coord::rows;
 use crate::error::CoreError;
-use crate::protocol::Reply;
+use crate::protocol::{Reply, Request};
 use crate::refdata::RefName;
 use crate::store::types::FactTable;
 
@@ -111,14 +111,28 @@ impl BatchItem {
     }
 
     /// Returns `true` if this item mutates or checks claims.
+    ///
+    /// Claim operations seal in the lane at commit time, after batching, so
+    /// their prepared facts carry no Claims keys yet. The request keys
+    /// batching too: without it two acquires (or an acquire and a path
+    /// write) could share one batch and seal against the same pre-batch
+    /// snapshot, committing overlapping enforced claims.
     #[must_use]
     pub(crate) fn touches_claims(&self) -> bool {
-        let facts = match self {
-            Self::Mutation { candidate, .. } => &candidate.facts,
-            Self::Internal { candidate, .. } => &candidate.facts,
-        };
-
-        facts.iter().any(|f| f.table == FactTable::Claims)
+        match self {
+            Self::Mutation { candidate, .. } => {
+                if matches!(
+                    candidate.request,
+                    Request::ClaimAcquire(_) | Request::ClaimRelease(_)
+                ) {
+                    return true;
+                }
+                candidate.facts.iter().any(|f| f.table == FactTable::Claims)
+            }
+            Self::Internal { candidate, .. } => {
+                candidate.facts.iter().any(|f| f.table == FactTable::Claims)
+            }
+        }
     }
 
     /// Completes the item with a pre-publication error.
@@ -257,6 +271,12 @@ impl BatchAccumulator {
                 }
                 if candidate.ref_transaction.is_some() || !candidate.ref_dependencies.is_empty() {
                     self.has_refs = true;
+                }
+                // Semantic claim touch, not just Claims facts: claim
+                // operations seal in the lane after batching, so a fact scan
+                // alone would never mark the batch.
+                if item.touches_claims() {
+                    self.has_claims = true;
                 }
                 if let Some(fence) = candidate.workspace_fence {
                     self.touched_keys

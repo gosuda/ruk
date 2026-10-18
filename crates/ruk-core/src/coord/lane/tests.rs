@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 
 use super::*;
 use crate::bytes::ByteString;
-use crate::change::{RequestId, SessionId, WorkspaceId};
+use crate::change::{ClaimId, RequestId, SessionId, WorkspaceId};
 use crate::coord::cancel::cancellation;
 use crate::coord::clock::Clock;
 use crate::coord::oplog;
@@ -34,9 +34,11 @@ use crate::coord::rows::{self, SessionRow, WorkspaceRow};
 use crate::coord::session::{SessionLive, SessionTable, prepare_open};
 use crate::error::ErrorCode;
 use crate::ids::HashKind;
+use crate::index::RepoPath;
 use crate::protocol::{
-    Method, Mutation, MutationOutcome, ReceiptRef, Reply, Request, RequestDigest, SessionOpenArgs,
-    Timestamp, WorkspaceInit, WsNewArgs, WsNewReply,
+    ClaimAcquireArgs, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimTtl, Method, Mutation,
+    MutationOutcome, ReceiptRef, Reply, Request, RequestDigest, SessionOpenArgs, Timestamp,
+    WorkspaceInit, WsNewArgs, WsNewReply,
 };
 use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject};
 use crate::store::{PreparationBudget, Store, StoreError};
@@ -1168,4 +1170,137 @@ async fn test_12_shutdown_drains_queued_submissions() {
             .expect("submission task joins")
             .expect("queued submission drains instead of failing");
     }
+}
+
+/// Claim acquisitions serialize across batches: two overlapping acquires
+/// never share one batch, so the second seals against the first's committed
+/// record and fails `E_CLAIMED` instead of committing an overlap.
+#[test]
+fn test_12_overlapping_claim_acquires_serialize_across_batches() {
+    fn acquire_candidate(
+        session: &Arc<SessionLive>,
+        principal: &Principal,
+    ) -> (MutationCandidate, ClaimId) {
+        let request_id = RequestId::generate();
+        let claim = ClaimId::generate();
+        let paths = vec![RepoPath::new("src").expect("test path")];
+        let request = Request::ClaimAcquire(Box::new(Mutation {
+            request_id,
+            args: ClaimAcquireArgs {
+                paths: paths.clone(),
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+            },
+        }));
+        let reply = Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+            outcome: MutationOutcome {
+                receipt: ReceiptRef {
+                    session: session.id(),
+                    request_id,
+                    digest: RequestDigest::from_bytes([0; 32]),
+                    replayed: false,
+                    retained_until: Timestamp::new(jiff::Timestamp::now()),
+                },
+                operation: None,
+                heads: crate::protocol::BoundedList::complete(Vec::new()).unwrap(),
+                stamps: crate::protocol::BoundedList::complete(Vec::new()).unwrap(),
+                warnings: crate::protocol::BoundedList::complete(Vec::new()).unwrap(),
+                merge: None,
+                provenance: crate::protocol::BoundedList::complete(Vec::new()).unwrap(),
+                identity: None,
+            },
+            claim: ClaimRecord {
+                claim,
+                holder: session.id(),
+                paths,
+                mode: ClaimMode::Enforce,
+                expires_at: Timestamp::new(jiff::Timestamp::now()),
+            },
+        }));
+        let (handle, cancel) = cancellation();
+        std::mem::forget(handle);
+        let candidate = MutationCandidate::new(
+            Arc::clone(session),
+            principal.clone(),
+            request_id,
+            request,
+            reply,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            cancel,
+            None,
+        )
+        .expect("valid claim candidate");
+        (candidate, claim)
+    }
+
+    let temp = TempRoot::new("claim-serialize");
+    let store = test_store(&temp);
+    let clock = Clock::system();
+    let session_table = SessionTable::new(clock.clone());
+    let principal = Principal::from_peer_uid(1000);
+    let policy_source = PolicySource::open(&temp.store_dir(), principal.clone());
+    let idle = SignedDuration::from_hours(24);
+
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+
+    let (cand1, _) = acquire_candidate(&session1, &principal);
+    let (cand2, _) = acquire_candidate(&session2, &principal);
+    let (tx1, mut rx1) = oneshot::channel();
+    let (tx2, mut rx2) = oneshot::channel();
+    let item1 = BatchItem::Mutation {
+        candidate: Box::new(cand1),
+        reply_tx: Some(tx1),
+    };
+    let item2 = BatchItem::Mutation {
+        candidate: Box::new(cand2),
+        reply_tx: Some(tx2),
+    };
+
+    // Same-batch admission is refused: the second acquire defers.
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&item1));
+    accumulator.add(item1);
+    assert!(
+        !accumulator.can_admit(&item2),
+        "overlapping claim acquire must defer to the next batch"
+    );
+
+    let (handle, cancel) = cancellation();
+    let _keep = std::mem::ManuallyDrop::new(handle);
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        accumulator.drain(),
+        &cancel,
+    )
+    .expect("batch 1 commits");
+    rx1.try_recv()
+        .expect("first acquire answers")
+        .expect("first acquire seals");
+
+    // Against the committed record the deferred acquire is claimed.
+    let mut accumulator2 = BatchAccumulator::new();
+    assert!(accumulator2.can_admit(&item2));
+    accumulator2.add(item2);
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        accumulator2.drain(),
+        &cancel,
+    )
+    .expect("batch 2 runs");
+    let err = rx2
+        .try_recv()
+        .expect("second acquire answers")
+        .expect_err("overlapping acquire is claimed");
+    assert_eq!(err.code, ErrorCode::EClaimed);
 }

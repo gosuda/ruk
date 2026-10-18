@@ -634,10 +634,7 @@ fn path_prefix(path: &[u8]) -> Vec<u8> {
 ///
 /// Read-only, so preparation may call it to predict its pending reply; the
 /// lane re-reads authoritatively at commit time.
-pub(crate) fn read_record(
-    store: &Store,
-    claim: ClaimId,
-) -> Result<Option<ClaimRecord>, CoreError> {
+pub(crate) fn read_record(store: &Store, claim: ClaimId) -> Result<Option<ClaimRecord>, CoreError> {
     Ok(read_claim(store, claim)?.map(|(_, row)| row.record))
 }
 
