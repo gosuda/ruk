@@ -302,6 +302,8 @@ pub fn ingest_pack<R: Read>(
         kind.gix(),
     )
     .map_err(|err| corrupt(format!("pack header is malformed: {err}")))?;
+    let profile = std::env::var_os("RUK_PROFILE").is_some_and(|value| value == "1");
+    let ingest_start = profile.then(std::time::Instant::now);
     let mut raw: Vec<RawEntry> = Vec::new();
     let mut compressed_total = 0u64;
     for item in iter {
@@ -339,21 +341,161 @@ pub fn ingest_pack<R: Read>(
             declared: entry.decompressed_size,
         });
     }
+    let stream_ms = ingest_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    let resolve_start = profile.then(std::time::Instant::now);
     let resolved = resolve_all(&raw, kind, store, limits, interrupt)?;
-    let mut oids = Vec::with_capacity(resolved.len());
-    let mut objects = Vec::with_capacity(resolved.len());
-    let mut payloads = HashMap::with_capacity(resolved.len());
-    for (oid, kind, bytes) in &resolved {
+    let resolve_ms = resolve_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    let stage_start = profile.then(std::time::Instant::now);
+    // CPU-heavy staging (hash plus zstd in `Store::prepare`) fans out
+    // across workers and rejoins in pack order; the serial loop below
+    // applies the first error in pack order, exactly as before.
+    let staged = stage_resolved(store, &resolved, interrupt);
+    let entry_count = resolved.len();
+    let mut oids = Vec::with_capacity(entry_count);
+    let mut objects = Vec::with_capacity(entry_count);
+    let mut payloads = HashMap::with_capacity(entry_count);
+    for ((oid, kind, bytes), staged) in resolved.into_iter().zip(staged) {
         interrupt.check("staging the pack")?;
-        objects.push(stage_object(store, *kind, bytes, Some(*oid))?);
-        oids.push(*oid);
-        payloads.insert(*oid, (*kind, bytes.clone()));
+        objects.push(staged?);
+        oids.push(oid);
+        payloads.insert(oid, (kind, bytes));
+    }
+    if let Some(start) = ingest_start {
+        eprintln!(
+            "[ruk-profile] ingest_pack entries={entry_count} stream={stream_ms:.1}ms resolve={resolve_ms:.1}ms stage={:.1}ms total={:.1}ms",
+            stage_start
+                .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
     }
     Ok(StagedPack {
         oids,
         objects,
         payloads,
     })
+}
+
+/// Prepares every resolved entry across `pack_threads` workers: hashing
+/// and zstd compression per object. The returned vector aligns 1:1 with
+/// `resolved`; the caller rejoins it in order. `Store::prepare` is
+/// thread-safe (the import lane already stages from scoped workers
+/// against the shared budget and uniquely named scratch spools).
+fn stage_resolved(
+    store: &Store,
+    resolved: &[(Oid, ObjectKind, Vec<u8>)],
+    interrupt: &Interrupt,
+) -> Vec<Result<PreparedObject, GitError>> {
+    fn stage_one(
+        store: &Store,
+        entry: &(Oid, ObjectKind, Vec<u8>),
+        interrupt: &Interrupt,
+    ) -> Result<PreparedObject, GitError> {
+        interrupt.check("staging the pack")?;
+        stage_object(store, entry.1, &entry.2, Some(entry.0))
+    }
+
+    let width = pack_threads();
+    if width <= 1 || resolved.len() <= 1 {
+        return resolved
+            .iter()
+            .map(|entry| stage_one(store, entry, interrupt))
+            .collect();
+    }
+    let piece = resolved.len().div_ceil(width);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in resolved.chunks(piece) {
+            handles.push(scope.spawn(move || {
+                part.iter()
+                    .map(|entry| stage_one(store, entry, interrupt))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut staged = Vec::with_capacity(resolved.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => staged.extend(part),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        staged
+    })
+}
+
+/// Inflates and hashes every base-kind entry, leaving deltas for the
+/// serial fixpoint. Workers return `(index, kind, bytes)` triples; the
+/// caller applies them through [`Resolver::finish`] in index order, so a
+/// corrupt entry surfaces in pack order. Narrow packs stay serial.
+fn pre_resolve_independent(resolver: &mut Resolver<'_>, interrupt: &Interrupt) -> Result<(), GitError> {
+    let independent: Vec<(usize, ObjectKind)> = resolver
+        .raw
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| pack_kind(&entry.header).map(|kind| (index, kind)))
+        .collect();
+    if independent.len() < 2 {
+        return Ok(());
+    }
+    let width = pack_threads();
+    let staged: Vec<Result<(usize, ObjectKind, Vec<u8>), GitError>> =
+        if width <= 1 || independent.len() < 32 {
+            independent
+                .iter()
+                .map(|(index, kind)| {
+                    interrupt.check("resolving pack deltas")?;
+                    inflate(
+                        &resolver.raw[*index].compressed,
+                        resolver.raw[*index].declared,
+                        resolver.limits.max_object_bytes,
+                    )
+                    .map(|bytes| (*index, *kind, bytes))
+                })
+                .collect()
+        } else {
+            let piece = independent.len().div_ceil(width);
+            let raw = &resolver.raw;
+            let max_object_bytes = resolver.limits.max_object_bytes;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for part in independent.chunks(piece) {
+                    handles.push(scope.spawn(move || {
+                        part.iter()
+                            .map(|(index, kind)| {
+                                if interrupt.check("resolving pack deltas").is_err() {
+                                    return Err(GitError::Cancelled {
+                                        detail: "resolving pack deltas was cancelled".to_owned(),
+                                    });
+                                }
+                                inflate(
+                                    &raw[*index].compressed,
+                                    raw[*index].declared,
+                                    max_object_bytes,
+                                )
+                                .map(|bytes| (*index, *kind, bytes))
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                }
+                let mut staged = Vec::with_capacity(independent.len());
+                for handle in handles {
+                    match handle.join() {
+                        Ok(part) => staged.extend(part),
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }
+                }
+                staged
+            })
+        };
+    for entry in staged {
+        let (index, kind, bytes) = entry?;
+        resolver.finish(index, kind, bytes)?;
+    }
+    Ok(())
 }
 
 enum Resolution {
@@ -397,6 +539,11 @@ fn resolve_all(
         store,
         limits,
     };
+    // Base-kind entries need no delta base: inflate and hash them across
+    // workers, rejoining in index order. Delta entries (and whole thin
+    // packs) fall through to the serial fixpoint below with their bases
+    // already cached. Pure per entry: no store reads, no shared state.
+    pre_resolve_independent(&mut resolver, interrupt)?;
     let mut deferred: HashSet<usize> = (0..raw.len()).collect();
     while !deferred.is_empty() {
         interrupt.check("resolving pack deltas")?;
@@ -855,6 +1002,110 @@ pub fn write_thin_pack<W: Write>(
     write_pack_inner(out, kind, entries, true, interrupt)
 }
 
+/// Compression workers: twin of `import::walk::import_threads`, kept local
+/// so the transport layer does not depend on the import lane.
+pub(crate) fn pack_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|width| width.get())
+        .unwrap_or(1)
+        .min(16)
+}
+
+/// One entry framed and compressed, ready for serial assembly.
+struct StagedEntry {
+    header_bytes: Vec<u8>,
+    base_prefix: Vec<u8>,
+    compressed: Vec<u8>,
+}
+
+/// Frames and compresses every entry across `pack_threads` workers. Pure
+/// per entry (delta selection, header encoding, zlib deflate); the
+/// returned vector aligns 1:1 with `entries`, so the serial assembly in
+/// [`write_pack_inner`] applies the first error in entry order, exactly as
+/// the serial loop would. A cancelled wave finishes its in-flight entries
+/// before the rejoin reports it; nothing is written until assembly.
+fn compress_entries(
+    entries: &[PackEntry<'_>],
+    thin: bool,
+    interrupt: &Interrupt,
+) -> Vec<Result<StagedEntry, GitError>> {
+    fn stage_one(
+        entry: &PackEntry<'_>,
+        thin: bool,
+        interrupt: &Interrupt,
+    ) -> Result<StagedEntry, GitError> {
+        interrupt.check("writing the pack")?;
+        let type_id = pack_type_id(entry.kind)?;
+        // Pack entry headers declare the *decompressed* size. For a thin
+        // REF_DELTA the base object id travels between the header and the
+        // compressed delta, never inside the compressed payload.
+        let mut base_prefix = Vec::new();
+        let (emit_type, payload) = match (thin, entry.base) {
+            (true, Some((base_oid, base_bytes))) => {
+                let delta = encode_delta(base_bytes, entry.bytes);
+                if delta.len() < entry.bytes.len() {
+                    base_prefix.extend_from_slice(base_oid.as_bytes());
+                    (7u8, delta)
+                } else {
+                    (type_id, entry.bytes.to_vec())
+                }
+            }
+            _ => (type_id, entry.bytes.to_vec()),
+        };
+        let compressed = deflate(&payload)?;
+        let declared = payload.len();
+        // The mask bounds the value to four bits, so the narrowing cast is exact.
+        let mut first = (emit_type << 4) | ((declared & 0x0f) as u8);
+        let mut size = declared;
+        size >>= 4;
+        if size != 0 {
+            first |= 0x80;
+        }
+        let mut header_bytes = vec![first];
+        while size != 0 {
+            // The mask bounds the value to seven bits, so the narrowing cast is exact.
+            let mut byte = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                byte |= 0x80;
+            }
+            header_bytes.push(byte);
+        }
+        Ok(StagedEntry {
+            header_bytes,
+            base_prefix,
+            compressed,
+        })
+    }
+
+    let width = pack_threads();
+    if width <= 1 || entries.len() <= 1 {
+        return entries
+            .iter()
+            .map(|entry| stage_one(entry, thin, interrupt))
+            .collect();
+    }
+    let piece = entries.len().div_ceil(width);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in entries.chunks(piece) {
+            handles.push(scope.spawn(move || {
+                part.iter()
+                    .map(|entry| stage_one(entry, thin, interrupt))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut staged = Vec::with_capacity(entries.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => staged.extend(part),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        staged
+    })
+}
+
 fn write_pack_inner<W: Write>(
     out: &mut W,
     kind: HashKind,
@@ -876,56 +1127,24 @@ fn write_pack_inner<W: Write>(
     header[8..12].copy_from_slice(&count.to_be_bytes());
     hasher.update(&header);
     out.write_all(&header).map_err(io)?;
+    // Byte assembly stays serial: the pack hash chains every byte in
+    // entry order, so only the compression above fans out.
+    let staged = compress_entries(entries, thin, interrupt);
     let mut offset = 12u64;
     let mut index = Vec::with_capacity(entries.len());
-    for entry in entries {
-        interrupt.check("writing the pack")?;
-        let type_id = pack_type_id(entry.kind)?;
-        // Pack entry headers declare the *decompressed* size. For a thin
-        // REF_DELTA the base object id travels between the header and the
-        // compressed delta, never inside the compressed payload.
-        let mut base_prefix = Vec::new();
-        let (emit_type, payload) = match (thin, entry.base) {
-            (true, Some((base_oid, base_bytes))) => {
-                let delta = encode_delta(base_bytes, entry.bytes);
-                if delta.len() < entry.bytes.len() {
-                    base_prefix.extend_from_slice(base_oid.as_bytes());
-                    (7u8, delta)
-                } else {
-                    (type_id, entry.bytes.to_vec())
-                }
-            }
-            _ => (type_id, entry.bytes.to_vec()),
-        };
-        let compressed = deflate(&payload)?;
+    for (entry, staged) in entries.iter().zip(staged) {
+        let staged = staged?;
         let entry_offset = offset;
-        let declared = payload.len();
-        // The mask bounds the value to four bits, so the narrowing cast is exact.
-        let mut first = (emit_type << 4) | ((declared & 0x0f) as u8);
-        let mut size = declared;
-        size >>= 4;
-        if size != 0 {
-            first |= 0x80;
+        hasher.update(&staged.header_bytes);
+        out.write_all(&staged.header_bytes).map_err(io)?;
+        if !staged.base_prefix.is_empty() {
+            hasher.update(&staged.base_prefix);
+            out.write_all(&staged.base_prefix).map_err(io)?;
         }
-        let mut header_bytes = vec![first];
-        while size != 0 {
-            // The mask bounds the value to seven bits, so the narrowing cast is exact.
-            let mut byte = (size & 0x7f) as u8;
-            size >>= 7;
-            if size != 0 {
-                byte |= 0x80;
-            }
-            header_bytes.push(byte);
-        }
-        hasher.update(&header_bytes);
-        out.write_all(&header_bytes).map_err(io)?;
-        if !base_prefix.is_empty() {
-            hasher.update(&base_prefix);
-            out.write_all(&base_prefix).map_err(io)?;
-        }
-        hasher.update(&compressed);
-        out.write_all(&compressed).map_err(io)?;
-        let entry_len = (header_bytes.len() + base_prefix.len() + compressed.len()) as u64;
+        hasher.update(&staged.compressed);
+        out.write_all(&staged.compressed).map_err(io)?;
+        let entry_len =
+            (staged.header_bytes.len() + staged.base_prefix.len() + staged.compressed.len()) as u64;
         offset += entry_len;
         index.push(PackedEntry {
             oid: entry.oid,
