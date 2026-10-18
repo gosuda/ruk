@@ -20,17 +20,58 @@ use super::{
 };
 use ruk_core::bytes::ByteString;
 use ruk_core::change::{LeaseId, OperationId, RequestId, SessionId, StoreId};
+use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
+use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
     BookmarkSetArgs, BookmarkTarget, IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor,
     PageLimit, PageRequest, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope, StatusArgs,
     TagAnnotation, TagSetArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefTarget};
+use ruk_core::store::{ObjectKind, PreparationBudget, Store};
 
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
+
+/// Mints one stored commit directly in the repository store and closes the
+/// handle before the daemon opens it, so dispatch-time reads see committed
+/// state with only one live handle at a time.
+fn seed_commit(repo_dir: &PathBuf) -> Oid {
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let tree = store
+        .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
+        .expect("prepare empty tree");
+    let tree_oid = tree.oid();
+    store.publish(vec![tree], &[]).expect("publish empty tree");
+    let signature = Signature {
+        name: ByteString::from("Tag"),
+        email: ByteString::from("tag@example.invalid"),
+        timestamp: 1_700_000_000,
+        offset: TzOffset::UTC,
+    };
+    let prepared = prepare_new(
+        &store,
+        NewRequest {
+            tree: tree_oid,
+            parents: Vec::new(),
+            author: signature.clone(),
+            committer: signature,
+            message: ByteString::from("seed"),
+            change_id: None,
+            predecessor: None,
+            provenance: None,
+        },
+    )
+    .expect("prepare seed commit");
+    let oid = prepared.output.oid.expect("seed commit is a Git commit");
+    store
+        .publish(prepared.objects, &prepared.facts)
+        .expect("publish seed commit");
+    oid
+}
 
 /// Creates an empty temp directory for one test.
 fn temp_root(case: &str) -> PathBuf {
@@ -821,12 +862,15 @@ async fn typed_dispatch_serves_annotated_tag_set() {
         .to_string();
     let repo = store_repo;
 
+    // An annotated tag renders `type commit`, so the target must be a stored
+    // commit before the session opens and the daemon binds the store.
+    let target = seed_commit(&repo_dir);
+
     let payload = Driver::typed_open(&repo, "session.open", None, None, None);
     let (stdout, _) = driver.run_typed(3, &payload).await;
     let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
     let session = opened.session.to_string();
 
-    let target = Oid::from_bytes(&[0x11; 20]).expect("tag target");
     let tag_args = TagSetArgs {
         name: RefName::new("refs/tags/v1").expect("tag name"),
         target,

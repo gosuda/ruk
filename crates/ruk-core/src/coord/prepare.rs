@@ -55,6 +55,7 @@ use crate::attestation::{Checkpoint, prepare_add};
 use crate::change::{RequestId, SessionId};
 use crate::conflict::TzOffset;
 use crate::error::{CoreError, ErrorCode};
+use crate::heads::Head;
 use crate::ids::Oid;
 use crate::protocol::{
     AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply, BookmarkResolution,
@@ -508,6 +509,18 @@ fn tag_set_parts(
         .ok_or_else(|| {
             CoreError::new(ErrorCode::EInvalid, "a tag name must live under refs/tags/")
         })?;
+    // An annotated tag object declares `type commit`: the target must be a
+    // stored commit, the way `pin` refuses unstored heads, so a tag never
+    // renders a commit header for bytes the store cannot serve.
+    if Records::new(store)
+        .get_commit(&Head::Git { oid: args.target })?
+        .is_none()
+    {
+        return Err(CoreError::new(
+            ErrorCode::ENotFound,
+            format!("tag target {} is not a stored commit", args.target),
+        ));
+    }
     let secs = clock.sample()?.timestamp().instant().as_second();
     let payload = tag_payload(
         args.target,
@@ -1174,7 +1187,9 @@ mod tests {
             name: "Ses".to_string(),
             email: "ses@example.invalid".to_string(),
         }));
-        let target = oid(0x11);
+        // The annotated arm renders `type commit`, so the target must be a
+        // stored commit; an unstored target is `E_NOT_FOUND` (see below).
+        let (_, _, target) = seed_commit(&store, None);
 
         // An explicit tagger wins over the session identity, and the staged
         // object hashes exactly to the canonical payload.
@@ -1255,6 +1270,29 @@ mod tests {
             .expect("hash tag payload");
         assert_eq!(prepared.objects.len(), 1);
         assert_eq!(prepared.objects[0].oid(), expected_oid);
+
+        // An unstored target never reaches tagger rendering: the commit
+        // check reports it first.
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::TagSet(Box::new(WireMutation {
+                request_id: request_id(),
+                args: TagSetArgs {
+                    name: name("refs/tags/v4"),
+                    target: oid(0x99),
+                    annotation: Some(TagAnnotation {
+                        tagger: Some(IdentityClaim {
+                            name: "Tag".to_string(),
+                            email: "tag@example.invalid".to_string(),
+                        }),
+                        message: ByteString::from("ghost"),
+                    }),
+                    expected: RefExpect::Absent,
+                },
+            })),
+        )
+        .expect_err("unstored tag target is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
 
         // With neither identity the call is invalid, not hosted: there is
         // no configuration ladder for the coordinator to consult.
