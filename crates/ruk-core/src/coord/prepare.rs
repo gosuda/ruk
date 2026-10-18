@@ -3221,8 +3221,8 @@ fn undo_parts(
         reply: Reply::Undo(Box::new(reply)),
         objects: Vec::new(),
         facts: plan.facts,
-        transaction: None,
-        dependencies: Vec::new(),
+        transaction: plan.ref_transaction,
+        dependencies: plan.ref_dependencies,
         fence: None,
     })
 }

@@ -20,6 +20,8 @@ use crate::coord::oplog::{OpDeltaReader, read_header, tracked};
 use crate::coord::rows::{OpHeader, fact_table_from_name};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Method, Request, UndoSummary};
+use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
+use crate::refs::StoreRefs;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
 
@@ -30,6 +32,11 @@ pub(crate) struct UndoPlan {
     pub(crate) facts: Vec<FactMutation>,
     /// Keys restored, counted by table.
     pub(crate) summary: UndoSummary,
+    /// The checked ref transaction when the inverse moves refs, re-checked by
+    /// the lane at publication like every live ref mutation.
+    pub(crate) ref_transaction: Option<RefTransaction>,
+    /// Ref names the transaction was validated against.
+    pub(crate) ref_dependencies: Vec<RefName>,
 }
 
 /// The operation an `undo` request inverts; every other request inverts none.
@@ -76,6 +83,8 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
             changes: 0,
             workspaces: 0,
         },
+        ref_transaction: None,
+        ref_dependencies: Vec::new(),
     };
     for ((table_name, key), (before, after)) in net {
         if before == after {
@@ -95,7 +104,68 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
         });
     }
     refuse_diverged(store, operation, &plan.facts)?;
+    let (transaction, dependencies) = undo_ref_transaction(store, &plan.facts)?;
+    plan.ref_transaction = transaction;
+    plan.ref_dependencies = dependencies;
     Ok(plan)
+}
+
+/// Lowers the inverse's Refs facts to a checked [`RefTransaction`] with its
+/// dependency names: the same namespace checks (directory/file collisions,
+/// symbolic-ref cycles and depth, judged against current state) live ref
+/// mutations run. The lane re-checks the transaction at publication, so a ref
+/// created beside the restored name after prepare still refuses. Returns
+/// `(None, [])` when the inverse moves no ref.
+///
+/// # Errors
+/// - [`ErrorCode::ECorrupt`] for a ref key or target that fails to decode.
+/// - The [`RefTransaction`] check failures, as for live ref mutations.
+fn undo_ref_transaction(
+    store: &Store,
+    facts: &[FactMutation],
+) -> Result<(Option<RefTransaction>, Vec<RefName>), CoreError> {
+    let mut updates = Vec::new();
+    for fact in facts {
+        if fact.table != FactTable::Refs {
+            continue;
+        }
+        let name = RefName::new(&fact.key).map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("undone operation names an invalid ref key: {err}"),
+            )
+        })?;
+        let expected = match &fact.expected {
+            FactExpectation::Value(after) => RefExpect::Present(decode_ref_target(store, after)?),
+            FactExpectation::Absent => RefExpect::Absent,
+            FactExpectation::Any => RefExpect::Any,
+        };
+        let change = match &fact.value {
+            Some(before) => RefChange::Set(decode_ref_target(store, before)?),
+            None => RefChange::Delete,
+        };
+        updates.push(RefUpdate {
+            name,
+            expected,
+            change,
+        });
+    }
+    if updates.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let dependencies = updates.iter().map(|update| update.name.clone()).collect();
+    let transaction =
+        RefTransaction::new(store.hash_kind(), updates).map_err(CoreError::from)?;
+    transaction.check(&StoreRefs::new(store)).map_err(CoreError::from)?;
+    Ok((Some(transaction), dependencies))
+}
+
+/// Decodes one stored ref target from an operation delta.
+///
+/// # Errors
+/// [`ErrorCode::ECorrupt`] for bytes that are not an encoded [`RefTarget`].
+fn decode_ref_target(store: &Store, bytes: &[u8]) -> Result<RefTarget, CoreError> {
+    crate::store::decode("ref target", bytes).map_err(CoreError::from)
 }
 
 /// Classifies every method. Methods whose effects reach outside the tracked
@@ -224,7 +294,8 @@ mod tests {
     use super::*;
     use crate::change::{CheckedOperationId, SessionId};
     use crate::coord::oplog::{self, OpMeta};
-    use crate::ids::HashKind;
+    use crate::ids::{HashKind, Oid};
+    use crate::refdata::RefTarget;
     use crate::protocol::Timestamp;
     use crate::store::PreparationBudget;
 
@@ -288,21 +359,60 @@ mod tests {
         }
     }
 
+    fn ref_target(n: u8) -> Vec<u8> {
+        let oid = Oid::from_hex(&format!("{n:040x}")).expect("test oid");
+        crate::store::encode("ref target", &RefTarget::Direct(oid)).expect("encode test target")
+    }
+
     #[test]
     fn undo_expects_each_after_value_and_writes_the_before_value() {
         let fixture = Fixture::new("inverse");
-        let id = fixture.record(Method::BookmarkSet, &[ref_set(b"refs/heads/main", b"new")]);
+        let created = ref_target(1);
+        let id = fixture.record(Method::BookmarkSet, &[ref_set(b"refs/heads/main", &created)]);
         let plan = prepare_undo(&fixture.store, id).expect("undo prepares");
         assert_eq!(plan.facts.len(), 1);
         let fact = &plan.facts[0];
         assert_eq!(fact.table, FactTable::Refs);
         assert_eq!(fact.key, b"refs/heads/main".to_vec());
         assert!(
-            matches!(&fact.expected, FactExpectation::Value(after) if after == b"new"),
+            matches!(&fact.expected, FactExpectation::Value(after) if after == &created),
             "expects the operation's after value"
         );
         assert_eq!(fact.value, None, "a created key is removed again");
         assert_eq!(plan.summary.refs, 1);
+        let transaction = plan.ref_transaction.as_ref().expect("undo carries a ref transaction");
+        assert_eq!(transaction.updates().len(), 1);
+        assert_eq!(
+            plan.ref_dependencies,
+            vec![RefName::new(b"refs/heads/main").expect("test name")],
+            "the lane re-checks the restored name at publication"
+        );
+    }
+
+    #[test]
+    fn undo_refuses_a_restored_ref_beside_a_live_child() {
+        let fixture = Fixture::new("ref-clash");
+        let deleted = ref_target(1);
+        let id = fixture.record(
+            Method::BookmarkDelete,
+            &[FactMutation {
+                table: FactTable::Refs,
+                key: b"refs/heads/a".to_vec(),
+                expected: FactExpectation::Value(deleted.clone()),
+                value: None,
+            }],
+        );
+        fixture
+            .store
+            .publish(Vec::new(), &[ref_set(b"refs/heads/a/b", &ref_target(2))])
+            .expect("a sibling ref lands");
+        let err = prepare_undo(&fixture.store, id).expect_err("directory/file clash refuses");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        assert!(
+            err.message.contains("refs/heads/a"),
+            "names the clashing ref: {}",
+            err.message
+        );
     }
 
     #[test]
