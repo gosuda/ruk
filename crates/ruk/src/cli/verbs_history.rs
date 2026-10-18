@@ -21,7 +21,7 @@
 //! `git/builtin/diff.c`, `git/builtin/merge-base.c`,
 //! `git/builtin/rev-list.c`, `git/builtin/rev-parse.c`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::Signature;
@@ -36,9 +36,10 @@ use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
 use super::state::{
-    IdentityRole, commit_record, head_oid, identity, is_ancestor, list_refs, load_or_default,
-    merge_base as state_merge_base, merged_rows, now_seconds, read_path_rows, read_ref,
-    resolve_rev, scan_index, sequencer_read, walk_history, workspace_mutation,
+    IdentityRole, PendingCommit, commit_record, enqueue, head_oid, identity, is_ancestor,
+    list_refs, load_or_default, merge_base as state_merge_base, merged_rows, now_seconds,
+    read_path_rows, read_ref, resolve_rev, scan_index, sequencer_read, walk_history,
+    workspace_mutation,
 };
 use super::tree::{
     WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree, read_object_bytes,
@@ -775,7 +776,7 @@ fn commit_parents(store: &Store, oid: Oid) -> Result<Vec<Oid>, GitError> {
         .collect())
 }
 
-/// Walks `tips` newest-first while skipping `exclude` and everything
+/// Walks `tips` in `git log` order while skipping `exclude` and everything
 /// reachable from it, mirroring [`walk_history`] otherwise.
 fn walk_history_excluding(
     store: &Store,
@@ -801,24 +802,30 @@ fn walk_history_excluding(
             }
         }
     }
-    let mut queue: Vec<Oid> = tips.to_vec();
+    let mut pending: HashMap<Oid, CommitRecord> = HashMap::new();
+    let mut heap: BinaryHeap<PendingCommit> = BinaryHeap::new();
+    let mut seq: u64 = 0;
+    for tip in tips {
+        enqueue(&records, &mut seen, &mut pending, &mut heap, &mut seq, *tip)?;
+    }
     let mut out = Vec::new();
-    while let Some(oid) = queue.pop() {
-        if !seen.insert(oid) {
+    while let Some(next) = heap.pop() {
+        let oid = next.oid();
+        let Some(record) = pending.remove(&oid) else {
             continue;
-        }
-        let record = records
-            .get_commit(&Head::Git { oid })
-            .map_err(GitError::from)?
-            .ok_or_else(|| GitError::NotFound {
-                detail: format!("object {} is not a stored commit", oid.to_hex()),
-            })?;
+        };
         for parent in record.parents() {
-            if let Some(parent_oid) = parent.as_git().copied() {
-                if !seen.contains(&parent_oid) {
-                    queue.push(parent_oid);
-                }
-            }
+            let Some(parent_oid) = parent.as_git().copied() else {
+                continue;
+            };
+            enqueue(
+                &records,
+                &mut seen,
+                &mut pending,
+                &mut heap,
+                &mut seq,
+                parent_oid,
+            )?;
         }
         out.push((oid, record));
         if limit.is_some_and(|max| out.len() >= max) {
@@ -1724,7 +1731,7 @@ pub(crate) fn revert(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     })
 }
 
-/// Shows commit logs from tips, newest discovered first.
+/// Shows commit logs from tips, newest committer-date first.
 ///
 /// Oracle: `git/builtin/log.c` (`cmd_log`). Decorations stay off unless
 /// `--decorate` is given: git's `auto` default shows them only on a

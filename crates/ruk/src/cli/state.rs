@@ -17,7 +17,7 @@
 //! records live in `FactTable::Pins`, the table with no typed readers, under
 //! `cli/` prefixes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::{Signature, TzOffset};
@@ -811,33 +811,122 @@ pub(crate) fn read_commit(
     Ok((oid, record))
 }
 
-/// Collects every ancestor of `tips`, newest-first by discovery order.
+/// One queued commit in a date-ordered history walk: committer timestamp
+/// plus insertion sequence. The heap pops the newest timestamp first;
+/// equal timestamps pop in push order, so the first parent wins ties.
+#[derive(PartialEq, Eq)]
+pub(crate) struct PendingCommit {
+    stamp: i64,
+    seq: u64,
+    oid: Oid,
+}
+
+impl PendingCommit {
+    /// The queued commit this entry represents.
+    pub(crate) const fn oid(&self) -> Oid {
+        self.oid
+    }
+}
+
+impl Ord for PendingCommit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.stamp
+            .cmp(&other.stamp)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for PendingCommit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Best-effort committer timestamp for walk ordering. An unparsable ident
+/// sorts before every real commit instead of failing the walk; rendering
+/// still reports the raw bytes it cannot parse.
+pub(crate) fn commit_stamp(record: &CommitRecord) -> i64 {
+    record
+        .committer()
+        .map(|sig| sig.timestamp)
+        .unwrap_or(i64::MIN)
+}
+
+/// Fetches one commit record for a history walk, naming the missing object
+/// the way the walk callers report it.
+pub(crate) fn walk_record(records: &Records<'_>, oid: Oid) -> Result<CommitRecord, GitError> {
+    records
+        .get_commit(&Head::Git { oid })
+        .map_err(GitError::from)?
+        .ok_or_else(|| GitError::NotFound {
+            detail: format!("object {} is not a stored commit", oid.to_hex()),
+        })
+}
+
+/// Queues one unseen commit for a date-ordered walk, fetching its record
+/// for the timestamp key. Already-seen oids are a no-op.
+pub(crate) fn enqueue(
+    records: &Records<'_>,
+    seen: &mut HashSet<Oid>,
+    pending: &mut HashMap<Oid, CommitRecord>,
+    heap: &mut BinaryHeap<PendingCommit>,
+    seq: &mut u64,
+    oid: Oid,
+) -> Result<(), GitError> {
+    if !seen.insert(oid) {
+        return Ok(());
+    }
+    let record = walk_record(records, oid)?;
+    heap.push(PendingCommit {
+        stamp: commit_stamp(&record),
+        seq: *seq,
+        oid,
+    });
+    *seq += 1;
+    pending.insert(oid, record);
+    Ok(())
+}
+
+/// Collects every ancestor of `tips` in `git log` order: committer-date
+/// descending, ties by discovery order.
+///
+/// This mirrors git's default revision walk: a max-heap on committer
+/// timestamp into which a parent enters only once one of its children has
+/// been emitted. Unrelated branches therefore interleave strictly by date
+/// while a child always precedes its parents; equal timestamps keep
+/// first-parent-first discovery order. Callers that only need the reachable
+/// set (merge-base search, object sweeps) are unaffected by the ordering.
 pub(crate) fn walk_history(
     store: &Store,
     tips: &[Oid],
     limit: Option<usize>,
 ) -> Result<Vec<(Oid, CommitRecord)>, GitError> {
     let records = Records::new(store);
-    let mut seen: HashMap<Oid, bool> = HashMap::new();
-    let mut queue: Vec<Oid> = tips.to_vec();
+    let mut seen: HashSet<Oid> = HashSet::new();
+    let mut pending: HashMap<Oid, CommitRecord> = HashMap::new();
+    let mut heap: BinaryHeap<PendingCommit> = BinaryHeap::new();
+    let mut seq: u64 = 0;
+    for tip in tips {
+        enqueue(&records, &mut seen, &mut pending, &mut heap, &mut seq, *tip)?;
+    }
     let mut out = Vec::new();
-    while let Some(oid) = queue.pop() {
-        if seen.contains_key(&oid) {
+    while let Some(next) = heap.pop() {
+        let oid = next.oid;
+        let Some(record) = pending.remove(&oid) else {
             continue;
-        }
-        seen.insert(oid, true);
-        let record = records
-            .get_commit(&Head::Git { oid })
-            .map_err(GitError::from)?
-            .ok_or_else(|| GitError::NotFound {
-                detail: format!("object {} is not a stored commit", oid.to_hex()),
-            })?;
+        };
         for parent in record.parents() {
-            if let Some(parent_oid) = head_oid_of(parent) {
-                if !seen.contains_key(&parent_oid) {
-                    queue.push(parent_oid);
-                }
-            }
+            let Some(parent_oid) = head_oid_of(parent) else {
+                continue;
+            };
+            enqueue(
+                &records,
+                &mut seen,
+                &mut pending,
+                &mut heap,
+                &mut seq,
+                parent_oid,
+            )?;
         }
         out.push((oid, record));
         if limit.is_some_and(|max| out.len() >= max) {
