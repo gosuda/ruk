@@ -27,10 +27,10 @@ use ruk_core::index::RepoPath;
 use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
     BookmarkSetArgs, BookmarkTarget, ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs,
-    ClaimTtl, DescribeArgs, IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor, PageLimit,
-    PageRequest, PathSelection, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope,
-    SessionOpenArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation, TagSetArgs,
-    WorkspaceInit, WsNewArgs,
+    ClaimTtl, DescribeArgs, EditArgs, IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor,
+    PageLimit, PageRequest, PathSelection, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope,
+    SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
+    TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefTarget};
 use ruk_core::store::{ObjectKind, PreparationBudget, Store};
@@ -1599,6 +1599,238 @@ async fn typed_split_refusal_names_tree_derivation() {
     assert!(
         report.message.contains("ops/tree_edit.rs"),
         "split names its missing producer: {}",
+        report.message
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `edit` checks a change out into a workspace
+/// through the lane: the state moves onto the new head, the stamp advances,
+/// and the operation is logged.
+#[tokio::test]
+async fn typed_edit_checks_out_change() {
+    let root = temp_root("typed-edit");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-edit",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-edit",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let open_args = SessionOpenArgs {
+        identity: Some(IdentityClaim {
+            name: "Ada".to_string(),
+            email: "ada@example.invalid".to_string(),
+        }),
+        ..SessionOpenArgs::default()
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "session.open",
+        None,
+        Some(sonic_rs::to_string(&open_args).expect("open args encode")),
+        None,
+    );
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let new_args = NewArgs {
+        parents: Vec::new(),
+        description: ByteString::from("before"),
+        identity: None,
+        workspace: None,
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "new",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&new_args).expect("new args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::New(created)) = envelope.body else {
+        panic!("new must answer its own reply");
+    };
+
+    let ws_args = WsNewArgs {
+        root: ByteString::from("/tmp/ruk-daemon-w4"),
+        init: WorkspaceInit::Native {
+            parents: Vec::new(),
+        },
+        scope: None,
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "ws.new",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&ws_args).expect("ws.new args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::WsNew(workspaced)) = envelope.body else {
+        panic!("ws.new must answer its own reply");
+    };
+
+    let edit_args = EditArgs {
+        binding: WorkspaceBinding {
+            workspace: workspaced.workspace,
+            expected: workspaced.state.stamp(),
+        },
+        target: ChangeRef {
+            change: created.created.change,
+            head: None,
+        },
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "edit",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&edit_args).expect("edit args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(9, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::Edit(edited)) = envelope.body else {
+        panic!("edit must answer its own reply");
+    };
+    let ruk_core::workspace::WorkspaceState::Native(next) = &edited.state else {
+        panic!("edit of a native workspace stays native");
+    };
+    assert_eq!(next.head, created.created.head);
+    assert_eq!(next.change, created.created.change);
+    assert_eq!(
+        next.stamp.sequence,
+        workspaced.state.stamp().sequence + 1
+    );
+
+    let payload = Driver::typed_open(
+        &store_repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(11, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(log)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(log.entries.items.len(), 3);
+    assert_eq!(log.entries.items[0].method, Method::Edit);
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `snapshot` stays honestly refused: capturing the
+/// worktree needs the prepare/job split with no producer on this path.
+#[tokio::test]
+async fn typed_snapshot_refusal_names_job_split() {
+    let root = temp_root("typed-snapshot");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-snapshot",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-snapshot",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let open_args = SessionOpenArgs {
+        identity: Some(IdentityClaim {
+            name: "Ada".to_string(),
+            email: "ada@example.invalid".to_string(),
+        }),
+        ..SessionOpenArgs::default()
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "session.open",
+        None,
+        Some(sonic_rs::to_string(&open_args).expect("open args encode")),
+        None,
+    );
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let ws_args = WsNewArgs {
+        root: ByteString::from("/tmp/ruk-daemon-w4-snapshot"),
+        init: WorkspaceInit::Native {
+            parents: Vec::new(),
+        },
+        scope: None,
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "ws.new",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&ws_args).expect("ws.new args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::WsNew(workspaced)) = envelope.body else {
+        panic!("ws.new must answer its own reply");
+    };
+
+    let snapshot_args = SnapshotArgs {
+        binding: WorkspaceBinding {
+            workspace: workspaced.workspace,
+            expected: workspaced.state.stamp(),
+        },
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "snapshot",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&snapshot_args).expect("snapshot args encode")),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(7, &payload).await;
+    assert_eq!(report.code, "E_HOSTED");
+    assert!(
+        report.message.contains("workcopy::snapshot"),
+        "snapshot names its missing producer: {}",
         report.message
     );
 
