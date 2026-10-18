@@ -8,7 +8,8 @@
 //! Covered today: `bookmark.set` (commit and change targets),
 //! `bookmark.delete`, `bookmark.resolve`, `tag.set` (plain and annotated),
 //! `tag.delete`, `pin`, `unpin`, `attest.add`, `new`, `claim.acquire`,
-//! `claim.release`, `ws.new`, `describe`, `rebase`, `squash`, and `abandon`.
+//! `claim.release`, `ws.new`, `describe`, `rebase`, `squash`, `abandon`,
+//! `edit`, `ws.scope`, `ws.take`, and `ws.drop`.
 //! The annotated tag arm needs the coordinator clock and a tagger identity,
 //! `new` and `ws.new` need the session identity row and the clock for
 //! signature synthesis, and `attest.add` needs the attestation progress gate,
@@ -24,10 +25,13 @@
 //!   commit-time snapshot, so preparation stages no claim facts and mints
 //!   only the acquire id the sealed record must carry. The lane seals with
 //!   that id and writes the authoritative record back into the reply.
-//! * Workspace (beyond `ws.new` and the `new` workspace switch),
-//!   change-rewrite, transport, land, undo, and prune mutations need object
-//!   preparation, claim sealing, workspace fencing, or plan evaluation that
-//!   no caller on this path supplies.
+//! * Workspace dirty state (`snapshot`, `write`, `ws.recover`), untouched
+//!   change-rewrite, transport, land, undo, and prune mutations need worktree
+//!   file I/O, object preparation, claim sealing, or plan evaluation that no
+//!   caller on this path supplies. The pure row transitions (`edit`,
+//!   `ws.scope`, `ws.take`, `ws.drop`) serve on both paths: they stage the
+//!   fenced row fact and leave worktree materialization to the post-commit
+//!   daemon job, exactly like the `new` workspace switch.
 //!
 //! The `crate::ops`-adjacent methods were evaluated one by one against
 //! their protocol args, each refused arm naming its missing piece:
@@ -93,12 +97,13 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
-    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs,
-    EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, MutationOutcome, NewArgs,
-    NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
+    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
+    EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, MutationOutcome,
+    NewArgs, NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
     RequestDigest, RewriteReply, SquashArgs, TagDeleteArgs, TagDeleteReply, TagSetArgs,
     TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding, WorkspaceInit,
-    WsNewArgs, WsNewReply,
+    WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsScopeArgs, WsScopeReply, WsTakeArgs,
+    WsTakeReply,
 };
 use crate::records::Records;
 use crate::records::codec::{decode_change_entry, encode_change_entry};
@@ -222,13 +227,11 @@ pub(crate) fn prepare_mutation_with(
         Request::ClaimAcquire(m) => claim_acquire_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimRelease(m) => claim_release_parts(ctx, m.request_id, &m.args)?,
         Request::WsNew(m) => ws_new_parts(ctx, m.request_id, &m.args)?,
+        Request::WsScope(m) => ws_scope_parts(ctx, m.request_id, &m.args)?,
+        Request::WsTake(m) => ws_take_parts(ctx, m.request_id, &m.args)?,
+        Request::WsDrop(m) => ws_drop_parts(ctx, m.request_id, &m.args)?,
         Request::Describe(m) => describe_parts(ctx, m.request_id, &m.args)?,
-        Request::Edit(_) => {
-            return Err(uncovered(
-                "edit",
-                "protocol `edit` checks a change out into a workspace while `ops::edit` rewrites a commit's message/tree/identities; the names match but the operations do not",
-            ));
-        }
+        Request::Edit(m) => edit_parts(ctx, m.request_id, &m.args)?,
         Request::Split(_) => {
             return Err(uncovered(
                 "split",
@@ -1155,6 +1158,172 @@ fn ws_new_parts(
         transaction: None,
         dependencies: Vec::new(),
         fence: None,
+    })
+}
+
+/// Prepares `edit`: checks a resolved change out into a workspace through
+/// `NativeWorkspace::move_to`, fencing at the binding's stamp. This is a
+/// workspace transition, not a commit rewrite: `ops::edit` is unrelated and
+/// stays uncalled.
+///
+/// File materialization is not part of the lane commit: the daemon opens a
+/// `WsApply` journal after publication. The wire reply carries only the
+/// resulting state, which matches `EditReply`.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown workspace or an unstored change.
+/// - [`ErrorCode::ELeaseLost`] when another session holds the workspace.
+/// - [`ErrorCode::EStale`] for a moved stamp or a pinned head that is no
+///   longer current.
+/// - [`ErrorCode::EDivergent`] for an unpinned divergent change.
+/// - [`ErrorCode::EHosted`] for a GitCompat workspace: moving it needs
+///   HEAD/index application with no producer on this path.
+fn edit_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &EditArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let observed = workspace::observe(store, args.binding.workspace)?;
+    observed.fence(session, args.binding.expected)?;
+    let (change, head) = resolve_rewrite_head(store, &args.target)?;
+    let WorkspaceState::Native(current) = &observed.row.state else {
+        return Err(uncovered(
+            "edit",
+            "moving a GitCompat workspace needs HEAD/index application with no producer on this path",
+        ));
+    };
+    let next = WorkspaceState::Native(current.move_to(args.binding.expected, change, head)?);
+    let root = observed.row.root.clone();
+    let fact = observed.replace(WorkspaceRow {
+        state: next.clone(),
+        holder: session,
+        root,
+    })?;
+    Ok(Parts {
+        reply: Reply::Edit(Box::new(EditReply {
+            outcome: pending_outcome(session, request_id),
+            state: next,
+        })),
+        objects: Vec::new(),
+        facts: vec![fact],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: Some((args.binding.workspace, args.binding.expected)),
+    })
+}
+
+/// Prepares `ws.scope`: replaces the workspace scope through
+/// `WorkspaceState::rescope`, advancing the stamp once. Serves both workspace
+/// kinds: scope is kind-independent.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown workspace.
+/// - [`ErrorCode::ELeaseLost`] when another session holds the workspace.
+/// - [`ErrorCode::EStale`] for a moved stamp.
+fn ws_scope_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &WsScopeArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let observed = workspace::observe(ctx.store, args.binding.workspace)?;
+    observed.fence(session, args.binding.expected)?;
+    let next = observed
+        .row
+        .state
+        .rescope(args.binding.expected, args.scope.clone())?;
+    let root = observed.row.root.clone();
+    let fact = observed.replace(WorkspaceRow {
+        state: next.clone(),
+        holder: session,
+        root,
+    })?;
+    Ok(Parts {
+        reply: Reply::WsScope(Box::new(WsScopeReply {
+            outcome: pending_outcome(session, request_id),
+            state: next,
+        })),
+        objects: Vec::new(),
+        facts: vec![fact],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: Some((args.binding.workspace, args.binding.expected)),
+    })
+}
+
+/// Prepares `ws.take`: advances the lease epoch through `WorkspaceState::take`
+/// so the taker fences the previous holder. A pinned take fences at the given
+/// stamp; an unpinned take seizes the workspace from whoever holds it and
+/// carries no lane fence (the lane would re-check holder against the still-old
+/// row). The exact row fact stays compare-and-swap either way.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown workspace.
+/// - [`ErrorCode::ELeaseLost`] when a pinned take names another holder's
+///   stamp.
+/// - [`ErrorCode::EStale`] for a moved stamp on a pinned take.
+fn ws_take_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &WsTakeArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let observed = workspace::observe(ctx.store, args.workspace)?;
+    let fence = match args.expected {
+        Some(expected) => {
+            observed.fence(session, expected)?;
+            Some((args.workspace, expected))
+        }
+        None => None,
+    };
+    let next = observed.row.state.take()?;
+    let root = observed.row.root.clone();
+    let fact = observed.replace(WorkspaceRow {
+        state: next.clone(),
+        holder: session,
+        root,
+    })?;
+    Ok(Parts {
+        reply: Reply::WsTake(Box::new(WsTakeReply {
+            outcome: pending_outcome(session, request_id),
+            state: next,
+        })),
+        objects: Vec::new(),
+        facts: vec![fact],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// Prepares `ws.drop`: removes the workspace row; user files are never
+/// touched. The fence still guards the stamp so a drop never lands over a
+/// concurrent workspace move.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown workspace.
+/// - [`ErrorCode::ELeaseLost`] when another session holds the workspace.
+/// - [`ErrorCode::EStale`] for a moved stamp.
+fn ws_drop_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &WsDropArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let observed = workspace::observe(ctx.store, args.binding.workspace)?;
+    observed.fence(session, args.binding.expected)?;
+    let fact = observed.remove();
+    Ok(Parts {
+        reply: Reply::WsDrop(Box::new(WsDropReply {
+            outcome: pending_outcome(session, request_id),
+        })),
+        objects: Vec::new(),
+        facts: vec![fact],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: Some((args.binding.workspace, args.binding.expected)),
     })
 }
 
@@ -3738,14 +3907,403 @@ mod tests {
         }
     }
 
+    /// Seeds a native workspace through `ws.new` and publishes it, returning
+    /// its id and state. Needs a context with a session identity and clock.
+    fn seed_workspace(
+        store: &Store,
+        ctx: &PrepareContext<'_>,
+        scope: Option<Scope>,
+    ) -> (WorkspaceId, WorkspaceState) {
+        let prepared = prepare_mutation_with(
+            ctx,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w4-test"),
+                    init: WorkspaceInit::Native {
+                        parents: Vec::new(),
+                    },
+                    scope,
+                },
+            })),
+        )
+        .expect("ws.new prepares");
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish workspace");
+        let Reply::WsNew(reply) = prepared.reply else {
+            panic!("ws.new must answer its own reply");
+        };
+        (reply.workspace, reply.state)
+    }
+
+    fn edit_request(binding: WorkspaceBinding, target: ChangeRef) -> Request {
+        Request::Edit(Box::new(WireMutation {
+            request_id: request_id(),
+            args: EditArgs { binding, target },
+        }))
+    }
+
+    #[test]
+    fn edit_checks_out_resolved_change_on_both_paths() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (head, change, _) = seed_commit(&store, None);
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let before = state.stamp();
+        let binding = WorkspaceBinding {
+            workspace: id,
+            expected: before,
+        };
+        let target = ChangeRef {
+            change,
+            head: Some(head),
+        };
+
+        let prepared =
+            prepare_mutation_with(&ctx, edit_request(binding, target)).expect("edit prepares");
+        assert_eq!(prepared.workspace_fence, Some((id, before)));
+        let Reply::Edit(reply) = prepared.reply else {
+            panic!("edit must answer its own reply");
+        };
+        let WorkspaceState::Native(next) = &reply.state else {
+            panic!("edit of a native workspace stays native");
+        };
+        assert_eq!(next.change, change);
+        assert_eq!(next.head, head);
+        assert_eq!(next.stamp.sequence, before.sequence + 1);
+        assert_eq!(prepared.facts.len(), 1);
+        assert_eq!(
+            prepared.facts[0].table,
+            crate::store::types::FactTable::Workspaces
+        );
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish edit");
+
+        // The row transition is context-free, so the legacy path serves it
+        // too once the caller holds the fresh stamp.
+        let legacy = prepare_mutation(
+            &store,
+            session,
+            edit_request(
+                WorkspaceBinding {
+                    workspace: id,
+                    expected: reply.state.stamp(),
+                },
+                target,
+            ),
+        )
+        .expect("edit serves on the legacy path");
+        let Reply::Edit(legacy_reply) = legacy.reply else {
+            panic!("edit must answer its own reply");
+        };
+        assert_eq!(
+            legacy_reply.state.stamp().sequence,
+            before.sequence + 2
+        );
+    }
+
+    #[test]
+    fn edit_refuses_gitcompat_and_bad_bindings() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (head, change, _) = seed_commit(&store, None);
+        let target = ChangeRef {
+            change,
+            head: Some(head),
+        };
+
+        // A GitCompat workspace has no checkout producer here.
+        let git = prepare_mutation_with(
+            &ctx,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w4-git"),
+                    init: WorkspaceInit::GitCompat {
+                        head: HeadRef::Detached(oid(0x44)),
+                    },
+                    scope: None,
+                },
+            })),
+        )
+        .expect("gitcompat ws.new prepares");
+        store
+            .publish(git.objects, &git.facts)
+            .expect("publish gitcompat workspace");
+        let Reply::WsNew(git_reply) = git.reply else {
+            panic!("ws.new must answer its own reply");
+        };
+        let err = prepare_mutation_with(
+            &ctx,
+            edit_request(
+                WorkspaceBinding {
+                    workspace: git_reply.workspace,
+                    expected: git_reply.state.stamp(),
+                },
+                target,
+            ),
+        )
+        .expect_err("gitcompat edit stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("HEAD/index application"),
+            "gitcompat edit names its missing producer: {}",
+            err.message
+        );
+
+        // An unknown workspace is not found.
+        let err = prepare_mutation_with(&ctx, edit_request(workspace_binding(), target))
+            .expect_err("unknown workspace is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        // A holder that is not the session loses the fence, not the call.
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let holder = SessionId::generate();
+        let holder_row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let holder_ctx = full_ctx(&store, holder, Some(&holder_row), Some(&clock), None);
+        let err = prepare_mutation_with(
+            &holder_ctx,
+            edit_request(
+                WorkspaceBinding {
+                    workspace: id,
+                    expected: state.stamp(),
+                },
+                target,
+            ),
+        )
+        .expect_err("foreign holder loses the fence");
+        assert_eq!(err.code, ErrorCode::ELeaseLost);
+
+        // A moved stamp is stale.
+        let err = prepare_mutation_with(
+            &ctx,
+            edit_request(
+                WorkspaceBinding {
+                    workspace: id,
+                    expected: WorkspaceStamp {
+                        sequence: 7,
+                        lease_epoch: 0,
+                    },
+                },
+                target,
+            ),
+        )
+        .expect_err("moved stamp is stale");
+        assert_eq!(err.code, ErrorCode::EStale);
+
+        // An unpinned divergent change names every head.
+        let (_, divergent, _) = seed_commit(&store, None);
+        seed_commit(&store, Some(divergent));
+        let err = prepare_mutation_with(
+            &ctx,
+            edit_request(
+                WorkspaceBinding {
+                    workspace: id,
+                    expected: state.stamp(),
+                },
+                ChangeRef {
+                    change: divergent,
+                    head: None,
+                },
+            ),
+        )
+        .expect_err("unpinned divergent change");
+        assert_eq!(err.code, ErrorCode::EDivergent);
+    }
+
+    #[test]
+    fn ws_scope_replaces_scope_on_both_paths() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let before = state.stamp();
+        let scope = Scope::cone([RepoPath::new("src").expect("test path")]);
+
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::WsScope(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsScopeArgs {
+                    binding: WorkspaceBinding {
+                        workspace: id,
+                        expected: before,
+                    },
+                    scope: scope.clone(),
+                },
+            })),
+        )
+        .expect("ws.scope prepares");
+        assert_eq!(prepared.workspace_fence, Some((id, before)));
+        let Reply::WsScope(reply) = prepared.reply else {
+            panic!("ws.scope must answer its own reply");
+        };
+        assert_eq!(reply.state.scope(), &scope);
+        assert_eq!(reply.state.stamp().sequence, before.sequence + 1);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish scope");
+
+        let legacy = prepare_mutation(
+            &store,
+            session,
+            Request::WsScope(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsScopeArgs {
+                    binding: WorkspaceBinding {
+                        workspace: id,
+                        expected: reply.state.stamp(),
+                    },
+                    scope: Scope::Full,
+                },
+            })),
+        )
+        .expect("ws.scope serves on the legacy path");
+        let Reply::WsScope(legacy_reply) = legacy.reply else {
+            panic!("ws.scope must answer its own reply");
+        };
+        assert_eq!(legacy_reply.state.scope(), &Scope::Full);
+    }
+
+    #[test]
+    fn ws_take_advances_epoch_pinned_and_seized() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let before = state.stamp();
+
+        // A pinned take keeps the sequence and raises the epoch.
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::WsTake(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsTakeArgs {
+                    workspace: id,
+                    expected: Some(before),
+                },
+            })),
+        )
+        .expect("pinned take prepares");
+        assert_eq!(prepared.workspace_fence, Some((id, before)));
+        let Reply::WsTake(reply) = prepared.reply else {
+            panic!("ws.take must answer its own reply");
+        };
+        assert_eq!(reply.state.stamp().sequence, before.sequence);
+        assert_eq!(reply.state.stamp().lease_epoch, before.lease_epoch + 1);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish take");
+
+        // An unpinned take seizes from whoever holds the workspace and
+        // carries no lane fence: the lane would re-check the holder against
+        // the still-old row.
+        let intruder = SessionId::generate();
+        let intruder_row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let intruder_ctx = full_ctx(&store, intruder, Some(&intruder_row), Some(&clock), None);
+        let seized = prepare_mutation_with(
+            &intruder_ctx,
+            Request::WsTake(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsTakeArgs {
+                    workspace: id,
+                    expected: None,
+                },
+            })),
+        )
+        .expect("seize prepares");
+        assert_eq!(seized.workspace_fence, None);
+        let Reply::WsTake(seized_reply) = seized.reply else {
+            panic!("ws.take must answer its own reply");
+        };
+        assert_eq!(
+            seized_reply.state.stamp().lease_epoch,
+            before.lease_epoch + 2
+        );
+        store
+            .publish(seized.objects, &seized.facts)
+            .expect("publish seize");
+
+        // The displaced holder's stamp can never match again.
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::WsTake(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsTakeArgs {
+                    workspace: id,
+                    expected: Some(reply.state.stamp()),
+                },
+            })),
+        )
+        .expect_err("displaced holder loses the fence");
+        assert_eq!(err.code, ErrorCode::ELeaseLost);
+    }
+
+    #[test]
+    fn ws_drop_removes_row_and_serves_legacy() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let before = state.stamp();
+
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::WsDrop(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsDropArgs {
+                    binding: WorkspaceBinding {
+                        workspace: id,
+                        expected: before,
+                    },
+                },
+            })),
+        )
+        .expect("ws.drop prepares");
+        assert_eq!(prepared.workspace_fence, Some((id, before)));
+        assert_eq!(prepared.facts.len(), 1);
+        assert!(prepared.facts[0].value.is_none());
+        let Reply::WsDrop(_) = prepared.reply else {
+            panic!("ws.drop must answer its own reply");
+        };
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish drop");
+        assert!(workspace::observe(&store, id).is_err(), "dropped workspace is gone");
+
+        // Dropping twice names the missing row, on either path.
+        let again = Request::WsDrop(Box::new(WireMutation {
+            request_id: request_id(),
+            args: WsDropArgs {
+                binding: WorkspaceBinding {
+                    workspace: id,
+                    expected: before,
+                },
+            },
+        }));
+        let err = prepare_mutation(&store, session, again).expect_err("second drop is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+    }
+
     #[test]
     fn ops_backed_mutations_name_their_missing_preparation() {
         let (_temp, store, session) = fixture();
         let target = change_target();
         let parent = Head::Git { oid: oid(0x11) };
         // `describe`, `rebase`, `squash`, and `abandon` preserve signatures
-        // and serve on the legacy path too; they have dedicated tests below.
-        // The rest still name their missing preparation here.
+        // and serve on the legacy path too, as do the context-free workspace
+        // row transitions (`edit`, `ws.scope`, `ws.take`, `ws.drop`); they
+        // have dedicated tests below. The rest still name their missing
+        // preparation here.
         let requests = [
             Request::New(Box::new(WireMutation {
                 request_id: request_id(),
@@ -3754,13 +4312,6 @@ mod tests {
                     description: ByteString::from("new change"),
                     identity: None,
                     workspace: None,
-                },
-            })),
-            Request::Edit(Box::new(WireMutation {
-                request_id: request_id(),
-                args: EditArgs {
-                    binding: workspace_binding(),
-                    target,
                 },
             })),
             Request::Split(Box::new(WireMutation {
