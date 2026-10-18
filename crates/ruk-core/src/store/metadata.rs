@@ -64,6 +64,7 @@ use serde::de::DeserializeOwned;
 
 use crate::ids::{HashKind, Oid};
 use crate::store::MAX_DELTA_DEPTH;
+use crate::store::capacity::{PendingReservation, ReservationState};
 use crate::store::error::StoreError;
 use crate::store::guards::{CapturedLink, ObjectSnapshot};
 use crate::store::segment;
@@ -103,6 +104,11 @@ fn builder() -> Builder {
 type BytesTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
 
 const OBJECTS: BytesTable = TableDefinition::new("objects");
+/// Durable pending-reservation rows of the capacity ledger, keyed by
+/// big-endian `(generation, seq)`. Publication-owned like `objects` and
+/// `segments`: written only through the pending-commit path and
+/// [`PublicationTxn::replace_pending`], never through a [`FactMutation`].
+const PENDING: BytesTable = TableDefinition::new("pending_reservations");
 const SEGMENTS: TableDefinition<'static, u64, &'static [u8]> = TableDefinition::new("segments");
 const GENERATION: TableDefinition<'static, (), u64> = TableDefinition::new("generation");
 const VERIFIED_GENERATION: TableDefinition<'static, (), u64> =
@@ -142,6 +148,7 @@ pub struct FactPage {
 
 fn is_census_name(name: &str) -> bool {
     name == OBJECTS.name()
+        || name == PENDING.name()
         || name == SEGMENTS.name()
         || name == GENERATION.name()
         || name == VERIFIED_GENERATION.name()
@@ -177,6 +184,7 @@ impl Metadata {
         let mut txn = db.begin_write().map_err(txn_error)?;
         txn.set_durability(Durability::Immediate)?;
         drop(txn.open_table(OBJECTS).map_err(table_error)?);
+        drop(txn.open_table(PENDING).map_err(table_error)?);
         drop(txn.open_table(SEGMENTS).map_err(table_error)?);
         for table in FactTable::ALL {
             drop(
@@ -479,6 +487,110 @@ impl Metadata {
         Ok(manifests)
     }
 
+    /// Every capacity-ledger row in key order: `(key, row)`. Recovery
+    /// reconciles the `Pending` ones; quota sums them. The table is tiny
+    /// (one row per reserving publication), so collecting ends the read
+    /// transaction before any segment file is touched.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for a malformed key or value.
+    pub(crate) fn pending_rows(&self) -> Result<Vec<(Vec<u8>, PendingReservation)>, StoreError> {
+        let txn = self.db.begin_read().map_err(txn_error)?;
+        let table = txn.open_table(PENDING).map_err(table_error)?;
+        let mut rows = Vec::new();
+        for row in table.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            PendingReservation::split_key(key.value())?;
+            let reservation: PendingReservation = decode("pending reservation", value.value())?;
+            rows.push((key.value().to_vec(), reservation));
+        }
+        Ok(rows)
+    }
+
+    /// Commits one `Pending` ledger row with Immediate durability. This is
+    /// the commit the capacity contract names: it returns before the first
+    /// platform reservation call of the publication, so a crash after any
+    /// reserve leaves a reconcilable row.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] when the key already exists: the probe plan
+    /// ran twice for one publication instead of once.
+    pub(crate) fn commit_pending(
+        &self,
+        key: &[u8],
+        row: &PendingReservation,
+    ) -> Result<(), StoreError> {
+        if row.state != ReservationState::Pending {
+            return Err(StoreError::Invalid(
+                "a newly persisted pending reservation must start Pending".to_owned(),
+            ));
+        }
+        let encoded = encode("pending reservation", row)?;
+        let mut txn = self.db.begin_write().map_err(txn_error)?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut table = txn.open_table(PENDING).map_err(table_error)?;
+            if table.get(key).map_err(storage)?.is_some() {
+                return Err(StoreError::Invalid(
+                    "pending reservation key already exists".to_owned(),
+                ));
+            }
+            table
+                .insert(key, encoded.as_slice())
+                .map_err(storage)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Marks rows `Released` in one Immediate commit (recovery
+    /// reconciliation of dead publications). Idempotent: rows already past
+    /// `Pending` — a racing opener reconciled first — are skipped, so
+    /// re-running reconciliation converges.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for a key with no row: reconciliation only
+    /// releases rows it just read.
+    pub(crate) fn release_pending(
+        &self,
+        updates: &[(Vec<u8>, PendingReservation)],
+    ) -> Result<(), StoreError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self.db.begin_write().map_err(txn_error)?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut table = txn.open_table(PENDING).map_err(table_error)?;
+            for (key, row) in updates {
+                if row.state != ReservationState::Released {
+                    return Err(StoreError::Invalid(
+                        "reconciliation only writes Released rows".to_owned(),
+                    ));
+                }
+                let current: Option<PendingReservation> = table
+                    .get(key.as_slice())
+                    .map_err(storage)?
+                    .map(|guard| decode("pending reservation", guard.value()))
+                    .transpose()?;
+                let Some(current) = current else {
+                    return Err(StoreError::Invalid(
+                        "pending reservation row vanished before release".to_owned(),
+                    ));
+                };
+                if current.state != ReservationState::Pending {
+                    continue;
+                }
+                let encoded = encode("pending reservation", row)?;
+                table
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .map_err(storage)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Returns at most `budget.rows` (clamped to 1024) fact rows strictly
     /// after `after` in raw key order, totaling at most `budget.bytes` of
     /// copied key and value bytes.
@@ -686,6 +798,50 @@ impl PublicationTxn {
         Ok(())
     }
 
+    /// Replaces a `Pending` ledger row with its post-append state, normally
+    /// `Committed` carrying the per-segment charges and their observed
+    /// receipts. The key must already exist in `Pending` state: that row is
+    /// the durable proof that persistence preceded the reservation calls,
+    /// so a missing or non-pending row fails the publication closed instead
+    /// of inventing a charge.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for a missing key, a row that is not
+    /// `Pending`, or a replacement that is still `Pending` (the appends
+    /// must settle the row one way or the other in this commit).
+    pub(crate) fn replace_pending(
+        &self,
+        key: &[u8],
+        row: &PendingReservation,
+    ) -> Result<(), StoreError> {
+        if row.state == ReservationState::Pending {
+            return Err(StoreError::Invalid(
+                "a settled pending reservation must leave Pending state".to_owned(),
+            ));
+        }
+        let encoded = encode("pending reservation", row)?;
+        let mut table = self.txn.open_table(PENDING).map_err(table_error)?;
+        let current: Option<PendingReservation> = table
+            .get(key)
+            .map_err(storage)?
+            .map(|guard| decode("pending reservation", guard.value()))
+            .transpose()?;
+        let Some(current) = current else {
+            return Err(StoreError::Invalid(
+                "pending reservation row is missing; persistence must precede reservation".to_owned(),
+            ));
+        };
+        if current.state != ReservationState::Pending {
+            return Err(StoreError::Invalid(
+                "pending reservation row is already settled".to_owned(),
+            ));
+        }
+        table
+            .insert(key, encoded.as_slice())
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Records the committed state of one segment.
     ///
     /// Extents must be consistent (`committed_end` is `records_end`, plus
@@ -797,33 +953,50 @@ fn apply_fact(txn: &WriteTransaction, fact: &FactMutation) -> Result<(), StoreEr
     Ok(())
 }
 
-/// Creates only the `lfs_objects` table when the database predates that
-/// schema revision, so an older store opens with the new table empty
-/// instead of refusing. Every other census table keeps its existing
-/// meaning: a missing one is still damage, never silently recreated —
-/// recreating `objects` would orphan segment bytes behind vanished
-/// locators and turn damage into silent missing-object reads. A write
-/// transaction's `open_table` creates the table only when absent;
+/// Creates the `lfs_objects` and `pending_reservations` tables when the
+/// database predates those schema revisions, so an older store opens with
+/// the new tables empty instead of refusing. Every other census table keeps
+/// its existing meaning: a missing one is still damage, never silently
+/// recreated — recreating `objects` would orphan segment bytes behind
+/// vanished locators and turn damage into silent missing-object reads. A
+/// write transaction's `open_table` creates the table only when absent;
 /// existing tables and rows are untouched.
 fn ensure_census(db: &Database) -> Result<(), StoreError> {
-    // Fast path: the revision table exists on every store written since its
-    // introduction, so probe with a read transaction and only take the
-    // exclusive write transaction (and its commit) when the table is
+    // Fast path: the revision tables exist on every store written since
+    // their introduction, so probe with a read transaction and only take
+    // the exclusive write transaction (and its commit) when a table is
     // actually absent. Creating-if-absent stays idempotent under racing
     // openers: the writer lock serializes them and the second create is a
     // no-op.
-    let present = {
+    let missing = {
         let txn = db.begin_read().map_err(txn_error)?;
-        txn.list_tables()
+        let names: Vec<String> = txn
+            .list_tables()
             .map_err(storage)?
-            .any(|handle| handle.name() == FactTable::LfsObjects.table_name())
+            .map(|handle| handle.name().to_owned())
+            .collect();
+        [
+            FactTable::LfsObjects.table_name(),
+            PENDING.name(),
+        ]
+        .into_iter()
+        .filter(|want| !names.iter().any(|name| name == want))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
     };
-    if present {
+    if missing.is_empty() {
         return Ok(());
     }
     let mut txn = db.begin_write().map_err(txn_error)?;
-    txn.open_table(fact_definition(FactTable::LfsObjects))
-        .map_err(table_error)?;
+    txn.set_durability(Durability::Immediate)?;
+    for name in &missing {
+        if name == FactTable::LfsObjects.table_name() {
+            txn.open_table(fact_definition(FactTable::LfsObjects))
+                .map_err(table_error)?;
+        } else {
+            txn.open_table(PENDING).map_err(table_error)?;
+        }
+    }
     txn.commit()?;
     Ok(())
 }
@@ -849,6 +1022,7 @@ fn verify_census(db: &Database) -> Result<(), StoreError> {
         ));
     }
     txn.open_table(OBJECTS).map_err(table_error)?;
+    txn.open_table(PENDING).map_err(table_error)?;
     txn.open_table(SEGMENTS).map_err(table_error)?;
     for table in FactTable::ALL {
         txn.open_table(fact_definition(table))
