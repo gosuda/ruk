@@ -411,13 +411,95 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
         .publish(Vec::new(), &[mutation])
         .map_err(GitError::from)?;
     import_remote_config(&git_dir, &store)?;
-    Ok(format!(
+    let lfs = ingest_lfs_sidecar(&git_dir, &store)?;
+    let mut out = format!(
         "Migrated {} objects and {} refs from {} [{kind}]\n",
         report.objects,
         report.refs_seen,
         git_dir.display(),
-    )
-    .into_bytes())
+    );
+    if let Some((stored, skipped)) = lfs {
+        out.push_str(&format!("LFS payloads: {stored} stored, {skipped} skipped\n"));
+    }
+    Ok(out.into_bytes())
+}
+
+/// Copies verified payloads from the source `<git-dir>/lfs/objects/` cache
+/// into the store sidecar, publishing one `lfs_objects` presence row per
+/// payload in a single facts-only transaction.
+///
+/// Every file whose name is 64 hex digits is hash- and size-verified
+/// against its name before staging; failures skip nonfatally with a
+/// warning count in the migrate report, never an error. A missing
+/// `lfs/objects/` directory means no payloads and no report line. The
+/// rows are inert under `Deny`/`Pointers`, so the ingest runs regardless
+/// of the store's LFS mode: `Full` reconciliation simply finds the
+/// payloads already present.
+fn ingest_lfs_sidecar(
+    git_dir: &std::path::Path,
+    store: &Store,
+) -> Result<Option<(u64, u64)>, GitError> {
+    use ruk_core::store::lfs as sidecar;
+
+    let root = git_dir.join("lfs").join("objects");
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let mut stored: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut mutations = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let hex = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if !sidecar::valid_oid_hex(&hex) {
+                skipped += 1;
+                continue;
+            }
+            let size = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            match sidecar::stage_verified(store.root(), &hex, size, &path) {
+                Ok(_) => {
+                    stored += 1;
+                    mutations.push(sidecar::upsert_mutation(
+                        &hex,
+                        &sidecar::LfsObjectRecord { size, complete: true },
+                    ));
+                }
+                Err(_) => skipped += 1,
+            }
+        }
+    }
+    if !mutations.is_empty() {
+        store
+            .publish(Vec::new(), &mutations)
+            .map_err(GitError::from)?;
+    }
+    Ok(Some((stored, skipped)))
 }
 
 /// Copies `remote.<name>.url` and the first `remote.<name>.fetch` line for

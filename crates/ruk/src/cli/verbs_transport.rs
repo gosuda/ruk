@@ -29,7 +29,7 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::mode_for_store;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::StoreRefs;
-use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
+use ruk_core::store::{FactExpectation, FactMutation, FactTable, ObjectKind, Store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
 use ruk_git::transport::fetch::{self, FetchWireRequest};
@@ -1437,6 +1437,148 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         }
     }
     Ok(out)
+}
+
+/// Reconciles the LFS sidecar against reachable pointers: every pointer
+/// blob reachable from live refs (the same ref-tips plus
+/// commit/tree walk [`fsck`] uses) must have a verified payload in
+/// `<store>/lfs/objects/`.
+///
+/// Pointers already verified are no-ops, so re-runs are idempotent; each
+/// fetched payload stages through a temp file with an atomic rename plus
+/// one fact-row publication, so a kill leaves at most one temp file and
+/// already-synced payloads stay synced. Payload bytes come from
+/// `--from <dir>` (a local directory holding `<oid>` files or
+/// `<aa>/<bb>/<oid>` trees, hash-verified before staging); without it,
+/// every absent payload lands in `missing`. Remote batch-API download is
+/// a named gap — HTTP remotes already refuse with one in
+/// `transport::net` — so the HTTP adapter is the follow-up, not this
+/// verb.
+///
+/// Stdout is JSON `{"synced": [...], "missing": [...]}` with both lists
+/// sorted; exit is 0 even when `missing` is non-empty (absence is
+/// reported, never fatal, matching push admission under `Full`).
+pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    use ruk_core::store::lfs as sidecar;
+
+    let specs = [FlagSpec {
+        long: "from",
+        short: None,
+        takes_value: true,
+    }];
+    let opts = collect(args, &specs)?;
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: lfs-payload-sync [--from <dir>]".to_owned(),
+        });
+    }
+    let from = match opts.single("from")? {
+        None => None,
+        Some(dir) => {
+            let path = std::path::Path::new(&dir);
+            Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                ctx.env.cwd.join(path)
+            })
+        }
+    };
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let mut tips = Vec::new();
+    for (_, target) in list_refs(store)? {
+        match target {
+            RefTarget::Direct(oid) => tips.push(oid),
+            RefTarget::Symbolic(name) => {
+                let resolved = ruk_core::refdata::resolve(&StoreRefs::new(store), &name)
+                    .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+                if let Some(oid) = resolved.oid {
+                    tips.push(oid);
+                }
+            }
+        }
+    }
+    // Reachable pointers, keyed by payload hex: small blobs only (a
+    // pointer is strictly below 1024 bytes), deduplicated across trees.
+    // Unreadable blobs are fsck's domain; the sync skips them.
+    let mut pointers: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (_, record) in super::state::walk_history(store, &tips, None)? {
+        let tree = super::tree::commit_tree_oid(&record)?;
+        for (_, _, oid) in super::tree::flatten_tree(store, kind, tree)? {
+            let len = store.object_len(oid).map_err(GitError::from)?;
+            if len.is_some_and(|bytes| bytes >= 1024) {
+                continue;
+            }
+            let Ok((object_kind, bytes)) = super::tree::read_object_bytes(store, oid) else {
+                continue;
+            };
+            if object_kind != ObjectKind::Blob {
+                continue;
+            }
+            if let Some((hex, size)) = ruk_core::parse_pointer(&bytes) {
+                pointers.entry(hex).or_insert(size);
+            }
+        }
+    }
+    let mut synced = Vec::new();
+    let mut missing = Vec::new();
+    let mut mutations = Vec::new();
+    for (hex, size) in &pointers {
+        if sidecar::sidecar_verified(store.root(), hex, *size) {
+            continue;
+        }
+        let staged = match &from {
+            None => false,
+            Some(dir) => {
+                let direct = dir.join(hex);
+                let nested =
+                    dir.join(&hex[0..2]).join(&hex[2..4]).join(hex);
+                let src = if direct.is_file() {
+                    Some(direct)
+                } else if nested.is_file() {
+                    Some(nested)
+                } else {
+                    None
+                };
+                match src {
+                    None => false,
+                    Some(path) => {
+                        sidecar::stage_verified(store.root(), hex, *size, &path).is_ok()
+                    }
+                }
+            }
+        };
+        if staged {
+            synced.push(hex.clone());
+            mutations.push(sidecar::upsert_mutation(
+                hex,
+                &sidecar::LfsObjectRecord { size: *size, complete: true },
+            ));
+        } else {
+            missing.push(hex.clone());
+        }
+    }
+    if !mutations.is_empty() {
+        store
+            .publish(Vec::new(), &mutations)
+            .map_err(GitError::from)?;
+    }
+    let mut out = String::from("{\"synced\": [");
+    for (index, hex) in synced.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{hex}\""));
+    }
+    out.push_str("], \"missing\": [");
+    for (index, hex) in missing.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{hex}\""));
+    }
+    out.push_str("]}\n");
+    Ok(out.into_bytes())
 }
 
 /// Checks one tree and its blobs recursively, recording misses.
