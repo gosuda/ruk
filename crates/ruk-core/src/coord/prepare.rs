@@ -1112,7 +1112,8 @@ fn claim_release_parts(
 ///
 /// # Errors
 /// Same as [`mint_empty_commit`] for native workspaces, plus `E_LIMIT` for
-/// an oversized row and the target validation of a GitCompat HEAD.
+/// an oversized row, the target validation of a GitCompat HEAD, and
+/// `E_NOT_FOUND` for a detached HEAD naming no stored commit.
 fn ws_new_parts(
     ctx: &PrepareContext<'_>,
     request_id: RequestId,
@@ -1139,6 +1140,15 @@ fn ws_new_parts(
         }
         WorkspaceInit::GitCompat { head } => {
             head.validate(store.hash_kind()).map_err(CoreError::from)?;
+            if let HeadRef::Detached(oid) = head {
+                let stored = Records::new(store).get_commit(&Head::Git { oid: *oid })?.is_some();
+                if !stored {
+                    return Err(CoreError::new(
+                        ErrorCode::ENotFound,
+                        format!("workspace HEAD {oid} is not a stored commit"),
+                    ));
+                }
+            }
             (
                 WorkspaceState::GitCompat(GitCompatWorkspace::new(head.clone(), scope)),
                 Vec::new(),
@@ -5006,6 +5016,28 @@ mod tests {
         .expect_err("identity-less ws.new is invalid");
         assert_eq!(err.code, ErrorCode::EInvalid);
     }
+
+    #[test]
+    fn ws_new_refuses_a_detached_head_outside_the_store() {
+        let (_temp, store, session) = fixture();
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w2-ghost"),
+                    init: WorkspaceInit::GitCompat {
+                        head: HeadRef::Detached(oid(0x44)),
+                    },
+                    scope: None,
+                },
+            })),
+        )
+        .expect_err("an unstored commit is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+        assert!(err.message.contains("not a stored commit"), "names the hazard: {}", err.message);
+    }
     fn change_target() -> ChangeRef {
         ChangeRef {
             change: ChangeId::from_bytes([0x22; 16]),
@@ -5125,7 +5157,7 @@ mod tests {
         let clock = fixed_clock();
         let row = session_row_caps(Some(ada_claim()), claim_all_caps());
         let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
-        let (head, change, _) = seed_commit(&store, None);
+        let (head, change, commit_oid) = seed_commit(&store, None);
         let target = ChangeRef {
             change,
             head: Some(head),
@@ -5139,7 +5171,7 @@ mod tests {
                 args: WsNewArgs {
                     root: ByteString::from("/tmp/ruk-w4-git"),
                     init: WorkspaceInit::GitCompat {
-                        head: HeadRef::Detached(oid(0x44)),
+                        head: HeadRef::Detached(commit_oid),
                     },
                     scope: None,
                 },
