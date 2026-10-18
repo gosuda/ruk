@@ -1323,21 +1323,29 @@ fn network_scheme_routing_names_gaps() {
         !matches!(err, GitError::Offline { .. }),
         "took the local path: {err}"
     );
-    // HTTP parses but refuses as the named gap without touching the net.
+    // HTTP serves smart-http, so an unroutable host fails in the network
+    // path (resolution), never as a gap and never as a local path. The
+    // dumb-http gap itself is covered by the smart-http discovery tests.
     let err = run(
         verbs_transport::fetch,
         &mut ctx,
         &["https://host.invalid/a.git"],
     )
-    .expect_err("https fetch is a named gap");
-    assert!(matches!(err, GitError::Unsupported { .. }), "got {err}");
+    .expect_err("https fetch must fail");
+    assert!(
+        !matches!(err, GitError::Unsupported { .. }),
+        "smart-http regressed to the gap: {err}"
+    );
     let err = run(
         verbs_transport::push,
         &mut ctx,
         &["http://host.invalid/a.git"],
     )
-    .expect_err("http push is a named gap");
-    assert!(matches!(err, GitError::Unsupported { .. }), "got {err}");
+    .expect_err("http push must fail");
+    assert!(
+        !matches!(err, GitError::Unsupported { .. }),
+        "smart-http regressed to the gap: {err}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 

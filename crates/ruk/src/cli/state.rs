@@ -1266,7 +1266,7 @@ pub(crate) fn remote_root(ctx: &Ctx, target: &str) -> Result<PathBuf, GitError> 
     let path = match ruk_git::transport::net::parse_endpoint(&raw) {
         Ok(ruk_git::transport::net::Endpoint::Local { path }) => path,
         Ok(ruk_git::transport::net::Endpoint::Http { url, .. }) => {
-            return Err(ruk_git::transport::net::http_gap(&url));
+            return Err(ruk_git::transport::net::dumb_http_gap(&url));
         }
         _ => PathBuf::from(raw),
     };

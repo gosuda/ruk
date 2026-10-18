@@ -112,13 +112,16 @@ pub fn normalize_base(url: &str) -> Result<String, GitError> {
     Ok(base.to_owned())
 }
 
-/// The discovery URL: `<base>/info/refs?service=<svc>`, joining with `&`
-/// when the base already carries a query string (the oracle appends the
-/// same way in `git/remote-curl.c` `discover_refs`).
+/// The discovery URL: `<base>/info/refs?service=<svc>`. A base that
+/// already carries a query string keeps it after the service parameter,
+/// so no server-side parameter is lost.
 #[must_use]
 pub fn refs_url(base: &str, service: SmartService) -> String {
-    let join = if base.contains('?') { '&' } else { '?' };
-    format!("{base}/info/refs{join}service={}", service.name())
+    let (path, query) = match base.split_once('?') {
+        Some((path, query)) => (path, format!("&{query}")),
+        None => (base, String::new()),
+    };
+    format!("{path}/info/refs?service={}{query}", service.name())
 }
 
 /// The RPC URL: `<base>/<svc>`.
@@ -622,7 +625,7 @@ mod tests {
         );
         assert_eq!(
             refs_url("https://host.x/a?token=t", SmartService::ReceivePack),
-            "https://host.x/a/info/refs?token=t&service=git-receive-pack"
+            "https://host.x/a/info/refs?service=git-receive-pack&token=t"
         );
         assert_eq!(
             rpc_url("https://host.x/a.git", SmartService::UploadPack),
@@ -779,6 +782,7 @@ mod tests {
         pktline::encode_data(&mut out, first.as_bytes()).expect("frame");
         let second = format!("{tip} refs/heads/main\n");
         pktline::encode_data(&mut out, second.as_bytes()).expect("frame");
+        pktline::encode_flush(&mut out);
         out
     }
 
@@ -927,7 +931,7 @@ mod tests {
             post.body.escape_ascii().to_string()
         );
         assert!(
-            post.body.windows(5).any(|w| w == b"done\n"[..]),
+            post.body.windows(5).any(|w| w == b"done\n"),
             "no done line"
         );
         assert!(post.body.ends_with(b"0000"), "no closing flush");
@@ -1046,7 +1050,6 @@ mod tests {
             "http://127.0.0.1:9/a.git",
             &adv,
             &store,
-            kind,
             &mut plan,
             &req,
             &Interrupt::none(),
