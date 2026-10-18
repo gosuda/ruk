@@ -20,7 +20,8 @@
 //! `\(...\)` match literally); there is no `.rukignore`/pathspec support
 //! (no ignore matcher exists anywhere in this tree yet), so a second
 //! positional is a usage error, never a path filter; binary hits render
-//! `Binary file <path> matches` and count as one.
+//! `Binary file <path> matches` and count as one; symlinks are skipped
+//! rather than followed out of the worktree.
 
 use std::borrow::Cow;
 
