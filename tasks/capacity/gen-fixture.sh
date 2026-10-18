@@ -171,8 +171,10 @@ seed_ruk() {
   if [ ! -x "$RUKBIN" ]; then
     return 0
   fi
-  if "$RUKBIN" git -C "$dir" migrate "$dir/.git" "$dir" >/dev/null 2>&1; then
-    return 0
+  if abs_dir="$(cd -- "$dir" 2>/dev/null && pwd)" && [ -n "$abs_dir" ]; then
+    if "$RUKBIN" git -C "$abs_dir" migrate "$abs_dir/.git" "$abs_dir" >/dev/null 2>&1; then
+      return 0
+    fi
   fi
   printf 'gen-fixture: warning: ruk migrate failed for %s\n' "$dir" >&2
 }

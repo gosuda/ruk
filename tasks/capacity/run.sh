@@ -65,6 +65,7 @@ if [ -z "$FIXTURE" ]; then
     || die "fixture generation failed"
 fi
 [ -d "$FIXTURE" ] || die "fixture dir missing: $FIXTURE"
+FIXTURE="$(cd -- "$FIXTURE" && pwd)" || die "cannot canonicalize fixture: $FIXTURE"
 
 mkdir -p -- "$OUT/raw" || die "cannot create out dir"
 WORK="$OUT/work-$(date -u '+%Y%m%dT%H%M%SZ')"
