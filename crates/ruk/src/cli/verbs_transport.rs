@@ -1319,12 +1319,13 @@ fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
     let (workspace, _) = load_or_default(store)?;
     match &workspace.head {
         ruk_core::workspace::HeadRef::Symbolic(name) => {
-            let oid = StoreRefs::new(store)
-                .get(name)?
-                .and_then(|target| match target {
-                    RefTarget::Direct(oid) => Some(oid),
-                    RefTarget::Symbolic(_) => None,
-                })
+            // Follow the full symref chain: a branch may itself point at
+            // another branch. A broken chain (cycle, too deep, dangling)
+            // advertises the zero OID, the same unborn signal as a branch
+            // with no commit.
+            let oid = ruk_core::refdata::resolve(&StoreRefs::new(store), name)
+                .ok()
+                .and_then(|resolved| resolved.oid)
                 .unwrap_or_else(|| store.hash_kind().zero_oid());
             Ok(HeadAdvertisement {
                 oid,
