@@ -26,10 +26,11 @@ use ruk_core::ids::Oid;
 use ruk_core::index::RepoPath;
 use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
-    BookmarkSetArgs, BookmarkTarget, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs, ClaimTtl,
-    IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor, PageLimit, PageRequest, PinArgs,
-    QueryDigest, Reply, ReplyBody, ReplyEnvelope, SessionOpenArgs, StatusArgs, TagAnnotation,
-    TagSetArgs, WorkspaceInit, WsNewArgs,
+    BookmarkSetArgs, BookmarkTarget, ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs,
+    ClaimTtl, DescribeArgs, IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor, PageLimit,
+    PageRequest, PathSelection, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope,
+    SessionOpenArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation, TagSetArgs,
+    WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefTarget};
 use ruk_core::store::{ObjectKind, PreparationBudget, Store};
@@ -1416,6 +1417,190 @@ async fn typed_ws_new_creates_workspace() {
     };
     assert_eq!(reply.entries.items.len(), 1);
     assert_eq!(reply.entries.items[0].method, Method::WsNew);
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `describe` rewrites a message through the lane:
+/// one rewrite, the identity reported, and the operation logged.
+#[tokio::test]
+async fn typed_describe_rewrites_message() {
+    let root = temp_root("typed-describe");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-describe",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-describe",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let open_args = SessionOpenArgs {
+        identity: Some(IdentityClaim {
+            name: "Ada".to_string(),
+            email: "ada@example.invalid".to_string(),
+        }),
+        ..SessionOpenArgs::default()
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "session.open",
+        None,
+        Some(sonic_rs::to_string(&open_args).expect("open args encode")),
+        None,
+    );
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let new_args = NewArgs {
+        parents: Vec::new(),
+        description: ByteString::from("before"),
+        identity: None,
+        workspace: None,
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "new",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&new_args).expect("new args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::New(created)) = envelope.body else {
+        panic!("new must answer its own reply");
+    };
+
+    let describe_args = DescribeArgs {
+        target: ChangeRef {
+            change: created.created.change,
+            head: None,
+        },
+        description: ByteString::from("after"),
+        identity: None,
+        workspaces: Vec::new(),
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "describe",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&describe_args).expect("describe args encode")),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::Describe(rewritten)) = envelope.body else {
+        panic!("describe must answer its own reply");
+    };
+    assert_eq!(rewritten.rewrites.items.len(), 1);
+    assert_eq!(rewritten.rewrites.items[0].old, created.created.head);
+    assert_ne!(rewritten.rewrites.items[0].new, created.created.head);
+    assert!(rewritten.abandoned.items.is_empty());
+    let identity = rewritten
+        .outcome
+        .identity
+        .expect("describe reports the session identity");
+    assert_eq!(identity.name, "Ada");
+
+    let payload = Driver::typed_open(
+        &store_repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(9, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(log)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(log.entries.items.len(), 2);
+    assert_eq!(log.entries.items[0].method, Method::Describe);
+    assert_eq!(log.entries.items[1].method, Method::New);
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `split` stays honestly refused: partitioning by
+/// paths needs intermediate-tree derivation with no producer on this path.
+#[tokio::test]
+async fn typed_split_refusal_names_tree_derivation() {
+    let root = temp_root("typed-split");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-split",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-split",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let split_args = SplitArgs {
+        source: ChangeRef {
+            change: ruk_core::change::ChangeId::from_bytes([0x22; 16]),
+            head: None,
+        },
+        paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
+        placement: SplitPlacement::SelectedFirst,
+        description: ByteString::from("part"),
+        identity: None,
+        merge: ruk_core::protocol::MergeSelection::default(),
+        workspaces: Vec::new(),
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "split",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&split_args).expect("split args encode")),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(5, &payload).await;
+    assert_eq!(report.code, "E_HOSTED");
+    assert!(
+        report.message.contains("ops/tree_edit.rs"),
+        "split names its missing producer: {}",
+        report.message
+    );
 
     drop(driver);
     task.abort();
