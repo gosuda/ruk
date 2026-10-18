@@ -68,6 +68,8 @@ struct Staged {
     current: Option<FreshSegment>,
     copied: HashMap<Oid, ObjectLocation>,
     bytes_copied: u64,
+    /// Segment roll target in effect for the fresh segments.
+    target: u64,
 }
 
 impl Store {
@@ -136,7 +138,10 @@ impl Store {
             return Ok(stats);
         }
         let segments_dir = self.root.join(SEGMENTS_DIR);
-        let mut staged = Staged::default();
+        let mut staged = Staged {
+            target,
+            ..Staged::default()
+        };
         let mut candidates: Vec<(Oid, ObjectLocation, u64)> = Vec::new();
         let mut candidate_bytes: u64 = 0;
         for (oid, location) in self.page_all_objects()? {
@@ -163,7 +168,6 @@ impl Store {
             let mut alloc = || self.create_segment_file(&segments_dir);
             self.copy_object(
                 &segments_dir,
-                target,
                 &mut staged,
                 &mut alloc,
                 *oid,
@@ -172,7 +176,7 @@ impl Store {
             )?;
         }
 
-        let new_generation = self.swap_segments(&segments_dir, target, &mut staged, &retire)?;
+        let new_generation = self.swap_segments(&segments_dir, &mut staged, &retire)?;
         stats.objects_copied = staged.copied.len();
         stats.bytes_copied = staged.bytes_copied;
         stats.segments_created = staged.segments.len();
@@ -214,7 +218,6 @@ impl Store {
     fn copy_object(
         &self,
         segments_dir: &std::path::Path,
-        target: u64,
         staged: &mut Staged,
         alloc: &mut impl FnMut() -> Result<FreshSegment, StoreError>,
         oid: Oid,
@@ -254,6 +257,7 @@ impl Store {
             .and_then(|payload| payload.finish_with_payload_crc())
             .map_err(|err| self.compact_record_error(err, location.segment, &oid))?;
         let record_len = header.record_len();
+        let target = staged.target;
         let needs_roll = staged.current.as_ref().is_some_and(|current| {
             current.writer.records_end() > 0 && !current.writer.fits_sized(record_len, target)
         });
@@ -386,7 +390,6 @@ impl Store {
     fn swap_segments(
         &self,
         segments_dir: &std::path::Path,
-        target: u64,
         staged: &mut Staged,
         retire: &HashSet<u64>,
     ) -> Result<u64, StoreError> {
@@ -395,7 +398,7 @@ impl Store {
         if let Some(reason) = writer.closed.as_ref() {
             return Err(StoreError::WriterClosed(reason.clone()));
         }
-        let outcome = self.swap_inner(segments_dir, target, staged, retire, &mut writer);
+        let outcome = self.swap_inner(segments_dir, staged, retire, &mut writer);
         match outcome {
             Ok(generation) => Ok(generation),
             Err(err) => {
@@ -414,7 +417,6 @@ impl Store {
     fn swap_inner(
         &self,
         segments_dir: &std::path::Path,
-        target: u64,
         staged: &mut Staged,
         retire: &HashSet<u64>,
         writer: &mut super::WriterState,
@@ -442,7 +444,6 @@ impl Store {
             let mut alloc = || self.create_segment_file_lockfree(segments_dir, &mut take_id);
             self.copy_object(
                 segments_dir,
-                target,
                 staged,
                 &mut alloc,
                 oid,

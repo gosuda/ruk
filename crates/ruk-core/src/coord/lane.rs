@@ -153,9 +153,7 @@ impl PublicationLaneRunner {
     pub(crate) async fn run(mut self, cancel: Cancel) -> Result<(), CoreError> {
         let mut deferred: Option<BatchItem> = None;
         let outcome = self.run_loop(&cancel, &mut deferred).await;
-        if let Err(drain_err) = self.drain(deferred).await {
-            return Err(drain_err);
-        }
+        self.drain(deferred).await?;
         outcome
     }
 
@@ -236,19 +234,13 @@ impl PublicationLaneRunner {
         if let Some(item) = deferred {
             accumulator.add(item);
         }
-        loop {
-            match self.rx.try_recv() {
-                Ok(LaneCommand::Submit(item)) => {
-                    if !accumulator.can_admit(&item) {
-                        let full =
-                            std::mem::replace(&mut accumulator, BatchAccumulator::new()).drain();
-                        self.commit_items(full).await?;
-                    }
-                    accumulator.add(item);
-                    pending = true;
-                }
-                Ok(LaneCommand::Close) | Err(_) => break,
+        while let Ok(LaneCommand::Submit(item)) = self.rx.try_recv() {
+            if !accumulator.can_admit(&item) {
+                let full = std::mem::replace(&mut accumulator, BatchAccumulator::new()).drain();
+                self.commit_items(full).await?;
             }
+            accumulator.add(item);
+            pending = true;
         }
         if pending {
             self.commit_items(accumulator.drain()).await?;
@@ -304,14 +296,14 @@ impl PublicationLaneRunner {
             ),
         };
 
-        if let Err(err) = commit_outcome {
-            if err.code == ErrorCode::ECoordinatorUnresponsive {
-                self.closed.store(true, Ordering::Release);
-                if let Ok(mut guard) = self.closed_reason.lock() {
-                    *guard = Some(err.message.clone());
-                }
-                return Err(err);
+        if let Err(err) = commit_outcome
+            && err.code == ErrorCode::ECoordinatorUnresponsive
+        {
+            self.closed.store(true, Ordering::Release);
+            if let Ok(mut guard) = self.closed_reason.lock() {
+                *guard = Some(err.message.clone());
             }
+            return Err(err);
         }
         Ok(())
     }

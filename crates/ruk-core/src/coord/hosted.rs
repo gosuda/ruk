@@ -1754,7 +1754,7 @@ mod tests {
         );
 
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
