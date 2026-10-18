@@ -834,7 +834,8 @@ mod tests {
                 | FactTable::WsApply
                 | FactTable::Reflogs
                 | FactTable::Promisor
-                | FactTable::Shallow => {
+                | FactTable::Shallow
+                | FactTable::LfsObjects => {
                     assert!(!is_tracked, "expected {table:?} to be untracked");
                 }
             }

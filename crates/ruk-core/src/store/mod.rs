@@ -34,6 +34,7 @@
 //! transport, retention and collection are later slices.
 
 pub mod error;
+pub mod lfs;
 pub mod types;
 
 mod compact;

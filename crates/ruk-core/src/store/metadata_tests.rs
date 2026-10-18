@@ -30,7 +30,7 @@ const RAW_VERIFIED: TableDefinition<'static, (), u64> = TableDefinition::new("ve
 
 /// The census of the core contract, spelled independently of the code under
 /// test: every table a store must contain, and no other.
-const CENSUS: [&str; 30] = [
+const CENSUS: [&str; 31] = [
     "objects",
     "commits",
     "changes",
@@ -61,6 +61,7 @@ const CENSUS: [&str; 30] = [
     "shallow",
     "pins",
     "reflogs",
+    "lfs_objects",
 ];
 
 fn every_fact_table() -> Vec<FactTable> {
