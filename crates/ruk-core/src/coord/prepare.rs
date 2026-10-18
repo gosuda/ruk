@@ -76,6 +76,7 @@ use super::clock::Clock;
 use super::hosted::PreparedMutation;
 use super::policy::Policy;
 use super::rows::{self, SessionRow, WorkspaceRow};
+use super::undo::prepare_undo;
 use super::workspace::{self, ObservedWorkspace};
 use crate::attestation::{Checkpoint, prepare_add};
 use crate::bytes::ByteString;
@@ -92,6 +93,10 @@ use crate::ops::{
     AbandonRequest, EditRequest, NewRequest, NewResult, PreparedOp, prepare_abandon, prepare_edit,
     prepare_new,
 };
+use crate::ops::revert::default_revert_message;
+use crate::ops::tree_edit::{
+    Node, Selection, apply_delta, conflicted_paths, covered_by, empty_tree, lookup, set_entry,
+};
 use crate::ops::{children, descendants};
 use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
@@ -105,6 +110,13 @@ use crate::protocol::{
     WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs,
     WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
+use crate::protocol::{
+    Content, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs, RevertReply,
+    UndoArgs, UndoReply,
+};
+use crate::index::{FileMode, RepoPath};
+use crate::workcopy::tree::TreeMode;
+use std::num::NonZeroU32;
 use crate::records::Records;
 use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::head_key;
@@ -245,16 +257,13 @@ pub(crate) fn prepare_mutation_with(
         Request::Squash(m) => squash_parts(ctx, m.request_id, &m.args)?,
         Request::Rebase(m) => rebase_parts(ctx, m.request_id, &m.args)?,
         Request::Abandon(m) => abandon_parts(ctx, m.request_id, &m.args)?,
-        Request::Resolve(_) => {
+        Request::Resolve(m) => resolve_parts(ctx, m.request_id, &m.args)?,
+        Request::Revert(m) => revert_parts(ctx, m.request_id, &m.args)?,
+        Request::Undo(m) => undo_parts(ctx, m.request_id, &m.args)?,
+        Request::OpPrune(_) => {
             return Err(uncovered(
-                "resolve",
-                "turning a path Resolution into a resolved tree needs conflict/merge evaluation with no backing on this path; `ops::resolve` needs a caller-resolved tree instead",
-            ));
-        }
-        Request::Revert(_) => {
-            return Err(uncovered(
-                "revert",
-                "computing the reverse-delta tree needs merge evaluation with no backing on this path; `ops::revert` needs a caller-resolved tree instead",
+                "op.prune",
+                "pruning needs an operation-retention policy, and none exists: the retention sweep covers receipts and sessions only, so no operation is ever expired; its sweep cursor lives in the lane-owned OpHead row, which only the internal Sweep candidate may advance, and that candidate writes no receipt for this reply",
             ));
         }
         _ => {
@@ -839,15 +848,6 @@ fn mint_empty_commit(
             "a commit over several parents needs tree-merge evaluation with no producer on this path; supply one parent or none",
         ));
     }
-    let claim = over.or(row.identity.as_ref()).ok_or_else(|| {
-        CoreError::new(
-            ErrorCode::EInvalid,
-            format!(
-                "method `{method}` needs an identity: neither the call nor the session carries one"
-            ),
-        )
-    })?;
-    claim.validate()?;
     // Read-only pre-checks before the tree publish below: a refused mint
     // must leave no state, so the checks `prepare_new` would run first run
     // here against committed state. They stay advisory — `prepare_new` and
@@ -870,13 +870,7 @@ fn mint_empty_commit(
             "commit message carries NUL",
         ));
     }
-    let secs = clock.sample()?.timestamp().instant().as_second();
-    let author = Signature {
-        name: ByteString::from(claim.name.as_str()),
-        email: ByteString::from(claim.email.as_str()),
-        timestamp: secs,
-        offset: TzOffset::UTC,
-    };
+    let (author, identity) = commit_signature(row, clock, method, over)?;
     let empty = store
         .hash_kind()
         .hash_git_object("tree", b"")
@@ -901,15 +895,6 @@ fn mint_empty_commit(
             provenance: None,
         },
     )?;
-    let identity = EffectiveIdentity {
-        name: claim.name.clone(),
-        email: claim.email.clone(),
-        source: if over.is_some() {
-            IdentitySource::OperationOverride
-        } else {
-            IdentitySource::SessionClaim
-        },
-    };
     Ok((prepared, identity))
 }
 
@@ -2504,6 +2489,482 @@ fn squash_parts(
         dependencies: Vec::new(),
         fence,
     })
+}
+
+/// Prepares `resolve`: replaces one conflicted path of a conflicted commit with
+/// a resolution and rewrites the commit.
+///
+/// Every tree term takes the resolved entry at the path, so the path agrees
+/// across the terms while every other conflict keeps its term list. A commit
+/// whose conflicts are all resolved becomes a singleton tree; `remaining` lists
+/// the paths still conflicted with their term counts.
+///
+/// # Errors
+/// - [`ErrorCode::EInvalid`] when the target is resolved, the path is not
+///   conflicted, a side index is out of range, `AcceptSame` finds sides that
+///   still differ, or the resolution leaves the tree unchanged.
+/// - [`ErrorCode::EConflicted`] when an ancestor of the path is a file in a term.
+/// - [`ErrorCode::EHosted`] for a target with descendants (re-deriving them over
+///   a resolved base needs merge evaluation), supplied staged content that is
+///   not in the store (uploads resolve through the lease registry), and a
+///   GitCompat workspace on the rewritten head.
+/// - Target resolution errors as for `describe`.
+fn resolve_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ResolveArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let target = load_rewrite_target(store, &args.target)?;
+    if target.record.tree().is_resolved() {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `resolve` needs a conflicted target: its tree is already resolved",
+        ));
+    }
+    if !children(store, &target.head)?.is_empty() {
+        return Err(uncovered(
+            "resolve",
+            "the target has descendants, which must be re-derived over the resolved tree with merge evaluation and no producer on this path",
+        ));
+    }
+    let path = &args.path;
+    let terms: Vec<Oid> = target.record.tree().iter().copied().collect();
+    let entries = terms
+        .iter()
+        .map(|term| lookup(store, *term, path))
+        .collect::<Result<Vec<Node>, CoreError>>()?;
+    let merged = Merge::try_from_vec(entries).map_err(CoreError::from)?;
+    if merged.simplify().is_resolved() {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "path {} is not conflicted in the target",
+                String::from_utf8_lossy(path.as_bytes())
+            ),
+        ));
+    }
+    let mut objects = Vec::new();
+    let resolved = resolution_entry(store, &merged, &args.resolution, &mut objects)?;
+    let mut rewritten = Vec::with_capacity(terms.len());
+    for term in &terms {
+        let edit = set_entry(store, *term, path, resolved)?;
+        rewritten.push(edit.root);
+        push_unique(&mut objects, edit.objects);
+    }
+    let tree = Merge::try_from_vec(rewritten)
+        .map_err(CoreError::from)?
+        .simplify();
+    if tree == *target.record.tree() {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `resolve` leaves the target's tree unchanged",
+        ));
+    }
+    let remaining = remaining_after(store, &terms, path)?;
+    let input = preserved_input(
+        &target.record,
+        tree,
+        target.record.parents().to_vec(),
+        Some(target.head),
+    )?;
+    let prepared = Records::new(store).prepare_native_commit(input)?;
+    let head = prepared.head;
+    push_unique(&mut objects, vec![prepared.prepared_object]);
+    let mut facts = prepared.mutations;
+    let gated = gate_workspaces(ctx, "resolve", &args.workspaces)?;
+    let rewrites = BTreeMap::from([(target.head, (target.change, head))]);
+    let (mut workspace_facts, fence) = advance_workspaces(gated, session, "resolve", &rewrites)?;
+    facts.append(&mut workspace_facts);
+    let change = ChangeHead {
+        change: target.change,
+        head,
+    };
+    let mut outcome = pending_outcome(session, request_id);
+    outcome.heads = BoundedList::complete(vec![change])?;
+    let reply = ResolveReply {
+        outcome,
+        change,
+        remaining: BoundedList::complete(remaining)?,
+    };
+    Ok(Parts {
+        reply: Reply::Resolve(Box::new(reply)),
+        objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// The entry a resolution writes at the conflicted path, staging any supplied
+/// blob into `objects`.
+fn resolution_entry(
+    store: &Store,
+    merged: &Merge<Node>,
+    resolution: &Resolution,
+    objects: &mut Vec<PreparedObject>,
+) -> Result<Node, CoreError> {
+    match resolution {
+        Resolution::Side { index } => {
+            let position = usize::try_from(*index).map_err(|_| side_missing(*index, merged))?;
+            merged
+                .get_add(position)
+                .copied()
+                .ok_or_else(|| side_missing(*index, merged))
+        }
+        Resolution::AcceptSame => accept_same(merged),
+        Resolution::Supplied {
+            content,
+            executable,
+        } => {
+            let oid = supplied_blob(store, content, objects)?;
+            let mode = if *executable {
+                FileMode::Executable
+            } else {
+                FileMode::Regular
+            };
+            Ok(Some((TreeMode::File(mode), oid)))
+        }
+    }
+}
+
+/// The refusal for a side index the conflict does not have.
+fn side_missing(index: u32, merged: &Merge<Node>) -> CoreError {
+    CoreError::new(
+        ErrorCode::EInvalid,
+        format!(
+            "side {index} does not exist: the conflict has {} sides",
+            merged.num_sides()
+        ),
+    )
+}
+
+/// Collapses a path conflict whose sides agree: a simplification that resolves
+/// outright, or add terms that all name one entry (the one lossy collapse).
+fn accept_same(merged: &Merge<Node>) -> Result<Node, CoreError> {
+    let simplified = merged.simplify();
+    if let Some(node) = simplified.as_resolved() {
+        return Ok(*node);
+    }
+    let adds: Vec<&Node> = simplified.adds().collect();
+    match adds.split_first() {
+        Some((first, rest)) if rest.iter().all(|add| add == first) => Ok(**first),
+        _ => Err(CoreError::new(
+            ErrorCode::EConflicted,
+            "the sides of the conflict still differ at this path: supply content or pick a side",
+        )),
+    }
+}
+
+/// The blob a supplied resolution names. Inline bytes are staged unless the
+/// store already holds them; a staged upload must already be stored with its
+/// declared size.
+fn supplied_blob(
+    store: &Store,
+    content: &Content,
+    objects: &mut Vec<PreparedObject>,
+) -> Result<Oid, CoreError> {
+    match content {
+        Content::Inline { data } => {
+            let bytes = data.as_bytes();
+            let oid = store.hash_kind().hash_git_object("blob", bytes)?;
+            if store.object_len(oid)?.is_none() {
+                let len = u64::try_from(bytes.len())
+                    .map_err(|_| CoreError::new(ErrorCode::ECapacity, "blob exceeds u64 bytes"))?;
+                let staged = store.prepare(ObjectKind::Blob, len, bytes, None)?;
+                push_unique(objects, vec![staged]);
+            }
+            Ok(oid)
+        }
+        Content::Staged { object } => {
+            let Some(size) = store.object_len(object.oid)? else {
+                return Err(uncovered(
+                    "resolve",
+                    "the supplied staged content is not in the store: staged uploads resolve through the lease registry, which this path does not supply",
+                ));
+            };
+            if size != object.size {
+                return Err(CoreError::new(
+                    ErrorCode::EInvalid,
+                    format!(
+                        "staged content {} is {size} bytes, not the declared {}",
+                        object.oid, object.size
+                    ),
+                ));
+            }
+            Ok(object.oid)
+        }
+    }
+}
+
+/// Adds each object whose id is not already in `objects`.
+fn push_unique(objects: &mut Vec<PreparedObject>, new: Vec<PreparedObject>) {
+    for object in new {
+        if !objects.iter().any(|known| known.oid() == object.oid()) {
+            objects.push(object);
+        }
+    }
+}
+
+/// The conflicts a resolution of `path` leaves: every conflicted path of the
+/// old terms outside the resolved path and beneath it.
+fn remaining_after(
+    store: &Store,
+    terms: &[Oid],
+    path: &RepoPath,
+) -> Result<Vec<RemainingConflict>, CoreError> {
+    conflicted_paths(store, terms)?
+        .into_iter()
+        .filter(|(conflict, _)| !covered_by(conflict.as_bytes(), path))
+        .map(|(conflict, count)| {
+            let terms = u32::try_from(count)
+                .map_err(|_| CoreError::new(ErrorCode::ECapacity, "conflict term count exceeds u32"))?;
+            Ok(RemainingConflict {
+                path: conflict,
+                terms,
+            })
+        })
+        .collect()
+}
+
+/// The single tree of a commit, refusing a conflicted one with `reason`.
+fn resolved_tree_of(record: &CommitRecord, method: &str, reason: &str) -> Result<Oid, CoreError> {
+    record
+        .tree()
+        .as_resolved()
+        .copied()
+        .ok_or_else(|| uncovered(method, reason))
+}
+
+/// Prepares `revert`: a new change on `onto` whose tree is the target's delta
+/// reversed.
+///
+/// The delta is the target's tree against the mainline parent's tree (the
+/// empty tree for a root). Applying its reverse onto the new parent's tree
+/// refuses with `E_CONFLICTED` where the parent diverged on the same paths.
+/// The commit is minted in a fresh change under the session identity and the
+/// coordinator clock, as `new` does.
+///
+/// # Errors
+/// - [`ErrorCode::EInvalid`] for `mainline` on a non-merge or missing on a
+///   merge, a mainline out of range, no `onto`, or a message carrying NUL.
+/// - [`ErrorCode::EHosted`] for a conflicted target or parent tree, several
+///   `onto` parents (tree merge), and the legacy path without identity or clock.
+/// - [`ErrorCode::EConflicted`] naming every path where the reversal collides.
+fn revert_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &RevertArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "revert",
+            "minting the revert's signature needs the session identity row, which this path does not supply",
+        )
+    })?;
+    let clock = ctx.clock.ok_or_else(|| {
+        uncovered(
+            "revert",
+            "minting the revert's signature needs the coordinator clock, which this path does not supply",
+        )
+    })?;
+    let target = load_rewrite_target(store, &args.target)?;
+    let target_tree = resolved_tree_of(
+        &target.record,
+        "revert",
+        "reverting a conflicted commit needs merge evaluation with no producer on this path",
+    )?;
+    let mainline_tree = match revert_base(target.record.parents(), args.mainline)? {
+        None => empty_tree(store.hash_kind())?,
+        Some(parent) => {
+            let commit = Records::new(store)
+                .get_commit(&parent)?
+                .ok_or_else(|| not_stored(&parent))?;
+            resolved_tree_of(
+                &commit,
+                "revert",
+                "reverting a change against a conflicted parent needs merge evaluation with no producer on this path",
+            )?
+        }
+    };
+    let onto = match args.onto.as_slice() {
+        [] => {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "method `revert` needs at least one parent in onto",
+            ));
+        }
+        [onto] => *onto,
+        _ => {
+            return Err(uncovered(
+                "revert",
+                "a revert over several parents needs tree-merge evaluation with no producer on this path; supply one parent",
+            ));
+        }
+    };
+    let onto_record = Records::new(store)
+        .get_commit(&onto)?
+        .ok_or_else(|| not_stored(&onto))?;
+    let onto_tree = resolved_tree_of(
+        &onto_record,
+        "revert",
+        "reverting onto a conflicted parent needs merge evaluation with no producer on this path",
+    )?;
+    let message = args
+        .description
+        .clone()
+        .unwrap_or_else(|| default_revert_message(target.record.message()));
+    if message.as_bytes().contains(&0) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "commit message carries NUL",
+        ));
+    }
+    let reversed = apply_delta(
+        store,
+        onto_tree,
+        target_tree,
+        mainline_tree,
+        Selection::All,
+    )?;
+    let (author, identity) = commit_signature(row, clock, "revert", args.identity.as_ref())?;
+    let input = NativeCommitInput {
+        change_id: ChangeId::generate(),
+        tree: Merge::resolved(reversed.root),
+        parents: vec![onto],
+        predecessor: None,
+        author: author.clone(),
+        committer: author,
+        extra_headers: Vec::new(),
+        message,
+        provenance: None,
+    };
+    let prepared = Records::new(store).prepare_native_commit(input)?;
+    let created = ChangeHead {
+        change: prepared.record.change_id(),
+        head: prepared.head,
+    };
+    let mut objects = reversed.objects;
+    push_unique(&mut objects, vec![prepared.prepared_object]);
+    let mut outcome = pending_outcome(session, request_id);
+    outcome.identity = Some(identity);
+    outcome.merge = merge_report_of(args.merge.mode)?;
+    outcome.heads = BoundedList::complete(vec![created])?;
+    Ok(Parts {
+        reply: Reply::Revert(Box::new(RevertReply { outcome, created })),
+        objects,
+        facts: prepared.mutations,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// The parent whose tree a revert measures the target's delta against: none
+/// for a root, the only parent for a plain commit, and the one-based mainline
+/// for a merge. `mainline` is refused wherever it does not select a parent.
+fn revert_base(parents: &[Head], mainline: Option<NonZeroU32>) -> Result<Option<Head>, CoreError> {
+    match (parents, mainline) {
+        ([], None) => Ok(None),
+        ([parent], None) => Ok(Some(*parent)),
+        ([] | [_], Some(_)) => Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "method `revert`: `mainline` selects a parent of a merge commit, and this commit has {} parents",
+                parents.len()
+            ),
+        )),
+        (_, None) => Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "method `revert` needs `mainline` to revert a merge commit, which has {} parents",
+                parents.len()
+            ),
+        )),
+        (_, Some(mainline)) => usize::try_from(mainline.get() - 1)
+            .ok()
+            .and_then(|index| parents.get(index).copied())
+            .map(Some)
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::EInvalid,
+                    format!(
+                        "`mainline` {mainline} names no parent of this {}-parent merge",
+                        parents.len()
+                    ),
+                )
+            }),
+    }
+}
+
+/// Prepares `undo`: the exact inverse of a retained operation.
+///
+/// # Errors
+/// As [`prepare_undo`]: `E_NOT_FOUND` for a pruned or unknown operation,
+/// `E_UNDO_CONFLICT` for methods whose effects lie outside the tracked tables.
+fn undo_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &UndoArgs,
+) -> Result<Parts, CoreError> {
+    let plan = prepare_undo(ctx.store, args.operation)?;
+    let reply = UndoReply {
+        outcome: pending_outcome(ctx.session, request_id),
+        undone: args.operation,
+        restored: plan.summary,
+    };
+    Ok(Parts {
+        reply: Reply::Undo(Box::new(reply)),
+        objects: Vec::new(),
+        facts: plan.facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// The signature a new commit carries: the call's identity override, else the
+/// session identity, stamped with the coordinator clock in UTC.
+///
+/// # Errors
+/// - [`ErrorCode::EInvalid`] with neither an override nor a session identity,
+///   or with a malformed identity.
+fn commit_signature(
+    row: &SessionRow,
+    clock: &Clock,
+    method: &str,
+    over: Option<&IdentityClaim>,
+) -> Result<(Signature, EffectiveIdentity), CoreError> {
+    let claim = over.or(row.identity.as_ref()).ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "method `{method}` needs an identity: neither the call nor the session carries one"
+            ),
+        )
+    })?;
+    claim.validate()?;
+    let secs = clock.sample()?.timestamp().instant().as_second();
+    let author = Signature {
+        name: ByteString::from(claim.name.as_str()),
+        email: ByteString::from(claim.email.as_str()),
+        timestamp: secs,
+        offset: TzOffset::UTC,
+    };
+    let identity = EffectiveIdentity {
+        name: claim.name.clone(),
+        email: claim.email.clone(),
+        source: if over.is_some() {
+            IdentitySource::OperationOverride
+        } else {
+            IdentitySource::SessionClaim
+        },
+    };
+    Ok((author, identity))
 }
 
 /// Prepares `abandon`: drops target heads and re-parents descendants onto the

@@ -224,7 +224,7 @@ fn describe_head(head: &Head) -> String {
     }
 }
 
-fn default_revert_message(original_message: &[u8]) -> ByteString {
+pub(crate) fn default_revert_message(original_message: &[u8]) -> ByteString {
     let first_line = match original_message.split(|&b| b == b'\n').next() {
         Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
         None => b"",

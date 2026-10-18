@@ -39,10 +39,10 @@ pub(crate) enum Selection<'a> {
 }
 
 /// One tree entry: its mode and object id.
-type Entry = (TreeMode, Oid);
+pub(crate) type Entry = (TreeMode, Oid);
 
 /// An entry that may be absent. An absent directory is the empty directory.
-type Node = Option<Entry>;
+pub(crate) type Node = Option<Entry>;
 
 /// The result of one tree edit: the new root and the tree objects it staged.
 #[derive(Debug)]
@@ -191,7 +191,7 @@ fn child(dir: &[u8], name: &[u8]) -> Vec<u8> {
 }
 
 /// Whether the selected `path` lies inside a selected path, itself included.
-fn covered_by(path: &[u8], selected: &RepoPath) -> bool {
+pub(crate) fn covered_by(path: &[u8], selected: &RepoPath) -> bool {
     let selected = selected.as_bytes();
     path == selected
         || (path.len() > selected.len()
