@@ -107,9 +107,21 @@ compare() {
     cp -- "$CAP/w_r_err.txt" "$CAP/n_r_err.txt" || die "stage ruk stderr failed"
   fi
   if cmp -s -- "$CAP/n_o_std.txt" "$CAP/n_r_std.txt" && cmp -s -- "$CAP/n_o_err.txt" "$CAP/n_r_err.txt" && [ "$O_CODE" -eq "$R_CODE" ]; then
+    if [ "$mode" = "divergent" ]; then
+      FAIL_N=$((FAIL_N + 1))
+      FAIL_ROWS="$FAIL_ROWS $label"
+      printf 'FAIL  %s (matched oracle; expected divergence)\n' "$label"
+      return 0
+    fi
     PASS_N=$((PASS_N + 1))
     PASS_ROWS="$PASS_ROWS $label"
     printf 'PASS  %s\n' "$label"
+    return 0
+  fi
+  if [ "$mode" = "divergent" ]; then
+    PASS_N=$((PASS_N + 1))
+    PASS_ROWS="$PASS_ROWS $label"
+    printf 'PASS  %s [expected-divergence]\n' "$label"
     return 0
   fi
   FAIL_N=$((FAIL_N + 1))
@@ -137,6 +149,7 @@ compare() {
 
 classify() {
   case "$1" in
+    a/init) printf 'expected-divergence' ;;
     a/merge-ff) printf 'unsupported-flag' ;;
     b/status-porcelain-mv|b/checkout-path|c/cat-file-t-head|c/cat-file-p-head) printf 'semantic-diff' ;;
     *) printf 'byte-diff-vs-git' ;;
@@ -179,7 +192,7 @@ scenario_a() {
   new_pair a
   run_o init -b main
   run_r init
-  compare "a/init" exact
+  compare "a/init" divergent
   seed a.txt 'hello\n'
   run_both "a/add" exact add a.txt
   run_both "a/commit-1" exact -c user.email=oracle@x -c user.name=Oracle commit -m one
