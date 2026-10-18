@@ -757,9 +757,21 @@ impl Store {
         if let Some(reason) = &writer.closed {
             return Err(StoreError::WriterClosed(reason.clone()));
         }
+        let profile = profile_enabled();
+        let begin_start = ProfileClock::now(profile);
         let txn = self.observe(self.meta.begin_publication(facts))?;
+        let begin_ms = begin_start.elapsed_ms();
+        let plan_start = ProfileClock::now(profile);
         let plan = self.observe(self.plan(&txn, &objects))?;
-        match self.write_and_commit(&mut writer, txn, plan) {
+        let plan_ms = plan_start.elapsed_ms();
+        if profile {
+            eprintln!(
+                "[ruk-profile] publish begin={begin_ms:.1}ms plan={plan_ms:.1}ms objects={} fresh={}",
+                objects.len(),
+                plan.fresh.len(),
+            );
+        }
+        match self.write_and_commit(&mut writer, txn, plan, profile) {
             Ok(publication) => Ok(publication),
             Err(err) => {
                 writer.closed = Some(format!(
@@ -911,6 +923,7 @@ impl Store {
         writer: &mut WriterState,
         txn: PublicationTxn,
         plan: Plan<'_>,
+        profile: bool,
     ) -> Result<Publication, StoreError> {
         let Plan {
             order,
@@ -919,24 +932,46 @@ impl Store {
         } = plan;
         let segments_dir = self.root.join(SEGMENTS_DIR);
         let mut batch = Batch::default();
+        let total_start = ProfileClock::now(profile);
+        let append_start = ProfileClock::now(profile);
+        let mut append_bytes = 0u64;
         for object in &fresh {
             append(writer, &mut batch, &segments_dir, object, generation)?;
+            if profile {
+                append_bytes += segment::record_len_for(object.payload.len()).unwrap_or(0);
+            }
         }
+        let append_ms = append_start.elapsed_ms();
         #[cfg(test)]
         crash_tests::crash_at("after_append");
 
+        let sync_start = ProfileClock::now(profile);
         batch.sync_files(writer)?;
+        let sync_files_ms = sync_start.elapsed_ms();
         #[cfg(test)]
         crash_tests::crash_at("after_segment_sync");
 
+        let dir_start = ProfileClock::now(profile);
         if batch.new_entries {
             sync_entries(&segments_dir)?;
         }
+        let sync_dir_ms = dir_start.elapsed_ms();
         #[cfg(test)]
         crash_tests::crash_at("after_directory_sync");
 
+        let stage_start = ProfileClock::now(profile);
         self.observe(batch.stage(&txn, writer, generation, !fresh.is_empty()))?;
+        let stage_ms = stage_start.elapsed_ms();
+        let commit_start = ProfileClock::now(profile);
         self.observe(txn.commit())?;
+        let commit_ms = commit_start.elapsed_ms();
+        if profile {
+            eprintln!(
+                "[ruk-profile] write_and_commit fresh={} append={append_ms:.1}ms append_bytes={append_bytes} sync_files={sync_files_ms:.1}ms sync_dir={sync_dir_ms:.1}ms stage={stage_ms:.1}ms commit={commit_ms:.1}ms total={:.1}ms",
+                fresh.len(),
+                total_start.elapsed_ms(),
+            );
+        }
         #[cfg(test)]
         crash_tests::crash_at("after_metadata_commit");
 
@@ -1123,6 +1158,34 @@ fn open_segment(
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// Coarse publish-stage timing for the clone-probe floor hunt. `RUK_PROFILE=1`
+/// prints one stderr line per publication stage; any other value (or unset)
+/// compiles to a dead clock with zero behavior change. Stderr, not tracing:
+/// `ruk-core` has no tracing dependency and the probe reads raw stderr.
+fn profile_enabled() -> bool {
+    std::env::var_os("RUK_PROFILE").is_some_and(|value| value == "1")
+}
+
+/// A clock that only runs when profiling. `elapsed_ms` on a disabled clock
+/// returns 0.0 without touching the system clock.
+struct ProfileClock {
+    start: Option<std::time::Instant>,
+}
+
+impl ProfileClock {
+    fn now(enabled: bool) -> Self {
+        Self {
+            start: enabled.then(std::time::Instant::now),
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.start
+            .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
     }
 }
 

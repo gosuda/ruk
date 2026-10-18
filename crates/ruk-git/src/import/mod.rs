@@ -248,18 +248,32 @@ pub fn import_repository(
     // is content-addressed with no predecessor, hence never a delta, so
     // `check_delta_base` is vacuous here regardless of order.
     let width = walk::import_threads();
+    let profile = std::env::var_os("RUK_PROFILE").is_some_and(|value| value == "1");
+    let import_start = profile.then(std::time::Instant::now);
+    let (mut walk_ms, mut prepare_ms, mut rejoin_ms) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let mut waves = 0_u64;
     loop {
         let mut chunk = Vec::new();
+        let walk_start = profile.then(std::time::Instant::now);
         while chunk.len() < PREPARE_CHUNK {
             match walker.next(&source, progress)? {
                 Some(emit) => chunk.push(emit),
                 None => break,
             }
         }
+        if let Some(start) = walk_start {
+            walk_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
         if chunk.is_empty() {
             break;
         }
+        waves += 1;
+        let prepare_start = profile.then(std::time::Instant::now);
         let staged = prepare_chunk(store, progress, &chunk, width)?;
+        if let Some(start) = prepare_start {
+            prepare_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
+        let rejoin_start = profile.then(std::time::Instant::now);
         for (emit, staged) in chunk.into_iter().zip(staged) {
             match staged? {
                 Staged::Ready(ready) => {
@@ -268,9 +282,16 @@ pub fn import_repository(
                 Staged::Serial => batcher.accept(&source, sink, &mut tally, &mut peeled, emit)?,
             }
         }
+        if let Some(start) = rejoin_start {
+            rejoin_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
     }
 
+    let plan_start = profile.then(std::time::Instant::now);
     let plan = refs::plan_refs(store, request, &source_refs, &peeled)?;
+    let plan_refs_ms = plan_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
 
     let mut shallow_seen = Vec::new();
     let mut shallow_facts = Vec::new();
@@ -298,7 +319,17 @@ pub fn import_repository(
 
     let mut facts = plan.facts;
     facts.extend(shallow_facts);
+    let finish_start = profile.then(std::time::Instant::now);
     let (objects, batches) = batcher.finish(sink, facts)?;
+    if let Some(start) = import_start {
+        eprintln!(
+            "[ruk-profile] import waves={waves} walk={walk_ms:.1}ms prepare={prepare_ms:.1}ms rejoin={rejoin_ms:.1}ms plan_refs={plan_refs_ms:.1}ms finish={:.1}ms total={:.1}ms width={width}",
+            finish_start
+                .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
 
     Ok(ImportReport {
         object_format: store.hash_kind(),

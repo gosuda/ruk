@@ -262,7 +262,13 @@ pub fn local_fetch(
             detail: "local source uses another object format".to_owned(),
         });
     }
+    let profile = std::env::var_os("RUK_PROFILE").is_some_and(|value| value == "1");
+    let fetch_start = profile.then(std::time::Instant::now);
+    let closure_start = profile.then(std::time::Instant::now);
     let closure = local_closure(src, kind, req, interrupt)?;
+    let closure_ms = closure_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
     let pack_entries: Vec<PackEntry<'_>> = closure
         .objects
         .iter()
@@ -274,8 +280,13 @@ pub fn local_fetch(
         })
         .collect();
     let mut pack = Vec::new();
+    let write_pack_start = profile.then(std::time::Instant::now);
     write_pack(&mut pack, kind, &pack_entries, interrupt)?;
+    let write_pack_ms = write_pack_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
     let staged = ingest_pack(&pack[..], kind, dest, limits, interrupt)?;
+    let verify_start = profile.then(std::time::Instant::now);
     let report = super::fetch::verify_closure(
         dest,
         &staged,
@@ -284,6 +295,9 @@ pub fn local_fetch(
         &closure.shallow,
         interrupt,
     )?;
+    let verify_ms = verify_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
     let mut facts: Vec<ruk_core::store::types::FactMutation> = Vec::new();
     if let Some(filter) = req.filter {
         facts.extend(promisor_facts(remote, filter, &report.missing_promisor)?);
@@ -291,8 +305,20 @@ pub fn local_fetch(
     facts.extend(shallow_facts(&closure.shallow, &[]));
     facts.extend(observation_mutations(remote, tracking));
     facts.extend(ref_mutations.iter().cloned());
+    let records_start = profile.then(std::time::Instant::now);
     facts.extend(super::fetch::commit_record_facts(dest, &staged)?);
+    let records_ms = records_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
     let publication = dest.publish(staged.into_objects(), &facts)?;
+    if let Some(start) = fetch_start {
+        eprintln!(
+            "[ruk-profile] local_fetch objects={} pack_bytes={} closure={closure_ms:.1}ms write_pack={write_pack_ms:.1}ms verify={verify_ms:.1}ms records={records_ms:.1}ms total={:.1}ms",
+            closure.objects.len(),
+            pack.len(),
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
     Ok(FetchReport {
         publication,
         delivered: report.wanted,
@@ -344,6 +370,10 @@ pub(crate) fn local_closure(
     let mut visited = HashSet::new();
     // (oid, commit depth from the wants; non-commits ride along).
     let mut queue: VecDeque<(Oid, u32)> = req.wants.iter().map(|oid| (*oid, 0)).collect();
+    // NOTE (measured 2026-10-18): fanning these reads across the pack
+    // worker pool regressed closure 1.6s -> 40s (1M pread64 at ~270us
+    // each plus a futex storm: concurrent point reads convoy on the
+    // source store's files). Serial reads stay.
     while let Some((oid, depth)) = queue.pop_front() {
         interrupt.check("computing the local fetch closure")?;
         if !visited.insert(oid) || uninteresting.contains(&oid) {
