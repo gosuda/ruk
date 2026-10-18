@@ -28,7 +28,7 @@ use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::ops::{NewRequest, prepare_new as ops_prepare_new};
-use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
+use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::refs::{ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog};
 use ruk_core::store::{FactMutation, Store};
 use ruk_core::workspace::HeadRef;
@@ -1776,10 +1776,22 @@ pub(crate) fn symbolic_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "no-recurse",
+            short: None,
+            takes_value: false,
+        },
+        // The default: accepted so scripts can spell it out.
+        FlagSpec {
+            long: "recurse",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
-    // `-m` is the reflog reason for deletions; writes move the workspace
-    // row, which carries no reflog message lane, so only deletes consume it.
+    // `-m` is the reflog reason for an update. Deletes ignore it, as the
+    // oracle does; a set on a symref has no reflog lane here, so it is refused
+    // rather than dropped (see the `[name, target]` arm).
     let message = opts.single("message")?;
     match opts.positionals.as_slice() {
         [] => Err(GitError::Invalid {
@@ -1787,18 +1799,28 @@ pub(crate) fn symbolic_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
         }),
         [name] => {
             if opts.is_set("delete") {
-                return delete_symbolic(ctx, name, message);
+                return delete_symbolic(ctx, name);
             }
+            let target = if opts.is_set("no-recurse") {
+                ref_text(&immediate_symbolic_target(ctx, name)?)
+            } else {
+                terminal_symbolic_target(ctx, name)?
+            };
             if opts.is_set("short") {
-                let target = symbolic_target(ctx, name)?;
                 return Ok(line(shorten_refname(&target).as_bytes().to_vec()));
             }
-            read_symbolic(ctx, name)
+            Ok(line(target.into_bytes()))
         }
         [name, target] => {
             if opts.is_set("delete") {
                 return Err(GitError::Invalid {
                     detail: "symbolic-ref -d takes only a name".to_owned(),
+                });
+            }
+            if message.is_some() {
+                return Err(GitError::Unsupported {
+                    command: "symbolic-ref -m on a set: symref reflog rows are not recorded"
+                        .to_owned(),
                 });
             }
             write_symbolic(ctx, name, target)
@@ -1817,38 +1839,75 @@ fn shorten_refname(name: &str) -> &str {
         .unwrap_or_else(|| name.strip_prefix("refs/").unwrap_or(name))
 }
 
-/// Reads one symbolic ref's target.
-fn read_symbolic(ctx: &Ctx, name: &str) -> Result<Vec<u8>, GitError> {
-    symbolic_target(ctx, name).map(|target| line(target.into_bytes()))
-}
-
-/// Resolves one symbolic ref to its target name.
-fn symbolic_target(ctx: &Ctx, name: &str) -> Result<String, GitError> {
+/// The one-level target of a symbolic ref, `HEAD` included (`--no-recurse`).
+fn immediate_symbolic_target(ctx: &Ctx, name: &str) -> Result<RefName, GitError> {
     let store = ctx.store()?;
     if name == "HEAD" {
         let (workspace, _) = load_or_default(store)?;
-        match workspace.head {
-            HeadRef::Symbolic(target) => {
-                return Ok(target.to_utf8().unwrap_or_default().to_owned());
-            }
-            HeadRef::Detached(_) => {
-                return Err(GitError::Invalid {
-                    detail: "ref HEAD is not a symbolic ref".to_owned(),
-                });
-            }
-        }
+        return match workspace.head {
+            HeadRef::Symbolic(target) => Ok(target),
+            HeadRef::Detached(_) => Err(not_symbolic("HEAD")),
+        };
     }
-    let refname = RefName::new(name.to_owned()).map_err(|err| GitError::Invalid {
-        detail: format!("bad ref name: {err}"),
-    })?;
+    let refname = symref_name(name)?;
     match super::state::read_ref(store, &refname)? {
-        Some(RefTarget::Symbolic(target)) => Ok(target.to_utf8().unwrap_or_default().to_owned()),
-        Some(RefTarget::Direct(_)) => Err(GitError::Invalid {
-            detail: format!("ref {name} is not a symbolic ref"),
-        }),
+        Some(RefTarget::Symbolic(target)) => Ok(target),
+        Some(RefTarget::Direct(_)) => Err(not_symbolic(name)),
         None => Err(GitError::NotFound {
             detail: format!("ref {name} does not exist"),
         }),
+    }
+}
+
+/// The terminal of a symbolic ref's chain: the oracle's default. It prints
+/// even when unborn, and a broken chain is reported by name.
+fn terminal_symbolic_target(ctx: &Ctx, name: &str) -> Result<String, GitError> {
+    let store = ctx.store()?;
+    let refs = StoreRefs::new(store);
+    if name == "HEAD" {
+        let (workspace, _) = load_or_default(store)?;
+        let resolved = match workspace.head.resolve(&refs).map_err(ref_error)? {
+            ruk_core::workspace::ResolvedHead::Symbolic(resolved) => resolved,
+            ruk_core::workspace::ResolvedHead::Detached(_) => {
+                return Err(not_symbolic("HEAD"));
+            }
+        };
+        return Ok(ref_text(&resolved.terminal));
+    }
+    // Reject a direct or absent ref before resolving through it.
+    immediate_symbolic_target(ctx, name)?;
+    let refname = symref_name(name)?;
+    let resolved = ruk_core::refdata::resolve(&refs, &refname).map_err(ref_error)?;
+    Ok(ref_text(&resolved.terminal))
+}
+
+/// Parses a stored ref name from the command line.
+fn symref_name(name: &str) -> Result<RefName, GitError> {
+    RefName::new(name.to_owned()).map_err(|err| GitError::Invalid {
+        detail: format!("bad ref name: {err}"),
+    })
+}
+
+/// The text of a ref name as the symref verbs print it.
+fn ref_text(name: &RefName) -> String {
+    name.to_utf8().unwrap_or_default().to_owned()
+}
+
+/// The refusal for a ref that is not symbolic.
+fn not_symbolic(name: &str) -> GitError {
+    GitError::Invalid {
+        detail: format!("ref {name} is not a symbolic ref"),
+    }
+}
+
+/// Maps a ref-contract failure: a store read keeps its error, while a broken
+/// chain (cycle or too deep) is reported by name.
+fn ref_error(err: ruk_core::refdata::RefError) -> GitError {
+    match err {
+        ruk_core::refdata::RefError::Read(core) => GitError::from(core),
+        other => GitError::Invalid {
+            detail: other.to_string(),
+        },
     }
 }
 
@@ -1860,6 +1919,11 @@ fn write_symbolic(ctx: &Ctx, name: &str, target: &str) -> Result<Vec<u8>, GitErr
         detail: format!("bad symref target: {err}"),
     })?;
     if name == "HEAD" {
+        if !target.starts_with("refs/") {
+            return Err(GitError::Invalid {
+                detail: "Refusing to point HEAD outside of refs/".to_owned(),
+            });
+        }
         let (workspace, raw) = load_or_default(store)?;
         let next = workspace.move_head(workspace.stamp, HeadRef::Symbolic(target_name))?;
         let mutation = workspace_mutation(raw.as_deref(), &next)?;
@@ -1883,26 +1947,38 @@ fn write_symbolic(ctx: &Ctx, name: &str, target: &str) -> Result<Vec<u8>, GitErr
     Ok(Vec::new())
 }
 
-/// Deletes one symbolic ref, refusing `HEAD` and direct refs.
-fn delete_symbolic(ctx: &Ctx, name: &str, message: Option<String>) -> Result<Vec<u8>, GitError> {
+/// Deletes one symbolic ref, refusing `HEAD` and any ref that is not symbolic.
+///
+/// The delete is a compare-and-swap on the symbolic value just read: a ref that
+/// turned direct in between fails the expectation instead of being removed.
+/// Like the oracle's delete, no reflog message is recorded.
+fn delete_symbolic(ctx: &Ctx, name: &str) -> Result<Vec<u8>, GitError> {
     if name == "HEAD" {
         return Err(GitError::Invalid {
             detail: "deleting HEAD is not allowed".to_owned(),
         });
     }
     let store = ctx.store()?;
-    let refname = RefName::new(name.to_owned()).map_err(|err| GitError::Invalid {
-        detail: format!("bad ref name: {err}"),
-    })?;
-    let target = super::state::read_ref(store, &refname)?.ok_or_else(|| GitError::NotFound {
-        detail: format!("ref {name} does not exist"),
-    })?;
-    if !matches!(target, RefTarget::Symbolic(_)) {
-        return Err(GitError::Invalid {
-            detail: format!("ref {name} is not a symbolic ref"),
-        });
-    }
-    delete_ref_logged(ctx, name, None, message)
+    let kind = ctx.kind()?;
+    let refname = symref_name(name)?;
+    let expected = match super::state::read_ref(store, &refname)? {
+        Some(target @ RefTarget::Symbolic(_)) => target,
+        _ => {
+            return Err(GitError::Invalid {
+                detail: format!("Cannot delete {name}, not a symbolic ref"),
+            });
+        }
+    };
+    apply_refs(
+        store,
+        kind,
+        vec![RefUpdate {
+            name: refname,
+            expected: RefExpect::Present(expected),
+            change: RefChange::Delete,
+        }],
+    )?;
+    Ok(Vec::new())
 }
 
 /// Lists local references.
