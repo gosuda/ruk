@@ -765,13 +765,14 @@ async fn serve_async(
     // Orderly shutdown: first wait for live connections to release their
     // permits, so accepted work finishes with coordinator services still
     // up (frame timeouts bound every connection, so the wait ends); then
-    // retire every coordinator, letting each lane drain in-flight and
-    // queued work. Spawned tasks hold registry clones, so registry Drop
-    // alone would never run while a connection hangs.
+    // retire every coordinator and await each lane runner, so the drain
+    // completes before the runtime drops. Spawned tasks hold registry
+    // clones, so registry Drop alone would never run while a connection
+    // hangs.
     if let Ok(permits) = u32::try_from(config.max_connections) {
         let _ = connections.acquire_many(permits).await;
     }
-    refs.registry.shutdown_all();
+    refs.registry.shutdown_and_drain().await;
     Ok(())
 }
 

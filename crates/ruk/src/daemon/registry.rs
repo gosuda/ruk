@@ -9,7 +9,9 @@
 //! retention task spawns alongside it unless the interval is zero, and idle
 //! eviction or registry drop retires the coordinator through `shutdown`.
 //! Eviction skips entries with invocations still in flight, so retiring
-//! never cancels a live submission.
+//! never cancels a live submission. Full serve shutdown goes further
+//! through `shutdown_and_drain`, which awaits every lane runner so the
+//! drain completes before the runtime drops.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,6 +31,10 @@ struct RepoEntry {
     path: PathBuf,
     /// The one hosted coordinator of this repository; `None` until first open.
     coordinator: Option<Arc<HostedCoordinator>>,
+    /// The spawned lane runner; awaited by full shutdown so the drain
+    /// completes before the runtime drops. Eviction drops it detached:
+    /// the runner still drains while the runtime lives.
+    runner: Option<tokio::task::JoinHandle<Result<(), CoreError>>>,
     /// The last instant this entry served an open.
     last_used: Instant,
 }
@@ -235,9 +241,10 @@ impl Registry {
             owner,
             canonical.to_path_buf(),
         )?);
-        let _ = coordinator.spawn_on(&runtime)?;
+        let runner = coordinator.spawn_on(&runtime)?;
         spawn_retention(&runtime, &coordinator, self.retention_interval_ms());
         entry.coordinator = Some(Arc::clone(&coordinator));
+        entry.runner = Some(runner);
         entry.last_used = Instant::now();
         Ok(coordinator)
     }
@@ -339,6 +346,7 @@ impl Registry {
             RepoEntry {
                 path: canonical.to_path_buf(),
                 coordinator: None,
+                runner: None,
                 last_used: Instant::now(),
             },
         );
@@ -461,6 +469,34 @@ impl Registry {
             .unwrap_or_default();
         for coordinator in retired {
             coordinator.shutdown();
+        }
+    }
+}
+
+impl Registry {
+    /// Retires every coordinator and awaits each lane runner to completion.
+    ///
+    /// `shutdown_all` signals the drain; this waits for it, so no runner
+    /// is still committing when the daemon runtime drops. Runner outcomes
+    /// are already delivered per submission; join failures (a runtime
+    /// tearing down around the wait) report nowhere new. Evicted entries
+    /// keep no handle: their runners drain detached while the runtime
+    /// lives, exactly as before.
+    pub async fn shutdown_and_drain(&self) {
+        self.shutdown_all();
+        let runners: Vec<tokio::task::JoinHandle<Result<(), CoreError>>> = self
+            .inner
+            .lock()
+            .map(|mut inner| {
+                inner
+                    .entries
+                    .values_mut()
+                    .filter_map(|entry| entry.runner.take())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for runner in runners {
+            let _ = runner.await;
         }
     }
 }
@@ -638,6 +674,41 @@ mod tests {
         assert_eq!(refused.code, ErrorCode::ECancelled);
         drop(coordinator);
         registry.shutdown_all();
+    }
+
+    #[test]
+    fn shutdown_and_drain_awaits_runner_completion() {
+        use ruk_core::HashKind;
+        use ruk_core::coord::cancellation;
+        use ruk_core::error::ErrorCode;
+        use ruk_core::store::{PreparationBudget, Store};
+        use std::sync::Arc;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        Store::create(
+            &root.join("repo-a"),
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("scratch store initializes");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+        let handle = registry
+            .open_by_path(&root.join("repo-a"))
+            .expect("inside path opens");
+        let (_, _, coordinator) = registry.open(&handle).expect("open coordinates");
+        let (_guard, cancel) = cancellation();
+        // Awaiting the drain returns: the runner exited instead of
+        // hanging, and a second call finds no handles left.
+        runtime.block_on(registry.shutdown_and_drain());
+        runtime.block_on(registry.shutdown_and_drain());
+        let refused = runtime
+            .block_on(coordinator.retention_sweep(&cancel))
+            .expect_err("sweep after drained shutdown is refused");
+        assert_eq!(refused.code, ErrorCode::ECancelled);
     }
 
     #[test]
