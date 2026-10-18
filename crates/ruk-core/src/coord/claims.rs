@@ -242,7 +242,15 @@ pub(crate) fn seal_write(
     Ok(ClaimCheck { facts, warnings })
 }
 
-fn canonical_paths(mut paths: Vec<RepoPath>) -> Result<Vec<RepoPath>, CoreError> {
+/// Canonicalizes a claim path set without touching the store: sorts,
+/// dedupes, and drops paths already covered by an ancestor.
+///
+/// Pure, so preparation may call it for its pending reply; sealing stays in
+/// the lane.
+///
+/// # Errors
+/// `E_INVALID` when the set is empty.
+pub(crate) fn canonical_paths(mut paths: Vec<RepoPath>) -> Result<Vec<RepoPath>, CoreError> {
     if paths.is_empty() {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
@@ -622,6 +630,17 @@ fn path_prefix(path: &[u8]) -> Vec<u8> {
     key
 }
 
+/// Reads one stored claim record without sealing anything.
+///
+/// Read-only, so preparation may call it to predict its pending reply; the
+/// lane re-reads authoritatively at commit time.
+pub(crate) fn read_record(
+    store: &Store,
+    claim: ClaimId,
+) -> Result<Option<ClaimRecord>, CoreError> {
+    Ok(read_claim(store, claim)?.map(|(_, row)| row.record))
+}
+
 fn read_claim(store: &Store, claim: ClaimId) -> Result<Option<(Vec<u8>, ClaimRow)>, CoreError> {
     let key = record_key(claim);
     store
@@ -839,6 +858,15 @@ impl ClaimSealEnvelope {
     /// seal the named record's removal, and every other operation seals its
     /// declared paths. The lane publishes the envelope facts with the
     /// operation on settle and drops them on abort; see [`ClaimSealGuard`].
+    /// The sealed record and advisory warnings report back through
+    /// [`ClaimSealEnvelope::settle`]; the lane writes them into the
+    /// precomputed reply, whose claim id preparation minted.
+    ///
+    /// `prepared_claim` is the claim id preparation minted for an acquire
+    /// (kept stable across the prepare-to-commit window so the sealed record
+    /// matches the precomputed reply); `None` mints one here for callers
+    /// with no prepared reply. Release operations ignore it: the record key
+    /// comes from the request args.
     ///
     /// # Errors
     /// Forwards `E_CLAIMED`, `E_CORRUPT`, `E_INVALID`, `E_LIMIT`,
@@ -848,13 +876,14 @@ impl ClaimSealEnvelope {
         clock: &ClaimClock,
         holder: SessionId,
         request: &crate::protocol::Request,
+        prepared_claim: Option<ClaimId>,
     ) -> Result<Self, CoreError> {
         match request {
             crate::protocol::Request::ClaimAcquire(inner) => Self::for_acquire(
                 store,
                 clock,
                 holder,
-                ClaimId::generate(),
+                prepared_claim.unwrap_or_else(ClaimId::generate),
                 inner.args.clone(),
             ),
             crate::protocol::Request::ClaimRelease(inner) => {

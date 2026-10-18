@@ -650,7 +650,8 @@ fn mutation_seal_covers_declared_write_paths() {
             &fixture.store,
             &fixture.claims,
             holder(2),
-            &write_request(&["src/lib.rs"])
+            &write_request(&["src/lib.rs"]),
+            None,
         )
         .err()
         .expect("blocked write")
@@ -662,6 +663,7 @@ fn mutation_seal_covers_declared_write_paths() {
         &fixture.claims,
         holder(2),
         &write_request(&["docs/a"]),
+        None,
     )
     .expect("free write");
     let (facts, _, _) = envelope.settle();

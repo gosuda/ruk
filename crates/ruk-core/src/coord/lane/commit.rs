@@ -25,7 +25,7 @@ use crate::coord::session::Authority;
 use crate::coord::session::SessionTable;
 use crate::coord::workspace;
 use crate::error::{CoreError, ErrorCode};
-use crate::protocol::{ReceiptRef, Reply, RequestDigest, SessionAuthority, Timestamp};
+use crate::protocol::{ReceiptRef, Reply, Request, RequestDigest, SessionAuthority, Timestamp};
 use crate::refs::StoreRefs;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
 use crate::store::{Store, StoreError};
@@ -207,6 +207,12 @@ pub(crate) fn commit_batch(
     let mut active_mutations: Vec<ActiveMutation> = Vec::with_capacity(candidate_mutations.len());
 
     for mut m in candidate_mutations {
+        // Claim acquires carry the id preparation minted so the sealed record
+        // matches the precomputed reply; every other seal mints its own.
+        let prepared_claim = match &m.candidate.mut_reply {
+            Reply::ClaimAcquire(reply) => Some(reply.claim.claim),
+            _ => None,
+        };
         let validation_res =
             validate_candidate(store, &policy, &m.candidate, &times).and_then(|()| {
                 claims::ClaimSealEnvelope::for_mutation(
@@ -214,9 +220,33 @@ pub(crate) fn commit_batch(
                     &claim_clock,
                     m.candidate.session.id(),
                     &m.candidate.request,
+                    prepared_claim,
                 )
                 .map(|envelope| {
-                    let (facts, _warnings, _record) = envelope.settle();
+                    let (facts, warnings, record) = envelope.settle();
+                    // Claim operations report their sealed record and advisory
+                    // warnings back on the precomputed reply. All other seals
+                    // keep dropping both, as before.
+                    if matches!(
+                        m.candidate.request,
+                        Request::ClaimAcquire(_) | Request::ClaimRelease(_)
+                    ) {
+                        if let Some(record) = record {
+                            match &mut m.candidate.mut_reply {
+                                Reply::ClaimAcquire(reply) => reply.claim = record,
+                                Reply::ClaimRelease(reply) => reply.released = record,
+                                _ => {}
+                            }
+                        }
+                        if !warnings.items.is_empty()
+                            && let Some(outcome) = m.candidate.mut_reply.outcome_mut()
+                        {
+                            for warning in warnings.items {
+                                outcome.warnings.items.push(warning);
+                                outcome.warnings.total += 1;
+                            }
+                        }
+                    }
                     for fact in facts {
                         let is_clock =
                             fact.table == FactTable::Claims && fact.key == claims::CLOCK_KEY;
