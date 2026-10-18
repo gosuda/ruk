@@ -10,7 +10,7 @@
 //! `tag.delete`, `pin`, `unpin`, `attest.add`, `new`, `claim.acquire`,
 //! `claim.release`, `ws.new`, `describe`, `split`, `rebase`, `squash`,
 //! `abandon`, `edit`, `ws.scope`, `ws.take`, `ws.drop`, `resolve`, `revert`,
-//! and `undo`.
+//! `undo`, and `land.prepare`.
 //! The annotated tag arm needs the coordinator clock and a tagger identity,
 //! `new` and `ws.new` need the session identity row and the clock for
 //! signature synthesis, and `attest.add` needs the attestation progress gate,
@@ -26,13 +26,15 @@
 //!   commit-time snapshot, so preparation stages no claim facts and mints
 //!   only the acquire id the sealed record must carry. The lane seals with
 //!   that id and writes the authoritative record back into the reply.
-//! * Workspace dirty state (`snapshot`, `write`, `ws.recover`) and transport,
-//!   land, and prune mutations need worktree
-//!   file I/O, object preparation, claim sealing, or plan evaluation that no
-//!   caller on this path supplies. The pure row transitions (`edit`,
-//!   `ws.scope`, `ws.take`, `ws.drop`) serve on both paths: they stage the
-//!   fenced row fact and leave worktree materialization to the post-commit
-//!   daemon job, exactly like the `new` workspace switch.
+//! * Workspace dirty state (`snapshot`, `write`, `ws.recover`), transport
+//!   (`fetch`, `push`, `push.reconcile`), `land.execute`, and prune mutations
+//!   need worktree file I/O, object preparation, network round-trips, or plan
+//!   evaluation that no caller on this path supplies. The pure row transitions
+//!   (`edit`, `ws.scope`, `ws.take`, `ws.drop`) serve on both paths: they stage
+//!   the fenced row fact and leave worktree materialization to the post-commit
+//!   daemon job, exactly like the `new` workspace switch. `land.prepare` serves
+//!   too: it freezes the resolved head as the exact candidate and moves no ref,
+//!   so the plan row stages with no transport involved.
 //!
 //! The `crate::ops`-adjacent methods were evaluated one by one against
 //! their protocol args, each refused arm naming its missing piece:
@@ -56,7 +58,11 @@
 //! descendants; `split` partitions one change by path; and `abandon` re-parents
 //! descendants onto the abandoned commits' parents in the same batch as the
 //! change-state transitions (merge-commit targets need fan-in parent
-//! replacement with no producer here, so they stay refused).
+//! replacement with no producer here, so they stay refused). `land.prepare`
+//! freezes the resolved head as the single exact candidate with empty
+//! requirements (the policy carries no land-requirement fields yet) and stages
+//! the plan row; `fetch`, `push`, `push.reconcile`, and `land.execute` refuse,
+//! each naming its missing transport job or plan codec.
 //!
 //! Path-level tree derivation (split, squash, revert, resolve) goes through
 //! [`crate::ops::tree_edit`]: `apply_delta` is a three-tree apply restricted to
@@ -79,6 +85,7 @@
 //! as a second layer.
 
 use super::claims::{ClaimClock, canonical_paths, read_record};
+use super::land::{LandPrepareRequest, prepare_land_plan};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::clock::Clock;
@@ -111,8 +118,9 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
-    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
-    EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, MutationOutcome,
+    ClaimAcquireReply, ClaimRecord,     ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
+    EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, LandPrepareArgs,
+    LandPrepareReply, MutationOutcome,
     NewArgs, NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
     RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
     TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
@@ -264,6 +272,31 @@ pub(crate) fn prepare_mutation_with(
         Request::Resolve(m) => resolve_parts(ctx, m.request_id, &m.args)?,
         Request::Revert(m) => revert_parts(ctx, m.request_id, &m.args)?,
         Request::Undo(m) => undo_parts(ctx, m.request_id, &m.args)?,
+        Request::Fetch(_) => {
+            return Err(uncovered(
+                "fetch",
+                "fetch stages remote objects before any ref can move, and the transfer plus object ingest run in a transport job: the lane can only publish ref deltas with staged objects plus a ref transaction, and no fetch job producer exists on this path — transport/mirror.rs plus net.rs own the transfer and RemoteObservations rows are written by transport outside the lane",
+            ));
+        }
+        Request::Push(_) => {
+            return Err(uncovered(
+                "push",
+                "push persists a PushPlans row whose codec lives in ruk-git transport (PushPlanRecord manual encoding): staging a second core-side encoding would corrupt the table for transport readers, and the send leg runs as a transport job after the plan commits, with no producer for either on this path",
+            ));
+        }
+        Request::PushReconcile(_) => {
+            return Err(uncovered(
+                "push.reconcile",
+                "push.reconcile observes the remote's live refs for an uncertain plan: observation is a network round-trip, not lane work, and RemoteObservations rows are written by transport outside the lane, so no preparation exists on this path",
+            ));
+        }
+        Request::LandPrepare(m) => land_prepare_parts(ctx, m.request_id, &m.args)?,
+        Request::LandExecute(_) => {
+            return Err(uncovered(
+                "land.execute",
+                "land.execute pushes a stored candidate: the local leg (coord/land.rs land_execute) publishes eagerly outside the lane and the remote push leg lives in transport, so executing through preparation needs a prepare/job split with no producer on this path — load the plan with load_plan and re-prepare when it drifts",
+            ));
+        }
         Request::OpPrune(_) => {
             return Err(uncovered(
                 "op.prune",
@@ -3193,6 +3226,95 @@ fn undo_parts(
     })
 }
 
+/// Prepares `land.prepare`: freezes the resolved change head as the exact
+/// single-candidate plan over the target's live tip, moving no ref.
+///
+/// The candidate set derives from the resolved head: one exact commit.
+/// Requirements and trusted signers ship empty with `policy_generation = 0`
+/// because `PrincipalPolicy` carries no land-requirement fields, only `land`
+/// ref patterns and `attest` kinds; a `[land] requirements` policy section is
+/// follow-up work. The target still needs the session's `land` capability,
+/// checked here while the lane re-checks authority at commit time.
+///
+/// # Errors
+/// - [`ErrorCode::EHosted`] without the session row (no capability source),
+///   the coordinator clock (no creation timestamp), or the attestation gate.
+/// - [`ErrorCode::EForbidden`] when the target leaves the session's `land`
+///   grant.
+/// - [`ErrorCode::EInvalid`] for a conflicted head: only an exact commit
+///   can land.
+/// - Target resolution errors as for `describe`.
+fn land_prepare_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &LandPrepareArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "land.prepare",
+            "land.prepare checks the session's `land` capability, which needs the session identity row this path does not supply",
+        )
+    })?;
+    let clock = ctx.clock.ok_or_else(|| {
+        uncovered(
+            "land.prepare",
+            "land.prepare stamps the plan creation time, which needs the coordinator clock this path does not supply",
+        )
+    })?;
+    let Some(checkpoint) = ctx.checkpoint else {
+        return Err(uncovered(
+            "land.prepare",
+            "land.prepare snapshots attestation requirements, which needs the attestation progress gate this path does not supply",
+        ));
+    };
+    let (_change, head) = resolve_rewrite_head(store, &args.change)?;
+    let Some(candidate) = head.as_git() else {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "land.prepare needs an exact commit: conflicted heads cannot land",
+        ));
+    };
+    row.capabilities.require_land(&args.target)?;
+    let (plan, mutation) = prepare_land_plan(
+        store,
+        LandPrepareRequest {
+            change: args.change,
+            target: args.target.clone(),
+            candidates: vec![*candidate],
+            requirements: Vec::new(),
+            trusted: Vec::new(),
+            merge: args.merge,
+            policy_generation: 0,
+            now: clock.sample()?.timestamp(),
+        },
+        checkpoint,
+    )?;
+    let Some(primary) = plan.candidate() else {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            "land preparation staged an empty candidate set",
+        ));
+    };
+    let reply = LandPrepareReply {
+        outcome: pending_outcome(ctx.session, request_id),
+        plan: plan.plan,
+        candidate: primary,
+        base: plan.base.unwrap_or_else(|| store.hash_kind().zero_oid()),
+        expires_at: plan.expires_at,
+        policy_generation: plan.policy_generation,
+        requirements: plan.requirements,
+    };
+    Ok(Parts {
+        reply: Reply::LandPrepare(Box::new(reply)),
+        objects: Vec::new(),
+        facts: vec![mutation],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
 /// The signature a new commit carries: the call's identity override, else the
 /// session identity, stamped with the coordinator clock in UTC.
 ///
@@ -3383,8 +3505,9 @@ mod tests {
     use super::*;
     use crate::attestation::Progress;
     use crate::bytes::ByteString;
-    use crate::capability::{AttestKind, AttestResult, Capabilities, PathPattern};
-    use crate::change::{ChangeId, ClaimId, SessionId, WorkspaceId};
+    use super::super::land::load_plan;
+    use crate::capability::{AttestKind, AttestResult, Capabilities, PathPattern, RefPattern};
+    use crate::change::{ChangeId, ClaimId, PlanId, SessionId, WorkspaceId};
     use crate::commit::ProvenanceClaims;
     use crate::conflict::Signature;
     use crate::heads::Head;
@@ -3394,11 +3517,13 @@ mod tests {
     use crate::protocol::{
         AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
         BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
-        ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, IdentityClaim, MergeSelection,
-        Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection, PinArgs, RebaseArgs,
-        RebaseScope, Resolution, ResolveArgs, RevertArgs, SessionAuthority, SplitArgs,
-        SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding, WorkspaceInit,
-        WsNewArgs,
+        ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs,
+        IdentityClaim, LandExecuteArgs, LandPrepareArgs, MergeSelection,
+        Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection, PinArgs, PushArgs,
+        PushAtomicity, PushReconcileArgs, PushSource, PushUpdate, RebaseArgs,
+        RebaseScope, RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
+        SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding,
+        WorkspaceInit, WsNewArgs,
     };
     use crate::records::codec::encode_change_entry;
     use crate::records::keys::change_key;
@@ -4147,6 +4272,179 @@ mod tests {
         assert!(
             err.message.contains("operation-retention policy"),
             "op.prune names its missing policy: {}",
+            err.message
+        );
+    }
+
+    fn land_caps() -> Capabilities {
+        Capabilities {
+            land: vec![RefPattern::parse("refs/heads/**").expect("land pattern")],
+            ..Capabilities::default()
+        }
+    }
+
+    fn origin_remote() -> RemoteSpec {
+        RemoteSpec::Named {
+            name: RemoteName::new("origin").expect("remote name"),
+        }
+    }
+
+    fn land_request(change: ChangeId, head: Option<Head>) -> Request {
+        Request::LandPrepare(Box::new(WireMutation {
+            request_id: request_id(),
+            args: LandPrepareArgs {
+                change: ChangeRef { change, head },
+                remote: origin_remote(),
+                target: name("refs/heads/main"),
+                merge: MergeSelection::default(),
+            },
+        }))
+    }
+
+    #[test]
+    fn land_prepare_freezes_exact_candidate() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        assert_eq!(reply.candidate, oid);
+        assert_eq!(reply.base, HashKind::Sha1.zero_oid());
+        assert!(reply.requirements.is_empty());
+        assert_eq!(reply.policy_generation, 0);
+        assert!(prepared.objects.is_empty());
+        assert!(prepared.ref_transaction.is_none());
+        assert!(prepared.workspace_fence.is_none());
+        assert_eq!(prepared.facts.len(), 1);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish land plan");
+        let stored = load_plan(&store, reply.plan)
+            .expect("read plan")
+            .expect("plan stored");
+        assert_eq!(stored.candidate(), Some(oid));
+        assert_eq!(stored.base, None);
+    }
+
+    #[test]
+    fn land_prepare_refuses_without_context() {
+        let (_temp, store, session) = fixture();
+        let (_, change, _) = seed_commit(&store, None);
+        let err = prepare_mutation(&store, session, land_request(change, None))
+            .expect_err("land.prepare stays refused on the legacy path");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("identity row"),
+            "land.prepare names its missing row: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn land_prepare_needs_land_capability() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, Capabilities::default());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let (head, change, _) = seed_commit(&store, None);
+        let err = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect_err("land.prepare without the land grant is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn land_prepare_resolves_change_ref() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let missing = ChangeId::generate();
+        let err = prepare_mutation_with(&ctx, land_request(missing, None))
+            .expect_err("unknown change is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+        let change = ChangeId::generate();
+        seed_commit(&store, Some(change));
+        seed_commit(&store, Some(change));
+        let err = prepare_mutation_with(&ctx, land_request(change, None))
+            .expect_err("divergent change needs a pinned head");
+        assert_eq!(err.code, ErrorCode::EDivergent);
+    }
+
+    #[test]
+    fn transport_arms_name_their_machinery() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let fetch = Request::Fetch(Box::new(WireMutation {
+            request_id: request_id(),
+            args: FetchArgs {
+                remote: origin_remote(),
+                refs: FetchRefs::AllBranches,
+                depth: None,
+                filter: FetchFilter::default(),
+            },
+        }));
+        let err =
+            prepare_mutation_with(&ctx, fetch).expect_err("fetch stays refused with context");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("transport job"),
+            "fetch names its missing job: {}",
+            err.message
+        );
+        let push = Request::Push(Box::new(WireMutation {
+            request_id: request_id(),
+            args: PushArgs {
+                remote: origin_remote(),
+                updates: vec![PushUpdate {
+                    remote_ref: name("refs/heads/agent/x"),
+                    source: PushSource::Delete,
+                    expected_old: None,
+                    force: false,
+                }],
+                atomicity: PushAtomicity::default(),
+            },
+        }));
+        let err = prepare_mutation_with(&ctx, push).expect_err("push stays refused with context");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("PushPlanRecord"),
+            "push names its codec owner: {}",
+            err.message
+        );
+        let reconcile = Request::PushReconcile(Box::new(WireMutation {
+            request_id: request_id(),
+            args: PushReconcileArgs {
+                plan: PlanId::generate(),
+            },
+        }));
+        let err = prepare_mutation_with(&ctx, reconcile)
+            .expect_err("push.reconcile stays refused with context");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("not lane work"),
+            "push.reconcile names its network leg: {}",
+            err.message
+        );
+        let execute = Request::LandExecute(Box::new(WireMutation {
+            request_id: request_id(),
+            args: LandExecuteArgs {
+                plan: PlanId::generate(),
+                candidate: oid(0x31),
+            },
+        }));
+        let err = prepare_mutation_with(&ctx, execute)
+            .expect_err("land.execute stays refused with context");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("load_plan"),
+            "land.execute names its plan machinery: {}",
             err.message
         );
     }
