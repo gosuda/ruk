@@ -25,7 +25,9 @@ use crate::coord::session::Authority;
 use crate::coord::session::SessionTable;
 use crate::coord::workspace;
 use crate::error::{CoreError, ErrorCode};
-use crate::protocol::{ReceiptRef, Reply, Request, RequestDigest, SessionAuthority, Timestamp};
+use crate::protocol::{
+    MAX_PAGE_SIZE, ReceiptRef, Reply, Request, RequestDigest, SessionAuthority, Timestamp,
+};
 use crate::refs::StoreRefs;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
 use crate::store::{Store, StoreError};
@@ -241,9 +243,16 @@ pub(crate) fn commit_batch(
                         if !warnings.items.is_empty()
                             && let Some(outcome) = m.candidate.mut_reply.outcome_mut()
                         {
+                            // The wire list holds at most MAX_PAGE_SIZE
+                            // items; extras still count in the total and
+                            // raise `truncated`.
                             for warning in warnings.items {
-                                outcome.warnings.items.push(warning);
-                                outcome.warnings.total += 1;
+                                outcome.warnings.total = outcome.warnings.total.saturating_add(1);
+                                if outcome.warnings.items.len() < MAX_PAGE_SIZE {
+                                    outcome.warnings.items.push(warning);
+                                } else {
+                                    outcome.warnings.truncated = true;
+                                }
                             }
                         }
                     }
