@@ -67,6 +67,10 @@ use crate::ids::{HashKind, Oid};
 
 /// Locators verified per metadata page during recovery.
 const VERIFY_PAGE: usize = 256;
+/// Locators collected per parallel verification batch. The batch vector
+/// stays near half a megabyte no matter how many objects the store holds,
+/// so the parallel pass keeps the old paged pass's bounded memory.
+const VERIFY_BATCH: usize = 4096;
 /// Largest object-verification fan-out. Sixteen workers use a workstation
 /// without spawning a thread per core on large machines; each worker holds
 /// at most one transient decode against the shared preparation budget, so
@@ -334,30 +338,49 @@ fn verify_segment(
 /// record the generation as verified.
 ///
 /// Locators are collected with the same fast redb scan as before, so still
-/// no metadata read spans payload I/O, then verified across at most
+/// no metadata read spans payload I/O, in batches of at most
+/// [`VERIFY_BATCH`] rows whose verification fans out across at most
 /// [`VERIFY_THREADS`] scoped workers. Sharing `committed` is safe: every
 /// metadata lookup opens and drops its own read transaction, guard
 /// registration is a short mutex critical section, and each worker holds at
 /// most one transient decode. Workers that observe another worker's failure
 /// stop early; the first failure decides the result.
 fn verify_objects(committed: &Committed<'_>, generation: u64) -> Result<(), StoreError> {
-    let mut locators = Vec::new();
     let mut after: Option<Oid> = None;
     loop {
-        let page = committed.meta.object_page(after.as_ref(), VERIFY_PAGE)?;
-        let Some((last, _)) = page.last() else {
-            break;
-        };
-        after = Some(*last);
-        locators.extend(page);
+        let mut batch = Vec::new();
+        loop {
+            let page = committed.meta.object_page(after.as_ref(), VERIFY_PAGE)?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            after = Some(*last);
+            batch.extend(page);
+            if batch.len() >= VERIFY_BATCH {
+                break;
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        verify_batch(committed, &batch, generation)?;
     }
+}
+
+/// Verifies one bounded batch of collected locators across at most
+/// [`VERIFY_THREADS`] scoped workers.
+fn verify_batch(
+    committed: &Committed<'_>,
+    locators: &[(Oid, ObjectLocation)],
+    generation: u64,
+) -> Result<(), StoreError> {
     let threads = std::thread::available_parallelism()
         .map(|width| width.get())
         .unwrap_or(1)
         .min(VERIFY_THREADS)
         .min(locators.len().max(1));
     if threads <= 1 {
-        for (oid, location) in &locators {
+        for (oid, location) in locators {
             committed.verify_object(*oid, location, generation)?;
         }
         return Ok(());
