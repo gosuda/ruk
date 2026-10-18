@@ -845,15 +845,32 @@ impl Store {
         // probe validates facts and objects and is aborted without
         // committing; the writer lock held throughout keeps the
         // re-validation below identical.
-        let probe_txn = self.observe(self.meta.begin_publication(facts))?;
-        let probe_plan = self.observe(self.plan(&probe_txn, &objects))?;
-        drop(probe_txn);
-        let pending = self.persist_pending(&probe_plan)?;
+        let staged = (|| {
+            let probe_txn = self.observe(self.meta.begin_publication(facts))?;
+            let probe_plan = self.observe(self.plan(&probe_txn, &objects))?;
+            drop(probe_txn);
+            let pending = self.persist_pending(&probe_plan)?;
+            let txn = self.observe(self.meta.begin_publication(facts))?;
+            let plan = self.observe(self.plan(&txn, &objects))?;
+            Ok::<_, StoreError>((pending, txn, plan))
+        })();
+        let (pending, txn, plan) = match staged {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                // Committed corruption met before the first append still
+                // ends this session's publications: the bytes the writer
+                // may hold queued against now-known-bad state cannot run.
+                if self.quarantine() {
+                    writer.closed = Some(format!(
+                        "publication observed committed corruption before writing; reopen the store to run recovery ({err})"
+                    ));
+                }
+                return Err(err);
+            }
+        };
         let begin_start = ProfileClock::now(profile);
-        let txn = self.observe(self.meta.begin_publication(facts))?;
         let begin_ms = begin_start.elapsed_ms();
         let plan_start = ProfileClock::now(profile);
-        let plan = self.observe(self.plan(&txn, &objects))?;
         let plan_ms = plan_start.elapsed_ms();
         if let Some(handle) = &pending
             && handle.row.generation != plan.generation
