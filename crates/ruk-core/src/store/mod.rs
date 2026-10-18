@@ -513,11 +513,15 @@ impl Store {
     /// [`StoreError::Io`] when the final flush fails.
     pub fn close(&self) -> Result<(), StoreError> {
         let mut writer = self.lock_writer()?;
-        if let Some(active) = writer.active.take() {
-            durability::sync_file(active.writer.get_ref())?;
-        }
+        // Latch before the fallible flush: a sync failure still returns
+        // `Io`, but the writer must already refuse further publication,
+        // otherwise the dropped handle plus a freshly minted segment would
+        // record two open segments and fail the next recovery.
         if writer.closed.is_none() {
             writer.closed = Some("store closed; reopen the store to publish again".to_owned());
+        }
+        if let Some(active) = writer.active.take() {
+            durability::sync_file(active.writer.get_ref())?;
         }
         Ok(())
     }
