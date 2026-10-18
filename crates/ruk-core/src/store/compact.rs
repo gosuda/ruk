@@ -540,6 +540,12 @@ impl Store {
             {
                 continue;
             }
+            // Drop the cached read-only handle first: a live generation pin
+            // keeps reading through its own `Arc`, while the unlink below
+            // must not see our descriptor on platforms where open files
+            // cannot be removed. Segment ids never repeat, so the evicted
+            // entry can never alias a newer segment.
+            self.segment_fds.evict(manifest.id);
             let path = self
                 .root
                 .join(SEGMENTS_DIR)
