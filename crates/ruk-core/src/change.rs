@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 use crate::error::CoreModelError;
-use crate::ids::{hex_byte, hex_val};
+use crate::ids::{Oid, hex_byte, hex_val};
 
 /// Serde visitor shared by the fixed-width identities: text for
 /// human-readable formats, raw bytes for binary ones.
@@ -84,6 +84,26 @@ impl ChangeId {
     #[must_use]
     pub fn generate() -> Self {
         Self(*Uuid::new_v4().as_bytes())
+    }
+
+    /// Derives a change identity deterministically from a commit object ID.
+    ///
+    /// Mirrors jj's synthetic fallback (`synthetic_change_id_from_git_commit_id`
+    /// in `jj/lib/src/git_backend.rs`): the trailing 16 bytes of the OID,
+    /// in reverse order with each byte's bits reversed. Leading OID bytes
+    /// are avoided so a hash prefix is unambiguous between commit and change
+    /// IDs, and the bit reversal keeps users from depending on any
+    /// relationship between the two. Predictability from the OID is an
+    /// accepted trade, as it is in jj.
+    #[must_use]
+    pub fn from_oid(oid: &Oid) -> Self {
+        let bytes = oid.as_bytes();
+        let start = bytes.len() - Self::LEN;
+        let mut out = [0_u8; Self::LEN];
+        for (slot, byte) in out.iter_mut().zip(bytes[start..].iter().rev()) {
+            *slot = byte.reverse_bits();
+        }
+        Self(out)
     }
 
     #[must_use]
@@ -504,6 +524,39 @@ mod tests {
             postcard::from_bytes::<ChangeId>(&binary).expect("decode"),
             id
         );
+    }
+
+    #[test]
+    fn oid_derived_change_ids_follow_jj_synthetic_rule() {
+        use crate::ids::HashKind;
+
+        // The trailing 16 OID bytes, reversed, with each byte bit-reversed.
+        // 0x01 is 0b00000001, so every derived byte is 0b10000000.
+        let sha1 = Oid::from_bytes(&[0x01; 20]).expect("sha1");
+        assert_eq!(sha1.kind(), HashKind::Sha1);
+        assert_eq!(ChangeId::from_oid(&sha1), ChangeId::from_bytes([0x80; 16]));
+
+        // Only the trailing bytes participate: a leading marker is ignored,
+        // and the last OID byte becomes the first change byte. 0x02 is
+        // 0b00000010, bit-reversed to 0b01000000.
+        let mut raw = [0x00; 20];
+        raw[0] = 0xAB;
+        raw[19] = 0x02;
+        let marked = Oid::from_bytes(&raw).expect("marked");
+        let mut expected = [0x00; 16];
+        expected[0] = 0x40;
+        assert_eq!(ChangeId::from_oid(&marked), ChangeId::from_bytes(expected));
+
+        // Same trailing bytes under sha256 derive the same change ID.
+        let mut wide = [0x00; 32];
+        wide[16..].copy_from_slice(&raw[4..]);
+        let sha256 = Oid::from_bytes(&wide).expect("sha256");
+        assert_eq!(sha256.kind(), HashKind::Sha256);
+        assert_eq!(ChangeId::from_oid(&sha256), ChangeId::from_oid(&marked));
+
+        // Derivation is deterministic and distinct per OID.
+        assert_eq!(ChangeId::from_oid(&sha1), ChangeId::from_oid(&sha1));
+        assert_ne!(ChangeId::from_oid(&sha1), ChangeId::from_oid(&marked));
     }
 
     #[test]

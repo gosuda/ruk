@@ -376,11 +376,16 @@ fn test_stable_absent_change_id_reimport() {
     payload.extend_from_slice(b"committer Carol <carol@example.com> 1700000000 +0000\n\n");
     payload.extend_from_slice(b"No change-id header in this commit\n");
 
-    // First import: mints a stable change ID
+    // First import: derives a stable change ID from the commit OID.
     let prep_1 = records
         .prepare_import_git(payload.clone(), None)
         .expect("first import");
     let minted_id = prep_1.change_id;
+    assert_eq!(
+        minted_id,
+        ChangeId::from_oid(prep_1.head.as_git().expect("git head")),
+        "headerless import derives its change ID from the OID",
+    );
 
     fixture
         .store()

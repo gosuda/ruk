@@ -34,7 +34,9 @@ pub struct NewRequest {
     pub committer: Signature,
     /// Raw message bytes. A NUL byte is refused.
     pub message: ByteString,
-    /// The change this commit belongs to. A fresh ID is minted when absent.
+    /// The change this commit belongs to. When absent, an ID is resolved for
+    /// the tree through the stable by-OID mapping (deterministically derived
+    /// from the OID when no row exists yet).
     pub change_id: Option<ChangeId>,
     /// The earlier head this commit rewrites, when it is a local rewrite.
     pub predecessor: Option<Head>,

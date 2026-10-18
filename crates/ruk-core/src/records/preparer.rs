@@ -64,11 +64,15 @@ impl<'a> RecordBatchPreparer<'a> {
         }
     }
 
-    /// Resolves an existing imported OID mapping or mints a fresh local ChangeId.
+    /// Resolves an existing imported OID mapping or derives a ChangeId from the OID.
     ///
-    /// Checks the pending overlay first, then the Store. If absent from both,
-    /// mints a fresh random ChangeId and records a pending mapping with CAS
-    /// expectation [`FactExpectation::Absent`].
+    /// Checks the pending overlay first, then the Store. A stored row always
+    /// wins, so commits written before deterministic derivation keep their
+    /// existing identity. If absent from both, derives the ID from the OID
+    /// ([`ChangeId::from_oid`], mirroring jj's synthetic fallback) and records
+    /// a pending mapping with CAS expectation [`FactExpectation::Absent`].
+    /// The row is still written so later lookups agree without recomputing
+    /// and a later header can still take precedence on re-import.
     pub fn resolve_or_mint_change_id(&mut self, oid: &Oid) -> Result<ChangeId, CoreError> {
         if let Some(pending) = self.pending_imported.get(oid) {
             return Ok(pending.change_id);
@@ -83,7 +87,7 @@ impl<'a> RecordBatchPreparer<'a> {
                 (cid, false)
             }
             None => {
-                let cid = ChangeId::generate();
+                let cid = ChangeId::from_oid(oid);
                 (cid, true)
             }
         };

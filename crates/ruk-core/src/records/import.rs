@@ -39,7 +39,7 @@ impl<'a> ImportBatch<'a> {
         }
     }
 
-    /// Resolves an existing imported OID mapping or mints a fresh local ChangeId.
+    /// Resolves an existing imported OID mapping or derives one from the OID.
     pub fn resolve_or_mint_change_id(&mut self, oid: &Oid) -> Result<ChangeId, CoreError> {
         self.preparer.resolve_or_mint_change_id(oid)
     }
