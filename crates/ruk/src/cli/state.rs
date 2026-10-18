@@ -30,7 +30,7 @@ use ruk_core::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate, resolve,
 };
 use ruk_core::refs::{StoreRefs, page_refs, prepare_checked_transaction};
-use ruk_core::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Store};
+use ruk_core::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store};
 pub(crate) use ruk_core::workspace::ResolvedHead;
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
@@ -631,11 +631,116 @@ fn ref_to_git(err: impl Into<CoreError>) -> GitError {
 /// Resolves user revision syntax to one object id.
 ///
 /// Accepts full ref names, `HEAD`, short branch names, raw hex, `<rev>~<n>`,
-/// and `<rev>^<n>`; anything else fails the way `rev-parse --verify` fails.
+/// `<rev>^<n>`, and one trailing `^{<type>}` / `^{}` peel; anything else
+/// fails the way `rev-parse --verify` fails.
 pub(crate) fn resolve_rev(store: &Store, kind: HashKind, rev: &str) -> Result<Oid, GitError> {
-    let (base, steps) = split_suffix_steps(rev)?;
+    let (inner, peel) = split_peel_suffix(rev);
+    let (base, steps) = split_suffix_steps(inner)?;
     let oid = resolve_base(store, kind, base)?;
-    walk_parents(store, oid, steps)
+    let oid = walk_parents(store, oid, steps)?;
+    let Some(want) = peel else {
+        return Ok(oid);
+    };
+    peel_object(store, oid, want)
+}
+
+/// Splits one trailing `^{<type>}` / `^{}` peel suffix from a revision.
+///
+/// Returns the inner revision and the wanted type (`""` for bare `^{}`).
+/// A tail that is not a well-formed peel passes through untouched and fails
+/// downstream as an unknown revision.
+fn split_peel_suffix(rev: &str) -> (&str, Option<&str>) {
+    if !rev.ends_with('}') {
+        return (rev, None);
+    }
+    let Some(open) = rev.rfind("^{") else {
+        return (rev, None);
+    };
+    let want = &rev[open + 2..rev.len() - 1];
+    if want.contains('{') || want.contains('}') {
+        return (rev, None);
+    }
+    if !matches!(want, "" | "commit" | "tag" | "tree" | "blob") {
+        return (rev, None);
+    }
+    (&rev[..open], Some(want))
+}
+
+/// Peels one object to the wanted type: `^{}` dereferences tags to any
+/// non-tag, `^{commit}` peels tags to their commit, `^{tree}` steps from a
+/// commit to its tree, and every other mismatch refuses. Repeats the walk
+/// until the type holds, at most 32 dereferences. Git semantics,
+/// `git/rev-parse.c` peel onion.
+fn peel_object(store: &Store, oid: Oid, want: &str) -> Result<Oid, GitError> {
+    let mut cur = oid;
+    for _ in 0..32 {
+        let (kind, _) = super::tree::read_object_bytes(store, cur)?;
+        if peel_matches(kind, want) {
+            return Ok(cur);
+        }
+        if kind == ObjectKind::Tag {
+            cur = tag_target(store, cur)?;
+            continue;
+        }
+        if kind == ObjectKind::Commit && (want == "tree" || want.is_empty()) {
+            cur = commit_tree(store, cur)?;
+            continue;
+        }
+        return Err(GitError::NotFound {
+            detail: format!("{} does not peel to {want:?}", oid.to_hex()),
+        });
+    }
+    Err(GitError::Invalid {
+        detail: format!("{} does not peel to {want:?} (chain too deep)", oid.to_hex()),
+    })
+}
+
+/// Reports whether an object type already satisfies a peel target.
+fn peel_matches(kind: ObjectKind, want: &str) -> bool {
+    match want {
+        "" => kind != ObjectKind::Tag,
+        "commit" => kind == ObjectKind::Commit,
+        "tag" => kind == ObjectKind::Tag,
+        "tree" => kind == ObjectKind::Tree,
+        "blob" => kind == ObjectKind::Blob,
+        _ => false,
+    }
+}
+
+/// Reads the target of one tag object.
+fn tag_target(store: &Store, oid: Oid) -> Result<Oid, GitError> {
+    let (_, bytes) = super::tree::read_object_bytes(store, oid)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| GitError::Corrupt {
+        detail: format!("tag {} is not utf-8", oid.to_hex()),
+    })?;
+    for line in text.lines() {
+        if let Some(hex) = line.strip_prefix("object ") {
+            return Oid::from_hex(hex.trim()).map_err(|_| GitError::Corrupt {
+                detail: format!("tag {} bad object line", oid.to_hex()),
+            });
+        }
+    }
+    Err(GitError::Corrupt {
+        detail: format!("tag {} missing object line", oid.to_hex()),
+    })
+}
+
+/// Reads the tree of one commit object.
+fn commit_tree(store: &Store, oid: Oid) -> Result<Oid, GitError> {
+    let (_, bytes) = super::tree::read_object_bytes(store, oid)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| GitError::Corrupt {
+        detail: format!("commit {} is not utf-8", oid.to_hex()),
+    })?;
+    for line in text.lines() {
+        if let Some(hex) = line.strip_prefix("tree ") {
+            return Oid::from_hex(hex.trim()).map_err(|_| GitError::Corrupt {
+                detail: format!("commit {} bad tree line", oid.to_hex()),
+            });
+        }
+    }
+    Err(GitError::Corrupt {
+        detail: format!("commit {} missing tree line", oid.to_hex()),
+    })
 }
 
 /// One ancestor step: `~n` walks first parents, `^n` names a parent by index.
