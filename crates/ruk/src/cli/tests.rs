@@ -410,6 +410,81 @@ fn tag_stash_remote_config_cycle() {
 }
 
 #[test]
+fn stash_push_mints_oracle_shaped_commits() {
+    let (root, env) = seeded_repo("stash-shape", "s.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    // Unstaged worktree edit, mirroring the parity harness `d/stash-*` rows.
+    std::fs::write(root.join("s.txt"), b"one\nwip\n").expect("modify");
+    let out = run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "Saved working directory and index state On main: wip\n"
+    );
+    // The push resets the worktree to HEAD.
+    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\n");
+    let refs = String::from_utf8(run(verbs_branch::show_ref, &mut ctx, &[]).expect("show-ref"))
+        .expect("refs utf8");
+    let ref_oid = |suffix: &str| {
+        refs.lines()
+            .find(|line| line.ends_with(suffix))
+            .expect("ref present")
+            .split_whitespace()
+            .next()
+            .expect("ref oid")
+            .to_owned()
+    };
+    let head = ref_oid(" refs/heads/main");
+    let stash = ref_oid(" refs/stash");
+    let mut payload = |oid: &str| {
+        String::from_utf8(
+            run(verbs_objects::cat_file, &mut ctx, &["-p", oid]).expect("cat object"),
+        )
+        .expect("object utf8")
+    };
+    let tree_of = |text: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix("tree "))
+            .expect("tree line")
+            .to_owned()
+    };
+    // The worktree commit has two parents (HEAD, index commit) and the
+    // oracle subject, and its tree differs from HEAD by the stashed edit.
+    let wip = payload(&stash);
+    let parents: Vec<&str> = wip
+        .lines()
+        .filter_map(|line| line.strip_prefix("parent "))
+        .collect();
+    assert_eq!(parents, vec![head.as_str(), parents[1]]);
+    // The oracle stores the worktree subject bare, without a trailing
+    // newline, and `cat-file` renders payload bytes faithfully.
+    assert!(wip.ends_with("\n\nOn main: wip"));
+    assert!(!wip.ends_with("\n\nOn main: wip\n"));
+    assert_ne!(tree_of(&wip), tree_of(&payload(&head)));
+    // The index commit has HEAD as its only parent, the oracle subject,
+    // and the HEAD tree (the index was clean at push time).
+    let index = payload(parents[1]);
+    let index_parents: Vec<&str> = index
+        .lines()
+        .filter_map(|line| line.strip_prefix("parent "))
+        .collect();
+    assert_eq!(index_parents, vec![head.as_str()]);
+    let short = head.chars().take(7).collect::<String>();
+    assert!(index.ends_with(&format!("\n\nindex on main: {short} seed\n")));
+    assert_eq!(tree_of(&index), tree_of(&payload(&head)));
+    // Popping restores the worktree edit unstaged and drops the slot,
+    // naming the worktree commit oid like the oracle `Dropped` line.
+    let out = run(verbs_branch::stash, &mut ctx, &["pop"]).expect("stash pop");
+    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\nwip\n");
+    assert!(
+        String::from_utf8_lossy(&out)
+            .ends_with(&format!("Dropped refs/stash@{{0}} ({stash})\n"))
+    );
+    let out = run(verbs_branch::stash, &mut ctx, &["list"]).expect("stash list");
+    assert!(out.is_empty());
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn clone_fetch_push_local_cycle() {
     let (root, _) = seeded_repo("clone-src", "c.txt", b"c\n");
     let base = root.parent().expect("parent").to_path_buf();
@@ -921,8 +996,7 @@ fn walk_orders_merge_topology_by_committer_date() {
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
     let store = open_store(&root);
-    let tree = super::tree::store_object(&store, ObjectKind::Tree, Vec::new())
-        .expect("empty tree");
+    let tree = super::tree::store_object(&store, ObjectKind::Tree, Vec::new()).expect("empty tree");
     let sig = |timestamp: i64| Signature {
         name: ByteString::from("Tariq"),
         email: ByteString::from("tariq@example.invalid"),
@@ -959,8 +1033,7 @@ fn walk_orders_merge_topology_by_committer_date() {
         1600,
         "merge feature\n",
     );
-    let history =
-        super::state::walk_history(&store, &[merge], None).expect("walk history");
+    let history = super::state::walk_history(&store, &[merge], None).expect("walk history");
     let subjects: Vec<String> = history
         .iter()
         .map(|(_, record)| {
@@ -1009,8 +1082,7 @@ fn log_excluding_skips_branch_in_date_order() {
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
     let store = open_store(&root);
-    let tree = super::tree::store_object(&store, ObjectKind::Tree, Vec::new())
-        .expect("empty tree");
+    let tree = super::tree::store_object(&store, ObjectKind::Tree, Vec::new()).expect("empty tree");
     let sig = |timestamp: i64| Signature {
         name: ByteString::from("Tariq"),
         email: ByteString::from("tariq@example.invalid"),
@@ -1048,9 +1120,8 @@ fn log_excluding_skips_branch_in_date_order() {
         1600,
         "merge feature\n",
     );
-    let history =
-        super::verbs_history::walk_history_excluding(&store, &[merge], &[seed], None)
-            .expect("excluding walk");
+    let history = super::verbs_history::walk_history_excluding(&store, &[merge], &[seed], None)
+        .expect("excluding walk");
     let subjects: Vec<String> = history
         .iter()
         .map(|(_, record)| {
@@ -1067,6 +1138,108 @@ fn log_excluding_skips_branch_in_date_order() {
         vec!["merge feature", "feature work", "main moves on", "add a"]
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn file_url_remote_fetch_push_cycle() {
+    // `file://` remotes route through URL parsing into the same local
+    // stores bare paths reach: fetch, ls-remote, and push all work.
+    let (src, _) = seeded_repo("fileurl-src", "f.txt", b"f\n");
+    let src_url = format!("file://{}", src.to_str().expect("utf8"));
+    let (dst, _) = seeded_repo("fileurl-dst", "g.txt", b"g\n");
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        run(verbs_repo::remote, &mut dst_ctx, &["add", "origin", &src_url])
+            .expect("remote add file://");
+        run(verbs_transport::fetch, &mut dst_ctx, &["origin"]).expect("fetch file://");
+        let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("refs/remotes/origin/main"), "got {text}");
+        let out = run(verbs_transport::ls_remote, &mut dst_ctx, &["origin"])
+            .expect("ls-remote file://");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("refs/heads/main"), "got {text}");
+    }
+    {
+        // Push back through the URL onto a new branch (the two seeds are
+        // unrelated histories, so main-to-main would rightly not
+        // fast-forward), then read the branch from the source.
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        std::fs::write(dst.join("h.txt"), b"h\n").expect("new file");
+        run(verbs_stage::add, &mut dst_ctx, &["h.txt"]).expect("add");
+        run(verbs_history::commit, &mut dst_ctx, &["-m", "via file url"]).expect("commit");
+        run(
+            verbs_transport::push,
+            &mut dst_ctx,
+            &["origin", "main:refs/heads/contrib"],
+        )
+        .expect("push file://");
+    }
+    {
+        let mut src_ctx = repo_ctx(&src, test_env(&src));
+        let out = run(verbs_branch::show_ref, &mut src_ctx, &[]).expect("show-ref");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("refs/heads/contrib"), "got {text}");
+        let out = run(verbs_history::log, &mut src_ctx, &["--oneline", "contrib"])
+            .expect("log contrib");
+        assert!(
+            String::from_utf8_lossy(&out).contains("via file url"),
+            "got {:?}",
+            out
+        );
+    }
+    let _ = std::fs::remove_dir_all(src.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(dst.parent().expect("parent"));
+}
+
+#[test]
+fn file_url_positional_push_with_refspec() {
+    // A positional `file://` URL (no remote name) pushes an explicit
+    // refspec through the same routing.
+    let (src, _) = seeded_repo("filepos-src", "f.txt", b"f\n");
+    let (dst, _) = seeded_repo("filepos-dst", "g.txt", b"g\n");
+    let dst_url = format!("file://{}", dst.to_str().expect("utf8"));
+    {
+        let mut src_ctx = repo_ctx(&src, test_env(&src));
+        run(
+            verbs_transport::push,
+            &mut src_ctx,
+            &[&dst_url, "main:refs/heads/seeded"],
+        )
+        .expect("push file:// url");
+    }
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("refs/heads/seeded"), "got {text}");
+    }
+    let _ = std::fs::remove_dir_all(src.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(dst.parent().expect("parent"));
+}
+
+#[test]
+fn network_scheme_routing_names_gaps() {
+    use ruk_git::GitError;
+    let (root, _) = seeded_repo("netroute", "n.txt", b"n\n");
+    // SSH to a closed loopback port: TCP refuses at once (no prompt, no
+    // hang), and the failure must come from the network path, never the
+    // old local-path refusal.
+    let mut ctx = repo_ctx(&root, test_env(&root));
+    let err = run(verbs_transport::ls_remote, &mut ctx, &["ssh://127.0.0.1:1/srv/a.git"])
+        .expect_err("ssh ls-remote must fail");
+    assert!(!matches!(err, GitError::Offline { .. }), "took the local path: {err}");
+    let err = run(verbs_transport::fetch, &mut ctx, &["ssh://127.0.0.1:1/srv/a.git"])
+        .expect_err("ssh fetch must fail");
+    assert!(!matches!(err, GitError::Offline { .. }), "took the local path: {err}");
+    // HTTP parses but refuses as the named gap without touching the net.
+    let err = run(verbs_transport::fetch, &mut ctx, &["https://host.invalid/a.git"])
+        .expect_err("https fetch is a named gap");
+    assert!(matches!(err, GitError::Unsupported { .. }), "got {err}");
+    let err = run(verbs_transport::push, &mut ctx, &["http://host.invalid/a.git"])
+        .expect_err("http push is a named gap");
+    assert!(matches!(err, GitError::Unsupported { .. }), "got {err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
 #[test]
