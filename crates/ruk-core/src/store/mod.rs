@@ -389,6 +389,14 @@ impl Store {
         }
     }
 
+    /// The store root directory: the directory holding `format`, the segment
+    /// files, and `policy.toml`. Absolute for stores opened through
+    /// [`Store::open`], as given for stores from [`Store::create`].
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The fixed hash kind of this store.
     #[must_use]
     pub fn hash_kind(&self) -> HashKind {

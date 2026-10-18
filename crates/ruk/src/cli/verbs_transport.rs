@@ -784,7 +784,7 @@ pub(crate) fn receive_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     let store = serve_store(ctx, args)?;
     let kind = store.hash_kind();
     let head = serve_head(&store)?;
-    let lfs = serve_lfs_mode(ctx, args);
+    let lfs = serve_lfs_mode(&store, args);
     match ctx.env.stdin.as_deref() {
         Some(input) => {
             let mut out = Vec::new();
@@ -825,26 +825,31 @@ pub(crate) fn receive_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
 }
 
 /// Reads the LFS pointer policy for one serve verb: the `lfs` key of the
-/// store's `policy.toml`, resolved from the same repository directory the
-/// serve store comes from. Missing or unreadable policy fails closed to
-/// [`LfsMode::Deny`], the store default.
-fn serve_lfs_mode(ctx: &Ctx, args: &[String]) -> LfsMode {
-    serve_store_root(ctx, args)
+/// store's `policy.toml`, read beside the store the verb actually serves.
+/// Missing or unreadable policy fails closed to [`LfsMode::Deny`], the
+/// store default.
+fn serve_lfs_mode(store: &Store, args: &[String]) -> LfsMode {
+    serve_store_root(store, args)
         .map(|root| mode_for_store(&root))
         .unwrap_or_default()
 }
 
 /// Resolves the store directory one serve verb runs against, mirroring
 /// [`serve_store`] discovery: `<dir>` itself when the positional names it,
-/// else the first ancestor of the context root holding a store.
+/// else the root of the already-resolved store.
 ///
-/// Every candidate is probed in the open path's precedence — `<repo>/.ruk`
-/// first (the layout the CLI creates), then `<repo>/.ruk/store` (the
-/// documented store root the daemon binds its coordinator policy beside),
-/// then the directory itself — and only a directory carrying a store
-/// `format` file wins, so the policy is always read beside the store files
-/// the verb actually opened.
-fn serve_store_root(ctx: &Ctx, args: &[String]) -> Option<std::path::PathBuf> {
+/// The no-positional arm must not walk up from `ctx.root`: the resolved
+/// store already accounts for `--git-dir`/`GIT_DIR` (which `open_ctx` baked
+/// into `ctx.store`), while a walk from the working directory lands in
+/// another repository — or none — and reads the wrong `policy.toml`.
+///
+/// Every positional candidate is probed in the open path's precedence —
+/// `<repo>/.ruk` first (the layout the CLI creates), then
+/// `<repo>/.ruk/store` (the documented store root the daemon binds its
+/// coordinator policy beside), then the directory itself — and only a
+/// directory carrying a store `format` file wins, so the policy is always
+/// read beside the store files the verb actually opened.
+fn serve_store_root(store: &Store, args: &[String]) -> Option<std::path::PathBuf> {
     let mut positionals: Vec<&str> = Vec::new();
     let mut dashdash = false;
     for arg in args {
@@ -861,16 +866,7 @@ fn serve_store_root(ctx: &Ctx, args: &[String]) -> Option<std::path::PathBuf> {
     if let Some(dir) = positionals.first() {
         return store_dir_beneath(std::path::Path::new(dir));
     }
-    let mut dir = ctx.root.as_path();
-    loop {
-        if let Some(root) = store_dir_beneath(dir) {
-            return Some(root);
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
-        }
-    }
+    Some(store.root().to_path_buf())
 }
 
 /// The store directory beneath one repository directory, if any: the first
