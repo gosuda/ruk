@@ -939,8 +939,13 @@ impl Store {
         let total_start = ProfileClock::now(profile);
         let append_start = ProfileClock::now(profile);
         let mut append_bytes = 0u64;
+        let mut probe = if profile {
+            AppendProbe::live()
+        } else {
+            AppendProbe::idle()
+        };
         for object in &fresh {
-            append(writer, &mut batch, &segments_dir, object, generation)?;
+            append(writer, &mut batch, &segments_dir, object, generation, &mut probe)?;
             if profile {
                 append_bytes += segment::record_len_for(object.payload.len()).unwrap_or(0);
             }
@@ -979,8 +984,11 @@ impl Store {
         let commit_ms = commit_start.elapsed_ms();
         if profile {
             eprintln!(
-                "[ruk-profile] write_and_commit fresh={} append={append_ms:.1}ms append_bytes={append_bytes} sync_files={sync_files_ms:.1}ms sync_dir={sync_dir_ms:.1}ms stage={stage_ms:.1}ms commit={commit_ms:.1}ms total={:.1}ms",
+                "[ruk-profile] write_and_commit fresh={} append={append_ms:.1}ms append_bytes={append_bytes} loop_pick={:.1}ms loop_write={:.1}ms loop_book={:.1}ms sync_files={sync_files_ms:.1}ms sync_dir={sync_dir_ms:.1}ms stage={stage_ms:.1}ms commit={commit_ms:.1}ms total={:.1}ms",
                 fresh.len(),
+                probe.pick_ms,
+                probe.write_ms,
+                probe.book_ms,
                 total_start.elapsed_ms(),
             );
         }
@@ -1053,6 +1061,37 @@ impl Batch {
     }
 }
 
+/// Per-phase accumulators for the append loop, reported on the
+/// `RUK_PROFILE=1` line. `pick` covers segment selection (and the rare
+/// open/roll), `write` the [`segment::SegmentWriter::append`] call
+/// (framing, payload CRC, staging), and `book` the locator push and the
+/// oversized check. Clocks only run when profiling; disabled probes cost
+/// three dead branches per record.
+#[derive(Default)]
+struct AppendProbe {
+    enabled: bool,
+    pick_ms: f64,
+    write_ms: f64,
+    book_ms: f64,
+}
+
+impl AppendProbe {
+    fn live() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    fn idle() -> Self {
+        Self::default()
+    }
+
+    fn clock(&self) -> ProfileClock {
+        ProfileClock::now(self.enabled)
+    }
+}
+
 /// Appends one prepared object to the active segment, rolling to a new
 /// segment first when it does not fit, and sealing a dedicated segment
 /// when a single record exceeds the target.
@@ -1062,10 +1101,14 @@ fn append(
     segments_dir: &Path,
     object: &PreparedObject,
     generation: u64,
+    probe: &mut AppendProbe,
 ) -> Result<(), StoreError> {
     let payload_len = object.payload.len();
     let record_len = segment::record_len_for(payload_len)?;
+    let pick_start = probe.clock();
     let active = active_segment(writer, batch, segments_dir, record_len)?;
+    probe.pick_ms += pick_start.elapsed_ms();
+    let write_start = probe.clock();
     let appended = active.writer.append(
         object.kind(),
         object.encoding(),
@@ -1073,6 +1116,8 @@ fn append(
         object.payload_crc,
         object.payload.view(),
     )?;
+    probe.write_ms += write_start.elapsed_ms();
+    let book_start = probe.clock();
     let segment = active.id;
     let oversized = active.writer.records_end() > writer.target_bytes();
     batch.active_touched = true;
@@ -1092,6 +1137,7 @@ fn append(
     if oversized {
         seal_active(writer, batch)?;
     }
+    probe.book_ms += book_start.elapsed_ms();
     Ok(())
 }
 
