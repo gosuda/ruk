@@ -7,10 +7,12 @@
 //! paths and `file://` URLs and refuses network schemes with
 //! [`GitError::Unsupported`], pointing at [`super::net::parse_endpoint`].
 //!
-//! A local native repository uses the same core streaming transfer path as
-//! the wire: [`local_fetch`] and [`local_push`] build real pack bytes from
-//! the source store and ingest them into the destination through
-//! [`ingest_pack`], then publish objects and ref deltas atomically. No
+//! A local native repository avoids the wire round-trip where it can:
+//! [`local_fetch`] stages the negotiated closure straight into the
+//! destination through [`super::pack::stage_local_objects`], while
+//! [`local_push`] builds real pack bytes from the source store and ingests
+//! them into the destination through [`ingest_pack`]; both then publish
+//! objects and ref deltas atomically. No
 //! shell, no subprocess, no raw segment bytes. Reading a local Git-format
 //! source and writing a local Git-format destination belong to the
 //! import/export slices; [`open_local_store`] says so explicitly instead
@@ -229,10 +231,10 @@ pub struct FetchReport {
     pub warnings: Vec<String>,
 }
 
-/// Fetches from one native store into another through a real pack: the
-/// closure is packed from `src`, ingested into `dest` staging, verified,
-/// and published with promisor/shallow/observation facts and the caller's
-/// ref mutations in one transaction.
+/// Fetches from one native store into another without a pack round-trip:
+/// the closure is staged from `src` straight into `dest` staging,
+/// verified, and published with promisor/shallow/observation facts and the
+/// caller's ref mutations in one transaction.
 ///
 /// `tracking` maps remote ref names to their new targets for observation
 /// rows; `ref_mutations` are lane-prepared ref CAS mutations (the lane owns
@@ -265,36 +267,26 @@ pub fn local_fetch(
     let profile = std::env::var_os("RUK_PROFILE").is_some_and(|value| value == "1");
     let fetch_start = profile.then(std::time::Instant::now);
     let closure_start = profile.then(std::time::Instant::now);
-    let closure = local_closure(src, kind, req, interrupt)?;
+    let LocalClosure { objects, shallow } = local_closure(src, kind, req, interrupt)?;
     let closure_ms = closure_start
         .map(|start| start.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
-    let pack_entries: Vec<PackEntry<'_>> = closure
-        .objects
-        .iter()
-        .map(|(oid, obj_kind, bytes)| PackEntry {
-            oid: *oid,
-            kind: *obj_kind,
-            bytes,
-            base: None,
-        })
-        .collect();
-    let mut pack = Vec::new();
-    let write_pack_start = profile.then(std::time::Instant::now);
-    write_pack(&mut pack, kind, &pack_entries, interrupt)?;
-    let write_pack_ms = write_pack_start
+    let object_count = objects.len();
+    let mut raw_bytes = 0u64;
+    for (_, _, bytes) in &objects {
+        let len = u64::try_from(bytes.len()).map_err(|_| GitError::Limit {
+            detail: "object length does not fit in 64 bits".to_owned(),
+        })?;
+        raw_bytes = raw_bytes.saturating_add(len);
+    }
+    let stage_start = profile.then(std::time::Instant::now);
+    let staged = super::pack::stage_local_objects(objects, dest, limits, interrupt)?;
+    let stage_ms = stage_start
         .map(|start| start.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
-    let staged = ingest_pack(&pack[..], kind, dest, limits, interrupt)?;
     let verify_start = profile.then(std::time::Instant::now);
-    let report = super::fetch::verify_closure(
-        dest,
-        &staged,
-        &req.wants,
-        req.filter,
-        &closure.shallow,
-        interrupt,
-    )?;
+    let report =
+        super::fetch::verify_closure(dest, &staged, &req.wants, req.filter, &shallow, interrupt)?;
     let verify_ms = verify_start
         .map(|start| start.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
@@ -302,7 +294,7 @@ pub fn local_fetch(
     if let Some(filter) = req.filter {
         facts.extend(promisor_facts(remote, filter, &report.missing_promisor)?);
     }
-    facts.extend(shallow_facts(&closure.shallow, &[]));
+    facts.extend(shallow_facts(&shallow, &[]));
     facts.extend(observation_mutations(remote, tracking));
     facts.extend(ref_mutations.iter().cloned());
     let records_start = profile.then(std::time::Instant::now);
@@ -313,16 +305,14 @@ pub fn local_fetch(
     let publication = dest.publish(staged.into_objects(), &facts)?;
     if let Some(start) = fetch_start {
         eprintln!(
-            "[ruk-profile] local_fetch objects={} pack_bytes={} closure={closure_ms:.1}ms write_pack={write_pack_ms:.1}ms verify={verify_ms:.1}ms records={records_ms:.1}ms total={:.1}ms",
-            closure.objects.len(),
-            pack.len(),
+            "[ruk-profile] local_fetch objects={object_count} raw_bytes={raw_bytes} closure={closure_ms:.1}ms stage={stage_ms:.1}ms verify={verify_ms:.1}ms records={records_ms:.1}ms local_fast=1 total={:.1}ms",
             start.elapsed().as_secs_f64() * 1000.0,
         );
     }
     Ok(FetchReport {
         publication,
         delivered: report.wanted,
-        shallow: closure.shallow,
+        shallow,
         warnings: Vec::new(),
     })
 }
@@ -841,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn local_fetch_publishes_through_a_real_pack() {
+    fn local_fetch_publishes_closure_directly() {
         let kind = HashKind::Sha1;
         let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
         let dest = test_store(kind);

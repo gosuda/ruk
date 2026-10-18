@@ -380,6 +380,83 @@ pub fn ingest_pack<R: Read>(
     })
 }
 
+/// Stages a local closure directly, skipping the pack encode/decode
+/// round-trip.
+///
+/// The triples are already full objects (no deltas), so there is nothing
+/// to resolve: each entry goes through [`stage_object`] with its announced
+/// OID as the expectation, exactly like [`ingest_pack`]'s staging tail.
+/// Verification is not weakened: [`Store::prepare`] recomputes the
+/// identity and a mismatch is [`GitError::Corrupt`]; delta-base refusal is
+/// vacuous here because no entry names a base. [`IngestLimits`] still
+/// apply: entry count against `max_objects`, each payload against
+/// `max_object_bytes`, and the summed raw bytes (conservative: raw is an
+/// upper bound on what the deflated pack would have carried) against
+/// `max_pack_bytes`. `max_delta_depth` has no work: there are no deltas.
+/// `interrupt` is honored per object, and staging fans out across
+/// `pack_threads` workers rejoining in order with the first error in
+/// closure order surfacing, matching [`ingest_pack`].
+///
+/// # Errors
+/// [`GitError::Limit`] past `limits`, [`GitError::Corrupt`] on identity
+/// mismatch, [`GitError::Cancelled`] from `interrupt`, and store failures
+/// from staging.
+pub fn stage_local_objects(
+    objects: Vec<(Oid, ObjectKind, Vec<u8>)>,
+    store: &Store,
+    limits: IngestLimits,
+    interrupt: &Interrupt,
+) -> Result<StagedPack, GitError> {
+    let count = u64::try_from(objects.len()).map_err(|_| GitError::Limit {
+        detail: "closure entry count does not fit".to_owned(),
+    })?;
+    if count > u64::from(limits.max_objects) {
+        return Err(GitError::Limit {
+            detail: format!("closure holds more than {} objects", limits.max_objects),
+        });
+    }
+    let mut raw_total = 0u64;
+    for (_, _, bytes) in &objects {
+        interrupt.check("staging the closure")?;
+        let len = u64::try_from(bytes.len()).map_err(|_| GitError::Limit {
+            detail: "object length does not fit in 64 bits".to_owned(),
+        })?;
+        if len > limits.max_object_bytes {
+            return Err(GitError::Limit {
+                detail: format!(
+                    "closure entry of {len} bytes exceeds the {}-byte object limit",
+                    limits.max_object_bytes
+                ),
+            });
+        }
+        raw_total = raw_total.saturating_add(len);
+        if raw_total > limits.max_pack_bytes {
+            return Err(GitError::Limit {
+                detail: format!(
+                    "closure exceeds the {}-byte ingest bound",
+                    limits.max_pack_bytes
+                ),
+            });
+        }
+    }
+    let staged = stage_resolved(store, &objects, interrupt);
+    let entry_count = objects.len();
+    let mut oids = Vec::with_capacity(entry_count);
+    let mut prepared = Vec::with_capacity(entry_count);
+    let mut payloads = HashMap::with_capacity(entry_count);
+    for ((oid, kind, bytes), staged) in objects.into_iter().zip(staged) {
+        interrupt.check("staging the closure")?;
+        prepared.push(staged?);
+        oids.push(oid);
+        payloads.insert(oid, (kind, bytes));
+    }
+    Ok(StagedPack {
+        oids,
+        objects: prepared,
+        payloads,
+    })
+}
+
 /// Prepares every resolved entry across `pack_threads` workers: hashing
 /// and zstd compression per object. The returned vector aligns 1:1 with
 /// `resolved`; the caller rejoins it in order. `Store::prepare` is
