@@ -3006,6 +3006,63 @@ fn stash_branch(ctx: &Ctx, name: &str, slot: u64) -> Result<Vec<u8>, GitError> {
     Ok(format!("Switched to a new branch '{name}'\n").into_bytes())
 }
 
+/// Derives the one-line subject the oracle prints in stash messages:
+/// `pp_commit_easy(CMIT_FMT_ONELINE, ...)` (`git/pretty.c`
+/// `format_subject` with `" "`). Leading blank lines are skipped and the
+/// first paragraph's lines are joined with single spaces, so a multi-line
+/// first paragraph reads as one line instead of truncating at the first
+/// `\n`.
+fn stash_subject(message: &[u8]) -> String {
+    let text = String::from_utf8_lossy(message);
+    let mut paragraph = Vec::new();
+    let mut started = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if started {
+                break;
+            }
+            continue;
+        }
+        started = true;
+        paragraph.push(line);
+    }
+    paragraph.join(" ")
+}
+
+/// Shortest unambiguous hex prefix of `oid` over stored commits, minimum 7:
+/// git's `repo_find_unique_abbrev` (`DEFAULT_ABBREV`) extends the prefix
+/// while another object shares it. Only the `Commits` table is enumerable
+/// here, so a hypothetical collision against an unindexed blob or tree
+/// still reads at 7; the commit set, where real collisions live, is exact.
+fn unique_short_oid(store: &Store, oid: Oid) -> Result<String, GitError> {
+    let hex = oid.to_hex();
+    let records = ruk_core::records::Records::new(store);
+    let budget = ruk_core::records::RecordPageBudget::new(4096, 1 << 26);
+    let mut peers = Vec::new();
+    let mut after = None;
+    loop {
+        let page = records
+            .page_commits(after.as_ref(), budget)
+            .map_err(GitError::from)?;
+        for (head, _) in &page.items {
+            if let Head::Git { oid: peer } = head {
+                if *peer != oid {
+                    peers.push(peer.to_hex());
+                }
+            }
+        }
+        after = page.next_cursor;
+        if !page.more {
+            break;
+        }
+    }
+    let mut width = 7.min(hex.len());
+    while width < hex.len() && peers.iter().any(|peer| peer.starts_with(&hex[..width])) {
+        width += 1;
+    }
+    Ok(hex[..width].to_owned())
+}
+
 /// Records the index and worktree in oracle-shaped stash commits, then
 /// resets both to `HEAD`.
 ///
@@ -3033,13 +3090,8 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     };
     let head_record = super::state::commit_record(store, tip)?;
     let head_tree = commit_tree_oid(&head_record)?;
-    let head_body = head_record.message();
-    let head_end = head_body
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(head_body.len());
-    let head_subject = String::from_utf8_lossy(&head_body[..head_end]).into_owned();
-    let head_short: String = tip.to_hex().chars().take(7).collect();
+    let head_subject = stash_subject(head_record.message());
+    let head_short = unique_short_oid(store, tip)?;
     let index_tree = build_index_tree(store, kind, &merged_rows(&rows))?;
     let (worktree_rows, blobs) = worktree_overlay_rows(ctx, store, kind, &rows)?;
     if !blobs.is_empty() {

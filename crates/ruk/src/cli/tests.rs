@@ -513,6 +513,43 @@ fn stash_pop_index_flag_restores_staged_state() {
 }
 
 #[test]
+fn stash_push_uses_paragraph_subject_and_short_abbrev() {
+    // HEAD's message has a two-line first paragraph: the oracle joins it
+    // with spaces (`format_subject` with " ") instead of cutting at the
+    // first newline, and shortens HEAD to its unique abbrev (7 hex here).
+    let (root, env) = seeded_repo("stash-subject", "s.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("s.txt"), b"one\ntwo\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["s.txt"]).expect("stage");
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "first line\nsecond line\n\nbody"],
+    )
+    .expect("commit");
+    std::fs::write(root.join("s.txt"), b"one\ntwo\nwip\n").expect("modify");
+    let out = run(verbs_branch::stash, &mut ctx, &["push"]).expect("stash");
+    let saved = String::from_utf8_lossy(&out).into_owned();
+    let refs = String::from_utf8(run(verbs_branch::show_ref, &mut ctx, &[]).expect("show-ref"))
+        .expect("refs utf8");
+    let head = refs
+        .lines()
+        .find(|line| line.ends_with(" refs/heads/main"))
+        .expect("main ref")
+        .split_whitespace()
+        .next()
+        .expect("head oid");
+    assert_eq!(
+        saved,
+        format!(
+            "Saved working directory and index state WIP on main: {} first line second line\n",
+            &head[..7]
+        )
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn clone_fetch_push_local_cycle() {
     let (root, _) = seeded_repo("clone-src", "c.txt", b"c\n");
     let base = root.parent().expect("parent").to_path_buf();
