@@ -374,10 +374,12 @@ pub fn ssh_connect_with(
 }
 
 /// Builds the git-daemon request as one pkt-line: 4-hex length prefix
-/// around `git-upload-pack <path> NUL host=<host> NUL version=2 NUL`.
+/// around `git-upload-pack <path> NUL host=<host> NUL NUL version=2 NUL`.
 /// The daemon reads it with `packet_read_line`, so raw bytes would die on
 /// the `git-` "length" (`git/connect.c`, `git_connect_git` via
-/// `packet_write`).
+/// `packet_write`). The doubled NUL opens the extensible extra-parameters
+/// section before `version=2`: oracle bytes captured from git 2.53.0 read
+/// `0042git-upload-pack /whatever.git\0host=127.0.0.1:19419\0\0version=2\0`.
 fn git_request(service: Service, host: &str, port: Option<u16>, path: &str) -> Vec<u8> {
     let mut body = format!("{} {path}", service.name()).into_bytes();
     body.push(0);
@@ -385,6 +387,7 @@ fn git_request(service: Service, host: &str, port: Option<u16>, path: &str) -> V
         Some(port) => body.extend_from_slice(format!("host={host}:{port}").as_bytes()),
         None => body.extend_from_slice(format!("host={host}").as_bytes()),
     }
+    body.push(0);
     body.push(0);
     body.extend_from_slice(b"version=2");
     body.push(0);
@@ -701,13 +704,23 @@ mod tests {
                 .expect("length");
         assert_eq!(len, request.len());
         assert!(request[4..].starts_with(b"git-upload-pack /srv/a.git\0"));
-        assert!(request.ends_with(b"host=host.x\0version=2\0"));
+        // Verbatim oracle shape (`git/connect.c` `git_connect_git`): the
+        // host arg and the extra-parameters section each open with their own
+        // NUL, so a single NUL before `version=2` dies in `parse_host_arg`
+        // with "Invalid request".
+        assert_eq!(
+            &request[4..],
+            b"git-upload-pack /srv/a.git\0host=host.x\0\0version=2\0"
+        );
         let request = git_request(Service::ReceivePack, "host.x", Some(9419), "/a");
         let len =
             usize::from_str_radix(std::str::from_utf8(&request[..4]).expect("hex"), 16)
                 .expect("length");
         assert_eq!(len, request.len());
-        assert!(request.ends_with(b"host=host.x:9419\0version=2\0"));
+        assert_eq!(
+            &request[4..],
+            b"git-receive-pack /a\0host=host.x:9419\0\0version=2\0"
+        );
     }
 
     fn advertisement_bytes(tip: &str) -> Vec<u8> {
@@ -782,6 +795,10 @@ mod tests {
             let request = read_git_request(&socket);
             assert!(request.starts_with(b"git-upload-pack /srv/a.git\0"));
             assert!(request.windows(5).any(|w| w == b"host="));
+            assert!(
+                request.ends_with(b"\0\0version=2\0"),
+                "daemon needs the doubled NUL before version=2"
+            );
             socket
                 .write_all(&advertisement_bytes(tip))
                 .expect("advertisement");
