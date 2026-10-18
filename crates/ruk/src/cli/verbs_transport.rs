@@ -4,9 +4,9 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `fetch` | `session::local_fetch` + refspec expansion | implemented for local paths; network is `Offline` |
+//! | `fetch` | `session::local_fetch` + refspec expansion | implemented for local paths; network is `Offline`; `--prune` drops orphaned remote-tracking refs (pull-mirror parity) |
 //! | `pull` | fetch + fast-forward | implemented for local paths (fast-forward only) |
-//! | `push` | `session::local_push` with a persisted plan | implemented for local paths |
+//! | `push` | `session::local_push` with a persisted plan | implemented for local paths; `--mirror` sets every ref and deletes stale ones (push-mirror parity) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
 //! | `archive` | no archive writer | unsupported |
@@ -21,6 +21,8 @@
 //! `git/builtin/bundle.c`, `git/builtin/gc.c`, `git/builtin/fsck.c`,
 //! `git/builtin/ls-remote.c`.
 
+use std::collections::HashSet;
+
 use ruk_core::change::PlanId;
 use ruk_core::ids::Oid;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
@@ -29,13 +31,14 @@ use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
 use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
+use ruk_git::transport::mirror::{prune_for_spec, push_mirror_updates};
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::push::{PushUpdate, PushWireRequest};
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
 use ruk_git::transport::session::{
     LocalFetchRequest, advertise, local_fetch, local_push, open_local_store,
 };
-use ruk_git::transport::{Interrupt, has_object};
+use ruk_git::transport::{Interrupt, has_object, observation_key};
 
 use super::state::{
     is_ancestor, list_refs, load_or_default, open_store_at, remote_fetch_specs, remote_root,
@@ -63,6 +66,11 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: None,
             takes_value: true,
         },
+        FlagSpec {
+            long: "prune",
+            short: Some('p'),
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
@@ -84,22 +92,30 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         force_all: opts.is_set("force"),
         depth,
         fetch_tags: opts.is_set("tags"),
+        prune: opts.is_set("prune"),
     };
     run_fetch(ctx, &remote_label, &spec_texts, plan)
 }
 
 /// How a fetch updates refs. Data, not selectors: one plan per invocation.
-struct FetchPlan {
+pub(crate) struct FetchPlan {
     /// Every update behaves as forced.
-    force_all: bool,
+    pub(crate) force_all: bool,
     /// Shallow depth, when the caller asked for one.
-    depth: Option<u32>,
+    pub(crate) depth: Option<u32>,
     /// Also take all advertised tags.
-    fetch_tags: bool,
+    pub(crate) fetch_tags: bool,
+    /// Delete remote-tracking refs whose upstream counterpart is gone.
+    pub(crate) prune: bool,
 }
 
 /// Expands refspecs, negotiates the pack, and updates refs atomically.
-fn run_fetch(
+///
+/// `remote update` shares this path: it passes the remote's configured
+/// refspecs with its own prune flag.
+///
+/// Oracle: `git/builtin/fetch.c`, `git/builtin/remote.c` (`update`).
+pub(crate) fn run_fetch(
     ctx: &Ctx,
     remote_label: &str,
     spec_texts: &[String],
@@ -139,10 +155,15 @@ fn run_fetch(
             }
         }
     }
-    if pairs.is_empty() {
+    let dest_refs = StoreRefs::new(dest);
+    let pruned = if plan.prune {
+        collect_prune_deletes(&advertised, dest, spec_texts, &pairs)?
+    } else {
+        Vec::new()
+    };
+    if pairs.is_empty() && pruned.is_empty() {
         return write_fetch_head(ctx, &[]);
     }
-    let dest_refs = StoreRefs::new(dest);
     let mut updates = Vec::new();
     let mut tracking = Vec::new();
     let mut lines = Vec::new();
@@ -177,6 +198,23 @@ fn run_fetch(
             name.to_utf8().unwrap_or_default()
         ));
     }
+    for name in &pruned {
+        let current = dest_refs
+            .get(name)
+            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+        let Some(RefTarget::Direct(oid)) = current else {
+            continue;
+        };
+        updates.push(RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Present(RefTarget::Direct(oid)),
+            change: RefChange::Delete,
+        });
+        lines.push(format!(
+            " - [deleted] {}\n",
+            name.to_utf8().unwrap_or_default()
+        ));
+    }
     let wants: Vec<Oid> = pairs.iter().map(|fetched| fetched.oid).collect();
     let haves: Vec<Oid> = list_refs(dest)?
         .into_iter()
@@ -190,7 +228,23 @@ fn run_fetch(
         &ruk_core::refdata::RefTransaction::new(dest_kind, updates)
             .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?,
     )?;
-    let ref_mutations = prepared.into_mutations();
+    let mut ref_mutations = prepared.into_mutations();
+    for name in &pruned {
+        ref_mutations.push(FactMutation {
+            table: FactTable::RemoteObservations,
+            key: observation_key(remote_label.as_bytes(), name),
+            expected: FactExpectation::Any,
+            value: None,
+        });
+    }
+    if pairs.is_empty() {
+        // Prune-only: no objects move, so the ref deletes (plus their
+        // observation cleanup) publish without a pack round-trip.
+        dest.publish(Vec::new(), &ref_mutations)?;
+        let mut out = lines.concat().into_bytes();
+        out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
+        return Ok(out);
+    }
     let request = LocalFetchRequest {
         wants,
         haves,
@@ -210,6 +264,49 @@ fn run_fetch(
     let mut out = lines.concat().into_bytes();
     out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
     Ok(out)
+}
+
+/// Remote-tracking refs one fetch refspec orphans: local destinations
+/// whose source counterpart is no longer advertised. Names already taking
+/// an update are kept, never pruned; symbolic refs never prune.
+fn collect_prune_deletes(
+    advertised: &[ruk_git::transport::session::AdvertisedLocalRef],
+    dest: &Store,
+    spec_texts: &[String],
+    pairs: &[FetchedRef],
+) -> Result<Vec<RefName>, GitError> {
+    let advertised_names: HashSet<Vec<u8>> =
+        advertised.iter().map(|entry| entry.name.clone()).collect();
+    let local_names: Vec<Vec<u8>> = list_refs(dest)?
+        .into_iter()
+        .filter_map(|(name, target)| {
+            matches!(target, RefTarget::Direct(_)).then(|| name.as_bytes().to_vec())
+        })
+        .collect();
+    let mut pruned = Vec::new();
+    for spec_text in spec_texts {
+        let spec = parse_spec(spec_text)?;
+        for orphan in prune_for_spec(
+            &local_names,
+            &advertised_names,
+            &spec.src,
+            spec.dst.as_deref(),
+        ) {
+            if pairs
+                .iter()
+                .any(|fetched| fetched.name.as_bytes() == orphan.as_slice())
+                || pruned
+                    .iter()
+                    .any(|name: &RefName| name.as_bytes() == orphan.as_slice())
+            {
+                continue;
+            }
+            pruned.push(RefName::new(orphan).map_err(|err| GitError::Invalid {
+                detail: format!("pruned ref refused: {err}"),
+            })?);
+        }
+    }
+    Ok(pruned)
 }
 
 /// Reads the direct oid behind an optional current target.
@@ -453,6 +550,7 @@ pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         force_all: false,
         depth: None,
         fetch_tags: false,
+        prune: false,
     };
     run_fetch(ctx, &remote_label, &[spec], plan)?;
     let tip = resolve_rev(
@@ -484,6 +582,11 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: Some('d'),
             takes_value: false,
         },
+        FlagSpec {
+            long: "mirror",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let store = ctx.store()?;
@@ -495,6 +598,18 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         return Err(GitError::ObjectFormat {
             detail: "source and destination object formats disagree".to_owned(),
         });
+    }
+    // Mirror force: the oracle's `--mirror` forces every ref update, the
+    // way a push mirror (`git push --mirror --force`) syncs deletions and
+    // rewinds alike.
+    let force_all = opts.is_set("force") || opts.is_set("mirror");
+    if opts.is_set("mirror") {
+        if opts.positionals.len() > 1 {
+            return Err(GitError::Invalid {
+                detail: "usage: push [--mirror] [<remote>]".to_owned(),
+            });
+        }
+        return push_mirror(ctx, &dest, target, opts.is_set("atomic"));
     }
     let spec_texts: Vec<String> = if opts.positionals.len() > 1 {
         opts.positionals[1..].to_vec()
@@ -534,7 +649,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         let new = resolve_rev(store, kind, src_text)?;
         let name = dwell_dest(&dest, dst_text)?;
         let old = peel_dest_oid(&dest, &name)?.unwrap_or(zero);
-        if old != zero && !force && !opts.is_set("force") && !is_ancestor(store, old, new)? {
+        if old != zero && !force && !force_all && !is_ancestor(store, old, new)? {
             return Err(GitError::PushRejected {
                 detail: format!(
                     "non-fast-forward push to {}",
@@ -558,7 +673,72 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         opts.is_set("atomic"),
         updates,
     );
-    let outcomes = local_push(&dest, store, kind, &mut plan, &request, &Interrupt::none())?;
+    push_outcomes(local_push(
+        &dest,
+        store,
+        kind,
+        &mut plan,
+        &request,
+        &Interrupt::none(),
+    )?)
+}
+
+/// Pushes every local ref to the same name on the destination and deletes
+/// destination refs with no local counterpart: `push --mirror`, the verb a
+/// push-mirror sync (`git push --mirror --force`) routes through.
+///
+/// Oracle: `git/builtin/push.c` (`--mirror`).
+fn push_mirror(ctx: &Ctx, dest: &Store, target: &str, atomic: bool) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let zero = kind.zero_oid();
+    let local = direct_tips(store)?;
+    let remote = direct_tips(dest)?;
+    let mut updates = Vec::new();
+    for mirror_update in push_mirror_updates(&local, &remote) {
+        updates.push(PushUpdate {
+            name: mirror_update.name,
+            old: mirror_update.old.unwrap_or(zero),
+            new: mirror_update.new.unwrap_or(zero),
+        });
+    }
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let request = PushWireRequest {
+        updates: updates.clone(),
+        atomic,
+    };
+    let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
+        PlanId::generate(),
+        target.as_bytes().to_vec(),
+        atomic,
+        updates,
+    );
+    push_outcomes(local_push(
+        dest,
+        store,
+        kind,
+        &mut plan,
+        &request,
+        &Interrupt::none(),
+    )?)
+}
+
+/// Direct ref tips of one store as `(name, oid)` pairs; symbolic refs
+/// never enter a mirror update.
+fn direct_tips(store: &Store) -> Result<Vec<(Vec<u8>, ruk_core::ids::Oid)>, GitError> {
+    let mut tips = Vec::new();
+    for (name, target) in list_refs(store)? {
+        if let RefTarget::Direct(oid) = target {
+            tips.push((name.as_bytes().to_vec(), oid));
+        }
+    }
+    Ok(tips)
+}
+
+/// Reports push outcomes the way [`push`] does, failing on any rejection.
+fn push_outcomes(outcomes: Vec<ruk_git::transport::push::RefOutcome>) -> Result<Vec<u8>, GitError> {
     let mut out = Vec::new();
     for outcome in &outcomes {
         let name = String::from_utf8_lossy(&outcome.name);

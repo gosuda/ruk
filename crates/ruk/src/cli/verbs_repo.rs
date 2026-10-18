@@ -6,7 +6,7 @@
 //! | `clone` | `Store::create` + `session::local_fetch` + ref copy | implemented for local paths; network sources are `Offline` |
 //! | `migrate` | `Store::create` + `import::import_repository` + workspace row | implemented; worktree checkout, config conversion, and hooks are out of scope |
 //! | `config` | `Pins` records under `cli/config/` | implemented, `--local` scope only |
-//! | `remote` | `remote.<name>.*` config records | implemented |
+//! | `remote` | `remote.<name>.*` config records | implemented, plus `update [--prune]` over configured refspecs (mirror parity) |
 //! | `worktree` | absent workcopy lane | unsupported |
 //!
 //! Oracle anchors: `git/builtin/init-db.c`, `git/builtin/clone.c`,
@@ -33,6 +33,7 @@ use super::state::{
     DEFAULT_BRANCH, apply_refs, config_list, config_read, config_unset, config_write,
     load_workspace, open_store_at, remote_fetch_specs, remote_root, remote_url, workspace_mutation,
 };
+use super::verbs_transport::{FetchPlan, run_fetch};
 use super::{Collected, Ctx, FlagSpec, collect, line};
 
 /// Creates an empty repository: the store, the workspace row, and an unborn
@@ -684,10 +685,53 @@ pub(crate) fn remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             }
             Ok(out)
         }
+        Some("update") => remote_update(ctx, sub_tail(&opts)),
         Some(other) => Err(GitError::Invalid {
             detail: format!("unknown remote subcommand {other:?}"),
         }),
     }
+}
+
+/// Fetches the configured refspecs of one or every remote: `remote update`,
+/// the verb a pull-mirror wiki sync (`git remote update --prune <name>`)
+/// routes through.
+///
+/// Names may carry `--prune` anywhere among them; with no names every
+/// configured remote updates in config order. Each remote's report appends
+/// in turn, the way successive fetches print one summary apiece.
+///
+/// Oracle: `git/builtin/remote.c` (`update`).
+fn remote_update(ctx: &mut Ctx, tail: &[String]) -> Result<Vec<u8>, GitError> {
+    let prune = tail.iter().any(|arg| arg == "--prune");
+    let explicit: Vec<&str> = tail
+        .iter()
+        .filter(|arg| arg.as_str() != "--prune")
+        .map(String::as_str)
+        .collect();
+    let owned: Vec<String>;
+    let names: Vec<&str> = if explicit.is_empty() {
+        owned = all_remote_names(ctx.store()?)?;
+        owned.iter().map(String::as_str).collect()
+    } else {
+        explicit
+    };
+    let mut out = Vec::new();
+    for name in names {
+        let owned = name.to_owned();
+        let specs = remote_fetch_specs(ctx, &owned);
+        out.extend_from_slice(&run_fetch(
+            ctx,
+            &owned,
+            &specs,
+            FetchPlan {
+                force_all: false,
+                depth: None,
+                fetch_tags: false,
+                prune,
+            },
+        )?);
+    }
+    Ok(out)
 }
 
 /// Lists remote names, one per line.

@@ -447,6 +447,126 @@ fn clone_fetch_push_local_cycle() {
 }
 
 #[test]
+fn fetch_prune_drops_orphaned_tracking_ref() {
+    // Stores open exclusively: each context drops before the other end
+    // opens the same store, the way the clone/fetch/push cycle test does.
+    let (src, _) = seeded_repo("prune-src", "p.txt", b"p\n");
+    {
+        let mut src_ctx = repo_ctx(&src, test_env(&src));
+        run(verbs_branch::branch, &mut src_ctx, &["gone"]).expect("branch gone");
+    }
+    let (dst, _) = seeded_repo("prune-dst", "q.txt", b"q\n");
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        run(
+            verbs_repo::remote,
+            &mut dst_ctx,
+            &["add", "origin", src.to_str().expect("utf8")],
+        )
+        .expect("remote add");
+        run(verbs_transport::fetch, &mut dst_ctx, &["origin"]).expect("fetch");
+        let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("refs/remotes/origin/gone"), "got {text}");
+    }
+    {
+        let mut src_ctx = repo_ctx(&src, test_env(&src));
+        run(
+            verbs_branch::branch,
+            &mut src_ctx,
+            &["--force-delete", "gone"],
+        )
+        .expect("delete gone upstream");
+    }
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        let out = run(verbs_transport::fetch, &mut dst_ctx, &["--prune", "origin"])
+            .expect("fetch --prune");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("[deleted]"), "got {text}");
+        assert!(text.contains("refs/remotes/origin/gone"), "got {text}");
+        let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(!text.contains("refs/remotes/origin/gone"), "got {text}");
+        assert!(text.contains("refs/remotes/origin/main"), "got {text}");
+    }
+    let _ = std::fs::remove_dir_all(src.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(dst.parent().expect("parent"));
+}
+
+#[test]
+fn push_mirror_syncs_refs_and_deletes_stale() {
+    let (src, _) = seeded_repo("mirror-src", "m.txt", b"m\n");
+    let src_tip = {
+        let mut src_ctx = repo_ctx(&src, test_env(&src));
+        run(verbs_branch::branch, &mut src_ctx, &["feat"]).expect("branch feat");
+        run(verbs_branch::tag, &mut src_ctx, &["v1"]).expect("tag v1");
+        super::state::head_oid(src_ctx.store().expect("store")).expect("src tip")
+    };
+    let (dst, _) = seeded_repo("mirror-dst", "d.txt", b"d\n");
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        run(verbs_branch::branch, &mut dst_ctx, &["stale"]).expect("branch stale");
+    }
+    {
+        let mut src_ctx = repo_ctx(&src, test_env(&src));
+        run(
+            verbs_repo::remote,
+            &mut src_ctx,
+            &["add", "origin", dst.to_str().expect("utf8")],
+        )
+        .expect("remote add");
+        let out = run(verbs_transport::push, &mut src_ctx, &["--mirror", "origin"])
+            .expect("push --mirror");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("ok refs/heads/feat"), "got {text}");
+    }
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("refs/heads/feat"), "got {text}");
+        assert!(text.contains("refs/tags/v1"), "got {text}");
+        assert!(!text.contains("refs/heads/stale"), "got {text}");
+        let dst_main = super::state::resolve_rev(
+            dst_ctx.store().expect("store"),
+            dst_ctx.kind().expect("kind"),
+            "refs/heads/main",
+        )
+        .expect("dst main");
+        assert_eq!(src_tip, dst_main, "mirror forces main to the source tip");
+    }
+    let _ = std::fs::remove_dir_all(src.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(dst.parent().expect("parent"));
+}
+
+#[test]
+fn remote_update_fetches_configured_specs() {
+    let (src, _) = seeded_repo("update-src", "u.txt", b"u\n");
+    let (dst, _) = seeded_repo("update-dst", "w.txt", b"w\n");
+    let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+    run(
+        verbs_repo::remote,
+        &mut dst_ctx,
+        &["add", "origin", src.to_str().expect("utf8")],
+    )
+    .expect("remote add");
+    let out = run(verbs_repo::remote, &mut dst_ctx, &["update", "origin"]).expect("remote update");
+    assert!(
+        String::from_utf8_lossy(&out).contains("refs/remotes/origin/main"),
+        "got {:?}",
+        out
+    );
+    let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
+    assert!(
+        String::from_utf8_lossy(&out).contains("refs/remotes/origin/main"),
+        "tracking ref landed"
+    );
+    let _ = std::fs::remove_dir_all(src.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(dst.parent().expect("parent"));
+}
+
+#[test]
 fn receive_pack_enforces_store_lfs_policy() {
     use ruk_core::store::types::ObjectKind;
     use ruk_git::transport::Interrupt;

@@ -43,6 +43,7 @@ pub mod dumb;
 pub mod fetch;
 pub mod hooks;
 pub mod lfs;
+pub mod mirror;
 pub mod pack;
 pub mod pktline;
 pub mod private;
