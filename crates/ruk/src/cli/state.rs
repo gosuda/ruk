@@ -24,7 +24,7 @@ use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::index::{FileMode, IndexEntry, IndexKey, PathEntries, RepoPath, Stage, row_delta};
+use ruk_core::index::{FileMode, IndexEntry, PathEntries, RepoPath, Stage, row_delta};
 use ruk_core::records::Records;
 use ruk_core::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate, resolve,
@@ -38,7 +38,7 @@ use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
 use serde::{Deserialize, Serialize};
 
-use super::{Ctx, line};
+use super::Ctx;
 use std::path::PathBuf;
 
 /// Workspace-row key: CLI-owned, disjoint from coordinator 16-byte keys.
