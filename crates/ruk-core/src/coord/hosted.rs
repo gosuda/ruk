@@ -49,6 +49,7 @@ use super::oplog::read_header;
 use super::policy::PolicySource;
 pub use super::policy::Principal;
 use super::prepare::{PrepareContext, prepare_mutation_with};
+use super::receipt;
 use super::retention::{RetentionClock, SweepTable, sweep_page};
 use super::rows::{
     CoordinatorHead, OP_HEAD_KEY, RECEIPT_HORIZON, SessionRow, decode_head, decode_session,
@@ -72,6 +73,17 @@ use crate::store::FactPageBudget;
 use crate::store::Store;
 use crate::store::types::{FactMutation, FactTable, PreparedObject};
 use crate::workspace::WorkspaceStamp;
+
+/// What [`HostedCoordinator::prepare_for_dispatch`] returns: either the stored
+/// reply for a request that committed before, or fresh lane parts for a new one.
+#[derive(Debug)]
+pub enum DispatchReady {
+    /// The `(session, request_id)` committed before; serve the stored reply
+    /// without preparing or publishing anything.
+    Replay(Reply),
+    /// A new request, translated into lane parts for submission.
+    Prepared(PreparedMutation),
+}
 
 /// Caller-prepared parts of one mutation submission.
 ///
@@ -206,7 +218,16 @@ impl HostedCoordinator {
         &self.store
     }
 
-    /// Prepares one mutation with the full coordinator context.
+    /// Prepares one mutation with the full coordinator context, replaying a
+    /// stored reply when the request committed before.
+    ///
+    /// Consults the receipt ledger before translating: a client retrying the
+    /// same `(session, request_id)` after a lost reply gets the stored reply,
+    /// because preparation re-runs translation against current state — which
+    /// already reflects the committed attempt — and would otherwise fail the
+    /// retry with `E_STALE` or `E_INVALID` before the lane's own receipt
+    /// lookup runs. A reused id with different arguments refuses with
+    /// `E_REQUEST_REUSED` here as well.
     ///
     /// Loads the session row and runs the per-method translation with the
     /// coordinator clock and the caller's attestation gate, so ref/data
@@ -222,6 +243,8 @@ impl HostedCoordinator {
     /// mutations on policy or clock rows those arms never read.
     ///
     /// # Errors
+    /// - [`ErrorCode::ERequestReused`] when the request id committed before
+    ///   with different arguments.
     /// - [`ErrorCode::EInvalid`] when the request is not a mutation.
     /// - [`ErrorCode::EHosted`] when the method has no preparation on this
     ///   path, or its required context input is absent.
@@ -234,7 +257,11 @@ impl HostedCoordinator {
         session: SessionId,
         request: Request,
         checkpoint: &Checkpoint<'_>,
-    ) -> Result<PreparedMutation, CoreError> {
+    ) -> Result<DispatchReady, CoreError> {
+        let wall = self.clock.sample()?.wall;
+        if let Some(reply) = receipt::replay_if_committed(&self.store, session, &request, wall)? {
+            return Ok(DispatchReady::Replay(reply));
+        }
         let key = session_key(session);
         let session_row = self
             .store
@@ -250,7 +277,7 @@ impl HostedCoordinator {
             policy: None,
             checkpoint: Some(checkpoint),
         };
-        prepare_mutation_with(&ctx, request)
+        prepare_mutation_with(&ctx, request).map(DispatchReady::Prepared)
     }
 
     /// Spawns the publication lane runner on `handle`.
@@ -1364,16 +1391,19 @@ mod tests {
     use crate::change::{ClaimId, LeaseId, RequestId, StoreId};
     use crate::commit::ProvenanceClaims;
     use crate::coord::claims::{ClaimClock, seal_acquire};
-    use crate::coord::rows::{Retained, SweepCursors, Usage, encode};
+    use crate::attestation::Progress;
+    use crate::coord::receipt;
+    use crate::coord::rows::{ReceiptRow, Retained, SweepCursors, Usage, encode, receipt_key};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::index::RepoPath;
     use crate::protocol::{
-        AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement, ClaimHolderFilter,
-        ClaimListArgs, ClaimMode, ClaimTtl, Method, Mutation as WireMutation, OpLogArgs,
-        PageCursor, PageLimit, PageRequest, PinArgs, QueryDigest, StatusArgs, TagSetArgs,
-        Timestamp,
+        AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement, BoundedList,
+        ClaimHolderFilter, ClaimListArgs, ClaimMode, ClaimTtl, Method, Mutation as WireMutation,
+        MutationOutcome, OpLogArgs, PageCursor, PageLimit, PageRequest, PinArgs, QueryDigest,
+        ReceiptRef, StatusArgs, TagSetArgs, Timestamp, UndoArgs, UndoReply, UndoSummary,
     };
+    use crate::store::types::{FactMutation, FactTable};
     use crate::refdata::{RefExpect, RefName};
     use crate::store::PreparationBudget;
     use crate::store::types::FactExpectation;
@@ -1422,6 +1452,77 @@ mod tests {
 
     fn stranger() -> Principal {
         Principal::from_peer_uid(2000)
+    }
+
+    #[test]
+    fn retried_mutation_replays_its_receipt_before_preparing() {
+        let (_temp, coord, _owner) = coordinator();
+        let session = SessionId::generate();
+        let request_id = RequestId::generate();
+        let request = Request::Undo(Box::new(WireMutation {
+            request_id,
+            args: UndoArgs {
+                operation: OperationId(999),
+            },
+        }));
+        // Without the receipt this request would fail preparation: operation
+        // 999 is not retained. The receipt proves it committed before.
+        let digest = receipt::digest_v1(&request)
+            .expect("digest computation")
+            .expect("a mutation has a digest");
+        let retained_until = Timestamp::new(
+            jiff::Timestamp::now()
+                .checked_add(jiff::SignedDuration::from_hours(24))
+                .expect("future"),
+        );
+        let reply = Reply::Undo(Box::new(UndoReply {
+            outcome: MutationOutcome {
+                receipt: ReceiptRef {
+                    session,
+                    request_id,
+                    digest,
+                    replayed: false,
+                    retained_until,
+                },
+                operation: Some(OperationId(7)),
+                heads: BoundedList::complete(Vec::new()).expect("empty"),
+                stamps: BoundedList::complete(Vec::new()).expect("empty"),
+                warnings: BoundedList::complete(Vec::new()).expect("empty"),
+                merge: None,
+                provenance: BoundedList::complete(Vec::new()).expect("empty"),
+                identity: None,
+            },
+            undone: OperationId(7),
+            restored: UndoSummary {
+                refs: 0,
+                changes: 0,
+                workspaces: 0,
+            },
+        }));
+        let row = ReceiptRow::new(session, request_id, reply).expect("receipt row");
+        let encoded = encode("receipt", &row).expect("encode receipt");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Receipts,
+                    key: receipt_key(session, request_id).to_vec(),
+                    expected: crate::store::types::FactExpectation::Absent,
+                    value: Some(encoded),
+                }],
+            )
+            .expect("publish receipt");
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        match coord.prepare_for_dispatch(session, request, &checkpoint) {
+            DispatchReady::Replay(replayed) => {
+                assert!(
+                    replayed.outcome().expect("outcome").receipt.replayed,
+                    "the retry replays the stored reply instead of re-executing"
+                );
+            }
+            DispatchReady::Prepared(_) => panic!("a committed request must replay, not prepare"),
+        }
     }
 
     fn presented_cursor() -> PageCursor {

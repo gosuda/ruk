@@ -78,6 +78,39 @@ pub(crate) fn lookup(
     }
 }
 
+/// Returns the stored reply when `(session, request)` committed before, so a
+/// retried request replays instead of re-executing.
+///
+/// The lane's receipt lookup runs after preparation, but preparation
+/// re-runs translation against current state — which already reflects the
+/// committed attempt — so a retry would fail `E_STALE`/`E_INVALID` before
+/// ever reaching the lane. The dispatch path calls this before preparing.
+///
+/// # Errors
+/// - [`ErrorCode::ERequestReused`] if the request id was used with a different digest.
+/// - [`ErrorCode::ECorrupt`] if committed receipt bytes fail decode or invariant validation.
+pub(crate) fn replay_if_committed(
+    store: &Store,
+    session: SessionId,
+    request: &Request,
+    wall: jiff::Timestamp,
+) -> Result<Option<Reply>, CoreError> {
+    let Some(request_id) = request.request_id() else {
+        return Ok(None);
+    };
+    let Some(digest) = digest_v1(request)? else {
+        return Ok(None);
+    };
+    match lookup(store, session, request_id, &digest, wall)? {
+        Lookup::Replay(reply) => Ok(Some(reply)),
+        Lookup::Reused => Err(CoreError::new(
+            ErrorCode::ERequestReused,
+            "request id already used with different digest",
+        )),
+        Lookup::Miss => Ok(None),
+    }
+}
+
 /// Rechecks the receipt table before returning a pre-lane rejection (e.g. `E_STALE` or `E_LEASE_LOST`).
 ///
 /// If the request actually committed previously (e.g. connection dropped after commit but before
@@ -324,6 +357,58 @@ mod tests {
         let current_wall = jiff::Timestamp::now();
         let res = lookup(&store, session, req_id, &digest, current_wall).expect("lookup");
         assert_eq!(res, Lookup::Miss, "expired receipt must return Miss");
+    }
+
+    #[test]
+    fn retried_request_replays_instead_of_re_executing() {
+        let (_dir, store) = test_store("replay-first");
+        let session = SessionId::generate();
+        let req_id = RequestId::generate();
+        let request = sample_take_request(req_id);
+        let digest = digest_v1(&request)
+            .expect("digest computation")
+            .expect("mutation has a digest");
+        let retained_until = Timestamp::new(
+            jiff::Timestamp::now()
+                .checked_add(jiff::SignedDuration::from_hours(24))
+                .expect("future"),
+        );
+        let reply = sample_mutation_reply(session, req_id, digest, false, retained_until);
+        let encoded = encode("receipt", &ReceiptRow::new(session, req_id, reply).expect("row"))
+            .expect("encode");
+        let key = receipt_key(session, req_id);
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Receipts,
+                    key: key.to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(encoded),
+                }],
+            )
+            .expect("publish");
+        let wall = jiff::Timestamp::now();
+        // The same session and request id retried replays the stored reply.
+        let replayed = replay_if_committed(&store, session, &request, wall)
+            .expect("replay lookup")
+            .expect("a committed request replays");
+        assert!(replayed.outcome().expect("outcome").receipt.replayed);
+        // The same id with different arguments refuses instead of executing.
+        let different = sample_take_request(req_id);
+        assert_ne!(
+            digest_v1(&different).expect("digest").expect("digest"),
+            digest,
+            "the test needs arguments that actually differ"
+        );
+        let reused = replay_if_committed(&store, session, &different, wall).expect_err("reused id");
+        assert_eq!(reused.code, ErrorCode::ERequestReused);
+        // An uncommitted id prepares normally.
+        let fresh = sample_take_request(RequestId::generate());
+        assert_eq!(
+            replay_if_committed(&store, session, &fresh, wall).expect("miss"),
+            None
+        );
     }
 
     #[test]

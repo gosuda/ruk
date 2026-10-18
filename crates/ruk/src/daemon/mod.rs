@@ -2184,13 +2184,21 @@ pub async fn dispatch_method(
                     // a cancelled call stops verification instead of
                     // publishing rows it no longer waits for.
                     let checkpoint = |_: ruk_core::attestation::Progress| cancel.check();
-                    let prepared =
+                    let typed_id = request.request_id();
+                    let ready =
                         coordinator.prepare_for_dispatch(session, request, &checkpoint)?;
-                    let request_id = prepared.request_id;
-                    let reply = coordinator
-                        .submit_prepared(principal, prepared, cancel)
-                        .await?;
-                    ipc::encode_control(&ReplyEnvelope::success(Some(request_id), reply))
+                    match ready {
+                        ruk_core::coord::DispatchReady::Replay(reply) => {
+                            ipc::encode_control(&ReplyEnvelope::success(typed_id, reply))
+                        }
+                        ruk_core::coord::DispatchReady::Prepared(prepared) => {
+                            let request_id = prepared.request_id;
+                            let reply = coordinator
+                                .submit_prepared(principal, prepared, cancel)
+                                .await?;
+                            ipc::encode_control(&ReplyEnvelope::success(Some(request_id), reply))
+                        }
+                    }
                 }
                 _ => Err(refuse_sessionless(method, Some(session))),
             }
