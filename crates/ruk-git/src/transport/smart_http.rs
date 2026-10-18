@@ -45,6 +45,7 @@ use std::io::Cursor;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::Store;
 
+use super::Interrupt;
 use super::fetch::{self, FetchWireRequest, ReceivedPack};
 use super::http;
 use super::net;
@@ -52,7 +53,6 @@ use super::pack::IngestLimits;
 use super::pktline::{self, PktReader};
 use super::push::{self, PushPlanRecord, PushWireRequest, RefOutcome};
 use super::refadv::{self, Advertisement, Initial};
-use super::Interrupt;
 use crate::{GitError, parse_oid_for};
 
 /// Which smart service one RPC round trip speaks.
@@ -328,8 +328,7 @@ pub fn fetch_pack(
     ]);
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
     check_status(&url, status)?;
-    if http::header(&reply, "content-type")
-        != Some(SmartService::UploadPack.result_type().as_str())
+    if http::header(&reply, "content-type") != Some(SmartService::UploadPack.result_type().as_str())
     {
         return Err(GitError::Corrupt {
             detail: format!("{url}: upload-pack RPC answered a non-pack content type"),
@@ -650,10 +649,7 @@ mod tests {
         let vars = HashMap::from([("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned())]);
         let headers = request_headers(&vars, &[("Accept", "*/*")]);
         assert!(headers.contains(&("Accept".to_owned(), "*/*".to_owned())));
-        assert!(headers.contains(&(
-            "authorization".to_owned(),
-            "Bearer tok".to_owned()
-        )));
+        assert!(headers.contains(&("authorization".to_owned(), "Bearer tok".to_owned())));
         // A bearer token wins over a user/password pair.
         let vars = HashMap::from([
             ("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned()),
@@ -669,10 +665,7 @@ mod tests {
         let headers = request_headers(&vars, &[]);
         assert_eq!(
             headers,
-            vec![(
-                "authorization".to_owned(),
-                "Basic dXNlcjpwYXNz".to_owned()
-            )]
+            vec![("authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned())]
         );
         assert!(request_headers(&HashMap::new(), &[]).is_empty());
     }
@@ -815,7 +808,10 @@ mod tests {
         assert!(adv.capabilities.has("side-band-64k"));
         assert_eq!(adv.refs.len(), 2);
         assert_eq!(adv.refs[0].oid, Some(oid(FOUR)));
-        assert_eq!(adv.refs[0].symref_target.as_deref(), Some(b"refs/heads/main".as_slice()));
+        assert_eq!(
+            adv.refs[0].symref_target.as_deref(),
+            Some(b"refs/heads/main".as_slice())
+        );
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
         assert!(
@@ -902,8 +898,15 @@ mod tests {
         )
         .expect("fetch");
         assert!(received.warnings.is_empty());
-        verify_closure(&dest, &received.staged, &[oid(FOUR)], None, &[], &Interrupt::none())
-            .expect("closure");
+        verify_closure(
+            &dest,
+            &received.staged,
+            &[oid(FOUR)],
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("closure");
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 2);
         let post = &requests[1];
@@ -914,12 +917,14 @@ mod tests {
             post.head
         );
         assert!(
-            post.head.contains("Content-Type: application/x-git-upload-pack-request"),
+            post.head
+                .contains("Content-Type: application/x-git-upload-pack-request"),
             "{:?}",
             post.head
         );
         assert!(
-            post.head.contains("Accept: application/x-git-upload-pack-result"),
+            post.head
+                .contains("Accept: application/x-git-upload-pack-result"),
             "{:?}",
             post.head
         );
@@ -930,10 +935,7 @@ mod tests {
             "no want line in {:?}",
             post.body.escape_ascii().to_string()
         );
-        assert!(
-            post.body.windows(5).any(|w| w == b"done\n"),
-            "no done line"
-        );
+        assert!(post.body.windows(5).any(|w| w == b"done\n"), "no done line");
         assert!(post.body.ends_with(b"0000"), "no closing flush");
     }
 
@@ -992,9 +994,10 @@ mod tests {
             atomic: false,
         };
         let _dest = test_store(kind);
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
-        let outcomes = push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none())
-            .expect("push");
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let outcomes =
+            push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none()).expect("push");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].name, b"refs/heads/x");
         assert!(
@@ -1012,13 +1015,12 @@ mod tests {
             post.head
         );
         assert!(
-            post.body.windows(b"refs/heads/x".len()).any(|w| w == b"refs/heads/x"),
+            post.body
+                .windows(b"refs/heads/x".len())
+                .any(|w| w == b"refs/heads/x"),
             "no command line"
         );
-        assert!(
-            post.body.windows(4).any(|w| w == b"PACK"),
-            "no pack bytes"
-        );
+        assert!(post.body.windows(4).any(|w| w == b"PACK"), "no pack bytes");
     }
 
     #[test]
@@ -1039,7 +1041,8 @@ mod tests {
             updates: updates.clone(),
             atomic: false,
         };
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
         let adv = Advertisement {
             version: super::super::refadv::ProtocolVersion::V0,
             capabilities: super::super::refadv::Capabilities::default(),

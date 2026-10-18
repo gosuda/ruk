@@ -760,9 +760,8 @@ impl Read for HttpBodyReader {
                             .take_while(|byte| **byte != b';')
                             .copied()
                             .collect::<Vec<u8>>();
-                        let text = std::str::from_utf8(&size_text).map_err(|_| {
-                            io_failed("chunk size is not UTF-8")
-                        })?;
+                        let text = std::str::from_utf8(&size_text)
+                            .map_err(|_| io_failed("chunk size is not UTF-8"))?;
                         let size = u64::from_str_radix(text, 16)
                             .map_err(|_| io_failed("bad chunk size"))?;
                         *state = if size == 0 {
@@ -819,11 +818,7 @@ pub fn post_open(
 ) -> Result<(HttpBodyReader, u16, Vec<(String, String)>), GitError> {
     let (reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
     let framing = open_framing(&headers)?;
-    Ok((
-        HttpBodyReader { reader, framing },
-        status,
-        headers,
-    ))
+    Ok((HttpBodyReader { reader, framing }, status, headers))
 }
 
 /// Picks the body framing for one open response from its headers: chunked
@@ -1002,10 +997,7 @@ pub fn batch_upload_request_body(objects: &[(String, u64)]) -> Result<Vec<u8>, G
 
 /// Renders one batch request document for `operation`: the shared shape
 /// behind [`batch_request_body`] and [`batch_upload_request_body`].
-fn batch_request_body_for(
-    operation: &str,
-    objects: &[(String, u64)],
-) -> Result<Vec<u8>, GitError> {
+fn batch_request_body_for(operation: &str, objects: &[(String, u64)]) -> Result<Vec<u8>, GitError> {
     for (oid, _) in objects {
         if !ruk_core::store::lfs::valid_oid_hex(oid) {
             return Err(GitError::Invalid {
@@ -1013,9 +1005,8 @@ fn batch_request_body_for(
             });
         }
     }
-    let mut out = format!(
-        "{{\"operation\":\"{operation}\",\"transfers\":[\"basic\"],\"objects\":["
-    );
+    let mut out =
+        format!("{{\"operation\":\"{operation}\",\"transfers\":[\"basic\"],\"objects\":[");
     for (index, (oid, size)) in objects.iter().enumerate() {
         if index > 0 {
             out.push(',');
@@ -1463,7 +1454,10 @@ mod tests {
             ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
             ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),
         ]);
-        assert_eq!(git_auth_header(&vars).map(|(_, value)| value), Some("Bearer tok".to_owned()));
+        assert_eq!(
+            git_auth_header(&vars).map(|(_, value)| value),
+            Some("Bearer tok".to_owned())
+        );
         let vars = HashMap::from([
             ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
             ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),

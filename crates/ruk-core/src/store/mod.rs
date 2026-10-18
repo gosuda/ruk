@@ -945,7 +945,14 @@ impl Store {
             AppendProbe::idle()
         };
         for object in &fresh {
-            append(writer, &mut batch, &segments_dir, object, generation, &mut probe)?;
+            append(
+                writer,
+                &mut batch,
+                &segments_dir,
+                object,
+                generation,
+                &mut probe,
+            )?;
             if profile {
                 append_bytes += segment::record_len_for(object.payload.len()).unwrap_or(0);
             }

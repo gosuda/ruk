@@ -560,9 +560,7 @@ pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitE
             detail: "local endpoints need no network stream".to_owned(),
         }),
         Endpoint::Http { url, .. } => Err(GitError::Invalid {
-            detail: format!(
-                "{url}: http(s) endpoints use smart-http RPC, not duplex streams"
-            ),
+            detail: format!("{url}: http(s) endpoints use smart-http RPC, not duplex streams"),
         }),
     }
 }

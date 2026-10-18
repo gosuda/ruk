@@ -365,7 +365,14 @@ pub(crate) fn run_fetch(
             )?;
         }
         FetchSource::Http { .. } => {
-            fetch_pack_http(dest, &source, remote_label, &request, &tracking, &ref_mutations)?;
+            fetch_pack_http(
+                dest,
+                &source,
+                remote_label,
+                &request,
+                &tracking,
+                &ref_mutations,
+            )?;
         }
     }
     let mut out = lines.concat().into_bytes();
@@ -396,7 +403,14 @@ fn fetch_pack_net(
         IngestLimits::default(),
         &Interrupt::none(),
     )?;
-    publish_received(dest, received, request, remote_label, tracking, ref_mutations)
+    publish_received(
+        dest,
+        received,
+        request,
+        remote_label,
+        tracking,
+        ref_mutations,
+    )
 }
 
 /// Runs the pack half of a smart-http fetch: POSTs the whole v0 request
@@ -426,7 +440,14 @@ fn fetch_pack_http(
         IngestLimits::default(),
         &Interrupt::none(),
     )?;
-    publish_received(dest, received, request, remote_label, tracking, ref_mutations)
+    publish_received(
+        dest,
+        received,
+        request,
+        remote_label,
+        tracking,
+        ref_mutations,
+    )
 }
 
 /// Verifies one received pack's closure and publishes staged objects

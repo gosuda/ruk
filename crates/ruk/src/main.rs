@@ -194,8 +194,10 @@ fn run(cli: Cli) -> Result<Vec<u8>, CoreError> {
             let description = ruk_core::ops::describe(&store, request)?;
             render(&description)
         }
-        Command::LfsPayloadSync { repo, from, upload } => cli::lfs_payload_sync_native(repo, from, upload)
-            .map_err(|err| CoreError::new(err.code(), err.to_string())),
+        Command::LfsPayloadSync { repo, from, upload } => {
+            cli::lfs_payload_sync_native(repo, from, upload)
+                .map_err(|err| CoreError::new(err.code(), err.to_string()))
+        }
         Command::Forgejo {
             command: ForgejoCommand::Serve { config },
         } => {

@@ -344,7 +344,11 @@ enum CountMatches {
 ///
 /// A single trailing newline does not add a phantom line; an empty file
 /// has no lines at all.
-fn scan_impl<'bytes>(matcher: &Matcher, bytes: &'bytes [u8], want: CountMatches) -> FileScan<'bytes> {
+fn scan_impl<'bytes>(
+    matcher: &Matcher,
+    bytes: &'bytes [u8],
+    want: CountMatches,
+) -> FileScan<'bytes> {
     let binary = bytes.contains(&0);
     let mut lines: Vec<&[u8]> = Vec::new();
     if !bytes.is_empty() {

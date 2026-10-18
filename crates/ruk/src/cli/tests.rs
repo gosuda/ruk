@@ -1371,8 +1371,10 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
     let mut adv = frame(b"# service=git-upload-pack\n");
     adv.extend_from_slice(b"0000");
     adv.extend_from_slice(&frame(
-        format!("{FOUR} HEAD\0multi_ack_detailed side-band-64k thin-pack ofs-delta object-format=sha1\n")
-            .as_bytes(),
+        format!(
+            "{FOUR} HEAD\0multi_ack_detailed side-band-64k thin-pack ofs-delta object-format=sha1\n"
+        )
+        .as_bytes(),
     ));
     adv.extend_from_slice(&frame(format!("{FOUR} refs/heads/main\n").as_bytes()));
     adv.extend_from_slice(b"0000");
@@ -1449,7 +1451,10 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
     let oid = ruk_core::ids::Oid::from_hex(FOUR).expect("hex");
     store.read(oid).expect("fetched object present");
     let name = RefName::new(b"refs/remotes/origin/main".to_vec()).expect("name");
-    let target = StoreRefs::new(&store).get(&name).expect("read ref").expect("ref present");
+    let target = StoreRefs::new(&store)
+        .get(&name)
+        .expect("read ref")
+        .expect("ref present");
     assert_eq!(target, ruk_core::refdata::RefTarget::Direct(oid));
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -1774,8 +1779,7 @@ fn lfs_payload_sync_uploads_via_batch() {
     // The sidecar already holds the payload: upload offers it, never fetches.
     let mut ctx = repo_ctx(&root, env);
     let store_root = ctx.store().expect("store").root().to_path_buf();
-    let sidecar =
-        ruk_core::store::lfs::sidecar_path(&store_root, BATCH_HEX).expect("sidecar path");
+    let sidecar = ruk_core::store::lfs::sidecar_path(&store_root, BATCH_HEX).expect("sidecar path");
     std::fs::create_dir_all(sidecar.parent().expect("sidecar dir")).expect("sidecar dirs");
     std::fs::write(&sidecar, BATCH_PAYLOAD).expect("seed payload");
     let (port, server) = lfs_batch_upload_server("upload");
@@ -1809,8 +1813,7 @@ fn lfs_payload_sync_upload_skips_remote_present_objects() {
     let (root, env) = lfs_pointer_repo("lfs-batch-upload-present");
     let mut ctx = repo_ctx(&root, env);
     let store_root = ctx.store().expect("store").root().to_path_buf();
-    let sidecar =
-        ruk_core::store::lfs::sidecar_path(&store_root, BATCH_HEX).expect("sidecar path");
+    let sidecar = ruk_core::store::lfs::sidecar_path(&store_root, BATCH_HEX).expect("sidecar path");
     std::fs::create_dir_all(sidecar.parent().expect("sidecar dir")).expect("sidecar dirs");
     std::fs::write(&sidecar, BATCH_PAYLOAD).expect("seed payload");
     let (port, server) = lfs_batch_upload_server("upload-present");
@@ -1826,10 +1829,7 @@ fn lfs_payload_sync_upload_skips_remote_present_objects() {
     assert!(text.contains("\"uploaded\": []"), "got {text:?}");
     assert!(text.contains("\"missing\": []"), "got {text:?}");
     let (paths, landed) = server.join().expect("server");
-    assert_eq!(
-        paths,
-        vec!["/repo.git/info/lfs/objects/batch".to_owned()]
-    );
+    assert_eq!(paths, vec!["/repo.git/info/lfs/objects/batch".to_owned()]);
     assert!(landed.is_empty());
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -1885,7 +1885,10 @@ fn grep_line_numbers() {
     std::fs::write(root.join("b.txt"), b"alpha four\n").expect("second file");
     let mut ctx = repo_ctx(&root, env);
     let out = run(verbs_grep::grep, &mut ctx, &["-n", "alpha"]).expect("grep -n");
-    assert_eq!(out, b"a.txt:1:alpha one\na.txt:3:alpha three\nb.txt:1:alpha four\n");
+    assert_eq!(
+        out,
+        b"a.txt:1:alpha one\na.txt:3:alpha three\nb.txt:1:alpha four\n"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -1928,8 +1931,12 @@ fn grep_word_prefix_alternatives_both_match() {
     // a shared leftmost alternation would drop "foobar x".
     let (root, env) = seeded_repo("grep-shadow", "a.txt", b"foobar x\nfoo y\nxfoobarbaz\n");
     let mut ctx = repo_ctx(&root, env);
-    let out = run(verbs_grep::grep, &mut ctx, &["-w", "-e", "foo", "-e", "foobar"])
-        .expect("grep -w -e");
+    let out = run(
+        verbs_grep::grep,
+        &mut ctx,
+        &["-w", "-e", "foo", "-e", "foobar"],
+    )
+    .expect("grep -w -e");
     assert_eq!(out, b"foobar x\nfoo y\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
