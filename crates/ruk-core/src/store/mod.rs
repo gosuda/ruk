@@ -1109,13 +1109,25 @@ fn append(
     let active = active_segment(writer, batch, segments_dir, record_len)?;
     probe.pick_ms += pick_start.elapsed_ms();
     let write_start = probe.clock();
-    let appended = active.writer.append(
-        object.kind(),
-        object.encoding(),
-        payload_len,
-        object.payload_crc,
-        object.payload.view(),
-    )?;
+    // Resident payloads skip the streaming path's per-record combine and
+    // scratch bounce: the slice path stages the same bytes with hardware
+    // checksum passes. File-backed payloads keep the streaming path and
+    // its re-verification against the prepared checksum.
+    let appended = match object.payload.memory_bytes() {
+        Some(bytes) => active.writer.append_slice(
+            object.kind(),
+            object.encoding(),
+            bytes,
+            object.payload_crc,
+        )?,
+        None => active.writer.append(
+            object.kind(),
+            object.encoding(),
+            payload_len,
+            object.payload_crc,
+            object.payload.view(),
+        )?,
+    };
     probe.write_ms += write_start.elapsed_ms();
     let book_start = probe.clock();
     let segment = active.id;

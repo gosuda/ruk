@@ -49,6 +49,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 
 use crc32c::{crc32c, crc32c_append, crc32c_combine};
 
+use crate::store::spool::to_u64;
 use crate::store::types::{Encoding, ObjectKind};
 
 /// Bytes in a record header: `len`, `kind`, `flags`, `crc`.
@@ -506,6 +507,99 @@ impl<W: Write + Seek> SegmentWriter<W> {
                 Err(err)
             }
         }
+    }
+
+    /// Appends one record from resident bytes, returning where it landed.
+    ///
+    /// `payload` must be the exact prepared bytes `payload_crc` covers (a
+    /// spool that never spilled to scratch disk): the checksum is still
+    /// verified against the staged bytes, exactly like [`Self::append`],
+    /// but both checksums stream over the resident slice in hardware
+    /// passes instead of combining the prepared checksum in. A combine's
+    /// per-call matrix work costs more than the pass it replaces on small
+    /// records, which is every record this path serves.
+    ///
+    /// # Errors
+    /// `Capacity` (nothing written, writer still usable) when the payload
+    /// exceeds the u32 framing limit or the segment extent plus footer would
+    /// overflow `u64`. `Corrupt` when the bytes do not match `payload_crc`:
+    /// nothing was staged, but the writer is still poisoned, the same as a
+    /// streaming checksum failure. `Io` on flush failure. `Poisoned` when an
+    /// earlier write on this writer failed.
+    pub(crate) fn append_slice(
+        &mut self,
+        kind: ObjectKind,
+        encoding: Encoding,
+        payload: &[u8],
+        payload_crc: u32,
+    ) -> Result<RecordAppended, SegmentError> {
+        self.ensure_open()?;
+        let len = checked_payload_len(to_u64(payload.len()))?;
+        let record_len = HEADER_LEN_U64 + u64::from(len);
+        let new_end = extent_after(self.records_end, record_len)?;
+        // A sealed segment must stay representable: reserve the footer now.
+        extent_after(new_end, FOOTER_LEN_U64)?;
+        let offset = self.records_end;
+        match self.write_slice(kind, encoding, len, payload, payload_crc) {
+            Ok(records_crc) => {
+                self.records_end = new_end;
+                self.records_crc = records_crc;
+                Ok(RecordAppended { offset, record_len })
+            }
+            Err(err) => {
+                self.poisoned = true;
+                self.position = None;
+                Err(err)
+            }
+        }
+    }
+
+    /// Stages one record from resident bytes and returns the new records CRC.
+    ///
+    /// The header checksum streams over the resident payload instead of
+    /// combining the prepared checksum in, and the verification streams
+    /// with it in the same hardware passes; the chain folds the staged
+    /// header and payload in order. Staged bytes, header value and chain
+    /// value are identical to [`Self::write_record`].
+    ///
+    /// Bytes accumulate in `staging` exactly as with the streaming path and
+    /// reach the stream at [`Self::flush_staged`]. A checksum mismatch
+    /// stages nothing. A flush past `STAGING_FLUSH_BYTES` behaves like a
+    /// mid-record flush of a large streaming record.
+    fn write_slice(
+        &mut self,
+        kind: ObjectKind,
+        encoding: Encoding,
+        len: u32,
+        payload: &[u8],
+        payload_crc: u32,
+    ) -> Result<u32, SegmentError> {
+        let prefix = header_prefix(len, kind, encoding);
+        // Both checksums stream over the resident payload: the header
+        // checksum from the prefix, and the verification against the
+        // prepared checksum. No combine: its per-call matrix work costs
+        // more than a hardware pass on records this size.
+        let header_crc = crc32c_append(crc32c(&prefix), payload);
+        let seen_crc = crc32c_append(0, payload);
+        if seen_crc != payload_crc {
+            return Err(corrupt(format!(
+                "prepared payload checksum {payload_crc:#010x} does not match its {len} resident bytes ({seen_crc:#010x})"
+            )));
+        }
+        let mut header = [0_u8; HEADER_LEN];
+        header[..HEADER_PREFIX_LEN].copy_from_slice(&prefix);
+        header[HEADER_PREFIX_LEN..].copy_from_slice(&header_crc.to_le_bytes());
+        self.staging.extend_from_slice(&header);
+        self.staging.extend_from_slice(payload);
+        if self.staging.len() >= STAGING_FLUSH_BYTES {
+            // Same as a mid-record flush in the streaming path: a failure
+            // keeps staging intact and the caller poisons the writer.
+            self.flush_staged()?;
+        }
+        Ok(crc32c_append(
+            crc32c_append(self.records_crc, &header),
+            payload,
+        ))
     }
 
     /// Stages one record at `records_end` and returns the new records CRC.

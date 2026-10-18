@@ -431,6 +431,16 @@ impl Spool {
             file: None,
         }
     }
+
+    /// The resident bytes when this spool never spilled to scratch disk:
+    /// exactly `len` bytes grown in lockstep with the length. `None` for
+    /// file-backed spools, whose bytes need a read cursor.
+    pub(crate) fn memory_bytes(&self) -> Option<&[u8]> {
+        match &self.storage {
+            Storage::Memory(bytes) => Some(bytes),
+            Storage::File { .. } => None,
+        }
+    }
 }
 
 impl fmt::Debug for Spool {
