@@ -658,3 +658,50 @@ fn test_corrupt_row_quarantine() {
         .expect_err("quarantine refuses");
     assert_eq!(store_fact_err.code(), ErrorCode::ECorrupt);
 }
+#[test]
+fn test_headless_abandoned_change_reads_back_while_headless_active_is_corrupt() {
+    // A headless `Abandoned` entry is the legal stored state `abandon` writes
+    // when it drains the last head: it must read back instead of failing.
+    let fixture = TestFixture::new("headless-abandoned", HashKind::Sha1);
+    let records = Records::new(fixture.store());
+    let change_id = ChangeId::generate();
+    let entry = ChangeEntry {
+        state: ChangeState::Abandoned,
+        heads: Vec::new(),
+    };
+    fixture.publish(&[FactMutation {
+        table: FactTable::Changes,
+        key: change_key(&change_id).to_vec(),
+        expected: FactExpectation::Absent,
+        value: Some(encode_change_entry(&entry).expect("encode")),
+    }]);
+    let read = records
+        .get_change(&change_id)
+        .expect("headless abandoned reads back")
+        .expect("change present");
+    assert_eq!(read.state, ChangeState::Abandoned);
+    assert!(read.heads.is_empty());
+
+    // A headless `Active` entry stays corruption: same shape, other state.
+    let bad_fixture = TestFixture::new("headless-active", HashKind::Sha1);
+    let bad_records = Records::new(bad_fixture.store());
+    let bad_id = ChangeId::generate();
+    let bad = ChangeEntry {
+        state: ChangeState::Active,
+        heads: Vec::new(),
+    };
+    bad_fixture.publish(&[FactMutation {
+        table: FactTable::Changes,
+        key: change_key(&bad_id).to_vec(),
+        expected: FactExpectation::Absent,
+        value: Some(encode_change_entry(&bad).expect("encode")),
+    }]);
+    let err = bad_records
+        .get_change(&bad_id)
+        .expect_err("headless active must fail");
+    assert_eq!(err.code, ErrorCode::ECorrupt);
+    let quarantined = bad_records
+        .get_change(&ChangeId::generate())
+        .expect_err("quarantined");
+    assert_eq!(quarantined.code, ErrorCode::ECorrupt);
+}
