@@ -115,7 +115,7 @@ fn run(
 }
 
 #[test]
-fn verb_table_covers_56_names() {
+fn verb_table_covers_advertised_names() {
     assert_eq!(VERBS.len(), 59);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
@@ -1793,6 +1793,19 @@ fn grep_tree_scope_searches_commit() {
     let mut ctx = repo_ctx(&root, env);
     let out = run(verbs_grep::grep, &mut ctx, &["alpha", "HEAD"]).expect("grep HEAD");
     assert_eq!(out, b"HEAD:a.txt:alpha one\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_word_case_and_repeatable_patterns() {
+    let (root, env) = seeded_repo("grep-opts", "a.txt", b"Foo bar\nfood fight\n");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_grep::grep, &mut ctx, &["-w", "Foo"]).expect("grep -w");
+    assert_eq!(out, b"Foo bar\n");
+    let out = run(verbs_grep::grep, &mut ctx, &["-i", "-w", "foo"]).expect("grep -iw");
+    assert_eq!(out, b"Foo bar\n");
+    let out = run(verbs_grep::grep, &mut ctx, &["-e", "bar", "-e", "fight"]).expect("grep -e");
+    assert_eq!(out, b"Foo bar\nfood fight\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 

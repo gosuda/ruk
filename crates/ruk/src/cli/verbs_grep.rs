@@ -29,7 +29,9 @@ use ruk_core::store::ObjectKind;
 use ruk_git::GitError;
 
 use super::state::resolve_rev;
-use super::tree::{flatten_tree, peel_to_tree, read_object_bytes, read_worktree_file, walk_worktree};
+use super::tree::{
+    WorktreeType, flatten_tree, peel_to_tree, read_object_bytes, read_worktree_file, walk_worktree,
+};
 use super::{Ctx, FlagSpec, collect};
 
 /// Searches worktree files, or one named tree, for pattern matches.
@@ -187,7 +189,7 @@ pub(crate) fn grep(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 out.extend_from_slice(lineno.to_string().as_bytes());
                 out.push(b':');
             }
-            out.extend_from_slice(String::from_utf8_lossy(line).as_bytes());
+            out.extend_from_slice(line);
             out.push(b'\n');
         }
     }
@@ -250,6 +252,10 @@ fn last_engine(args: &[String]) -> Engine {
 }
 
 /// Compiled multi-pattern matcher: any pattern matching is a hit.
+///
+/// Word limits (`-w`) are checked per hit against the raw neighbor bytes,
+/// the same rule for both engines, so neither engine depends on regex
+/// look-around support.
 enum Matcher {
     /// Literal byte needles, lowercased up front when ignoring case.
     Fixed {
@@ -257,8 +263,8 @@ enum Matcher {
         ignore_case: bool,
         word: bool,
     },
-    /// Alternation of the patterns, word-wrapped up front when needed.
-    Re(Regex),
+    /// Alternation of the patterns.
+    Re { regex: Regex, word: bool },
 }
 
 /// Compiles the patterns for one engine; regex failures are usage errors.
@@ -285,19 +291,16 @@ fn build_matcher(
         Engine::Regex => {
             let combined = patterns
                 .iter()
-                .map(|pattern| {
-                    if options.word {
-                        format!("(?:^|(?<=[^0-9A-Za-z_]))(?:{pattern})(?:$|(?=[^0-9A-Za-z_]))")
-                    } else {
-                        format!("(?:{pattern})")
-                    }
-                })
+                .map(|pattern| format!("(?:{pattern})"))
                 .collect::<Vec<_>>()
                 .join("|");
             RegexBuilder::new(&combined)
                 .case_insensitive(options.ignore_case)
                 .build()
-                .map(Matcher::Re)
+                .map(|regex| Matcher::Re {
+                    regex,
+                    word: options.word,
+                })
                 .map_err(|err| GitError::Usage {
                     detail: format!("bad pattern: {err}"),
                 })
@@ -366,7 +369,17 @@ fn scan_impl<'bytes>(matcher: &Matcher, bytes: &'bytes [u8], want: CountMatches)
 /// Reports whether one raw line matches any pattern.
 fn line_matches(matcher: &Matcher, line: &[u8]) -> bool {
     match matcher {
-        Matcher::Re(regex) => regex.is_match(line),
+        Matcher::Re { regex, word } => {
+            if !word {
+                return regex.is_match(line);
+            }
+            regex.find_iter(line).any(|hit| {
+                let (start, end) = (hit.start(), hit.end());
+                let left_ok = start == 0 || !is_word_byte(line[start - 1]);
+                let right_ok = end == line.len() || !is_word_byte(line[end]);
+                left_ok && right_ok
+            })
+        }
         Matcher::Fixed {
             needles,
             ignore_case,
@@ -420,11 +433,17 @@ fn load_sources(
     }
 }
 
-/// Reads every worktree file under the context base.
+/// Reads every regular worktree file under the context base.
+///
+/// Symlinks are skipped: following them could read outside the worktree,
+/// and the oracle never reports link bytes as matches.
 fn load_worktree(ctx: &Ctx) -> Result<(Option<String>, Vec<(Vec<u8>, Vec<u8>)>), GitError> {
     ctx.require_worktree()?;
     let mut files = Vec::new();
     for entry in walk_worktree(&ctx.file_base)? {
+        if entry.file_type != WorktreeType::File {
+            continue;
+        }
         let bytes = read_worktree_file(&ctx.file_base, &entry.path)?;
         files.push((entry.path, bytes));
     }

@@ -1,4 +1,4 @@
-//! Verb table: the 58 advertised names and their handlers.
+//! Verb table: the 59 advertised names and their handlers.
 //!
 //! The shape mirrors `git.c:commands[]`: one row per verb with its oracle
 //! anchor, whether it needs a repository, a one-line summary, and the entry
