@@ -100,12 +100,13 @@ use crate::protocol::{
     ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
     EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, MutationOutcome,
     NewArgs, NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
-    RequestDigest, RewriteReply, SquashArgs, TagDeleteArgs, TagDeleteReply, TagSetArgs,
-    TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding, WorkspaceInit,
-    WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsScopeArgs, WsScopeReply, WsTakeArgs,
-    WsTakeReply,
+    RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
+    TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
+    WorkspaceInit, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs, WsScopeArgs,
+    WsScopeReply, WsTakeArgs, WsTakeReply, WriteArgs,
 };
 use crate::records::Records;
+use crate::workcopy::journal_state::{NoJournal, ensure_idle};
 use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::head_key;
 use crate::records::types::{ChangeEntry, ChangeState};
@@ -230,6 +231,9 @@ pub(crate) fn prepare_mutation_with(
         Request::WsScope(m) => ws_scope_parts(ctx, m.request_id, &m.args)?,
         Request::WsTake(m) => ws_take_parts(ctx, m.request_id, &m.args)?,
         Request::WsDrop(m) => ws_drop_parts(ctx, m.request_id, &m.args)?,
+        Request::Snapshot(m) => snapshot_parts(ctx, m.request_id, &m.args)?,
+        Request::Write(m) => write_parts(ctx, m.request_id, &m.args)?,
+        Request::WsRecover(m) => ws_recover_parts(ctx, m.request_id, &m.args)?,
         Request::Describe(m) => describe_parts(ctx, m.request_id, &m.args)?,
         Request::Edit(m) => edit_parts(ctx, m.request_id, &m.args)?,
         Request::Split(_) => {
@@ -1325,6 +1329,103 @@ fn ws_drop_parts(
         dependencies: Vec::new(),
         fence: Some((args.binding.workspace, args.binding.expected)),
     })
+}
+
+/// Validates the binding and journal state shared by the dirty-state methods,
+/// returning the observed workspace. The worktree crawl itself runs outside
+/// preparation (see [`snapshot_parts`]), so this covers only what the store
+/// can answer purely.
+fn gate_dirty_workspace(
+    ctx: &PrepareContext<'_>,
+    method: &str,
+    binding: &WorkspaceBinding,
+) -> Result<ObservedWorkspace, CoreError> {
+    let observed = workspace::observe(ctx.store, binding.workspace)?;
+    observed.fence(ctx.session, binding.expected)?;
+    ensure_idle(&NoJournal, ctx.store, binding.workspace).map(|_| ())?;
+    if observed.row.root.is_empty() {
+        return Err(uncovered(
+            method,
+            "resolving the worktree needs the row root (WorkspaceRow.root), which rows written before the root field do not carry; re-create the workspace through `ws.new`",
+        ));
+    }
+    Ok(observed)
+}
+
+/// Refuses `snapshot` after its pure checks. Capturing the worktree needs a
+/// crawl, blob hashing, and a tree rebuild through `workcopy::snapshot`,
+/// which does file I/O and cannot run inside preparation without holding the
+/// lane. The honest shape is a prepare/job split — prepare stages the fence
+/// plus the expectation, a post-commit job applies the bytes — with no job
+/// producer on this path, so preparation stops at the refusal.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown workspace.
+/// - [`ErrorCode::ELeaseLost`] when another session holds the workspace.
+/// - [`ErrorCode::EStale`] for a moved stamp.
+/// - [`ErrorCode::EWorkspaceApplying`] while a materialization is open.
+/// - [`ErrorCode::EHosted`] naming the missing job split (or the missing row
+///   root on pre-root rows).
+fn snapshot_parts(
+    ctx: &PrepareContext<'_>,
+    _request_id: RequestId,
+    args: &SnapshotArgs,
+) -> Result<Parts, CoreError> {
+    gate_dirty_workspace(ctx, "snapshot", &args.binding)?;
+    Err(uncovered(
+        "snapshot",
+        "capturing the worktree needs a crawl, blob hashing, and a tree rebuild through workcopy::snapshot, which does file I/O and cannot run inside preparation without holding the lane; the prepare/job split (fence plus expectation in prepare, bytes in a post-commit job) has no producer on this path",
+    ))
+}
+
+/// Refuses `write` after its pure checks. Hashing the named paths and
+/// rebuilding the tree through `workcopy::write` is file I/O with the same
+/// lane-holding problem as [`snapshot_parts`]; the prepare/job split has no
+/// producer on this path.
+///
+/// # Errors
+/// Same as [`snapshot_parts`].
+fn write_parts(
+    ctx: &PrepareContext<'_>,
+    _request_id: RequestId,
+    args: &WriteArgs,
+) -> Result<Parts, CoreError> {
+    gate_dirty_workspace(ctx, "write", &args.binding)?;
+    Err(uncovered(
+        "write",
+        "hashing the named paths and rebuilding the tree through workcopy::write does file I/O and cannot run inside preparation without holding the lane; the prepare/job split (fence plus expectation in prepare, bytes in a post-commit job) has no producer on this path",
+    ))
+}
+
+/// Refuses `ws.recover` after its pure checks. Resolving the open journal
+/// through `workcopy_journal::recover` reads and writes the worktree, which
+/// cannot run inside preparation without holding the lane; the prepare/job
+/// split has no producer on this path. Unlike `snapshot` and `write`, an open
+/// journal is the normal case here, so no idle check applies.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown workspace.
+/// - [`ErrorCode::ELeaseLost`] when another session holds the workspace.
+/// - [`ErrorCode::EStale`] for a moved stamp.
+/// - [`ErrorCode::EHosted`] naming the missing job split (or the missing row
+///   root on pre-root rows).
+fn ws_recover_parts(
+    ctx: &PrepareContext<'_>,
+    _request_id: RequestId,
+    args: &WsRecoverArgs,
+) -> Result<Parts, CoreError> {
+    let observed = workspace::observe(ctx.store, args.binding.workspace)?;
+    observed.fence(ctx.session, args.binding.expected)?;
+    if observed.row.root.is_empty() {
+        return Err(uncovered(
+            "ws.recover",
+            "resolving the worktree needs the row root (WorkspaceRow.root), which rows written before the root field do not carry; re-create the workspace through `ws.new`",
+        ));
+    }
+    Err(uncovered(
+        "ws.recover",
+        "resolving the open journal through workcopy_journal::recover reads and writes the worktree and cannot run inside preparation without holding the lane; the prepare/job split (fence plus expectation in prepare, bytes in a post-commit job) has no producer on this path",
+    ))
 }
 
 /// Header carrying the native change ID; rewrites preserve every other header.
@@ -2563,6 +2664,7 @@ mod tests {
     use crate::ids::{CommitKey, HashKind, Oid};
     use crate::index::RepoPath;
     use crate::ops::{NewRequest, prepare_new};
+    use crate::workcopy::journal_state::ws_apply_key;
     use crate::protocol::{
         AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
         BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
@@ -4292,6 +4394,179 @@ mod tests {
         }));
         let err = prepare_mutation(&store, session, again).expect_err("second drop is not found");
         assert_eq!(err.code, ErrorCode::ENotFound);
+    }
+
+    #[test]
+    fn snapshot_names_its_missing_job_split() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let snapshot = |binding| {
+            Request::Snapshot(Box::new(WireMutation {
+                request_id: request_id(),
+                args: SnapshotArgs { binding },
+            }))
+        };
+
+        // An unknown workspace is not found: no machinery invented.
+        let err = prepare_mutation_with(&ctx, snapshot(workspace_binding()))
+            .expect_err("unknown workspace is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let binding = WorkspaceBinding {
+            workspace: id,
+            expected: state.stamp(),
+        };
+        let err = prepare_mutation_with(&ctx, snapshot(binding))
+            .expect_err("snapshot stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("workcopy::snapshot"),
+            "snapshot names its missing producer: {}",
+            err.message
+        );
+
+        // Dirty state needs no context, so the legacy path refuses alike.
+        let err = prepare_mutation(&store, session, snapshot(binding))
+            .expect_err("snapshot stays refused on the legacy path");
+        assert_eq!(err.code, ErrorCode::EHosted);
+
+        // An open journal refuses with its own code before the job split.
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: crate::store::types::FactTable::WsApply,
+                    key: ws_apply_key(id),
+                    expected: FactExpectation::Absent,
+                    value: Some(vec![0x01]),
+                }],
+            )
+            .expect("stage open journal");
+        let err = prepare_mutation_with(&ctx, snapshot(binding))
+            .expect_err("open journal refuses first");
+        assert_eq!(err.code, ErrorCode::EWorkspaceApplying);
+
+        // A pre-root row names the root backfill instead of the job split.
+        let (head, change, _) = seed_commit(&store, None);
+        let bare_id = WorkspaceId::generate();
+        let bare = WorkspaceRow {
+            state: WorkspaceState::Native(NativeWorkspace::new(change, head, Scope::Full)),
+            holder: session,
+            root: ByteString::from(""),
+        };
+        let value = rows::encode("workspace", &bare).expect("encode bare row");
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: crate::store::types::FactTable::Workspaces,
+                    key: rows::workspace_key(bare_id).to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(value),
+                }],
+            )
+            .expect("publish bare row");
+        let err = prepare_mutation_with(
+            &ctx,
+            snapshot(WorkspaceBinding {
+                workspace: bare_id,
+                expected: WorkspaceStamp::INITIAL,
+            }),
+        )
+        .expect_err("pre-root snapshot names the root");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("WorkspaceRow.root"),
+            "pre-root snapshot names the backfill: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn write_names_its_missing_job_split() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let args = WriteArgs {
+            binding: WorkspaceBinding {
+                workspace: id,
+                expected: state.stamp(),
+            },
+            edits: vec![crate::protocol::WriteEdit {
+                path: RepoPath::new("noted.txt").expect("test path"),
+                action: crate::protocol::EditAction::Delete,
+            }],
+        };
+        let request = || {
+            Request::Write(Box::new(WireMutation {
+                request_id: request_id(),
+                args: args.clone(),
+            }))
+        };
+        let err =
+            prepare_mutation_with(&ctx, request()).expect_err("write stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("workcopy::write"),
+            "write names its missing producer: {}",
+            err.message
+        );
+        let err =
+            prepare_mutation(&store, session, request()).expect_err("write stays refused legacy");
+        assert_eq!(err.code, ErrorCode::EHosted);
+    }
+
+    #[test]
+    fn ws_recover_names_its_missing_job_split() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (id, state) = seed_workspace(&store, &ctx, None);
+        let args = WsRecoverArgs {
+            binding: WorkspaceBinding {
+                workspace: id,
+                expected: state.stamp(),
+            },
+            action: crate::protocol::RecoverAction::Resume,
+        };
+        let request = || {
+            Request::WsRecover(Box::new(WireMutation {
+                request_id: request_id(),
+                args: args.clone(),
+            }))
+        };
+        let err =
+            prepare_mutation_with(&ctx, request()).expect_err("ws.recover stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("workcopy_journal::recover"),
+            "ws.recover names its missing producer: {}",
+            err.message
+        );
+
+        // An open journal is the normal case for recovery, so it does not
+        // divert to the idle check; the job split is still the refusal.
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: crate::store::types::FactTable::WsApply,
+                    key: ws_apply_key(id),
+                    expected: FactExpectation::Absent,
+                    value: Some(vec![0x01]),
+                }],
+            )
+            .expect("stage open journal");
+        let err = prepare_mutation(&store, session, request())
+            .expect_err("ws.recover stays refused with an open journal");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(err.message.contains("workcopy_journal::recover"));
     }
 
     #[test]
