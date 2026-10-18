@@ -542,7 +542,10 @@ impl Store {
         if writer.closed.is_none() {
             writer.closed = Some("store closed; reopen the store to publish again".to_owned());
         }
-        if let Some(active) = writer.active.take() {
+        if let Some(mut active) = writer.active.take() {
+            // Normally empty: every publication flushed after its append
+            // loop. Flush anyway so no staged byte is left behind the sync.
+            active.writer.flush_staged()?;
             durability::sync_file(active.writer.get_ref())?;
         }
         Ok(())
@@ -941,6 +944,14 @@ impl Store {
             if profile {
                 append_bytes += segment::record_len_for(object.payload.len()).unwrap_or(0);
             }
+        }
+        // Staged record bytes reach the stream here, in one write per
+        // segment: the `after_append` hook promises the last record byte
+        // (and any seal footer the batch wrote) is on the file, and the
+        // fsync below must cover every staged byte. Seal already flushed
+        // the parked segments; only the active one can hold staging.
+        if let Some(active) = writer.active.as_mut() {
+            active.writer.flush_staged()?;
         }
         let append_ms = append_start.elapsed_ms();
         #[cfg(test)]

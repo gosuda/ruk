@@ -31,8 +31,12 @@
 //! once sealed). Every offset and length is handled with checked `u64`
 //! arithmetic. A record must lie entirely inside `records_end`, never in the
 //! footer and never beyond the committed bytes. Memory is bounded: records
-//! stream through fixed-size chunks and no function allocates in proportion
-//! to a segment or a record.
+//! stream through fixed-size chunks into a bounded staging buffer (at most
+//! `STAGING_FLUSH_BYTES` plus one chunk), so no function allocates in
+//! proportion to a segment or a record. Staged bytes reach the stream at
+//! [`SegmentWriter::flush_staged`], which owners call after the serial
+//! append loop and which [`SegmentWriter::seal`] calls before the footer,
+//! so the on-stream order is exactly the append order.
 //!
 //! # Trust
 //!
@@ -64,6 +68,11 @@ pub(crate) const SEGMENT_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 const HEADER_PREFIX_LEN: usize = 6;
 /// Streaming chunk for appends and verification passes.
 const IO_CHUNK: usize = 64 * 1024;
+/// Staging bound for batched appends: record bytes accumulate in memory
+/// until this many are staged, then flush to the stream in one write.
+/// Collapses one `write()` syscall per record into a few flushes per
+/// publication while bounding memory.
+const STAGING_FLUSH_BYTES: usize = 8 * 1024 * 1024;
 /// Chunk for draining the unread tail of a record in [`RecordPayload::finish`].
 const DRAIN_CHUNK: usize = 16 * 1024;
 // Widening usize -> u64 of small literals; lossless on every supported target.
@@ -265,11 +274,15 @@ pub(crate) struct RecordAppended {
 /// Append-only writer for one segment file.
 ///
 /// It is the single owner of the segment's record extent: `records_end`
-/// advances only after a record's final byte was written, so the extent never
-/// has a hole. After any failure past argument validation the writer is
-/// poisoned: bytes may sit beyond `records_end` and only recovery (truncating
-/// to the committed extent) may reuse the file. No operation syncs; the
-/// owner syncs through [`Self::get_ref`] and then commits the manifest.
+/// advances only after a record's final byte was staged, so the extent never
+/// has a hole. Staged bytes sit in [`Self::staging`] starting at
+/// `flushed_end` and reach the stream at [`Self::flush_staged`]; the
+/// on-stream order is exactly the append order, so offsets, `records_end`
+/// and the checksum chain are identical to unbuffered writes. After any
+/// failure past argument validation the writer is poisoned: bytes may sit
+/// beyond `records_end` and only recovery (truncating to the committed
+/// extent) may reuse the file. No operation syncs; the owner flushes staged
+/// bytes, syncs through [`Self::get_ref`], and then commits the manifest.
 #[derive(Debug)]
 pub(crate) struct SegmentWriter<W> {
     inner: W,
@@ -278,7 +291,7 @@ pub(crate) struct SegmentWriter<W> {
     sealed: bool,
     poisoned: bool,
     /// Known stream position when `Some`: construction leaves the stream at
-    /// `records_end`, and every successful record or seal write advances it
+    /// `records_end`, and every successful flush or seal write advances it
     /// in lockstep, so the next write can skip its positioning seek. `None`
     /// forces a seek. The stream is never exposed mutably (`get_ref` lends
     /// `&W`), so nothing else can move it behind this record.
@@ -286,6 +299,14 @@ pub(crate) struct SegmentWriter<W> {
     /// Bounded append scratch reused across `append` calls. At most
     /// `IO_CHUNK` bytes; empty until the first record, freed on `seal`.
     scratch: Vec<u8>,
+    /// Record bytes staged in memory but not yet written to the stream,
+    /// starting at `flushed_end`. At most `STAGING_FLUSH_BYTES` plus one
+    /// chunk; invisible through `get_ref` until [`Self::flush_staged`].
+    staging: Vec<u8>,
+    /// Stream offset the staged bytes start at: the physical end of the
+    /// file. Lags `records_end` while appends are staged, meets it at
+    /// every flush.
+    flushed_end: u64,
 }
 
 impl<W: Write + Seek> SegmentWriter<W> {
@@ -328,6 +349,9 @@ impl<W: Write + Seek> SegmentWriter<W> {
             // The length probe above leaves the stream exactly here.
             position: Some(records_end),
             scratch: Vec::new(),
+            staging: Vec::new(),
+            // Nothing staged: the physical end is the logical extent.
+            flushed_end: records_end,
         })
     }
 
@@ -374,9 +398,53 @@ impl<W: Write + Seek> SegmentWriter<W> {
             .is_some_and(|end| end <= target)
     }
 
-    /// The underlying stream, for the owner's fsync.
+    /// The underlying stream, for the owner's fsync. Only flushed bytes are
+    /// visible here: the owner calls [`Self::flush_staged`] after the append
+    /// loop, in [`Self::seal`], and before close, so no staged byte is ever
+    /// left behind at a sync.
     pub(crate) fn get_ref(&self) -> &W {
         &self.inner
+    }
+
+    /// Writes every staged byte to the stream in one call, advancing the
+    /// physical end to cover them. Owners call this after the serial append
+    /// loop (before the `after_append` crash hook and any fsync); `seal`
+    /// calls it before the footer. No-op when nothing is staged.
+    ///
+    /// Deliberately usable on a poisoned writer: a flush never changes the
+    /// logical extent, it only moves already-accounted bytes at the
+    /// accounted offset, and recovery truncates anything past the committed
+    /// extent. A failed flush likewise keeps staging intact (`flushed_end`
+    /// still covers it) and poisons; every caller aborts on flush error,
+    /// so no retry can double-write.
+    ///
+    /// # Errors
+    /// `Io` on seek/write failure, which poisons the writer exactly as a
+    /// direct record write failure would.
+    pub(crate) fn flush_staged(&mut self) -> Result<(), SegmentError> {
+        if self.staging.is_empty() {
+            return Ok(());
+        }
+        if self.position != Some(self.flushed_end) {
+            if let Err(err) = self.inner.seek(SeekFrom::Start(self.flushed_end)) {
+                self.poisoned = true;
+                self.position = None;
+                return Err(err.into());
+            }
+            self.position = Some(self.flushed_end);
+        }
+        let bytes = self.staging.len();
+        if let Err(err) = self.inner.write_all(&self.staging) {
+            self.poisoned = true;
+            self.position = None;
+            return Err(err.into());
+        }
+        self.staging.clear();
+        // `bytes` is bounded by `STAGING_FLUSH_BYTES` plus one chunk:
+        // the widening cannot overflow.
+        self.flushed_end += bytes as u64;
+        self.position = Some(self.flushed_end);
+        Ok(())
     }
 
     fn ensure_open(&self) -> Result<(), SegmentError> {
@@ -397,9 +465,9 @@ impl<W: Write + Seek> SegmentWriter<W> {
     ///
     /// `payload_crc` is the CRC32C of exactly those bytes; it is verified
     /// against what was actually streamed. The header CRC is combined from it
-    /// before the payload is written, so a mismatch is detected only after
-    /// the bytes landed: the writer is then poisoned and the record is not
-    /// part of the extent.
+    /// before the payload is staged, so a mismatch is detected only after
+    /// the bytes were staged: the writer is then poisoned and the record is
+    /// not part of the extent.
     ///
     /// # Errors
     /// `Capacity` (nothing written, writer still usable) when the payload
@@ -428,9 +496,8 @@ impl<W: Write + Seek> SegmentWriter<W> {
             Ok(records_crc) => {
                 self.records_end = new_end;
                 self.records_crc = records_crc;
-                // The record's final byte landed here; the next write
-                // starts exactly at the new extent.
-                self.position = Some(new_end);
+                // Staging leaves the stream cursor alone: the next flush
+                // seeks to `flushed_end` unless already there.
                 Ok(RecordAppended { offset, record_len })
             }
             Err(err) => {
@@ -441,7 +508,19 @@ impl<W: Write + Seek> SegmentWriter<W> {
         }
     }
 
-    /// Writes one record at `records_end` and returns the new records CRC.
+    /// Stages one record at `records_end` and returns the new records CRC.
+    ///
+    /// Bytes accumulate in `staging` instead of reaching the stream per
+    /// record; the stream sees them at [`Self::flush_staged`], in exactly
+    /// this order, so offsets, extents and the checksum chain match
+    /// unbuffered writes byte for byte. Staging past
+    /// `STAGING_FLUSH_BYTES` flushes mid-record, so even a huge record
+    /// keeps memory bounded.
+    ///
+    /// A payload that ends early or mismatches `payload_crc` drops this
+    /// record's still-staged bytes (bytes a mid-record flush already wrote
+    /// sit beyond `records_end`, exactly as with unbuffered writes) and the
+    /// caller poisons the writer.
     fn write_record(
         &mut self,
         kind: ObjectKind,
@@ -453,53 +532,60 @@ impl<W: Write + Seek> SegmentWriter<W> {
         let prefix = header_prefix(len, kind, encoding);
         let header_crc = crc32c_combine(crc32c(&prefix), payload_crc, payload_usize(len)?);
         let total = HEADER_LEN_U64 + u64::from(len);
-        // Small records leave in one write; large ones in IO_CHUNK pieces.
+        // Small records stage in one piece; large ones in IO_CHUNK pieces.
         // Reuse one bounded scratch across appends; only growth zeroes.
         let buf_len = usize::try_from(total).map_or(IO_CHUNK, |total| total.min(IO_CHUNK));
-        let Self {
-            inner,
-            scratch,
-            records_end,
-            records_crc,
-            position,
-            ..
-        } = &mut *self;
-        if scratch.len() < buf_len {
-            scratch.resize(buf_len, 0);
+        if self.scratch.len() < buf_len {
+            self.scratch.resize(buf_len, 0);
         }
-        let buf: &mut [u8] = &mut scratch[..buf_len];
-        buf[..HEADER_PREFIX_LEN].copy_from_slice(&prefix);
-        buf[HEADER_PREFIX_LEN..HEADER_LEN].copy_from_slice(&header_crc.to_le_bytes());
-
-        if *position != Some(*records_end) {
-            inner.seek(SeekFrom::Start(*records_end))?;
-            *position = Some(*records_end);
-        }
-        let mut next_crc = *records_crc;
+        let staged_at = self.staging.len();
+        let mut header = [0_u8; HEADER_LEN];
+        header[..HEADER_PREFIX_LEN].copy_from_slice(&prefix);
+        header[HEADER_PREFIX_LEN..].copy_from_slice(&header_crc.to_le_bytes());
+        self.staging.extend_from_slice(&header);
+        // The chain folds exactly the staged bytes — the header, then each
+        // payload chunk in order. Chunking never changes the value, only
+        // where flushes land.
+        let mut next_crc = crc32c_append(self.records_crc, &header);
         let mut seen_crc = 0_u32;
         let mut remaining = payload_usize(len)?;
-        let mut filled = HEADER_LEN;
-        loop {
-            let take = remaining.min(buf.len() - filled);
-            let end = filled + take;
-            payload.read_exact(&mut buf[filled..end]).map_err(|err| {
-                eof_or(err, || {
+        while remaining > 0 {
+            let take = remaining.min(self.scratch.len());
+            // Read into scratch first; the borrow ends before staging or
+            // a flush touches `self`, so a short source can roll the
+            // record's staged bytes back before returning.
+            let read_err = {
+                let buf = &mut self.scratch[..take];
+                payload.read_exact(buf).err()
+            };
+            if let Some(err) = read_err {
+                self.staging.truncate(staged_at.min(self.staging.len()));
+                return Err(eof_or(err, || {
                     invalid(
                         "record payload",
                         format!("source ended before the declared {len} bytes"),
                     )
-                })
-            })?;
-            seen_crc = crc32c_append(seen_crc, &buf[filled..end]);
-            next_crc = crc32c_append(next_crc, &buf[..end]);
-            inner.write_all(&buf[..end])?;
-            remaining -= take;
-            filled = 0;
-            if remaining == 0 {
-                break;
+                }));
             }
+            {
+                let buf = &self.scratch[..take];
+                seen_crc = crc32c_append(seen_crc, buf);
+                next_crc = crc32c_append(next_crc, buf);
+                self.staging.extend_from_slice(buf);
+            }
+            if self.staging.len() >= STAGING_FLUSH_BYTES {
+                // A failed flush keeps staging intact (`flushed_end` still
+                // covers it) and poisons; the caller never appends again.
+                self.flush_staged()?;
+            }
+            remaining -= take;
         }
         if seen_crc != payload_crc {
+            // Drop this record's still-staged bytes. A mid-record flush may
+            // have shrunk staging below `staged_at`; then this is a no-op
+            // and the accounting (staging starts at `flushed_end`) stays
+            // exact either way.
+            self.staging.truncate(staged_at.min(self.staging.len()));
             return Err(corrupt(format!(
                 "prepared payload checksum {payload_crc:#010x} does not match its {len} streamed bytes ({seen_crc:#010x})"
             )));
@@ -516,6 +602,8 @@ impl<W: Write + Seek> SegmentWriter<W> {
     pub(crate) fn seal(&mut self) -> Result<u64, SegmentError> {
         self.ensure_open()?;
         let committed_end = extent_after(self.records_end, FOOTER_LEN_U64)?;
+        // The footer must land after every record byte on the stream.
+        self.flush_staged()?;
         let footer = SealFooter {
             records_extent: self.records_end,
             records_crc: self.records_crc,

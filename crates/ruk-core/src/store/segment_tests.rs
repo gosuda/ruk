@@ -276,6 +276,31 @@ impl Seek for FailAfter {
     }
 }
 
+/// Counts `write` calls, so tests can pin that staged appends batch into
+/// one flush instead of one syscall per record.
+#[derive(Debug, Default)]
+struct CountWrites {
+    inner: Cursor<Vec<u8>>,
+    writes: usize,
+}
+
+impl Write for CountWrites {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for CountWrites {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
 /// Serves filler bytes, then fails with a non-EOF I/O error.
 #[derive(Debug)]
 struct BrokenReader {
@@ -372,6 +397,7 @@ fn writer_emits_the_golden_segment_bytes() {
         appended.iter().map(|a| a.record_len).collect::<Vec<_>>(),
         FIXTURE_RECORD_LENS
     );
+    writer.flush_staged().expect("staged bytes reach the stream");
     assert_eq!(written(&writer), &fixture_records());
     assert_eq!(writer.records_end(), FIXTURE_RECORDS_END);
     assert_eq!(writer.records_crc(), FIXTURE_REGION_CRC);
@@ -463,6 +489,7 @@ fn record_offsets_are_dense_across_chunk_boundaries() {
         .iter()
         .flat_map(|(kind, flags, payload)| frame(*kind, *flags, payload))
         .collect();
+    writer.flush_staged().expect("staged bytes reach the stream");
     assert_eq!(written(&writer), &expected);
 
     let mut next = 0_u64;
@@ -498,6 +525,7 @@ fn resumed_writer_continues_the_records_checksum_chain() {
     let all = fixture();
     let mut first = open_cursor();
     append_all(&mut first, &all[..2]);
+    first.flush_staged().expect("staged bytes reach the stream");
     let (end, crc, bytes) = (
         first.records_end(),
         first.records_crc(),
@@ -507,6 +535,7 @@ fn resumed_writer_continues_the_records_checksum_chain() {
 
     let mut second = SegmentWriter::resumed(Cursor::new(bytes), end, crc).expect("resume");
     append_all(&mut second, &all[2..]);
+    second.flush_staged().expect("staged bytes reach the stream");
     assert_eq!(written(&second), &fixture_records());
     assert_eq!(second.records_crc(), FIXTURE_REGION_CRC);
     assert_eq!(second.seal().expect("seal"), FIXTURE_SEALED_END);
@@ -732,28 +761,60 @@ fn payload_source_io_failure_and_sink_failure_poison() {
         Err(SegmentError::Poisoned)
     ));
 
+    // Small records stage in memory without touching the sink: the append
+    // succeeds and the full disk surfaces at the flush, which poisons the
+    // writer just as a direct write failure would.
     let sink = FailAfter {
         inner: Cursor::new(Vec::new()),
         budget: 3,
     };
     let mut writer = SegmentWriter::fresh(sink).expect("fresh");
-    let result = writer.append(
-        ObjectKind::Blob,
-        Encoding::Raw,
-        9,
-        crc_ref(b"123456789"),
-        &b"123456789"[..],
-    );
-    match result {
+    let placed = writer
+        .append(
+            ObjectKind::Blob,
+            Encoding::Raw,
+            9,
+            crc_ref(b"123456789"),
+            &b"123456789"[..],
+        )
+        .expect("a small record stages without touching the sink");
+    assert_eq!(placed.record_len, 19);
+    match writer.flush_staged() {
         Err(SegmentError::Io(err)) => assert_eq!(err.kind(), io::ErrorKind::StorageFull),
         other => panic!("expected Io, got {other:?}"),
     }
-    assert_eq!(writer.records_end(), 0, "a partial record never counts");
-    assert_eq!(writer.committed_end(), 0);
     assert!(matches!(
         writer.append(ObjectKind::Blob, Encoding::Raw, 0, 0, io::empty()),
         Err(SegmentError::Poisoned)
     ));
+    assert!(matches!(writer.seal(), Err(SegmentError::Poisoned)));
+}
+
+#[test]
+fn staged_appends_batch_into_one_write_per_flush() {
+    let mut writer =
+        SegmentWriter::fresh(CountWrites::default()).expect("fresh");
+    let records = fixture();
+    let appended = append_all(&mut writer, &records);
+    assert_eq!(
+        writer.get_ref().writes,
+        0,
+        "appends stage in memory without touching the stream"
+    );
+    writer.flush_staged().expect("flush");
+    assert_eq!(
+        writer.get_ref().writes,
+        1,
+        "one flush writes the whole staging in one call"
+    );
+    assert_eq!(
+        writer.get_ref().inner.get_ref(),
+        &fixture_records(),
+        "batched bytes match the unbuffered framing"
+    );
+    writer.flush_staged().expect("empty flush is a no-op");
+    assert_eq!(writer.get_ref().writes, 1);
+    assert_eq!(appended.len(), records.len());
 }
 
 #[test]
@@ -788,6 +849,7 @@ fn source_longer_than_declared_is_not_over_read() {
         )
         .expect("append");
     assert_eq!(source.position(), 10);
+    writer.flush_staged().expect("staged bytes reach the stream");
     assert_eq!(written(&writer), &frame(1, 0, &[9; 10]));
 }
 
