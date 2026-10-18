@@ -135,6 +135,42 @@ pub(crate) fn reserve_prepublication(
     platform::reserve(file, offset, len)
 }
 
+/// A platform reservation held by the store's capacity ledger.
+///
+/// This is a receipt holder, never a guard: dropping it releases nothing.
+/// The charge it records lives in the ledger's durable pending-reservation
+/// row and is released only through durable truncation, deletion, or
+/// compaction. A dropped guard would silently free a charge the ledger
+/// still counts as held, so no `Drop` impl exists on purpose.
+///
+/// The receipt already contains the post-operation re-query of the
+/// still-open handle (`stat_receipt`/`FileStandardInfo` run after the
+/// reservation call inside [`reserve_prepublication`]), so the ledger can
+/// copy the observed fields straight into the pending record without a
+/// second query that could observe a different state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PhysicalReservation {
+    receipt: AllocationReceipt,
+}
+
+impl PhysicalReservation {
+    /// Reserve `[offset, offset + len)` on the already-open segment file.
+    /// See [`reserve_prepublication`] for the platform contract.
+    pub(crate) fn reserve(
+        file: &File,
+        offset: u64,
+        len: u64,
+    ) -> Result<Self, AllocationError> {
+        reserve_prepublication(file, offset, len).map(|receipt| Self { receipt })
+    }
+
+    /// The post-operation observation of the still-open handle.
+    #[must_use]
+    pub(crate) fn receipt(&self) -> AllocationReceipt {
+        self.receipt
+    }
+}
+
 /// Advisory volume sample for admission diagnostics. See [`VolumeFloor`].
 pub(crate) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
     platform::volume_free_floor(path)
