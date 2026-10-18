@@ -38,7 +38,10 @@
 //! evades a cached open. Segment-file damage is still caught on every open
 //! by the manifest pass, every served read still verifies the chain it
 //! touches, and any generation the cache has not covered is fully
-//! verified.
+//! verified. Setting `RUK_VERIFY=full` in the environment forces the full
+//! object pass on every open, bypassing the cache: the escape hatch for
+//! the paranoid and for crash tests that surgically damage committed
+//! state after it was verified.
 //!
 //! Any missing or damaged committed byte found by the passes that run is
 //! [`StoreError::Corrupt`]; the store does not open. Unknown files in the
@@ -71,6 +74,11 @@ const VERIFY_PAGE: usize = 256;
 const VERIFY_THREADS: usize = 8;
 /// Buffer in front of segment reads.
 const READ_BUFFER: usize = 64 * 1024;
+/// Environment variable forcing the full object identity pass on every
+/// open, bypassing the verified-generation cache.
+const VERIFY_ENV: &str = "RUK_VERIFY";
+/// [`VERIFY_ENV`] value selecting the full pass.
+const VERIFY_FULL: &str = "full";
 
 /// A read-side view of one store's committed state.
 #[derive(Clone, Copy)]
@@ -235,6 +243,12 @@ impl Committed<'_> {
     }
 }
 
+/// Whether the environment demands the full object identity pass on this
+/// open regardless of the verification cache.
+fn full_verify_forced() -> bool {
+    std::env::var(VERIFY_ENV).is_ok_and(|value| value == VERIFY_FULL)
+}
+
 fn missing_is_corrupt(err: io::Error, id: u64) -> StoreError {
     if err.kind() == io::ErrorKind::NotFound {
         return corrupt(format!("committed segment {id} is missing"));
@@ -274,7 +288,7 @@ pub(super) fn run(committed: &Committed<'_>) -> Result<Recovered, StoreError> {
         }
     }
     let generation = committed.meta.generation()?;
-    if committed.meta.verified_generation()? != Some(generation) {
+    if full_verify_forced() || committed.meta.verified_generation()? != Some(generation) {
         verify_objects(committed, generation)?;
         committed.meta.set_verified_generation(generation)?;
     }
