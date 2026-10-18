@@ -131,8 +131,9 @@ pub fn encode_change_entry(entry: &ChangeEntry) -> Result<Vec<u8>, CoreError> {
 /// Decodes and semantically validates a [`ChangeEntry`] from `FactTable::Changes`.
 ///
 /// # Errors
-/// [`ErrorCode::ECorrupt`] if bytes are malformed, heads list is empty,
-/// contains duplicates, or contains heads incompatible with the store's hash kind.
+/// [`ErrorCode::ECorrupt`] if bytes are malformed, an `Active` entry has an
+/// empty heads list, heads contain duplicates, or heads are incompatible with
+/// the store's hash kind. A headless `Abandoned` entry is valid, not corrupt.
 /// Latches quarantine on the store.
 pub fn decode_change_entry(
     store: &Store,

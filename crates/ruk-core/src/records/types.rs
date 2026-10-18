@@ -115,11 +115,16 @@ impl ChangeEntry {
 
     /// Validates internal semantic invariants against the repository hash kind.
     ///
+    /// A headless entry is valid only when abandoned: `abandon` drains the
+    /// last head and flips the state, so stored `Abandoned` rows legitimately
+    /// carry no heads. A headless `Active` entry is corruption.
+    ///
     /// # Errors
-    /// [`CoreModelError::Invalid`] if `heads` is empty or has duplicates.
+    /// [`CoreModelError::Invalid`] if an `Active` entry has no `heads`, or if
+    /// `heads` has duplicates.
     /// [`CoreModelError::ObjectFormat`] if any head has an invalid width.
     pub fn validate(&self, kind: HashKind) -> Result<(), CoreModelError> {
-        if self.heads.is_empty() {
+        if self.heads.is_empty() && self.state != ChangeState::Abandoned {
             return Err(CoreModelError::Invalid {
                 what: "change entry",
                 detail: "change entry must have at least one head".to_owned(),
