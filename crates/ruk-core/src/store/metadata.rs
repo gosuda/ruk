@@ -210,9 +210,22 @@ impl Metadata {
     /// [`StoreError::Version`] for an unknown table or a file format
     /// that needs an offline upgrade.
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
+        let profiling = super::profile_enabled();
+        let mut clock = super::ProfileClock::now(profiling);
         let db = builder().open(path).map_err(database_error)?;
+        let redb_ms = clock.elapsed_ms();
+        clock = super::ProfileClock::now(profiling);
         ensure_census(&db)?;
+        let ensure_ms = clock.elapsed_ms();
+        clock = super::ProfileClock::now(profiling);
         verify_census(&db)?;
+        let census_ms = clock.elapsed_ms();
+        if profiling {
+            eprintln!(
+                "[ruk-profile] meta redb={:.2}ms ensure={:.2}ms census={:.2}ms",
+                redb_ms, ensure_ms, census_ms,
+            );
+        }
         Ok(Self { db })
     }
 
@@ -793,6 +806,21 @@ fn apply_fact(txn: &WriteTransaction, fact: &FactMutation) -> Result<(), StoreEr
 /// transaction's `open_table` creates the table only when absent;
 /// existing tables and rows are untouched.
 fn ensure_census(db: &Database) -> Result<(), StoreError> {
+    // Fast path: the revision table exists on every store written since its
+    // introduction, so probe with a read transaction and only take the
+    // exclusive write transaction (and its commit) when the table is
+    // actually absent. Creating-if-absent stays idempotent under racing
+    // openers: the writer lock serializes them and the second create is a
+    // no-op.
+    let present = {
+        let txn = db.begin_read().map_err(txn_error)?;
+        txn.list_tables()
+            .map_err(storage)?
+            .any(|handle| handle.name() == FactTable::LfsObjects.table_name())
+    };
+    if present {
+        return Ok(());
+    }
     let mut txn = db.begin_write().map_err(txn_error)?;
     txn.open_table(fact_definition(FactTable::LfsObjects))
         .map_err(table_error)?;

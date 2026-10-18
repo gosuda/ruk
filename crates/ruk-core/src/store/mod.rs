@@ -333,14 +333,25 @@ impl Store {
     /// [`StoreError::Corrupt`] for committed damage; I/O and database
     /// failures propagate, including a `root` that cannot be made absolute.
     pub fn open(root: &Path, budget: Arc<PreparationBudget>) -> Result<Self, StoreError> {
+        let profiling = profile_enabled();
+        let total = ProfileClock::now(profiling);
+        let mut clock = ProfileClock::now(profiling);
         let root = std::path::absolute(root)?;
         let root = root.as_path();
         let (format, format_file) = read_format(root)?;
+        let format_ms = clock.elapsed_ms();
+        clock = ProfileClock::now(profiling);
         let meta = Metadata::open(&root.join(META_FILE))?;
+        let meta_ms = clock.elapsed_ms();
+        clock = ProfileClock::now(profiling);
         durability::sync_file(&format_file)?;
         sync_entries(root)?;
         drop(format_file);
+        let sync_ms = clock.elapsed_ms();
+        clock = ProfileClock::now(profiling);
         budget.register_scratch(root)?;
+        let scratch_ms = clock.elapsed_ms();
+        clock = ProfileClock::now(profiling);
         let generation = meta.generation()?;
         let guards = Arc::new(GenerationRegistry::new(generation));
         let segment_fds = SegmentFileCache::default();
@@ -352,6 +363,8 @@ impl Store {
             guards: &guards,
             files: &segment_fds,
         };
+        let setup_ms = clock.elapsed_ms();
+        clock = ProfileClock::now(profiling);
         let recovered = match recovery::run(&committed) {
             Ok(recovered) => recovered,
             Err(err) => {
@@ -367,8 +380,24 @@ impl Store {
         // The recovery pass above warmed `segment_fds` (one open per sealed
         // segment); the assembled store keeps warming it instead of
         // reopening those segments on first serve.
+        let recovery_ms = clock.elapsed_ms();
+        clock = ProfileClock::now(profiling);
         let mut store = Self::assemble(root, format, meta, budget, guards, recovered);
         store.segment_fds = segment_fds;
+        let assemble_ms = clock.elapsed_ms();
+        if profiling {
+            eprintln!(
+                "[ruk-profile] open total={:.2}ms format={:.2}ms meta={:.2}ms sync={:.2}ms scratch={:.2}ms setup={:.2}ms recovery={:.2}ms assemble={:.2}ms",
+                total.elapsed_ms(),
+                format_ms,
+                meta_ms,
+                sync_ms,
+                scratch_ms,
+                setup_ms,
+                recovery_ms,
+                assemble_ms,
+            );
+        }
         Ok(store)
     }
 
