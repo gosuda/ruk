@@ -645,25 +645,6 @@ impl<T> Merge<Option<T>> {
         Self::resolved(Some(value))
     }
 
-    /// Create a `Merge` from a `removes` and `adds`, padding with `None` to
-    /// make sure that there is exactly one more `adds` than `removes`.
-    pub fn from_legacy_form(
-        removes: impl IntoIterator<Item = T>,
-        adds: impl IntoIterator<Item = T>,
-    ) -> Self {
-        let mut removes = removes.into_iter().fuse();
-        let mut adds = adds.into_iter().fuse();
-        let mut values = smallvec_inline![adds.next()];
-        loop {
-            let (remove, add) = (removes.next(), adds.next());
-            if remove.is_none() && add.is_none() {
-                break;
-            }
-            values.extend([remove, add]);
-        }
-        Self { values }
-    }
-
     /// Whether this represents a resolved value of `None`.
     pub fn is_absent(&self) -> bool {
         matches!(self.as_resolved(), Some(None))
@@ -689,21 +670,6 @@ impl<T> Merge<Option<T>> {
         self.adds().flatten()
     }
 
-    /// Creates lists of `removes` and `adds` from a `Merge` by dropping
-    /// `None` values. Note that the conversion is lossy: the order of `None`
-    /// values is not preserved when converting back to a `Merge`.
-    pub fn into_legacy_form(self) -> (Vec<T>, Vec<T>) {
-        // Allocate the maximum size assuming there would be few `None`s.
-        let mut removes = Vec::with_capacity(self.values.len() / 2);
-        let mut adds = Vec::with_capacity(self.values.len() / 2 + 1);
-        let mut values = self.values.into_iter();
-        adds.extend(values.next().expect("merge has a zeroth add"));
-        while let Some(remove) = values.next() {
-            removes.extend(remove);
-            adds.extend(values.next().expect("merge has paired add"));
-        }
-        (removes, adds)
-    }
 }
 
 impl<T: Clone> Merge<Option<&T>> {

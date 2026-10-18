@@ -191,47 +191,6 @@ fn run_trivial_merge_table(same_change: SameChange) {
 }
 
 #[test]
-fn test_legacy_form_conversion() {
-    fn test_equivalent<T>(legacy_form: (Vec<T>, Vec<T>), merge: Merge<Option<T>>)
-    where
-        T: Clone + PartialEq + std::fmt::Debug,
-    {
-        assert_eq!(merge.clone().into_legacy_form(), legacy_form);
-        assert_eq!(Merge::from_legacy_form(legacy_form.0, legacy_form.1), merge);
-    }
-    // Non-conflict
-    test_equivalent(
-        (vec![], vec![0]),
-        Merge::from_removes_adds(vec![], vec![Some(0)]),
-    );
-    // Regular 3-way conflict
-    test_equivalent(
-        (vec![0], vec![1, 2]),
-        Merge::from_removes_adds(vec![Some(0)], vec![Some(1), Some(2)]),
-    );
-    // Modify/delete conflict
-    test_equivalent(
-        (vec![0], vec![1]),
-        Merge::from_removes_adds(vec![Some(0)], vec![Some(1), None]),
-    );
-    // Add/add conflict
-    test_equivalent(
-        (vec![], vec![0, 1]),
-        Merge::from_removes_adds(vec![None], vec![Some(0), Some(1)]),
-    );
-    // 5-way conflict
-    test_equivalent(
-        (vec![0, 1], vec![2, 3, 4]),
-        Merge::from_removes_adds(vec![Some(0), Some(1)], vec![Some(2), Some(3), Some(4)]),
-    );
-    // 5-way delete/delete conflict
-    test_equivalent(
-        (vec![0, 1], vec![]),
-        Merge::from_removes_adds(vec![Some(0), Some(1)], vec![None, None, None]),
-    );
-}
-
-#[test]
 fn test_as_resolved() {
     assert_eq!(
         Merge::from_removes_adds(vec![], vec![0]).as_resolved(),
