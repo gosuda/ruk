@@ -49,17 +49,18 @@
 //! orphan a created segment file and the append owner skips its name
 //! instead.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::durability;
 use super::guards::{CapturedLink, GenerationRegistry, ObjectSnapshot};
 use super::metadata::Metadata;
 use super::prepare;
-use super::segment::{self, RecordPayload};
+use super::segment::{self, PreadReader, RecordPayload};
 use super::spool::{PreparationBudget, Spool};
 use super::types::{ObjectLocation, ReadObject, SegmentManifest};
 use super::{SEGMENTS_DIR, StoreError};
@@ -84,6 +85,58 @@ const VERIFY_ENV: &str = "RUK_VERIFY";
 /// [`VERIFY_ENV`] value selecting the full pass.
 const VERIFY_FULL: &str = "full";
 
+/// Read-only descriptors for committed segments, opened once per segment id.
+///
+/// `Store::read` used to `File::open` the same segment once per object;
+/// this keeps one canonical read-only `File` per segment and hands out
+/// clones of its `Arc` instead. Callers must read through [`PreadReader`]
+/// (positional reads), never by seeking the shared `File`: its cursor is
+/// process-wide and concurrent readers would move it under each other.
+///
+/// Retirement safety: segment ids are allocated monotonically and never
+/// reused, so a cached descriptor can never alias a newer segment; fresh
+/// reads reject retired manifests before touching payload I/O, so a cached
+/// descriptor for a retired segment is unreachable (a pre-retirement
+/// snapshot keeps its own pin through the generation registry, and its
+/// `Arc` keeps reading even after eviction). Compaction still evicts on
+/// unlink so a cached handle never pins a retired file on platforms where
+/// open files cannot be unlinked.
+#[derive(Debug, Default)]
+pub(super) struct SegmentFileCache {
+    files: Mutex<HashMap<u64, Arc<File>>>,
+}
+
+impl SegmentFileCache {
+    /// The canonical read-only handle for `id`, opening `path` once. A
+    /// missing file is missing committed bytes, hence corruption.
+    pub(super) fn get_or_open(&self, id: u64, path: &Path) -> Result<Arc<File>, StoreError> {
+        let mut files = match self.files.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // A poisoned cache must not refuse reads: serve this one
+                // uncached. Correctness never depends on the cache.
+                return File::open(path)
+                    .map(Arc::new)
+                    .map_err(|err| missing_is_corrupt(err, id));
+            }
+        };
+        if let Some(cached) = files.get(&id) {
+            return Ok(Arc::clone(cached));
+        }
+        let file = Arc::new(File::open(path).map_err(|err| missing_is_corrupt(err, id))?);
+        files.insert(id, Arc::clone(&file));
+        Ok(file)
+    }
+
+    /// Forgets the cached handle for `id`, if any. Compaction calls this
+    /// before unlinking a retired segment file.
+    pub(super) fn evict(&self, id: u64) {
+        if let Ok(mut files) = self.files.lock() {
+            files.remove(&id);
+        }
+    }
+}
+
 /// A read-side view of one store's committed state.
 #[derive(Clone, Copy)]
 pub(super) struct Committed<'a> {
@@ -92,6 +145,7 @@ pub(super) struct Committed<'a> {
     pub(super) meta: &'a Metadata,
     pub(super) budget: &'a Arc<PreparationBudget>,
     pub(super) guards: &'a Arc<GenerationRegistry>,
+    pub(super) files: &'a SegmentFileCache,
 }
 
 /// The open (unsealed) segment recovery verified, ready to resume appends.
@@ -122,10 +176,11 @@ impl Committed<'_> {
             .join(segment::segment_file_name(id))
     }
 
-    /// Opens a committed segment file read-only. A missing file is missing
-    /// committed bytes, hence corruption.
-    fn open_committed(&self, id: u64) -> Result<File, StoreError> {
-        File::open(self.segment_path(id)).map_err(|err| missing_is_corrupt(err, id))
+    /// The cached read-only handle for a committed segment. A missing file
+    /// is missing committed bytes, hence corruption. Callers read through
+    /// [`PreadReader`]: the shared cursor is never moved.
+    pub(super) fn open_committed(&self, id: u64) -> Result<Arc<File>, StoreError> {
+        self.files.get_or_open(id, &self.segment_path(id))
     }
 
     pub(super) fn check_width(&self, oid: Oid) -> Result<(), StoreError> {
@@ -198,7 +253,7 @@ impl Committed<'_> {
             })?;
         let file = self.open_committed(location.segment)?;
         let mut payload = RecordPayload::open(
-            BufReader::with_capacity(READ_BUFFER, file),
+            BufReader::with_capacity(READ_BUFFER, PreadReader::new(&file)),
             location.offset,
             manifest.records_end,
         )?;
@@ -310,21 +365,32 @@ fn verify_segment(
     manifest: &SegmentManifest,
 ) -> Result<segment::VerifiedSegment, StoreError> {
     let path = committed.segment_path(manifest.id);
-    let mut file = if manifest.sealed {
-        committed.open_committed(manifest.id)?
-    } else {
-        durability::open_existing(&path).map_err(|err| match err {
-            StoreError::Io(io_err) => missing_is_corrupt(io_err, manifest.id),
-            other => other,
-        })?
-    };
+    if manifest.sealed {
+        // Sealed segments never change, so the cached read-only handle is
+        // exact; positional reads keep the shared cursor untouched.
+        let cached = committed.open_committed(manifest.id)?;
+        let mut src = PreadReader::new(&cached);
+        return segment::validate_segment_file(
+            &mut src,
+            manifest.committed_end,
+            manifest.records_end,
+            manifest.sealed,
+        )
+        .map_err(StoreError::from);
+    }
+    // The open segment needs a read-write handle for tail truncation; it
+    // must never come from the read-only cache.
+    let mut file = durability::open_existing(&path).map_err(|err| match err {
+        StoreError::Io(io_err) => missing_is_corrupt(io_err, manifest.id),
+        other => other,
+    })?;
     let verified = segment::validate_segment_file(
         &mut file,
         manifest.committed_end,
         manifest.records_end,
         manifest.sealed,
     )?;
-    if !manifest.sealed && verified.file_len > manifest.committed_end {
+    if verified.file_len > manifest.committed_end {
         file.set_len(manifest.committed_end)?;
         durability::sync_file(&file)?;
         #[cfg(test)]
