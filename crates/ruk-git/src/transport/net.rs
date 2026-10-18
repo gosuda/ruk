@@ -209,18 +209,13 @@ fn remote_command(service: Service, path: &str) -> String {
 /// How to spawn the SSH connection: a program plus argv, or a shell line
 /// when `GIT_SSH_COMMAND` overrides the program (`git/connect.c`).
 fn ssh_invocation(
-    host: &str,
+    login: &str,
     port: Option<u16>,
-    user: Option<&str>,
     service: Service,
     path: &str,
     ssh_program: &str,
     ssh_command: Option<&str>,
 ) -> SshInvocation {
-    let login = match user {
-        Some(name) => format!("{name}@{host}"),
-        None => host.to_owned(),
-    };
     let remote = remote_command(service, path);
     match ssh_command {
         Some(command) if !command.is_empty() => {
@@ -240,7 +235,7 @@ fn ssh_invocation(
                 argv.push("-p".to_owned());
                 argv.push(port.to_string());
             }
-            argv.push(login);
+            argv.push(login.to_owned());
             argv.push(remote);
             SshInvocation::Exec(argv)
         }
@@ -306,11 +301,35 @@ pub fn ssh_connect(
     ssh_connect_with(host, port, user, service, path, &ssh_program, ssh_command.as_deref())
 }
 
+/// Builds the `user@host` login, refusing leading dashes: a `-evil` host
+/// would otherwise parse as an ssh flag in the spawned argv
+/// (`git/connect.c` blocks the same "strange hostname").
+///
+/// # Errors
+/// [`GitError::Invalid`] for an empty or dash-led host or user.
+fn ssh_login(host: &str, user: Option<&str>) -> Result<String, GitError> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(GitError::Invalid {
+            detail: format!("strange hostname {host:?} blocked"),
+        });
+    }
+    if user.is_some_and(|name| name.is_empty() || name.starts_with('-')) {
+        return Err(GitError::Invalid {
+            detail: "strange ssh user blocked".to_owned(),
+        });
+    }
+    Ok(match user {
+        Some(name) => format!("{name}@{host}"),
+        None => host.to_owned(),
+    })
+}
+
 /// Opens an SSH stream with an explicit program and override: the testable
 /// half of [`ssh_connect`], which only resolves the environment.
 ///
 /// # Errors
-/// [`GitError::Io`] when the command cannot spawn.
+/// [`GitError::Invalid`] for a dash-led host or user, [`GitError::Io`]
+/// when the command cannot spawn.
 pub fn ssh_connect_with(
     host: &str,
     port: Option<u16>,
@@ -320,9 +339,9 @@ pub fn ssh_connect_with(
     ssh_program: &str,
     ssh_command: Option<&str>,
 ) -> Result<SshStream, GitError> {
-    let what = format!("ssh to {host}");
-    let mut command = match ssh_invocation(host, port, user, service, path, ssh_program, ssh_command)
-    {
+    let login = ssh_login(host, user)?;
+    let what = format!("ssh to {login}");
+    let mut command = match ssh_invocation(&login, port, service, path, ssh_program, ssh_command) {
         SshInvocation::Exec(argv) => {
             let mut command = Command::new(&argv[0]);
             command.args(&argv[1..]);
@@ -354,18 +373,23 @@ pub fn ssh_connect_with(
     })
 }
 
-/// Builds the raw git-daemon request: `git-upload-pack <path> NUL
-/// host=<host> NUL version=2 NUL` (`git/connect.c`, `git_connect_git`).
+/// Builds the git-daemon request as one pkt-line: 4-hex length prefix
+/// around `git-upload-pack <path> NUL host=<host> NUL version=2 NUL`.
+/// The daemon reads it with `packet_read_line`, so raw bytes would die on
+/// the `git-` "length" (`git/connect.c`, `git_connect_git` via
+/// `packet_write`).
 fn git_request(service: Service, host: &str, port: Option<u16>, path: &str) -> Vec<u8> {
-    let mut out = format!("{} {path}", service.name()).into_bytes();
-    out.push(0);
+    let mut body = format!("{} {path}", service.name()).into_bytes();
+    body.push(0);
     match port {
-        Some(port) => out.extend_from_slice(format!("host={host}:{port}").as_bytes()),
-        None => out.extend_from_slice(format!("host={host}").as_bytes()),
+        Some(port) => body.extend_from_slice(format!("host={host}:{port}").as_bytes()),
+        None => body.extend_from_slice(format!("host={host}").as_bytes()),
     }
-    out.push(0);
-    out.extend_from_slice(b"version=2");
-    out.push(0);
+    body.push(0);
+    body.extend_from_slice(b"version=2");
+    body.push(0);
+    let mut out = format!("{:04x}", body.len() + 4).into_bytes();
+    out.extend_from_slice(&body);
     out
 }
 
@@ -626,9 +650,8 @@ mod tests {
     fn ssh_invocation_honors_env_overrides() {
         assert_eq!(
             ssh_invocation(
-                "host.x",
+                "git@host.x",
                 Some(2222),
-                Some("git"),
                 Service::UploadPack,
                 "/srv/a.git",
                 "ssh",
@@ -646,7 +669,6 @@ mod tests {
             ssh_invocation(
                 "host.x",
                 None,
-                None,
                 Service::ReceivePack,
                 "a.git",
                 "ssh",
@@ -659,13 +681,32 @@ mod tests {
     }
 
     #[test]
+    fn ssh_login_blocks_dash_led_hosts_and_users() {
+        assert_eq!(ssh_login("host.x", Some("git")).expect("login"), "git@host.x");
+        assert!(matches!(
+            ssh_connect_with("-oProxyCommand=evil", None, None, Service::UploadPack, "/x", "ssh", None),
+            Err(GitError::Invalid { .. })
+        ));
+        assert!(matches!(
+            ssh_connect_with("host.x", None, Some("-l"), Service::UploadPack, "/x", "ssh", None),
+            Err(GitError::Invalid { .. })
+        ));
+    }
+
+    #[test]
     fn git_request_frames_service_host_and_version() {
         let request = git_request(Service::UploadPack, "host.x", None, "/srv/a.git");
-        assert_eq!(
-            request,
-            b"git-upload-pack /srv/a.git\0host=host.x\0version=2\0".to_vec()
-        );
+        let len =
+            usize::from_str_radix(std::str::from_utf8(&request[..4]).expect("hex"), 16)
+                .expect("length");
+        assert_eq!(len, request.len());
+        assert!(request[4..].starts_with(b"git-upload-pack /srv/a.git\0"));
+        assert!(request.ends_with(b"host=host.x\0version=2\0"));
         let request = git_request(Service::ReceivePack, "host.x", Some(9419), "/a");
+        let len =
+            usize::from_str_radix(std::str::from_utf8(&request[..4]).expect("hex"), 16)
+                .expect("length");
+        assert_eq!(len, request.len());
         assert!(request.ends_with(b"host=host.x:9419\0version=2\0"));
     }
 
@@ -731,16 +772,14 @@ mod tests {
 
     #[test]
     fn git_daemon_handshake_serves_discovery() {
-        use std::io::Read as _;
+        use std::io::Write as _;
         let tip = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
         let listener =
             std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
         let port = listener.local_addr().expect("addr").port();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
-            let mut request = vec![0u8; 256];
-            let read = socket.read(&mut request).expect("request");
-            request.truncate(read);
+            let request = read_git_request(&socket);
             assert!(request.starts_with(b"git-upload-pack /srv/a.git\0"));
             assert!(request.windows(5).any(|w| w == b"host="));
             socket
@@ -757,6 +796,158 @@ mod tests {
         )
         .expect("map");
         assert!(refs.iter().any(|entry| entry.name == b"refs/heads/main"));
+        server.join().expect("server");
+    }
+
+    use super::super::fetch;
+    use super::super::pack::IngestLimits;
+    use super::super::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
+    use super::super::session::test_support::{store_with_pack, test_store};
+    use ruk_core::LfsMode;
+    use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTransaction, RefUpdate};
+    use ruk_core::refs::prepare_checked_transaction;
+
+    const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+
+    fn set_ref(store: &ruk_core::store::Store, kind: HashKind, name: &[u8], target: &str) {
+        let update = RefUpdate {
+            expected: RefExpect::Absent,
+            change: RefChange::Set(RefTarget::Direct(sha1(target))),
+            name: RefName::new(name.to_vec()).expect("ref name"),
+        };
+        let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
+        let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
+        store
+            .publish(Vec::new(), &prepared.into_mutations())
+            .expect("publish ref");
+    }
+
+    fn loopback() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+        let port = listener.local_addr().expect("addr").port();
+        (listener, port)
+    }
+
+    /// Reads one pkt-line-framed git-daemon request the way the daemon
+    /// consumes it before the service sees the stream; returns the body
+    /// past the length prefix.
+    fn read_git_request(socket: &std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut stream = socket;
+        let mut prefix = [0u8; 4];
+        stream.read_exact(&mut prefix).expect("length prefix");
+        let len = usize::from_str_radix(std::str::from_utf8(&prefix).expect("hex"), 16)
+            .expect("length");
+        let mut body = vec![0u8; len - 4];
+        stream.read_exact(&mut body).expect("request body");
+        body
+    }
+
+    #[test]
+    fn fetch_pack_flows_over_a_daemon_socket() {
+        // Client and server speak the real protocol over a real socket:
+        // dial + handshake, advertisement, wants, pack, verify, publish.
+        let kind = HashKind::Sha1;
+        let server_store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        set_ref(&server_store, kind, b"refs/heads/main", FOUR);
+        let head = HeadAdvertisement {
+            oid: sha1(FOUR),
+            symref: Some(b"refs/heads/main".to_vec()),
+        };
+        let (listener, port) = loopback();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept");
+            let request = read_git_request(&socket);
+            assert!(request.starts_with(b"git-upload-pack /srv/a.git\0"));
+            let reader = socket.try_clone().expect("split");
+            serve_upload_pack(reader, socket, &server_store, kind, &head, &Interrupt::none())
+                .expect("serve");
+        });
+        let dest = test_store(kind);
+        let stream = git_connect("127.0.0.1", Some(port), Service::UploadPack, "/srv/a.git")
+            .expect("dial");
+        let request = fetch::FetchWireRequest {
+            wants: vec![sha1(FOUR)],
+            haves: Vec::new(),
+            filter: None,
+            depth: None,
+            shallow: Vec::new(),
+            list_refs: false,
+            ref_prefixes: Vec::new(),
+        };
+        let received =
+            fetch::receive(stream, kind, &dest, &request, IngestLimits::default(), &Interrupt::none())
+                .expect("receive");
+        let report = fetch::verify_closure(
+            &dest,
+            &received.staged,
+            &[sha1(FOUR)],
+            None,
+            &received.shallow,
+            &Interrupt::none(),
+        )
+        .expect("verify");
+        assert_eq!(report.wanted, vec![sha1(FOUR)]);
+        fetch::publish_fetch(&dest, received.staged, &[]).expect("publish");
+        assert!(dest.read(sha1(FOUR)).is_ok());
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn push_updates_land_over_a_daemon_socket() {
+        use ruk_core::change::PlanId;
+        use super::super::push::{PushPlanRecord, PushUpdate, PushWireRequest, push_over};
+        use super::super::push::{PushState, RefResult};
+
+        let kind = HashKind::Sha1;
+        let client = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let server_store = test_store(kind);
+        let head = HeadAdvertisement {
+            oid: kind.zero_oid(),
+            symref: None,
+        };
+        let (listener, port) = loopback();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept");
+            let request = read_git_request(&socket);
+            assert!(request.starts_with(b"git-receive-pack /srv/a.git\0"));
+            let reader = socket.try_clone().expect("split");
+            serve_receive_pack(
+                reader,
+                socket,
+                &server_store,
+                kind,
+                &head,
+                &Interrupt::none(),
+                LfsMode::Deny,
+            )
+            .expect("serve");
+            assert!(
+                server_store
+                    .fact(ruk_core::store::types::FactTable::Refs, b"refs/heads/main",)
+                    .expect("read")
+                    .is_some(),
+                "ref published on the server"
+            );
+        });
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/main".to_vec(),
+            old: kind.zero_oid(),
+            new: sha1(FOUR),
+        }];
+        let request = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
+        let stream = git_connect("127.0.0.1", Some(port), Service::ReceivePack, "/srv/a.git")
+            .expect("dial");
+        let outcomes =
+            push_over(stream, &client, kind, &mut plan, &request, &Interrupt::none())
+                .expect("push");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].result, RefResult::Ok);
+        assert_eq!(plan.state, PushState::Confirmed);
         server.join().expect("server");
     }
 
