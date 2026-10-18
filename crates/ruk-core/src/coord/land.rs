@@ -179,25 +179,22 @@ pub fn load_plan(store: &Store, plan: PlanId) -> Result<Option<LandPlan>, CoreEr
     Ok(Some(stored))
 }
 
-/// Freezes an exact-candidate land plan and stores it.
+/// Stages an exact-candidate land plan without publishing it.
 ///
-/// Reads the resolved target tip as the required base, validates every
-/// candidate width and stored existence, snapshots the attestation predicate
-/// outcome, sets the one-hour deadline, and publishes the plan row with an
-/// absent-key expectation. The call moves no ref.
+/// Runs every check [`land_prepare`] runs — candidate width and stored
+/// existence, target resolution, attestation snapshot, deadline, row-size
+/// bound — and returns the frozen plan plus its `LandPlans` row mutation
+/// (absent-key expectation), so the hosted lane can publish the row through
+/// its own commit path. A generated plan id that collides with a stored row
+/// refuses `E_STALE` here instead of failing at publication time.
 ///
 /// # Errors
-/// `E_INVALID` for an empty candidate set, a symbolic target, or an
-/// overflowing deadline; `E_LIMIT` for too many candidates, requirements,
-/// trusted signers, or an oversized row; `E_OBJECT_FORMAT` for a candidate
-/// of the wrong hash width; `E_NOT_FOUND` for a candidate with no stored
-/// object; `E_POLICY` for requirements with no trusted signer; `E_STALE`
-/// for a plan identity collision; `E_CORRUPT` or `E_IO` from the store.
-pub fn land_prepare(
+/// Same as [`land_prepare`], without publishing.
+pub fn prepare_land_plan(
     store: &Store,
     request: LandPrepareRequest,
     checkpoint: &Checkpoint<'_>,
-) -> Result<LandPlan, CoreError> {
+) -> Result<(LandPlan, FactMutation), CoreError> {
     if request.candidates.is_empty() {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
@@ -293,12 +290,42 @@ pub fn land_prepare(
             "encoded land plan exceeds one control frame",
         ));
     }
+    let key = plan_key(plan.plan).to_vec();
+    if store.fact(FactTable::LandPlans, &key)?.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            "land plan identity collision; re-prepare",
+        ));
+    }
     let mutation = FactMutation {
         table: FactTable::LandPlans,
-        key: plan_key(plan.plan).to_vec(),
+        key,
         expected: FactExpectation::Absent,
         value: Some(bytes),
     };
+    Ok((plan, mutation))
+}
+
+/// Freezes an exact-candidate land plan and stores it.
+///
+/// Reads the resolved target tip as the required base, validates every
+/// candidate width and stored existence, snapshots the attestation predicate
+/// outcome, sets the one-hour deadline, and publishes the plan row with an
+/// absent-key expectation. The call moves no ref.
+///
+/// # Errors
+/// `E_INVALID` for an empty candidate set, a symbolic target, or an
+/// overflowing deadline; `E_LIMIT` for too many candidates, requirements,
+/// trusted signers, or an oversized row; `E_OBJECT_FORMAT` for a candidate
+/// of the wrong hash width; `E_NOT_FOUND` for a candidate with no stored
+/// object; `E_POLICY` for requirements with no trusted signer; `E_STALE`
+/// for a plan identity collision; `E_CORRUPT` or `E_IO` from the store.
+pub fn land_prepare(
+    store: &Store,
+    request: LandPrepareRequest,
+    checkpoint: &Checkpoint<'_>,
+) -> Result<LandPlan, CoreError> {
+    let (plan, mutation) = prepare_land_plan(store, request, checkpoint)?;
     store.publish(Vec::new(), &[mutation])?;
     Ok(plan)
 }
