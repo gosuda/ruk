@@ -647,21 +647,6 @@ impl Verifier<'_> {
     }
 }
 
-/// Collects ancestor commits of `tips` to offer as haves, newest discovery
-/// order, bounded by `max`. Reads (not trusted structures) back the walk.
-/// Promised objects are never offered: the local store does not hold them.
-///
-/// # Errors
-/// Store failures.
-pub fn collect_haves(
-    store: &Store,
-    tips: &[Oid],
-    max: usize,
-    interrupt: &Interrupt,
-) -> Result<Vec<Oid>, GitError> {
-    collect_haves_filtered(store, tips, max, &PrivateFilter::empty(), interrupt)
-}
-
 /// Collects haves while excluding a private closure.
 ///
 /// Excluded roots are never entered, so private history stays private at
