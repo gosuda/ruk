@@ -33,12 +33,12 @@ use ruk_core::store::types::{ObjectKind, Publication};
 use ruk_core::store::{PreparationBudget, Store};
 
 use super::fetch::observation_mutations;
-use super::fetch::{FetchWireRequest, Filter, promisor_facts, shallow_facts};
+use super::fetch::{Filter, promisor_facts, shallow_facts};
 use super::pack::{
     IngestLimits, Links, PackEntry, StagedPack, ingest_pack, object_links, pack_threads, write_pack,
 };
 use super::push::{
-    PushPlanRecord, PushUpdate, PushWireRequest, RefOutcome, RefResult, push_closure, reconcile,
+    PushPlanRecord, PushUpdate, PushWireRequest, RefOutcome, RefResult, push_closure,
 };
 use super::{Interrupt, read_object};
 use crate::GitError;
@@ -865,48 +865,11 @@ fn map_ref_error(err: ruk_core::refdata::RefError) -> GitError {
     }
 }
 
-/// Reconciles an uncertain local plan against the destination's refs.
-#[must_use]
-pub fn reconcile_local(
-    plan: &PushPlanRecord,
-    kind: HashKind,
-    dest: &Store,
-) -> Vec<super::push::ReconciledRef> {
-    let mut observed = Vec::with_capacity(plan.updates.len());
-    for update in &plan.updates {
-        let oid = RefName::new(update.name.clone())
-            .ok()
-            .and_then(|name| StoreRefs::new(dest).get(&name).ok().flatten())
-            .and_then(|target| match target {
-                RefTarget::Direct(oid) => Some(oid),
-                RefTarget::Symbolic(_) => None,
-            });
-        observed.push((update.name.clone(), oid));
-    }
-    reconcile(plan, kind, &observed)
-}
-
-/// Builds a [`FetchWireRequest`] against one [`Reconnectable`] prefetch
-/// note: promisor servers accept bare blob wants (reachable SHAs are
-/// allowed by default); see [`super::fetch::prefetch`].
-#[must_use]
-pub fn prefetch_request(wants: Vec<Oid>) -> FetchWireRequest {
-    FetchWireRequest {
-        wants,
-        haves: Vec::new(),
-        filter: None,
-        depth: None,
-        shallow: Vec::new(),
-        list_refs: false,
-        ref_prefixes: Vec::new(),
-    }
-}
-
 /// Re-exports for the wire tests: the scripted peer and received-pack
 /// plumbing live here so fetch and push tests share one harness.
 #[cfg(test)]
 pub mod test_support {
-    use super::super::fetch::ReceivedPack;
+    use super::super::fetch::{FetchWireRequest, ReceivedPack};
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
