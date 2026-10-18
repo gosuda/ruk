@@ -76,6 +76,7 @@ use crate::capability::{
 use crate::commit::ProvenanceClaims;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{IdentityClaim, Validate};
+use crate::store::CapacityLimits;
 use crate::workcopy::lfs::LfsMode;
 
 /// File name of the policy inside the store directory.
@@ -422,6 +423,7 @@ impl PrincipalPolicy {
 pub(crate) struct Policy {
     session_idle: SignedDuration,
     lfs: LfsMode,
+    capacity: CapacityLimits,
     entries: HashMap<Principal, PrincipalPolicy>,
 }
 
@@ -435,6 +437,7 @@ impl Policy {
         Ok(Self {
             session_idle: DEFAULT_SESSION_IDLE,
             lfs: LfsMode::default(),
+            capacity: CapacityLimits::unbounded(),
             entries: HashMap::from([(owner.clone(), PrincipalPolicy::owner_default()?)]),
         })
     }
@@ -468,9 +471,17 @@ impl Policy {
             }
             entries.insert(principal, policy);
         }
+        let capacity = raw.capacity.unwrap_or(RawCapacity {
+            max_pending: None,
+            max_total: None,
+        });
         Ok(Self {
             session_idle,
             lfs: raw.lfs.unwrap_or_default(),
+            capacity: CapacityLimits {
+                max_pending_bytes: capacity.max_pending,
+                max_store_bytes: capacity.max_total,
+            },
             entries,
         })
     }
@@ -501,6 +512,15 @@ impl Policy {
     pub(crate) const fn lfs(&self) -> LfsMode {
         self.lfs
     }
+
+    /// The durable-store quota knobs from `policy.toml [capacity]`
+    /// (`max_pending` / `max_total`), unbounded when absent. The
+    /// coordinator applies them to the store with
+    /// [`crate::store::Store::set_capacity_limits`].
+    #[must_use]
+    pub(crate) const fn capacity_limits(&self) -> CapacityLimits {
+        self.capacity
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -513,8 +533,22 @@ struct RawPolicy {
     version: i64,
     session_idle: Option<String>,
     lfs: Option<LfsMode>,
+    #[serde(default)]
+    capacity: Option<RawCapacity>,
     #[serde(default, rename = "principal")]
     principals: Vec<RawPrincipal>,
+}
+
+/// The `policy.toml [capacity]` table: durable-store quota knobs for the
+/// capacity ledger. Both bounds are byte counts; absent means unbounded.
+/// A zero bound admits nothing and is taken literally.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCapacity {
+    #[serde(default)]
+    max_pending: Option<u64>,
+    #[serde(default)]
+    max_total: Option<u64>,
 }
 
 #[derive(Deserialize)]
