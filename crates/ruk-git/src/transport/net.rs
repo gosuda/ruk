@@ -22,6 +22,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use ruk_core::ids::HashKind;
 use ruk_core::refdata::{RefName, RefTarget};
@@ -251,9 +252,20 @@ enum SshInvocation {
     Shell(String),
 }
 
+/// Grace period for the ssh child to exit once its stdin closes. Closing
+/// the pipe lets the remote run post-receive/post-update hooks to
+/// completion (Forgejo's `forgejo hook post-receive` settles push state
+/// there); the grace only binds a hung network or a child that outlives
+/// its pipes, and then the child is killed and reaped.
+const SSH_EXIT_GRACE: Duration = Duration::from_secs(30);
+
 /// A live SSH connection: the child's pipes plus the child itself.
+///
+/// `stdin` is an `Option` so teardown can close the pipe (dropping the
+/// handle sends EOF) before waiting: waiting with stdin open deadlocks a
+/// child blocked on input, and killing first cuts the remote's hooks.
 pub struct SshStream {
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: ChildStdout,
     #[allow(dead_code)]
     child: Child,
@@ -267,20 +279,46 @@ impl Read for SshStream {
 
 impl Write for SshStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stdin.write(buf)
+        match self.stdin.as_mut() {
+            Some(stdin) => stdin.write(buf),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "ssh stdin is closed",
+            )),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.stdin.flush()
+        match self.stdin.as_mut() {
+            Some(stdin) => stdin.flush(),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "ssh stdin is closed",
+            )),
+        }
     }
 }
 
 impl Drop for SshStream {
     fn drop(&mut self) {
-        // Best-effort reap: killing an exited child is a harmless error,
-        // and the wait after it releases the zombie either way.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // EOF first, then wait: git's `disconnect_git` closes the pipes
+        // before `finish_connect` waits, so the remote sees a clean hangup
+        // instead of a signal. The wait is bounded (Drop must not hang);
+        // only a child still alive past the grace is killed and reaped.
+        self.stdin.take();
+        let deadline = Instant::now() + SSH_EXIT_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -367,7 +405,7 @@ pub fn ssh_connect_with(
         detail: format!("{what} has no stdout pipe"),
     })?;
     Ok(SshStream {
-        stdin,
+        stdin: Some(stdin),
         stdout,
         child,
     })
@@ -486,8 +524,10 @@ pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitE
 }
 
 /// Reads one advertisement over an open stream: v0/v1 refs directly, or
-/// one `ls-refs` round trip against a v2 server. The stream closes on
-/// return, the way `ls-remote` hangs up after discovery.
+/// one `ls-refs` round trip against a v2 server. The stream hangs up on
+/// return the way `ls-remote` does after discovery: git's `disconnect_git`
+/// (`git/transport.c`) sends a closing flush before closing the pipes, so
+/// this sends one too, on both the v0 and v2 arms.
 ///
 /// # Errors
 /// Grammar failures are [`GitError::Corrupt`].
@@ -496,14 +536,20 @@ pub fn discover<R: Read + Write>(
     kind: HashKind,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
     let mut pkt = PktReader::new(stream, Interrupt::none());
-    match refadv::read_initial(&mut pkt, kind)? {
-        Initial::Refs(advertisement) => Ok(advertisement.refs),
+    let refs = match refadv::read_initial(&mut pkt, kind)? {
+        Initial::Refs(advertisement) => advertisement.refs,
         Initial::V2(caps) => {
             let request = refadv::ls_refs_request(&caps, kind, &[])?;
             pktline::send(pkt.get_mut(), &request)?;
-            refadv::read_ls_refs(&mut pkt, kind)
+            refadv::read_ls_refs(&mut pkt, kind)?
         }
-    }
+    };
+    // Hangup hygiene, not protocol: the refs are already in hand, so a
+    // peer that hung up first must not fail discovery. Best-effort.
+    let mut flush = Vec::new();
+    pktline::encode_flush(&mut flush);
+    let _ = pktline::send(pkt.get_mut(), &flush);
+    Ok(refs)
 }
 
 /// Discovers a network endpoint's refs: opens the stream, reads the
@@ -784,8 +830,65 @@ mod tests {
     }
 
     #[test]
-    fn git_daemon_handshake_serves_discovery() {
+    fn ssh_drop_delivers_eof_and_reaps_without_kill() {
+        // The far end copies stdin to a file and only then flags its exit:
+        // a teardown that kills first never writes the flag, and a wait
+        // with stdin open never sees EOF. Drop must return promptly with
+        // both files in place.
         use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-net-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let out = dir.join("stdin.bin");
+        let flag = dir.join("exited");
+        let script = dir.join("fake-ssh.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > \"{}\"\necho done > \"{}\"\n",
+                out.display(),
+                flag.display()
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+        let mut stream = ssh_connect_with(
+            "far.test",
+            None,
+            None,
+            Service::UploadPack,
+            "/srv/a.git",
+            "ssh",
+            Some(script.to_str().expect("utf8")),
+        )
+        .expect("spawn");
+        stream.write_all(b"hello").expect("stdin");
+        let started = std::time::Instant::now();
+        drop(stream);
+        assert!(
+            started.elapsed() < SSH_EXIT_GRACE,
+            "teardown waits for exit, it does not sit out the grace"
+        );
+        assert_eq!(std::fs::read(&out).expect("stdin bytes"), b"hello");
+        assert_eq!(std::fs::read(&flag).expect("exit flag"), b"done\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_daemon_handshake_serves_discovery() {
+        use std::io::{Read as _, Write as _};
         let tip = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
         let listener =
             std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
@@ -802,6 +905,11 @@ mod tests {
             socket
                 .write_all(&advertisement_bytes(tip))
                 .expect("advertisement");
+            // Discovery hangs up the way `ls-remote` does: refs first, then
+            // git's closing flush before the pipes close.
+            let mut hangup = [0u8; 4];
+            socket.read_exact(&mut hangup).expect("closing flush");
+            assert_eq!(&hangup, b"0000");
         });
         let endpoint = Endpoint::Git {
             host: "127.0.0.1".to_owned(),
