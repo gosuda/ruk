@@ -193,7 +193,6 @@ impl PrivateClosure {
         }
         Ok(Self { oids })
     }
-
 }
 
 /// Enqueues every object one link set names.

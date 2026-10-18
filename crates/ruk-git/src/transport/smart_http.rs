@@ -992,9 +992,10 @@ mod tests {
             updates: updates.clone(),
             atomic: false,
         };
-                let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
-        let outcomes = push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none())
-            .expect("push");
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let outcomes =
+            push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none()).expect("push");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].name, b"refs/heads/x");
         assert!(

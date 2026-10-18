@@ -1459,71 +1459,68 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
-    /// Serves canned smart-http replies on loopback, recording every
-    /// request head plus body and delivering the log once all replies
-    /// are served. The receiver bounds the wait: a client that stops
-    /// early fails the test instead of hanging the suite.
-    fn smart_http_server(
-        replies: Vec<(Vec<u8>, &'static str)>,
-    ) -> (
-        String,
-        std::sync::mpsc::Receiver<Vec<(String, Vec<u8>)>>,
-    ) {
-        use std::net::TcpListener;
+/// Serves canned smart-http replies on loopback, recording every
+/// request head plus body and delivering the log once all replies
+/// are served. The receiver bounds the wait: a client that stops
+/// early fails the test instead of hanging the suite.
+fn smart_http_server(
+    replies: Vec<(Vec<u8>, &'static str)>,
+) -> (String, std::sync::mpsc::Receiver<Vec<(String, Vec<u8>)>>) {
+    use std::net::TcpListener;
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
-        let port = listener.local_addr().expect("addr").port();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            for (body, ctype) in replies {
-                let (socket, _) = listener.accept().expect("accept");
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .expect("timeout");
-                let mut reader = BufReader::new(socket.try_clone().expect("split"));
-                let mut head = Vec::new();
-                loop {
-                    let mut line = Vec::new();
-                    reader.read_until(b'\n', &mut line).expect("request line");
-                    if line.is_empty() {
-                        panic!("client hung up mid-request");
-                    }
-                    head.extend_from_slice(&line);
-                    if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
-                        break;
-                    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (body, ctype) in replies {
+            let (socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut reader = BufReader::new(socket.try_clone().expect("split"));
+            let mut head = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).expect("request line");
+                if line.is_empty() {
+                    panic!("client hung up mid-request");
                 }
-                let text = String::from_utf8_lossy(&head).into_owned();
-                let length = text
-                    .lines()
-                    .filter_map(|line| line.split_once(':'))
-                    .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
-                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
-                let mut request_body = vec![0_u8; length];
-                if length > 0 {
-                    reader.read_exact(&mut request_body).expect("request body");
+                head.extend_from_slice(&line);
+                if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
+                    break;
                 }
-                requests.push((text, request_body));
-                let reply = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let mut socket = socket;
-                socket.write_all(reply.as_bytes()).expect("reply head");
-                socket.write_all(&body).expect("reply body");
             }
-            tx.send(requests).expect("deliver log");
-        });
-        (format!("http://127.0.0.1:{port}/a.git"), rx)
-    }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let length = text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut request_body = vec![0_u8; length];
+            if length > 0 {
+                reader.read_exact(&mut request_body).expect("request body");
+            }
+            requests.push((text, request_body));
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut socket = socket;
+            socket.write_all(reply.as_bytes()).expect("reply head");
+            socket.write_all(&body).expect("reply body");
+        }
+        tx.send(requests).expect("deliver log");
+    });
+    (format!("http://127.0.0.1:{port}/a.git"), rx)
+}
 
-    fn pkt_frame(payload: &[u8]) -> Vec<u8> {
-        let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
-        out.extend_from_slice(payload);
-        out
-    }
+fn pkt_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+    out.extend_from_slice(payload);
+    out
+}
 
 #[test]
 fn push_over_smart_http_reports_status() {
@@ -1562,7 +1559,8 @@ fn push_over_smart_http_reports_status() {
         "{head:?}"
     );
     assert!(
-        body.windows(b"refs/heads/main".len()).any(|w| w == b"refs/heads/main"),
+        body.windows(b"refs/heads/main".len())
+            .any(|w| w == b"refs/heads/main"),
         "no command line"
     );
     assert!(body.windows(4).any(|w| w == b"PACK"), "no pack bytes");
@@ -1579,10 +1577,7 @@ fn ls_remote_over_smart_http_lists_refs() {
     ));
     adv.extend_from_slice(&pkt_frame(format!("{TIP} refs/heads/main\n").as_bytes()));
     adv.extend_from_slice(b"0000");
-    let (base, log) = smart_http_server(vec![(
-        adv,
-        "application/x-git-upload-pack-advertisement",
-    )]);
+    let (base, log) = smart_http_server(vec![(adv, "application/x-git-upload-pack-advertisement")]);
     let (root, env) = seeded_repo("httpls", "l.txt", b"l\n");
     let mut ctx = repo_ctx(&root, env);
     let out = run(verbs_transport::ls_remote, &mut ctx, &[&base]).expect("http ls-remote");

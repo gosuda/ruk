@@ -669,7 +669,6 @@ impl<T> Merge<Option<T>> {
     pub fn present_adds(&self) -> impl Iterator<Item = &T> {
         self.adds().flatten()
     }
-
 }
 
 impl<T: Clone> Merge<Option<&T>> {
