@@ -2023,6 +2023,44 @@ mod tests {
     }
 
     #[test]
+    fn open_verifies_every_object_across_batch_boundaries() {
+        // More committed objects than one verification batch holds
+        // (recovery batches 4096 locators), so the reopening pass must
+        // carry its page cursor across at least one batch boundary. Keep
+        // this count above the batch size if that constant ever moves.
+        const OBJECTS: usize = 4100;
+        const CHUNK: usize = 512;
+        let temp = TempRoot::new("verify-batches");
+        let store = create(&temp, HashKind::Sha1);
+        let mut oids = Vec::with_capacity(OBJECTS);
+        let indices: Vec<usize> = (0..OBJECTS).collect();
+        for group in indices.chunks(CHUNK) {
+            let batch: Vec<PreparedObject> = group
+                .iter()
+                .map(|i| blob(&store, &pseudo(16, u64::try_from(*i).expect("object index fits u64"))))
+                .collect();
+            oids.extend(store.publish(batch, &[]).expect("publish").objects);
+        }
+        assert_eq!(oids.len(), OBJECTS);
+        drop(store);
+        let store = reopen(&temp);
+        for i in [0, OBJECTS / 2, OBJECTS - 1] {
+            assert_eq!(read_all(&store, oids[i]), pseudo(16, i as u64));
+        }
+        drop(store);
+        // Damage the last row in digest order: a reopen must reach the
+        // final batch to refuse it.
+        let mut ordered = oids.clone();
+        ordered.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let tail = *ordered.last().expect("committed objects");
+        let meta = meta_file(&temp);
+        raw_put_object(&meta, tail.as_bytes(), &[0xFF; 3]);
+        raw_bump_generation(&meta);
+        let err = Store::open(&temp.store_dir(), budget()).expect_err("damaged tail row");
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+    }
+
+    #[test]
     fn open_refuses_missing_committed_bytes() {
         let temp = TempRoot::new("short");
         let store = create(&temp, HashKind::Sha1);
