@@ -883,6 +883,9 @@ pub enum IdentitySource {
     SessionClaim,
     RukConfig,
     GitConfig,
+    /// The committer preserved from the rewritten commit: rewrites keep the
+    /// original signatures instead of synthesizing new ones.
+    Preserved,
 }
 
 /// The exact identity an operation recorded, and why.

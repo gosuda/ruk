@@ -1553,8 +1553,11 @@ fn load_rewrite_target(store: &Store, target: &ChangeRef) -> Result<RewriteTarge
 }
 
 /// Reports the identity a rewrite ran under: the call override, else the
-/// session identity, else none. Rewrites preserve signatures, so unlike `new`
-/// this never refuses; it only reports.
+/// session identity, else none. Only arms that synthesize a signature
+/// (`new`, `revert`, native `ws.new`) may report it; arms that preserve the
+/// original committer (`describe`, `split`, `squash`) report
+/// [`preserved_identity`] instead, so the reply never claims an identity the
+/// new commits never record.
 fn report_identity(
     ctx: &PrepareContext<'_>,
     over: Option<&IdentityClaim>,
@@ -1575,6 +1578,19 @@ fn report_identity(
             email: claim.email.clone(),
             source: IdentitySource::SessionClaim,
         }))
+}
+
+/// Reports the identity a rewrite committed: the committer preserved from the
+/// rewritten commit. Rewrites keep the original signatures — new-style
+/// synthesis from the session or override identity is a documented deviation —
+/// so the reply reports who the new commits actually name.
+fn preserved_identity(record: &CommitRecord) -> Result<EffectiveIdentity, CoreError> {
+    let committer = record.committer()?;
+    Ok(EffectiveIdentity {
+        name: String::from_utf8_lossy(committer.name.as_bytes()).into_owned(),
+        email: String::from_utf8_lossy(committer.email.as_bytes()).into_owned(),
+        source: IdentitySource::Preserved,
+    })
 }
 
 /// Echoes an explicit merge-mode request in the reply. No content is merged
@@ -2106,7 +2122,7 @@ fn describe_parts(
     let reply = rewrite_reply(
         session,
         request_id,
-        report_identity(ctx, args.identity.as_ref())?,
+        Some(preserved_identity(&target.record)?),
         None,
         &staged,
         Vec::new(),
@@ -2513,7 +2529,7 @@ fn split_parts(
     let mut reply = rewrite_reply(
         session,
         request_id,
-        report_identity(ctx, args.identity.as_ref())?,
+        Some(preserved_identity(&source.record)?),
         merge_report_of(args.merge.mode)?,
         &staged,
         Vec::new(),
@@ -2779,7 +2795,7 @@ fn squash_parts(
     let reply = rewrite_reply(
         session,
         request_id,
-        report_identity(ctx, args.identity.as_ref())?,
+        Some(preserved_identity(&source.record)?),
         merge_report_of(args.merge.mode)?,
         &staged,
         abandoned,
@@ -5852,8 +5868,12 @@ mod tests {
         let identity = reply
             .outcome
             .identity
-            .expect("describe reports the session identity");
-        assert_eq!(identity.source, IdentitySource::SessionClaim);
+            .expect("describe reports the committed identity");
+        // The rewrite preserves the seeded committer rather than recording
+        // the session identity, so the reply reports who the commit names.
+        assert_eq!(identity.source, IdentitySource::Preserved);
+        assert_eq!(identity.name, "Ada");
+        assert_eq!(identity.email, "ada@example.invalid");
 
         let missing = ChangeRef {
             change: ChangeId::from_bytes([0x77; 16]),
