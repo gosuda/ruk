@@ -103,6 +103,7 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
             value: before,
         });
     }
+    refuse_restoring_workspaces(operation, &plan.facts)?;
     refuse_diverged(store, operation, &plan.facts)?;
     let (transaction, dependencies) = undo_ref_transaction(store, &plan.facts)?;
     plan.ref_transaction = transaction;
@@ -248,6 +249,29 @@ fn inverse_table(name: &str) -> Result<FactTable, CoreError> {
         ));
     }
     Ok(table)
+}
+
+/// Refuses the undo when it would restore a workspace row.
+///
+/// Workspace stamps and lease epochs never move backward: fencing tokens are
+/// issued against the current stamp, so writing the pre-operation bytes would
+/// reissue an old stamp for different state (ABA) or hand the workspace to a
+/// displaced holder at a lower lease epoch, reviving its fencing tokens.
+/// Every other table restores exact bytes safely.
+fn refuse_restoring_workspaces(
+    operation: OperationId,
+    facts: &[FactMutation],
+) -> Result<(), CoreError> {
+    if facts.iter().any(|fact| fact.table == FactTable::Workspaces) {
+        return Err(CoreError::new(
+            ErrorCode::EUndoConflict,
+            format!(
+                "operation {} cannot be undone: it moves a workspace, and restoring the row would move its stamp or lease epoch backward",
+                operation.0
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Refuses the undo when any key no longer holds the value the operation left.
@@ -440,6 +464,23 @@ mod tests {
             .expect("a later write lands");
         let err = prepare_undo(&fixture.store, id).expect_err("the key has moved");
         assert_eq!(err.code, ErrorCode::EUndoConflict);
+    }
+
+    #[test]
+    fn undo_refuses_to_restore_a_workspace_row() {
+        let fixture = Fixture::new("workspace");
+        let id = fixture.record(
+            Method::Describe,
+            &[FactMutation {
+                table: FactTable::Workspaces,
+                key: vec![7; 16],
+                expected: FactExpectation::Absent,
+                value: Some(b"row".to_vec()),
+            }],
+        );
+        let err = prepare_undo(&fixture.store, id).expect_err("workspace rows never restore");
+        assert_eq!(err.code, ErrorCode::EUndoConflict);
+        assert!(err.message.contains("workspace"), "names the hazard: {}", err.message);
     }
 
     #[test]
