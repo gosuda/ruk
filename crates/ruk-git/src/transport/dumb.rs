@@ -29,7 +29,7 @@ use std::io::Write;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use ruk_core::ids::Oid;
-use ruk_core::refdata::{RefRead, RefTarget};
+use ruk_core::refdata::RefName;
 use ruk_core::refs::StoreRefs;
 use ruk_core::store::ObjectKind;
 use ruk_core::store::Store;
@@ -69,27 +69,20 @@ fn type_name(kind: ObjectKind) -> Option<&'static str> {
     }
 }
 
-/// Follows a symbolic target to a direct OID, bounding the chain.
+/// Resolves an advertised ref to a direct OID through the core ref contract,
+/// the same chain bound every other reader uses.
 ///
-/// Returns `None` when the chain breaks or cycles: like the oracle's dumb
-/// handlers, which skip refs whose objects do not parse, the caller drops
-/// the ref instead of failing the whole advertisement.
-fn resolve(store: &Store, target: &RefTarget) -> Option<Oid> {
-    if let RefTarget::Direct(oid) = target {
-        return Some(*oid);
+/// Returns `None` for a dangling, cyclic, or over-deep chain, so the caller
+/// drops the ref the way the oracle's dumb handlers skip refs they cannot
+/// serve. A store read failure is not a missing ref: it propagates.
+fn resolve(store: &Store, name: &[u8]) -> Result<Option<Oid>, GitError> {
+    let name = RefName::new(name)
+        .map_err(|err| corrupt(format!("stored ref name is invalid: {err}")))?;
+    match ruk_core::refdata::resolve(&StoreRefs::new(store), &name) {
+        Ok(resolved) => Ok(resolved.oid),
+        Err(ruk_core::refdata::RefError::Read(err)) => Err(GitError::from(err)),
+        Err(_) => Ok(None),
     }
-    // Symbolic chains walk through one owned cursor; each hop moves in
-    // and the next lookup moves out, so no per-hop allocation remains.
-    let mut cursor = target.clone();
-    for _ in 0..16 {
-        match cursor {
-            RefTarget::Direct(oid) => return Some(oid),
-            RefTarget::Symbolic(name) => {
-                cursor = StoreRefs::new(store).get(&name).ok()??;
-            }
-        }
-    }
-    None
 }
 
 /// Peels a tag to its ultimate non-tag target, mirroring the oracle's
@@ -133,7 +126,7 @@ pub fn dumb_info_refs(
         if entry.name == b"HEAD" {
             continue;
         }
-        let Some(oid) = resolve(store, &entry.target) else {
+        let Some(oid) = resolve(store, &entry.name)? else {
             continue;
         };
         let kind = match read_object(store, oid, max_bytes()) {
