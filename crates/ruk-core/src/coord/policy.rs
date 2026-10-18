@@ -718,8 +718,10 @@ pub(crate) struct PolicySource {
 /// non-regular file — fails closed to [`LfsMode::Deny`], never `Pointers`.
 /// A missing file selects the owner-only default, whose mode is the store
 /// default. The `owner` alias resolves against the on-disk owner of the
-/// store directory, the same choice the daemon registry makes when it binds
-/// a coordinator, so transport servers and the coordinator read one policy.
+/// store directory on Unix, the same choice the daemon registry makes when
+/// it binds a coordinator; elsewhere it resolves against the process
+/// identity (the daemon refuses hosting there, so no coordinator policy
+/// exists to diverge from).
 pub(crate) fn lfs_mode_for_store(store_root: &Path) -> LfsMode {
     let Some(owner) = store_owner(store_root) else {
         return LfsMode::Deny;

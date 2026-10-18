@@ -671,6 +671,28 @@ fn receive_pack_enforces_store_lfs_policy() {
         lines,
         vec![b"unpack ok\n".to_vec(), b"ok refs/heads/lfs\n".to_vec()]
     );
+    // Fail-closed: a file the coordinator policy loader refuses never
+    // enables pointers, even with `lfs = "pointers"` set.
+    std::fs::write(
+        root.join(".ruk").join("policy.toml"),
+        "version = 1\nlfs = \"pointers\"\nunknown = 1\n",
+    )
+    .expect("policy");
+    ctx.env.stdin = Some(push_input(&tip, &zero, &pack));
+    let report = run(verbs_transport::receive_pack, &mut ctx, &[]).expect("receive reports ng");
+    let lines = report_lines(&report);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], b"unpack ok\n".to_vec());
+    assert!(
+        lines[1].starts_with(b"ng refs/heads/lfs "),
+        "got {:?}",
+        lines[1]
+    );
+    assert!(
+        String::from_utf8_lossy(&lines[1]).contains("E_UNSUPPORTED_LFS"),
+        "got {:?}",
+        lines[1]
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
