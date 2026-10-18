@@ -533,53 +533,6 @@ pub(crate) fn persist_best_effort(store: &Store, plan: &PushPlanRecord, kind: Ha
     }
 }
 
-/// Pushes over `stream` while refusing private tips locally.
-///
-/// Updates whose new tip is private or promised are never sent: they join
-/// the returned outcomes as rejections and the plan persists `Rejected`
-/// without transmitting a byte for them. Every other update follows the
-/// exact [`push_over`] framing with a privately filtered closure.
-///
-/// # Errors
-/// As [`push_over`].
-pub fn push_over_with_private<R: Read + Write>(
-    stream: R,
-    store: &Store,
-    kind: HashKind,
-    plan: &mut PushPlanRecord,
-    req: &PushWireRequest,
-    filter: &PrivateFilter,
-    interrupt: &Interrupt,
-) -> Result<Vec<RefOutcome>, GitError> {
-    if req.updates.is_empty() {
-        return Err(GitError::Invalid {
-            detail: "push needs at least one update".to_owned(),
-        });
-    }
-    if plan.updates != req.updates || plan.atomic != req.atomic {
-        return Err(GitError::Invalid {
-            detail: "push plan does not match the push request".to_owned(),
-        });
-    }
-    for update in &req.updates {
-        if update.name.is_empty() || update.name.iter().any(|b| *b == 0 || *b == b'\n') {
-            return Err(GitError::Invalid {
-                detail: "push update carries a malformed ref name".to_owned(),
-            });
-        }
-    }
-    persist(store, plan, kind, None)?;
-    let outcome = push_over_inner(stream, store, kind, plan, req, filter, interrupt);
-    match outcome {
-        Ok(outcomes) => Ok(outcomes),
-        Err(err) => {
-            plan.mark_uncertain();
-            persist_best_effort(store, plan, kind);
-            Err(err)
-        }
-    }
-}
-
 /// Refuses updates whose new tip must not leave the store.
 fn refuse_private_tips<'a>(
     store: &Store,
