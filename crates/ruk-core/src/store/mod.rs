@@ -492,19 +492,34 @@ impl Store {
     ///
     /// Every committed byte was already synced by its publication before the
     /// metadata commit, so this only forces out whatever the OS still holds
-    /// back. Dropping the store without closing is still safe: the next
-    /// open truncates any uncommitted tail during recovery. Closing is
-    /// idempotent; a store with no open segment returns immediately.
+    /// back, then drops the open `File` so the descriptor does not linger
+    /// until the store itself drops. The retirement is terminal for
+    /// publication: dropping the handle without sealing leaves the committed
+    /// manifest naming one unsealed segment, so minting a fresh segment
+    /// afterwards would record two open segments and fail recovery. The
+    /// writer latches closed instead, and later publications fail with
+    /// [`StoreError::WriterClosed`] until the store reopens (recovery then
+    /// resumes the single open segment). Reads are unaffected. Dropping the
+    /// store without closing is still safe: the next open truncates any
+    /// uncommitted tail during recovery. Closing is idempotent; a store
+    /// with no open segment returns immediately.
+    ///
+    /// The publication lane runner calls this once its drain commits the
+    /// final batch (see [`crate::coord`]), so the handle always retires
+    /// after the last write rather than before it.
     ///
     /// # Errors
     /// [`StoreError::WriterClosed`] when the writer state is poisoned;
     /// [`StoreError::Io`] when the final flush fails.
     pub fn close(&self) -> Result<(), StoreError> {
-        let writer = self.lock_writer()?;
-        match writer.active.as_ref() {
-            Some(active) => durability::sync_file(active.writer.get_ref()),
-            None => Ok(()),
+        let mut writer = self.lock_writer()?;
+        if let Some(active) = writer.active.take() {
+            durability::sync_file(active.writer.get_ref())?;
         }
+        if writer.closed.is_none() {
+            writer.closed = Some("store closed; reopen the store to publish again".to_owned());
+        }
+        Ok(())
     }
 
     /// Shrinks the segment roll target for this store. Test-only: lets
@@ -1910,6 +1925,49 @@ mod tests {
         let second_oid = store
             .publish(vec![blob(&store, &second)], &[])
             .expect("second")
+            .objects[0];
+        assert!(!segment_file(&temp, 1).exists());
+        drop(store);
+
+        let store = reopen(&temp);
+        assert_eq!(read_all(&store, first_oid), first);
+        assert_eq!(read_all(&store, second_oid), second);
+    }
+
+    #[test]
+    fn close_retires_the_handle_and_reopen_resumes() {
+        let temp = TempRoot::new("close");
+        let store = create(&temp, HashKind::Sha1);
+        let first = pseudo(2000, 60);
+        let first_oid = store
+            .publish(vec![blob(&store, &first)], &[])
+            .expect("first")
+            .objects[0];
+        store.close().expect("close");
+        // Idempotent: closing twice retires nothing new.
+        store.close().expect("second close");
+        // Terminal for publication: the dropped handle stays the single
+        // committed open segment, so a fresh segment here would strand two
+        // opens and fail the next recovery.
+        let refused = pseudo(2000, 61);
+        let err = store
+            .publish(vec![blob(&store, &refused)], &[])
+            .expect_err("publish after close is refused");
+        assert!(
+            matches!(err, StoreError::WriterClosed(_)),
+            "expected WriterClosed, got {err:?}"
+        );
+        // Reads still serve after close.
+        assert_eq!(read_all(&store, first_oid), first);
+        drop(store);
+
+        // Recovery resumes the single open segment, not a second one.
+        let store = reopen(&temp);
+        assert_eq!(read_all(&store, first_oid), first);
+        let second = pseudo(2000, 62);
+        let second_oid = store
+            .publish(vec![blob(&store, &second)], &[])
+            .expect("post-reopen publish resumes the open segment")
             .objects[0];
         assert!(!segment_file(&temp, 1).exists());
         drop(store);

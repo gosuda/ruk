@@ -146,14 +146,23 @@ impl PublicationLaneRunner {
     /// instead of failing it. The drain after the loop commits whatever the
     /// loop did not reach (a deferred item plus every submit still queued)
     /// the same way. Only a fatal storage failure stops the drain early and
-    /// latches the lane.
+    /// latches the lane. The store handle retires after the drain, once the
+    /// final write committed: closing here (rather than in
+    /// [`HostedCoordinator::shutdown`](super::hosted::HostedCoordinator::shutdown),
+    /// which only signals the drain) keeps the single publication owner as
+    /// the single closer, on both the awaited-shutdown and the
+    /// eviction-detached paths.
     ///
     /// # Errors
     /// Returns `CoreError` if a fatal or ambiguous storage failure closes the lane.
     pub(crate) async fn run(mut self, cancel: Cancel) -> Result<(), CoreError> {
         let mut deferred: Option<BatchItem> = None;
         let outcome = self.run_loop(&cancel, &mut deferred).await;
-        self.drain(deferred).await?;
+        let drained = self.drain(deferred).await;
+        // Best-effort: every committed byte was already synced by its own
+        // publication; a flush failure here reports nothing new.
+        let _ = self.store.close();
+        drained?;
         outcome
     }
 

@@ -46,6 +46,8 @@ use super::leases::{
     AcquireArgs, CursorWant, INTERACTIVE_TTL, LeaseKind, LeaseRegistry, OwnerGuard,
 };
 use super::oplog::read_header;
+use super::prepare::{PrepareContext, prepare_mutation_with};
+use crate::attestation::Checkpoint;
 use super::policy::PolicySource;
 pub use super::policy::Principal;
 use super::retention::{RetentionClock, SweepTable, sweep_page};
@@ -204,6 +206,52 @@ impl HostedCoordinator {
         &self.store
     }
 
+    /// Prepares one mutation with the full coordinator context.
+    ///
+    /// Loads the session row, samples the coordinator clock, opens the
+    /// claim clock, loads policy, and runs the per-method translation with
+    /// all of it, so ref/data methods that need identity, time, or the
+    /// attestation gate can prepare. The socket dispatch path calls this
+    /// with a cancellation-aware `checkpoint`; arms whose required input
+    /// is absent (an unknown session has no row) refuse honestly, and
+    /// [`HostedCoordinator::submit_prepared`] still enforces session
+    /// authority and holder binding afterwards.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::EInvalid`] when the request is not a mutation.
+    /// - [`ErrorCode::EHosted`] when the method has no preparation on this
+    ///   path, or its required context input is absent.
+    /// - [`ErrorCode::EStale`], [`ErrorCode::ENotFound`],
+    ///   [`ErrorCode::EDivergent`], or [`ErrorCode::EForbidden`] from the
+    ///   per-method translation.
+    /// - [`ErrorCode::EIo`] from clock sampling, [`ErrorCode::EPolicy`]
+    ///   from policy load, and store errors from the session-row read.
+    pub fn prepare_for_dispatch(
+        &self,
+        session: SessionId,
+        request: Request,
+        checkpoint: &Checkpoint<'_>,
+    ) -> Result<PreparedMutation, CoreError> {
+        let key = session_key(session);
+        let session_row = self
+            .store
+            .fact(FactTable::Sessions, &key)?
+            .map(|bytes| decode_session(&self.store, &key, &bytes))
+            .transpose()?;
+        let policy = self.policies.load()?;
+        let claim_clock = ClaimClock::open(&self.store, self.clock.clone())?;
+        let ctx = PrepareContext {
+            store: &self.store,
+            session,
+            session_row: session_row.as_ref(),
+            clock: Some(&self.clock),
+            claim_clock: Some(&claim_clock),
+            policy: Some(&policy),
+            checkpoint: Some(checkpoint),
+        };
+        prepare_mutation_with(&ctx, request)
+    }
+
     /// Spawns the publication lane runner on `handle`.
     ///
     /// The runner is single ownership: the first call takes it and the host
@@ -236,14 +284,16 @@ impl HostedCoordinator {
     /// Closes the lane to new submissions and cancels the runner's blocking
     /// waits. In-flight batches still settle under sole publication ownership
     /// (each batch commits under its own uncancelled token), and queued
-    /// submissions drain before the runner returns. The store handle
-    /// retires best-effort: every committed byte was already synced by its
-    /// publication, so a flush failure here reports nothing new and the
-    /// next open truncates any uncommitted tail during recovery.
+    /// submissions drain before the runner returns. The store handle retires
+    /// when the runner exits (the runner closes it after the drain commits
+    /// the final batch), never here: closing before the drain would retire
+    /// the handle while drained batches can still append. Every committed
+    /// byte was already synced by its publication, so the retirement flush
+    /// reports nothing new and the next open truncates any uncommitted tail
+    /// during recovery.
     pub fn shutdown(&self) {
         self.lane.close();
         self.shutdown_handle.cancel();
-        let _ = self.store.close();
     }
 
     /// Opens one session for `principal` and publishes its durable row.
