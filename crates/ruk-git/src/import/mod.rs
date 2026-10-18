@@ -237,8 +237,37 @@ pub fn import_repository(
     let mut tally = CommitTally::empty();
     let mut peeled: HashMap<Oid, Oid> = HashMap::new();
 
-    while let Some(emit) = walker.next(&source, progress)? {
-        batcher.accept(&source, sink, &mut tally, &mut peeled, emit)?;
+    // Ordered prepare waves: the walk still discovers objects serially
+    // (closure order is inherently sequential), but the CPU-heavy staging
+    // of each drained chunk — hashing and zstd compression in
+    // `Store::prepare` plus tag parsing — runs across `import_threads`
+    // workers. Results rejoin strictly in walk order below, so batch
+    // boundaries, tally order, peel mapping, progress counts, and the
+    // first-error position are identical to the serial import. Publication
+    // keeps today's single-batch transaction shape; every prepared object
+    // is content-addressed with no predecessor, hence never a delta, so
+    // `check_delta_base` is vacuous here regardless of order.
+    let width = walk::import_threads();
+    loop {
+        let mut chunk = Vec::new();
+        while chunk.len() < PREPARE_CHUNK {
+            match walker.next(&source, progress)? {
+                Some(emit) => chunk.push(emit),
+                None => break,
+            }
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        let staged = prepare_chunk(store, progress, &chunk, width)?;
+        for (emit, staged) in chunk.into_iter().zip(staged) {
+            match staged? {
+                Staged::Ready(ready) => {
+                    batcher.accept_ready(&source, sink, &mut peeled, ready)?;
+                }
+                Staged::Serial => batcher.accept(&source, sink, &mut tally, &mut peeled, emit)?,
+            }
+        }
     }
 
     let plan = refs::plan_refs(store, request, &source_refs, &peeled)?;
@@ -280,6 +309,110 @@ pub fn import_repository(
         head,
         commits: tally,
         shallow: shallow_seen,
+    })
+}
+
+/// Emissions drained per prepare wave. One scoped wave of at most sixteen
+/// workers stages a chunk while the serial walk refills the next, so the
+/// wave count stays near `objects / PREPARE_CHUNK` instead of scaling with
+/// the object count. Bounded: a chunk holds at most this many payloads
+/// plus their staged objects, on the order of today's batch buffer.
+const PREPARE_CHUNK: usize = 256;
+
+/// One drained emission after the thread-safe part of its staging: either
+/// a prepared object ready to push in walk order, or the original emission
+/// for the serial path. Commits stay serial — observing them mutates the
+/// records overlay in order — and large blobs stay serial, streaming from
+/// the source inside the batcher as today.
+enum Staged {
+    Ready(ReadyObject),
+    Serial,
+}
+
+/// One wave-prepared object rejoining the serial batcher in walk order.
+/// Carries its OID, its staged store object, its decoded size, and the
+/// tag target the wave parsed, if any.
+struct ReadyObject {
+    oid: Oid,
+    prepared: PreparedObject,
+    size: u64,
+    tag: Option<Oid>,
+}
+
+/// Stages a drained chunk's thread-safe work: non-commit hashing,
+/// compression, and tag parsing. Pure per emission except for the shared
+/// preparation budget (mutex-guarded) and uniquely named scratch spools,
+/// so workers share only `store` and `progress`. Commits and streams defer
+/// to the serial path. The returned vector aligns 1:1 with `chunk`; the
+/// first error in walk order wins when the caller applies it with `?` in
+/// sequence. The scoped wave joins before returning: no task outlives the
+/// call that owns it, and a cancelled wave stops at the next chunk — the
+/// serial walk and batcher keep polling per object and per batch.
+fn prepare_chunk(
+    store: &Store,
+    progress: &ImportProgress,
+    chunk: &[walk::Emit],
+    width: usize,
+) -> Result<Vec<Result<Staged, GitError>>, GitError> {
+    fn stage_one(
+        store: &Store,
+        progress: &ImportProgress,
+        emit: &walk::Emit,
+    ) -> Result<Staged, GitError> {
+        if progress.is_cancelled() {
+            return Err(GitError::Cancelled {
+                detail: "import cancelled".to_owned(),
+            });
+        }
+        let walk::Emit::Memory { oid, object } = emit else {
+            return Ok(Staged::Serial);
+        };
+        if object.kind == ObjectKind::Commit {
+            return Ok(Staged::Serial);
+        }
+        let size = u64_len(object.payload.len(), "object payload")?;
+        let tag = if object.kind == ObjectKind::Tag {
+            refs::tag_target(object, store.hash_kind())?
+        } else {
+            None
+        };
+        let prepared = store
+            .prepare(object.kind, size, &object.payload[..], None)
+            .map_err(GitError::from)?;
+        if prepared.oid() != *oid {
+            return Err(GitError::Corrupt {
+                detail: format!("object {oid} hashes to {}", prepared.oid()),
+            });
+        }
+        Ok(Staged::Ready(ReadyObject {
+            oid: *oid,
+            prepared,
+            size,
+            tag,
+        }))
+    }
+
+    if width <= 1 {
+        return Ok(chunk.iter().map(|emit| stage_one(store, progress, emit)).collect());
+    }
+    let piece = chunk.len().div_ceil(width);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in chunk.chunks(piece) {
+            handles.push(scope.spawn(move || {
+                part.iter()
+                    .map(|emit| stage_one(store, progress, emit))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut staged = Vec::with_capacity(chunk.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => staged.extend(part),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        Ok(staged)
     })
 }
 
@@ -359,6 +492,30 @@ impl<'a, 'p> Batcher<'a, 'p> {
                 }
             }
         }
+        self.maybe_flush(sink)?;
+        Ok(())
+    }
+
+    /// Pushes one wave-prepared object in walk order: records a tag peel
+    /// when the wave parsed one, then stages exactly as the serial path
+    /// would have after preparing the same bytes.
+    fn accept_ready(
+        &mut self,
+        source: &objects::SourceObjects,
+        sink: &mut dyn PublishSink,
+        peeled: &mut HashMap<Oid, Oid>,
+        ready: ReadyObject,
+    ) -> Result<(), GitError> {
+        if let Some(target) = ready.tag {
+            peeled.insert(ready.oid, peel_final(source, target)?);
+        }
+        self.push(ready.prepared, ready.size)?;
+        self.maybe_flush(sink)?;
+        Ok(())
+    }
+
+    /// Publishes the in-flight batch once it reaches either admission bound.
+    fn maybe_flush(&mut self, sink: &mut dyn PublishSink) -> Result<(), GitError> {
         if self.objects.len() >= self.limits.batch_objects || self.bytes >= self.limits.batch_bytes
         {
             self.flush(sink, Vec::new())?;

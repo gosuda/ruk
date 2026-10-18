@@ -19,7 +19,7 @@ use ruk_core::store::ObjectKind;
 
 use crate::GitError;
 use crate::import::objects::{
-    Body, Location, SourceObject, SourceObjects, corrupt, header_name, verify,
+    Body, Location, SourceObject, SourceObjects, corrupt, header_name, oid_from_gix, verify,
 };
 
 /// Outgoing links of one object, in emission order.
@@ -60,12 +60,12 @@ pub fn object_links(
                 .map_err(|err| corrupt(format!("commit payload: {err}")))?;
             let mut links = Vec::with_capacity(parsed.parents.len() + 1);
             links.push(Link {
-                oid: hex_to_oid(&parsed.tree().to_hex().to_string(), hash)?,
+                oid: oid_from_gix(&parsed.tree(), hash)?,
                 kind: ObjectKind::Tree,
             });
             for parent in parsed.parents() {
                 links.push(Link {
-                    oid: hex_to_oid(&parent.to_hex().to_string(), hash)?,
+                    oid: oid_from_gix(&parent, hash)?,
                     kind: ObjectKind::Commit,
                 });
             }
@@ -85,7 +85,7 @@ pub fn object_links(
                     ObjectKind::Blob
                 };
                 links.push(Link {
-                    oid: hex_to_oid(&entry.oid.to_hex().to_string(), hash)?,
+                    oid: oid_from_gix(&entry.oid.to_owned(), hash)?,
                     kind: want,
                 });
             }
@@ -100,7 +100,7 @@ pub fn object_links(
                 gix_object::Kind::Commit => ObjectKind::Commit,
                 gix_object::Kind::Tag => ObjectKind::Tag,
             };
-            let oid = hex_to_oid(&parsed.target().to_hex().to_string(), hash)?;
+            let oid = oid_from_gix(&parsed.target(), hash)?;
             Ok(ObjectLinks {
                 links: vec![Link { oid, kind }],
             })
@@ -111,13 +111,18 @@ pub fn object_links(
     }
 }
 
-fn hex_to_oid(hex: &str, hash: HashKind) -> Result<Oid, GitError> {
-    crate::parse_oid_for(hex, hash)
-}
-
 /// Total payload bytes held in exit frames before the walker falls back to
 /// rereading an object at exit.
 pub(crate) const EXIT_HOLD_BYTES: u64 = 64 << 20;
+
+/// Import worker fan-out: host parallelism capped at sixteen. Prepare waves
+/// share this bound so one import never oversubscribes a workstation.
+pub(crate) fn import_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|width| width.get())
+        .unwrap_or(1)
+        .min(16)
+}
 
 /// One object the closure walk emits; the object's closure was already
 /// emitted (or is empty) when this is handed to the batcher.
