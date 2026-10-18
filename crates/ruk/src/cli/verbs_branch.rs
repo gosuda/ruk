@@ -1778,14 +1778,16 @@ pub(crate) fn symbolic_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
         },
     ];
     let opts = collect(args, &specs)?;
-    let _ = opts.single("message")?;
+    // `-m` is the reflog reason for deletions; writes move the workspace
+    // row, which carries no reflog message lane, so only deletes consume it.
+    let message = opts.single("message")?;
     match opts.positionals.as_slice() {
         [] => Err(GitError::Invalid {
             detail: "usage: symbolic-ref [-d] <name> [<target>]".to_owned(),
         }),
         [name] => {
             if opts.is_set("delete") {
-                return delete_symbolic(ctx, name);
+                return delete_symbolic(ctx, name, message);
             }
             if opts.is_set("short") {
                 let target = symbolic_target(ctx, name)?;
@@ -1881,14 +1883,26 @@ fn write_symbolic(ctx: &Ctx, name: &str, target: &str) -> Result<Vec<u8>, GitErr
     Ok(Vec::new())
 }
 
-/// Deletes one symbolic ref, refusing `HEAD`.
-fn delete_symbolic(ctx: &Ctx, name: &str) -> Result<Vec<u8>, GitError> {
+/// Deletes one symbolic ref, refusing `HEAD` and direct refs.
+fn delete_symbolic(ctx: &Ctx, name: &str, message: Option<String>) -> Result<Vec<u8>, GitError> {
     if name == "HEAD" {
         return Err(GitError::Invalid {
             detail: "deleting HEAD is not allowed".to_owned(),
         });
     }
-    delete_ref_logged(ctx, name, None, None)
+    let store = ctx.store()?;
+    let refname = RefName::new(name.to_owned()).map_err(|err| GitError::Invalid {
+        detail: format!("bad ref name: {err}"),
+    })?;
+    let target = super::state::read_ref(store, &refname)?.ok_or_else(|| GitError::NotFound {
+        detail: format!("ref {name} does not exist"),
+    })?;
+    if !matches!(target, RefTarget::Symbolic(_)) {
+        return Err(GitError::Invalid {
+            detail: format!("ref {name} is not a symbolic ref"),
+        });
+    }
+    delete_ref_logged(ctx, name, None, message)
 }
 
 /// Lists local references.
