@@ -323,7 +323,7 @@ pub(crate) fn commit_batch(
             session: m.candidate.session.id(),
             method: m.candidate.request.method(),
             committed_at: times.timestamp(),
-            undoes: None,
+            undoes: undone_operation(&m.candidate.request),
         };
 
         let op_record = oplog::record(&mut ops, parent_op, meta, &m.candidate.facts)?;
@@ -549,6 +549,14 @@ pub(crate) fn commit_batch(
     }
 
     Ok(())
+}
+
+/// The operation an `undo` request inverts; every other request inverts none.
+fn undone_operation(request: &Request) -> Option<OperationId> {
+    match request {
+        Request::Undo(undo) => Some(undo.args.operation),
+        _ => None,
+    }
 }
 
 fn validate_candidate(

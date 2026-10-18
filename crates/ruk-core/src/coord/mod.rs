@@ -24,6 +24,7 @@ mod retention;
 mod rows;
 mod session;
 mod transport;
+mod undo;
 #[cfg(windows)]
 mod windows;
 mod workspace;
