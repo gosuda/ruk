@@ -39,14 +39,14 @@ use std::sync::atomic::Ordering;
 
 use zstd::stream::read::Decoder;
 
+#[cfg(test)]
+use super::SEGMENTS_DIR;
+use super::Store;
 use super::delta::{IO_CHUNK, apply_delta, classify_read};
 use super::error::StoreError;
 use super::segment::{PreadReader, RecordPayload};
 use super::spool::to_u64;
 use super::types::{Encoding, ObjectKind, ReadObject};
-use super::Store;
-#[cfg(test)]
-use super::SEGMENTS_DIR;
 use crate::ids::{HashKind, Oid};
 
 /// Largest window any accepted frame may need: zstd level 3 uses

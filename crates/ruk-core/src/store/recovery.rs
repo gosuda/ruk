@@ -53,8 +53,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::durability;
 use super::guards::{CapturedLink, GenerationRegistry, ObjectSnapshot};

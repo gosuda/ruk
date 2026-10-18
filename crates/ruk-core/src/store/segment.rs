@@ -664,8 +664,9 @@ impl Read for PreadReader<'_> {
             return Ok(0);
         }
         let read = read_at(self.file, buf, self.pos)?;
-        self.pos += u64::try_from(read)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pread byte count overflows u64"))?;
+        self.pos += u64::try_from(read).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "pread byte count overflows u64")
+        })?;
         Ok(read)
     }
 }

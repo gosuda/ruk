@@ -1329,10 +1329,9 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
 fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
     let (workspace, _) = load_or_default(store)?;
     match workspace.head.resolve(&StoreRefs::new(store)) {
-        Ok(ruk_core::workspace::ResolvedHead::Detached(oid)) => Ok(HeadAdvertisement {
-            oid,
-            symref: None,
-        }),
+        Ok(ruk_core::workspace::ResolvedHead::Detached(oid)) => {
+            Ok(HeadAdvertisement { oid, symref: None })
+        }
         Ok(ruk_core::workspace::ResolvedHead::Symbolic(resolved)) => Ok(HeadAdvertisement {
             oid: resolved.oid.unwrap_or_else(|| store.hash_kind().zero_oid()),
             symref: Some(resolved.terminal.as_bytes().to_vec()),

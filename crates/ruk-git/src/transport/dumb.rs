@@ -76,8 +76,8 @@ fn type_name(kind: ObjectKind) -> Option<&'static str> {
 /// drops the ref the way the oracle's dumb handlers skip refs they cannot
 /// serve. A store read failure is not a missing ref: it propagates.
 fn resolve(store: &Store, name: &[u8]) -> Result<Option<Oid>, GitError> {
-    let name = RefName::new(name)
-        .map_err(|err| corrupt(format!("stored ref name is invalid: {err}")))?;
+    let name =
+        RefName::new(name).map_err(|err| corrupt(format!("stored ref name is invalid: {err}")))?;
     match ruk_core::refdata::resolve(&StoreRefs::new(store), &name) {
         Ok(resolved) => Ok(resolved.oid),
         Err(ruk_core::refdata::RefError::Read(err)) => Err(GitError::from(err)),
@@ -254,9 +254,7 @@ mod tests {
     use super::super::session::test_support::{store_with_pack, test_store};
     use super::*;
     use ruk_core::ids::HashKind;
-    use ruk_core::refdata::{
-        RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate,
-    };
+    use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
     use ruk_core::refs::prepare_checked_transaction;
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";

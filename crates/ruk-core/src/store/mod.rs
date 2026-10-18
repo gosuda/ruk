@@ -2049,7 +2049,12 @@ mod tests {
         for group in indices.chunks(CHUNK) {
             let batch: Vec<PreparedObject> = group
                 .iter()
-                .map(|i| blob(&store, &pseudo(16, u64::try_from(*i).expect("object index fits u64"))))
+                .map(|i| {
+                    blob(
+                        &store,
+                        &pseudo(16, u64::try_from(*i).expect("object index fits u64")),
+                    )
+                })
                 .collect();
             oids.extend(store.publish(batch, &[]).expect("publish").objects);
         }
