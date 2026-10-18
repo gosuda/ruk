@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn fetch_ingests_a_canned_pack() {
         use super::super::fetch::verify_closure;
-        use super::super::session::test_support::{store_with_pack, test_store};
+        use super::super::session::test_support::test_store;
 
         let kind = HashKind::Sha1;
         let pack = include_bytes!("fixtures/basic.pack").to_vec();
@@ -878,7 +878,6 @@ mod tests {
         ]);
         let adv = discover(&base, SmartService::UploadPack, kind).expect("discover");
         let dest = test_store(kind);
-        let _src = store_with_pack(kind, &pack);
         let req = FetchWireRequest {
             wants: vec![oid(FOUR)],
             haves: Vec::new(),
@@ -993,11 +992,9 @@ mod tests {
             updates: updates.clone(),
             atomic: false,
         };
-        let _dest = test_store(kind);
-        let mut plan =
-            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
-        let outcomes =
-            push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none()).expect("push");
+                let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let outcomes = push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none())
+            .expect("push");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].name, b"refs/heads/x");
         assert!(

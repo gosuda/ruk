@@ -746,6 +746,9 @@ impl Read for HttpBodyReader {
                 let want = usize::try_from((*rest).min(buf.len() as u64))
                     .map_err(|_| io_failed("response length exceeds addressable memory"))?;
                 let got = self.reader.read(&mut buf[..want])?;
+                if got == 0 {
+                    return Err(io_failed("response body ended early"));
+                }
                 *rest -= got as u64;
                 Ok(got)
             }
@@ -1509,6 +1512,44 @@ mod tests {
         body.read_to_end(&mut decoded).expect("read");
         // Exactly the declared 12 bytes: pkt-line never sees framing
         // spill or the trailing connection bytes.
+        assert_eq!(decoded, b"0008NAK\n0000");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn post_open_refuses_a_truncated_body() {
+        let (port, server) = fake_raw_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n0008NAK\n".to_vec(),
+        ]);
+        let (mut body, status, _) = post_open(
+            &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
+            &[],
+            b"0000",
+        )
+        .expect("post");
+        assert_eq!(status, 200);
+        let mut decoded = Vec::new();
+        let err = body
+            .read_to_end(&mut decoded)
+            .expect_err("truncated body must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn post_open_reads_an_undelimited_body_to_eof() {
+        let (port, server) = fake_raw_server(vec![
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n0008NAK\n0000".to_vec(),
+        ]);
+        let (mut body, status, _) = post_open(
+            &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
+            &[],
+            b"0000",
+        )
+        .expect("post");
+        assert_eq!(status, 200);
+        let mut decoded = Vec::new();
+        body.read_to_end(&mut decoded).expect("read");
         assert_eq!(decoded, b"0008NAK\n0000");
         server.join().expect("server");
     }
