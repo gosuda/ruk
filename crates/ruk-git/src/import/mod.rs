@@ -324,6 +324,9 @@ const PREPARE_CHUNK: usize = 256;
 /// for the serial path. Commits stay serial — observing them mutates the
 /// records overlay in order — and large blobs stay serial, streaming from
 /// the source inside the batcher as today.
+// 264 bytes per item worst case, times a 256-item chunk: boxed indirection
+// would only trade one transient allocation per emission for nothing.
+#[expect(clippy::large_enum_variant)]
 enum Staged {
     Ready(ReadyObject),
     Serial,
@@ -393,7 +396,10 @@ fn prepare_chunk(
     }
 
     if width <= 1 {
-        return Ok(chunk.iter().map(|emit| stage_one(store, progress, emit)).collect());
+        return Ok(chunk
+            .iter()
+            .map(|emit| stage_one(store, progress, emit))
+            .collect());
     }
     let piece = chunk.len().div_ceil(width);
     std::thread::scope(|scope| {
