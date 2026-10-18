@@ -264,8 +264,10 @@ enum Matcher {
         ignore_case: bool,
         word: bool,
     },
-    /// Alternation of the patterns.
-    Re { regex: Regex, word: bool },
+    /// One compiled regex per pattern: each pattern searches the line
+    /// independently, so a short alternative can never shadow a longer one
+    /// sharing its prefix (leftmost-first alternation would).
+    Re { regexes: Vec<Regex>, word: bool },
 }
 
 /// Compiles the patterns for one engine; regex failures are usage errors.
@@ -290,21 +292,20 @@ fn build_matcher(
             word: options.word,
         }),
         Engine::Regex => {
-            let combined = patterns
-                .iter()
-                .map(|pattern| format!("(?:{pattern})"))
-                .collect::<Vec<_>>()
-                .join("|");
-            RegexBuilder::new(&combined)
-                .case_insensitive(options.ignore_case)
-                .build()
-                .map(|regex| Matcher::Re {
-                    regex,
-                    word: options.word,
-                })
-                .map_err(|err| GitError::Usage {
-                    detail: format!("bad pattern: {err}"),
-                })
+            let mut regexes = Vec::with_capacity(patterns.len());
+            for pattern in patterns {
+                let regex = RegexBuilder::new(pattern)
+                    .case_insensitive(options.ignore_case)
+                    .build()
+                    .map_err(|err| GitError::Usage {
+                        detail: format!("bad pattern {pattern:?}: {err}"),
+                    })?;
+                regexes.push(regex);
+            }
+            Ok(Matcher::Re {
+                regexes,
+                word: options.word,
+            })
         }
     }
 }
@@ -370,7 +371,7 @@ fn scan_impl<'bytes>(matcher: &Matcher, bytes: &'bytes [u8], want: CountMatches)
 /// Reports whether one raw line matches any pattern.
 fn line_matches(matcher: &Matcher, line: &[u8]) -> bool {
     match matcher {
-        Matcher::Re { regex, word } => {
+        Matcher::Re { regexes, word } => regexes.iter().any(|regex| {
             if !word {
                 return regex.is_match(line);
             }
@@ -380,7 +381,7 @@ fn line_matches(matcher: &Matcher, line: &[u8]) -> bool {
                 let right_ok = end == line.len() || !is_word_byte(line[end]);
                 left_ok && right_ok
             })
-        }
+        }),
         Matcher::Fixed {
             needles,
             ignore_case,

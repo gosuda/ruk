@@ -1350,6 +1350,111 @@ fn network_scheme_routing_names_gaps() {
 }
 
 #[test]
+fn fetch_over_smart_http_publishes_pack_and_ref() {
+    use std::net::TcpListener;
+
+    use ruk_core::refdata::{RefName, RefRead as _};
+    use ruk_core::refs::StoreRefs;
+
+    const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+        out.extend_from_slice(payload);
+        out
+    }
+    fn sideband(payload: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", payload.len() + 5).into_bytes();
+        out.push(1);
+        out.extend_from_slice(payload);
+        out
+    }
+    let mut adv = frame(b"# service=git-upload-pack\n");
+    adv.extend_from_slice(b"0000");
+    adv.extend_from_slice(&frame(
+        format!("{FOUR} HEAD\0multi_ack_detailed side-band-64k thin-pack ofs-delta object-format=sha1\n")
+            .as_bytes(),
+    ));
+    adv.extend_from_slice(&frame(format!("{FOUR} refs/heads/main\n").as_bytes()));
+    adv.extend_from_slice(b"0000");
+    let pack = include_bytes!("../../../ruk-git/src/transport/fixtures/basic.pack");
+    let mut result = frame(b"NAK\n");
+    result.extend_from_slice(&sideband(pack));
+    result.extend_from_slice(b"0000");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+    let port = listener.local_addr().expect("addr").port();
+    let (served_tx, served_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for (body, ctype) in [
+            (adv, "application/x-git-upload-pack-advertisement"),
+            (result, "application/x-git-upload-pack-result"),
+        ] {
+            let (socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut reader = BufReader::new(socket.try_clone().expect("split"));
+            let mut head = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).expect("request line");
+                if line.is_empty() {
+                    panic!("client hung up mid-request");
+                }
+                head.extend_from_slice(&line);
+                if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let length = text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if length > 0 {
+                let mut discard = vec![0_u8; length];
+                reader.read_exact(&mut discard).expect("request body");
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut socket = socket;
+            socket.write_all(reply.as_bytes()).expect("reply head");
+            socket.write_all(&body).expect("reply body");
+        }
+        served_tx.send(()).expect("signal served");
+    });
+
+    let (root, env) = seeded_repo("httpfetch", "f.txt", b"f\n");
+    let mut ctx = repo_ctx(&root, env);
+    let url = format!("http://127.0.0.1:{port}/a.git");
+    // Into a remote-tracking name: the seeded `main` already exists
+    // locally, and fast-forward planning cannot walk a tip it has not
+    // fetched yet.
+    run(
+        verbs_transport::fetch,
+        &mut ctx,
+        &[&url, "refs/heads/main:refs/remotes/origin/main"],
+    )
+    .expect("http fetch");
+    // Bounded wait, never a bare join: a client that stops after
+    // discovery must fail the test, not hang the suite.
+    served_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("server finished both RPCs");
+    let store = ctx.store().expect("store");
+    let oid = ruk_core::ids::Oid::from_hex(FOUR).expect("hex");
+    store.read(oid).expect("fetched object present");
+    let name = RefName::new(b"refs/remotes/origin/main".to_vec()).expect("name");
+    let target = StoreRefs::new(&store).get(&name).expect("read ref").expect("ref present");
+    assert_eq!(target, ruk_core::refdata::RefTarget::Direct(oid));
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn sequencer_absent_reads_clean() {
     let (root, env) = seeded_repo("seq", "s.txt", b"s\n");
     let mut ctx = repo_ctx(&root, env);
@@ -1814,6 +1919,18 @@ fn grep_word_case_and_repeatable_patterns() {
     assert_eq!(out, b"Foo bar\n");
     let out = run(verbs_grep::grep, &mut ctx, &["-e", "bar", "-e", "fight"]).expect("grep -e");
     assert_eq!(out, b"Foo bar\nfood fight\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_word_prefix_alternatives_both_match() {
+    // Oracle check: `git grep -w -e foo -e foobar` matches both lines;
+    // a shared leftmost alternation would drop "foobar x".
+    let (root, env) = seeded_repo("grep-shadow", "a.txt", b"foobar x\nfoo y\nxfoobarbaz\n");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_grep::grep, &mut ctx, &["-w", "-e", "foo", "-e", "foobar"])
+        .expect("grep -w -e");
+    assert_eq!(out, b"foobar x\nfoo y\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
