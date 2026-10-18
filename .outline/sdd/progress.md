@@ -81,5 +81,8 @@ The first consumer run incorrectly classified the other supported hash kind as m
 ## Change-identity decision (user-adopted)
 change-id header only in conflict-v1 frames; exportable commits get deterministic jj-style OID-derived ChangeId; parity 54/56 (remaining: init wording, stash merge shape).
 
-## Mutation translation (in progress)
-Design: .outline/sdd/mutation-translation-design.md (W0 context + W1 ref/data landed 262fba0; W2 commit minting, W3 history rewrite, W4 workspace, W5 tree/conflict+oplog, W6 transport remain).
+## Mutation translation (waves 2–6 landed, wave 8 reviewed)
+Design: .outline/sdd/mutation-translation-design.md. Waves W2–W6 landed through `a6feb57`; wave-8 review (`local://wave8-review.md`) found 3×P1 (squash wrong-destination revert, undo unchecked ref rows, retry replay ordering), 3×P2, 3×P3 — all fixed through `19b68c0`; 1283/1283 green. Served: prepare arms for `new`, `edit` (checkout), `ws.scope/take/drop`, `describe`, `split`, `squash` (incl. paths/keep_empty via `ops/tree_edit.rs`), `rebase` (content-less), `abandon`, `resolve`, `revert`, `undo` (exact inverse facts, `E_UNDO_CONFLICT`/`E_STALE` on divergence), `claim.acquire/release` (lane seal write-back), `land.prepare` (PlanId minted; publish in `land.rs`). Refused naming machinery: `snapshot`, `write`, `ws.recover` (workcopy job split), `fetch`, `push`, `push.reconcile`, `land.execute` (transfer/send + remote-observation legs missing), `op.prune` (no retention policy exists). Retry replay: receipt consulted before prepare.
+
+## Forgejo branch-page integration (partial, gaps named)
+Commit `5072201288`/`97dbc57d70` in `forgejo/`: `IDX_branch_repo_deleted_commit_name` migration + `GetFirstBranch` bounded ref read. Gaps: (A) fresh installs never run init funcs — `models/db/engine.go:86` checks `len(initFuncs)` vs `len(initFunc)`, upstream bug, fix would enable auth-token caches; (B) no native ref-count/bounded-list IPC method; (C) no typed reflog/ref-change page with sequence cursor for the branch-table projection. Evidence: `.outline/sdd/task-10b-report.md`.
