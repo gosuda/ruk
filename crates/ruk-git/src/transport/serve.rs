@@ -19,17 +19,19 @@
 //!   capabilities), and a `filter` capability request is refused the way
 //!   the oracle refuses unnegotiated filtering.
 //! - `receive-pack` advertises refs with `report-status delete-refs
-//!   ofs-delta object-format agent`, reads update commands, ingests the
-//!   pack (skipped for delete-only pushes, mirroring the oracle's
-//!   `delete_only` gate), verifies the closure, stages the objects in
-//!   quarantine (see [`super::hooks`]), runs the `pre-receive`/`update`
-//!   phases, publishes objects plus commit rows only when those pass, and
-//!   applies surviving refs through the shared
+//!   ofs-delta push-options object-format agent`, reads update commands,
+//!   then the push options (which precede the pack, like the oracle's
+//!   `read_push_options`), ingests the pack (skipped for delete-only
+//!   pushes, mirroring the oracle's `delete_only` gate), verifies the
+//!   closure, stages the objects in quarantine (see [`super::hooks`]),
+//!   runs the `pre-receive`/`update` phases, publishes objects plus commit
+//!   rows only when those pass, diverts `refs/for/` and `refs/pull/`
+//!   commands to the `proc-receive` hook (see [`super::proc_receive`]),
+//!   and applies surviving refs through the shared
 //!   [`apply_refs`](super::session::apply_refs) CAS path, reporting
-//!   per-ref `ok`/`ng` lines, before the `post-receive` phase. `atomic`,
-//!   `push-cert` and `push-options` are
-//!   not advertised; an `atomic` request that arrives anyway rejects every
-//!   ref instead of desynchronizing the stream.
+//!   per-ref `ok`/`ng` lines, before the `post-receive` phase. `atomic`
+//!   and `push-cert` are not advertised; an `atomic` request that arrives
+//!   anyway rejects every ref instead of desynchronizing the stream.
 //!
 //! The functions are generic over separate `Read`/`Write` halves so the CLI
 //! verbs can run them buffered (scripted stdin) or streaming (live pipes).
@@ -48,9 +50,10 @@ use ruk_core::refdata::{RefName, RefTarget};
 use ruk_core::store::{FactMutation, Store};
 
 use super::fetch::{commit_record_facts, verify_closure};
-use super::hooks::{ReceiveHooks, run_hook, stage_quarantine};
+use super::hooks::{Quarantine, ReceiveHooks, run_hook, stage_quarantine};
 use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, write_pack};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush, send};
+use super::proc_receive::{ProcReceiveCommand, ProcVerdict, is_proc_receive_ref, run_proc_receive};
 use super::push::{PushUpdate, RefResult};
 use super::session::{LocalFetchRequest, advertise, apply_refs, local_closure};
 use super::{AGENT, Interrupt, has_object};
@@ -140,6 +143,11 @@ fn read_frame<R: Read>(pkt: &mut PktReader<R>, what: &str) -> Result<Option<Vec<
         other => Err(corrupt(format!("expected {what}, got {other:?}"))),
     }
 }
+
+/// Largest push-option count accepted: the oracle bounds nothing, but an
+/// unbounded pre-pack read is a memory sink, and no real client (Forgejo
+/// uses at most four AGit keys) approaches this.
+const MAX_PUSH_OPTIONS: usize = 256;
 
 /// One parsed `want` line: the requested OID and whether the client asked
 /// for multi-ack negotiation on this line's capability list.
@@ -390,6 +398,79 @@ fn hook_line(cmd: &Command) -> String {
     )
 }
 
+/// Runs the AGit diversion for surviving proc-receive commands: accepted
+/// commands report `ok` for their original ref (the review backend wrote
+/// the review ref itself), refused ones report `ng`, and fall-through
+/// commands rejoin the normal path through the `update` hook, leaving
+/// their verdict undecided for the CAS path below.
+#[allow(clippy::too_many_arguments)]
+fn run_proc_receive_phase(
+    live: &[(usize, PushUpdate)],
+    results: &mut [Option<Result<(), String>>],
+    hooks: &ReceiveHooks,
+    quarantine: Option<&Quarantine>,
+    push_options: &[String],
+    offer_push_options: bool,
+    kind: HashKind,
+    interrupt: &Interrupt,
+) -> Result<(), GitError> {
+    let mut indices = Vec::new();
+    let mut hook_commands = Vec::new();
+    for (index, update) in live {
+        if results[*index].is_none() && is_proc_receive_ref(&update.name) {
+            indices.push(*index);
+            hook_commands.push(ProcReceiveCommand {
+                old: update.old,
+                new: update.new,
+                name: update.name.clone(),
+            });
+        }
+    }
+    if hook_commands.is_empty() {
+        return Ok(());
+    }
+    interrupt.check("running proc-receive hook")?;
+    let verdicts = run_proc_receive(
+        hooks,
+        quarantine,
+        &hook_commands,
+        push_options,
+        offer_push_options,
+        kind,
+        interrupt,
+    );
+    for (position, verdict) in verdicts.into_iter().enumerate() {
+        let index = indices[position];
+        match verdict {
+            ProcVerdict::Accepted { .. } => results[index] = Some(Ok(())),
+            ProcVerdict::Rejected { reason } => results[index] = Some(Err(reason)),
+            ProcVerdict::FallThrough => {}
+        }
+    }
+    for (index, update) in live {
+        if !indices.contains(index) || results[*index].is_some() {
+            continue;
+        }
+        interrupt.check("running update hooks")?;
+        let args = [
+            String::from_utf8_lossy(&update.name).into_owned(),
+            update.old.to_hex(),
+            update.new.to_hex(),
+        ];
+        if let Some(reason) = run_hook(
+            hooks,
+            quarantine,
+            "update",
+            &args,
+            None,
+            push_options,
+        ) {
+            results[*index] = Some(Err(reason));
+        }
+    }
+    Ok(())
+}
+
 /// Serves one `receive-pack` session: writes the advertisement, reads update
 /// commands plus the pack, and reports per-ref outcomes.
 ///
@@ -428,14 +509,17 @@ pub fn serve_receive_pack<R: Read, W: Write>(
 /// Serves one `receive-pack` session with quarantine staging and hook
 /// phases (see [`super::hooks`]): the pack stages unpublished, hooks
 /// observe it through the quarantine directory, staged objects publish
-/// only after the refusing phases pass, surviving refs apply through the
-/// shared CAS path, and `post-receive` runs after refs land.
+/// only after the refusing phases pass, `refs/for/` and `refs/pull/`
+/// commands divert to the `proc-receive` hook (see
+/// [`super::proc_receive`]), surviving refs apply through the shared CAS
+/// path, and `post-receive` runs after refs land.
 ///
 /// A `pre-receive` refusal marks every live ref `ng` and drops the staging
 /// without publishing; an `update` refusal marks only its own ref; a
-/// `post-receive` failure is relayed to the server's stderr and never
-/// fails the push. Refusals complete the protocol with `unpack ok` plus
-/// `ng` lines and return `Ok`, exactly like CAS rejections.
+/// `proc-receive` refusal marks only its diverted refs while normal refs
+/// still land; a `post-receive` failure is relayed to the server's stderr
+/// and never fails the push. Refusals complete the protocol with `unpack
+/// ok` plus `ng` lines and return `Ok`, exactly like CAS rejections.
 ///
 /// # Errors
 /// [`GitError::Corrupt`] for grammar violations, [`GitError::ObjectFormat`]
@@ -456,7 +540,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         });
     }
     let caps = format!(
-        "report-status delete-refs ofs-delta object-format={} agent={}",
+        "report-status delete-refs ofs-delta push-options object-format={} agent={}",
         object_format_value(kind),
         AGENT
     );
@@ -465,6 +549,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     let mut pkt = PktReader::new(reader, interrupt.clone());
     let mut commands: Vec<Command> = Vec::new();
     let mut atomic = false;
+    let mut client_push_options = false;
     while let Some(mut line) = read_frame(&mut pkt, "update commands")? {
         if commands.is_empty() {
             if line == b"push-cert" || line.starts_with(b"push-cert\0") {
@@ -477,6 +562,8 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
                 for token in tail[1..].split(|b| *b == b' ') {
                     if token == b"atomic" {
                         atomic = true;
+                    } else if token == b"push-options" {
+                        client_push_options = true;
                     }
                 }
             }
@@ -485,6 +572,24 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     }
     if commands.is_empty() {
         return Ok(());
+    }
+    // Push options follow the commands flush and precede the pack, exactly
+    // like the oracle's `read_push_options` before `unpack_with_sideband`.
+    // Forgejo advertises them on every repository
+    // (`receive.advertisePushOptions`), and AGit reads `topic`,
+    // `force-push`, `title` and `description` from them.
+    let mut push_options: Vec<String> = Vec::new();
+    if client_push_options {
+        while let Some(line) = read_frame(&mut pkt, "push options")? {
+            if push_options.len() >= MAX_PUSH_OPTIONS {
+                return Err(GitError::Limit {
+                    detail: format!("push sent more than {MAX_PUSH_OPTIONS} options"),
+                });
+            }
+            let option = String::from_utf8(line)
+                .map_err(|_| corrupt("push option is not UTF-8"))?;
+            push_options.push(option);
+        }
     }
     let zero = kind.zero_oid();
     // Pre-validate names: `apply_refs` fails the whole batch on a malformed
@@ -555,6 +660,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         "pre-receive",
         &[],
         Some(all_lines.as_bytes()),
+        &push_options,
     ) {
         for (index, _) in &live {
             results[*index] = Some(Err(reason.clone()));
@@ -564,14 +670,27 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     }
     // `update` per live ref over argv (`<ref> <old> <new>`, mirroring the
     // oracle and Forgejo's dispatcher): a refusal marks only its own ref.
+    // Proc-receive refs skip this phase: the oracle's `update()` runs only
+    // for commands the hook did not claim, and Forgejo never sees an
+    // `update` call for `refs/for/` either.
     for (index, update) in &live {
+        if is_proc_receive_ref(&update.name) {
+            continue;
+        }
         interrupt.check("running update hooks")?;
         let args = [
             String::from_utf8_lossy(&update.name).into_owned(),
             update.old.to_hex(),
             update.new.to_hex(),
         ];
-        if let Some(reason) = run_hook(hooks, quarantine.as_ref(), "update", &args, None) {
+        if let Some(reason) = run_hook(
+            hooks,
+            quarantine.as_ref(),
+            "update",
+            &args,
+            None,
+            &push_options,
+        ) {
             results[*index] = Some(Err(reason));
         }
     }
@@ -587,22 +706,37 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             return Err(err);
         }
     }
+    // AGit diversion runs only outside `atomic`: consulting the hook could
+    // create a review the client is then told failed, and atomicity across
+    // a review backend is out of scope, so atomic rejects everything first.
+    if atomic {
+        for (index, _) in &live {
+            if results[*index].is_none() {
+                results[*index] = Some(Err("atomic pushes are not supported".to_owned()));
+            }
+        }
+    } else {
+        run_proc_receive_phase(
+            &live,
+            &mut results,
+            hooks,
+            quarantine.as_ref(),
+            &push_options,
+            client_push_options,
+            kind,
+            interrupt,
+        )?;
+    }
     // Only hook-surviving refs reach the CAS path; hook verdicts already
-    // recorded above are never overwritten.
+    // recorded above are never overwritten. Fall-through refs rejoined the
+    // undecided set with their `update` verdict recorded, so they apply
+    // through the same path as ordinary refs.
     let survivors: Vec<&PushUpdate> = live
         .iter()
         .filter(|(index, _)| results[*index].is_none())
         .map(|(_, update)| update)
         .collect();
-    if atomic {
-        for survivor in &survivors {
-            let (index, _) = live
-                .iter()
-                .find(|(_, update)| update.name == survivor.name)
-                .expect("survivor names a live command");
-            results[*index] = Some(Err("atomic pushes are not supported".to_owned()));
-        }
-    } else if !survivors.is_empty() {
+    if !atomic && !survivors.is_empty() {
         match apply_refs(store, kind, &survivors, false) {
             Ok(outcomes) => {
                 for outcome in &outcomes {
@@ -647,6 +781,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             "post-receive",
             &[],
             Some(landed.as_bytes()),
+            &push_options,
         ) {
             tracing::warn!("post-receive hook failed: {reason}");
         }
@@ -1108,12 +1243,36 @@ mod tests {
         pack: &[u8],
         hooks: &ReceiveHooks,
     ) -> Vec<Vec<u8>> {
+        serve_push_raw(
+            dest,
+            kind,
+            updates,
+            "report-status delete-refs ofs-delta agent=test",
+            &[],
+            pack,
+            hooks,
+        )
+    }
+
+    /// Serves one push whose first command carries `first_caps`, with raw
+    /// `middle` bytes (push-option frames) between the commands flush and
+    /// the pack, returning the report lines.
+    fn serve_push_raw(
+        dest: &Store,
+        kind: HashKind,
+        updates: &[(Oid, Oid, &[u8])],
+        first_caps: &str,
+        middle: &[u8],
+        pack: &[u8],
+        hooks: &ReceiveHooks,
+    ) -> Vec<Vec<u8>> {
         let mut input = Vec::new();
         for (index, (old, new, name)) in updates.iter().enumerate() {
-            let caps = (index == 0).then_some("report-status delete-refs ofs-delta agent=test");
+            let caps = (index == 0).then_some(first_caps);
             input.extend_from_slice(&command(*old, *new, name, caps));
         }
         input.extend_from_slice(b"0000");
+        input.extend_from_slice(middle);
         input.extend_from_slice(pack);
         let mut out = Vec::new();
         serve_receive_pack_with(
@@ -1129,6 +1288,56 @@ mod tests {
         report_lines(&out)
     }
 
+    /// Writes an executable `hooks/proc-receive` stub speaking the hook
+    /// protocol: it records the diverted commands to `cmds_marker` and
+    /// answers every command with `verdict`. Byte-exact `dd` reads keep it
+    /// POSIX sh (no `head -c` over-read, no bashisms); the conversation is
+    /// lock-step with the server so no phase blocks. Only the accept path
+    /// needs a speaking stub — refusals use `exit 1`, and the protocol
+    /// grammar itself is covered by in-memory transcript tests.
+    fn write_proc_receive_stub(
+        repo: &std::path::Path,
+        cmds_marker: &std::path::Path,
+        verdict: &str,
+    ) {
+        let body = format!(
+            r#"
+L=$(dd bs=4 count=1 2>/dev/null)
+N=$(($((0x$L)) - 4))
+V=$(dd bs=1 count="$N" 2>/dev/null)
+F=$(dd bs=4 count=1 2>/dev/null)
+printf '000eversion=1\n0000'
+while :; do
+  L=$(dd bs=4 count=1 2>/dev/null)
+  [ "$L" = "0000" ] && break
+  [ -z "$L" ] && exit 1
+  N=$(($((0x$L)) - 4))
+  C=$(dd bs=1 count="$N" 2>/dev/null)
+  echo "$C" >> "{cmds}"
+  set -- $C
+  REF=$3
+  NEW=$2
+  {verdict}
+done
+printf '0000'
+"#,
+            cmds = cmds_marker.display(),
+        );
+        write_hook(repo, "proc-receive", &body);
+    }
+
+    /// Answers one diverted command with `ok` plus a review-ref option.
+    fn ok_with_review_ref() -> &'static str {
+        r#"
+  R="ok $REF"
+  printf '%04x%s' "$((${#R} + 4))" "$R"
+  O="option refname refs/pull/1/head"
+  printf '%04x%s' "$((${#O} + 4))" "$O"
+  O2="option new-oid $NEW"
+  printf '%04x%s' "$((${#O2} + 4))" "$O2"
+"#
+    }
+
     fn ref_oid(dest: &Store, name: &[u8]) -> Option<Oid> {
         let target = StoreRefs::new(dest)
             .get(&RefName::new(name.to_vec()).expect("ref name"))
@@ -1137,6 +1346,161 @@ mod tests {
             Some(RefTarget::Direct(oid)) => Some(oid),
             _ => None,
         }
+    }
+
+    /// A mixed push diverts `refs/for/` to the hook while the normal ref
+    /// lands: the client sees `ok` for both, the review backend saw only
+    /// the diverted command, and no literal `refs/for/` ref is created.
+    #[test]
+    fn agit_ok_routes_for_to_review_not_literal_ref() {
+        use std::time::Duration;
+
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let cmds_marker = repo.join("proc-commands");
+        write_proc_receive_stub(&repo, &cmds_marker, ok_with_review_ref());
+        let hooks = ReceiveHooks::for_repo(repo).with_timeout(Duration::from_secs(10));
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_raw(
+            &dest,
+            kind,
+            &[
+                (kind.zero_oid(), oid(FOUR), b"refs/heads/main"),
+                (kind.zero_oid(), oid(FOUR), b"refs/for/main"),
+            ],
+            "report-status delete-refs ofs-delta agent=test",
+            &[],
+            &pack,
+            &hooks,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                b"unpack ok".to_vec(),
+                b"ok refs/heads/main".to_vec(),
+                b"ok refs/for/main".to_vec(),
+            ]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+        assert_eq!(ref_oid(&dest, b"refs/for/main"), None);
+        let seen = std::fs::read_to_string(&cmds_marker).expect("hook saw commands");
+        assert!(
+            seen.contains("refs/for/main"),
+            "hook missed the diverted command: {seen:?}"
+        );
+        assert!(
+            !seen.contains("refs/heads/main"),
+            "hook saw a normal ref: {seen:?}"
+        );
+    }
+
+    /// A failing `proc-receive` hook refuses only its diverted refs
+    /// in-band; the normal refs of the same push still land.
+    #[test]
+    fn agit_hook_failure_keeps_normal_refs() {
+        use std::time::Duration;
+
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        write_hook(&repo, "proc-receive", "exit 1\n");
+        let hooks = ReceiveHooks::for_repo(repo).with_timeout(Duration::from_secs(10));
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_raw(
+            &dest,
+            kind,
+            &[
+                (kind.zero_oid(), oid(FOUR), b"refs/heads/main"),
+                (kind.zero_oid(), oid(FOUR), b"refs/for/main"),
+            ],
+            "report-status delete-refs ofs-delta agent=test",
+            &[],
+            &pack,
+            &hooks,
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], b"unpack ok");
+        assert_eq!(lines[1], b"ok refs/heads/main");
+        assert!(
+            lines[2].starts_with(b"ng refs/for/main "),
+            "got {:?}",
+            lines[2]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+        assert_eq!(ref_oid(&dest, b"refs/for/main"), None);
+    }
+
+    /// With no `proc-receive` script installed there is no review backend,
+    /// so `refs/for/` pushes fall through to the normal ref path.
+    #[test]
+    fn agit_missing_hook_falls_through_to_normal_ref() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/for/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/for/main".to_vec(),]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/for/main"), Some(oid(FOUR)));
+    }
+
+    /// Push options travel before the pack on the wire and reach hooks as
+    /// `GIT_PUSH_OPTION_*`: a `pre-receive` recorder observes them while
+    /// the pack still ingests normally.
+    #[test]
+    fn push_options_reach_hooks_before_the_pack() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let marker = repo.join("push-options");
+        write_hook(
+            &repo,
+            "pre-receive",
+            &format!(
+                "echo \"COUNT=$GIT_PUSH_OPTION_COUNT OPT0=$GIT_PUSH_OPTION_0\" > \"{}\"\n",
+                marker.display()
+            ),
+        );
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+        let mut middle = Vec::new();
+        encode_data(&mut middle, b"topic=my-topic").expect("frame");
+        middle.extend_from_slice(b"0000");
+
+        let lines = serve_push_raw(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            "report-status delete-refs ofs-delta push-options agent=test",
+            &middle,
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+        let seen = std::fs::read_to_string(&marker).expect("hook saw options");
+        assert!(
+            seen.contains("COUNT=1 OPT0=topic=my-topic"),
+            "options lost: {seen:?}"
+        );
     }
 
     #[test]

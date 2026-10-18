@@ -128,6 +128,11 @@ impl ReceiveHooks {
         self.repo_dir.is_some()
     }
 
+    /// The per-hook wall-clock budget bounding one hook conversation.
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// The repository directory hooks resolve against, if any.
     #[must_use]
     pub fn repo_dir(&self) -> Option<&Path> {
@@ -268,16 +273,20 @@ fn write_loose(objects: &Path, hex: &str, type_name: &str, payload: &[u8]) -> Re
 /// Runs one hook phase: `None` when the hook passes or is absent,
 /// `Some(reason)` when it refuses.
 ///
-/// Spawn failures and timeouts refuse fail-closed with an explanatory
-/// reason; they never pass silently and never abort the protocol with an
-/// error (the refusal travels in-band as `ng` lines, like any hook
-/// decline). Direct exec, never a shell: `args` cannot interpolate.
+/// `push_options` reaches the hook as `GIT_PUSH_OPTION_COUNT` plus
+/// `GIT_PUSH_OPTION_<i>`, mirroring the oracle's `run_receive_hook`
+/// environment. Spawn failures and timeouts refuse fail-closed with an
+/// explanatory reason; they never pass silently and never abort the
+/// protocol with an error (the refusal travels in-band as `ng` lines,
+/// like any hook decline). Direct exec, never a shell: `args` cannot
+/// interpolate.
 pub(crate) fn run_hook(
     hooks: &ReceiveHooks,
     quarantine: Option<&Quarantine>,
     name: &str,
     args: &[String],
     stdin: Option<&[u8]>,
+    push_options: &[String],
 ) -> Option<String> {
     let repo_dir = hooks.repo_dir.as_deref()?;
     let path = hooks.hook_path(name)?;
@@ -287,10 +296,43 @@ pub(crate) fn run_hook(
     if !path.exists() {
         return None;
     }
-    match execute(&path, repo_dir, quarantine, args, stdin, hooks.timeout) {
+    match execute(
+        &path,
+        repo_dir,
+        quarantine,
+        args,
+        stdin,
+        push_options,
+        hooks.timeout,
+    ) {
         Ok(Outcome::Pass) => None,
         Ok(Outcome::Declined { stderr }) => Some(decline_message(name, &stderr)),
         Err(err) => Some(format!("{name} hook failed: {}", shorten(&err.to_string()))),
+    }
+}
+
+/// Applies the shared hook environment: quarantine inspection, the
+/// repository directory, and the client's push options.
+///
+/// One constructor so every phase (`pre-receive`, `update`,
+/// `post-receive`, `proc-receive`) exports identical variables. `COUNT`
+/// is always present, matching the oracle, which exports the bare name
+/// when the client sent no options.
+pub(crate) fn apply_hook_env(
+    cmd: &mut Command,
+    repo_dir: &Path,
+    quarantine: Option<&Quarantine>,
+    push_options: &[String],
+) {
+    if let Some(q) = quarantine {
+        cmd.env("GIT_QUARANTINE_PATH", q.dir());
+        cmd.env("GIT_OBJECT_DIRECTORY", q.objects_dir());
+        cmd.env("RUK_QUARANTINE_MANIFEST", q.manifest());
+    }
+    cmd.env("GIT_DIR", repo_dir);
+    cmd.env("GIT_PUSH_OPTION_COUNT", push_options.len().to_string());
+    for (index, option) in push_options.iter().enumerate() {
+        cmd.env(format!("GIT_PUSH_OPTION_{index}"), option);
     }
 }
 
@@ -323,11 +365,13 @@ fn execute(
     quarantine: Option<&Quarantine>,
     args: &[String],
     stdin_bytes: Option<&[u8]>,
+    push_options: &[String],
     timeout: Duration,
 ) -> Result<Outcome, GitError> {
     let mut cmd = Command::new(path);
     cmd.args(args);
     cmd.current_dir(repo_dir);
+    apply_hook_env(&mut cmd, repo_dir, quarantine, push_options);
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -338,12 +382,6 @@ fn execute(
     // post-receive relay.
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
-    if let Some(q) = quarantine {
-        cmd.env("GIT_QUARANTINE_PATH", q.dir());
-        cmd.env("GIT_OBJECT_DIRECTORY", q.objects_dir());
-        cmd.env("RUK_QUARANTINE_MANIFEST", q.manifest());
-    }
-    cmd.env("GIT_DIR", repo_dir);
     let mut child = cmd.spawn().map_err(|err| GitError::Io {
         detail: format!("cannot execute {}: {err}", path.display()),
     })?;

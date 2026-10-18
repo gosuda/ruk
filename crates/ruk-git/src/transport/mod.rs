@@ -30,6 +30,7 @@
 //! - [`fetch`]: fetch negotiation, verification, publication, prefetch.
 //! - [`push`]: send-pack client, report-status, push plans.
 //! - [`serve`]: the `upload-pack`/`receive-pack` server halves (protocol v0).
+//! - [`proc_receive`]: AGit `refs/for/` diversion to the `proc-receive` hook.
 //! - [`archive`]: the `upload-archive` server half (streaming tar).
 //! - [`session`]: the network transport seam and the local native transport.
 //!
@@ -42,6 +43,7 @@ pub mod hooks;
 pub mod pack;
 pub mod pktline;
 pub mod private;
+pub mod proc_receive;
 pub mod push;
 pub mod refadv;
 pub mod serve;
