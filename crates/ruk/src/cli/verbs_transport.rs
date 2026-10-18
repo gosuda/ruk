@@ -1461,24 +1461,43 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
 /// token only on the endpoint's own authority. Batch error entries and
 /// failed downloads land in `missing` with the server's detail.
 ///
-/// Stdout is JSON `{"synced": [...], "missing": [{"oid","error"}]}` with
-/// both lists sorted by oid; exit is 0 even when `missing` is non-empty
-/// (absence is reported, never fatal, matching push admission under
-/// `Full`). Only a refused batch document itself fails the verb.
+/// With `--upload` the direction flips: the verb POSTs one batch upload
+/// request listing every reachable payload already verified in the
+/// sidecar, then PUTs each answered `actions.upload.href` (objects the
+/// remote already holds answer no actions and need nothing). Pointers
+/// with no local payload cannot be offered and land in `missing`.
+/// Successful PUTs land in `uploaded`; `--from` is refused alongside
+/// `--upload`.
+///
+/// Stdout is JSON
+/// `{"synced": [...], "missing": [{"oid","error"}], "uploaded": [...]}`
+/// with all lists sorted by oid (`uploaded` stays empty on the download
+/// half; `synced` on the upload half holds only presence-row repairs);
+/// exit is 0 even when `missing` is non-empty (absence is reported, never
+/// fatal, matching push admission under `Full`). Only a refused batch
+/// document itself fails the verb.
 pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     use ruk_core::store::lfs as sidecar;
 
-    let specs = [FlagSpec {
-        long: "from",
-        short: None,
-        takes_value: true,
-    }];
+    let specs = [
+        FlagSpec {
+            long: "from",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "upload",
+            short: None,
+            takes_value: false,
+        },
+    ];
     let opts = collect(args, &specs)?;
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: lfs_payload_sync [--from <dir>]".to_owned(),
+            detail: "usage: lfs_payload_sync [--from <dir>] [--upload]".to_owned(),
         });
     }
+    let upload = opts.is_set("upload");
     let store = ctx.store()?;
     if mode_for_store(store.root()) != LfsMode::Full {
         return Err(GitError::Invalid {
@@ -1496,6 +1515,11 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             })
         }
     };
+    if upload && from.is_some() {
+        return Err(GitError::Invalid {
+            detail: "--upload reads payloads from the sidecar, not --from".to_owned(),
+        });
+    }
     let kind = ctx.kind()?;
     let mut tips = Vec::new();
     for (_, target) in list_refs(store)? {
@@ -1534,11 +1558,15 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
     }
     let mut synced: Vec<String> = Vec::new();
     let mut missing: Vec<(String, String)> = Vec::new();
+    let mut uploaded: Vec<String> = Vec::new();
     let mut mutations = Vec::new();
     // Pointers already verified are no-ops (row repair included); the
     // rest need bytes from exactly one source below. `pointers` is a
     // BTreeMap, so both report lists stay sorted by oid.
     let mut pending: Vec<(String, u64)> = Vec::new();
+    // Reachable payloads already verified locally: the download half
+    // ignores them; `--upload` offers them to the remote.
+    let mut present: Vec<(String, u64)> = Vec::new();
     for (hex, size) in &pointers {
         if sidecar::sidecar_verified(store.root(), hex, *size) {
             // The file survived; the row may not have (rename committed,
@@ -1556,6 +1584,7 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
                     },
                 ));
             }
+            present.push((hex.clone(), *size));
             continue;
         }
         pending.push((hex.clone(), *size));
@@ -1593,7 +1622,7 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
                 }
             }
         }
-        None => sync_via_batch(
+        None if !upload => sync_via_batch(
             ctx,
             store,
             &pending,
@@ -1601,6 +1630,15 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             &mut missing,
             &mut mutations,
         )?,
+        // `--upload` reads the sidecar, never `--from` (refused above):
+        // offer every locally verified payload to the remote, reporting
+        // pointers with no local bytes as missing.
+        None => {
+            for (hex, _) in &pending {
+                missing.push((hex.clone(), "no local payload to upload".to_owned()));
+            }
+            sync_via_batch_upload(ctx, store, &present, &mut uploaded, &mut missing)?;
+        }
     }
     if !mutations.is_empty() {
         store
@@ -1623,6 +1661,13 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             "{{\"oid\": \"{hex}\", \"error\": \"{}\"}}",
             json_escape(error)
         ));
+    }
+    out.push_str("], \"uploaded\": [");
+    for (index, hex) in uploaded.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{hex}\""));
     }
     out.push_str("]}\n");
     Ok(out.into_bytes())
@@ -1762,6 +1807,151 @@ fn sync_via_batch(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Uploads `present` payloads through the git-lfs batch API at the
+/// configured endpoint (`lfs.url`, falling back to
+/// `remote.origin.lfsurl`): one `objects/batch` POST for the upload
+/// operation, then one payload PUT per answered `actions.upload.href`.
+/// Entries without actions are already at the remote and need nothing;
+/// server error entries, omitted objects, and failed PUTs land in
+/// `missing` with detail; only a refused batch document itself fails the
+/// verb. No fact rows change: the sidecar already holds these payloads.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a malformed endpoint or batch request,
+/// [`GitError::Offline`] when the batch endpoint refuses, plus transport
+/// failures from the HTTP client.
+fn sync_via_batch_upload(
+    ctx: &Ctx,
+    store: &Store,
+    present: &[(String, u64)],
+    uploaded: &mut Vec<String>,
+    missing: &mut Vec<(String, String)>,
+) -> Result<(), GitError> {
+    use ruk_git::transport::http::{self, UploadEntry};
+
+    if present.is_empty() {
+        return Ok(());
+    }
+    let Some(endpoint) = ctx
+        .config_get("lfs.url")
+        .or_else(|| ctx.config_get("remote.origin.lfsurl"))
+    else {
+        for (hex, _) in present {
+            missing.push((
+                hex.clone(),
+                "no LFS endpoint configured (set lfs.url) and nothing to upload to".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
+    let request = http::batch_upload_request_body(present)?;
+    let mut headers: Vec<(String, String)> = vec![
+        ("Content-Type".to_owned(), http::LFS_JSON.to_owned()),
+        ("Accept".to_owned(), http::LFS_JSON.to_owned()),
+    ];
+    if let Some(auth) = http::auth_header(&ctx.env.vars) {
+        headers.push(auth);
+    }
+    let borrowed: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let reply = http::post_json(&batch_url, &borrowed, &request)?;
+    if !http::is_success(reply.status) {
+        let preview: String = String::from_utf8_lossy(&reply.body)
+            .chars()
+            .take(200)
+            .collect();
+        return Err(GitError::Offline {
+            detail: format!(
+                "lfs batch {batch_url} refused status {}: {preview:?}",
+                reply.status
+            ),
+        });
+    }
+    let mut answers: HashMap<String, UploadEntry> = HashMap::new();
+    for entry in http::parse_batch_upload_response(&reply.body)? {
+        let oid = match &entry {
+            UploadEntry::NeedsUpload { oid, .. }
+            | UploadEntry::Present { oid }
+            | UploadEntry::Failed { oid, .. } => oid.clone(),
+        };
+        answers.insert(oid, entry);
+    }
+    for (hex, size) in present {
+        match answers.get(hex) {
+            None => missing.push((hex.clone(), "batch response omits this object".to_owned())),
+            Some(UploadEntry::Failed { detail, .. }) => {
+                missing.push((hex.clone(), detail.clone()));
+            }
+            // Already at the remote: nothing to send, nothing to report.
+            Some(UploadEntry::Present { .. }) => {}
+            Some(UploadEntry::NeedsUpload {
+                href,
+                headers: action_headers,
+                ..
+            }) => {
+                let mut put_headers: Vec<(String, String)> = action_headers.clone();
+                if put_headers
+                    .iter()
+                    .all(|(name, _)| name.to_ascii_lowercase() != "content-type")
+                {
+                    put_headers.push((
+                        "Content-Type".to_owned(),
+                        "application/octet-stream".to_owned(),
+                    ));
+                }
+                if let Some(auth) = http::auth_header(&ctx.env.vars)
+                    && http::same_origin(&batch_url, href).unwrap_or(false)
+                {
+                    put_headers.push(auth);
+                }
+                let outcome = upload_one(store, href, &put_headers, hex, *size);
+                match outcome {
+                    Ok(()) => uploaded.push(hex.clone()),
+                    Err(detail) => missing.push((hex.clone(), detail)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// PUTs one sidecar payload to `href`, returning the human detail for
+/// `missing` on any failure so one bad object never fails its siblings.
+fn upload_one(
+    store: &Store,
+    href: &str,
+    headers: &[(String, String)],
+    hex: &str,
+    size: u64,
+) -> Result<(), String> {
+    use ruk_core::store::lfs as sidecar;
+    use ruk_git::transport::http;
+
+    let Some(path) = sidecar::sidecar_path(store.root(), hex) else {
+        return Err(format!("no local payload for {hex}"));
+    };
+    let body = std::fs::read(&path).map_err(|err| format!("cannot read local payload: {err}"))?;
+    if body.len() as u64 != size {
+        return Err(format!(
+            "local payload size {} differs from pointer size {size}",
+            body.len()
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let reply =
+        http::put_bytes(href, &borrowed, &body).map_err(|err| format!("PUT {href} failed: {err}"))?;
+    if !http::is_success(reply.status) {
+        return Err(format!("PUT {href} failed with status {}", reply.status));
     }
     Ok(())
 }
