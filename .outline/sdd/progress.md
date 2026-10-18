@@ -20,11 +20,11 @@ The user authorized verified phase commits and normal branch-only pushes to `htt
 - [x] 7. Agent protocol and publication policy [Tony Hoare, David Parnas] — CLI/MCP (b8a7164), claims, attestation, LandPlans, streaming landed; typed session dispatch 9f97090
 - [x] 8. Git object exchange [Richard Feynman, Tony Hoare] — import/export, packs, receive-pack client, notes, private-object exclusion, push durability (26b60ac, 54b14be); shallow/partial fetch OPEN
 - [x] 9. Git-compatible CLI surface and typed backend ops — verbs + flag parity + parity harness (a694058..81c3e77, aedc587); typed invocation coverage in progress
-- [x] 10. Forgejo daemon and patch — pooled hosted daemon, typed Go backend seam, serv routing, [git] RUK_SOCKET (3374dcf, aab49be; forgejo 08399162d1..47a9edb704); SSH entry point + caches partially OPEN
-- [x] 11. Receive and application parity — upload-pack/receive-pack/upload-archive + quarantine + hook phases landed (18230bd, 43ae77a); AGit, signing, LFS paths, mirrors, wiki/template, dumb HTTP OPEN
-- [x] 12. Retention and maintenance — periodic/explicit sweeps landed (3585bdd); copying compaction, cache eviction, handle retirement OPEN
-- [ ] 13. Migration and full verification — `ruk migrate` imports real .git (cd4990c); offline inventory/cutover/rollback + Forgejo DB/browser suite gates OPEN
-- [ ] 14. Capacity acceptance — harness exists (tasks/parity-harness); cold/warm/branch-saturation/noisy-neighbor runs OPEN; needs user-approved load profile
+- [x] 10. Forgejo daemon and patch — daemon, Go seam, serv routing incl. absolute-path SSH fix (forgejo ..03216b8); caches honest no-change; scratch roots via repo_roots doc
+- [x] 11. Receive and application parity — upload-pack/receive-pack/upload-archive + quarantine + hooks (18230bd, 43ae77a, ed67fcc); AGit proc-receive, dumb HTTP, LFS pointer gate, mirror verbs (620992b, 18ca748, 56df91f, 8a8c51c); OPEN: LFS payload sync, symbolic refs, wiki/template flows
+- [x] 12. Retention and maintenance — sweeps (3585bdd) + copying compaction w/ sealed barrier (9d570ed, edff88a) + close/drain/retire (5ddcb85, 68867f7, 8533b59)
+- [x] 13. Migration — tasks/migration 73/73: inventory/import/verify/cutover/rollback proven (d78f857, 9390b1b, 91c7fb6); Forgejo DB/browser suite gates OPEN
+- [ ] 14. Capacity acceptance — harness built per Forgejo-realistic profile (b9e3508, 2f99e40); git-side baselines + partial ruk rows recorded; full-profile runs OPEN (need full-scale hardware)
 
 
 ## Slice verification policy
@@ -77,3 +77,9 @@ Parent verification passed: formatting, strict Clippy, all 466 nextest tests, ca
 A separate consumer passed all 11 schema checks on an ordinary worker thread with `RUST_MIN_STACK` unset. It exercised every method schema, buffered Serde replay, numeric boundaries, duplicate keys, depth 128 operations, depth 129 refusal, and retained non-schema postcard paths. All seven store checks passed. They covered both hash kinds, byte oracles, stable identities, six competing creators, 44 malformed markers, 156 strict prefixes, and rejection without changing marker or metadata bytes.
 
 The first consumer run incorrectly classified the other supported hash kind as malformed. The parent removed that invalid oracle and reran store checks. No product code changed to satisfy it. Fresh bounded source reviews found no remaining actionable defect. Evidence: `local://ruk-breaking-gate-evidence.md`. Later product slices and all capacity claims remain unverified.
+
+## Change-identity decision (user-adopted)
+change-id header only in conflict-v1 frames; exportable commits get deterministic jj-style OID-derived ChangeId; parity 54/56 (remaining: init wording, stash merge shape).
+
+## Mutation translation (in progress)
+Design: .outline/sdd/mutation-translation-design.md (W0 context + W1 ref/data landed 262fba0; W2 commit minting, W3 history rewrite, W4 workspace, W5 tree/conflict+oplog, W6 transport remain).
