@@ -818,6 +818,62 @@ fn staged_appends_batch_into_one_write_per_flush() {
 }
 
 #[test]
+fn large_record_flushes_mid_record_and_stays_byte_identical() {
+    // A record larger than the staging bound flushes mid-record: memory
+    // stays bounded and the streamed bytes still match the framing.
+    let payload = pattern(9_000_000, 7);
+    let mut writer = SegmentWriter::fresh(CountWrites::default()).expect("fresh");
+    let placed = writer
+        .append(
+            ObjectKind::Blob,
+            Encoding::Raw,
+            plen(&payload),
+            crc_ref(&payload),
+            payload.as_slice(),
+        )
+        .expect("large record stages");
+    assert_eq!(placed.record_len, 10 + plen(&payload));
+    assert_eq!(
+        writer.get_ref().writes,
+        1,
+        "staging past the bound flushes mid-record"
+    );
+    writer.flush_staged().expect("flush the tail");
+    assert_eq!(writer.get_ref().writes, 2);
+    assert_eq!(
+        writer.get_ref().inner.get_ref(),
+        &frame(1, 0, &payload),
+        "flushed pieces concatenate to the exact framing"
+    );
+    assert_eq!(writer.records_end(), 10 + plen(&payload));
+    assert_eq!(writer.records_crc(), crc_ref(writer.get_ref().inner.get_ref()));
+}
+
+#[test]
+fn checksum_mismatch_after_a_mid_record_flush_still_poisons() {
+    // The bad record's flushed prefix sits beyond the extent (the poisoned
+    // state recovery truncates); the writer still reports an empty extent
+    // and refuses everything after.
+    let payload = pattern(9_000_000, 9);
+    let mut writer = SegmentWriter::fresh(CountWrites::default()).expect("fresh");
+    let result = writer.append(
+        ObjectKind::Blob,
+        Encoding::Raw,
+        plen(&payload),
+        0xdead_beef,
+        payload.as_slice(),
+    );
+    assert!(matches!(result, Err(SegmentError::Corrupt(_))));
+    assert_eq!(writer.records_end(), 0);
+    assert_eq!(writer.committed_end(), 0);
+    assert!(matches!(
+        writer.append(ObjectKind::Blob, Encoding::Raw, 0, 0, io::empty()),
+        Err(SegmentError::Poisoned)
+    ));
+    assert!(matches!(writer.seal(), Err(SegmentError::Poisoned)));
+}
+
+#[test]
 fn failed_footer_write_poisons_and_does_not_seal() {
     // Enough room for the first record (19 bytes) but only 5 footer bytes.
     let sink = FailAfter {
@@ -1441,6 +1497,10 @@ fn real_file_crash_recovery_shape_truncate_tail_then_resume() {
     let mut writer = SegmentWriter::fresh(scratch.create_new()).expect("fresh file writer");
     append_all(&mut writer, &all[..3]);
     let committed = writer.records_end();
+    // Model the production crash shape: the append loop always flushes
+    // staged bytes before any crash hook or sync, so a killed process
+    // leaves the committed prefix on the file.
+    writer.flush_staged().expect("committed prefix reaches the file");
     drop(writer);
 
     // An append that was never committed: a whole record plus a torn one.
@@ -1467,6 +1527,7 @@ fn real_file_crash_recovery_shape_truncate_tail_then_resume() {
     let mut writer = SegmentWriter::resumed(file, committed, verified.records_crc).expect("resume");
     append_all(&mut writer, &all[3..]);
     assert_eq!(writer.records_crc(), FIXTURE_REGION_CRC);
+    writer.flush_staged().expect("resumed tail reaches the file");
     assert_eq!(
         std::fs::read(&scratch.0).expect("read back"),
         fixture_records()
