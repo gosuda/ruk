@@ -55,12 +55,6 @@ impl PrivateFilter {
         }
     }
 
-    /// A filter holding exactly the closure's OIDs, moved without copying.
-    #[must_use]
-    pub fn from_closure(closure: PrivateClosure) -> Self {
-        Self { oids: closure.oids }
-    }
-
     /// Inserts `oid`, reporting whether it was newly present.
     pub fn insert(&mut self, oid: Oid) -> bool {
         self.oids.insert(oid)
@@ -99,38 +93,6 @@ impl PrivateFilter {
             return Ok(true);
         }
         Ok(promisor_row(store, oid)?.is_some())
-    }
-
-    /// Whether `oid` may be emitted: neither private nor promised.
-    ///
-    /// # Errors
-    /// Store failures; a malformed promisor row is [`GitError::Corrupt`].
-    pub fn should_emit(&self, store: &Store, oid: Oid) -> Result<bool, GitError> {
-        Ok(!self.is_excluded(store, oid)?)
-    }
-
-    /// Removes explicitly private OIDs from `roots`, preserving order.
-    #[must_use]
-    pub fn filter_roots(&self, roots: &[Oid]) -> Vec<Oid> {
-        roots
-            .iter()
-            .copied()
-            .filter(|oid| !self.oids.contains(oid))
-            .collect()
-    }
-
-    /// Removes excluded OIDs (private or promised) from `roots`.
-    ///
-    /// # Errors
-    /// Store failures; a malformed promisor row is [`GitError::Corrupt`].
-    pub fn filter_roots_store(&self, store: &Store, roots: &[Oid]) -> Result<Vec<Oid>, GitError> {
-        let mut kept = Vec::with_capacity(roots.len());
-        for oid in roots.iter().copied() {
-            if !self.is_excluded(store, oid)? {
-                kept.push(oid);
-            }
-        }
-        Ok(kept)
     }
 
     /// Removes explicitly private OIDs from `haves`, preserving order.
@@ -232,11 +194,6 @@ impl PrivateClosure {
         Ok(Self { oids })
     }
 
-    /// Converts the closure into an emission filter, moved without copying.
-    #[must_use]
-    pub fn into_filter(self) -> PrivateFilter {
-        PrivateFilter { oids: self.oids }
-    }
 }
 
 /// Enqueues every object one link set names.
@@ -249,24 +206,4 @@ fn enqueue_links(links: &Links, queue: &mut VecDeque<Oid>) {
     if let Some((target, _)) = links.tag_target {
         queue.push_back(target);
     }
-}
-
-/// Whether `oid` is promised by a partial clone and therefore unemittable.
-///
-/// # Errors
-/// Store failures; a malformed row is [`GitError::Corrupt`].
-pub fn is_promised(store: &Store, oid: Oid) -> Result<bool, GitError> {
-    Ok(promisor_row(store, oid)?.is_some())
-}
-
-/// Removes excluded OIDs (private or promised) from `oids`.
-///
-/// # Errors
-/// Store failures; a malformed promisor row is [`GitError::Corrupt`].
-pub fn exclude_private_oids(
-    store: &Store,
-    filter: &PrivateFilter,
-    oids: &[Oid],
-) -> Result<Vec<Oid>, GitError> {
-    filter.filter_roots_store(store, oids)
 }
