@@ -8,7 +8,7 @@
 //! `Connection: close` on a fresh connection), no git smart-http: the
 //! smart protocol over HTTP stays a named gap in [`super::net`]
 //! (`Endpoint::Http` keeps refusing for git verbs) and only LFS payload
-//! fetch gets HTTP.
+//! fetch and upload get HTTP.
 //!
 //! Oracle anchors: the git-lfs batch API
 //! (`https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md`:
@@ -640,6 +640,29 @@ pub fn post_json(
     })
 }
 
+/// PUTs `body` bytes and buffers the reply, capped at
+/// [`MAX_BUFFERED_BYTES`]: the LFS upload half of [`post_json`].
+/// Single-shot (no redirect follow): upload `href`s are presigned URLs
+/// used immediately, and re-sending a payload to a redirected host would
+/// need fresh credential scoping the caller cannot do blindly.
+///
+/// # Errors
+/// Routing, framing, and transport failures as [`GitError`].
+pub fn put_bytes(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<HttpResponse, GitError> {
+    let (mut reader, status, headers) = request_head(url, "PUT", headers, Some(body))?;
+    let mut reply = Vec::new();
+    read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
+    Ok(HttpResponse {
+        status,
+        headers,
+        body: reply,
+    })
+}
+
 /// GETs `url` streaming the body into `sink` (no size cap: the caller
 /// verifies what lands), following up to [`MAX_REDIRECTS`] hops. An
 /// `authorization` header is dropped when a hop changes host, so a token
@@ -716,6 +739,23 @@ pub fn get(url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, GitError
 /// One object the batch request asks about: content hash plus byte size,
 /// exactly as the batch spec's `objects[]` entries read.
 pub fn batch_request_body(objects: &[(String, u64)]) -> Result<Vec<u8>, GitError> {
+    batch_request_body_for("download", objects)
+}
+
+/// One batch upload request: the same object list with
+/// `"operation":"upload"`. The server answers each object with an
+/// `actions.upload` href when it lacks the payload and omits actions for
+/// objects it already holds, so the caller PUTs only what is missing.
+pub fn batch_upload_request_body(objects: &[(String, u64)]) -> Result<Vec<u8>, GitError> {
+    batch_request_body_for("upload", objects)
+}
+
+/// Renders one batch request document for `operation`: the shared shape
+/// behind [`batch_request_body`] and [`batch_upload_request_body`].
+fn batch_request_body_for(
+    operation: &str,
+    objects: &[(String, u64)],
+) -> Result<Vec<u8>, GitError> {
     for (oid, _) in objects {
         if !ruk_core::store::lfs::valid_oid_hex(oid) {
             return Err(GitError::Invalid {
@@ -723,8 +763,9 @@ pub fn batch_request_body(objects: &[(String, u64)]) -> Result<Vec<u8>, GitError
             });
         }
     }
-    let mut out =
-        String::from("{\"operation\":\"download\",\"transfers\":[\"basic\"],\"objects\":[");
+    let mut out = format!(
+        "{{\"operation\":\"{operation}\",\"transfers\":[\"basic\"],\"objects\":["
+    );
     for (index, (oid, size)) in objects.iter().enumerate() {
         if index > 0 {
             out.push(',');
@@ -782,11 +823,14 @@ struct BatchObjectDoc {
     error: Option<BatchErrorDoc>,
 }
 
-/// The `actions` map of one object entry; only `download` matters here.
+/// The `actions` map of one object entry: `download` for fetch, `upload`
+/// for push.
 #[derive(Debug, Default, serde::Deserialize)]
 struct BatchActionsDoc {
     #[serde(default)]
     download: Option<DownloadActionDoc>,
+    #[serde(default)]
+    upload: Option<UploadActionDoc>,
 }
 
 /// One `actions.download` entry: the payload URL plus headers the GET
@@ -795,6 +839,17 @@ struct BatchActionsDoc {
 /// construction.
 #[derive(Debug, serde::Deserialize)]
 struct DownloadActionDoc {
+    #[serde(default)]
+    href: String,
+    #[serde(default)]
+    header: HashMap<String, String>,
+}
+/// One `actions.upload` entry: where the payload bytes go via PUT plus
+/// headers the PUT must echo. Expiry needs no client clock for the same
+/// reason as [`DownloadActionDoc`]: hrefs are used immediately and never
+/// cached.
+#[derive(Debug, serde::Deserialize)]
+struct UploadActionDoc {
     #[serde(default)]
     href: String,
     #[serde(default)]
@@ -856,6 +911,87 @@ pub fn parse_batch_response(body: &[u8]) -> Result<Vec<BatchEntry>, GitError> {
                 oid: object.oid,
                 detail: "no download action".to_owned(),
             }),
+        }
+    }
+    Ok(entries)
+}
+
+/// One batch upload answer: either a PUT target, an already-present
+/// object needing nothing, or a server-side refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UploadEntry {
+    /// The remote lacks this object: PUT its bytes to `href`, echoing
+    /// `headers` the way `actions.upload.header` demands.
+    NeedsUpload {
+        /// Content hash of the object.
+        oid: String,
+        /// Declared byte size.
+        size: u64,
+        /// Where the payload bytes go.
+        href: String,
+        /// Extra headers the PUT must carry.
+        headers: Vec<(String, String)>,
+    },
+    /// The remote already holds this object (no actions answered):
+    /// nothing to send.
+    Present {
+        /// Content hash of the object.
+        oid: String,
+    },
+    /// The server refused this object; the caller reports it missing with
+    /// `detail` (never fatal to the other objects).
+    Failed {
+        /// Content hash of the refused object.
+        oid: String,
+        /// `"<code>: <message>"` from the entry's `error` object.
+        detail: String,
+    },
+}
+
+/// Reads one batch upload response document into per-object answers.
+///
+/// An entry with an `error` object is a refusal; an entry with an
+/// `actions.upload.href` needs a PUT; anything else means the remote
+/// already holds the object. Unlike the download half, a missing action
+/// is success (nothing to send), not failure.
+///
+/// # Errors
+/// [`GitError::Corrupt`] for a non-JSON or misshapen document.
+pub fn parse_batch_upload_response(body: &[u8]) -> Result<Vec<UploadEntry>, GitError> {
+    let text = std::str::from_utf8(body).map_err(|_| GitError::Corrupt {
+        detail: "lfs batch upload response is not UTF-8".to_owned(),
+    })?;
+    let document: BatchResponseDoc = sonic_rs::from_str(text).map_err(|err| GitError::Corrupt {
+        detail: format!("lfs batch upload response does not parse: {err}"),
+    })?;
+    let mut entries = Vec::with_capacity(document.objects.len());
+    for object in document.objects {
+        if object.oid.is_empty() {
+            return Err(GitError::Corrupt {
+                detail: "lfs batch upload response holds an object without an oid".to_owned(),
+            });
+        }
+        if let Some(error) = object.error {
+            let message = error.message.trim();
+            let detail = if message.is_empty() {
+                format!("code {}", error.code)
+            } else {
+                format!("code {}: {message}", error.code)
+            };
+            entries.push(UploadEntry::Failed {
+                oid: object.oid,
+                detail,
+            });
+            continue;
+        }
+        match object.actions.and_then(|actions| actions.upload) {
+            Some(action) if !action.href.is_empty() => entries.push(UploadEntry::NeedsUpload {
+                oid: object.oid,
+                size: object.size,
+                href: action.href,
+                headers: action.header.into_iter().collect(),
+            }),
+            _ => entries.push(UploadEntry::Present { oid: object.oid }),
         }
     }
     Ok(entries)
@@ -1175,5 +1311,71 @@ mod tests {
         );
         assert!(parse_batch_response(b"not json").is_err());
         assert!(parse_batch_response(b"{\"objects\":[{}]}").is_err());
+    }
+
+    #[test]
+    fn upload_shapes_round_trip() {
+        let oid = "c".repeat(64);
+        let body = batch_upload_request_body(&[(oid.clone(), 7)]).expect("request");
+        assert_eq!(
+            String::from_utf8(body).expect("utf8"),
+            format!(
+                "{{\"operation\":\"upload\",\"transfers\":[\"basic\"],\"objects\":[{{\"oid\":\"{oid}\",\"size\":7}}]}}"
+            )
+        );
+        assert!(batch_upload_request_body(&[("short".to_owned(), 1)]).is_err());
+        // An upload href means PUT; a bare entry means already present;
+        // an error entry is a refusal.
+        let entries = parse_batch_upload_response(
+            format!(
+                "{{\"objects\":[{{\"oid\":\"{oid}\",\"size\":7,\"actions\":{{\"upload\":{{\"href\":\"http://x/u\",\"header\":{{\"Authorization\":\"tok\"}}}}}}}},{{\"oid\":\"{}\",\"size\":1}},{{\"oid\":\"{}\",\"size\":2,\"error\":{{\"code\":403,\"message\":\"no\"}}}}]}}",
+                "d".repeat(64),
+                "e".repeat(64),
+            )
+            .as_bytes(),
+        )
+        .expect("parse");
+        assert_eq!(
+            entries,
+            vec![
+                UploadEntry::NeedsUpload {
+                    oid: oid.clone(),
+                    size: 7,
+                    href: "http://x/u".to_owned(),
+                    headers: vec![("Authorization".to_owned(), "tok".to_owned())],
+                },
+                UploadEntry::Present {
+                    oid: "d".repeat(64),
+                },
+                UploadEntry::Failed {
+                    oid: "e".repeat(64),
+                    detail: "code 403: no".to_owned(),
+                },
+            ]
+        );
+        assert!(parse_batch_upload_response(b"not json").is_err());
+        assert!(parse_batch_upload_response(b"{\"objects\":[{}]}").is_err());
+    }
+
+    #[test]
+    fn puts_bytes_with_method_and_length() {
+        let (port, server) = fake_server(vec![(200, vec![], b"{}".to_vec())]);
+        let url = format!("http://127.0.0.1:{port}/up/abcd");
+        let reply = put_bytes(
+            &url,
+            &[("Content-Type", "application/octet-stream")],
+            b"payload-bytes",
+        )
+        .expect("put");
+        assert_eq!(reply.status, 200);
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        let head = &requests[0];
+        assert!(head.starts_with("PUT /up/abcd HTTP/1.1\r\n"), "{head:?}");
+        assert!(head.contains("Content-Length: 13"), "{head:?}");
+        assert!(
+            head.contains("Content-Type: application/octet-stream"),
+            "{head:?}"
+        );
     }
 }
