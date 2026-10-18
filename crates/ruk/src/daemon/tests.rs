@@ -23,11 +23,13 @@ use ruk_core::change::{LeaseId, OperationId, RequestId, SessionId, StoreId};
 use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
+use ruk_core::index::RepoPath;
 use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
-    BookmarkSetArgs, BookmarkTarget, IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor,
-    PageLimit, PageRequest, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope, StatusArgs,
-    TagAnnotation, TagSetArgs,
+    BookmarkSetArgs, BookmarkTarget, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs, ClaimTtl,
+    IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor, PageLimit, PageRequest, PinArgs,
+    QueryDigest, Reply, ReplyBody, ReplyEnvelope, SessionOpenArgs, StatusArgs, TagAnnotation,
+    TagSetArgs, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefTarget};
 use ruk_core::store::{ObjectKind, PreparationBudget, Store};
@@ -1035,11 +1037,10 @@ async fn typed_oplog_continuation_pages_through_its_lease() {
     task.abort();
 }
 
-/// The ops-backed `new` mutation travels the typed path but stays refused:
-/// its protocol args carry no tree object and no timestamped signature, so
-/// no `ops::NewRequest` can be built without inventing the commit.
+/// Socket-level proof that `new` mints an empty-tree change: the signature
+/// comes from the session identity, and every call mints a fresh change.
 #[tokio::test]
-async fn typed_new_names_its_missing_preparation() {
+async fn typed_new_mints_change_with_session_identity() {
     let root = temp_root("typed-new");
     let repo_dir = root.join("repo");
     std::fs::create_dir_all(&repo_dir).expect("repo dir");
@@ -1066,6 +1067,118 @@ async fn typed_new_names_its_missing_preparation() {
         .expect("utf8 store repo")
         .to_string();
 
+    let open_args = SessionOpenArgs {
+        identity: Some(IdentityClaim {
+            name: "Ada".to_string(),
+            email: "ada@example.invalid".to_string(),
+        }),
+        ..SessionOpenArgs::default()
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "session.open",
+        None,
+        Some(sonic_rs::to_string(&open_args).expect("open args encode")),
+        None,
+    );
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let submit_new = async |driver: &mut Driver,
+                            stream: u64,
+                            description: &str|
+           -> ruk_core::protocol::NewReply {
+        let new_args = NewArgs {
+            parents: Vec::new(),
+            description: ByteString::from(description),
+            identity: None,
+            workspace: None,
+        };
+        let args_json = sonic_rs::to_string(&new_args).expect("new args encode");
+        let payload = Driver::typed_open(
+            &store_repo,
+            "new",
+            Some(&RequestId::generate().to_string()),
+            Some(args_json),
+            Some(&session),
+        );
+        let (stdout, _) = driver.run_typed(stream, &payload).await;
+        let envelope = typed_success(&stdout);
+        let ReplyBody::Success(Reply::New(reply)) = envelope.body else {
+            panic!("new must answer its own reply");
+        };
+        *reply
+    };
+
+    let first = submit_new(&mut driver, 5, "typed new").await;
+    let identity = first
+        .outcome
+        .identity
+        .expect("new reports its recorded identity");
+    assert_eq!(identity.name, "Ada");
+    let second = submit_new(&mut driver, 7, "typed new again").await;
+    assert_ne!(
+        second.created.change, first.created.change,
+        "every new mints a fresh change"
+    );
+
+    // Both mints published: the log records two `new` operations.
+    let payload = Driver::typed_open(
+        &store_repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(9, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(reply)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(reply.entries.items.len(), 2);
+    assert!(
+        reply
+            .entries
+            .items
+            .iter()
+            .all(|entry| entry.method == Method::New)
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `new` without any identity is invalid, not
+/// hosted: no configuration ladder exists for the coordinator to consult.
+#[tokio::test]
+async fn typed_new_without_identity_is_invalid() {
+    let root = temp_root("typed-new-bare");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-new-bare",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-new-bare",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
     let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
     let (stdout, _) = driver.run_typed(3, &payload).await;
     let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
@@ -1073,7 +1186,7 @@ async fn typed_new_names_its_missing_preparation() {
 
     let new_args = NewArgs {
         parents: Vec::new(),
-        description: ByteString::from("typed new"),
+        description: ByteString::from("nobody"),
         identity: None,
         workspace: None,
     };
@@ -1086,12 +1199,7 @@ async fn typed_new_names_its_missing_preparation() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(5, &payload).await;
-    assert_eq!(report.code, "E_HOSTED");
-    assert!(
-        report.message.contains("does not cover preparation"),
-        "unexpected message: {}",
-        report.message
-    );
+    assert_eq!(report.code, "E_INVALID");
 
     // The refusal published nothing: the log stays empty.
     let payload = Driver::typed_open(
@@ -1107,6 +1215,207 @@ async fn typed_new_names_its_missing_preparation() {
         panic!("op.log must answer its own reply");
     };
     assert!(reply.entries.items.is_empty());
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `claim.acquire` seals in the lane with the
+/// prepared id, and `claim.release` drops the same record.
+#[tokio::test]
+async fn typed_claim_acquire_and_release_round_trip() {
+    let root = temp_root("typed-claim");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-claim",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-claim",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let acquire_args = ClaimAcquireArgs {
+        paths: vec![RepoPath::new("src").expect("test path")],
+        ttl: ClaimTtl::new(60).expect("ttl"),
+        mode: ClaimMode::Enforce,
+    };
+    let args_json = sonic_rs::to_string(&acquire_args).expect("acquire args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "claim.acquire",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::ClaimAcquire(acquired)) = envelope.body else {
+        panic!("claim.acquire must answer its own reply");
+    };
+
+    // The acquire sealed in the lane: `claim.list` serves the sealed record.
+    let payload = Driver::typed_open(
+        &store_repo,
+        "claim.list",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(6, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::ClaimList(listed)) = envelope.body else {
+        panic!("claim.list must answer its own reply");
+    };
+    assert_eq!(listed.claims.items.len(), 1);
+    assert_eq!(listed.claims.items[0], acquired.claim);
+
+    let release_args = ClaimReleaseArgs {
+        claim: acquired.claim.claim,
+    };
+    let args_json = sonic_rs::to_string(&release_args).expect("release args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "claim.release",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::ClaimRelease(released)) = envelope.body else {
+        panic!("claim.release must answer its own reply");
+    };
+    assert_eq!(released.released, acquired.claim);
+
+    // The release sealed in the lane: the list is empty again.
+    // (`op.log` stays silent by design — the Claims table is untracked.)
+    let payload = Driver::typed_open(
+        &store_repo,
+        "claim.list",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(9, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::ClaimList(listed)) = envelope.body else {
+        panic!("claim.list must answer its own reply");
+    };
+    assert!(listed.claims.items.is_empty(), "release dropped the claim");
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `ws.new` creates a native workspace row without
+/// materializing a worktree.
+#[tokio::test]
+async fn typed_ws_new_creates_workspace() {
+    let root = temp_root("typed-wsnew");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-wsnew",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-wsnew",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let open_args = SessionOpenArgs {
+        identity: Some(IdentityClaim {
+            name: "Ada".to_string(),
+            email: "ada@example.invalid".to_string(),
+        }),
+        ..SessionOpenArgs::default()
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "session.open",
+        None,
+        Some(sonic_rs::to_string(&open_args).expect("open args encode")),
+        None,
+    );
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let ws_args = WsNewArgs {
+        root: ByteString::from("/tmp/ruk-daemon-wsnew"),
+        init: WorkspaceInit::Native {
+            parents: Vec::new(),
+        },
+        scope: None,
+    };
+    let args_json = sonic_rs::to_string(&ws_args).expect("ws.new args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "ws.new",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::WsNew(created)) = envelope.body else {
+        panic!("ws.new must answer its own reply");
+    };
+    assert_ne!(
+        created.workspace,
+        ruk_core::change::WorkspaceId::nil(),
+        "ws.new mints a fresh workspace"
+    );
+
+    let payload = Driver::typed_open(
+        &store_repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(reply)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(reply.entries.items.len(), 1);
+    assert_eq!(reply.entries.items[0].method, Method::WsNew);
 
     drop(driver);
     task.abort();

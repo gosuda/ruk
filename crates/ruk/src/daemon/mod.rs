@@ -624,7 +624,7 @@ pub fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::read (op.log, claim.list, attest.list first pages served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
-            "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref mutations covered; the rest name their missing preparation)"
+            "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest mutations covered; the rest name their missing preparation)"
         }
     }
 }
@@ -2183,8 +2183,7 @@ pub async fn dispatch_method(
                     // The attestation gate follows invocation cancellation:
                     // a cancelled call stops verification instead of
                     // publishing rows it no longer waits for.
-                    let checkpoint =
-                        |_: ruk_core::attestation::Progress| cancel.check();
+                    let checkpoint = |_: ruk_core::attestation::Progress| cancel.check();
                     let prepared =
                         coordinator.prepare_for_dispatch(session, request, &checkpoint)?;
                     let request_id = prepared.request_id;
