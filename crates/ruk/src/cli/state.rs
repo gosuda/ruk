@@ -1146,11 +1146,17 @@ pub(crate) fn remote_url(ctx: &Ctx, remote: &str) -> Result<String, GitError> {
 }
 
 /// Maps a local path or remote name to a repository root holding `.ruk`.
+///
+/// `file://` URLs route to their local path; anything that does not
+/// resolve to a local store keeps the old `Offline` refusal.
 pub(crate) fn remote_root(ctx: &Ctx, target: &str) -> Result<PathBuf, GitError> {
-    let path = ctx
+    let raw = ctx
         .config_get(&format!("remote.{target}.url"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(target));
+        .unwrap_or_else(|| target.to_owned());
+    let path = match ruk_git::transport::net::parse_endpoint(&raw) {
+        Ok(ruk_git::transport::net::Endpoint::Local { path }) => path,
+        _ => PathBuf::from(raw),
+    };
     let base = if path.is_absolute() {
         path
     } else {

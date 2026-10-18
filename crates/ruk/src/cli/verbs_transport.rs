@@ -4,16 +4,16 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `fetch` | `session::local_fetch` + refspec expansion | implemented for local paths; network is `Offline`; `--prune` drops orphaned remote-tracking refs (pull-mirror parity) |
-//! | `pull` | fetch + fast-forward | implemented for local paths (fast-forward only) |
-//! | `push` | `session::local_push` with a persisted plan | implemented for local paths; `--mirror` sets every ref and deletes stale ones (push-mirror parity) |
+//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams | `--prune` drops orphaned remote-tracking refs (pull-mirror parity); `http(s)` is a named gap |
+//! | `pull` | fetch + fast-forward | local and SSH/git remotes (fast-forward only) |
+//! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, both with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); `http(s)` is a named gap |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
 //! | `archive` | no archive writer | unsupported |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
 //! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
-//! | `ls-remote` | `session::advertise` | implemented for local paths; network is `Offline` |
+//! | `ls-remote` | local `session::advertise` or one `net::discover` round trip | SSH/git remotes served; `http(s)` is a named gap |
 //!
 //! Oracle anchors: `git/builtin/fetch.c`, `git/builtin/pull.c`,
 //! `git/builtin/push.c`, `git/builtin/receive-pack.c`,
@@ -21,22 +21,26 @@
 //! `git/builtin/bundle.c`, `git/builtin/gc.c`, `git/builtin/fsck.c`,
 //! `git/builtin/ls-remote.c`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use ruk_core::change::PlanId;
-use ruk_core::ids::Oid;
+use ruk_core::ids::{HashKind, Oid};
 use ruk_core::mode_for_store;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::StoreRefs;
 use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
+use ruk_git::transport::fetch::{self, FetchWireRequest};
 use ruk_git::transport::mirror::{prune_for_spec, push_mirror_updates};
+use ruk_git::transport::net::{self, Endpoint};
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::push::{PushUpdate, PushWireRequest};
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
 use ruk_git::transport::session::{
-    LocalFetchRequest, advertise, local_fetch, local_push, open_local_store,
+    AdvertisedLocalRef, LocalFetchRequest, Service, advertise, local_fetch, local_push,
+    open_local_store,
 };
 use ruk_git::transport::{Interrupt, has_object, observation_key};
 
@@ -109,6 +113,39 @@ pub(crate) struct FetchPlan {
     pub(crate) prune: bool,
 }
 
+/// Where a fetch/push/ls-remote target points: a local repository root or
+/// a network endpoint SSH and git-daemon transports serve.
+enum Target {
+    /// A local repository root holding `.ruk`.
+    Local(PathBuf),
+    /// An SSH or git-daemon endpoint.
+    Net(Endpoint),
+}
+
+/// Resolves a remote name or URL: configured names read their URL first,
+/// then `file://` URLs and bare paths land local, SSH and git-daemon URLs
+/// route network, and HTTP URLs refuse with the named gap.
+///
+/// Oracle: `git/builtin/fetch.c` (remote resolution).
+fn resolve_target(ctx: &Ctx, target: &str) -> Result<Target, GitError> {
+    let url = ctx
+        .config_get(&format!("remote.{target}.url"))
+        .unwrap_or_else(|| target.to_owned());
+    match net::parse_endpoint(&url)? {
+        Endpoint::Local { .. } => Ok(Target::Local(remote_root(ctx, target)?)),
+        endpoint @ (Endpoint::Ssh { .. } | Endpoint::Git { .. }) => Ok(Target::Net(endpoint)),
+        Endpoint::Http { url, .. } => Err(net::http_gap(&url)),
+    }
+}
+
+/// The source side of one fetch: a local store or a network endpoint.
+enum FetchSource {
+    /// A local source store.
+    Local(Store),
+    /// A network endpoint (refs discover over a separate connection).
+    Net(Endpoint),
+}
+
 /// Expands refspecs, negotiates the pack, and updates refs atomically.
 ///
 /// `remote update` shares this path: it passes the remote's configured
@@ -123,17 +160,32 @@ pub(crate) fn run_fetch(
 ) -> Result<Vec<u8>, GitError> {
     let dest = ctx.store()?;
     let dest_kind = ctx.kind()?;
-    let src_root = remote_root(ctx, remote_label)?;
-    let src = open_store_at(&src_root)?;
-    if src.hash_kind() != dest_kind {
-        return Err(GitError::ObjectFormat {
-            detail: "source and destination object formats disagree".to_owned(),
-        });
-    }
-    let advertised = advertise(&src)?;
+    let (source, advertised) = match resolve_target(ctx, remote_label)? {
+        Target::Local(src_root) => {
+            let src = open_store_at(&src_root)?;
+            if src.hash_kind() != dest_kind {
+                return Err(GitError::ObjectFormat {
+                    detail: "source and destination object formats disagree".to_owned(),
+                });
+            }
+            let advertised = advertise(&src)?;
+            (FetchSource::Local(src), advertised)
+        }
+        Target::Net(endpoint) => {
+            let advertised = net::to_local_refs(net::discover_endpoint(
+                &endpoint,
+                Service::UploadPack,
+                dest_kind,
+            )?)?;
+            (FetchSource::Net(endpoint), advertised)
+        }
+    };
     let mut pairs: Vec<FetchedRef> = Vec::new();
     for spec_text in spec_texts {
-        pairs.extend(expand_spec(&src, &advertised, spec_text)?);
+        match &source {
+            FetchSource::Local(src) => pairs.extend(expand_spec(src, &advertised, spec_text)?),
+            FetchSource::Net(_) => pairs.extend(expand_spec_net(&advertised, dest, spec_text)?),
+        }
     }
     if plan.fetch_tags {
         for entry in &advertised {
@@ -245,25 +297,98 @@ pub(crate) fn run_fetch(
         out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
         return Ok(out);
     }
-    let request = LocalFetchRequest {
-        wants,
-        haves,
-        filter: None,
-        depth: plan.depth,
-    };
-    local_fetch(
-        dest,
-        &src,
-        remote_label.as_bytes(),
-        &request,
-        &tracking,
-        &ref_mutations,
-        IngestLimits::default(),
-        &Interrupt::none(),
-    )?;
+    match &source {
+        FetchSource::Local(src) => {
+            let request = LocalFetchRequest {
+                wants,
+                haves,
+                filter: None,
+                depth: plan.depth,
+            };
+            local_fetch(
+                dest,
+                src,
+                remote_label.as_bytes(),
+                &request,
+                &tracking,
+                &ref_mutations,
+                IngestLimits::default(),
+                &Interrupt::none(),
+            )?;
+        }
+        FetchSource::Net(endpoint) => {
+            fetch_pack_net(
+                dest,
+                endpoint,
+                remote_label,
+                &wants,
+                &haves,
+                plan.depth,
+                &tracking,
+                &ref_mutations,
+            )?;
+        }
+    }
     let mut out = lines.concat().into_bytes();
     out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
     Ok(out)
+}
+
+/// Runs the pack half of a network fetch over one upload-pack connection:
+/// negotiate the wants, verify the closure, and publish staged objects
+/// together with the caller's ref deltas, the way `local_fetch` publishes
+/// its pack plus ref mutations in one transaction.
+///
+/// Oracle: `git/builtin/fetch.c`.
+fn fetch_pack_net(
+    dest: &Store,
+    endpoint: &Endpoint,
+    remote_label: &str,
+    wants: &[Oid],
+    haves: &[Oid],
+    depth: Option<u32>,
+    tracking: &[(RefName, RefTarget)],
+    ref_mutations: &[FactMutation],
+) -> Result<(), GitError> {
+    let request = FetchWireRequest {
+        wants: wants.to_vec(),
+        haves: haves.to_vec(),
+        filter: None,
+        depth,
+        shallow: Vec::new(),
+        list_refs: false,
+        ref_prefixes: Vec::new(),
+    };
+    let stream = net::open_stream(endpoint, Service::UploadPack)?;
+    let received = fetch::receive(
+        stream,
+        dest.hash_kind(),
+        dest,
+        &request,
+        IngestLimits::default(),
+        &Interrupt::none(),
+    )?;
+    let report = fetch::verify_closure(
+        dest,
+        &received.staged,
+        wants,
+        None,
+        &received.shallow,
+        &Interrupt::none(),
+    )?;
+    if !report.missing_promisor.is_empty() {
+        return Err(GitError::Corrupt {
+            detail: "fetch without a filter left promisor objects missing".to_owned(),
+        });
+    }
+    let mut facts = ref_mutations.to_vec();
+    facts.extend(fetch::shallow_facts(&received.shallow, &received.unshallow));
+    facts.extend(fetch::observation_mutations(
+        remote_label.as_bytes(),
+        tracking,
+    ));
+    fetch::publish_fetch(dest, received.staged, &facts)?;
+    Ok(())
 }
 
 /// Remote-tracking refs one fetch refspec orphans: local destinations
@@ -359,42 +484,15 @@ fn parse_spec(text: &str) -> Result<RefSpec, GitError> {
     })
 }
 
-/// Expands one refspec against the advertised source refs.
+/// Expands one refspec against the advertised refs of a local source.
 fn expand_spec(
     src: &Store,
-    advertised: &[ruk_git::transport::session::AdvertisedLocalRef],
+    advertised: &[AdvertisedLocalRef],
     text: &str,
 ) -> Result<Vec<FetchedRef>, GitError> {
     let spec = parse_spec(text)?;
-    let mut out = Vec::new();
     if spec.src.contains('*') {
-        let dst_pattern = spec.dst.ok_or_else(|| GitError::Invalid {
-            detail: format!("glob refspec {text:?} needs a destination"),
-        })?;
-        for entry in advertised {
-            let name_text = String::from_utf8_lossy(&entry.name).into_owned();
-            if !glob_pair(&spec.src, &name_text) {
-                continue;
-            }
-            let mapped =
-                map_glob(&spec.src, &dst_pattern, &name_text).ok_or_else(|| GitError::Invalid {
-                    detail: format!("refspec {text:?} does not map {name_text:?}"),
-                })?;
-            let name = RefName::new(mapped).map_err(|err| GitError::Invalid {
-                detail: format!("mapped ref refused: {err}"),
-            })?;
-            if let RefTarget::Direct(oid) = &entry.target {
-                if entry.name.starts_with(b"refs/heads/") || entry.name.starts_with(b"refs/tags/") {
-                    out.push(FetchedRef {
-                        oid: *oid,
-                        name,
-                        target: entry.target.clone(),
-                        force: spec.force,
-                    });
-                }
-            }
-        }
-        return Ok(out);
+        return expand_glob(advertised, &spec, text);
     }
     let oid = resolve_rev(src, src.hash_kind(), &spec.src)?;
     match spec.dst {
@@ -409,6 +507,105 @@ fn expand_spec(
             }])
         }
     }
+}
+
+/// Expands one refspec against network-advertised refs: globs behave
+/// exactly like [`expand_spec`], while exact sources resolve against the
+/// advertisement instead of a source store.
+fn expand_spec_net(
+    advertised: &[AdvertisedLocalRef],
+    dest: &Store,
+    text: &str,
+) -> Result<Vec<FetchedRef>, GitError> {
+    let spec = parse_spec(text)?;
+    if spec.src.contains('*') {
+        return expand_glob(advertised, &spec, text);
+    }
+    let (oid, target) = resolve_advertised(advertised, &spec.src)?;
+    match spec.dst {
+        None => Ok(Vec::new()),
+        Some(dst) => {
+            let name = dwell_dest(dest, &dst)?;
+            Ok(vec![FetchedRef {
+                oid,
+                name: name.clone(),
+                target,
+                force: spec.force,
+            }])
+        }
+    }
+}
+
+/// Expands one glob refspec against advertised refs, mapping each matched
+/// source name through the destination pattern.
+fn expand_glob(
+    advertised: &[AdvertisedLocalRef],
+    spec: &RefSpec,
+    text: &str,
+) -> Result<Vec<FetchedRef>, GitError> {
+    let dst_pattern = spec.dst.clone().ok_or_else(|| GitError::Invalid {
+        detail: format!("glob refspec {text:?} needs a destination"),
+    })?;
+    let mut out = Vec::new();
+    for entry in advertised {
+        let name_text = String::from_utf8_lossy(&entry.name).into_owned();
+        if !glob_pair(&spec.src, &name_text) {
+            continue;
+        }
+        let mapped =
+            map_glob(&spec.src, &dst_pattern, &name_text).ok_or_else(|| GitError::Invalid {
+                detail: format!("refspec {text:?} does not map {name_text:?}"),
+            })?;
+        let name = RefName::new(mapped).map_err(|err| GitError::Invalid {
+            detail: format!("mapped ref refused: {err}"),
+        })?;
+        if let RefTarget::Direct(oid) = &entry.target {
+            if entry.name.starts_with(b"refs/heads/") || entry.name.starts_with(b"refs/tags/") {
+                out.push(FetchedRef {
+                    oid: *oid,
+                    name,
+                    target: entry.target.clone(),
+                    force: spec.force,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolves an exact fetch source against advertised refs: the full name,
+/// then the `heads`/`tags` guesses, then a raw OID the server may serve
+/// (`git fetch <sha>`).
+fn resolve_advertised(
+    advertised: &[AdvertisedLocalRef],
+    src: &str,
+) -> Result<(Oid, RefTarget), GitError> {
+    let guesses = [
+        src.to_owned(),
+        format!("refs/heads/{src}"),
+        format!("refs/tags/{src}"),
+    ];
+    for guess in &guesses {
+        match advertised
+            .iter()
+            .find(|entry| String::from_utf8_lossy(&entry.name) == *guess)
+        {
+            Some(entry) => match &entry.target {
+                RefTarget::Direct(oid) => return Ok((*oid, entry.target.clone())),
+                RefTarget::Symbolic(_) => {
+                    return Err(GitError::Invalid {
+                        detail: format!("cannot fetch unborn ref {src:?}"),
+                    });
+                }
+            },
+            None => {}
+        }
+    }
+    Oid::from_hex(src)
+        .map(|oid| (oid, RefTarget::Direct(oid)))
+        .map_err(|_| GitError::NotFound {
+            detail: format!("no such ref {src:?} on the remote"),
+        })
 }
 
 /// Expands a short destination the way Git guesses refnames: a full name
@@ -592,53 +789,94 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
-    let dest_root = remote_root(ctx, target)?;
-    let dest = open_store_at(&dest_root)?;
-    if dest.hash_kind() != kind {
-        return Err(GitError::ObjectFormat {
-            detail: "source and destination object formats disagree".to_owned(),
-        });
-    }
     // Mirror force: the oracle's `--mirror` forces every ref update, the
     // way a push mirror (`git push --mirror --force`) syncs deletions and
     // rewinds alike.
     let force_all = opts.is_set("force") || opts.is_set("mirror");
-    if opts.is_set("mirror") {
-        if opts.positionals.len() > 1 {
-            return Err(GitError::Invalid {
-                detail: "usage: push [--mirror] [<remote>]".to_owned(),
-            });
-        }
-        return push_mirror(ctx, &dest, target, opts.is_set("atomic"));
+    let mirror = opts.is_set("mirror");
+    let atomic = opts.is_set("atomic");
+    let delete = opts.is_set("delete");
+    if mirror && opts.positionals.len() > 1 {
+        return Err(GitError::Invalid {
+            detail: "usage: push [--mirror] [<remote>]".to_owned(),
+        });
     }
-    let spec_texts: Vec<String> = if opts.positionals.len() > 1 {
+    let spec_texts: Vec<String> = if mirror {
+        Vec::new()
+    } else if opts.positionals.len() > 1 {
         opts.positionals[1..].to_vec()
     } else {
-        let (workspace, _) = load_or_default(store)?;
-        match workspace.head {
-            ruk_core::workspace::HeadRef::Symbolic(name) => {
-                let short = name.to_utf8().unwrap_or_default().to_owned();
-                vec![format!("{short}:{short}")]
-            }
-            ruk_core::workspace::HeadRef::Detached(_) => {
-                return Err(GitError::Invalid {
-                    detail: "push from a detached HEAD needs an explicit refspec".to_owned(),
+        default_push_specs(store)?
+    };
+    match resolve_target(ctx, target)? {
+        Target::Local(dest_root) => {
+            let dest = open_store_at(&dest_root)?;
+            if dest.hash_kind() != kind {
+                return Err(GitError::ObjectFormat {
+                    detail: "source and destination object formats disagree".to_owned(),
                 });
             }
+            if mirror {
+                return push_mirror(ctx, &dest, target, atomic);
+            }
+            let updates = build_push_updates(store, &dest, &spec_texts, delete, force_all, &|name| {
+                peel_dest_oid(&dest, name)
+            })?;
+            push_local(store, &dest, target, kind, atomic, updates)
         }
-    };
+        Target::Net(endpoint) => push_net(
+            ctx,
+            &endpoint,
+            target,
+            &spec_texts,
+            mirror,
+            atomic,
+            delete,
+            force_all,
+        ),
+    }
+}
+
+/// The default push refspecs from the current branch: `HEAD`'s short name
+/// pushed to itself, the way the oracle pushes the current branch with no
+/// explicit refspec.
+fn default_push_specs(store: &Store) -> Result<Vec<String>, GitError> {
+    let (workspace, _) = load_or_default(store)?;
+    match workspace.head {
+        ruk_core::workspace::HeadRef::Symbolic(name) => {
+            let short = name.to_utf8().unwrap_or_default().to_owned();
+            Ok(vec![format!("{short}:{short}")])
+        }
+        ruk_core::workspace::HeadRef::Detached(_) => Err(GitError::Invalid {
+            detail: "push from a detached HEAD needs an explicit refspec".to_owned(),
+        }),
+    }
+}
+
+/// Builds push updates from refspecs: deletes resolve the destination name
+/// and zero the tip, sets resolve the source rev locally and check
+/// fast-forward against the destination tip `peel` reports.
+fn build_push_updates(
+    src: &Store,
+    dwell: &Store,
+    spec_texts: &[String],
+    delete: bool,
+    force_all: bool,
+    peel: &dyn Fn(&RefName) -> Result<Option<Oid>, GitError>,
+) -> Result<Vec<PushUpdate>, GitError> {
+    let kind = src.hash_kind();
     let zero = kind.zero_oid();
     let mut updates = Vec::new();
-    for spec_text in &spec_texts {
+    for spec_text in spec_texts {
         let (force, rest) = spec_text
             .strip_prefix('+')
             .map_or((false, spec_text.as_str()), |tail| (true, tail));
         let (src_text, dst_text) = rest
             .split_once(':')
             .map_or((rest, rest), |(left, right)| (left, right));
-        if opts.is_set("delete") {
-            let name = dwell_dest(&dest, dst_text)?;
-            let old = peel_dest_oid(&dest, &name)?.unwrap_or(zero);
+        if delete {
+            let name = dwell_dest(dwell, dst_text)?;
+            let old = peel(&name)?.unwrap_or(zero);
             updates.push(PushUpdate {
                 name: name.as_bytes().to_vec(),
                 old,
@@ -646,10 +884,10 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             });
             continue;
         }
-        let new = resolve_rev(store, kind, src_text)?;
-        let name = dwell_dest(&dest, dst_text)?;
-        let old = peel_dest_oid(&dest, &name)?.unwrap_or(zero);
-        if old != zero && !force && !force_all && !is_ancestor(store, old, new)? {
+        let new = resolve_rev(src, kind, src_text)?;
+        let name = dwell_dest(dwell, dst_text)?;
+        let old = peel(&name)?.unwrap_or(zero);
+        if old != zero && !force && !force_all && !is_ancestor(src, old, new)? {
             return Err(GitError::PushRejected {
                 detail: format!(
                     "non-fast-forward push to {}",
@@ -663,24 +901,116 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             new,
         });
     }
+    Ok(updates)
+}
+
+/// Pushes prebuilt updates to a local destination through a persisted plan.
+fn push_local(
+    src: &Store,
+    dest: &Store,
+    target: &str,
+    kind: HashKind,
+    atomic: bool,
+    updates: Vec<PushUpdate>,
+) -> Result<Vec<u8>, GitError> {
     let request = PushWireRequest {
         updates: updates.clone(),
-        atomic: opts.is_set("atomic"),
+        atomic,
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
         target.as_bytes().to_vec(),
-        opts.is_set("atomic"),
+        atomic,
         updates,
     );
     push_outcomes(local_push(
-        &dest,
+        dest,
+        src,
+        kind,
+        &mut plan,
+        &request,
+        &Interrupt::none(),
+    )?)
+}
+
+/// Pushes to a network endpoint: discovers the remote tips for CAS
+/// expectations, then drives `push_over` over one receive-pack connection
+/// with the same persisted plan local pushes use.
+///
+/// Oracle: `git/builtin/push.c`.
+fn push_net(
+    ctx: &Ctx,
+    endpoint: &Endpoint,
+    target: &str,
+    spec_texts: &[String],
+    mirror: bool,
+    atomic: bool,
+    delete: bool,
+    force_all: bool,
+) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let advertised = net::to_local_refs(net::discover_endpoint(
+        endpoint,
+        Service::ReceivePack,
+        kind,
+    )?)?;
+    let remote: Vec<(Vec<u8>, Oid)> = advertised
+        .iter()
+        .filter_map(|entry| match &entry.target {
+            RefTarget::Direct(oid) => Some((entry.name.clone(), *oid)),
+            RefTarget::Symbolic(_) => None,
+        })
+        .collect();
+    let updates = if mirror {
+        mirror_push_updates(kind, &direct_tips(store)?, &remote)
+    } else {
+        build_push_updates(store, store, spec_texts, delete, force_all, &|name| {
+            peel_advertised(&advertised, name)
+        })?
+    };
+    if mirror && updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let request = PushWireRequest {
+        updates: updates.clone(),
+        atomic,
+    };
+    let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
+        PlanId::generate(),
+        target.as_bytes().to_vec(),
+        atomic,
+        updates,
+    );
+    let stream = net::open_stream(endpoint, Service::ReceivePack)?;
+    push_outcomes(ruk_git::transport::push::push_over(
+        stream,
         store,
         kind,
         &mut plan,
         &request,
         &Interrupt::none(),
     )?)
+}
+
+/// Reads the advertised tip behind one destination ref, if it exists: the
+/// network counterpart of [`peel_dest_oid`].
+fn peel_advertised(
+    advertised: &[AdvertisedLocalRef],
+    name: &RefName,
+) -> Result<Option<Oid>, GitError> {
+    match advertised
+        .iter()
+        .find(|entry| entry.name == name.as_bytes())
+    {
+        None => Ok(None),
+        Some(entry) => match &entry.target {
+            RefTarget::Direct(oid) => Ok(Some(*oid)),
+            RefTarget::Symbolic(_) => Err(GitError::Invalid {
+                detail: "destination ref is symbolic".to_owned(),
+            }),
+        },
+    }
 }
 
 /// Pushes every local ref to the same name on the destination and deletes
@@ -691,17 +1021,9 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
 fn push_mirror(ctx: &Ctx, dest: &Store, target: &str, atomic: bool) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let zero = kind.zero_oid();
     let local = direct_tips(store)?;
     let remote = direct_tips(dest)?;
-    let mut updates = Vec::new();
-    for mirror_update in push_mirror_updates(&local, &remote) {
-        updates.push(PushUpdate {
-            name: mirror_update.name,
-            old: mirror_update.old.unwrap_or(zero),
-            new: mirror_update.new.unwrap_or(zero),
-        });
-    }
+    let updates = mirror_push_updates(kind, &local, &remote);
     if updates.is_empty() {
         return Ok(Vec::new());
     }
@@ -723,6 +1045,25 @@ fn push_mirror(ctx: &Ctx, dest: &Store, target: &str, atomic: bool) -> Result<Ve
         &request,
         &Interrupt::none(),
     )?)
+}
+
+/// Builds the `push --mirror` update list from local and remote direct
+/// tips, forcing every set the way the oracle's `--mirror` does.
+fn mirror_push_updates(
+    kind: HashKind,
+    local: &[(Vec<u8>, Oid)],
+    remote: &[(Vec<u8>, Oid)],
+) -> Vec<PushUpdate> {
+    let zero = kind.zero_oid();
+    let mut updates = Vec::new();
+    for mirror_update in push_mirror_updates(&local, &remote) {
+        updates.push(PushUpdate {
+            name: mirror_update.name,
+            old: mirror_update.old.unwrap_or(zero),
+            new: mirror_update.new.unwrap_or(zero),
+        });
+    }
+    updates
 }
 
 /// Direct ref tips of one store as `(name, oid)` pairs; symbolic refs
@@ -1111,9 +1452,9 @@ fn check_tree(
     Ok(())
 }
 
-/// Lists refs in a local repository.
+/// Lists refs in a local repository or over one discovery round trip.
 ///
-/// Oracle: `git/builtin/ls-remote.c`. Network remotes are `Offline`.
+/// Oracle: `git/builtin/ls-remote.c`.
 pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -1134,9 +1475,6 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             detail: "usage: ls-remote [<remote>] [<pattern>]".to_owned(),
         });
     }
-    let root = remote_root(ctx, target)?;
-    let src = open_store_at(&root)?;
-    let advertised = advertise(&src)?;
     let pattern = match opts.positionals.as_slice() {
         [_] | [] => None,
         [_, want] => Some(want.clone()),
@@ -1146,14 +1484,41 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             });
         }
     };
-    let want = pattern.as_deref();
+    let advertised = match resolve_target(ctx, target)? {
+        Target::Local(root) => {
+            let src = open_store_at(&root)?;
+            advertise(&src)?
+        }
+        Target::Net(endpoint) => net::to_local_refs(net::discover_endpoint(
+            &endpoint,
+            Service::UploadPack,
+            ctx.kind()?,
+        )?)?,
+    };
+    Ok(render_ls_remote(
+        &advertised,
+        opts.is_set("heads"),
+        opts.is_set("tags"),
+        pattern.as_deref(),
+    ))
+}
+
+/// Renders advertised refs the `ls-remote` way: one `<oid>\t<name>` line
+/// per direct ref, `ref: <target>` lines for symbolic refs, filtered by
+/// the `--heads`/`--tags` flags and an optional substring pattern.
+fn render_ls_remote(
+    advertised: &[AdvertisedLocalRef],
+    heads_only: bool,
+    tags_only: bool,
+    want: Option<&str>,
+) -> Vec<u8> {
     let mut out = Vec::new();
-    for entry in &advertised {
+    for entry in advertised {
         let name = String::from_utf8_lossy(&entry.name).into_owned();
-        if opts.is_set("heads") && !name.starts_with("refs/heads/") {
+        if heads_only && !name.starts_with("refs/heads/") {
             continue;
         }
-        if opts.is_set("tags") && !name.starts_with("refs/tags/") {
+        if tags_only && !name.starts_with("refs/tags/") {
             continue;
         }
         if want.is_some_and(|text| !name.contains(text)) {
@@ -1170,5 +1535,5 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             }
         }
     }
-    Ok(line(out))
+    line(out)
 }
