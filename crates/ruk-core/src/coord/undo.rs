@@ -428,6 +428,10 @@ mod tests {
     fn undo_refuses_a_restored_ref_beside_a_live_child() {
         let fixture = Fixture::new("ref-clash");
         let deleted = ref_target(1);
+        fixture
+            .store
+            .publish(Vec::new(), &[ref_set(b"refs/heads/a", &deleted)])
+            .expect("seed the ref the operation deletes");
         let id = fixture.record(
             Method::BookmarkDelete,
             &[FactMutation {
