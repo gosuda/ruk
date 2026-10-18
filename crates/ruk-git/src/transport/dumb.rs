@@ -254,7 +254,9 @@ mod tests {
     use super::super::session::test_support::{store_with_pack, test_store};
     use super::*;
     use ruk_core::ids::HashKind;
-    use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTransaction, RefUpdate};
+    use ruk_core::refdata::{
+        RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate,
+    };
     use ruk_core::refs::prepare_checked_transaction;
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
