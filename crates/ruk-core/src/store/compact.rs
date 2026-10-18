@@ -26,7 +26,7 @@ use super::durability;
 use super::metadata::PublicationTxn;
 use super::segment::{self, RecordPayload, SegmentWriter};
 use super::types::{Encoding, ObjectLocation, SegmentManifest};
-use super::{Store, SEGMENTS_DIR, StoreError};
+use super::{SEGMENTS_DIR, Store, StoreError};
 use crate::ids::Oid;
 
 /// What one [`Store::compact`] pass did.
@@ -463,9 +463,10 @@ impl Store {
         if !staged.segments.is_empty() {
             super::sync_entries(segments_dir)?;
         }
-        let new_generation = self.observe(self.meta.generation())?.checked_add(1).ok_or_else(|| {
-            StoreError::Capacity("locator generation exhausted".to_owned())
-        })?;
+        let new_generation = self
+            .observe(self.meta.generation())?
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Capacity("locator generation exhausted".to_owned()))?;
         let txn = self.observe(self.meta.begin_publication(&[]))?;
         self.stage_swap(&txn, staged, retire, new_generation)?;
         self.observe(txn.commit())?;
@@ -627,10 +628,7 @@ mod tests {
     fn read_all(store: &Store, oid: Oid) -> Vec<u8> {
         let mut object = store.read(oid).expect("read object");
         let mut bytes = Vec::new();
-        object
-            .bytes
-            .read_to_end(&mut bytes)
-            .expect("read spool");
+        object.bytes.read_to_end(&mut bytes).expect("read spool");
         bytes
     }
 
@@ -701,7 +699,10 @@ mod tests {
         let stats = store.compact().expect("compact");
         assert!(stats.did_work(), "merging {before} segments must do work");
         assert_eq!(stats.objects_copied, retired_objects);
-        assert_eq!(stats.segments_retired, before - usize::from(open_id.is_some()));
+        assert_eq!(
+            stats.segments_retired,
+            before - usize::from(open_id.is_some())
+        );
         assert!(stats.bytes_freed > 0, "retired files must unlink");
         assert_eq!(stats.segments_unlinked, stats.segments_retired);
 
@@ -710,15 +711,16 @@ mod tests {
         }
         let generation_after = store.meta.generation().expect("generation");
         assert!(generation_after > generation_before);
-        assert!(
-            segment_count(&store) < before,
-            "segments must merge down"
-        );
+        assert!(segment_count(&store) < before, "segments must merge down");
 
         drop(store);
         let reopened = Store::open(&temp.store_dir(), budget()).expect("reopen");
         for (oid, bytes) in &expected {
-            assert_eq!(read_all(&reopened, *oid), *bytes, "object {oid} after reopen");
+            assert_eq!(
+                read_all(&reopened, *oid),
+                *bytes,
+                "object {oid} after reopen"
+            );
         }
         let idle = reopened.compact().expect("second compact");
         assert!(!idle.did_work(), "merged store has nothing left to do");
@@ -764,7 +766,11 @@ mod tests {
         let reopened = Store::open(&temp.store_dir(), budget()).expect("reopen");
         let guard = expected.lock().expect("poisoned");
         for (oid, bytes) in guard.iter() {
-            assert_eq!(read_all(&reopened, *oid), *bytes, "object {oid} after reopen");
+            assert_eq!(
+                read_all(&reopened, *oid),
+                *bytes,
+                "object {oid} after reopen"
+            );
         }
     }
 }
