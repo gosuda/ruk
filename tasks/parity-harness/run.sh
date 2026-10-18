@@ -15,9 +15,9 @@
 #
 # Volatile fields are masked before comparison: the two tempdir paths always
 # (mode "exact"), plus 40-hex object ids and abbreviated-oid lines (mode
-# "oid") for commands whose output names commit objects. Commit oids differ
-# legitimately because ruk appends a change-id trailer to commit payloads
-# (blob/tree oids are identical and compared exactly).
+# "oid") for commands whose output names objects. Exportable ruk commits carry
+# no change-id header, so commit oids match the oracle exactly when the inputs
+# match (blob/tree oids likewise); oid mode remains only for abbreviated forms.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -304,10 +304,11 @@ write_gaps() {
     printf 'failing rows:%s\n' "$FAIL_ROWS"
     printf '\n'
     printf '%s\n' 'Masking: tempdir paths always; 40-hex and abbreviated oids in oid-mode rows only.'
-    printf '%s\n' 'Root divergence: ruk appends a `change-id` trailer to commit payloads, so commit'
-    printf '%s\n' 'oids always differ while blob/tree oids match exactly (see c/hash-object, c/ls-tree,'
-    printf '%s\n' 'c/write-tree PASS rows). Classes: byte-diff-vs-git / unsupported-flag /'
-    printf '%s\n' 'unsupported-verb (probes below) / semantic-diff.'
+    printf '%s\n' 'Identity: exportable ruk commits carry no `change-id` header, so commit oids'
+    printf '%s\n' 'match the oracle exactly when inputs match (as do blob/tree oids; see c/hash-object,'
+    printf '%s\n' 'c/ls-tree, c/write-tree PASS rows). Only native conflict frames carry the header.'
+    printf '%s\n' 'Classes: byte-diff-vs-git / unsupported-flag / unsupported-verb (probes below) /'
+    printf '%s\n' 'semantic-diff.'
     printf '\n'
     printf '%s\n' '## failing rows (observed diffs)'
     cat -- "$GAPS_FRAG" || die "read gaps fragment failed"
