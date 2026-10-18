@@ -31,6 +31,7 @@
 //! - [`push`]: send-pack client, report-status, push plans.
 //! - [`serve`]: the `upload-pack`/`receive-pack` server halves (protocol v0).
 //! - [`proc_receive`]: AGit `refs/for/` diversion to the `proc-receive` hook.
+//! - [`dumb`]: dumb-HTTP `info/refs` text and loose objects.
 //! - [`archive`]: the `upload-archive` server half (streaming tar).
 //! - [`session`]: the network transport seam and the local native transport.
 //!
@@ -38,6 +39,7 @@
 //! later slice; this module contains none.
 
 pub mod archive;
+pub mod dumb;
 pub mod fetch;
 pub mod hooks;
 pub mod pack;
