@@ -21,13 +21,16 @@
 //! * A natively created record is validated by the `conflict-v1` model (one
 //!   validation and one canonical ordering for both forms), then rendered:
 //!   extra headers are sorted bytewise by name then value, structural header
-//!   names and a repeated `change-id` are rejected, and the native
-//!   `change-id` header carries the change ID. An exportable record renders
-//!   as a Git commit payload; any other as a `conflict-v1` frame.
+//!   names, a caller-supplied `change-id`, and a repeated `change-id` are
+//!   rejected, and the native `change-id` header carries the change ID. An
+//!   exportable record renders as a Git commit payload with no `change-id`
+//!   header, byte-identical to Git's rendering of the same commit; any other
+//!   renders as a `conflict-v1` frame carrying the header.
 //!
 //! The change ID is local metadata. A usable `change-id` header (exactly one,
 //! 32 reverse-hex characters) must agree with it; an imported commit without
-//! one gets its ID from the caller, which owns the stable by-OID mapping.
+//! one gets its ID from the caller, which owns the stable by-OID mapping
+//! (deterministically derived from the OID when no row exists yet).
 //! The predecessor is never read from imported bytes: a remote-controlled
 //! claim is not trusted supersession evidence, so only
 //! [`CommitRecord::create`] accepts one.
@@ -228,8 +231,9 @@ impl Provenance {
 
 /// Everything needed to create a native commit.
 ///
-/// `extra_headers` must not include `change-id`; it is derived from
-/// `change_id`. `parents` are ordered and distinct.
+/// `extra_headers` must not include `change-id`: `create` derives it from
+/// `change_id` for native `conflict-v1` frames, and exportable Git payloads
+/// carry no `change-id` header at all. `parents` are ordered and distinct.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NativeCommitInput {
     pub change_id: ChangeId,
@@ -492,6 +496,10 @@ impl CommitRecord {
     ///
     /// The record is a Git commit when `tree` is a singleton and every
     /// parent is a Git commit, and a native `conflict-v1` record otherwise.
+    /// Only the native form carries the `change-id` header: an exportable
+    /// payload stays byte-identical to Git's rendering of the same commit,
+    /// so its change identity lives in the record wire and change tables,
+    /// never in the hashed bytes.
     ///
     /// # Errors
     /// `ObjectFormat` for an object ID of the wrong width. `Invalid` for a
@@ -510,11 +518,28 @@ impl CommitRecord {
                 ));
             }
         }
+        if input
+            .extra_headers
+            .iter()
+            .any(|header| header.name.as_bytes() == CHANGE_ID_HEADER)
+        {
+            return Err(invalid(
+                "extra headers",
+                "a caller-supplied change-id header",
+            ));
+        }
+        // Decide exportability from the input, before validation builds the
+        // record: it depends only on the tree shape and parent kinds, which
+        // validation preserves.
+        let exportable =
+            input.tree.as_resolved().is_some() && input.parents.iter().all(Head::is_git);
         let mut extra_headers = input.extra_headers;
-        extra_headers.push(ExtraHeader {
-            name: ByteString::from(CHANGE_ID_HEADER),
-            value: ByteString::from(input.change_id.to_reverse_hex()),
-        });
+        if !exportable {
+            extra_headers.push(ExtraHeader {
+                name: ByteString::from(CHANGE_ID_HEADER),
+                value: ByteString::from(input.change_id.to_reverse_hex()),
+            });
+        }
         let record = ConflictRecord::from_input(
             &ConflictRecordInput {
                 trees: input.tree.iter().copied().collect(),
@@ -1153,16 +1178,23 @@ mod tests {
                 "tree {}\nparent {}\nparent {}\n\
                  author Ann <ann@example.test> 1700000000 +0900\n\
                  committer Cy <cy@example.test> 1700000001 -0000\n\
-                 alpha 2\nchange-id {}\nmergetag l1\n l2\nzeta 1\n\n\
+                 alpha 2\nmergetag l1\n l2\nzeta 1\n\n\
                  subject\n\nbody\n",
                 oid(kind, 1),
                 oid(kind, 4),
                 oid(kind, 2),
-                change(7).to_reverse_hex(),
             );
             assert_eq!(record.git_payload(), Some(expected.as_bytes()));
             assert!(record.is_exportable());
             assert!(record.native_record().is_none());
+            assert!(
+                !record
+                    .git_payload()
+                    .expect("payload")
+                    .windows(CHANGE_ID_HEADER.len())
+                    .any(|window| window == CHANGE_ID_HEADER),
+                "exportable payload carries no change-id header"
+            );
             assert_eq!(
                 record.parents(),
                 [git(kind, 4), git(kind, 2)],
@@ -1173,7 +1205,7 @@ mod tests {
                 .iter()
                 .map(|h| h.name.as_bytes())
                 .collect();
-            assert_eq!(names, [&b"alpha"[..], b"change-id", b"mergetag", b"zeta"]);
+            assert_eq!(names, [&b"alpha"[..], b"mergetag", b"zeta"]);
             assert_eq!(record.change_id(), change(7));
             assert_eq!(
                 record.head().expect("head"),
@@ -1252,6 +1284,47 @@ mod tests {
                 record.head().expect("head"),
                 Head::Conflicted { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn exportable_commits_carry_no_header_while_native_frames_do() {
+        for kind in KINDS {
+            let exportable = CommitRecord::create(input(kind), kind).expect("exportable");
+            assert!(exportable.is_exportable());
+            let payload = exportable.git_payload().expect("payload");
+            assert_eq!(CommitRecord::git_header_change_id(payload), None);
+            assert_eq!(exportable.change_id(), change(7));
+            // A headerless payload imports under any caller mapping, and a
+            // headered past commit still binds its declared ID.
+            let reread =
+                CommitRecord::import_git(payload.to_vec(), kind, change(9), None).expect("import");
+            assert_eq!(reread.change_id(), change(9));
+            assert_eq!(reread.git_payload(), Some(payload));
+
+            let mut native_input = input(kind);
+            native_input.tree = conflicted_tree(kind);
+            let native = CommitRecord::create(native_input, kind).expect("native");
+            assert!(!native.is_exportable());
+            let declared: Vec<String> = native
+                .extra_headers()
+                .iter()
+                .filter(|h| h.name.as_bytes() == CHANGE_ID_HEADER)
+                .map(|h| h.value.to_utf8().expect("header text").to_owned())
+                .collect();
+            assert_eq!(declared, [change(7).to_reverse_hex()]);
+            assert_eq!(native.change_id(), change(7));
+
+            // A caller-supplied header is rejected on both forms, so an
+            // exportable payload can never smuggle one in.
+            for conflicted in [false, true] {
+                let mut smuggled = input(kind);
+                if conflicted {
+                    smuggled.tree = conflicted_tree(kind);
+                }
+                smuggled.extra_headers = vec![header("change-id", &change(7).to_reverse_hex())];
+                assert!(CommitRecord::create(smuggled, kind).is_err());
+            }
         }
     }
 
@@ -1468,8 +1541,21 @@ mod tests {
 
         let value = |record: &CommitRecord| sonic_rs::to_value(record).expect("value");
 
-        // Wrong change ID for the header inside the bytes.
+        // An exportable payload carries no header, so any local mapping is
+        // accepted; a native frame still binds its change ID to the header.
         let mut forged = value(&exportable);
+        forged["change_id"] = sonic_rs::to_value(&change(8)).expect("id");
+        assert_eq!(
+            sonic_rs::from_value::<CommitRecord>(&forged).expect("headerless accepts mapping"),
+            CommitRecord::import_git(
+                exportable.git_payload().expect("payload").to_vec(),
+                kind,
+                change(8),
+                None
+            )
+            .expect("import")
+        );
+        let mut forged = value(&native);
         forged["change_id"] = sonic_rs::to_value(&change(8)).expect("id");
         assert!(sonic_rs::from_value::<CommitRecord>(&forged).is_err());
 
@@ -1589,14 +1675,15 @@ mod tests {
             prop_assert_eq!(record.parents(), parents.as_slice());
             prop_assert_eq!(record.message(), message.as_bytes());
             prop_assert_eq!(record.change_id(), change_id);
-            // Canonical order, with exactly one change-id header.
+            // Canonical order, with exactly one change-id header on native
+            // frames and none on exportable payloads.
             prop_assert!(record.extra_headers().windows(2).all(|pair| pair[0] <= pair[1]));
             let ids = record
                 .extra_headers()
                 .iter()
                 .filter(|h| h.name.as_bytes() == CHANGE_ID_HEADER)
                 .count();
-            prop_assert_eq!(ids, 1);
+            prop_assert_eq!(ids, usize::from(!expect_git));
 
             prop_assert_eq!(&json_round_trip(&record), &record);
             prop_assert_eq!(&postcard_round_trip(&record), &record);
