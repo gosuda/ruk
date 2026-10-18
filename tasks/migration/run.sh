@@ -479,12 +479,16 @@ gen_results() {
     printf '%s\n' "  by the gitdir-intact and rollback checks."
     printf '%s\n' "- \`ruk git for-each-ref\` prints \`<oid> <ref>\` while git prints"
     printf '%s\n' "  \`<oid> <type><tab><ref>\`; the comparison normalizes to oid+refname, which is exact."
-    printf '%s\n' "- \`ruk git log\` order is a LIFO discovery walk (\`walk_history\`,"
-    printf '%s\n' "  \`crates/ruk/src/cli/state.rs\`), not git's date-ordered default: on the merge"
-    printf '%s\n' "  fixture a parent sorts after its own ancestors (see basic/log-order.diff)."
-    printf '%s\n' "  Content (set+tip) is exact everywhere; byte order matched on all-distinct"
-    printf '%s\n' "  timestamps (big: 602 commits). This is a log-verb gap, not a migrate defect:"
-    printf '%s\n' "  every migrated object, ref, and OID is proven byte-identical above."
+    if grep -qF -- "$(printf 'log-order\tFAIL')" "${RESULTS_TSV:?}"; then
+      printf '%s\n' "- \`ruk git log\` order regressed: a log-order check FAILs above (see the"
+      printf '%s\n' "  fixture's log-order.diff). \`walk_history\` (\`crates/ruk/src/cli/state.rs\`)"
+      printf '%s\n' "  must follow git's date-ordered default; the table, not this bullet, is truth."
+    else
+      printf '%s\n' "- \`ruk git log\` order follows git's date-ordered default (\`walk_history\`,"
+      printf '%s\n' "  \`crates/ruk/src/cli/state.rs\`): committer-date descending, ties by discovery"
+      printf '%s\n' "  order, byte-identical on every fixture including the merge fixture with"
+      printf '%s\n' "  identical timestamps (basic) and 602 commits (big)."
+    fi
     printf '%s\n' "- git C-quotes non-ASCII paths in ls-tree under a C locale (core.quotepath) but"
     printf '%s\n' "  prints raw bytes under UTF-8 locales; ruk always prints raw bytes. Modes, OIDs,"
     printf '%s\n' "  and name bytes are identical; comparisons pin git with"
