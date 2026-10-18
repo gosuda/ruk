@@ -113,11 +113,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_56_names() {
-    assert_eq!(VERBS.len(), 57);
+    assert_eq!(VERBS.len(), 58);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 57);
+    assert_eq!(names.len(), 58);
     for name in [
         "add",
         "archive",
@@ -171,6 +171,7 @@ fn verb_table_covers_56_names() {
         "tag",
         "update-index",
         "update-ref",
+        "upload-archive",
         "upload-pack",
         "verify-pack",
         "version",
@@ -556,6 +557,33 @@ fn serve_verbs_round_trip_scripted_stdin() {
 
     let _ = std::fs::remove_dir_all(root_a.parent().expect("parent"));
     let _ = std::fs::remove_dir_all(root_b.parent().expect("parent"));
+}
+
+#[test]
+fn upload_archive_argv_reaches_serve_half() {
+    use ruk_git::transport::pktline::encode_data;
+
+    let (root, env) = seeded_repo("serve-archive", "a.txt", b"a\n");
+    let mut input = Vec::new();
+    encode_data(&mut input, b"argument HEAD\n").expect("frame");
+    input.extend_from_slice(b"0000");
+    let env = CliEnv {
+        stdin: Some(input),
+        ..env
+    };
+    let argv = vec![
+        "ruk".to_owned(),
+        "upload-archive".to_owned(),
+        root.to_str().expect("utf8 root").to_owned(),
+    ];
+    let (stdout, _) = super::run_inner(&argv, env).expect("upload-archive routes");
+    assert!(
+        stdout.starts_with(b"0008ACK\n0000"),
+        "argv reaches serve_upload_archive: {stdout:?}"
+    );
+    assert!(lookup("upload-archive").is_some());
+
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
 #[test]

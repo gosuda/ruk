@@ -27,6 +27,7 @@ use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUp
 use ruk_core::refs::StoreRefs;
 use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
 use ruk_git::GitError;
+use ruk_git::transport::archive::serve_upload_archive;
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::push::{PushUpdate, PushWireRequest};
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
@@ -654,6 +655,39 @@ pub(crate) fn upload_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
             let stdout = std::io::stdout();
             let mut output = stdout.lock();
             serve_upload_pack(
+                &mut input,
+                &mut output,
+                &store,
+                kind,
+                &head,
+                &Interrupt::none(),
+            )?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Serves `upload-archive`: answers `ACK` and streams the tar.
+///
+/// Oracle: `git/builtin/upload-archive.c`.
+pub(crate) fn upload_archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let store = serve_store(ctx, args)?;
+    let kind = store.hash_kind();
+    let head = serve_head(&store)?;
+    match ctx.env.stdin.as_deref() {
+        Some(input) => {
+            let mut out = Vec::new();
+            serve_upload_archive(input, &mut out, &store, kind, &head, &Interrupt::none())?;
+            Ok(out)
+        }
+        // Live pipes stream `ACK` and the tar straight to stdout; see
+        // `receive_pack` for why the return value stays empty here.
+        None => {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            serve_upload_archive(
                 &mut input,
                 &mut output,
                 &store,
