@@ -2910,6 +2910,11 @@ fn resolve_parts(
 
 /// The entry a resolution writes at the conflicted path, staging any supplied
 /// blob into `objects`.
+///
+/// A side index addresses the simplified merge's adds: the same sides the
+/// conflict check and `remaining` report. A raw add can name a cancelled
+/// value (such as the base) that no side holds, so indexing it would resolve
+/// to content the client never saw as a side.
 fn resolution_entry(
     store: &Store,
     merged: &Merge<Node>,
@@ -2918,11 +2923,13 @@ fn resolution_entry(
 ) -> Result<Node, CoreError> {
     match resolution {
         Resolution::Side { index } => {
-            let position = usize::try_from(*index).map_err(|_| side_missing(*index, merged))?;
-            merged
+            let simplified = merged.simplify();
+            let position =
+                usize::try_from(*index).map_err(|_| side_missing(*index, &simplified))?;
+            simplified
                 .get_add(position)
                 .copied()
-                .ok_or_else(|| side_missing(*index, merged))
+                .ok_or_else(|| side_missing(*index, &simplified))
         }
         Resolution::AcceptSame => accept_same(merged),
         Resolution::Supplied {
@@ -6311,6 +6318,69 @@ mod tests {
             .expect("resolved commit is stored");
         assert_eq!(resolved.tree().as_resolved(), Some(&t1));
         assert_eq!(resolved.predecessor(), Some(head));
+    }
+
+    #[test]
+    fn resolve_side_indexes_the_simplified_sides() {
+        let (_temp, store, session) = fixture();
+        let t1 = seed_files(&store, &[("x", 1)]);
+        let t2 = seed_files(&store, &[("x", 2)]);
+        let t3 = seed_files(&store, &[("x", 3)]);
+        let t4 = seed_files(&store, &[("x", 4)]);
+        let change = ChangeId::generate();
+        // Terms [1, 2, 2, 3, 4] simplify to [1, 3, 4] with sides [1, 4]: the
+        // raw second add is the cancelled content 2, while the simplified
+        // second side is 4.
+        let input = NativeCommitInput {
+            change_id: change,
+            tree: Merge::from_vec(vec![t1, t2, t2, t3, t4]),
+            parents: Vec::new(),
+            predecessor: None,
+            author: signature(),
+            committer: signature(),
+            extra_headers: Vec::new(),
+            message: ByteString::from("conflicted"),
+            provenance: None,
+        };
+        let conflicted = Records::new(&store)
+            .prepare_native_commit(input)
+            .expect("prepare conflicted commit");
+        let head = conflicted.head;
+        store
+            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .expect("publish conflicted commit");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::Resolve(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ResolveArgs {
+                    target: ChangeRef {
+                        change,
+                        head: Some(head),
+                    },
+                    path: RepoPath::new("x").expect("test path"),
+                    resolution: Resolution::Side { index: 1 },
+                    workspaces: Vec::new(),
+                },
+            })),
+        )
+        .expect("resolve prepares");
+        let Reply::Resolve(reply) = prepared.reply else {
+            panic!("resolve must answer its own reply");
+        };
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish resolve");
+        let resolved = Records::new(&store)
+            .get_commit(&reply.change.head)
+            .expect("read resolved commit")
+            .expect("resolved commit is stored");
+        assert_eq!(
+            resolved.tree().as_resolved(),
+            Some(&t4),
+            "side 1 is the simplified second side, not the cancelled raw add"
+        );
     }
 
     #[test]
