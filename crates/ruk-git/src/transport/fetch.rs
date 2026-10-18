@@ -431,8 +431,7 @@ fn receive_v2<R: Read + Write>(
                         // with band-2 progress either way (verified against
                         // git 2.53.0), so this arm always demultiplexes. A
                         // raw pack here is corrupt, not a legacy shape.
-                        let mut band =
-                            SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
+                        let mut band = SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
                         let pack = ingest_pack(&mut band, kind, store, limits, interrupt)?;
                         progress = band.drain_to_end()?;
                         staged = Some(pack);

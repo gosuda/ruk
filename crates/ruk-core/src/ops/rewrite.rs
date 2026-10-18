@@ -203,13 +203,7 @@ mod tests {
         /// Restages `old` as a new head of `change`, the way describe/rebase
         /// rewrite one closure member: the old record stays stored, but only
         /// the new head stays a current head of the change.
-        fn rewrite(
-            &self,
-            old: Head,
-            parents: Vec<Head>,
-            message: &str,
-            change: ChangeId,
-        ) -> Head {
+        fn rewrite(&self, old: Head, parents: Vec<Head>, message: &str, change: ChangeId) -> Head {
             self.mint(parents, message, change, Some(old))
         }
 
@@ -351,13 +345,12 @@ mod tests {
         let fixture = Fixture::new("abandon");
         let a = fixture.commit(Vec::new(), "a");
         let b = fixture.commit(vec![a], "b");
-        crate::ops::abandon(&fixture.store, crate::ops::AbandonRequest { heads: vec![b] })
-            .expect("abandon");
-        assert!(
-            children(&fixture.store, &a)
-                .expect("children")
-                .is_empty()
-        );
+        crate::ops::abandon(
+            &fixture.store,
+            crate::ops::AbandonRequest { heads: vec![b] },
+        )
+        .expect("abandon");
+        assert!(children(&fixture.store, &a).expect("children").is_empty());
         assert!(
             descendants(&fixture.store, &[a])
                 .expect("closure")
@@ -378,10 +371,7 @@ mod tests {
         let x = fixture.commit_on(vec![d], "x", change_x);
         let x2 = fixture.rewrite(x, vec![e], "x2", change_x);
         assert_eq!(children(&fixture.store, &d).expect("children"), vec![s]);
-        assert_eq!(
-            children(&fixture.store, &e).expect("moved child"),
-            vec![x2]
-        );
+        assert_eq!(children(&fixture.store, &e).expect("moved child"), vec![x2]);
     }
 
     #[test]

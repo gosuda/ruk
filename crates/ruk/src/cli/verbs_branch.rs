@@ -3538,11 +3538,7 @@ enum IndexRestore {
 }
 
 /// Dispatches `apply` on the parsed `--index` flag to its named entry point.
-fn stash_apply_scoped(
-    ctx: &Ctx,
-    slot: u64,
-    opts: &super::Collected,
-) -> Result<Vec<u8>, GitError> {
+fn stash_apply_scoped(ctx: &Ctx, slot: u64, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     if opts.is_set("index") {
         stash_apply_with_index(ctx, slot)
     } else {
@@ -3638,12 +3634,18 @@ fn stash_restore(ctx: &Ctx, slot: u64, scope: IndexRestore) -> Result<Vec<u8>, G
     // on disk (untracked files) stays.
     let mut extra: Vec<Vec<u8>> = Vec::new();
     for (path, _, _) in &base_paths {
-        if !extra.iter().any(|known| known.as_slice() == path.as_slice()) {
+        if !extra
+            .iter()
+            .any(|known| known.as_slice() == path.as_slice())
+        {
             extra.push(path.clone());
         }
     }
     for (path, stage, _) in &current {
-        if *stage == Stage::Zero && !extra.iter().any(|known| known.as_slice() == path.as_bytes())
+        if *stage == Stage::Zero
+            && !extra
+                .iter()
+                .any(|known| known.as_slice() == path.as_bytes())
         {
             extra.push(path.as_bytes().to_vec());
         }

@@ -1721,10 +1721,7 @@ async fn typed_edit_checks_out_change() {
     };
     assert_eq!(next.head, created.created.head);
     assert_eq!(next.change, created.created.change);
-    assert_eq!(
-        next.stamp.sequence,
-        workspaced.state.stamp().sequence + 1
-    );
+    assert_eq!(next.stamp.sequence, workspaced.state.stamp().sequence + 1);
 
     let payload = Driver::typed_open(
         &store_repo,

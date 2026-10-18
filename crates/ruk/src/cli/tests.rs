@@ -436,10 +436,8 @@ fn stash_push_mints_oracle_shaped_commits() {
     let head = ref_oid(" refs/heads/main");
     let stash = ref_oid(" refs/stash");
     let mut payload = |oid: &str| {
-        String::from_utf8(
-            run(verbs_objects::cat_file, &mut ctx, &["-p", oid]).expect("cat object"),
-        )
-        .expect("object utf8")
+        String::from_utf8(run(verbs_objects::cat_file, &mut ctx, &["-p", oid]).expect("cat object"))
+            .expect("object utf8")
     };
     let tree_of = |text: &str| {
         text.lines()
@@ -474,10 +472,12 @@ fn stash_push_mints_oracle_shaped_commits() {
     // Popping restores the worktree edit unstaged and drops the slot,
     // naming the worktree commit oid like the oracle `Dropped` line.
     let out = run(verbs_branch::stash, &mut ctx, &["pop"]).expect("stash pop");
-    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\nwip\n");
+    assert_eq!(
+        std::fs::read(root.join("s.txt")).expect("read"),
+        b"one\nwip\n"
+    );
     assert!(
-        String::from_utf8_lossy(&out)
-            .ends_with(&format!("Dropped refs/stash@{{0}} ({stash})\n"))
+        String::from_utf8_lossy(&out).ends_with(&format!("Dropped refs/stash@{{0}} ({stash})\n"))
     );
     let out = run(verbs_branch::stash, &mut ctx, &["list"]).expect("stash list");
     assert!(out.is_empty());
@@ -489,23 +489,27 @@ fn stash_pop_index_flag_restores_staged_state() {
     let (root, env) = seeded_repo("stash-index", "s.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
     let porcelain = |ctx: &mut Ctx| {
-        String::from_utf8(
-            run(verbs_stage::status, ctx, &["--porcelain"]).expect("status"),
-        )
-        .expect("status utf8")
+        String::from_utf8(run(verbs_stage::status, ctx, &["--porcelain"]).expect("status"))
+            .expect("status utf8")
     };
     std::fs::write(root.join("s.txt"), b"one\nwip\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["s.txt"]).expect("stage");
     run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
     // Without `--index` a stashed staged change comes back unstaged.
     run(verbs_branch::stash, &mut ctx, &["pop"]).expect("pop");
-    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\nwip\n");
+    assert_eq!(
+        std::fs::read(root.join("s.txt")).expect("read"),
+        b"one\nwip\n"
+    );
     assert_eq!(porcelain(&mut ctx), " M s.txt\n");
     // With `--index` the staged state comes back staged.
     run(verbs_stage::add, &mut ctx, &["s.txt"]).expect("stage");
     run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
     run(verbs_branch::stash, &mut ctx, &["pop", "--index"]).expect("pop --index");
-    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\nwip\n");
+    assert_eq!(
+        std::fs::read(root.join("s.txt")).expect("read"),
+        b"one\nwip\n"
+    );
     assert_eq!(porcelain(&mut ctx), "M  s.txt\n");
     let out = run(verbs_branch::stash, &mut ctx, &["list"]).expect("stash list");
     assert!(out.is_empty());
@@ -1214,14 +1218,18 @@ fn file_url_remote_fetch_push_cycle() {
     let (dst, _) = seeded_repo("fileurl-dst", "g.txt", b"g\n");
     {
         let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
-        run(verbs_repo::remote, &mut dst_ctx, &["add", "origin", &src_url])
-            .expect("remote add file://");
+        run(
+            verbs_repo::remote,
+            &mut dst_ctx,
+            &["add", "origin", &src_url],
+        )
+        .expect("remote add file://");
         run(verbs_transport::fetch, &mut dst_ctx, &["origin"]).expect("fetch file://");
         let out = run(verbs_branch::show_ref, &mut dst_ctx, &[]).expect("show-ref");
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("refs/remotes/origin/main"), "got {text}");
-        let out = run(verbs_transport::ls_remote, &mut dst_ctx, &["origin"])
-            .expect("ls-remote file://");
+        let out =
+            run(verbs_transport::ls_remote, &mut dst_ctx, &["origin"]).expect("ls-remote file://");
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("refs/heads/main"), "got {text}");
     }
@@ -1245,8 +1253,8 @@ fn file_url_remote_fetch_push_cycle() {
         let out = run(verbs_branch::show_ref, &mut src_ctx, &[]).expect("show-ref");
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("refs/heads/contrib"), "got {text}");
-        let out = run(verbs_history::log, &mut src_ctx, &["--oneline", "contrib"])
-            .expect("log contrib");
+        let out =
+            run(verbs_history::log, &mut src_ctx, &["--oneline", "contrib"]).expect("log contrib");
         assert!(
             String::from_utf8_lossy(&out).contains("via file url"),
             "got {:?}",
@@ -1291,18 +1299,40 @@ fn network_scheme_routing_names_gaps() {
     // hang), and the failure must come from the network path, never the
     // old local-path refusal.
     let mut ctx = repo_ctx(&root, test_env(&root));
-    let err = run(verbs_transport::ls_remote, &mut ctx, &["ssh://127.0.0.1:1/srv/a.git"])
-        .expect_err("ssh ls-remote must fail");
-    assert!(!matches!(err, GitError::Offline { .. }), "took the local path: {err}");
-    let err = run(verbs_transport::fetch, &mut ctx, &["ssh://127.0.0.1:1/srv/a.git"])
-        .expect_err("ssh fetch must fail");
-    assert!(!matches!(err, GitError::Offline { .. }), "took the local path: {err}");
+    let err = run(
+        verbs_transport::ls_remote,
+        &mut ctx,
+        &["ssh://127.0.0.1:1/srv/a.git"],
+    )
+    .expect_err("ssh ls-remote must fail");
+    assert!(
+        !matches!(err, GitError::Offline { .. }),
+        "took the local path: {err}"
+    );
+    let err = run(
+        verbs_transport::fetch,
+        &mut ctx,
+        &["ssh://127.0.0.1:1/srv/a.git"],
+    )
+    .expect_err("ssh fetch must fail");
+    assert!(
+        !matches!(err, GitError::Offline { .. }),
+        "took the local path: {err}"
+    );
     // HTTP parses but refuses as the named gap without touching the net.
-    let err = run(verbs_transport::fetch, &mut ctx, &["https://host.invalid/a.git"])
-        .expect_err("https fetch is a named gap");
+    let err = run(
+        verbs_transport::fetch,
+        &mut ctx,
+        &["https://host.invalid/a.git"],
+    )
+    .expect_err("https fetch is a named gap");
     assert!(matches!(err, GitError::Unsupported { .. }), "got {err}");
-    let err = run(verbs_transport::push, &mut ctx, &["http://host.invalid/a.git"])
-        .expect_err("http push is a named gap");
+    let err = run(
+        verbs_transport::push,
+        &mut ctx,
+        &["http://host.invalid/a.git"],
+    )
+    .expect_err("http push is a named gap");
     assert!(matches!(err, GitError::Unsupported { .. }), "got {err}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

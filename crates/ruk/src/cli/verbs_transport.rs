@@ -819,9 +819,10 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             if mirror {
                 return push_mirror(ctx, &dest, target, atomic);
             }
-            let updates = build_push_updates(store, &dest, &spec_texts, delete, force_all, &|name| {
-                peel_dest_oid(&dest, name)
-            })?;
+            let updates =
+                build_push_updates(store, &dest, &spec_texts, delete, force_all, &|name| {
+                    peel_dest_oid(&dest, name)
+                })?;
             push_local(store, &dest, target, kind, atomic, updates)
         }
         Target::Net(endpoint) => push_net(

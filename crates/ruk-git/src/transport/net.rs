@@ -261,19 +261,24 @@ const SSH_EXIT_GRACE: Duration = Duration::from_secs(30);
 
 /// A live SSH connection: the child's pipes plus the child itself.
 ///
-/// `stdin` is an `Option` so teardown can close the pipe (dropping the
-/// handle sends EOF) before waiting: waiting with stdin open deadlocks a
-/// child blocked on input, and killing first cuts the remote's hooks.
+/// `stdin` and `stdout` are `Option` so teardown can take both handles:
+/// closing `stdin` sends EOF before waiting (waiting with `stdin` open
+/// deadlocks a child blocked on input, and killing first cuts the remote's
+/// hooks), and taking `stdout` lets a drain thread sink any trailing remote
+/// output to EOF so a chatty hook cannot block on a full pipe.
 pub struct SshStream {
     stdin: Option<ChildStdin>,
-    stdout: ChildStdout,
+    stdout: Option<ChildStdout>,
     #[allow(dead_code)]
     child: Child,
 }
 
 impl Read for SshStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stdout.read(buf)
+        match self.stdout.as_mut() {
+            Some(o) => o.read(buf),
+            None => Ok(0),
+        }
     }
 }
 
@@ -301,16 +306,34 @@ impl Write for SshStream {
 
 impl Drop for SshStream {
     fn drop(&mut self) {
-        // EOF first, then wait: git's `disconnect_git` closes the pipes
-        // before `finish_connect` waits, so the remote sees a clean hangup
-        // instead of a signal. The wait is bounded (Drop must not hang);
-        // only a child still alive past the grace is killed and reaped.
+        // EOF first, then drain, then wait: git's send-pack drains the
+        // sideband demux to remote EOF before `disconnect_git` closes the
+        // pipes and `finish_connect` waits. The drain is required, not
+        // hygiene: post-receive hook stderr travels this same stdout pipe
+        // as band-2 sideband *after* the report-status flush, which the
+        // caller already consumed -- leaving it unread lets a chatty hook
+        // fill the pipe buffer, block the remote on write, and force the
+        // grace to end in a kill mid-hook. stdin closes first so an
+        // upload-pack server holding the connection open for more requests
+        // sees EOF and exits instead of deadlocking the drain. Everything
+        // is bounded (Drop must not hang); past the grace the child is
+        // killed and reaped and the detached drain thread exits on its own
+        // once the pipe closes.
         self.stdin.take();
+        let drain = self.stdout.take().and_then(|mut out| {
+            std::thread::Builder::new()
+                .name("ruk-ssh-drain".to_owned())
+                .spawn(move || {
+                    let _ = std::io::copy(&mut out, &mut std::io::sink());
+                })
+                .ok()
+        });
         let deadline = Instant::now() + SSH_EXIT_GRACE;
         loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) | Err(_) => return,
-                Ok(None) => {}
+            let reaped = matches!(self.child.try_wait(), Ok(Some(_)) | Err(_));
+            let drained = drain.as_ref().map(|h| h.is_finished()).unwrap_or(true);
+            if reaped && drained {
+                return;
             }
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
@@ -336,7 +359,15 @@ pub fn ssh_connect(
 ) -> Result<SshStream, GitError> {
     let ssh_program = std::env::var("GIT_SSH").unwrap_or_else(|_| "ssh".to_owned());
     let ssh_command = std::env::var("GIT_SSH_COMMAND").ok();
-    ssh_connect_with(host, port, user, service, path, &ssh_program, ssh_command.as_deref())
+    ssh_connect_with(
+        host,
+        port,
+        user,
+        service,
+        path,
+        &ssh_program,
+        ssh_command.as_deref(),
+    )
 }
 
 /// Builds the `user@host` login, refusing leading dashes: a `-evil` host
@@ -406,7 +437,7 @@ pub fn ssh_connect_with(
     })?;
     Ok(SshStream {
         stdin: Some(stdin),
-        stdout,
+        stdout: Some(stdout),
         child,
     })
 }
@@ -510,12 +541,9 @@ pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitE
             service,
             path,
         )?)),
-        Endpoint::Git { host, port, path } => Ok(Stream::Tcp(git_connect(
-            host,
-            *port,
-            service,
-            path,
-        )?)),
+        Endpoint::Git { host, port, path } => {
+            Ok(Stream::Tcp(git_connect(host, *port, service, path)?))
+        }
         Endpoint::Local { .. } => Err(GitError::Invalid {
             detail: "local endpoints need no network stream".to_owned(),
         }),
@@ -731,13 +759,32 @@ mod tests {
 
     #[test]
     fn ssh_login_blocks_dash_led_hosts_and_users() {
-        assert_eq!(ssh_login("host.x", Some("git")).expect("login"), "git@host.x");
+        assert_eq!(
+            ssh_login("host.x", Some("git")).expect("login"),
+            "git@host.x"
+        );
         assert!(matches!(
-            ssh_connect_with("-oProxyCommand=evil", None, None, Service::UploadPack, "/x", "ssh", None),
+            ssh_connect_with(
+                "-oProxyCommand=evil",
+                None,
+                None,
+                Service::UploadPack,
+                "/x",
+                "ssh",
+                None
+            ),
             Err(GitError::Invalid { .. })
         ));
         assert!(matches!(
-            ssh_connect_with("host.x", None, Some("-l"), Service::UploadPack, "/x", "ssh", None),
+            ssh_connect_with(
+                "host.x",
+                None,
+                Some("-l"),
+                Service::UploadPack,
+                "/x",
+                "ssh",
+                None
+            ),
             Err(GitError::Invalid { .. })
         ));
     }
@@ -745,9 +792,8 @@ mod tests {
     #[test]
     fn git_request_frames_service_host_and_version() {
         let request = git_request(Service::UploadPack, "host.x", None, "/srv/a.git");
-        let len =
-            usize::from_str_radix(std::str::from_utf8(&request[..4]).expect("hex"), 16)
-                .expect("length");
+        let len = usize::from_str_radix(std::str::from_utf8(&request[..4]).expect("hex"), 16)
+            .expect("length");
         assert_eq!(len, request.len());
         assert!(request[4..].starts_with(b"git-upload-pack /srv/a.git\0"));
         // Verbatim oracle shape (`git/connect.c` `git_connect_git`): the
@@ -759,9 +805,8 @@ mod tests {
             b"git-upload-pack /srv/a.git\0host=host.x\0\0version=2\0"
         );
         let request = git_request(Service::ReceivePack, "host.x", Some(9419), "/a");
-        let len =
-            usize::from_str_radix(std::str::from_utf8(&request[..4]).expect("hex"), 16)
-                .expect("length");
+        let len = usize::from_str_radix(std::str::from_utf8(&request[..4]).expect("hex"), 16)
+            .expect("length");
         assert_eq!(len, request.len());
         assert_eq!(
             &request[4..],
@@ -776,11 +821,7 @@ mod tests {
             format!("{tip} HEAD\0symref=HEAD:refs/heads/main multi_ack\n").as_bytes(),
         )
         .expect("frame");
-        pkt::encode_data(
-            &mut out,
-            format!("{tip} refs/heads/main\n").as_bytes(),
-        )
-        .expect("frame");
+        pkt::encode_data(&mut out, format!("{tip} refs/heads/main\n").as_bytes()).expect("frame");
         pkt::encode_flush(&mut out);
         out
     }
@@ -887,11 +928,65 @@ mod tests {
     }
 
     #[test]
+    fn ssh_drop_drains_chatty_post_report_output() {
+        // 512KB >> 64KB pipe buffer, so without the drain the child blocks
+        // on write and the flag never appears before the kill.
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-net-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let out = dir.join("stdin.bin");
+        let flag = dir.join("exited");
+        let script = dir.join("fake-ssh.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > \"{}\"\ni=0\nwhile [ $i -lt 32 ]; do\n    head -c 16384 /dev/zero | tr '\\0' 'A'\n    i=$((i + 1))\ndone\necho done > \"{}\"\n",
+                out.display(),
+                flag.display()
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+        let mut stream = ssh_connect_with(
+            "far.test",
+            None,
+            None,
+            Service::ReceivePack,
+            "/srv/a.git",
+            "ssh",
+            Some(script.to_str().expect("utf8")),
+        )
+        .expect("spawn");
+        stream.write_all(b"hello").expect("stdin");
+        let started = std::time::Instant::now();
+        drop(stream);
+        assert!(
+            started.elapsed() < SSH_EXIT_GRACE,
+            "teardown drains stdout so a chatty hook finishes without hitting the grace"
+        );
+        assert_eq!(std::fs::read(&out).expect("stdin bytes"), b"hello");
+        assert_eq!(std::fs::read(&flag).expect("exit flag"), b"done\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn git_daemon_handshake_serves_discovery() {
         use std::io::{Read as _, Write as _};
         let tip = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
-        let listener =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
         let port = listener.local_addr().expect("addr").port();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
@@ -961,8 +1056,8 @@ mod tests {
         let mut stream = socket;
         let mut prefix = [0u8; 4];
         stream.read_exact(&mut prefix).expect("length prefix");
-        let len = usize::from_str_radix(std::str::from_utf8(&prefix).expect("hex"), 16)
-            .expect("length");
+        let len =
+            usize::from_str_radix(std::str::from_utf8(&prefix).expect("hex"), 16).expect("length");
         let mut body = vec![0u8; len - 4];
         stream.read_exact(&mut body).expect("request body");
         body
@@ -985,12 +1080,19 @@ mod tests {
             let request = read_git_request(&socket);
             assert!(request.starts_with(b"git-upload-pack /srv/a.git\0"));
             let reader = socket.try_clone().expect("split");
-            serve_upload_pack(reader, socket, &server_store, kind, &head, &Interrupt::none())
-                .expect("serve");
+            serve_upload_pack(
+                reader,
+                socket,
+                &server_store,
+                kind,
+                &head,
+                &Interrupt::none(),
+            )
+            .expect("serve");
         });
         let dest = test_store(kind);
-        let stream = git_connect("127.0.0.1", Some(port), Service::UploadPack, "/srv/a.git")
-            .expect("dial");
+        let stream =
+            git_connect("127.0.0.1", Some(port), Service::UploadPack, "/srv/a.git").expect("dial");
         let request = fetch::FetchWireRequest {
             wants: vec![sha1(FOUR)],
             haves: Vec::new(),
@@ -1000,9 +1102,15 @@ mod tests {
             list_refs: false,
             ref_prefixes: Vec::new(),
         };
-        let received =
-            fetch::receive(stream, kind, &dest, &request, IngestLimits::default(), &Interrupt::none())
-                .expect("receive");
+        let received = fetch::receive(
+            stream,
+            kind,
+            &dest,
+            &request,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("receive");
         let report = fetch::verify_closure(
             &dest,
             &received.staged,
@@ -1020,9 +1128,9 @@ mod tests {
 
     #[test]
     fn push_updates_land_over_a_daemon_socket() {
-        use ruk_core::change::PlanId;
         use super::super::push::{PushPlanRecord, PushUpdate, PushWireRequest, push_over};
         use super::super::push::{PushState, RefResult};
+        use ruk_core::change::PlanId;
 
         let kind = HashKind::Sha1;
         let client = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
@@ -1064,12 +1172,19 @@ mod tests {
             updates: updates.clone(),
             atomic: false,
         };
-        let mut plan = PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
-        let stream = git_connect("127.0.0.1", Some(port), Service::ReceivePack, "/srv/a.git")
-            .expect("dial");
-        let outcomes =
-            push_over(stream, &client, kind, &mut plan, &request, &Interrupt::none())
-                .expect("push");
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
+        let stream =
+            git_connect("127.0.0.1", Some(port), Service::ReceivePack, "/srv/a.git").expect("dial");
+        let outcomes = push_over(
+            stream,
+            &client,
+            kind,
+            &mut plan,
+            &request,
+            &Interrupt::none(),
+        )
+        .expect("push");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].result, RefResult::Ok);
         assert_eq!(plan.state, PushState::Confirmed);

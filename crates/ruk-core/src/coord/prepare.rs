@@ -102,11 +102,10 @@ use crate::protocol::{
     NewArgs, NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
     RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
     TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
-    WorkspaceInit, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs, WsScopeArgs,
-    WsScopeReply, WsTakeArgs, WsTakeReply, WriteArgs,
+    WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs,
+    WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::records::Records;
-use crate::workcopy::journal_state::{NoJournal, ensure_idle};
 use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::head_key;
 use crate::records::types::{ChangeEntry, ChangeState};
@@ -115,6 +114,7 @@ use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conf
 use crate::store::ObjectKind;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
+use crate::workcopy::journal_state::{NoJournal, ensure_idle};
 use crate::workspace::{
     GitCompatWorkspace, HeadRef, NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState,
 };
@@ -2664,7 +2664,6 @@ mod tests {
     use crate::ids::{CommitKey, HashKind, Oid};
     use crate::index::RepoPath;
     use crate::ops::{NewRequest, prepare_new};
-    use crate::workcopy::journal_state::ws_apply_key;
     use crate::protocol::{
         AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
         BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
@@ -2679,6 +2678,7 @@ mod tests {
     use crate::records::types::{ChangeEntry, ChangeState};
     use crate::refdata::RefName;
     use crate::store::PreparationBudget;
+    use crate::workcopy::journal_state::ws_apply_key;
     use crate::workspace::WorkspaceStamp;
 
     static SEQ: AtomicU64 = AtomicU64::new(1);
@@ -4102,10 +4102,7 @@ mod tests {
         let Reply::Edit(legacy_reply) = legacy.reply else {
             panic!("edit must answer its own reply");
         };
-        assert_eq!(
-            legacy_reply.state.stamp().sequence,
-            before.sequence + 2
-        );
+        assert_eq!(legacy_reply.state.stamp().sequence, before.sequence + 2);
     }
 
     #[test]
@@ -4380,7 +4377,10 @@ mod tests {
         store
             .publish(prepared.objects, &prepared.facts)
             .expect("publish drop");
-        assert!(workspace::observe(&store, id).is_err(), "dropped workspace is gone");
+        assert!(
+            workspace::observe(&store, id).is_err(),
+            "dropped workspace is gone"
+        );
 
         // Dropping twice names the missing row, on either path.
         let again = Request::WsDrop(Box::new(WireMutation {
@@ -4419,8 +4419,8 @@ mod tests {
             workspace: id,
             expected: state.stamp(),
         };
-        let err = prepare_mutation_with(&ctx, snapshot(binding))
-            .expect_err("snapshot stays refused");
+        let err =
+            prepare_mutation_with(&ctx, snapshot(binding)).expect_err("snapshot stays refused");
         assert_eq!(err.code, ErrorCode::EHosted);
         assert!(
             err.message.contains("workcopy::snapshot"),
@@ -4445,8 +4445,8 @@ mod tests {
                 }],
             )
             .expect("stage open journal");
-        let err = prepare_mutation_with(&ctx, snapshot(binding))
-            .expect_err("open journal refuses first");
+        let err =
+            prepare_mutation_with(&ctx, snapshot(binding)).expect_err("open journal refuses first");
         assert_eq!(err.code, ErrorCode::EWorkspaceApplying);
 
         // A pre-root row names the root backfill instead of the job split.
@@ -4508,8 +4508,7 @@ mod tests {
                 args: args.clone(),
             }))
         };
-        let err =
-            prepare_mutation_with(&ctx, request()).expect_err("write stays refused");
+        let err = prepare_mutation_with(&ctx, request()).expect_err("write stays refused");
         assert_eq!(err.code, ErrorCode::EHosted);
         assert!(
             err.message.contains("workcopy::write"),
@@ -4541,8 +4540,7 @@ mod tests {
                 args: args.clone(),
             }))
         };
-        let err =
-            prepare_mutation_with(&ctx, request()).expect_err("ws.recover stays refused");
+        let err = prepare_mutation_with(&ctx, request()).expect_err("ws.recover stays refused");
         assert_eq!(err.code, ErrorCode::EHosted);
         assert!(
             err.message.contains("workcopy_journal::recover"),
