@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{
@@ -33,7 +34,10 @@ use ruk_core::store::{PreparationBudget, Store};
 
 use super::fetch::observation_mutations;
 use super::fetch::{FetchWireRequest, Filter, promisor_facts, shallow_facts};
-use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, object_links, write_pack};
+use super::pack::{
+    IngestLimits, Links, PackEntry, StagedPack, ingest_pack, object_links, pack_threads,
+    write_pack,
+};
 use super::push::{
     PushPlanRecord, PushUpdate, PushWireRequest, RefOutcome, RefResult, push_closure, reconcile,
 };
@@ -326,75 +330,281 @@ pub(crate) struct LocalClosure {
     pub(crate) shallow: Vec<Oid>,
 }
 
+/// Point reads per closure batch: small frontiers stay serial, larger ones
+/// fan out (order-preserving, errors positional for in-order surfacing).
+const READ_BATCH: usize = 256;
+
+/// Batches below this stay serial: a channel round-trip for a handful of
+/// reads costs more than it saves.
+const READ_SERIAL_BELOW: usize = 8;
+
+/// Refuses bodies larger than this before buffering them, matching the
+/// transport's per-object read bound.
+const CLOSURE_READ_MAX: u64 = 512 << 20;
+
+/// One closure point read plus its link parse: interruptible, pure against
+/// `src` (parsing is a pure function of the bytes, so it parallelizes
+/// while queue extension stays serial in batch order). A read failure and
+/// a corrupt payload both surface as the item error, in the same order the
+/// serial walk produced them: the caller maps `NotFound` and lets any
+/// other error (read or parse) through untouched.
+type ClosureRead = (ObjectKind, Vec<u8>, Links);
+
+fn read_one(
+    src: &Store,
+    oid: Oid,
+    hash: HashKind,
+    interrupt: &Interrupt,
+) -> Result<ClosureRead, GitError> {
+    interrupt.check("computing the local fetch closure")?;
+    let (kind, bytes) = read_object(src, oid, CLOSURE_READ_MAX)?;
+    let links = object_links(kind, &bytes, hash)?;
+    Ok((kind, bytes, links))
+}
+
+/// Long-lived closure readers inside one thread scope.
+///
+/// Spawning an OS thread per batch (a scope per batch) measured ~2ms of
+/// spawn overhead per 64-object batch, dwarfing the reads; these workers
+/// spawn once per closure and serve every batch over dedicated channels.
+/// Each worker owns its lane: the main thread splits a batch across lanes
+/// and rejoins lane by lane, so results align 1:1 with the batch with no
+/// shared mutable state. Stop-and-wait keeps at most one chunk per lane in
+/// flight, and each lane is a rendezvous (`sync_channel(1)`): a slow lane
+/// backpressures the main thread instead of buffering, so lane queues hold
+/// at most one chunk (bounded by `READ_BATCH` across lanes) with no shed
+/// policy needed. Dropping the pool disconnects the lanes and the scope
+/// rejoins them.
+struct ClosureReadPool {
+    jobs: Vec<SyncSender<Vec<Oid>>>,
+    results: Vec<Receiver<Vec<Result<ClosureRead, GitError>>>>,
+    hash: HashKind,
+}
+
+impl ClosureReadPool {
+    fn spawn<'scope, 'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        src: &'env Store,
+        hash: HashKind,
+        interrupt: &'env Interrupt,
+    ) -> Self {
+        let mut jobs = Vec::new();
+        let mut results = Vec::new();
+        for _ in 0..pack_threads() {
+            let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Vec<Oid>>(1);
+            let (res_tx, res_rx) =
+                std::sync::mpsc::sync_channel::<Vec<Result<ClosureRead, GitError>>>(1);
+            scope.spawn(move || {
+                while let Ok(oids) = job_rx.recv() {
+                    let out = oids
+                        .iter()
+                        .map(|oid| read_one(src, *oid, hash, interrupt))
+                        .collect::<Vec<_>>();
+                    if res_tx.send(out).is_err() {
+                        break;
+                    }
+                }
+            });
+            jobs.push(job_tx);
+            results.push(res_rx);
+        }
+        Self {
+            jobs,
+            results,
+            hash,
+        }
+    }
+
+    /// Reads `oids` in batch order. Small batches (and single-lane pools)
+    /// go serial; larger ones split across lanes and rejoin in order.
+    /// A dead lane is a hard [`GitError::Io`], never a panic: the caller
+    /// fails the fetch instead of crashing it.
+    fn read(
+        &self,
+        src: &Store,
+        oids: &[Oid],
+        interrupt: &Interrupt,
+    ) -> Result<Vec<Result<ClosureRead, GitError>>, GitError> {
+        if oids.len() < READ_SERIAL_BELOW || self.jobs.len() <= 1 {
+            return Ok(oids
+                .iter()
+                .map(|oid| read_one(src, *oid, self.hash, interrupt))
+                .collect());
+        }
+        let lanes = self.jobs.len().min(oids.len());
+        let piece = oids.len().div_ceil(lanes);
+        for (lane, part) in oids.chunks(piece).enumerate() {
+            if self.jobs[lane].send(part.to_vec()).is_err() {
+                return Err(GitError::Io {
+                    detail: "closure read lane died mid-batch".to_owned(),
+                });
+            }
+        }
+        let mut out = Vec::with_capacity(oids.len());
+        for (lane, part) in oids.chunks(piece).enumerate() {
+            match self.results[lane].recv() {
+                Ok(reads) => {
+                    debug_assert_eq!(reads.len(), part.len());
+                    out.extend(reads);
+                }
+                Err(_) => {
+                    // A lane died mid-batch: surface one error per unread
+                    // object so the caller still fails in batch order.
+                    out.extend(part.iter().map(|oid| {
+                        Err(GitError::Io {
+                            detail: format!(
+                                "closure read lane died while reading object {oid}"
+                            ),
+                        })
+                    }));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Computes wants-minus-haves in `src`, depth-bounded when asked.
+///
+/// Both walks batch their point reads through one [`ClosureReadPool`]:
+/// reads fan out over long-lived lanes, discovery stays serial in batch
+/// order, so observable behavior (visited order, first error in BFS order,
+/// cutoff set) matches the old serial walk. The 2026-10-18 convoy note
+/// that used to live here described a walk sharing discovery state across
+/// threads; batching keeps no shared mutable state on the hot path, and
+/// the lanes are scoped to this call (one spawn per closure, not per
+/// batch).
 pub(crate) fn local_closure(
     src: &Store,
     kind: HashKind,
     req: &LocalFetchRequest,
     interrupt: &Interrupt,
 ) -> Result<LocalClosure, GitError> {
-    const MAX: u64 = 512 << 20;
+    std::thread::scope(|scope| {
+        // Parse with the caller's `kind`, exactly as the serial walk did:
+        // on a kind mismatch the same objects fail the same way.
+        let pool = ClosureReadPool::spawn(scope, src, kind, interrupt);
+        local_closure_scoped(src, req, interrupt, &pool)
+    })
+}
+
+/// The two wants-minus-haves walks, reading through `pool`.
+fn local_closure_scoped(
+    src: &Store,
+    req: &LocalFetchRequest,
+    interrupt: &Interrupt,
+    pool: &ClosureReadPool,
+) -> Result<LocalClosure, GitError> {
     let haves: HashSet<Oid> = req.haves.iter().copied().collect();
     let mut uninteresting = HashSet::new();
     let mut frontier: VecDeque<Oid> = haves.iter().copied().collect();
-    while let Some(oid) = frontier.pop_front() {
+    while !frontier.is_empty() {
         interrupt.check("computing the local fetch closure")?;
-        if !uninteresting.insert(oid) {
-            continue;
+        let mut batch = Vec::new();
+        while let Some(oid) = frontier.pop_front() {
+            if !uninteresting.insert(oid) {
+                continue;
+            }
+            batch.push(oid);
+            if batch.len() >= READ_BATCH {
+                break;
+            }
         }
-        let bytes = match read_object(src, oid, MAX) {
-            Ok((ObjectKind::Commit, bytes)) => bytes,
-            Ok(_) => continue,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
-            Err(err) => return Err(err),
-        };
-        frontier.extend(
-            object_links(ObjectKind::Commit, &bytes, kind)?
-                .parents
-                .iter()
-                .copied(),
-        );
+        if batch.is_empty() {
+            break;
+        }
+        let reads = pool.read(src, &batch, interrupt)?;
+        for (_, read) in batch.into_iter().zip(reads) {
+            let links = match read {
+                Ok((ObjectKind::Commit, _, links)) => links,
+                Ok(_) => continue,
+                Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+                Err(err) => return Err(err),
+            };
+            frontier.extend(links.parents.iter().copied());
+        }
     }
     let mut objects = Vec::new();
     let mut shallow = Vec::new();
     let mut visited = HashSet::new();
+    let profile = std::env::var_os("RUK_PROFILE").is_some_and(|value| value == "1");
+    let mut read_ms = 0.0f64;
+    let mut link_ms = 0.0f64;
+    let mut collect_ms = 0.0f64;
+    let mut serial_items = 0u64;
+    let mut parallel_items = 0u64;
     // (oid, commit depth from the wants; non-commits ride along).
     let mut queue: VecDeque<(Oid, u32)> = req.wants.iter().map(|oid| (*oid, 0)).collect();
-    // NOTE (measured 2026-10-18): fanning these reads across the pack
-    // worker pool regressed closure 1.6s -> 40s (1M pread64 at ~270us
-    // each plus a futex storm: concurrent point reads convoy on the
-    // source store's files). Serial reads stay.
-    while let Some((oid, depth)) = queue.pop_front() {
+    while !queue.is_empty() {
         interrupt.check("computing the local fetch closure")?;
-        if !visited.insert(oid) || uninteresting.contains(&oid) {
-            continue;
+        let collect_start = profile.then(std::time::Instant::now);
+        let mut batch = Vec::new();
+        while let Some((oid, depth)) = queue.pop_front() {
+            if !visited.insert(oid) || uninteresting.contains(&oid) {
+                continue;
+            }
+            batch.push((oid, depth));
+            if batch.len() >= READ_BATCH {
+                break;
+            }
         }
-        let (obj_kind, bytes) = read_object(src, oid, MAX).map_err(|err| match err {
-            GitError::NotFound { .. } => GitError::NotFound {
-                detail: format!("local source lacks wanted object {oid}"),
-            },
-            other => other,
-        })?;
-        let links = object_links(obj_kind, &bytes, kind)?;
-        let cutoff = req
-            .depth
-            .is_some_and(|max| obj_kind == ObjectKind::Commit && depth >= max);
-        if cutoff {
-            shallow.push(oid);
+        collect_ms += collect_start
+            .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        if batch.is_empty() {
+            break;
         }
-        if let Some(tree) = links.tree {
-            queue.push_back((tree, depth));
+        let oids: Vec<Oid> = batch.iter().map(|(oid, _)| *oid).collect();
+        if batch.len() < READ_SERIAL_BELOW {
+            serial_items += u64::try_from(batch.len()).expect("batch is bounded by READ_BATCH");
+        } else {
+            parallel_items += u64::try_from(batch.len()).expect("batch is bounded by READ_BATCH");
         }
-        if !cutoff {
-            queue.extend(links.parents.iter().map(|parent| (*parent, depth + 1)));
+        let read_start = profile.then(std::time::Instant::now);
+        let reads = pool.read(src, &oids, interrupt)?;
+        read_ms += read_start
+            .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let link_start = profile.then(std::time::Instant::now);
+        for ((oid, depth), read) in batch.into_iter().zip(reads) {
+            let (obj_kind, bytes, links) = read.map_err(|err| match err {
+                GitError::NotFound { .. } => GitError::NotFound {
+                    detail: format!("local source lacks wanted object {oid}"),
+                },
+                other => other,
+            })?;
+            let cutoff = req
+                .depth
+                .is_some_and(|max| obj_kind == ObjectKind::Commit && depth >= max);
+            if cutoff {
+                shallow.push(oid);
+            }
+            if let Some(tree) = links.tree {
+                queue.push_back((tree, depth));
+            }
+            if !cutoff {
+                queue.extend(links.parents.iter().map(|parent| (*parent, depth + 1)));
+            }
+            queue.extend(links.entries.iter().map(|(entry, _)| (*entry, depth)));
+            if let Some((target, _)) = links.tag_target {
+                queue.push_back((target, depth));
+            }
+            objects.push((oid, obj_kind, bytes));
         }
-        queue.extend(links.entries.iter().map(|(entry, _)| (*entry, depth)));
-        if let Some((target, _)) = links.tag_target {
-            queue.push_back((target, depth));
-        }
-        objects.push((oid, obj_kind, bytes));
+        link_ms += link_start
+            .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
     }
+    let sort_start = profile.then(std::time::Instant::now);
     objects.sort_by(|a, b| a.0.cmp(&b.0));
+    let sort_ms = sort_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    if profile {
+        eprintln!(
+            "[ruk-profile] local_closure reads={read_ms:.1}ms links={link_ms:.1}ms collect={collect_ms:.1}ms sort={sort_ms:.1}ms serial_items={serial_items} parallel_items={parallel_items}"
+        );
+    }
     Ok(LocalClosure { objects, shallow })
 }
 
