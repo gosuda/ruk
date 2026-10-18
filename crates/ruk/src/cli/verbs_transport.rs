@@ -1531,8 +1531,7 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             None => false,
             Some(dir) => {
                 let direct = dir.join(hex);
-                let nested =
-                    dir.join(&hex[0..2]).join(&hex[2..4]).join(hex);
+                let nested = dir.join(&hex[0..2]).join(&hex[2..4]).join(hex);
                 let src = if direct.is_file() {
                     Some(direct)
                 } else if nested.is_file() {
@@ -1542,9 +1541,7 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
                 };
                 match src {
                     None => false,
-                    Some(path) => {
-                        sidecar::stage_verified(store.root(), hex, *size, &path).is_ok()
-                    }
+                    Some(path) => sidecar::stage_verified(store.root(), hex, *size, &path).is_ok(),
                 }
             }
         };
@@ -1552,7 +1549,10 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             synced.push(hex.clone());
             mutations.push(sidecar::upsert_mutation(
                 hex,
-                &sidecar::LfsObjectRecord { size: *size, complete: true },
+                &sidecar::LfsObjectRecord {
+                    size: *size,
+                    complete: true,
+                },
             ));
         } else {
             missing.push(hex.clone());

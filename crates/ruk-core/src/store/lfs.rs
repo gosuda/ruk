@@ -97,7 +97,8 @@ fn hash_file(path: &Path) -> Result<(String, u64), StoreError> {
             break;
         }
         hasher.update(&chunk[..read]);
-        size += u64::try_from(read).map_err(|_| StoreError::Invalid("file read exceeds u64".to_owned()))?;
+        size += u64::try_from(read)
+            .map_err(|_| StoreError::Invalid("file read exceeds u64".to_owned()))?;
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
@@ -180,7 +181,8 @@ fn stage_copy(src: &Path, tmp: &Path) -> Result<(String, u64), StoreError> {
         }
         std::io::Write::write_all(&mut output, &chunk[..read])?;
         hasher.update(&chunk[..read]);
-        size += u64::try_from(read).map_err(|_| StoreError::Invalid("file read exceeds u64".to_owned()))?;
+        size += u64::try_from(read)
+            .map_err(|_| StoreError::Invalid("file read exceeds u64".to_owned()))?;
     }
     std::io::Write::flush(&mut output)?;
     let digest = hasher.finalize();
@@ -197,7 +199,8 @@ mod tests {
     use super::*;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ruk-lfs-sidecar-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ruk-lfs-sidecar-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("seed dir");
         dir
@@ -213,7 +216,12 @@ mod tests {
         let path = sidecar_path(Path::new("/s"), &hex).unwrap();
         assert_eq!(
             path,
-            Path::new("/s").join("lfs").join("objects").join("ab").join("ab").join(&hex)
+            Path::new("/s")
+                .join("lfs")
+                .join("objects")
+                .join("ab")
+                .join("ab")
+                .join(&hex)
         );
     }
 
@@ -228,8 +236,14 @@ mod tests {
         assert!(sidecar_verified(&store_root, &hex, size));
         assert!(!sidecar_verified(&store_root, &hex, size + 1));
         // Second run is a no-op success.
-        assert_eq!(stage_verified(&store_root, &hex, size, &src).expect("restage"), final_path);
-        let record = LfsObjectRecord { size, complete: true };
+        assert_eq!(
+            stage_verified(&store_root, &hex, size, &src).expect("restage"),
+            final_path
+        );
+        let record = LfsObjectRecord {
+            size,
+            complete: true,
+        };
         let back = decode_record(&encode_record(&record)).expect("decode");
         assert_eq!(back, record);
         assert_eq!(upsert_mutation(&hex, &record).table, FactTable::LfsObjects);

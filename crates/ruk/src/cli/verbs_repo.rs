@@ -419,7 +419,9 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
         git_dir.display(),
     );
     if let Some((stored, skipped)) = lfs {
-        out.push_str(&format!("LFS payloads: {stored} stored, {skipped} skipped\n"));
+        out.push_str(&format!(
+            "LFS payloads: {stored} stored, {skipped} skipped\n"
+        ));
     }
     Ok(out.into_bytes())
 }
@@ -487,7 +489,10 @@ fn ingest_lfs_sidecar(
                     stored += 1;
                     mutations.push(sidecar::upsert_mutation(
                         &hex,
-                        &sidecar::LfsObjectRecord { size, complete: true },
+                        &sidecar::LfsObjectRecord {
+                            size,
+                            complete: true,
+                        },
                     ));
                 }
                 Err(_) => skipped += 1,
