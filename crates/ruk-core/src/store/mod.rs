@@ -37,6 +37,7 @@ pub mod error;
 pub mod lfs;
 pub mod types;
 
+mod capacity;
 mod compact;
 mod delta;
 pub mod durability;
@@ -64,8 +65,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub use capacity::CapacityLimits;
 pub use compact::CompactionStats;
 pub use error::StoreError;
+pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
 pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
 pub use metadata::{FactPage, FactPageBudget, FactRow};
 pub(crate) use metadata::{MAX_FACT_ROW_BYTES, decode, encode};
@@ -80,6 +83,7 @@ use crate::change::StoreId;
 use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
 use metadata::{Metadata, PublicationTxn};
+use crate::physical::{AllocationError as PhysicalAllocationError, PhysicalReservation};
 use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
 use segment::SegmentWriter;
 
@@ -138,6 +142,7 @@ pub struct Store {
     meta: Metadata,
     io: IoCounters,
     budget: Arc<PreparationBudget>,
+    capacity: Mutex<CapacityLimits>,
     guards: Arc<GenerationRegistry>,
     writer: Mutex<WriterState>,
     /// Read-only descriptors for committed segments, opened once per id and
@@ -194,6 +199,17 @@ struct Batch {
     /// Whether a segment file was created (its entry needs publishing).
     new_entries: bool,
     locations: Vec<(Oid, ObjectLocation)>,
+    /// Platform reservations performed by this publication, in order, with
+    /// their observed receipts. Settled into the pending row at stage time.
+    charges: Vec<SegmentCharge>,
+}
+
+/// Durable proof that the pending row committed before the first reserve
+/// call of a publication. Carried from the pending commit to the stage step
+/// of the same publication, under the same writer lock.
+struct PendingHandle {
+    key: Vec<u8>,
+    row: PendingReservation,
 }
 
 /// A validated publication: identities in request order and the objects
@@ -377,6 +393,11 @@ impl Store {
                 return Err(err);
             }
         };
+        // Reconcile capacity-ledger rows left Pending by publications that
+        // never committed, after recovery truncated the tails they may have
+        // reserved in: re-check them against the file extents as found and
+        // release them (see store::capacity).
+        capacity::reconcile_stale_pending(&meta, &root.join(SEGMENTS_DIR))?;
         // The recovery pass above warmed `segment_fds` (one open per sealed
         // segment); the assembled store keeps warming it instead of
         // reopening those segments on first serve.
@@ -415,6 +436,7 @@ impl Store {
             meta,
             io: IoCounters::default(),
             budget,
+            capacity: Mutex::new(CapacityLimits::unbounded()),
             guards,
             segment_fds: SegmentFileCache::default(),
             writer: Mutex::new(WriterState {
@@ -578,6 +600,32 @@ impl Store {
             durability::sync_file(active.writer.get_ref())?;
         }
         Ok(())
+    }
+
+    /// Replaces the capacity quota knobs (default unbounded). The
+    /// coordinator applies the `policy.toml [capacity]` values here; the
+    /// ledger reads them at each publication admission.
+    pub fn set_capacity_limits(&self, limits: CapacityLimits) {
+        *self
+            .capacity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limits;
+    }
+
+    fn capacity_limits(&self) -> CapacityLimits {
+        *self
+            .capacity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Every capacity-ledger row. Test-only: lets crash tests assert the
+    /// reconciliation outcome without reopening the metadata database.
+    #[cfg(test)]
+    pub(crate) fn capacity_pending_rows_for_tests(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, PendingReservation)>, StoreError> {
+        self.meta.pending_rows()
     }
 
     /// Shrinks the segment roll target for this store. Test-only: lets
@@ -791,12 +839,36 @@ impl Store {
             return Err(StoreError::WriterClosed(reason.clone()));
         }
         let profile = profile_enabled();
+        // Probe first: the pending row must commit before the first
+        // reservation call, but redb holds a single writer, so the real
+        // publication transaction opens only after the pending commit. The
+        // probe validates facts and objects and is aborted without
+        // committing; the writer lock held throughout keeps the
+        // re-validation below identical.
+        let probe_txn = self.observe(self.meta.begin_publication(facts))?;
+        let probe_plan = self.observe(self.plan(&probe_txn, &objects))?;
+        drop(probe_txn);
+        let pending = self.persist_pending(&probe_plan)?;
         let begin_start = ProfileClock::now(profile);
         let txn = self.observe(self.meta.begin_publication(facts))?;
         let begin_ms = begin_start.elapsed_ms();
         let plan_start = ProfileClock::now(profile);
         let plan = self.observe(self.plan(&txn, &objects))?;
         let plan_ms = plan_start.elapsed_ms();
+        if let Some(handle) = &pending
+            && handle.row.generation != plan.generation
+        {
+            // Unreachable while the writer lock is held; fail closed and
+            // release the row rather than stranding it until the next open.
+            let released = PendingReservation {
+                state: ReservationState::Released,
+                ..handle.row.clone()
+            };
+            let _ = self.meta.release_pending(&[(handle.key.clone(), released)]);
+            return Err(StoreError::Invalid(
+                "publication generation moved under the writer lock".to_owned(),
+            ));
+        }
         if profile {
             eprintln!(
                 "[ruk-profile] publish begin={begin_ms:.1}ms plan={plan_ms:.1}ms objects={} fresh={}",
@@ -804,7 +876,7 @@ impl Store {
                 plan.fresh.len(),
             );
         }
-        match self.write_and_commit(&mut writer, txn, plan, profile) {
+        match self.write_and_commit(&mut writer, txn, plan, profile, pending) {
             Ok(publication) => Ok(publication),
             Err(err) => {
                 writer.closed = Some(format!(
@@ -951,12 +1023,62 @@ impl Store {
     /// flushing steps handle staged bytes, where a payload checksum
     /// mismatch is not committed corruption and must not latch quarantine;
     /// the caller closes the writer for either.
+    /// Checks the probe plan against the capacity quotas and commits the
+    /// pending row with Immediate durability. Returns `None` for
+    /// publications that append nothing. A quota refusal is
+    /// [`StoreError::Limit`] before the first mutation, so the writer stays
+    /// open; anything later closes it and the row reconciles at next open.
+    fn persist_pending(&self, plan: &Plan<'_>) -> Result<Option<PendingHandle>, StoreError> {
+        if plan.fresh.is_empty() {
+            return Ok(None);
+        }
+        let mut estimate = 0u64;
+        for object in &plan.fresh {
+            let record_len = segment::record_len_for(object.payload.len())?;
+            estimate = estimate.checked_add(record_len).ok_or_else(|| {
+                StoreError::Capacity("publication byte estimate overflows u64".to_owned())
+            })?;
+        }
+        let rows = self.observe(self.meta.pending_rows())?;
+        let mut committed_held = 0u64;
+        for manifest in self.observe(self.meta.all_manifests())? {
+            if manifest.retired {
+                continue;
+            }
+            committed_held = committed_held
+                .checked_add(manifest.committed_end)
+                .ok_or_else(|| {
+                    StoreError::Capacity("committed byte accounting overflows u64".to_owned())
+                })?;
+        }
+        capacity::admit(
+            capacity::pending_held(&rows),
+            committed_held,
+            estimate,
+            &self.capacity_limits(),
+        )?;
+        let seq = capacity::next_seq(&rows, plan.generation);
+        let key = PendingReservation::key(plan.generation, seq);
+        let row = PendingReservation {
+            generation: plan.generation,
+            seq,
+            estimated_bytes: estimate,
+            state: ReservationState::Pending,
+            charges: Vec::new(),
+        };
+        self.observe(self.meta.commit_pending(&key, &row))?;
+        #[cfg(test)]
+        crash_tests::crash_at("capacity_pending_persisted");
+        Ok(Some(PendingHandle { key, row }))
+    }
+
     fn write_and_commit(
         &self,
         writer: &mut WriterState,
         txn: PublicationTxn,
         plan: Plan<'_>,
         profile: bool,
+        pending: Option<PendingHandle>,
     ) -> Result<Publication, StoreError> {
         let Plan {
             order,
@@ -1013,7 +1135,13 @@ impl Store {
         crash_tests::crash_at("after_directory_sync");
 
         let stage_start = ProfileClock::now(profile);
-        self.observe(batch.stage(&txn, writer, generation, !fresh.is_empty()))?;
+        self.observe(batch.stage(
+            &txn,
+            writer,
+            generation,
+            !fresh.is_empty(),
+            pending.as_ref(),
+        ))?;
         let stage_ms = stage_start.elapsed_ms();
         let commit_start = ProfileClock::now(profile);
         self.observe(txn.commit())?;
@@ -1044,13 +1172,17 @@ impl Store {
 
 impl Batch {
     /// Records the generation, every new locator, and the final manifest of
-    /// every touched segment in the publication transaction.
+    /// every touched segment in the publication transaction, and settles
+    /// the pending row: `Committed` with the observed charges, proving the
+    /// persistence-before-reservation order in the same commit that makes
+    /// the bytes visible.
     fn stage(
         &self,
         txn: &PublicationTxn,
         writer: &WriterState,
         generation: u64,
         advance_generation: bool,
+        pending: Option<&PendingHandle>,
     ) -> Result<(), StoreError> {
         if advance_generation {
             txn.set_generation(generation)?;
@@ -1060,6 +1192,31 @@ impl Batch {
         }
         for manifest in self.manifests(writer, generation) {
             txn.upsert_manifest(&manifest)?;
+        }
+        match pending {
+            Some(handle) => {
+                if handle.row.generation != generation {
+                    return Err(StoreError::Invalid(
+                        "pending reservation names a different generation".to_owned(),
+                    ));
+                }
+                txn.replace_pending(
+                    &handle.key,
+                    &PendingReservation {
+                        generation: handle.row.generation,
+                        seq: handle.row.seq,
+                        estimated_bytes: handle.row.estimated_bytes,
+                        state: ReservationState::Committed,
+                        charges: self.charges.clone(),
+                    },
+                )?;
+            }
+            None if !self.charges.is_empty() => {
+                return Err(StoreError::Invalid(
+                    "segment charges without a pending reservation".to_owned(),
+                ));
+            }
+            None => {}
         }
         Ok(())
     }
@@ -1144,6 +1301,21 @@ fn append(
     let pick_start = probe.clock();
     let active = active_segment(writer, batch, segments_dir, record_len)?;
     probe.pick_ms += pick_start.elapsed_ms();
+    // Pre-publication reservation of exactly the range about to be
+    // appended, on the still-open segment file. The receipt carries the
+    // post-operation re-query; the charge joins the batch for the stage
+    // step. A refusal fails the publication closed here, before the bytes.
+    let reserve_offset = active.writer.records_end();
+    let reservation = PhysicalReservation::reserve(active.writer.get_ref(), reserve_offset, record_len)
+        .map_err(map_allocation_error)?;
+    let receipt = reservation.receipt();
+    batch.charges.push(SegmentCharge {
+        segment: active.id,
+        offset: reserve_offset,
+        len: record_len,
+        allocated_bytes: receipt.allocated_bytes,
+        logical_len: receipt.logical_len,
+    });
     let write_start = probe.clock();
     // Resident payloads skip the streaming path's per-record combine and
     // scratch bounce: the slice path stages the same bytes with hardware
@@ -1222,9 +1394,44 @@ fn seal_active(writer: &mut WriterState, batch: &mut Batch) -> Result<(), StoreE
     let Some(mut active) = writer.active.take() else {
         return Ok(());
     };
+    // Pre-reserve the 24-byte seal footer at the current records end before
+    // it is written, so the seal itself cannot hit a late allocation.
+    let footer_offset = active.writer.records_end();
+    let footer_len = spool::to_u64(segment::FOOTER_LEN);
+    let reservation =
+        PhysicalReservation::reserve(active.writer.get_ref(), footer_offset, footer_len)
+            .map_err(map_allocation_error)?;
+    let receipt = reservation.receipt();
+    batch.charges.push(SegmentCharge {
+        segment: active.id,
+        offset: footer_offset,
+        len: footer_len,
+        allocated_bytes: receipt.allocated_bytes,
+        logical_len: receipt.logical_len,
+    });
     active.writer.seal()?;
     batch.sealed.push(active);
     Ok(())
+}
+
+/// Maps a platform reservation refusal onto the store's typed errors. `Io`
+/// (including `ENOSPC`) stays I/O; a filesystem that cannot honour the
+/// strict contract fails closed as invalid input to this publication.
+fn map_allocation_error(err: PhysicalAllocationError) -> StoreError {
+    match err {
+        PhysicalAllocationError::Io(inner) => StoreError::Io(inner),
+        PhysicalAllocationError::Overflow => {
+            StoreError::Invalid("reservation range overflows u64".to_owned())
+        }
+        PhysicalAllocationError::NotRegularFile => {
+            StoreError::Invalid("segment handle is not a regular file".to_owned())
+        }
+        PhysicalAllocationError::Unsupported | PhysicalAllocationError::UnverifiedFilesystem => {
+            StoreError::Invalid(
+                "strict platform reservation refused: segment filesystem fails the pre-publication contract".to_owned(),
+            )
+        }
+    }
 }
 
 /// Reopens the recovered open segment once, otherwise creates the next
