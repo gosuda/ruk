@@ -397,7 +397,9 @@ fn writer_emits_the_golden_segment_bytes() {
         appended.iter().map(|a| a.record_len).collect::<Vec<_>>(),
         FIXTURE_RECORD_LENS
     );
-    writer.flush_staged().expect("staged bytes reach the stream");
+    writer
+        .flush_staged()
+        .expect("staged bytes reach the stream");
     assert_eq!(written(&writer), &fixture_records());
     assert_eq!(writer.records_end(), FIXTURE_RECORDS_END);
     assert_eq!(writer.records_crc(), FIXTURE_REGION_CRC);
@@ -489,7 +491,9 @@ fn record_offsets_are_dense_across_chunk_boundaries() {
         .iter()
         .flat_map(|(kind, flags, payload)| frame(*kind, *flags, payload))
         .collect();
-    writer.flush_staged().expect("staged bytes reach the stream");
+    writer
+        .flush_staged()
+        .expect("staged bytes reach the stream");
     assert_eq!(written(&writer), &expected);
 
     let mut next = 0_u64;
@@ -535,7 +539,9 @@ fn resumed_writer_continues_the_records_checksum_chain() {
 
     let mut second = SegmentWriter::resumed(Cursor::new(bytes), end, crc).expect("resume");
     append_all(&mut second, &all[2..]);
-    second.flush_staged().expect("staged bytes reach the stream");
+    second
+        .flush_staged()
+        .expect("staged bytes reach the stream");
     assert_eq!(written(&second), &fixture_records());
     assert_eq!(second.records_crc(), FIXTURE_REGION_CRC);
     assert_eq!(second.seal().expect("seal"), FIXTURE_SEALED_END);
@@ -792,8 +798,7 @@ fn payload_source_io_failure_and_sink_failure_poison() {
 
 #[test]
 fn staged_appends_batch_into_one_write_per_flush() {
-    let mut writer =
-        SegmentWriter::fresh(CountWrites::default()).expect("fresh");
+    let mut writer = SegmentWriter::fresh(CountWrites::default()).expect("fresh");
     let records = fixture();
     let appended = append_all(&mut writer, &records);
     assert_eq!(
@@ -846,7 +851,10 @@ fn large_record_flushes_mid_record_and_stays_byte_identical() {
         "flushed pieces concatenate to the exact framing"
     );
     assert_eq!(writer.records_end(), 10 + plen(&payload));
-    assert_eq!(writer.records_crc(), crc_ref(writer.get_ref().inner.get_ref()));
+    assert_eq!(
+        writer.records_crc(),
+        crc_ref(writer.get_ref().inner.get_ref())
+    );
 }
 
 #[test]
@@ -905,7 +913,9 @@ fn source_longer_than_declared_is_not_over_read() {
         )
         .expect("append");
     assert_eq!(source.position(), 10);
-    writer.flush_staged().expect("staged bytes reach the stream");
+    writer
+        .flush_staged()
+        .expect("staged bytes reach the stream");
     assert_eq!(written(&writer), &frame(1, 0, &[9; 10]));
 }
 
@@ -1500,7 +1510,9 @@ fn real_file_crash_recovery_shape_truncate_tail_then_resume() {
     // Model the production crash shape: the append loop always flushes
     // staged bytes before any crash hook or sync, so a killed process
     // leaves the committed prefix on the file.
-    writer.flush_staged().expect("committed prefix reaches the file");
+    writer
+        .flush_staged()
+        .expect("committed prefix reaches the file");
     drop(writer);
 
     // An append that was never committed: a whole record plus a torn one.
@@ -1527,7 +1539,9 @@ fn real_file_crash_recovery_shape_truncate_tail_then_resume() {
     let mut writer = SegmentWriter::resumed(file, committed, verified.records_crc).expect("resume");
     append_all(&mut writer, &all[3..]);
     assert_eq!(writer.records_crc(), FIXTURE_REGION_CRC);
-    writer.flush_staged().expect("resumed tail reaches the file");
+    writer
+        .flush_staged()
+        .expect("resumed tail reaches the file");
     assert_eq!(
         std::fs::read(&scratch.0).expect("read back"),
         fixture_records()
