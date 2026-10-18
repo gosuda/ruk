@@ -269,7 +269,10 @@ const SSH_EXIT_GRACE: Duration = Duration::from_secs(30);
 pub struct SshStream {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "owns the spawned ssh so Drop can kill-and-reap it after taking the pipes"
+    )]
     child: Child,
 }
 
