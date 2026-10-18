@@ -964,6 +964,90 @@ fn walk_orders_merge_topology_by_committer_date() {
 }
 
 #[test]
+fn log_excluding_skips_branch_in_date_order() {
+    use ruk_core::ByteString;
+    use ruk_core::conflict::{Signature, TzOffset};
+    use ruk_core::heads::Head;
+    use ruk_core::ids::Oid;
+    use ruk_core::ops::{NewRequest, new as ops_new};
+    use ruk_core::store::ObjectKind;
+
+    let base = temp_base("logexclude");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env,
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    let store = open_store(&root);
+    let tree = super::tree::store_object(&store, ObjectKind::Tree, Vec::new())
+        .expect("empty tree");
+    let sig = |timestamp: i64| Signature {
+        name: ByteString::from("Tariq"),
+        email: ByteString::from("tariq@example.invalid"),
+        timestamp,
+        offset: TzOffset::UTC,
+    };
+    let make = |parents: Vec<Head>, timestamp: i64, message: &str| -> Oid {
+        ops_new(
+            &store,
+            NewRequest {
+                tree,
+                parents,
+                author: sig(timestamp),
+                committer: sig(timestamp),
+                message: ByteString::from(message),
+                change_id: None,
+                predecessor: None,
+                provenance: None,
+            },
+        )
+        .expect("new commit")
+        .oid
+        .expect("git commit")
+    };
+    // Same interleaved merge topology as the walk test, excluding only the
+    // root: both sides stay live, so LIFO discovery (second-parent chain
+    // first) disagrees with date order on `main moves on` vs `add a` — the
+    // exact shape `log <tip> ^<exclude>` walks.
+    let seed = make(vec![], 1000, "seed\n");
+    let add_a = make(vec![Head::Git { oid: seed }], 1100, "add a\n");
+    let feature = make(vec![Head::Git { oid: add_a }], 1500, "feature work\n");
+    let main2 = make(vec![Head::Git { oid: add_a }], 1200, "main moves on\n");
+    let merge = make(
+        vec![Head::Git { oid: main2 }, Head::Git { oid: feature }],
+        1600,
+        "merge feature\n",
+    );
+    let history =
+        super::verbs_history::walk_history_excluding(&store, &[merge], &[seed], None)
+            .expect("excluding walk");
+    let subjects: Vec<String> = history
+        .iter()
+        .map(|(_, record)| {
+            let message = record.message();
+            let end = message
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(message.len());
+            String::from_utf8_lossy(&message[..end]).into_owned()
+        })
+        .collect();
+    assert_eq!(
+        subjects,
+        vec!["merge feature", "feature work", "main moves on", "add a"]
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn sequencer_absent_reads_clean() {
     let (root, env) = seeded_repo("seq", "s.txt", b"s\n");
     let mut ctx = repo_ctx(&root, env);

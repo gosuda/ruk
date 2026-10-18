@@ -778,7 +778,7 @@ fn commit_parents(store: &Store, oid: Oid) -> Result<Vec<Oid>, GitError> {
 
 /// Walks `tips` in `git log` order while skipping `exclude` and everything
 /// reachable from it, mirroring [`walk_history`] otherwise.
-fn walk_history_excluding(
+pub(crate) fn walk_history_excluding(
     store: &Store,
     tips: &[Oid],
     exclude: &[Oid],
