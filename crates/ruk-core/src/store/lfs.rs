@@ -171,9 +171,64 @@ pub fn stage_verified(
     Ok(final_path)
 }
 
+/// Streams an HTTP download body into the sidecar for `hex` with
+/// streaming sha256 + size verification and an atomic rename: the same
+/// guarantee as [`stage_verified`], but the bytes arrive from a reader
+/// (the batch-API payload GET) instead of a source file, so multi-hundred
+/// MiB payloads never sit buffered in memory.
+///
+/// Idempotent and mismatch behavior match [`stage_verified`]: a verified
+/// sidecar file short-circuits to `Ok`, a mismatch discards the temp file
+/// with [`StoreError::Invalid`], and partial transfers never touch the
+/// sidecar path.
+///
+/// # Errors
+/// [`StoreError::Invalid`] for a non-canonical `hex` or a verification
+/// mismatch; filesystem failures propagate as [`StoreError::Io`].
+pub fn stage_stream_verified(
+    store_root: &Path,
+    hex: &str,
+    size: u64,
+    stream: &mut impl Read,
+) -> Result<PathBuf, StoreError> {
+    let hex = hex.to_ascii_lowercase();
+    let Some(final_path) = sidecar_path(store_root, &hex) else {
+        return Err(StoreError::Invalid(format!(
+            "lfs oid is not 64 hex digits: {hex:?}"
+        )));
+    };
+    if sidecar_verified(store_root, &hex, size) {
+        return Ok(final_path);
+    }
+    if let Some(parent) = final_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = final_path.with_extension(format!("tmp.{}", std::process::id()));
+    let staged = copy_stream(stream, &tmp_path)?;
+    if staged != (hex.clone(), size) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(StoreError::Invalid(format!(
+            "lfs payload {hex} verifies as {} with {staged_size} bytes (want {size})",
+            staged.0,
+            staged_size = staged.1,
+        )));
+    }
+    std::fs::rename(&tmp_path, &final_path)?;
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent() {
+        super::durability::sync_dir(parent)?;
+    }
+    Ok(final_path)
+}
+
 /// Streams `src` to `tmp`, returning the observed `(hex, bytes)`.
 fn stage_copy(src: &Path, tmp: &Path) -> Result<(String, u64), StoreError> {
     let mut input = std::fs::File::open(src)?;
+    copy_stream(&mut input, tmp)
+}
+
+/// Streams `input` to `tmp`, returning the observed `(hex, bytes)`.
+fn copy_stream(input: &mut impl Read, tmp: &Path) -> Result<(String, u64), StoreError> {
     let mut output = std::fs::File::create(tmp)?;
     let mut hasher = Sha256::new();
     let mut size: u64 = 0;
@@ -254,6 +309,31 @@ mod tests {
         let back = decode_record(&encode_record(&record)).expect("decode");
         assert_eq!(back, record);
         assert_eq!(upsert_mutation(&hex, &record).table, FactTable::LfsObjects);
+    }
+
+    #[test]
+    fn stream_stage_verifies_without_a_source_file() {
+        let dir = test_dir("stream");
+        let payload = b"streamed lfs payload";
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            hex.push(char::from_digit(u32::from(byte >> 4), 16).expect("hex digit"));
+            hex.push(char::from_digit(u32::from(byte & 0x0F), 16).expect("hex digit"));
+        }
+        let store_root = dir.join("store");
+        let mut stream: &[u8] = payload;
+        let staged = stage_stream_verified(&store_root, &hex, payload.len() as u64, &mut stream)
+            .expect("stage");
+        assert!(sidecar_verified(&store_root, &hex, payload.len() as u64));
+        assert_eq!(std::fs::read(&staged).expect("bytes"), payload);
+        // A short stream fails verification and leaves no sidecar file.
+        let bad_hex = "c".repeat(64);
+        let mut short: &[u8] = b"too short";
+        assert!(stage_stream_verified(&store_root, &bad_hex, 999, &mut short).is_err());
+        assert!(sidecar_path(&store_root, &bad_hex).is_some_and(|path| !path.exists()));
     }
 
     #[test]
