@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::MAX_CONTROL_FRAME_BYTES;
+use crate::bytes::ByteString;
 use crate::capability::Capabilities;
 use crate::change::{OperationId, RequestId, SessionId, WorkspaceId};
 use crate::commit::ProvenanceClaims;
@@ -430,16 +431,34 @@ pub(crate) fn decode_receipt(
 // ---------------------------------------------------------------------------
 
 /// Stored row for [`FactTable::Workspaces`].
+///
+/// `root` is the host directory the workspace materializes into, written by
+/// `ws.new` from its wire args. Rows committed before the root field decode
+/// through [`LegacyWorkspaceRow`] in [`decode_workspace`] and upgrade with an
+/// empty root; postcard is positional, so a `#[serde(default)]` alone would
+/// read those shorter rows as truncation and latch quarantine instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceRow {
     pub(crate) state: WorkspaceState,
     pub(crate) holder: SessionId,
+    pub(crate) root: ByteString,
+}
+
+/// Pre-root workspace row: `{state, holder}` only. Decoding only; new rows
+/// always carry a root. Any postcard truncation of the current shape retries
+/// as this shape before quarantine latches (see [`decode_workspace`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyWorkspaceRow {
+    state: WorkspaceState,
+    holder: SessionId,
 }
 
 impl WorkspaceRow {
     /// Validates the transition to `next`: delegates to
-    /// [`WorkspaceState::check_successor`] and enforces that the holder changes
-    /// only when `lease_epoch` strictly increases.
+    /// [`WorkspaceState::check_successor`], enforces that the holder changes
+    /// only when `lease_epoch` strictly increases, and pins the root: it is
+    /// fixed at creation like the workspace kind, so a row write can never
+    /// retarget another workspace's host directory.
     ///
     /// # Errors
     /// `E_INVALID` on any transition or fencing rule violation.
@@ -458,6 +477,12 @@ impl WorkspaceRow {
                 ),
             ));
         }
+        if self.root != next.root {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "workspace root is fixed at creation and cannot be retargeted",
+            ));
+        }
         Ok(())
     }
 }
@@ -471,7 +496,21 @@ pub(crate) fn decode_workspace(
     _key: &[u8; 16],
     b: &[u8],
 ) -> Result<WorkspaceRow, CoreError> {
-    let row: WorkspaceRow = decode(store, "workspace row", b)?;
+    // Decode the current shape without observing first: a pre-root row is
+    // shorter, postcard reports truncation, and observing that expected
+    // version skew would latch quarantine on a healthy store. Only the
+    // legacy retry observes, so genuinely corrupt bytes still latch.
+    let row: WorkspaceRow = match crate::store::decode("workspace row", b) {
+        Ok(row) => row,
+        Err(_) => {
+            let legacy: LegacyWorkspaceRow = decode(store, "workspace row", b)?;
+            WorkspaceRow {
+                state: legacy.state,
+                holder: legacy.holder,
+                root: ByteString::from(""),
+            }
+        }
+    };
     if let Err(err) = row.state.validate(store.hash_kind()) {
         return corrupt(
             store,
@@ -853,6 +892,7 @@ mod tests {
         let row0 = WorkspaceRow {
             state: state0.clone(),
             holder: holder0,
+            root: ByteString::from("/tmp/ruk-rows-test"),
         };
 
         // Same holder, advance stamp sequence: valid
@@ -862,6 +902,7 @@ mod tests {
         let row_advanced = WorkspaceRow {
             state: state_advanced,
             holder: holder0,
+            root: ByteString::from("/tmp/ruk-rows-test"),
         };
         assert!(row0.check_successor(&row_advanced).is_ok());
 
@@ -870,6 +911,7 @@ mod tests {
         let row_taken = WorkspaceRow {
             state: state_taken,
             holder: holder1,
+            root: ByteString::from("/tmp/ruk-rows-test"),
         };
         assert!(row0.check_successor(&row_taken).is_ok());
 
@@ -877,6 +919,7 @@ mod tests {
         let row_takeover_no_epoch = WorkspaceRow {
             state: state0.clone(),
             holder: holder1,
+            root: ByteString::from("/tmp/ruk-rows-test"),
         };
         assert_eq!(
             row0.check_successor(&row_takeover_no_epoch)
@@ -884,6 +927,49 @@ mod tests {
                 .code,
             ErrorCode::EInvalid
         );
+
+        // Root retargeting is invalid even on an identical replacement.
+        let row_retargeted = WorkspaceRow {
+            state: state0.clone(),
+            holder: holder0,
+            root: ByteString::from("/tmp/ruk-rows-elsewhere"),
+        };
+        assert_eq!(
+            row0.check_successor(&row_retargeted)
+                .expect_err("root retarget")
+                .code,
+            ErrorCode::EInvalid
+        );
+    }
+
+    #[test]
+    fn pre_root_workspace_rows_decode_with_empty_root_and_no_quarantine() {
+        let (_temp, store) = test_store("ws-legacy");
+        let holder = SessionId::from_bytes([9; 16]);
+        let state = sample_workspace_state();
+        // Authentic pre-root bytes: the legacy shape only.
+        let legacy = LegacyWorkspaceRow {
+            state: state.clone(),
+            holder,
+        };
+        let bytes = crate::store::encode("workspace row", &legacy).expect("encode legacy row");
+        let key = workspace_key(WorkspaceId::from_bytes([4; 16]));
+        let row = decode_workspace(&store, &key, &bytes).expect("legacy row upgrades");
+        assert_eq!(row.state, state);
+        assert_eq!(row.holder, holder);
+        assert!(row.root.is_empty());
+
+        // The fallback retry must not latch quarantine: the store still
+        // serves reads after upgrading a shorter row.
+        store
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("store usable after legacy upgrade");
+
+        // Genuine corruption still latches: trailing bytes fail both shapes.
+        let mut corrupt = bytes.clone();
+        corrupt.push(0xff);
+        let err = decode_workspace(&store, &key, &corrupt).expect_err("trailing bytes fail");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
     }
 
     #[test]

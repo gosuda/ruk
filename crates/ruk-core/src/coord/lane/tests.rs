@@ -509,6 +509,7 @@ fn test_4_stale_same_workspace_rejection_and_epoch_first_fencing() {
             w
         }),
         holder: session_a.id(),
+        root: crate::bytes::ByteString::from("/tmp/ruk-lane-test"),
     };
     let encoded_ws = rows::encode("workspace", &ws_row).unwrap();
 

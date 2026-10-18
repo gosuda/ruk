@@ -954,9 +954,11 @@ fn new_parts(
             created.change,
             created.head,
         )?);
+        let root = observed.row.root.clone();
         facts.push(observed.replace(WorkspaceRow {
             state: next.clone(),
             holder: session,
+            root,
         })?);
         state = Some(next);
         fence = Some((binding.workspace, binding.expected));
@@ -1074,10 +1076,10 @@ fn claim_release_parts(
 /// empty-tree change over `parents`, or GitCompat at the given HEAD.
 ///
 /// Only the row is written: worktree materialization is a post-commit daemon
-/// job, and the host root is validated but not stored (no row field carries
-/// it until W4). Native creation needs the session identity row and the
-/// coordinator clock for the inner commit's signature; GitCompat creation is
-/// context-free.
+/// job, and the host root is stored on the row for the later snapshot, write,
+/// and recover job split to resolve. Native creation needs the session
+/// identity row and the coordinator clock for the inner commit's signature;
+/// GitCompat creation is context-free.
 ///
 /// # Errors
 /// Same as [`mint_empty_commit`] for native workspaces, plus `E_LIMIT` for
@@ -1120,6 +1122,7 @@ fn ws_new_parts(
         &WorkspaceRow {
             state: state.clone(),
             holder: session,
+            root: args.root.clone(),
         },
     )?;
     let key = rows::workspace_key(id).to_vec();
@@ -1324,9 +1327,11 @@ fn advance_workspaces(
             };
             let next =
                 WorkspaceState::Native(current.move_to(binding.expected, *change, *new_head)?);
+            let root = observed.row.root.clone();
             let fact = observed.replace(WorkspaceRow {
                 state: next,
                 holder: session,
+                root,
             })?;
             Ok((vec![fact], fence))
         }
