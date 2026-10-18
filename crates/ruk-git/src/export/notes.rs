@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::refdata::{RefName, RefTarget};
+use ruk_core::refdata::RefName;
 use ruk_core::store::Store;
 use ruk_core::store::types::ObjectKind;
 
@@ -88,21 +88,6 @@ impl NotesNamespace {
             .find(|edge| edge.target == target)
             .map(|edge| edge.note)
     }
-}
-
-/// Every direct notes ref in `entries` with its commit OID.
-#[must_use]
-pub fn notes_targets(entries: &[(RefName, RefTarget)]) -> Vec<(RefName, Oid)> {
-    let mut out = Vec::new();
-    for (name, target) in entries {
-        if !is_notes_ref(name) {
-            continue;
-        }
-        if let RefTarget::Direct(oid) = target {
-            out.push((name.clone(), *oid));
-        }
-    }
-    out
 }
 
 /// Loads one notes namespace from the store.
