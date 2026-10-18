@@ -508,7 +508,10 @@ fn stage_resolved(
 /// serial fixpoint. Workers return `(index, kind, bytes)` triples; the
 /// caller applies them through [`Resolver::finish`] in index order, so a
 /// corrupt entry surfaces in pack order. Narrow packs stay serial.
-fn pre_resolve_independent(resolver: &mut Resolver<'_>, interrupt: &Interrupt) -> Result<(), GitError> {
+fn pre_resolve_independent(
+    resolver: &mut Resolver<'_>,
+    interrupt: &Interrupt,
+) -> Result<(), GitError> {
     let independent: Vec<(usize, ObjectKind)> = resolver
         .raw
         .iter()
