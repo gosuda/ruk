@@ -1738,7 +1738,7 @@ fn sync_via_batch(
                 headers: action_headers,
                 ..
             }) => {
-                                let mut get_headers: Vec<(String, String)> = action_headers.clone();
+                let mut get_headers: Vec<(String, String)> = action_headers.clone();
                 if let Some(auth) = http::auth_header(&ctx.env.vars)
                     && http::same_origin(&batch_url, href).unwrap_or(false)
                 {
@@ -1829,8 +1829,7 @@ fn download_and_stage(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let file =
-        std::fs::File::create(tmp).map_err(|err| format!("cannot stage download: {err}"))?;
+    let file = std::fs::File::create(tmp).map_err(|err| format!("cannot stage download: {err}"))?;
     // Any byte past the pointer's declared size already fails verification,
     // so abort the stream there: a lying or endless body cannot fill the
     // disk while we wait for the hash check to reject it.

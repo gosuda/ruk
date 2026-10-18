@@ -35,8 +35,7 @@ use ruk_core::store::{PreparationBudget, Store};
 use super::fetch::observation_mutations;
 use super::fetch::{FetchWireRequest, Filter, promisor_facts, shallow_facts};
 use super::pack::{
-    IngestLimits, Links, PackEntry, StagedPack, ingest_pack, object_links, pack_threads,
-    write_pack,
+    IngestLimits, Links, PackEntry, StagedPack, ingest_pack, object_links, pack_threads, write_pack,
 };
 use super::push::{
     PushPlanRecord, PushUpdate, PushWireRequest, RefOutcome, RefResult, push_closure, reconcile,
@@ -452,9 +451,7 @@ impl ClosureReadPool {
                     // object so the caller still fails in batch order.
                     out.extend(part.iter().map(|oid| {
                         Err(GitError::Io {
-                            detail: format!(
-                                "closure read lane died while reading object {oid}"
-                            ),
+                            detail: format!("closure read lane died while reading object {oid}"),
                         })
                     }));
                 }
