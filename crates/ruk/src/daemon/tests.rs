@@ -23,10 +23,11 @@ use ruk_core::change::{LeaseId, OperationId, RequestId, SessionId, StoreId};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
 use ruk_core::protocol::{
-    BookmarkSetArgs, BookmarkTarget, Method, NewArgs, OpLogArgs, PageCursor, PageLimit,
-    PageRequest, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope, StatusArgs, TagSetArgs,
+    BookmarkSetArgs, BookmarkTarget, IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor,
+    PageLimit, PageRequest, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope, StatusArgs,
+    TagAnnotation, TagSetArgs,
 };
-use ruk_core::refdata::{RefExpect, RefName};
+use ruk_core::refdata::{RefExpect, RefName, RefTarget};
 
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
@@ -754,7 +755,8 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
     let (report, _) = driver.expect_typed_refused(25, &payload).await;
     assert_eq!(report.code, "E_INVALID");
 
-    // A mutation outside the covered subset names its missing preparation.
+    // A covered mutation with an unsatisfiable precondition reports it:
+    // `pin` prepares, but the fixture head was never stored.
     let pin_args = PinArgs {
         head: Head::Git {
             oid: Oid::from_bytes(&[0x11; 20]).expect("pin target"),
@@ -769,12 +771,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(27, &payload).await;
-    assert_eq!(report.code, "E_HOSTED");
-    assert!(
-        report.message.contains("does not cover preparation"),
-        "unexpected message: {}",
-        report.message
-    );
+    assert_eq!(report.code, "E_NOT_FOUND");
 
     // The session check runs before preparation: an uncovered method with
     // an unknown session reports forbidden, never the missing preparation.
@@ -787,6 +784,98 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
     );
     let (report, _) = driver.expect_typed_refused(29, &payload).await;
     assert_eq!(report.code, "E_FORBIDDEN");
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that an annotated `tag.set` renders its tag object
+/// through the dispatch context: the ref points at the tag object rather
+/// than the target commit, and the log records the mutation.
+#[tokio::test]
+async fn typed_dispatch_serves_annotated_tag_set() {
+    let root = temp_root("typed-tag");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let repo = store_repo;
+
+    let payload = Driver::typed_open(&repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let target = Oid::from_bytes(&[0x11; 20]).expect("tag target");
+    let tag_args = TagSetArgs {
+        name: RefName::new("refs/tags/v1").expect("tag name"),
+        target,
+        annotation: Some(TagAnnotation {
+            tagger: Some(IdentityClaim {
+                name: "Tag".to_string(),
+                email: "tag@example.invalid".to_string(),
+            }),
+            message: ByteString::from("annotated"),
+        }),
+        expected: RefExpect::Absent,
+    };
+    let args_json = sonic_rs::to_string(&tag_args).expect("tag args encode");
+    let mutation_id = RequestId::generate().to_string();
+    let payload = Driver::typed_open(
+        &repo,
+        "tag.set",
+        Some(&mutation_id),
+        Some(args_json),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    assert_eq!(
+        envelope.request_id.map(|id| id.to_string()),
+        Some(mutation_id)
+    );
+    let ReplyBody::Success(Reply::TagSet(reply)) = envelope.body else {
+        panic!("tag.set must answer its own reply");
+    };
+    let RefTarget::Direct(tag_oid) = reply.target else {
+        panic!("annotated tag.set must point at its tag object");
+    };
+    assert_ne!(tag_oid, target, "the ref moves to the tag object");
+
+    let payload = Driver::typed_open(
+        &repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(log)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(log.entries.items.len(), 1);
+    assert_eq!(log.entries.items[0].method, Method::TagSet);
 
     drop(driver);
     task.abort();

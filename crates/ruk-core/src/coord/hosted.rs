@@ -46,10 +46,9 @@ use super::leases::{
     AcquireArgs, CursorWant, INTERACTIVE_TTL, LeaseKind, LeaseRegistry, OwnerGuard,
 };
 use super::oplog::read_header;
-use super::prepare::{PrepareContext, prepare_mutation_with};
-use crate::attestation::Checkpoint;
 use super::policy::PolicySource;
 pub use super::policy::Principal;
+use super::prepare::{PrepareContext, prepare_mutation_with};
 use super::retention::{RetentionClock, SweepTable, sweep_page};
 use super::rows::{
     CoordinatorHead, OP_HEAD_KEY, RECEIPT_HORIZON, SessionRow, decode_head, decode_session,
@@ -57,6 +56,7 @@ use super::rows::{
 };
 use super::session::{Authority, ResumeOutcome, SessionTable, prepare_open};
 use crate::ByteString;
+use crate::attestation::Checkpoint;
 use crate::capability::{Capabilities, ReadAccess};
 use crate::change::{LeaseId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
@@ -1849,9 +1849,11 @@ mod tests {
                 },
             },
         }));
+        // Pinning now prepares; the fixture head was never stored, so the
+        // existence check reports it instead of a refusal.
         let err = super::super::prepare_mutation(coord.store(), session, pin)
-            .expect_err("pin stays refused");
-        assert_eq!(err.code, ErrorCode::EHosted);
+            .expect_err("unstored pin target is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
 
         let foreign = super::super::prepare_mutation(
             coord.store(),
