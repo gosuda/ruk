@@ -26,8 +26,7 @@ const RAW_OBJECTS: TableDefinition<'static, &'static [u8], &'static [u8]> =
     TableDefinition::new("objects");
 const RAW_SEGMENTS: TableDefinition<'static, u64, &'static [u8]> = TableDefinition::new("segments");
 const RAW_GENERATION: TableDefinition<'static, (), u64> = TableDefinition::new("generation");
-const RAW_VERIFIED: TableDefinition<'static, (), u64> =
-    TableDefinition::new("verified_generation");
+const RAW_VERIFIED: TableDefinition<'static, (), u64> = TableDefinition::new("verified_generation");
 
 /// The census of the core contract, spelled independently of the code under
 /// test: every table a store must contain, and no other.
@@ -463,12 +462,14 @@ fn open_accepts_a_store_predating_the_verified_generation_table_as_unverified() 
         meta.verified_generation().expect("verified generation"),
         None
     );
-    meta.set_verified_generation(4).expect("record verification");
+    meta.set_verified_generation(4)
+        .expect("record verification");
     assert_eq!(
         meta.verified_generation().expect("verified generation"),
         Some(4)
     );
-    meta.set_verified_generation(7).expect("record verification");
+    meta.set_verified_generation(7)
+        .expect("record verification");
     assert_eq!(
         meta.verified_generation().expect("verified generation"),
         Some(7)

@@ -229,10 +229,7 @@ impl Metadata {
             Err(TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(err) => return Err(table_error(err)),
         };
-        Ok(table
-            .get(())
-            .map_err(storage)?
-            .map(|guard| guard.value()))
+        Ok(table.get(()).map_err(storage)?.map(|guard| guard.value()))
     }
 
     /// Records `generation` as fully identity-verified in one Immediate

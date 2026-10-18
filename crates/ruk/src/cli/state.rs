@@ -30,7 +30,9 @@ use ruk_core::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate, resolve,
 };
 use ruk_core::refs::{StoreRefs, page_refs, prepare_checked_transaction};
-use ruk_core::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store};
+use ruk_core::store::{
+    FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store,
+};
 pub(crate) use ruk_core::workspace::ResolvedHead;
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
@@ -691,7 +693,10 @@ fn peel_object(store: &Store, oid: Oid, want: &str) -> Result<Oid, GitError> {
         });
     }
     Err(GitError::Invalid {
-        detail: format!("{} does not peel to {want:?} (chain too deep)", oid.to_hex()),
+        detail: format!(
+            "{} does not peel to {want:?} (chain too deep)",
+            oid.to_hex()
+        ),
     })
 }
 
