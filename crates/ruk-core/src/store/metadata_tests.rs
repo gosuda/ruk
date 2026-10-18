@@ -23,10 +23,12 @@ const RAW_OBJECTS: TableDefinition<'static, &'static [u8], &'static [u8]> =
     TableDefinition::new("objects");
 const RAW_SEGMENTS: TableDefinition<'static, u64, &'static [u8]> = TableDefinition::new("segments");
 const RAW_GENERATION: TableDefinition<'static, (), u64> = TableDefinition::new("generation");
+const RAW_VERIFIED: TableDefinition<'static, (), u64> =
+    TableDefinition::new("verified_generation");
 
 /// The census of the core contract, spelled independently of the code under
 /// test: every table a store must contain, and no other.
-const CENSUS: [&str; 29] = [
+const CENSUS: [&str; 30] = [
     "objects",
     "commits",
     "changes",
@@ -52,6 +54,7 @@ const CENSUS: [&str; 29] = [
     "ws_apply",
     "segments",
     "generation",
+    "verified_generation",
     "promisor",
     "shallow",
     "pins",
@@ -292,6 +295,10 @@ fn create_initializes_the_complete_census_and_generation_zero() {
     let dir = TestDir::new("census");
     let meta = create(&dir);
     assert_eq!(meta.generation().expect("generation"), 0);
+    assert_eq!(
+        meta.verified_generation().expect("verified generation"),
+        Some(0)
+    );
     assert!(meta.all_manifests().expect("manifests").is_empty());
     drop(meta);
 
@@ -417,6 +424,33 @@ fn open_refuses_an_unknown_table_as_an_unknown_format() {
     }
     let result = Metadata::open(&dir.meta_path());
     assert!(matches!(result, Err(StoreError::Version(_))), "{result:?}");
+}
+
+#[test]
+fn open_accepts_a_store_predating_the_verified_generation_table_as_unverified() {
+    let dir = TestDir::new("open-no-verified-table");
+    drop(create(&dir));
+    {
+        let db = Database::open(dir.meta_path()).expect("raw open");
+        let txn = db.begin_write().expect("raw write");
+        assert!(txn.delete_table(RAW_VERIFIED).expect("delete table"));
+        txn.commit().expect("raw commit");
+    }
+    let meta = reopen(&dir);
+    assert_eq!(
+        meta.verified_generation().expect("verified generation"),
+        None
+    );
+    meta.set_verified_generation(4).expect("record verification");
+    assert_eq!(
+        meta.verified_generation().expect("verified generation"),
+        Some(4)
+    );
+    meta.set_verified_generation(7).expect("record verification");
+    assert_eq!(
+        meta.verified_generation().expect("verified generation"),
+        Some(7)
+    );
 }
 
 #[test]

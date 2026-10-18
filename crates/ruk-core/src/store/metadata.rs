@@ -4,12 +4,15 @@
 //!
 //! # Tables
 //!
-//! Twenty-nine named tables are created together, once, by
+//! Thirty named tables are created together, once, by
 //! [`Metadata::create_in_file`]:
 //!
 //! - `objects`: raw object digest -> postcard [`ObjectLocation`];
 //! - `segments`: segment id -> postcard [`SegmentManifest`];
 //! - `generation`: `()` -> the current locator generation;
+//! - `verified_generation`: `()` -> the locator generation whose objects
+//!   recovery last fully identity-verified, written only by recovery on a
+//!   successful open;
 //! - one `&[u8] -> &[u8]` table per [`FactTable`] variant, named by
 //!   [`FactTable::table_name`]. Fact values are opaque here; their owners
 //!   postcard-encode them.
@@ -17,6 +20,12 @@
 //! `objects`, `segments` and `generation` are publication-owned: they are
 //! written only through [`PublicationTxn`], never through a
 //! [`FactMutation`].
+//!
+//! A store written before `verified_generation` existed opens normally: the
+//! missing table reads as unverified, so the next open verifies every
+//! object and then records the table. A binary that predates the table
+//! refuses a store holding it as [`StoreError::Version`], the same unknown
+//! census signal as any other format drift.
 //!
 //! # Initialization versus opening
 //!
@@ -96,6 +105,8 @@ type BytesTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
 const OBJECTS: BytesTable = TableDefinition::new("objects");
 const SEGMENTS: TableDefinition<'static, u64, &'static [u8]> = TableDefinition::new("segments");
 const GENERATION: TableDefinition<'static, (), u64> = TableDefinition::new("generation");
+const VERIFIED_GENERATION: TableDefinition<'static, (), u64> =
+    TableDefinition::new("verified_generation");
 
 const fn fact_definition(table: FactTable) -> BytesTable {
     TableDefinition::new(table.table_name())
@@ -133,6 +144,7 @@ fn is_census_name(name: &str) -> bool {
     name == OBJECTS.name()
         || name == SEGMENTS.name()
         || name == GENERATION.name()
+        || name == VERIFIED_GENERATION.name()
         || FactTable::ALL
             .iter()
             .any(|table| table.table_name() == name)
@@ -176,6 +188,10 @@ impl Metadata {
             let mut generation = txn.open_table(GENERATION).map_err(table_error)?;
             generation.insert((), 0_u64).map_err(storage)?;
         }
+        {
+            let mut verified = txn.open_table(VERIFIED_GENERATION).map_err(table_error)?;
+            verified.insert((), 0_u64).map_err(storage)?;
+        }
         txn.commit()?;
         Ok(Self { db })
     }
@@ -197,6 +213,41 @@ impl Metadata {
     pub(crate) fn generation(&self) -> Result<u64, StoreError> {
         let txn = self.db.begin_read().map_err(txn_error)?;
         lookup_generation(&txn.open_table(GENERATION).map_err(table_error)?)
+    }
+
+    /// The locator generation recovery last fully identity-verified, or
+    /// `None` when no verified generation is recorded.
+    ///
+    /// A missing table means the store predates the verification cache, not
+    /// damage: the caller must verify every object and then record the
+    /// result with [`Metadata::set_verified_generation`]. Any other table
+    /// failure keeps the existing census meaning.
+    pub(crate) fn verified_generation(&self) -> Result<Option<u64>, StoreError> {
+        let txn = self.db.begin_read().map_err(txn_error)?;
+        let table = match txn.open_table(VERIFIED_GENERATION) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(table_error(err)),
+        };
+        Ok(table
+            .get(())
+            .map_err(storage)?
+            .map(|guard| guard.value()))
+    }
+
+    /// Records `generation` as fully identity-verified in one Immediate
+    /// commit. Recovery calls this after a successful verification pass and
+    /// before serving anything; the commit may already be durable on
+    /// failure, so callers treat it like any other metadata commit.
+    pub(crate) fn set_verified_generation(&self, generation: u64) -> Result<(), StoreError> {
+        let mut txn = self.db.begin_write().map_err(txn_error)?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut table = txn.open_table(VERIFIED_GENERATION).map_err(table_error)?;
+            table.insert((), generation).map_err(storage)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// The locator for `oid`, or `None` if it was never published.
