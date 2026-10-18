@@ -91,6 +91,7 @@ fn every_fact_table() -> Vec<FactTable> {
         FactTable::Promisor,
         FactTable::Shallow,
         FactTable::Pins,
+        FactTable::LfsObjects,
     ];
     // A new variant fails to compile here until it is listed above.
     for table in &all {
@@ -120,7 +121,8 @@ fn every_fact_table() -> Vec<FactTable> {
             | FactTable::Reflogs
             | FactTable::Promisor
             | FactTable::Shallow
-            | FactTable::Pins => {}
+            | FactTable::Pins
+            | FactTable::LfsObjects => {}
         }
     }
     all
@@ -329,7 +331,7 @@ fn create_initializes_the_complete_census_and_generation_zero() {
 
     let reopened = reopen(&dir);
     let tables = every_fact_table();
-    assert_eq!(tables.len(), 26);
+    assert_eq!(tables.len(), 27);
     assert_eq!(tables, FactTable::ALL.to_vec(), "FactTable::ALL drifted");
     for table in tables {
         assert!(CENSUS.contains(&table.table_name()), "{table:?}");

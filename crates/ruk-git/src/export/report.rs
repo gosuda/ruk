@@ -57,13 +57,16 @@ pub enum LossCategory {
     /// fails instead of omitting one inside its closure; this counts the
     /// records outside it.
     Promisor,
+    /// LFS payload presence rows. Payload bytes live outside the object
+    /// graph in the sidecar, so only the presence rows are lost here.
+    LfsObjects,
     /// The coordinator capability policy file (`policy.toml`).
     CapabilityPolicy,
 }
 
 impl LossCategory {
     /// Every category, in report order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::RefConflicts,
         Self::RemoteTracking,
         Self::ChangeMetadata,
@@ -75,6 +78,7 @@ impl LossCategory {
         Self::Publication,
         Self::RetentionPins,
         Self::Promisor,
+        Self::LfsObjects,
         Self::CapabilityPolicy,
     ];
 }
@@ -116,6 +120,7 @@ pub const fn disposition(table: FactTable) -> Disposition {
         }
         FactTable::Pins => Lost(L::RetentionPins),
         FactTable::Promisor => Lost(L::Promisor),
+        FactTable::LfsObjects => Lost(L::LfsObjects),
     }
 }
 

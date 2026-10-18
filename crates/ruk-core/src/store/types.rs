@@ -263,11 +263,12 @@ pub enum FactTable {
     Promisor,
     Shallow,
     Pins,
+    LfsObjects,
 }
 
 impl FactTable {
     /// Every table, in schema order.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Refs,
         Self::RefConflicts,
         Self::RemoteObservations,
@@ -294,6 +295,7 @@ impl FactTable {
         Self::Promisor,
         Self::Shallow,
         Self::Pins,
+        Self::LfsObjects,
     ];
 
     /// The exact on-disk table name from the core census.
@@ -326,6 +328,7 @@ impl FactTable {
             Self::Promisor => "promisor",
             Self::Shallow => "shallow",
             Self::Pins => "pins",
+            Self::LfsObjects => "lfs_objects",
         }
     }
 }

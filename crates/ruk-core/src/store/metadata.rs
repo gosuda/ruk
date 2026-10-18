@@ -198,13 +198,20 @@ impl Metadata {
 
     /// Opens an existing metadata database and verifies the census.
     ///
+    /// Schema revision: census tables the file predates (a store written
+    /// before a [`FactTable`] variant existed) are created empty before
+    /// verification, the same tolerance [`Metadata::verified_generation`]
+    /// shows a missing verification cache: absence means an older schema,
+    /// not damage. Unknown tables still refuse with [`StoreError::Version`].
+    ///
     /// # Errors
     /// [`StoreError::Corrupt`] for a missing, empty, foreign or damaged
-    /// file, a missing or mistyped census table, or a missing generation
-    /// row; [`StoreError::Version`] for an unknown table or a file format
-    /// that needs an offline upgrade. Nothing is created or repaired.
+    /// file, a mistyped census table, or a missing generation row;
+    /// [`StoreError::Version`] for an unknown table or a file format
+    /// that needs an offline upgrade.
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
         let db = builder().open(path).map_err(database_error)?;
+        ensure_census(&db)?;
         verify_census(&db)?;
         Ok(Self { db })
     }
@@ -774,6 +781,22 @@ fn apply_fact(txn: &WriteTransaction, fact: &FactMutation) -> Result<(), StoreEr
             table.remove(fact.key.as_slice()).map_err(storage)?;
         }
     }
+    Ok(())
+}
+
+/// Creates only the `lfs_objects` table when the database predates that
+/// schema revision, so an older store opens with the new table empty
+/// instead of refusing. Every other census table keeps its existing
+/// meaning: a missing one is still damage, never silently recreated —
+/// recreating `objects` would orphan segment bytes behind vanished
+/// locators and turn damage into silent missing-object reads. A write
+/// transaction's `open_table` creates the table only when absent;
+/// existing tables and rows are untouched.
+fn ensure_census(db: &Database) -> Result<(), StoreError> {
+    let mut txn = db.begin_write().map_err(txn_error)?;
+    txn.open_table(fact_definition(FactTable::LfsObjects))
+        .map_err(table_error)?;
+    txn.commit()?;
     Ok(())
 }
 

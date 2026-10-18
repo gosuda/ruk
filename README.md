@@ -1,24 +1,26 @@
 # Ruk
 
-Ruk is an agent-native version control system built in Rust for multi-agent software development and hosted Git infrastructure. It pairs exact Git SHA-1 and SHA-256 object identity with a transactional store (`redb` metadata and zstd-compressed, CRC32C-framed object segments) so concurrent agents and services can coordinate without lockfile contention or worktree races. Unlike stock Git, which coordinates callers through filesystem lockfiles and untyped CLI text, Ruk provides a typed v1 protocol with idempotent mutation receipts, path claims, isolated workspaces, an operation log, and a single serialized publication lane per repository, alongside a Git-compatible CLI and a multi-repository daemon for Forgejo.
+Ruk is an agent-native version control system built in Rust with exact Git SHA-1 and SHA-256 object interoperability, transactional repository state (`redb` metadata and zstd-compressed, CRC32C-framed object segments), isolated concurrent workspaces, first-class conflict records, and a typed v1 agent protocol. It provides a Git-compatible CLI (`ruk git`), a stdio Model Context Protocol server (`ruk mcp`), and a hosted multi-repository daemon (`ruk forgejo serve`) targeting Forgejo through a bounded backend patch.
 
-- **Agent-native protocol**: 46 typed v1 protocol methods (`ruk model`) and a stdio MCP server (`ruk mcp`) covering sessions (`session.open`, `session.resume`), path claims (`claim.acquire`, `claim.release`, `claim.list` with up to 3600s TTL), isolated workspaces (`ws.new`, `ws.scope`, `ws.take`, `ws.drop`, `ws.recover`), operation log queries (`op.log`, `undo`), and serialized publication lanes (2ms group-commit linger, up to 64 requests or 64 MiB per batch) with 7-day idempotent replay receipts.
-- **Native conflict algebra**: First-class `conflict-v1` records (`ruk encode-conflict`, `ruk decode-conflict`) preserve ordered `+`/`-` tree terms, parents, signatures, and headers without polluting Git commit headers, paired with syntax-aware merges across 21 pinned Tree-sitter grammars plus Markdown and MDX.
-- **Git CLI and wire interop**: `ruk git <verb>` (or invoking the binary as `git`) dispatches 58 advertised verbs (`crates/ruk/src/cli/dispatch.rs`) and passes 56/56 comparisons against Git 2.53.0 in `tasks/parity-harness/`. `ruk git migrate` imports existing `.git` repositories (loose objects, pack v2/v3, refs, and `HEAD`, 73/73 checks passing in `tasks/migration/`), while `ruk-git` implements transport over local paths, `file://`, `ssh://`, and `git://` (`http(s)://` is a named unimplemented gap).
+- **Agent-native protocol**: 46 v1 protocol method schemas (`ruk model`) and a stdio MCP server (`ruk mcp`). Coordinator mutation translation serves `new`, `edit`, `ws.scope`, `ws.take`, `ws.drop`, `describe`, `split`, `squash`, `rebase`, `abandon`, `resolve`, `revert`, `undo`, `claim.acquire`, `claim.release`, and `land.prepare` over a single serialized `PublicationLane` per repository (2ms group-commit linger, up to 64 requests or 64 MiB per batch), with 30-second lease-bound cursors on `op.log`, `claim.list`, and `attest.list` and 7-day idempotent mutation receipts (`FactTable::Receipts`).
+- **Native conflict algebra**: First-class `conflict-v1` records (`ruk encode-conflict`, `ruk decode-conflict`) preserve ordered `+`/`-` tree terms, parents, signatures, and headers without adding headers to exported Git commits, paired with syntax-aware merges across 21 pinned Tree-sitter grammars plus Markdown and MDX.
+- **Git CLI and wire interop**: `ruk git <verb>` (or invoking the binary as `git`) dispatches 58 advertised verb names in `crates/ruk/src/cli/dispatch.rs` (48 implemented or served, 3 partial (`cherry-pick`, `rebase`, `revert`), and 7 unsupported (`archive`, `bundle`, `count-objects`, `gc`, `index-pack`, `pack-objects`, `worktree`), passing 56/56 scripted scenario checks against Git 2.53.0 in `tasks/parity-harness/GAPS.md`). `ruk git migrate` imports existing `.git` repositories (loose objects, pack v2/v3, refs, and `HEAD`, 73/73 checks passing in `tasks/migration/RESULTS.md`), while `ruk-git` supports transport over local paths, `file://`, `ssh://`, and `git://` (`http(s)://` is a named unimplemented gap).
 - **Verified storage integrity**: Every segment record carries a CRC32C header-and-payload checksum, and sealed segments end with a 24-byte `RUKSEAL1` CRC32C footer. `Store::open` validates segment manifests on every open, caches `verified_generation` in committed metadata so repeat opens skip full object-hash sweeps, and supports `RUK_VERIFY=full` to force full parallel object-identity verification on every open (exercised across 7 publication and recovery kill points in `crates/ruk-core/src/store/crash_tests.rs`).
 - **Measured dev-scale capacity**: In warm-cache CLI benchmarks on an 80-CPU, 754 GiB host (`tasks/capacity/RESULTS.md`, not the reference deployment or open-loop daemon load), Ruk p50 vs. Git 2.53.0 p50 is **22ms vs. 47ms** on `adv-1k` (2.1x faster) and **98ms vs. 149ms** on `page1` (1.5x faster), **61ms vs. 54ms** on `adv-10k`, **49ms vs. 10ms** on single-ref `lookup`, **49ms vs. 28ms** on `write`, **6.94s vs. 1.38s** on 10k-branch bare `clone`, and **990ms vs. 87ms** on incremental `fetch`.
 
 ## Usage example
 
 ```bash
-ruk git init demo && printf 'hello
-' > demo/a.txt
-ruk git -C demo add a.txt
-ruk git -C demo -c user.name=Alice -c user.email=alice@example.com commit -m "initial"
-# Initialized empty Ruk repository in /tmp/demo/.ruk/
-# [main (root-commit) 5f2d8c1] initial
-#  1 file changed, 1 insertion(+)
-#  create mode 100644 a.txt
+ruk git init repo && printf 'one
+' > repo/f.txt
+ruk git -C repo add f.txt
+ruk git -C repo -c user.name=Ada -c user.email=ada@example.invalid commit -m seed
+ruk git -C repo hash-object f.txt
+ruk git -C repo config user.nick ada && ruk git -C repo config user.nick
+ruk git -C repo status --porcelain
+# Initialized empty Ruk repository in /tmp/repo/.ruk/
+# 9117217ff36c2893110e6526d217e9596b16bb85
+# ada
 ```
 
 ---

@@ -35,6 +35,13 @@ pub enum LfsMode {
     /// `lfs = "pointers"`: pointer bytes are ordinary content; payloads
     /// are never fetched.
     Pointers,
+    /// `lfs = "full"`: pointer bytes are ordinary blobs (exactly as under
+    /// [`LfsMode::Pointers`]) plus payloads are reconciled into the
+    /// content-addressed sidecar (`<store>/lfs/objects/`, tracked by the
+    /// `lfs_objects` fact table). A push with an absent payload still
+    /// succeeds: the pointer is recorded and the sidecar row stays absent
+    /// until `lfs-payload-sync` fills it.
+    Full,
 }
 
 /// Whether `bytes` is a Git LFS pointer.
@@ -79,6 +86,30 @@ fn parse_oid(line: &[u8]) -> bool {
 fn parse_size(line: &[u8]) -> bool {
     line.strip_prefix(SIZE_PREFIX)
         .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+}
+
+/// A decoded pointer: the 64 lowercase hex digits of the payload's sha256
+/// and its declared byte size.
+///
+/// Returns `None` when `bytes` is not a pointer per [`is_pointer`], or when
+/// the declared size overflows `u64`. The hex is lowercased on return so
+/// sidecar paths and fact keys have one canonical spelling.
+pub fn parse_pointer(bytes: &[u8]) -> Option<(String, u64)> {
+    if !is_pointer(bytes) {
+        return None;
+    }
+    let mut lines = bytes.split(|byte| *byte == b'\n');
+    lines.next()?;
+    let oid = loop {
+        match lines.next()? {
+            line if line.starts_with(EXT_PREFIX) => continue,
+            line => break line,
+        }
+    };
+    let hex = std::str::from_utf8(oid.strip_prefix(OID_PREFIX)?).ok()?;
+    let size_text = std::str::from_utf8(lines.next()?.strip_prefix(SIZE_PREFIX)?).ok()?;
+    let size = size_text.parse::<u64>().ok()?;
+    Some((hex.to_ascii_lowercase(), size))
 }
 
 /// Reads the LFS mode the store at `store_root` declares: the `lfs` key of

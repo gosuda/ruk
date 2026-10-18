@@ -85,7 +85,8 @@ impl TrackedTable {
             | FactTable::Reflogs
             | FactTable::Promisor
             | FactTable::Shallow
-            | FactTable::Pins => None,
+            | FactTable::Pins
+            | FactTable::LfsObjects => None,
         }
     }
 }

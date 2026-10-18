@@ -1146,9 +1146,9 @@ mod tests {
             parsed("version = 1\nlfs = \"pointers\"\n").lfs(),
             LfsMode::Pointers
         );
+        assert_eq!(parsed("version = 1\nlfs = \"full\"\n").lfs(), LfsMode::Full);
         for text in [
             "version = 1\nlfs = \"fetch\"\n",
-            "version = 1\nlfs = \"full\"\n",
             "version = 1\nlfs = true\n",
         ] {
             assert_eq!(code_of(text), ErrorCode::EPolicy, "{text:?}");

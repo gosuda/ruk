@@ -44,7 +44,10 @@ pub fn refused_reason() -> String {
 
 /// Staged blobs whose bytes are Git LFS pointers: what this push would
 /// introduce. Empty under [`LfsMode::Pointers`] by construction — callers
-/// skip the gate entirely in that mode.
+/// skip the gate entirely in that mode. Under [`LfsMode::Full`] the same
+/// skip applies: pointers ingest as ordinary blobs and an absent payload
+/// never refuses the push (the sidecar row simply stays absent until
+/// `lfs-payload-sync` fills it).
 #[must_use]
 pub fn staged_pointers(staged: &StagedPack) -> Vec<Oid> {
     staged
@@ -129,8 +132,10 @@ fn links_of(kind: ObjectKind, payload: &[u8], hash: HashKind) -> Result<Vec<Oid>
 /// Command indices whose ref update the push must refuse under `mode`:
 /// every non-delete live update whose new tip reaches a staged pointer
 /// blob. `live` pairs command order with the update's new tip, the way the
-/// serve half tracks verdicts. Under [`LfsMode::Pointers`] the refusals are
-/// always empty.
+/// serve half tracks verdicts. Under [`LfsMode::Pointers`] or
+/// [`LfsMode::Full`] the refusals are always empty: both modes record
+/// pointer bytes plainly, and `Full` never couples payload presence to
+/// push admission.
 ///
 /// # Errors
 /// [`GitError::Corrupt`] for malformed staged payloads.

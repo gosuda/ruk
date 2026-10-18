@@ -43,7 +43,7 @@ use crate::store::types::{FactExpectation, FactMutation, FactTable};
 ///
 /// Exhaustive match with no wildcard per the state proposal section 8 contract.
 /// Tracked tables: `Refs`, `RefConflicts`, `Changes`, `ChangeHistory`, `Workspaces`,
-/// `WsIndex`, and `Pins`. All other 19 tables in the census are untracked.
+/// `WsIndex`, and `Pins`. All other 20 tables in the census are untracked.
 #[must_use]
 pub(crate) fn tracked(table: FactTable) -> bool {
     match table {
@@ -74,6 +74,7 @@ pub(crate) fn tracked(table: FactTable) -> bool {
         FactTable::Reflogs => false,
         FactTable::Promisor => false,
         FactTable::Shallow => false,
+        FactTable::LfsObjects => false,
     }
 }
 
