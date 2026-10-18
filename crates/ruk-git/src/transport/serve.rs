@@ -53,7 +53,9 @@ use super::fetch::{commit_record_facts, verify_closure};
 use super::hooks::{Quarantine, ReceiveHooks, run_hook, stage_quarantine};
 use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, write_pack};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush, send};
-use super::proc_receive::{ProcReceiveCommand, ProcVerdict, is_proc_receive_ref, run_proc_receive};
+use super::proc_receive::{
+    ProcReceiveCommand, ProcVerdict, PushOptions, is_proc_receive_ref, run_proc_receive,
+};
 use super::push::{PushUpdate, RefResult};
 use super::session::{LocalFetchRequest, advertise, apply_refs, local_closure};
 use super::{AGENT, Interrupt, has_object};
@@ -403,14 +405,12 @@ fn hook_line(cmd: &Command) -> String {
 /// the review ref itself), refused ones report `ng`, and fall-through
 /// commands rejoin the normal path through the `update` hook, leaving
 /// their verdict undecided for the CAS path below.
-#[allow(clippy::too_many_arguments)]
 fn run_proc_receive_phase(
     live: &[(usize, PushUpdate)],
     results: &mut [Option<Result<(), String>>],
     hooks: &ReceiveHooks,
     quarantine: Option<&Quarantine>,
-    push_options: &[String],
-    offer_push_options: bool,
+    options: &PushOptions<'_>,
     kind: HashKind,
     interrupt: &Interrupt,
 ) -> Result<(), GitError> {
@@ -430,15 +430,7 @@ fn run_proc_receive_phase(
         return Ok(());
     }
     interrupt.check("running proc-receive hook")?;
-    let verdicts = run_proc_receive(
-        hooks,
-        quarantine,
-        &hook_commands,
-        push_options,
-        offer_push_options,
-        kind,
-        interrupt,
-    );
+    let verdicts = run_proc_receive(hooks, quarantine, &hook_commands, options, kind, interrupt);
     for (position, verdict) in verdicts.into_iter().enumerate() {
         let index = indices[position];
         match verdict {
@@ -457,14 +449,7 @@ fn run_proc_receive_phase(
             update.old.to_hex(),
             update.new.to_hex(),
         ];
-        if let Some(reason) = run_hook(
-            hooks,
-            quarantine,
-            "update",
-            &args,
-            None,
-            push_options,
-        ) {
+        if let Some(reason) = run_hook(hooks, quarantine, "update", &args, None, options.values) {
             results[*index] = Some(Err(reason));
         }
     }
@@ -586,8 +571,8 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
                     detail: format!("push sent more than {MAX_PUSH_OPTIONS} options"),
                 });
             }
-            let option = String::from_utf8(line)
-                .map_err(|_| corrupt("push option is not UTF-8"))?;
+            let option =
+                String::from_utf8(line).map_err(|_| corrupt("push option is not UTF-8"))?;
             push_options.push(option);
         }
     }
@@ -716,13 +701,16 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             }
         }
     } else {
+        let options = PushOptions {
+            values: &push_options,
+            negotiated: client_push_options,
+        };
         run_proc_receive_phase(
             &live,
             &mut results,
             hooks,
             quarantine.as_ref(),
-            &push_options,
-            client_push_options,
+            &options,
             kind,
             interrupt,
         )?;

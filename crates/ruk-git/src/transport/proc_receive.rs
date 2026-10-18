@@ -48,9 +48,9 @@ use std::time::{Duration, Instant};
 
 use ruk_core::ids::{HashKind, Oid};
 
+use super::Interrupt;
 use super::hooks::{Quarantine, ReceiveHooks, apply_hook_env};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush};
-use super::Interrupt;
 use crate::{GitError, parse_oid_for};
 
 /// Refs diverted to the `proc-receive` hook: Forgejo's
@@ -67,6 +67,20 @@ pub fn is_proc_receive_ref(name: &[u8]) -> bool {
         let raw = prefix.as_bytes();
         name == raw || (name.starts_with(raw) && name.get(raw.len()) == Some(&b'/'))
     })
+}
+
+/// The client's push options with their negotiation flag.
+///
+/// The values travel to the hook over the protocol and to every other
+/// phase as `GIT_PUSH_OPTION_*`; the flag mirrors the oracle's
+/// server-to-hook feature bit and stays true when the client negotiated
+/// `push-options` but sent no lines.
+#[derive(Clone, Debug)]
+pub(crate) struct PushOptions<'a> {
+    /// Option lines in wire order.
+    pub values: &'a [String],
+    /// Whether the client negotiated `push-options`.
+    pub negotiated: bool,
 }
 
 /// One diverted `<old> <new> <ref>` command.
@@ -133,15 +147,12 @@ fn broken(detail: impl Into<String>) -> GitError {
 ///
 /// With no hook script installed every command falls through (see the
 /// module docs). Every other failure refuses the diverted refs in-band;
-/// normal refs are never affected. `offer_push_options` mirrors the
-/// oracle's server-to-hook feature bit: true when the client negotiated
-/// `push-options`, even if it then sent none.
+/// normal refs are never affected.
 pub(crate) fn run_proc_receive(
     hooks: &ReceiveHooks,
     quarantine: Option<&Quarantine>,
     commands: &[ProcReceiveCommand],
-    push_options: &[String],
-    offer_push_options: bool,
+    options: &PushOptions<'_>,
     kind: HashKind,
     interrupt: &Interrupt,
 ) -> Vec<ProcVerdict> {
@@ -159,7 +170,7 @@ pub(crate) fn run_proc_receive(
     }
     let mut cmd = std::process::Command::new(&path);
     cmd.current_dir(repo_dir);
-    apply_hook_env(&mut cmd, repo_dir, quarantine, push_options);
+    apply_hook_env(&mut cmd, repo_dir, quarantine, options.values);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -200,7 +211,8 @@ pub(crate) fn run_proc_receive(
         return reject_all(commands, "cannot read proc-receive stderr".to_owned());
     }
     let worker_commands: Vec<ProcReceiveCommand> = commands.to_vec();
-    let worker_options: Vec<String> = push_options.to_vec();
+    let worker_options: Vec<String> = options.values.to_vec();
+    let worker_negotiated = options.negotiated;
     let worker_interrupt = interrupt.clone();
     let worker = std::thread::Builder::new()
         .name("ruk-proc-receive-converse".to_owned())
@@ -210,7 +222,7 @@ pub(crate) fn run_proc_receive(
                 Box::new(stdout) as Box<dyn Read + Send>,
                 &worker_commands,
                 &worker_options,
-                offer_push_options,
+                worker_negotiated,
                 kind,
                 &worker_interrupt,
             )
@@ -292,10 +304,7 @@ fn reap(child: &mut std::process::Child) {
 
 /// One [`ProcVerdict::FallThrough`] per command.
 fn fall_through_all(commands: &[ProcReceiveCommand]) -> Vec<ProcVerdict> {
-    commands
-        .iter()
-        .map(|_| ProcVerdict::FallThrough)
-        .collect()
+    commands.iter().map(|_| ProcVerdict::FallThrough).collect()
 }
 
 /// One [`ProcVerdict::Rejected`] per command.
@@ -389,9 +398,9 @@ fn converse(
         })
         .collect();
     loop {
-        let packet = pkt.read_packet().map_err(|err| {
-            broken(format!("reading the proc-receive report: {err}"))
-        })?;
+        let packet = pkt
+            .read_packet()
+            .map_err(|err| broken(format!("reading the proc-receive report: {err}")))?;
         match packet {
             Packet::Flush => break,
             Packet::Delimiter | Packet::ResponseEnd => {
@@ -483,9 +492,11 @@ fn report_line(
     if let Some(body) = line.strip_prefix("option ") {
         return report_option(body, pending, kind);
     }
-    let (status, rest) = line
-        .split_once(' ')
-        .ok_or_else(|| broken(format!("proc-receive sent an incomplete status line: {line:?}")))?;
+    let (status, rest) = line.split_once(' ').ok_or_else(|| {
+        broken(format!(
+            "proc-receive sent an incomplete status line: {line:?}"
+        ))
+    })?;
     if status != "ok" && status != "ng" {
         return Err(broken(format!("proc-receive sent bad status {status:?}")));
     }
@@ -671,12 +682,9 @@ mod tests {
         loop {
             match pkt.read_packet().expect("frame") {
                 Packet::Flush => frames.push(Vec::new()),
-                Packet::Data(payload) => frames.push(
-                    payload
-                        .strip_suffix(b"\n")
-                        .unwrap_or(payload)
-                        .to_vec(),
-                ),
+                Packet::Data(payload) => {
+                    frames.push(payload.strip_suffix(b"\n").unwrap_or(payload).to_vec())
+                }
                 other => panic!("unexpected {other:?}"),
             }
             if pkt.get_mut().is_empty() {
@@ -819,12 +827,15 @@ mod tests {
     #[test]
     fn missing_hook_falls_through() {
         let repo = hook_repo();
+        let options = PushOptions {
+            values: &[],
+            negotiated: false,
+        };
         let verdicts = run_proc_receive(
             &ReceiveHooks::for_repo(repo),
             None,
             &[command("refs/for/main")],
-            &[],
-            false,
+            &options,
             HashKind::Sha1,
             &Interrupt::none(),
         );
@@ -840,12 +851,15 @@ mod tests {
         std::fs::write(&path, "#!/bin/sh\nexit 1\n").expect("hook script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("hook executable");
+        let options = PushOptions {
+            values: &[],
+            negotiated: false,
+        };
         let verdicts = run_proc_receive(
             &ReceiveHooks::for_repo(repo).with_timeout(Duration::from_secs(10)),
             None,
             &[command("refs/for/main")],
-            &[],
-            false,
+            &options,
             HashKind::Sha1,
             &Interrupt::none(),
         );

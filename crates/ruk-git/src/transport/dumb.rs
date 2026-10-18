@@ -35,9 +35,9 @@ use ruk_core::store::ObjectKind;
 use ruk_core::store::Store;
 
 use super::pack::{IngestLimits, object_links};
+use super::read_object;
 use super::serve::HeadAdvertisement;
 use super::session::advertise;
-use super::read_object;
 #[cfg(test)]
 use super::stage_object;
 use crate::{GitError, parse_oid_for};
@@ -214,11 +214,7 @@ fn parse_locator(store: &Store, oid_or_path: &str) -> Result<Oid, GitError> {
 /// Store failures, [`GitError::NotFound`] for a missing object,
 /// [`GitError::Limit`] above the ingest ceiling, [`GitError::Corrupt`]
 /// for a malformed locator, and [`GitError::Io`] when `out` fails.
-pub fn dumb_object(
-    store: &Store,
-    oid_or_path: &str,
-    out: &mut dyn Write,
-) -> Result<(), GitError> {
+pub fn dumb_object(store: &Store, oid_or_path: &str, out: &mut dyn Write) -> Result<(), GitError> {
     if oid_or_path.starts_with("objects/pack/") || oid_or_path.starts_with("objects/info/") {
         return Err(GitError::NotFound {
             detail: format!("no pack route serves {oid_or_path:?} over dumb HTTP"),
@@ -235,11 +231,9 @@ pub fn dumb_object(
     write!(encoder, "{type_name} {}\0", bytes.len()).map_err(|err| GitError::Io {
         detail: format!("framing dumb object {oid}: {err}"),
     })?;
-    encoder
-        .write_all(&bytes)
-        .map_err(|err| GitError::Io {
-            detail: format!("framing dumb object {oid}: {err}"),
-        })?;
+    encoder.write_all(&bytes).map_err(|err| GitError::Io {
+        detail: format!("framing dumb object {oid}: {err}"),
+    })?;
     let framed = encoder.finish().map_err(|err| GitError::Io {
         detail: format!("deflating dumb object {oid}: {err}"),
     })?;
