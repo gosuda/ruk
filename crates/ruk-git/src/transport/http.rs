@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -249,23 +249,62 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, GitError> {
     })
 }
 
-/// Dials `parsed` with connect/read/write timeouts and runs the TLS
-/// handshake up front on `https`, so a certificate failure reports before
-/// any request bytes move.
+/// Compares the credential scope of two URLs: scheme, host, and port all
+/// match, so a token for an `https` endpoint never follows a downgrade to
+/// `http` on the same host.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a non-HTTP URL on either side.
+pub fn same_origin(a: &str, b: &str) -> Result<bool, GitError> {
+    let a = parse_url(a)?;
+    let b = parse_url(b)?;
+    Ok(a.secure == b.secure && a.host == b.host && a.port == b.port)
+}
+
+/// Dials `parsed` with a bounded connect plus read/write timeouts and runs
+/// the TLS handshake up front on `https`, so a certificate failure reports
+/// before any request bytes move. Every resolved address is tried in order
+/// (resolution, not string splicing, builds the dial address, so IPv6
+/// hosts dial correctly).
 ///
 /// # Errors
 /// [`GitError::Invalid`] for an unusable server name, [`GitError::Io`]
-/// when the peer cannot be reached or the handshake fails.
+/// when no address resolves or none connects within the timeout.
 fn connect(parsed: &Url) -> Result<Stream, GitError> {
-    let addr = format!("{}:{}", parsed.host, parsed.port);
-    let socket = TcpStream::connect(addr.as_str()).map_err(|err| GitError::Io {
-        detail: format!("cannot reach {addr}: {err}"),
+    let label = format!("{}:{}", parsed.host, parsed.port);
+    let addrs: Vec<std::net::SocketAddr> = (parsed.host.as_str(), parsed.port)
+        .to_socket_addrs()
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot resolve {label}: {err}"),
+        })?
+        .collect();
+    if addrs.is_empty() {
+        return Err(GitError::Io {
+            detail: format!("cannot resolve {label}: no addresses"),
+        });
+    }
+    let mut last_err = String::from("no addresses tried");
+    let mut socket = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, IO_TIMEOUT) {
+            Ok(dialed) => {
+                socket = Some(dialed);
+                break;
+            }
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    let socket = socket.ok_or_else(|| GitError::Io {
+        detail: format!(
+            "cannot reach {label} within {}s: {last_err}",
+            IO_TIMEOUT.as_secs()
+        ),
     })?;
     socket
         .set_read_timeout(Some(IO_TIMEOUT))
         .and(socket.set_write_timeout(Some(IO_TIMEOUT)))
         .map_err(|err| GitError::Io {
-            detail: format!("cannot arm timeouts on {addr}: {err}"),
+            detail: format!("cannot arm timeouts on {label}: {err}"),
         })?;
     if !parsed.secure {
         return Ok(Stream::Plain(socket));
@@ -634,9 +673,7 @@ pub fn get_to_writer(
                     detail: format!("GET {current} redirects without a Location"),
                 })?
                 .to_owned();
-            let next_parsed = parse_url(&next)?;
-            let prev_parsed = parse_url(&current)?;
-            if next_parsed.host != prev_parsed.host || next_parsed.port != prev_parsed.port {
+            if !same_origin(&current, &next)? {
                 owned.retain(|(name, _)| name.to_ascii_lowercase() != "authorization");
             }
             current = next;
@@ -1059,6 +1096,15 @@ mod tests {
             "token leaked: {:?}",
             second_requests[0]
         );
+    }
+
+    #[test]
+    fn origin_scopes_credentials_by_scheme_host_and_port() {
+        assert!(same_origin("http://h.x/a", "http://h.x:80/b").expect("same"));
+        assert!(!same_origin("http://h.x/a", "https://h.x:443/a").expect("downgrade"));
+        assert!(!same_origin("http://h.x:1/a", "http://h.x:2/a").expect("port"));
+        assert!(!same_origin("http://a.x/", "http://b.x/").expect("host"));
+        assert!(same_origin("http://h.x/a", "http://h.x/a").expect("self"));
     }
 
     #[test]
