@@ -589,6 +589,35 @@ impl PublicationTxn {
         Ok(())
     }
 
+    /// Moves a committed locator to its compacted position. The key must
+    /// already exist: compaction rewrites positions, never identities, so a
+    /// missing row means the swap set raced its own snapshot and the swap
+    /// must abort rather than invent a locator.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for a missing key or a location whose
+    /// extent, base or depth is inconsistent.
+    pub(crate) fn replace_object(
+        &self,
+        oid: &Oid,
+        location: &ObjectLocation,
+    ) -> Result<(), StoreError> {
+        if let Some(defect) = location_defect(oid, location) {
+            return Err(StoreError::Invalid(format!("object {oid}: {defect}")));
+        }
+        let encoded = encode("object location", location)?;
+        let mut table = self.txn.open_table(OBJECTS).map_err(table_error)?;
+        if table.get(oid.as_bytes()).map_err(storage)?.is_none() {
+            return Err(StoreError::Invalid(format!(
+                "object {oid} has no committed locator to replace"
+            )));
+        }
+        table
+            .insert(oid.as_bytes(), encoded.as_slice())
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Records the committed state of one segment.
     ///
     /// Extents must be consistent (`committed_end` is `records_end`, plus

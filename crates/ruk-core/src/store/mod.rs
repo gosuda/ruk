@@ -36,6 +36,7 @@
 pub mod error;
 pub mod types;
 
+mod compact;
 mod delta;
 pub mod durability;
 mod guards;
@@ -62,6 +63,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub use compact::CompactionStats;
 pub use error::StoreError;
 pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
 pub use metadata::{FactPage, FactPageBudget, FactRow};
@@ -137,6 +139,9 @@ pub struct Store {
     budget: Arc<PreparationBudget>,
     guards: Arc<GenerationRegistry>,
     writer: Mutex<WriterState>,
+    /// Serializes whole compaction passes against each other. Publications
+    /// never take it; the swap takes the writer lock beneath it.
+    compaction_lock: Mutex<()>,
     quarantine: Mutex<Option<String>>,
     quarantined: AtomicBool,
 }
@@ -151,6 +156,23 @@ struct WriterState {
     next_segment_id: u64,
     /// Set once a publication failed after durable work began.
     closed: Option<String>,
+    /// Test-only segment roll target in bytes; zero means the production
+    /// [`segment::SEGMENT_TARGET_BYTES`]. Lets compaction tests build
+    /// multi-segment stores without 256 MiB payloads.
+    #[cfg(test)]
+    segment_target_override: u64,
+}
+
+impl WriterState {
+    /// The segment roll target in effect: the test override when set, the
+    /// production target otherwise.
+    fn target_bytes(&self) -> u64 {
+        #[cfg(test)]
+        if self.segment_target_override > 0 {
+            return self.segment_target_override;
+        }
+        segment::SEGMENT_TARGET_BYTES
+    }
 }
 
 struct ActiveSegment {
@@ -358,7 +380,10 @@ impl Store {
                 resume: recovered.open,
                 next_segment_id: recovered.next_segment_id,
                 closed: None,
+                #[cfg(test)]
+                segment_target_override: 0,
             }),
+            compaction_lock: Mutex::new(()),
             quarantine: Mutex::new(None),
             quarantined: AtomicBool::new(false),
         }
@@ -418,6 +443,15 @@ impl Store {
         &self.guards
     }
 
+    /// Builds a corruption error and latches quarantine, mirroring
+    /// committed reads: callers that detect committed damage report it
+    /// through here instead of constructing it inline.
+    pub(crate) fn latch_corrupt(&self, detail: String) -> StoreError {
+        let err = StoreError::Corrupt(detail);
+        self.latch(&err.to_string());
+        err
+    }
+
     /// Latches quarantine. The first reason stays.
     fn latch(&self, reason: &str) {
         if let Ok(mut slot) = self.quarantine.lock() {
@@ -452,6 +486,36 @@ impl Store {
         self.writer
             .lock()
             .map_err(|_| StoreError::WriterClosed("writer state poisoned by a panic".to_owned()))
+    }
+
+    /// Flushes the writer's open segment file and retires the handle.
+    ///
+    /// Every committed byte was already synced by its publication before the
+    /// metadata commit, so this only forces out whatever the OS still holds
+    /// back. Dropping the store without closing is still safe: the next
+    /// open truncates any uncommitted tail during recovery. Closing is
+    /// idempotent; a store with no open segment returns immediately.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`] when the writer state is poisoned;
+    /// [`StoreError::Io`] when the final flush fails.
+    pub fn close(&self) -> Result<(), StoreError> {
+        let writer = self.lock_writer()?;
+        match writer.active.as_ref() {
+            Some(active) => durability::sync_file(active.writer.get_ref()),
+            None => Ok(()),
+        }
+    }
+
+    /// Shrinks the segment roll target for this store. Test-only: lets
+    /// compaction tests build multi-segment stores without 256 MiB
+    /// payloads. The floor keeps one small record plus its header and seal
+    /// footer representable.
+    #[cfg(test)]
+    pub(crate) fn set_segment_target_for_tests(&self, bytes: u64) {
+        if let Ok(mut writer) = self.writer.lock() {
+            writer.segment_target_override = bytes.max(1024);
+        }
     }
 
     /// Prepares one object for publication.
@@ -923,7 +987,7 @@ fn append(
         object.payload.view(),
     )?;
     let segment = active.id;
-    let oversized = active.writer.records_end() > segment::SEGMENT_TARGET_BYTES;
+    let oversized = active.writer.records_end() > writer.target_bytes();
     batch.active_touched = true;
     batch.locations.push((
         object.oid(),
@@ -957,8 +1021,9 @@ fn active_segment<'w>(
         let opened = open_segment(writer, batch, segments_dir)?;
         writer.active = Some(opened);
     }
+    let target = writer.target_bytes();
     let overflows = writer.active.as_ref().is_some_and(|active| {
-        active.writer.records_end() > 0 && !active.writer.fits_target(record_len)
+        active.writer.records_end() > 0 && !active.writer.fits_sized(record_len, target)
     });
     if overflows {
         seal_active(writer, batch)?;

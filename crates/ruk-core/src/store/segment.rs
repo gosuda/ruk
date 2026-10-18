@@ -353,9 +353,16 @@ impl<W: Write + Seek> SegmentWriter<W> {
     /// [`SEGMENT_TARGET_BYTES`]. The owner seals and rolls over when it does
     /// not and the segment is non-empty.
     pub(crate) fn fits_target(&self, record_len: u64) -> bool {
+        self.fits_sized(record_len, SEGMENT_TARGET_BYTES)
+    }
+
+    /// Whether a record of `record_len` bytes still fits under `target`.
+    /// Compaction rolls its fresh segments by the same rule against the
+    /// store's effective target, which tests may shrink per store.
+    pub(crate) fn fits_sized(&self, record_len: u64, target: u64) -> bool {
         self.records_end
             .checked_add(record_len)
-            .is_some_and(|end| end <= SEGMENT_TARGET_BYTES)
+            .is_some_and(|end| end <= target)
     }
 
     /// The underlying stream, for the owner's fsync.
@@ -664,6 +671,30 @@ impl<R: Read> Read for RecordPayload<R> {
 }
 
 impl<R: Read> RecordPayload<R> {
+    /// Drains the payload while verifying the stored checksum, returning the
+    /// CRC32C over the payload alone. Compaction feeds that checksum back
+    /// into [`SegmentWriter::append`] so the copied record carries identical
+    /// framing without re-encoding its payload.
+    ///
+    /// # Errors
+    /// `Corrupt` on missing bytes or a checksum mismatch; `Io` on I/O failure.
+    pub(crate) fn finish_with_payload_crc(mut self) -> Result<u32, SegmentError> {
+        let mut payload_crc = 0_u32;
+        let mut scratch = [0_u8; DRAIN_CHUNK];
+        while self.remaining > 0 {
+            let amount = self.remaining.min(scratch.len());
+            self.read_exact(&mut scratch[..amount])?;
+            payload_crc = crc32c_append(payload_crc, &scratch[..amount]);
+        }
+        if self.crc != self.header.crc {
+            return Err(corrupt(format!(
+                "record checksum mismatch at offset {}: stored {:#010x}, computed {:#010x}",
+                self.offset, self.header.crc, self.crc
+            )));
+        }
+        Ok(payload_crc)
+    }
+
     /// Consumes whatever the reader left unread, then checks the record
     /// checksum. Success means the entire record is intact.
     ///
