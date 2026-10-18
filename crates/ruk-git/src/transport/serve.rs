@@ -1395,6 +1395,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn receive_records_pointer_bytes_under_full_mode_without_payload() {
+        let kind = HashKind::Sha1;
+        let src = test_store(kind);
+        let tip = pointer_tip(&src, kind);
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), tip, b"refs/heads/main");
+        let lines = serve_push_with_mode(&dest, kind, &pack, tip, LfsMode::Full);
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert!(
+            super::super::has_object(&dest, tip).expect("pointer commit landed"),
+            "full mode records the pointer with no payload present"
+        );
+    }
+
     static HOOK_TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// A fresh repository directory holding `hooks/`, unique per test.

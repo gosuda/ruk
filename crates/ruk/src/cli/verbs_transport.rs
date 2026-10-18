@@ -1469,7 +1469,7 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
     let opts = collect(args, &specs)?;
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: lfs-payload-sync [--from <dir>]".to_owned(),
+            detail: "usage: lfs_payload_sync [--from <dir>]".to_owned(),
         });
     }
     let from = match opts.single("from")? {

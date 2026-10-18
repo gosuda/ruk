@@ -187,7 +187,7 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_repo::init,
     },
     Verb {
-        name: "lfs-payload-sync",
+        name: "lfs_payload_sync",
         oracle: "git/builtin/fsck.c",
         needs_repo: true,
         summary: "Reconcile LFS sidecar payloads against reachable pointers",
