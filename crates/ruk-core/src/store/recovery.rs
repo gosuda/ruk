@@ -67,11 +67,11 @@ use crate::ids::{HashKind, Oid};
 
 /// Locators verified per metadata page during recovery.
 const VERIFY_PAGE: usize = 256;
-/// Largest object-verification fan-out. Eight workers use a workstation
+/// Largest object-verification fan-out. Sixteen workers use a workstation
 /// without spawning a thread per core on large machines; each worker holds
 /// at most one transient decode against the shared preparation budget, so
 /// the extra residency stays far below the reference 2 GiB ceiling.
-const VERIFY_THREADS: usize = 8;
+const VERIFY_THREADS: usize = 16;
 /// Buffer in front of segment reads.
 const READ_BUFFER: usize = 64 * 1024;
 /// Environment variable forcing the full object identity pass on every
