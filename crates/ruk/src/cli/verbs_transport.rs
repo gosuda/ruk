@@ -1577,25 +1577,30 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
                         hex.clone(),
                         format!("not present in --from {}", dir.display()),
                     )),
-                    Some(path) => {
-                        match sidecar::stage_verified(store.root(), hex, *size, &path) {
-                            Ok(_) => {
-                                synced.push(hex.clone());
-                                mutations.push(sidecar::upsert_mutation(
-                                    hex,
-                                    &sidecar::LfsObjectRecord {
-                                        size: *size,
-                                        complete: true,
-                                    },
-                                ));
-                            }
-                            Err(err) => missing.push((hex.clone(), err.to_string())),
+                    Some(path) => match sidecar::stage_verified(store.root(), hex, *size, &path) {
+                        Ok(_) => {
+                            synced.push(hex.clone());
+                            mutations.push(sidecar::upsert_mutation(
+                                hex,
+                                &sidecar::LfsObjectRecord {
+                                    size: *size,
+                                    complete: true,
+                                },
+                            ));
                         }
-                    }
+                        Err(err) => missing.push((hex.clone(), err.to_string())),
+                    },
                 }
             }
         }
-        None => sync_via_batch(ctx, store, &pending, &mut synced, &mut missing, &mut mutations)?,
+        None => sync_via_batch(
+            ctx,
+            store,
+            &pending,
+            &mut synced,
+            &mut missing,
+            &mut mutations,
+        )?,
     }
     if !mutations.is_empty() {
         store
@@ -1698,7 +1703,10 @@ fn sync_via_batch(
         .collect();
     let reply = http::post_json(&batch_url, &borrowed, &request)?;
     if !http::is_success(reply.status) {
-        let preview: String = String::from_utf8_lossy(&reply.body).chars().take(200).collect();
+        let preview: String = String::from_utf8_lossy(&reply.body)
+            .chars()
+            .take(200)
+            .collect();
         return Err(GitError::Offline {
             detail: format!(
                 "lfs batch {batch_url} refused status {}: {preview:?}",
@@ -1722,10 +1730,7 @@ fn sync_via_batch(
     })?;
     for (hex, size) in pending {
         match answers.get(hex) {
-            None => missing.push((
-                hex.clone(),
-                "batch response omits this object".to_owned(),
-            )),
+            None => missing.push((hex.clone(), "batch response omits this object".to_owned())),
             Some(BatchEntry::Failed { detail, .. }) => {
                 missing.push((hex.clone(), detail.clone()));
             }
@@ -1736,8 +1741,7 @@ fn sync_via_batch(
             }) => {
                 let mut get_headers: Vec<(String, String)> = action_headers.clone();
                 if let Some(auth) = http::auth_header(&ctx.env.vars)
-                    && batch_authority.as_deref()
-                        == http::url_authority(href).ok().as_deref()
+                    && batch_authority.as_deref() == http::url_authority(href).ok().as_deref()
                 {
                     get_headers.push(auth);
                 }
@@ -1787,8 +1791,7 @@ fn download_and_stage(
         .map_err(|err| format!("GET {href} failed: {err}"))?;
     // The staging read opens its own descriptor; flush here so it sees
     // every byte even though the handle drops at return.
-    std::io::Write::flush(&mut file)
-        .map_err(|err| format!("cannot flush download: {err}"))?;
+    std::io::Write::flush(&mut file).map_err(|err| format!("cannot flush download: {err}"))?;
     if !http::is_success(status) {
         return Err(format!("GET {href} failed with status {status}"));
     }

@@ -107,8 +107,7 @@ pub fn auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {
 /// Standard-alphabet base64 with padding, so Basic credentials need no new
 /// dependency for one short header value.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let mut word: u32 = 0;
@@ -194,7 +193,12 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     } else {
         port
     };
-    Ok(Url { secure, host, port, path })
+    Ok(Url {
+        secure,
+        host,
+        port,
+        path,
+    })
 }
 
 /// One request stream: plaintext or a TLS session over the same socket.
@@ -235,17 +239,9 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, GitError> {
     static CONFIG: LazyLock<Result<Arc<rustls::ClientConfig>, String>> = LazyLock::new(|| {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
-        )
+        rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
             .with_safe_default_protocol_versions()
-            .map(|builder| {
-                Arc::new(
-                    builder
-                        .with_root_certificates(roots)
-                        .with_no_client_auth(),
-                )
-            })
+            .map(|builder| Arc::new(builder.with_root_certificates(roots).with_no_client_auth()))
             .map_err(|err| format!("tls provider refused: {err}"))
     });
     CONFIG.clone().map_err(|detail| GitError::Io {
@@ -322,9 +318,11 @@ fn send_request(
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).map_err(|err| GitError::Io {
-        detail: format!("cannot send {what}: {err}"),
-    })?;
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot send {what}: {err}"),
+        })?;
     if let Some(body) = body {
         stream.write_all(body).map_err(|err| GitError::Io {
             detail: format!("cannot send {what} body: {err}"),
@@ -345,9 +343,11 @@ fn read_head(reader: &mut BufReader<Stream>) -> Result<(u16, Vec<(String, String
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
-        reader.read_until(b'\n', &mut line).map_err(|err| GitError::Io {
-            detail: format!("cannot read response head: {err}"),
-        })?;
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(|err| GitError::Io {
+                detail: format!("cannot read response head: {err}"),
+            })?;
         if line.is_empty() {
             return Err(GitError::Io {
                 detail: "response ended mid-head".to_owned(),
@@ -414,9 +414,11 @@ fn read_sized(
         let want = usize::try_from(rest.min(chunk.len() as u64)).map_err(|_| GitError::Limit {
             detail: "response chunk exceeds addressable memory".to_owned(),
         })?;
-        let got = reader.read(&mut chunk[..want]).map_err(|err| GitError::Io {
-            detail: format!("cannot read response body: {err}"),
-        })?;
+        let got = reader
+            .read(&mut chunk[..want])
+            .map_err(|err| GitError::Io {
+                detail: format!("cannot read response body: {err}"),
+            })?;
         if got == 0 {
             return Err(GitError::Io {
                 detail: format!("response body ended {rest} bytes early"),
@@ -436,15 +438,20 @@ fn read_sized(
 /// [`GitError::Io`] on EOF or read failure.
 fn read_line(reader: &mut BufReader<Stream>) -> Result<Vec<u8>, GitError> {
     let mut line = Vec::new();
-    reader.read_until(b'\n', &mut line).map_err(|err| GitError::Io {
-        detail: format!("cannot read chunk line: {err}"),
-    })?;
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot read chunk line: {err}"),
+        })?;
     if line.is_empty() {
         return Err(GitError::Io {
             detail: "chunked body ended mid-stream".to_owned(),
         });
     }
-    while line.last().is_some_and(|byte| *byte == b'\n' || *byte == b'\r') {
+    while line
+        .last()
+        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+    {
         line.pop();
     }
     Ok(line)
@@ -586,12 +593,7 @@ pub fn post_json(
 ) -> Result<HttpResponse, GitError> {
     let (mut reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
     let mut reply = Vec::new();
-    read_body(
-        &mut reader,
-        &headers,
-        &mut reply,
-        Some(MAX_BUFFERED_BYTES),
-    )?;
+    read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
     Ok(HttpResponse {
         status,
         headers,
@@ -656,8 +658,8 @@ pub fn get_to_writer(
 /// Routing, framing, and transport failures as [`GitError`].
 pub fn get(url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, GitError> {
     let mut body = Vec::new();
-    let (status, headers) = request_head(url, "GET", headers, None)
-        .and_then(|(mut reader, status, headers)| {
+    let (status, headers) =
+        request_head(url, "GET", headers, None).and_then(|(mut reader, status, headers)| {
             if is_success(status) {
                 read_body(&mut reader, &headers, &mut body, Some(MAX_BUFFERED_BYTES))?;
             }
@@ -840,40 +842,22 @@ mod tests {
     fn auth_prefers_bearer_and_encodes_basic() {
         let vars = HashMap::from([
             ("GIT_LFS_AUTH_BEARER".to_owned(), "tok".to_owned()),
-            (
-                "GIT_LFS_AUTH_BASIC".to_owned(),
-                "user:pass".to_owned(),
-            ),
+            ("GIT_LFS_AUTH_BASIC".to_owned(), "user:pass".to_owned()),
         ]);
         assert_eq!(
             auth_header(&vars),
-            Some((
-                "authorization".to_owned(),
-                "Bearer tok".to_owned()
-            ))
+            Some(("authorization".to_owned(), "Bearer tok".to_owned()))
         );
-        let vars = HashMap::from([(
-            "GIT_LFS_AUTH_BASIC".to_owned(),
-            "user:pass".to_owned(),
-        )]);
+        let vars = HashMap::from([("GIT_LFS_AUTH_BASIC".to_owned(), "user:pass".to_owned())]);
         assert_eq!(
             auth_header(&vars),
-            Some((
-                "authorization".to_owned(),
-                "Basic dXNlcjpwYXNz".to_owned()
-            ))
+            Some(("authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned()))
         );
         // An already-encoded value without a colon passes through.
-        let vars = HashMap::from([(
-            "GIT_LFS_AUTH_BASIC".to_owned(),
-            "dXNlcjpwYXNz".to_owned(),
-        )]);
+        let vars = HashMap::from([("GIT_LFS_AUTH_BASIC".to_owned(), "dXNlcjpwYXNz".to_owned())]);
         assert_eq!(
             auth_header(&vars),
-            Some((
-                "authorization".to_owned(),
-                "Basic dXNlcjpwYXNz".to_owned()
-            ))
+            Some(("authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned()))
         );
         assert_eq!(auth_header(&HashMap::new()), None);
     }
@@ -949,8 +933,10 @@ mod tests {
                     404 => "Not Found",
                     _ => "Error",
                 };
-                let mut reply =
-                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n", body.len());
+                let mut reply = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n",
+                    body.len()
+                );
                 for (name, value) in &headers {
                     reply.push_str(&format!("{name}: {value}\r\n"));
                 }
@@ -967,9 +953,7 @@ mod tests {
     /// Serves raw reply bytes on loopback (for chunked framing, which the
     /// framed helper above never emits): each connection gets the next
     /// byte string verbatim on its accepted socket.
-    fn fake_raw_server(
-        replies: Vec<Vec<u8>>,
-    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    fn fake_raw_server(replies: Vec<Vec<u8>>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
         let port = listener.local_addr().expect("addr").port();
         let server = std::thread::spawn(move || {
@@ -1012,9 +996,15 @@ mod tests {
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
         let head = &requests[0];
-        assert!(head.starts_with("POST /info/lfs/objects/batch HTTP/1.1\r\n"), "{head:?}");
+        assert!(
+            head.starts_with("POST /info/lfs/objects/batch HTTP/1.1\r\n"),
+            "{head:?}"
+        );
         assert!(head.contains("Authorization: Bearer tok"), "{head:?}");
-        assert!(head.contains(&format!("Content-Type: {LFS_JSON}")), "{head:?}");
+        assert!(
+            head.contains(&format!("Content-Type: {LFS_JSON}")),
+            "{head:?}"
+        );
     }
 
     #[test]
@@ -1023,28 +1013,25 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
         ]);
         let mut sunk = Vec::new();
-        let (status, _) = get_to_writer(
-            &format!("http://127.0.0.1:{port}/payload"),
-            &[],
-            &mut sunk,
-        )
-        .expect("get");
+        let (status, _) =
+            get_to_writer(&format!("http://127.0.0.1:{port}/payload"), &[], &mut sunk)
+                .expect("get");
         assert_eq!(status, 200);
         assert_eq!(sunk, b"hello world");
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("GET /payload HTTP/1.1\r\n"), "{:?}", requests[0]);
+        assert!(
+            requests[0].starts_with("GET /payload HTTP/1.1\r\n"),
+            "{:?}",
+            requests[0]
+        );
     }
 
     #[test]
     fn get_follows_redirects_and_drops_cross_host_auth() {
         // Hop one redirects cross-host (port differs, so the host key
         // differs): the Authorization header must not follow.
-        let (second_port, second) = fake_server(vec![(
-            200,
-            vec![],
-            b"payload-bytes".to_vec(),
-        )]);
+        let (second_port, second) = fake_server(vec![(200, vec![], b"payload-bytes".to_vec())]);
         let (first_port, first) = fake_server(vec![(
             302,
             vec![(

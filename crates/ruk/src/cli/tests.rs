@@ -1561,7 +1561,10 @@ fn lfs_payload_sync_reports_batch_errors_as_missing() {
     // An error entry is reported, never fatal: exit stays 0.
     let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &[]).expect("sync");
     let text = String::from_utf8(out).expect("utf8");
-    assert!(text.contains(&format!("\"oid\": \"{BATCH_HEX}\"")), "got {text:?}");
+    assert!(
+        text.contains(&format!("\"oid\": \"{BATCH_HEX}\"")),
+        "got {text:?}"
+    );
     assert!(text.contains("code 404: not found"), "got {text:?}");
     assert!(text.contains("\"synced\": []"), "got {text:?}");
     let _ = server.join().expect("server");
@@ -1574,7 +1577,10 @@ fn lfs_payload_sync_without_endpoint_reports_a_clear_error() {
     let mut ctx = repo_ctx(&root, env);
     let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &[]).expect("sync");
     let text = String::from_utf8(out).expect("utf8");
-    assert!(text.contains(&format!("\"oid\": \"{BATCH_HEX}\"")), "got {text:?}");
+    assert!(
+        text.contains(&format!("\"oid\": \"{BATCH_HEX}\"")),
+        "got {text:?}"
+    );
     assert!(text.contains("set lfs.url"), "got {text:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
