@@ -71,7 +71,7 @@ pub(crate) struct TreeItem {
 
 /// Git's tree order: bytewise by name, a tree compared as if its name ended
 /// in `/`.
-fn git_order(left: &TreeItem, right: &TreeItem) -> Ordering {
+pub(crate) fn git_order(left: &TreeItem, right: &TreeItem) -> Ordering {
     let suffix = |item: &TreeItem| (item.mode == TreeMode::Tree).then_some(b'/');
     let left_bytes = left.name.iter().copied().chain(suffix(left));
     let right_bytes = right.name.iter().copied().chain(suffix(right));

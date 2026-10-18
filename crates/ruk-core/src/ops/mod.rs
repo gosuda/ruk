@@ -15,6 +15,7 @@ pub mod revert;
 pub mod rewrite;
 pub mod split;
 pub mod squash;
+pub(crate) mod tree_edit;
 
 #[cfg(test)]
 mod tests;
