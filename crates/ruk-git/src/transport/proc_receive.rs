@@ -96,8 +96,9 @@ pub struct ProcReceiveCommand {
 
 /// The review ref the hook reported creating, from its `option` lines.
 ///
-/// Informational: the hook performed the write itself (Forgejo's
-/// `UpdateRef`); the server only reports the original ref to the client.
+/// The hook performed the write itself (Forgejo's `UpdateRef`), so the
+/// client still reports the original ref while `post-receive` observes
+/// this review ref (see `run_proc_receive_phase` in `serve.rs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlternateRef {
     /// The review ref, e.g. `refs/pull/1/head`.
@@ -170,7 +171,13 @@ pub(crate) fn run_proc_receive(
     }
     let mut cmd = std::process::Command::new(&path);
     cmd.current_dir(repo_dir);
-    apply_hook_env(&mut cmd, repo_dir, quarantine, options.values);
+    apply_hook_env(
+        &mut cmd,
+        repo_dir,
+        quarantine,
+        options.values,
+        options.negotiated,
+    );
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

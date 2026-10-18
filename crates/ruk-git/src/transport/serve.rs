@@ -48,13 +48,16 @@ use std::io::{Read, Write};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
 use ruk_core::store::{FactMutation, Store};
+use ruk_core::LfsMode;
 
 use super::fetch::{commit_record_facts, verify_closure};
+use super::lfs::refusals_for_live;
 use super::hooks::{Quarantine, ReceiveHooks, run_hook, stage_quarantine};
 use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, write_pack};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush, send};
 use super::proc_receive::{
-    ProcReceiveCommand, ProcVerdict, PushOptions, is_proc_receive_ref, run_proc_receive,
+    AlternateRef, ProcReceiveCommand, ProcVerdict, PushOptions, is_proc_receive_ref,
+    run_proc_receive,
 };
 use super::push::{PushUpdate, RefResult};
 use super::session::{LocalFetchRequest, advertise, apply_refs, local_closure};
@@ -400,14 +403,31 @@ fn hook_line(cmd: &Command) -> String {
     )
 }
 
+/// One landed `post-receive` line for a diverted command the hook
+/// accepted: the review ref it reported, with the hook-supplied OIDs when
+/// it sent `option old-oid` / `option new-oid`, else the pushed OIDs.
+fn alternate_line(alternate: &AlternateRef, old: Oid, new: Oid) -> String {
+    format!(
+        "{} {} {}\n",
+        alternate.old_oid.unwrap_or(old).to_hex(),
+        alternate.new_oid.unwrap_or(new).to_hex(),
+        String::from_utf8_lossy(&alternate.refname),
+    )
+}
+
 /// Runs the AGit diversion for surviving proc-receive commands: accepted
 /// commands report `ok` for their original ref (the review backend wrote
 /// the review ref itself), refused ones report `ng`, and fall-through
 /// commands rejoin the normal path through the `update` hook, leaving
 /// their verdict undecided for the CAS path below.
+///
+/// Accepted review refs accumulate in `alternates` as `(command index,
+/// review ref)` pairs so `post-receive` observes the hook-supplied
+/// refname and OIDs, mirroring the oracle's use of the hook's `ref_name`.
 fn run_proc_receive_phase(
     live: &[(usize, PushUpdate)],
     results: &mut [Option<Result<(), String>>],
+    alternates: &mut Vec<(usize, AlternateRef)>,
     hooks: &ReceiveHooks,
     quarantine: Option<&Quarantine>,
     options: &PushOptions<'_>,
@@ -434,7 +454,12 @@ fn run_proc_receive_phase(
     for (position, verdict) in verdicts.into_iter().enumerate() {
         let index = indices[position];
         match verdict {
-            ProcVerdict::Accepted { .. } => results[index] = Some(Ok(())),
+            ProcVerdict::Accepted { alternate } => {
+                results[index] = Some(Ok(()));
+                if let Some(alternate) = alternate {
+                    alternates.push((index, alternate));
+                }
+            }
             ProcVerdict::Rejected { reason } => results[index] = Some(Err(reason)),
             ProcVerdict::FallThrough => {}
         }
@@ -449,7 +474,15 @@ fn run_proc_receive_phase(
             update.old.to_hex(),
             update.new.to_hex(),
         ];
-        if let Some(reason) = run_hook(hooks, quarantine, "update", &args, None, options.values) {
+        if let Some(reason) = run_hook(
+            hooks,
+            quarantine,
+            "update",
+            &args,
+            None,
+            options.values,
+            options.negotiated,
+        ) {
             results[*index] = Some(Err(reason));
         }
     }
@@ -468,6 +501,12 @@ fn run_proc_receive_phase(
 /// [`serve_receive_pack_with`] to enable quarantine staging with
 /// `pre-receive`/`update`/`post-receive` execution.
 ///
+/// `lfs` is the store's pointer policy: under [`LfsMode::Deny`] a push
+/// whose new-tip closure introduces a pointer blob refuses exactly those
+/// ref updates with an `ng` line, the way hook refusals report in-band.
+/// Under [`LfsMode::Pointers`] pointer bytes land plainly, which is what
+/// ingest already does.
+///
 /// # Errors
 /// [`GitError::Corrupt`] for grammar violations, [`GitError::ObjectFormat`]
 /// for store/kind mismatch or foreign OIDs, plus ingest, verification,
@@ -479,6 +518,7 @@ pub fn serve_receive_pack<R: Read, W: Write>(
     kind: HashKind,
     head: &HeadAdvertisement,
     interrupt: &Interrupt,
+    lfs: LfsMode,
 ) -> Result<(), GitError> {
     serve_receive_pack_with(
         reader,
@@ -488,6 +528,7 @@ pub fn serve_receive_pack<R: Read, W: Write>(
         head,
         interrupt,
         &ReceiveHooks::disabled(),
+        lfs,
     )
 }
 
@@ -518,6 +559,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     head: &HeadAdvertisement,
     interrupt: &Interrupt,
     hooks: &ReceiveHooks,
+    lfs: LfsMode,
 ) -> Result<(), GitError> {
     if store.hash_kind() != kind {
         return Err(GitError::ObjectFormat {
@@ -622,6 +664,29 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             }
         }
     }
+    // LFS policy gate over what the pack introduces: under `Deny` a
+    // pointer blob refuses exactly the live ref updates reaching it, with
+    // the same in-band `ng` shape as hook refusals. This runs before
+    // quarantine staging, so refused pushes never materialize.
+    if staged.is_some() {
+        let live_tips: Vec<(usize, Oid)> = live
+            .iter()
+            .map(|(index, update)| (*index, update.new))
+            .collect();
+        let staged_pack = staged.as_ref().expect("pack was ingested above");
+        match refusals_for_live(store, staged_pack, kind, lfs, &live_tips, interrupt) {
+            Ok(refusals) => {
+                for (index, reason) in refusals {
+                    results[index] = Some(Err(reason));
+                }
+            }
+            Err(err) => {
+                let reason = sanitize(&err.to_string());
+                send_report(&mut writer, Some(&reason), &all_ng(&commands, &reason))?;
+                return Err(err);
+            }
+        }
+    }
     // Quarantine staging for hook inspection. A materialization failure is
     // infrastructure, not a hook verdict: every ref reports `ng` and the
     // error propagates, with the unpack line still `ok`.
@@ -646,6 +711,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         &[],
         Some(all_lines.as_bytes()),
         &push_options,
+        client_push_options,
     ) {
         for (index, _) in &live {
             results[*index] = Some(Err(reason.clone()));
@@ -675,6 +741,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             &args,
             None,
             &push_options,
+            client_push_options,
         ) {
             results[*index] = Some(Err(reason));
         }
@@ -694,6 +761,8 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     // AGit diversion runs only outside `atomic`: consulting the hook could
     // create a review the client is then told failed, and atomicity across
     // a review backend is out of scope, so atomic rejects everything first.
+    // Accepted review refs collect here for the `post-receive` lines below.
+    let mut alternates: Vec<(usize, AlternateRef)> = Vec::new();
     if atomic {
         for (index, _) in &live {
             if results[*index].is_none() {
@@ -708,6 +777,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         run_proc_receive_phase(
             &live,
             &mut results,
+            &mut alternates,
             hooks,
             quarantine.as_ref(),
             &options,
@@ -750,11 +820,18 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     }
     // `post-receive` over the landed refs, after refs are updated. Its
     // failure relays to server diagnostics and never fails the push:
-    // protocol v0's report has no sideband slot for it.
+    // protocol v0's report has no sideband slot for it. Diverted commands
+    // the hook accepted arrive under their review ref: the hook performed
+    // the write itself, so the landed line names the hook-supplied refname
+    // (with the hook-supplied OIDs when present), not the original
+    // `refs/for/` name.
     let landed: String = live
         .iter()
         .filter(|(index, _)| matches!(results[*index], Some(Ok(()))))
-        .map(|(_, update)| {
+        .map(|(index, update)| {
+            if let Some((_, alternate)) = alternates.iter().find(|(i, _)| i == index) {
+                return alternate_line(alternate, update.old, update.new);
+            }
             let cmd = commands
                 .iter()
                 .find(|cmd| cmd.name == update.name)
@@ -770,6 +847,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             &[],
             Some(landed.as_bytes()),
             &push_options,
+            client_push_options,
         ) {
             tracing::warn!("post-receive hook failed: {reason}");
         }
@@ -1093,6 +1171,7 @@ mod tests {
             kind,
             &head(),
             &Interrupt::none(),
+            LfsMode::Deny,
         )
         .expect("serve");
         let lines = report_lines(&out);
@@ -1124,6 +1203,7 @@ mod tests {
             kind,
             &head(),
             &Interrupt::none(),
+            LfsMode::Deny,
         )
         .expect("serve");
         let lines = report_lines(&out);
@@ -1157,6 +1237,7 @@ mod tests {
             kind,
             &head(),
             &Interrupt::none(),
+            LfsMode::Deny,
         )
         .expect("serve reports rejections in-band");
         let lines = report_lines(&out);
@@ -1190,6 +1271,7 @@ mod tests {
             kind,
             &head(),
             &Interrupt::none(),
+            LfsMode::Deny,
         )
         .expect_err("garbage pack");
         assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
@@ -1199,6 +1281,116 @@ mod tests {
             lines[1].starts_with(b"ng refs/heads/main "),
             "got {:?}",
             lines[1]
+        );
+    }
+
+    const POINTER_BLOB: &[u8] = b"version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d0b46e9c\nsize 14\n";
+
+    /// A source store holding one commit whose tree carries a Git LFS
+    /// pointer blob, returning the commit tip.
+    fn pointer_tip(src: &Store, kind: HashKind) -> Oid {
+        use ruk_core::store::types::ObjectKind;
+        let blob = src
+            .prepare(
+                ObjectKind::Blob,
+                POINTER_BLOB.len() as u64,
+                &POINTER_BLOB[..],
+                None,
+            )
+            .expect("pointer blob");
+        let blob_oid = blob.oid();
+        let mut tree = b"100644 asset.bin\0".to_vec();
+        tree.extend_from_slice(blob_oid.as_bytes());
+        let tree_oid = kind.hash_git_object("tree", &tree).expect("tree id");
+        let tree_prepared = src
+            .prepare(ObjectKind::Tree, tree.len() as u64, &tree[..], None)
+            .expect("tree");
+        assert_eq!(tree_prepared.oid(), tree_oid);
+        let commit = format!(
+            "tree {}\nauthor T <t@example.invalid> 0 +0000\ncommitter T <t@example.invalid> 0 +0000\n\npointer\n",
+            tree_oid.to_hex()
+        );
+        let commit_prepared = src
+            .prepare(
+                ObjectKind::Commit,
+                commit.len() as u64,
+                commit.as_bytes(),
+                None,
+            )
+            .expect("commit");
+        let tip = commit_prepared.oid();
+        src.publish(vec![blob, tree_prepared, commit_prepared], &[])
+            .expect("publish pointer commit");
+        tip
+    }
+
+    fn serve_push_with_mode(
+        dest: &Store,
+        kind: HashKind,
+        pack: &[u8],
+        new: Oid,
+        mode: LfsMode,
+    ) -> Vec<Vec<u8>> {
+        let mut input = command(
+            kind.zero_oid(),
+            new,
+            b"refs/heads/main",
+            Some("report-status delete-refs ofs-delta agent=test"),
+        );
+        input.extend_from_slice(b"0000");
+        input.extend_from_slice(pack);
+        let mut out = Vec::new();
+        serve_receive_pack_with(
+            &input[..],
+            &mut out,
+            dest,
+            kind,
+            &head(),
+            &Interrupt::none(),
+            &ReceiveHooks::disabled(),
+            mode,
+        )
+        .expect("serve reports refusals in-band");
+        report_lines(&out)
+    }
+
+    #[test]
+    fn receive_refuses_pointer_push_under_deny() {
+        let kind = HashKind::Sha1;
+        let src = test_store(kind);
+        let tip = pointer_tip(&src, kind);
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), tip, b"refs/heads/main");
+        let lines = serve_push_with_mode(&dest, kind, &pack, tip, LfsMode::Deny);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"unpack ok");
+        assert!(
+            lines[1].starts_with(b"ng refs/heads/main "),
+            "got {:?}",
+            lines[1]
+        );
+        assert!(
+            String::from_utf8_lossy(&lines[1]).contains("E_UNSUPPORTED_LFS"),
+            "the refusal names the policy code: got {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn receive_records_pointer_bytes_under_pointers_mode() {
+        let kind = HashKind::Sha1;
+        let src = test_store(kind);
+        let tip = pointer_tip(&src, kind);
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), tip, b"refs/heads/main");
+        let lines = serve_push_with_mode(&dest, kind, &pack, tip, LfsMode::Pointers);
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert!(
+            super::super::has_object(&dest, tip).expect("pointer commit landed"),
+            "pointers mode records the bytes plainly"
         );
     }
 
@@ -1271,6 +1463,7 @@ mod tests {
             &head(),
             &Interrupt::none(),
             hooks,
+            LfsMode::Deny,
         )
         .expect("serve completes refused pushes in-band");
         report_lines(&out)
@@ -1382,6 +1575,93 @@ printf '0000'
         assert!(
             !seen.contains("refs/heads/main"),
             "hook saw a normal ref: {seen:?}"
+        );
+    }
+
+    /// `post-receive` observes the hook-supplied review ref for a diverted
+    /// command the hook accepted, not the original `refs/for/` name: the
+    /// hook sent `option refname` plus `option new-oid`, so the landed
+    /// line carries both (with the pushed old OID, which the hook did not
+    /// override).
+    #[test]
+    fn agit_post_receive_observes_review_ref() {
+        use std::time::Duration;
+
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let cmds_marker = repo.join("proc-commands");
+        write_proc_receive_stub(&repo, &cmds_marker, ok_with_review_ref());
+        let post_marker = repo.join("post-lines");
+        write_hook(
+            &repo,
+            "post-receive",
+            &format!("cat > \"{}\"\n", post_marker.display()),
+        );
+        let hooks = ReceiveHooks::for_repo(repo).with_timeout(Duration::from_secs(10));
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_raw(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/for/main")],
+            "report-status delete-refs ofs-delta agent=test",
+            &[],
+            &pack,
+            &hooks,
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/for/main".to_vec(),]
+        );
+        let seen = std::fs::read_to_string(&post_marker).expect("post-receive ran");
+        assert_eq!(
+            seen,
+            format!(
+                "{} {} refs/pull/1/head\n",
+                kind.zero_oid().to_hex(),
+                oid(FOUR).to_hex()
+            ),
+            "post-receive missed the review ref: {seen:?}"
+        );
+    }
+
+    /// `GIT_PUSH_OPTION_COUNT` is exported only when the client negotiated
+    /// `push-options`: this push carries no such capability, so the hook
+    /// must observe neither the count nor any option.
+    #[test]
+    fn push_option_count_absent_without_negotiation() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let marker = repo.join("push-option-count");
+        write_hook(
+            &repo,
+            "pre-receive",
+            &format!(
+                "echo \"COUNT=${{GIT_PUSH_OPTION_COUNT-unset}}\" > \"{}\"\n",
+                marker.display()
+            ),
+        );
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ReceiveHooks::for_repo(repo),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        let seen = std::fs::read_to_string(&marker).expect("hook ran");
+        assert!(
+            seen.contains("COUNT=unset"),
+            "unnegotiated push exported a count: {seen:?}"
         );
     }
 
@@ -1806,7 +2086,17 @@ pub fn serve_command<R: Read, W: Write>(
 ) -> Result<(), GitError> {
     match name {
         "upload-pack" => serve_upload_pack(reader, writer, store, kind, head, interrupt),
-        "receive-pack" => serve_receive_pack(reader, writer, store, kind, head, interrupt),
+        // No repository directory travels with a bare command dispatch, so
+        // no policy file is readable: fail closed to pointer refusal.
+        "receive-pack" => serve_receive_pack(
+            reader,
+            writer,
+            store,
+            kind,
+            head,
+            interrupt,
+            LfsMode::Deny,
+        ),
         "upload-archive" => {
             super::archive::serve_upload_archive(reader, writer, store, kind, head, interrupt)
         }

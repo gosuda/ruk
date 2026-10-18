@@ -274,8 +274,10 @@ fn write_loose(objects: &Path, hex: &str, type_name: &str, payload: &[u8]) -> Re
 /// `Some(reason)` when it refuses.
 ///
 /// `push_options` reaches the hook as `GIT_PUSH_OPTION_COUNT` plus
-/// `GIT_PUSH_OPTION_<i>`, mirroring the oracle's `run_receive_hook`
-/// environment. Spawn failures and timeouts refuse fail-closed with an
+/// `GIT_PUSH_OPTION_<i>` only when the client negotiated `push-options`,
+/// mirroring the oracle's `run_receive_hook` environment (which exports
+/// nothing when the capability was not negotiated, not even a zero
+/// count). Spawn failures and timeouts refuse fail-closed with an
 /// explanatory reason; they never pass silently and never abort the
 /// protocol with an error (the refusal travels in-band as `ng` lines,
 /// like any hook decline). Direct exec, never a shell: `args` cannot
@@ -287,6 +289,7 @@ pub(crate) fn run_hook(
     args: &[String],
     stdin: Option<&[u8]>,
     push_options: &[String],
+    negotiated: bool,
 ) -> Option<String> {
     let repo_dir = hooks.repo_dir.as_deref()?;
     let path = hooks.hook_path(name)?;
@@ -303,6 +306,7 @@ pub(crate) fn run_hook(
         args,
         stdin,
         push_options,
+        negotiated,
         hooks.timeout,
     ) {
         Ok(Outcome::Pass) => None,
@@ -315,14 +319,16 @@ pub(crate) fn run_hook(
 /// repository directory, and the client's push options.
 ///
 /// One constructor so every phase (`pre-receive`, `update`,
-/// `post-receive`, `proc-receive`) exports identical variables. `COUNT`
-/// is always present, matching the oracle, which exports the bare name
-/// when the client sent no options.
+/// `post-receive`, `proc-receive`) exports identical variables.
+/// `GIT_PUSH_OPTION_COUNT` (plus `GIT_PUSH_OPTION_<i>`) is exported only
+/// when the client negotiated `push-options`, matching the oracle: an
+/// unnegotiated push exports neither the count nor any option.
 pub(crate) fn apply_hook_env(
     cmd: &mut Command,
     repo_dir: &Path,
     quarantine: Option<&Quarantine>,
     push_options: &[String],
+    negotiated: bool,
 ) {
     if let Some(q) = quarantine {
         cmd.env("GIT_QUARANTINE_PATH", q.dir());
@@ -330,9 +336,11 @@ pub(crate) fn apply_hook_env(
         cmd.env("RUK_QUARANTINE_MANIFEST", q.manifest());
     }
     cmd.env("GIT_DIR", repo_dir);
-    cmd.env("GIT_PUSH_OPTION_COUNT", push_options.len().to_string());
-    for (index, option) in push_options.iter().enumerate() {
-        cmd.env(format!("GIT_PUSH_OPTION_{index}"), option);
+    if negotiated {
+        cmd.env("GIT_PUSH_OPTION_COUNT", push_options.len().to_string());
+        for (index, option) in push_options.iter().enumerate() {
+            cmd.env(format!("GIT_PUSH_OPTION_{index}"), option);
+        }
     }
 }
 
@@ -366,12 +374,13 @@ fn execute(
     args: &[String],
     stdin_bytes: Option<&[u8]>,
     push_options: &[String],
+    negotiated: bool,
     timeout: Duration,
 ) -> Result<Outcome, GitError> {
     let mut cmd = Command::new(path);
     cmd.args(args);
     cmd.current_dir(repo_dir);
-    apply_hook_env(&mut cmd, repo_dir, quarantine, push_options);
+    apply_hook_env(&mut cmd, repo_dir, quarantine, push_options, negotiated);
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
