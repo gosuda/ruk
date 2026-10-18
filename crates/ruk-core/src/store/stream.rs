@@ -34,7 +34,6 @@
 //! count toward the same I/O counters; stopped streams count only the
 //! metadata lookup.
 
-use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::atomic::Ordering;
 
@@ -42,10 +41,12 @@ use zstd::stream::read::Decoder;
 
 use super::delta::{IO_CHUNK, apply_delta, classify_read};
 use super::error::StoreError;
-use super::segment::{RecordPayload, segment_file_name};
+use super::segment::{PreadReader, RecordPayload};
 use super::spool::to_u64;
 use super::types::{Encoding, ObjectKind, ReadObject};
-use super::{SEGMENTS_DIR, Store};
+use super::Store;
+#[cfg(test)]
+use super::SEGMENTS_DIR;
 use crate::ids::{HashKind, Oid};
 
 /// Largest window any accepted frame may need: zstd level 3 uses
@@ -173,20 +174,11 @@ impl Store {
                     location.offset, location.record_len, manifest.id, manifest.records_end
                 ))
             })?;
-        let file = File::open(
-            self.root
-                .join(SEGMENTS_DIR)
-                .join(segment_file_name(location.segment)),
-        )
-        .map_err(|err| {
-            if err.kind() == io::ErrorKind::NotFound {
-                corrupt(format!("committed segment {} is missing", location.segment))
-            } else {
-                StoreError::Io(err)
-            }
-        })?;
+        // The cached read-only handle: positional reads keep the shared
+        // cursor untouched, so concurrent streams stay independent.
+        let file = committed.open_committed(location.segment)?;
         let mut payload = RecordPayload::open(
-            BufReader::with_capacity(IO_CHUNK, file),
+            BufReader::with_capacity(IO_CHUNK, PreadReader::new(&file)),
             location.offset,
             manifest.records_end,
         )?;
@@ -271,13 +263,13 @@ impl Store {
 /// What one per-encoding pump proved: the full record with its payload and
 /// consumed stored-byte count, or a clean callback stop with nothing left
 /// to verify.
-enum Step {
-    Complete(StoredPayload, u64),
+enum Step<'a> {
+    Complete(StoredPayload<'a>, u64),
     Stopped,
 }
 
 /// One stored record positioned for decoding.
-type StoredPayload = RecordPayload<BufReader<File>>;
+type StoredPayload<'a> = RecordPayload<BufReader<PreadReader<'a>>>;
 
 /// Identity of the streaming target, shared by the per-encoding pumps.
 struct StreamTarget {
@@ -342,11 +334,11 @@ fn sink_pump(sink: &mut ChunkSink<'_>, err: StoreError) -> Result<Pump, StoreErr
     Err(err)
 }
 
-fn sink_step(
+fn sink_step<'a>(
     sink: &mut ChunkSink<'_>,
     target: &StreamTarget,
     err: StoreError,
-) -> Result<Step, StoreError> {
+) -> Result<Step<'a>, StoreError> {
     if let Some(failure) = sink.failure.take() {
         return Err(failure);
     }
@@ -520,13 +512,13 @@ impl<R: Read> Read for FrameReader<R> {
 /// Mirrors the preparation decoder's exact copy.
 /// Pumps one raw record: the stored bytes are the decoded bytes, so the
 /// lengths must agree before the first byte moves.
-fn pump_raw(
-    mut payload: StoredPayload,
+fn pump_raw<'p>(
+    mut payload: StoredPayload<'p>,
     sink: &mut ChunkSink<'_>,
     chunk: &mut [u8],
     target: &StreamTarget,
     encoded_len: u64,
-) -> Result<Step, StoreError> {
+) -> Result<Step<'p>, StoreError> {
     if encoded_len != target.decoded_len {
         return Err(corrupt(format!(
             "raw payload of {encoded_len} bytes declares {} decoded bytes",
@@ -540,12 +532,12 @@ fn pump_raw(
 }
 
 /// Pumps one zstd record through a single capped frame.
-fn pump_zstd(
-    payload: StoredPayload,
+fn pump_zstd<'p>(
+    payload: StoredPayload<'p>,
     sink: &mut ChunkSink<'_>,
     chunk: &mut [u8],
     target: &StreamTarget,
-) -> Result<Step, StoreError> {
+) -> Result<Step<'p>, StoreError> {
     let mut frame = FrameReader::over(Counted::new(payload))?;
     match copy_to_chunks(&mut frame, sink, chunk, target, "zstd payload")? {
         Pump::Complete => {
@@ -559,14 +551,14 @@ fn pump_zstd(
 /// Pumps one delta record over its decoded base. The base is the only
 /// object-sized allocation the stream holds; the target itself is never
 /// stored.
-fn pump_delta(
-    payload: StoredPayload,
+fn pump_delta<'p>(
+    payload: StoredPayload<'p>,
     sink: &mut ChunkSink<'_>,
     base: Option<&ReadObject>,
     target: &StreamTarget,
     hash_kind: HashKind,
     base_oid: Oid,
-) -> Result<Step, StoreError> {
+) -> Result<Step<'p>, StoreError> {
     let Some(base_object) = base else {
         return Err(corrupt("delta record without a decoded base"));
     };
