@@ -1285,11 +1285,12 @@ fn read_seal_footer_at(file: &File, records_end: u64) -> Result<SealFooter, Segm
     let mut raw = [0_u8; FOOTER_LEN];
     let mut filled = 0_usize;
     while filled < FOOTER_LEN {
-        let offset = records_end + u64::try_from(filled).map_err(|_| {
-            SegmentError::Capacity(format!(
-                "seal footer read offset {filled} exceeds the addressable length"
-            ))
-        })?;
+        let offset = records_end
+            + u64::try_from(filled).map_err(|_| {
+                SegmentError::Capacity(format!(
+                    "seal footer read offset {filled} exceeds the addressable length"
+                ))
+            })?;
         let read = read_at(file, &mut raw[filled..], offset).map_err(SegmentError::from)?;
         if read == 0 {
             return Err(corrupt(format!(

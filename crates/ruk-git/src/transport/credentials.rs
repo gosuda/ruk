@@ -61,7 +61,9 @@ fn credential_parts(url: &str) -> Option<(String, String)> {
     } else {
         match hostport.rsplit_once(':') {
             Some((host, port))
-                if !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+                if !host.is_empty()
+                    && !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit()) =>
             {
                 host
             }
@@ -143,7 +145,10 @@ fn config_paths() -> Vec<PathBuf> {
 /// Splits a `[name "subsection"]` header into its lowercase section name and
 /// optional subsection. A malformed header matches nothing.
 fn parse_section_header(line: &str) -> (String, Option<String>) {
-    let Some(inner) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) else {
+    let Some(inner) = line
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
         return (String::new(), None);
     };
     let inner = inner.trim();
@@ -407,8 +412,7 @@ pub fn credential_fill(url: &str) -> Option<(String, String)> {
 /// spelling [`super::http`] uses for its env header; duplicated so this
 /// module needs no visibility into that private helper).
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let mut word: u32 = 0;
@@ -455,10 +459,7 @@ pub fn auth_header_for_url_with(
 /// An `Authorization` header for `url` through the live helpers, then the
 /// environment.
 #[must_use]
-pub fn auth_header_for_url(
-    url: &str,
-    vars: &HashMap<String, String>,
-) -> Option<(String, String)> {
+pub fn auth_header_for_url(url: &str, vars: &HashMap<String, String>) -> Option<(String, String)> {
     let helpers = helper_commands(url);
     if helpers.is_empty() {
         return http::git_auth_header(vars);
@@ -503,7 +504,10 @@ mod tests {
     fn fill_skips_refusals_for_the_next_helper() {
         let out = credential_fill_with(
             "https://host.x/a",
-            &[external_helper("/bin/first"), external_helper("/bin/second")],
+            &[
+                external_helper("/bin/first"),
+                external_helper("/bin/second"),
+            ],
             |program, _, _| {
                 if program == "/bin/second" {
                     return Some(b"username=bob\npassword=\n".to_vec());
@@ -525,13 +529,19 @@ mod tests {
             None
         );
         assert_eq!(
-            credential_fill_with("https://host.x/a", &[external_helper("/bin/helper")], |_, _, _| None),
+            credential_fill_with(
+                "https://host.x/a",
+                &[external_helper("/bin/helper")],
+                |_, _, _| None
+            ),
             None
         );
         assert_eq!(
-            credential_fill_with("ftp://host.x/a", &[external_helper("/bin/helper")], |_, _, _| Some(
-                b"username=a\npassword=b\n".to_vec()
-            )),
+            credential_fill_with(
+                "ftp://host.x/a",
+                &[external_helper("/bin/helper")],
+                |_, _, _| Some(b"username=a\npassword=b\n".to_vec())
+            ),
             None
         );
     }
@@ -544,11 +554,19 @@ mod tests {
         // File order, not scoped-first: git appends in config read order,
         // so the top-level helper answers before the scoped one.
         let chain = helper_commands_for("https://host.x/sub/a", &entries);
-        assert_eq!(chain, vec![external_helper("/bin/top"), external_helper("/bin/scoped")]);
+        assert_eq!(
+            chain,
+            vec![external_helper("/bin/top"), external_helper("/bin/scoped")]
+        );
         let other = helper_commands_for("https://elsewhere.x/a", &entries);
         assert_eq!(other, vec![external_helper("/bin/top")]);
-        let reset = parse_config_entries("[credential]\n\thelper = /bin/a\n\thelper =\n\thelper = /bin/b\n");
-        assert_eq!(helper_commands_for("https://host.x/a", &reset), vec![external_helper("/bin/b")]);
+        let reset = parse_config_entries(
+            "[credential]\n\thelper = /bin/a\n\thelper =\n\thelper = /bin/b\n",
+        );
+        assert_eq!(
+            helper_commands_for("https://host.x/a", &reset),
+            vec![external_helper("/bin/b")]
+        );
     }
 
     #[test]
@@ -561,7 +579,12 @@ mod tests {
         assert!(!scope_matches("https://host", "https://hostile.x/a"));
         assert!(!scope_matches("", "https://host.x/a"));
         assert_eq!(classify_helper("~/bin/helper --flag"), {
-            let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("bin/helper").to_string_lossy().into_owned());
+            let home = std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join("bin/helper")
+                    .to_string_lossy()
+                    .into_owned()
+            });
             home.map(|program| (program, vec!["--flag".to_owned()]))
         });
     }
@@ -614,7 +637,11 @@ mod tests {
     #[test]
     fn helper_attempts_are_time_bounded() {
         let started = Instant::now();
-        let out = run_helper("/bin/sleep", &["30".to_owned()], b"protocol=https\nhost=h\n\n");
+        let out = run_helper(
+            "/bin/sleep",
+            &["30".to_owned()],
+            b"protocol=https\nhost=h\n\n",
+        );
         assert_eq!(out, None);
         assert!(
             started.elapsed() < HELPER_TIMEOUT + Duration::from_secs(5),

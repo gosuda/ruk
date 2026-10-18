@@ -1536,9 +1536,8 @@ fn concurrent_validation_matches_sequential_on_large_extents() {
     )
     .expect("sequential validates");
     let file = File::open(&scratch.0).expect("open shared");
-    let concurrent =
-        validate_segment_file_concurrent(&file, sealed_end, records_end, true)
-            .expect("concurrent validates");
+    let concurrent = validate_segment_file_concurrent(&file, sealed_end, records_end, true)
+        .expect("concurrent validates");
     assert_eq!(concurrent.records_crc, sequential.records_crc);
     assert_eq!(concurrent.file_len, sequential.file_len);
 
@@ -1555,7 +1554,10 @@ fn concurrent_validation_matches_sequential_on_large_extents() {
     std::fs::write(&scratch.0, &damaged).expect("write damaged");
     let file = File::open(&scratch.0).expect("open damaged");
     let concurrent_detail = corrupt_detail(validate_segment_file_concurrent(
-        &file, sealed_end, records_end, true,
+        &file,
+        sealed_end,
+        records_end,
+        true,
     ));
     assert_eq!(concurrent_detail, sequential_detail);
 
@@ -1573,7 +1575,10 @@ fn concurrent_validation_matches_sequential_on_large_extents() {
     std::fs::write(&scratch.0, &twice).expect("write twice damaged");
     let file = File::open(&scratch.0).expect("open twice damaged");
     let concurrent_detail = corrupt_detail(validate_segment_file_concurrent(
-        &file, sealed_end, records_end, true,
+        &file,
+        sealed_end,
+        records_end,
+        true,
     ));
     assert_eq!(concurrent_detail, sequential_detail);
     assert!(

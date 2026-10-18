@@ -34,8 +34,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::store::types::ObjectKind;
 use ruk_core::store::Store;
+use ruk_core::store::types::ObjectKind;
 
 use super::credentials;
 use super::fetch::{FetchWireRequest, ReceivedPack};
@@ -149,7 +149,9 @@ pub fn parse_dumb_info_refs(body: &[u8], kind: HashKind) -> Result<Vec<Advertise
             .split_once(['\t', ' '])
             .ok_or_else(|| corrupt(format!("dumb info/refs line without a separator: {line:?}")))?;
         if name.is_empty() {
-            return Err(corrupt(format!("dumb info/refs line without a name: {line:?}")));
+            return Err(corrupt(format!(
+                "dumb info/refs line without a name: {line:?}"
+            )));
         }
         let oid = parse_oid_for(hex, kind).map_err(|err| match err {
             GitError::ObjectFormat { detail } => GitError::ObjectFormat { detail },
@@ -157,7 +159,9 @@ pub fn parse_dumb_info_refs(body: &[u8], kind: HashKind) -> Result<Vec<Advertise
         })?;
         if let Some(base) = name.strip_suffix("^{}") {
             let Some(&index) = by_name.get(base.as_bytes()) else {
-                return Err(corrupt(format!("dumb info/refs peel without its ref: {line:?}")));
+                return Err(corrupt(format!(
+                    "dumb info/refs peel without its ref: {line:?}"
+                )));
             };
             if refs[index].peeled.is_some() {
                 return Err(corrupt(format!("dumb info/refs repeats a peel: {line:?}")));
@@ -246,12 +250,16 @@ fn decode_loose(raw: &[u8]) -> Result<(ObjectKind, Vec<u8>), GitError> {
     let body = framed[nul + 1..].to_vec();
     let header = std::str::from_utf8(&framed[..nul])
         .map_err(|_| corrupt("dumb loose object header is not UTF-8"))?;
-    let (type_name, len_text) = header
-        .split_once(' ')
-        .ok_or_else(|| corrupt(format!("dumb loose object header without a length: {header:?}")))?;
-    let declared: usize = len_text
-        .parse()
-        .map_err(|_| corrupt(format!("dumb loose object length is not a number: {header:?}")))?;
+    let (type_name, len_text) = header.split_once(' ').ok_or_else(|| {
+        corrupt(format!(
+            "dumb loose object header without a length: {header:?}"
+        ))
+    })?;
+    let declared: usize = len_text.parse().map_err(|_| {
+        corrupt(format!(
+            "dumb loose object length is not a number: {header:?}"
+        ))
+    })?;
     if declared != body.len() {
         return Err(corrupt(format!(
             "dumb loose object declares {declared} bytes but carries {}",
@@ -263,7 +271,11 @@ fn decode_loose(raw: &[u8]) -> Result<(ObjectKind, Vec<u8>), GitError> {
         "tree" => ObjectKind::Tree,
         "blob" => ObjectKind::Blob,
         "tag" => ObjectKind::Tag,
-        _ => return Err(corrupt(format!("dumb loose object has no git type: {type_name:?}"))),
+        _ => {
+            return Err(corrupt(format!(
+                "dumb loose object has no git type: {type_name:?}"
+            )));
+        }
     };
     Ok((kind, body))
 }
@@ -343,7 +355,9 @@ fn collect_pack_objects(
     for name in &names {
         interrupt.check("listing dumb-http packs")?;
         let Some(bytes) = fetch_pack_file(base, name, limits.max_pack_bytes)? else {
-            warnings.push(format!("dumb-http pack {name} vanished; fetching loose instead"));
+            warnings.push(format!(
+                "dumb-http pack {name} vanished; fetching loose instead"
+            ));
             continue;
         };
         let staged = ingest_pack(std::io::Cursor::new(bytes), kind, store, limits, interrupt)?;
@@ -404,7 +418,10 @@ pub fn fetch_pack(
         }
         if seen.len() > max_objects {
             return Err(GitError::Limit {
-                detail: format!("dumb-http closure holds more than {} objects", limits.max_objects),
+                detail: format!(
+                    "dumb-http closure holds more than {} objects",
+                    limits.max_objects
+                ),
             });
         }
         if has_object(store, oid)? {
@@ -508,7 +525,8 @@ mod tests {
 
     #[test]
     fn pack_list_parses_only_pack_lines() {
-        let body = b"P pack-abc123.pack\nP pack-def456.pack\n\n# comment\nP not-a-pack.idx\n".to_vec();
+        let body =
+            b"P pack-abc123.pack\nP pack-def456.pack\n\n# comment\nP not-a-pack.idx\n".to_vec();
         let names = pack_names(&body);
         assert_eq!(names, vec!["pack-abc123.pack", "pack-def456.pack"]);
         assert!(pack_names(b"\n").is_empty());
@@ -517,10 +535,8 @@ mod tests {
     #[test]
     fn loose_round_trips_through_zlib_framing() {
         let payload = b"hello dumb".to_vec();
-        let mut encoder = flate2::write::ZlibEncoder::new(
-            Vec::new(),
-            flate2::Compression::default(),
-        );
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
             .write_all(format!("blob {}\0", payload.len()).as_bytes())
             .expect("header");
@@ -610,26 +626,23 @@ mod tests {
                 ObjectKind::Tag => "tag",
                 ObjectKind::Conflict => "blob",
             };
-            let mut encoder = flate2::write::ZlibEncoder::new(
-                Vec::new(),
-                flate2::Compression::default(),
-            );
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             encoder
                 .write_all(format!("{type_name} {}\0", bytes.len()).as_bytes())
                 .expect("header");
             encoder.write_all(&bytes).expect("body");
-            return (200, "application/octet-stream", encoder.finish().expect("finish"));
+            return (
+                200,
+                "application/octet-stream",
+                encoder.finish().expect("finish"),
+            );
         }
         (404, "text/plain", b"no such route".to_vec())
     }
 
     /// Writes one HTTP/1.1 response with `Content-Length`.
-    fn write_response(
-        socket: std::net::TcpStream,
-        status: u16,
-        content_type: &str,
-        body: &[u8],
-    ) {
+    fn write_response(socket: std::net::TcpStream, status: u16, content_type: &str, body: &[u8]) {
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
@@ -687,10 +700,14 @@ mod tests {
             change: RefChange::Set(ruk_core::refdata::RefTarget::Direct(tip)),
             name: RefName::new(b"refs/heads/main".to_vec()).expect("ref name"),
         };
-        let prepared =
-            prepare_checked_transaction(&server, &RefTransaction::new(kind, vec![update]).expect("tx"))
-                .expect("prepare");
-        server.publish(Vec::new(), &prepared.into_mutations()).expect("publish");
+        let prepared = prepare_checked_transaction(
+            &server,
+            &RefTransaction::new(kind, vec![update]).expect("tx"),
+        )
+        .expect("prepare");
+        server
+            .publish(Vec::new(), &prepared.into_mutations())
+            .expect("publish");
 
         // One discovery GET, one pack-list GET, then one GET per closure
         // object: the server answers from its own store, so any miscount
@@ -713,11 +730,24 @@ mod tests {
             list_refs: false,
             ref_prefixes: Vec::new(),
         };
-        let received = fetch_pack(&base, &dest, &req, IngestLimits::default(), &Interrupt::none())
-            .expect("fetch");
+        let received = fetch_pack(
+            &base,
+            &dest,
+            &req,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("fetch");
         assert!(received.warnings.is_empty());
-        verify_closure(&dest, &received.staged, &[tip], None, &[], &Interrupt::none())
-            .expect("closure");
+        verify_closure(
+            &dest,
+            &received.staged,
+            &[tip],
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("closure");
         publish_fetch(&dest, received.staged, &[]).expect("publish");
         assert!(dest.read(tip).is_ok());
         handle.join().expect("server");
@@ -738,10 +768,14 @@ mod tests {
             change: RefChange::Set(ruk_core::refdata::RefTarget::Direct(tip)),
             name: RefName::new(b"refs/heads/main".to_vec()).expect("ref name"),
         };
-        let prepared =
-            prepare_checked_transaction(&server, &RefTransaction::new(kind, vec![update]).expect("tx"))
-                .expect("prepare");
-        server.publish(Vec::new(), &prepared.into_mutations()).expect("publish");
+        let prepared = prepare_checked_transaction(
+            &server,
+            &RefTransaction::new(kind, vec![update]).expect("tx"),
+        )
+        .expect("prepare");
+        server
+            .publish(Vec::new(), &prepared.into_mutations())
+            .expect("publish");
 
         // Dumb servers negotiate nothing: the filter and depth requests
         // warn and the fetch covers complete history anyway. Publication is
@@ -760,11 +794,24 @@ mod tests {
             list_refs: false,
             ref_prefixes: Vec::new(),
         };
-        let received = fetch_pack(&base, &dest, &req, IngestLimits::default(), &Interrupt::none())
-            .expect("fetch");
+        let received = fetch_pack(
+            &base,
+            &dest,
+            &req,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("fetch");
         assert_eq!(received.warnings.len(), 2);
-        verify_closure(&dest, &received.staged, &[tip], None, &[], &Interrupt::none())
-            .expect("closure");
+        verify_closure(
+            &dest,
+            &received.staged,
+            &[tip],
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("closure");
         publish_fetch(&dest, received.staged, &[]).expect("publish");
         assert!(dest.read(tip).is_ok());
         handle.join().expect("server");

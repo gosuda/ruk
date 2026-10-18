@@ -177,9 +177,7 @@ pub fn request_headers_with(
         .iter()
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
-    if let Some((name, value)) =
-        credentials::auth_header_for_url_with(url, vars, helpers, runner)
-    {
+    if let Some((name, value)) = credentials::auth_header_for_url_with(url, vars, helpers, runner) {
         out.push((name, value));
     }
     out
@@ -359,10 +357,13 @@ pub fn fetch_pack(
     let url = rpc_url(base, SmartService::UploadPack);
     let request_type = SmartService::UploadPack.request_type();
     let result_type = SmartService::UploadPack.result_type();
-    let owned = live_headers(&url, &[
-        ("Content-Type", request_type.as_str()),
-        ("Accept", result_type.as_str()),
-    ]);
+    let owned = live_headers(
+        &url,
+        &[
+            ("Content-Type", request_type.as_str()),
+            ("Accept", result_type.as_str()),
+        ],
+    );
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
     check_status(&url, status)?;
     if http::header(&reply, "content-type") != Some(SmartService::UploadPack.result_type().as_str())
@@ -607,10 +608,13 @@ fn push_pack_inner(
     let url = rpc_url(base, SmartService::ReceivePack);
     let request_type = SmartService::ReceivePack.request_type();
     let result_type = SmartService::ReceivePack.result_type();
-    let owned = live_headers(&url, &[
-        ("Content-Type", request_type.as_str()),
-        ("Accept", result_type.as_str()),
-    ]);
+    let owned = live_headers(
+        &url,
+        &[
+            ("Content-Type", request_type.as_str()),
+            ("Accept", result_type.as_str()),
+        ],
+    );
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
     check_status(&url, status)?;
     if http::header(&reply, "content-type")
@@ -722,10 +726,7 @@ pub fn fetch_archive(
     }
     if first != b"ACK" {
         return Err(GitError::Corrupt {
-            detail: format!(
-                "{url}: upload-archive answered {}",
-                first.escape_ascii()
-            ),
+            detail: format!("{url}: upload-archive answered {}", first.escape_ascii()),
         });
     }
     match pkt.read_packet()? {
@@ -826,8 +827,14 @@ mod tests {
             vec![("authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned())]
         );
         assert!(
-            request_headers_with("https://host.x/a.git", &HashMap::new(), &[], &[], |_, _, _| None)
-                .is_empty()
+            request_headers_with(
+                "https://host.x/a.git",
+                &HashMap::new(),
+                &[],
+                &[],
+                |_, _, _| None
+            )
+            .is_empty()
         );
     }
 
@@ -835,16 +842,16 @@ mod tests {
     fn helper_answer_wins_over_the_environment() {
         let helpers = vec![("/bin/helper".to_owned(), Vec::new())];
         let vars = HashMap::from([("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned())]);
-        let headers = request_headers_with(
-            "https://host.x/a.git",
-            &vars,
-            &[],
-            &helpers,
-            |_, _, _| Some(b"username=alice\npassword=s3cret\n".to_vec()),
-        );
+        let headers =
+            request_headers_with("https://host.x/a.git", &vars, &[], &helpers, |_, _, _| {
+                Some(b"username=alice\npassword=s3cret\n".to_vec())
+            });
         assert_eq!(
             headers,
-            vec![("authorization".to_owned(), "Basic YWxpY2U6czNjcmV0".to_owned())]
+            vec![(
+                "authorization".to_owned(),
+                "Basic YWxpY2U6czNjcmV0".to_owned()
+            )]
         );
     }
 
@@ -1242,10 +1249,7 @@ mod tests {
 
     #[test]
     fn archive_shapes_match_the_service() {
-        assert_eq!(
-            SmartService::UploadArchive.name(),
-            "git-upload-archive"
-        );
+        assert_eq!(SmartService::UploadArchive.name(), "git-upload-archive");
         assert_eq!(
             SmartService::UploadArchive.advertisement_type(),
             "application/x-git-upload-archive-advertisement"

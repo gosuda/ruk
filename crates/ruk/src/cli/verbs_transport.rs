@@ -207,9 +207,7 @@ pub(crate) fn run_fetch(
                         let advertised = net::to_local_refs(adv.refs.clone())?;
                         (FetchSource::Http { base, adv }, advertised)
                     }
-                    Err(err)
-                        if ruk_git::transport::dumb_http::is_dumb_gap(&err) =>
-                    {
+                    Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
                         let adv = ruk_git::transport::dumb_http::discover(&base, dest_kind)?;
                         let advertised = net::to_local_refs(adv.refs.clone())?;
                         (FetchSource::DumbHttp { base }, advertised)
