@@ -4,7 +4,7 @@
 //! | --- | --- | --- |
 //! | `init` | `Store::create` + workspace row + unborn `HEAD` | implemented |
 //! | `clone` | `Store::create` + `session::local_fetch` + ref copy | implemented for local paths; network sources are `Offline` |
-//! | `migrate` | `Store::create` + `import::import_repository` + workspace row | implemented; worktree checkout, config conversion, and hooks are out of scope |
+//! | `migrate` | `Store::create` + `import::import_repository` + workspace row | implemented; carries `remote.*.url/fetch` over, worktree checkout, remaining config conversion, and hooks are out of scope |
 //! | `config` | `Pins` records under `cli/config/` | implemented, `--local` scope only |
 //! | `remote` | `remote.<name>.*` config records | implemented, plus `update [--prune]` over configured refspecs (mirror parity) |
 //! | `worktree` | absent workcopy lane | unsupported |
@@ -12,6 +12,7 @@
 //! Oracle anchors: `git/builtin/init-db.c`, `git/builtin/clone.c`,
 //! `git/builtin/config.c`, `git/builtin/remote.c`, `git/builtin/worktree.c`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ruk_core::change::OperationId;
@@ -315,7 +316,9 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
 ///
 /// Objects publish in bounded batches and refs only in the final batch, so
 /// a mid-import failure may leave a partial `.ruk`: retry with `--force`.
-/// Worktree checkout, config conversion, and hooks are out of scope.
+/// `remote.<name>.url` / `remote.<name>.fetch` carry over so migrated
+/// clones keep their origin; the rest of config conversion, worktree
+/// checkout, and hooks are out of scope.
 pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -402,6 +405,7 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
     store
         .publish(Vec::new(), &[mutation])
         .map_err(GitError::from)?;
+    import_remote_config(&git_dir, &store)?;
     Ok(format!(
         "Migrated {} objects and {} refs from {} [{kind}]\n",
         report.objects,
@@ -409,6 +413,132 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
         git_dir.display(),
     )
     .into_bytes())
+}
+
+/// Copies `remote.<name>.url` and the first `remote.<name>.fetch` line for
+/// each remote from the source Git config into the fresh store, so a
+/// migrated clone keeps its origin for `fetch`/`push`/`ls-remote`. A missing
+/// config file means no remotes and is not an error; the rest of config
+/// conversion stays out of scope with worktree checkout and hooks.
+fn import_remote_config(git_dir: &std::path::Path, store: &Store) -> Result<(), GitError> {
+    let path = git_dir.join("config");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(GitError::Io {
+                detail: format!("reading {}: {err}", path.display()),
+            });
+        }
+    };
+    let mut section: Option<String> = None;
+    let mut urls: HashMap<String, String> = HashMap::new();
+    let mut fetches: HashMap<String, String> = HashMap::new();
+    for raw in String::from_utf8_lossy(&bytes).lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(next) = parse_config_section(line) {
+            section = next;
+            continue;
+        }
+        let Some(name) = section.as_ref() else {
+            continue;
+        };
+        let Some((key, value)) = parse_config_entry(line) else {
+            continue;
+        };
+        if key == "url" {
+            urls.insert(name.clone(), value);
+            continue;
+        }
+        if key == "fetch" {
+            fetches.entry(name.clone()).or_insert(value);
+        }
+    }
+    for (name, url) in &urls {
+        config_write(store, &format!("remote.{name}.url"), url)?;
+    }
+    for (name, fetch) in &fetches {
+        if urls.contains_key(name) {
+            config_write(store, &format!("remote.{name}.fetch"), fetch)?;
+        }
+    }
+    Ok(())
+}
+
+/// Parses a `[remote "<name>"]` header: `Some(Some(name))` for remote
+/// sections, `Some(None)` for any other section, `None` when the line is
+/// not a section header at all.
+fn parse_config_section(line: &str) -> Option<Option<String>> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let (head, tail) = match inner.find([' ', '\t']) {
+        Some(at) => (inner[..at].to_owned(), inner[at..].trim()),
+        None => (inner.to_owned(), ""),
+    };
+    if !head.eq_ignore_ascii_case("remote") {
+        return Some(None);
+    }
+    Some(unquote_config_value(tail))
+}
+
+/// Splits one `key = value` entry: lowercased key plus unquoted value with
+/// any trailing comment stripped. Returns `None` for bare keys and lines
+/// without `=`.
+fn parse_config_entry(line: &str) -> Option<(String, String)> {
+    let (key, raw) = line.split_once('=')?;
+    let key = key.trim().to_lowercase();
+    if key.is_empty() || key.contains([' ', '\t']) {
+        return None;
+    }
+    let value = strip_config_comment(raw.trim()).trim().to_owned();
+    Some((key, unquote_config_value(&value).unwrap_or(value)))
+}
+
+/// Strips a trailing `;` / `#` comment started outside quotes.
+fn strip_config_comment(raw: &str) -> &str {
+    let mut quoted = false;
+    let mut prev = ' ';
+    for (at, ch) in raw.char_indices() {
+        if ch == '"' && prev != '\\' {
+            quoted = !quoted;
+        }
+        if !quoted && (ch == '#' || ch == ';') && (prev == ' ' || prev == '\t') {
+            return raw[..at].trim_end();
+        }
+        prev = ch;
+    }
+    raw
+}
+
+/// Unquotes one config token, resolving `\"`, `\\`, `\n`, and `\t`.
+/// Returns `None` when the token is not a well-formed quoted string.
+fn unquote_config_value(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            None => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{08}'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Maps a migrate source argument to the Git directory it names: a
