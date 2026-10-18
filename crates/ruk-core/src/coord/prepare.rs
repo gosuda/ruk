@@ -660,6 +660,20 @@ fn unpin_parts(
     })
 }
 
+/// Prepares `attest.add` through [`prepare_add`], returning its mutations
+/// with exact fact expectations so row publication stays compare-and-swap
+/// safe.
+///
+/// Subject-lease invariant: this arm stages no lease over the attested
+/// subject, so a collection mark running in the prepare-to-submit window
+/// could condemn an otherwise unrooted subject before the batch commits in
+/// lane order. That window is inert today — the only `begin_mark` callers
+/// are the `leases`/`barrier` unit tests; no collector runs against a live
+/// lane — which is why staging nothing is sound. Once a collector exists,
+/// prepare must acquire a subject lease from the lane registry and the
+/// prepared mutation must carry it to submit; the `PreparedMutation` shape
+/// has no field for that guard yet, so the collector wiring must add the
+/// carriage, not just the mark.
 fn attest_add_parts(
     ctx: &PrepareContext<'_>,
     request_id: RequestId,
