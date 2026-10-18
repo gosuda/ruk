@@ -85,7 +85,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | rm | implemented | `--cached`, `-r`; unknown paths fail |
 | show | implemented | `--oneline`, `-s`, `--stat`, `--name-only`, parent diff |
 | show-ref | implemented | `--head`, `--verify`, `--tags`, `--heads`, patterns |
-| stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; apply requires a clean index on the stashed base |
+| stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; oracle two-commit shape (index + `WIP` parents); apply requires a clean index on the stashed base |
 | status | implemented | `--porcelain`, `--short`, `--branch`, long format; renames undetected |
 | switch | implemented | `-c`/`-C`, `--detach`, remote guess |
 | symbolic-ref | implemented | `HEAD` moves the workspace row; other names are ref symrefs |
@@ -107,7 +107,9 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 - `diff` hunks come from a simple bounded LCS differ, split every 20
   operations; large inputs are labeled omissions, never silent truncation.
 - `status` and `diff` do not detect renames.
-- `stash apply`/`pop` require a clean index on the stashed base instead of
-  merging; dropped slots leave numbering gaps.
+- `stash apply`/`pop` require a clean index on the stashed base and a clean
+  worktree on the restored paths instead of merging; the index rows come
+  back only with `--index` (`stash branch` always restores them); dropped
+  slots leave numbering gaps.
 - `rev-list` order is ancestry-discovery order, not date order.
 - `fetch`/`push`/`clone`/`pull`/`ls-remote` route local paths only.

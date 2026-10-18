@@ -26,7 +26,7 @@ use ruk_core::commit::CommitRecord;
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::index::{IndexEntry, IndexFlags, RepoPath, Stage};
+use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::ops::{NewRequest, new as ops_new};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::{ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog};
@@ -2855,8 +2855,8 @@ pub(crate) fn stash(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: Some('q'),
             takes_value: false,
         },
-        // Accepted: restoring the index rows already is the `--index`
-        // behavior, the only apply mode this store has.
+        // Accepted: `apply`/`pop` restore the index rows only with `--index`;
+        // without it the worktree alone comes back, like the oracle.
         FlagSpec {
             long: "index",
             short: None,
@@ -2925,10 +2925,14 @@ pub(crate) fn stash(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         [sub, slot] if sub == "show" => stash_show(ctx, Some(parse_slot(slot)?)),
         [sub] if sub == "drop" => hush_result(stash_drop_slot(ctx, 0), quiet),
         [sub, slot] if sub == "drop" => hush_result(stash_drop_slot(ctx, parse_slot(slot)?), quiet),
-        [sub] if sub == "pop" => hush_result(stash_pop(ctx, 0), quiet),
-        [sub, slot] if sub == "pop" => hush_result(stash_pop(ctx, parse_slot(slot)?), quiet),
-        [sub] if sub == "apply" => hush_result(stash_apply(ctx, 0), quiet),
-        [sub, slot] if sub == "apply" => hush_result(stash_apply(ctx, parse_slot(slot)?), quiet),
+        [sub] if sub == "pop" => hush_result(stash_pop_scoped(ctx, 0, &opts), quiet),
+        [sub, slot] if sub == "pop" => {
+            hush_result(stash_pop_scoped(ctx, parse_slot(slot)?, &opts), quiet)
+        }
+        [sub] if sub == "apply" => hush_result(stash_apply_scoped(ctx, 0, &opts), quiet),
+        [sub, slot] if sub == "apply" => {
+            hush_result(stash_apply_scoped(ctx, parse_slot(slot)?, &opts), quiet)
+        }
         [sub] if sub == "clear" => stash_clear(ctx),
         [sub, name] if sub == "branch" => hush_result(stash_branch(ctx, name, 0), quiet),
         [sub, name, slot] if sub == "branch" => {
@@ -2982,22 +2986,25 @@ fn stash_branch(ctx: &Ctx, name: &str, slot: u64) -> Result<Vec<u8>, GitError> {
     }
     create_branch(store, kind, name, base)?;
     switch_head_to(ctx, HeadRef::Symbolic(branch_name(name)?))?;
-    stash_apply(ctx, slot)?;
+    stash_apply_with_index(ctx, slot)?;
     stash_drop(store, slot)?;
     repoint_stash_ref(ctx)?;
     Ok(format!("Switched to a new branch '{name}'\n").into_bytes())
 }
 
-/// Records the current index in a stash commit and resets the index.
+/// Records the index and worktree in oracle-shaped stash commits, then
+/// resets both to `HEAD`.
+///
+/// Oracle: `git/builtin/stash.c` (`do_push_stash`). A push mints two
+/// commits: an index commit (`tree` = index state, parent = `HEAD`,
+/// subject `index on <branch>: <short> <subject>`) and a worktree commit
+/// (`tree` = worktree state, parents = [`HEAD`, index commit], subject
+/// `On <branch>: <msg>` or `WIP on ...`). `refs/stash` points at the
+/// worktree commit, whose oid the later `Dropped` line names.
 fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let rows = scan_index(store, kind)?;
-    if rows.is_empty() {
-        return Err(GitError::Invalid {
-            detail: "no local changes to save".to_owned(),
-        });
-    }
     for (_, stage, _) in &rows {
         if *stage != Stage::Zero {
             return Err(GitError::Invalid {
@@ -3005,54 +3012,71 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
             });
         }
     }
-    let base = head_oid(store).ok();
-    let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
+    let Some(tip) = head_oid(store).ok() else {
+        return Err(GitError::Invalid {
+            detail: "You do not have the initial commit yet".to_owned(),
+        });
+    };
+    let head_record = super::state::commit_record(store, tip)?;
+    let head_tree = commit_tree_oid(&head_record)?;
+    let head_body = head_record.message();
+    let head_end = head_body
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(head_body.len());
+    let head_subject = String::from_utf8_lossy(&head_body[..head_end]).into_owned();
+    let head_short: String = tip.to_hex().chars().take(7).collect();
+    let index_tree = build_index_tree(store, kind, &merged_rows(&rows))?;
+    let (worktree_rows, blobs) = worktree_overlay_rows(ctx, store, kind, &rows)?;
+    if !blobs.is_empty() {
+        store.publish(blobs, &[]).map_err(GitError::from)?;
+    }
+    let worktree_tree = build_index_tree(store, kind, &worktree_rows)?;
+    if index_tree == head_tree && worktree_tree == head_tree {
+        return Ok(b"No local changes to save\n".to_vec());
+    }
     let branch = stash_branch_label(store)?;
-    // The slot subject doubles as the stash commit message, the way the
+    // The slot subject doubles as the worktree commit message, the way the
     // oracle records `On <branch>: <msg>` (or `WIP on ...` without `-m`).
     let message = match opts.single("message")? {
         Some(given) => format!("On {branch}: {given}"),
-        None => {
-            let Some(tip) = base else {
-                return Err(GitError::Invalid {
-                    detail: "You do not have the initial commit yet".to_owned(),
-                });
-            };
-            let record = super::state::commit_record(store, tip)?;
-            let body = record.message();
-            let end = body
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .unwrap_or(body.len());
-            format!(
-                "WIP on {branch}: {} {}",
-                tip.to_hex().chars().take(7).collect::<String>(),
-                String::from_utf8_lossy(&body[..end])
-            )
-        }
+        None => format!("WIP on {branch}: {head_short} {head_subject}"),
     };
+    let index_message = format!("index on {branch}: {head_short} {head_subject}");
     let author = super::state::identity(ctx, super::state::IdentityRole::Author)?;
     let committer = super::state::identity(ctx, super::state::IdentityRole::Committer)?;
-    let parents = base
-        .map(|tip| vec![Head::Git { oid: tip }])
-        .unwrap_or_default();
-    let request = NewRequest {
-        tree,
-        parents,
-        author,
-        committer,
-        message: ruk_core::ByteString::from(message.as_str()),
-        change_id: None,
-        predecessor: None,
-        provenance: None,
-    };
-    let result = ops_new(store, request).map_err(GitError::from)?;
-    let commit_oid = result
-        .oid
-        .or_else(|| result.head.as_git().copied())
-        .ok_or_else(|| GitError::Invalid {
-            detail: "stash commit has no git identity".to_owned(),
-        })?;
+    let base_heads = vec![Head::Git { oid: tip }];
+    // Commit payloads carry the message verbatim. The oracle ends its index
+    // message with a newline but leaves the worktree subject bare; the slot
+    // subject matches the latter for `list` and the `Saved` line.
+    let index_oid = mint_stash_commit(
+        store,
+        NewRequest {
+            tree: index_tree,
+            parents: base_heads.clone(),
+            author: author.clone(),
+            committer: committer.clone(),
+            message: ruk_core::ByteString::from(format!("{index_message}\n").as_str()),
+            change_id: None,
+            predecessor: None,
+            provenance: None,
+        },
+    )?;
+    let mut wip_parents = base_heads;
+    wip_parents.push(Head::Git { oid: index_oid });
+    let commit_oid = mint_stash_commit(
+        store,
+        NewRequest {
+            tree: worktree_tree,
+            parents: wip_parents,
+            author,
+            committer,
+            message: ruk_core::ByteString::from(message.as_str()),
+            change_id: None,
+            predecessor: None,
+            provenance: None,
+        },
+    )?;
     let slot = stash_alloc(store)?;
     let slot_rows: Vec<(Vec<u8>, Stage, IndexEntry)> = rows
         .iter()
@@ -3063,7 +3087,7 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
         slot,
         &StashSlot {
             message: message.clone(),
-            base_hex: base.map(|tip| tip.to_hex()).unwrap_or_default(),
+            base_hex: tip.to_hex(),
             commit_hex: commit_oid.to_hex(),
             rows: slot_rows,
         },
@@ -3083,15 +3107,234 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     // `--keep-index` records the slot without resetting, leaving the
     // stashed changes staged the way the oracle does.
     if !opts.is_set("keep-index") {
-        match base {
-            Some(tip) => {
-                let record = super::state::commit_record(store, tip)?;
-                reset_index_tree(ctx, commit_tree_oid(&record)?)?;
-            }
-            None => clear_index(ctx)?,
-        }
+        reset_index_tree(ctx, head_tree)?;
+        let indexed: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|(path, _, _)| path.as_bytes().to_vec())
+            .collect();
+        checkout_tree_files(ctx, store, kind, head_tree, &indexed)?;
     }
     Ok(format!("Saved working directory and index state {message}\n").into_bytes())
+}
+
+/// Mints one stash commit through the shared exportable path (no
+/// `change-id` header, so oids match the oracle byte-for-byte) and returns
+/// its object id.
+fn mint_stash_commit(store: &Store, request: NewRequest) -> Result<Oid, GitError> {
+    let result = ops_new(store, request).map_err(GitError::from)?;
+    result
+        .oid
+        .or_else(|| result.head.as_git().copied())
+        .ok_or_else(|| GitError::Invalid {
+            detail: "stash commit has no git identity".to_owned(),
+        })
+}
+
+/// Builds `(path, entry)` rows for the stash worktree tree: the tracked
+/// index rows with every on-disk file's bytes re-hashed, so unstaged edits
+/// land in the `WIP` commit the way the oracle records them. Files missing
+/// from disk drop out (staged deletions); gitlinks keep their index entry;
+/// untracked files are never read. Returns the rows plus the newly staged
+/// blob objects for the caller to publish.
+fn worktree_overlay_rows(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    rows: &[(RepoPath, Stage, IndexEntry)],
+) -> Result<
+    (
+        Vec<(Vec<u8>, IndexEntry)>,
+        Vec<ruk_core::store::PreparedObject>,
+    ),
+    GitError,
+> {
+    let mut out = Vec::new();
+    let mut objects = Vec::new();
+    for (path, stage, entry) in rows {
+        if *stage != Stage::Zero {
+            continue;
+        }
+        if entry.mode() == FileMode::Gitlink {
+            out.push((path.as_bytes().to_vec(), entry.clone()));
+            continue;
+        }
+        let full = join_base(&ctx.file_base, path.as_bytes())?;
+        let meta = match std::fs::symlink_metadata(&full) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(GitError::Io {
+                    detail: format!("statting {}: {err}", full.display()),
+                });
+            }
+        };
+        if meta.file_type().is_dir() {
+            continue;
+        }
+        let (mode, bytes) = if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&full).map_err(|err| GitError::Io {
+                detail: format!("reading link {}: {err}", full.display()),
+            })?;
+            (
+                FileMode::Symlink,
+                target.as_os_str().as_encoded_bytes().to_vec(),
+            )
+        } else {
+            let bytes = std::fs::read(&full).map_err(|err| GitError::Io {
+                detail: format!("reading {}: {err}", full.display()),
+            })?;
+            (super::verbs_stage::file_mode_of(&meta), bytes)
+        };
+        let hashed = IndexEntry::for_blob(kind, mode, &bytes, None)
+            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        let len = u64::try_from(bytes.len()).map_err(|_| GitError::Limit {
+            detail: format!(
+                "file {} exceeds the length range",
+                String::from_utf8_lossy(path.as_bytes())
+            ),
+        })?;
+        let prepared = store
+            .prepare(
+                ruk_core::store::types::ObjectKind::Blob,
+                len,
+                std::io::Cursor::new(bytes),
+                None,
+            )
+            .map_err(GitError::from)?;
+        objects.push(prepared);
+        out.push((path.as_bytes().to_vec(), hashed));
+    }
+    Ok((out, objects))
+}
+
+/// Refuses a restore whose `WIP` tree would overwrite unsaved worktree
+/// edits. A path passes when it is missing on disk, already holds the
+/// `WIP` bytes (re-apply), or still holds the base bytes (clean restore);
+/// anything else — including an untracked file where the stash adds one —
+/// errors instead of clobbering, the way the oracle refuses an overwriting
+/// merge.
+fn refuse_worktree_overwrite(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    tree: Oid,
+    base_paths: &[(Vec<u8>, FileMode, Oid)],
+) -> Result<(), GitError> {
+    let mut wip: std::collections::BTreeMap<Vec<u8>, Oid> = std::collections::BTreeMap::new();
+    for (path, _, oid) in flatten_tree(store, kind, tree)? {
+        wip.insert(path, oid);
+    }
+    let mut base: std::collections::BTreeMap<Vec<u8>, Oid> = std::collections::BTreeMap::new();
+    for (path, _, oid) in base_paths {
+        base.insert(path.clone(), *oid);
+    }
+    let mut union: Vec<&Vec<u8>> = wip.keys().collect();
+    for path in base.keys() {
+        if !wip.contains_key(path.as_slice()) {
+            union.push(path);
+        }
+    }
+    let mut blocked = Vec::new();
+    for path in union {
+        let full = join_base(&ctx.file_base, path)?;
+        let disk = match std::fs::symlink_metadata(&full) {
+            Ok(meta) if meta.file_type().is_dir() => None,
+            Ok(meta) if meta.file_type().is_symlink() => std::fs::read_link(&full)
+                .ok()
+                .map(|target| target.as_os_str().as_encoded_bytes().to_vec()),
+            Ok(_) => std::fs::read(&full).ok(),
+            Err(_) => None,
+        };
+        let Some(disk) = disk else {
+            // Missing on disk, or a directory where the stash names a file:
+            // the checkout recreates the first and fails loudly on the
+            // second, so neither silently loses edits.
+            if std::fs::symlink_metadata(&full).is_ok() {
+                blocked.push(String::from_utf8_lossy(path).into_owned());
+            }
+            continue;
+        };
+        let matches = |oid: Option<&Oid>| {
+            oid.is_some_and(|want| {
+                read_object_bytes(store, *want)
+                    .ok()
+                    .is_some_and(|(_, body)| body == disk)
+            })
+        };
+        if !matches(wip.get(path)) && !matches(base.get(path)) {
+            blocked.push(String::from_utf8_lossy(path).into_owned());
+        }
+    }
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    blocked.sort();
+    Err(GitError::Invalid {
+        detail: format!(
+            "worktree has changes; stash apply needs a clean worktree: {}",
+            blocked.join(", ")
+        ),
+    })
+}
+
+/// Writes every path of `tree` into the worktree and deletes the `extra`
+/// paths missing from it. Only `tree` members and `extra` entries are ever
+/// touched: untracked files stay. Callers pass the paths the old index or
+/// `HEAD` named, so a push resets the worktree to `HEAD` and an apply
+/// restores the `WIP` tree including its deletions.
+fn checkout_tree_files(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    tree: Oid,
+    extra: &[Vec<u8>],
+) -> Result<(), GitError> {
+    let mut wanted: std::collections::BTreeMap<Vec<u8>, (FileMode, Oid)> =
+        std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, tree)? {
+        wanted.insert(path, (mode, oid));
+    }
+    for (path, (mode, oid)) in &wanted {
+        let full = join_base(&ctx.file_base, path)?;
+        if *mode == FileMode::Gitlink {
+            continue;
+        }
+        if *mode == FileMode::Symlink {
+            create_worktree_link(store, *oid, &full)?;
+            continue;
+        }
+        let (_, body) = read_object_bytes(store, *oid)?;
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
+                detail: format!("creating {}: {err}", parent.display()),
+            })?;
+        }
+        std::fs::write(&full, body).map_err(|err| GitError::Io {
+            detail: format!("writing {}: {err}", full.display()),
+        })?;
+        #[cfg(unix)]
+        if *mode == FileMode::Executable {
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&full, permissions).map_err(|err| GitError::Io {
+                detail: format!("chmod {}: {err}", full.display()),
+            })?;
+        }
+    }
+    for raw in extra {
+        if wanted.contains_key(raw) {
+            continue;
+        }
+        let Ok(full) = join_base(&ctx.file_base, raw) else {
+            continue;
+        };
+        if full.is_symlink() || full.is_file() {
+            std::fs::remove_file(&full).map_err(|err| GitError::Io {
+                detail: format!("removing {}: {err}", full.display()),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Names the stashed branch shortened, `(no branch)` when detached, for
@@ -3106,24 +3349,6 @@ fn stash_branch_label(store: &Store) -> Result<String, GitError> {
             .to_owned()),
         HeadRef::Detached(_) => Ok("(no branch)".to_owned()),
     }
-}
-
-/// Empties every index row, for stashes on an unborn branch.
-fn clear_index(ctx: &Ctx) -> Result<(), GitError> {
-    let store = ctx.store()?;
-    let kind = ctx.kind()?;
-    let (workspace, raw) = load_or_default(store)?;
-    let mut mutations = Vec::new();
-    for (path, _, _) in scan_index(store, kind)? {
-        let before = read_path_rows(store, kind, &path)?;
-        mutations.extend(path_row_mutations(&path, &before, &[])?);
-    }
-    let next = workspace.mutate_index(workspace.stamp)?;
-    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-    store
-        .publish(Vec::new(), &mutations)
-        .map_err(GitError::from)?;
-    Ok(())
 }
 
 /// Lists every live stash slot in number order.
@@ -3221,8 +3446,57 @@ fn live_slots(store: &Store) -> Result<Vec<u64>, GitError> {
     Ok(out)
 }
 
-/// Restores one slot's index rows, requiring `HEAD` and a clean index.
+/// Whether a stash restore also brings back the stashed index rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexRestore {
+    /// Worktree files only, like `apply`/`pop` without `--index`: a stashed
+    /// staged change comes back unstaged.
+    Worktree,
+    /// Worktree files plus index rows (`--index`, `stash branch`).
+    WorktreeAndIndex,
+}
+
+/// Dispatches `apply` on the parsed `--index` flag to its named entry point.
+fn stash_apply_scoped(
+    ctx: &Ctx,
+    slot: u64,
+    opts: &super::Collected,
+) -> Result<Vec<u8>, GitError> {
+    if opts.is_set("index") {
+        stash_apply_with_index(ctx, slot)
+    } else {
+        stash_apply(ctx, slot)
+    }
+}
+
+/// Dispatches `pop` on the parsed `--index` flag to its named entry point.
+fn stash_pop_scoped(ctx: &Ctx, slot: u64, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    if opts.is_set("index") {
+        stash_pop_with_index(ctx, slot)
+    } else {
+        stash_pop(ctx, slot)
+    }
+}
+
+/// Restores one slot's worktree files, requiring `HEAD` and a clean index
+/// on the stashed base.
 fn stash_apply(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
+    stash_restore(ctx, slot, IndexRestore::Worktree)
+}
+
+/// Restores one slot's worktree files and its index rows, requiring `HEAD`
+/// and a clean index on the stashed base.
+fn stash_apply_with_index(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
+    stash_restore(ctx, slot, IndexRestore::WorktreeAndIndex)
+}
+
+/// Restores one slot's worktree files from its `WIP` commit, and its index
+/// rows too under [`IndexRestore::WorktreeAndIndex`].
+///
+/// Oracle: `git/builtin/stash.c` (`do_apply_stash`). Without `--index` the
+/// oracle leaves the index on the base, so a stashed staged change comes
+/// back unstaged; `stash branch` always restores the index.
+fn stash_restore(ctx: &Ctx, slot: u64, scope: IndexRestore) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {
@@ -3268,6 +3542,48 @@ fn stash_apply(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
             });
         }
     }
+    let commit_oid = ruk_git::parse_oid_for(&entry.commit_hex, kind)?;
+    let record = super::state::commit_record(store, commit_oid)?;
+    let tree = commit_tree_oid(&record)?;
+    let base_paths = if entry.base_hex.is_empty() {
+        Vec::new()
+    } else {
+        let base_oid = ruk_git::parse_oid_for(&entry.base_hex, kind)?;
+        let base_record = super::state::commit_record(store, base_oid)?;
+        flatten_tree(store, kind, commit_tree_oid(&base_record)?)?
+    };
+    // Restore the worktree from the `WIP` tree. Paths the stash deletes come
+    // back out through the base-tree and current-index extras; anything else
+    // on disk (untracked files) stays.
+    let mut extra: Vec<Vec<u8>> = Vec::new();
+    for (path, _, _) in &base_paths {
+        if !extra.iter().any(|known| known.as_slice() == path.as_slice()) {
+            extra.push(path.clone());
+        }
+    }
+    for (path, stage, _) in &current {
+        if *stage == Stage::Zero && !extra.iter().any(|known| known.as_slice() == path.as_bytes())
+        {
+            extra.push(path.as_bytes().to_vec());
+        }
+    }
+    refuse_worktree_overwrite(ctx, store, kind, tree, &base_paths)?;
+    checkout_tree_files(ctx, store, kind, tree, &extra)?;
+    if scope == IndexRestore::WorktreeAndIndex {
+        restore_stash_index(store, kind, &current, &entry)?;
+    }
+    let plan = super::verbs_stage::status_plan(ctx, store, kind)?;
+    let branch = super::verbs_stage::long_branch_label(store)?;
+    Ok(super::verbs_stage::render_long(store, &branch, &plan))
+}
+
+/// Writes one slot's recorded index rows back into the index.
+fn restore_stash_index(
+    store: &Store,
+    kind: HashKind,
+    current: &[(RepoPath, Stage, IndexEntry)],
+    entry: &StashSlot,
+) -> Result<(), GitError> {
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     let mut union: Vec<RepoPath> = current.iter().map(|(path, _, _)| path.clone()).collect();
@@ -3293,15 +3609,25 @@ fn stash_apply(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     store
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;
-    let plan = super::verbs_stage::status_plan(ctx, store, kind)?;
-    let branch = super::verbs_stage::long_branch_label(store)?;
-    Ok(super::verbs_stage::render_long(store, &branch, &plan))
+    Ok(())
 }
 
 /// Applies one slot and drops it, reporting the worktree status plus the
 /// `Dropped refs/stash@{n} (<oid>)` line like the oracle.
 fn stash_pop(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
-    stash_apply(ctx, slot)?;
+    stash_pop_inner(ctx, slot, IndexRestore::Worktree)
+}
+
+/// Applies one slot with its index rows and drops it, reporting the
+/// worktree status plus the `Dropped` line like `pop --index`.
+fn stash_pop_with_index(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
+    stash_pop_inner(ctx, slot, IndexRestore::WorktreeAndIndex)
+}
+
+/// Applies one slot under `scope` and drops it, reporting the worktree
+/// status plus the `Dropped refs/stash@{n} (<oid>)` line like the oracle.
+fn stash_pop_inner(ctx: &Ctx, slot: u64, scope: IndexRestore) -> Result<Vec<u8>, GitError> {
+    stash_restore(ctx, slot, scope)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {

@@ -214,7 +214,7 @@ fn stage_bytes(
 }
 
 /// Derives the index mode from worktree metadata.
-fn file_mode_of(meta: &std::fs::Metadata) -> FileMode {
+pub(crate) fn file_mode_of(meta: &std::fs::Metadata) -> FileMode {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
