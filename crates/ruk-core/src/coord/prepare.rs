@@ -118,7 +118,7 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
-    ClaimAcquireReply, ClaimRecord,     ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
+    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
     EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, LandPrepareArgs,
     LandPrepareReply, MutationOutcome,
     NewArgs, NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,

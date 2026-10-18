@@ -624,7 +624,7 @@ pub fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::read (op.log, claim.list, attest.list first pages served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
-            "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, land.prepare mutations covered; the rest name their missing preparation)"
+            "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, split, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, resolve, revert, undo, land.prepare mutations covered; the rest name their missing preparation)"
         }
     }
 }
