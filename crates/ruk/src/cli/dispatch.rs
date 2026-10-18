@@ -8,6 +8,7 @@
 use ruk_git::GitError;
 
 use super::verbs_branch;
+use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_meta;
 use super::verbs_objects;
@@ -157,6 +158,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Cleanup unnecessary files and optimize the local repository",
         run: verbs_transport::gc,
+    },
+    Verb {
+        name: "grep",
+        oracle: "git/builtin/grep.c",
+        needs_repo: true,
+        summary: "Print lines matching a pattern",
+        run: verbs_grep::grep,
     },
     Verb {
         name: "hash-object",

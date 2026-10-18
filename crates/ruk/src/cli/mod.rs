@@ -3,7 +3,7 @@
 //! This module owns argv parsing in the `git.c` tradition (verb first, global
 //! options before the verb, `ruk <verb> --help` rewriting) and the shared
 //! per-command context over the native store. Every verb is a separate
-//! function in one `verbs_*` module; [`dispatch`] maps the 56 advertised
+//! function in one `verbs_*` module; [`dispatch`] maps the 59 advertised
 //! names to those functions the way `git.c`'s `commands[]` table maps names
 //! to `cmd_*` entry points.
 //!
@@ -27,6 +27,7 @@ pub(crate) mod dispatch;
 pub(crate) mod state;
 pub(crate) mod tree;
 pub(crate) mod verbs_branch;
+pub(crate) mod verbs_grep;
 pub(crate) mod verbs_history;
 pub(crate) mod verbs_meta;
 pub(crate) mod verbs_objects;
