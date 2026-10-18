@@ -116,3 +116,106 @@ fn count(summary: &mut UndoSummary, table: FactTable) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::change::{CheckedOperationId, SessionId};
+    use crate::coord::oplog::{self, OpMeta};
+    use crate::ids::HashKind;
+    use crate::protocol::Timestamp;
+    use crate::store::PreparationBudget;
+
+    struct Fixture {
+        root: std::path::PathBuf,
+        store: Store,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "ruk-undo-test-{}-{}-{tag}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = Store::create(
+                &root,
+                HashKind::Sha1,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create test store");
+            Self { root, store }
+        }
+
+        /// Records one operation over `changes` and publishes its log entry.
+        fn record(&self, method: Method, changes: &[FactMutation]) -> OperationId {
+            let mut ops = CheckedOperationId::new(0, u64::MAX);
+            let meta = OpMeta {
+                session: SessionId::generate(),
+                method,
+                committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+                undoes: None,
+            };
+            let (id, mutations) = oplog::record(&mut ops, None, meta, changes)
+                .expect("record operation")
+                .expect("tracked change recorded");
+            self.store
+                .publish(Vec::new(), &mutations)
+                .expect("publish operation");
+            id
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn ref_set(key: &[u8], value: &[u8]) -> FactMutation {
+        FactMutation {
+            table: FactTable::Refs,
+            key: key.to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(value.to_vec()),
+        }
+    }
+
+    #[test]
+    fn undo_expects_each_after_value_and_writes_the_before_value() {
+        let fixture = Fixture::new("inverse");
+        let id = fixture.record(Method::BookmarkSet, &[ref_set(b"refs/heads/main", b"new")]);
+        let plan = prepare_undo(&fixture.store, id).expect("undo prepares");
+        assert_eq!(plan.facts.len(), 1);
+        let fact = &plan.facts[0];
+        assert_eq!(fact.table, FactTable::Refs);
+        assert_eq!(fact.key, b"refs/heads/main".to_vec());
+        assert!(
+            matches!(&fact.expected, FactExpectation::Value(after) if after == b"new"),
+            "expects the operation's after value"
+        );
+        assert_eq!(fact.value, None, "a created key is removed again");
+        assert_eq!(plan.summary.refs, 1);
+    }
+
+    #[test]
+    fn undo_refuses_operations_with_effects_outside_tracked_tables() {
+        let fixture = Fixture::new("fetch");
+        let id = fixture.record(Method::Fetch, &[ref_set(b"refs/remotes/origin/main", b"x")]);
+        let err = prepare_undo(&fixture.store, id).expect_err("fetch cannot be inverted");
+        assert_eq!(err.code, ErrorCode::EUndoConflict);
+        assert!(err.message.contains("fetch"), "names the effect: {}", err.message);
+    }
+
+    #[test]
+    fn undo_of_an_unretained_operation_is_not_found() {
+        let fixture = Fixture::new("missing");
+        let err = prepare_undo(&fixture.store, OperationId(7)).expect_err("no such operation");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+    }
+}

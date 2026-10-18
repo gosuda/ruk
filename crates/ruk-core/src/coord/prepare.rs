@@ -8,8 +8,9 @@
 //! Covered today: `bookmark.set` (commit and change targets),
 //! `bookmark.delete`, `bookmark.resolve`, `tag.set` (plain and annotated),
 //! `tag.delete`, `pin`, `unpin`, `attest.add`, `new`, `claim.acquire`,
-//! `claim.release`, `ws.new`, `describe`, `rebase`, `squash`, `abandon`,
-//! `edit`, `ws.scope`, `ws.take`, and `ws.drop`.
+//! `claim.release`, `ws.new`, `describe`, `split`, `rebase`, `squash`,
+//! `abandon`, `edit`, `ws.scope`, `ws.take`, `ws.drop`, `resolve`, `revert`,
+//! and `undo`.
 //! The annotated tag arm needs the coordinator clock and a tagger identity,
 //! `new` and `ws.new` need the session identity row and the clock for
 //! signature synthesis, and `attest.add` needs the attestation progress gate,
@@ -25,8 +26,8 @@
 //!   commit-time snapshot, so preparation stages no claim facts and mints
 //!   only the acquire id the sealed record must carry. The lane seals with
 //!   that id and writes the authoritative record back into the reply.
-//! * Workspace dirty state (`snapshot`, `write`, `ws.recover`), untouched
-//!   change-rewrite, transport, land, undo, and prune mutations need worktree
+//! * Workspace dirty state (`snapshot`, `write`, `ws.recover`) and transport,
+//!   land, and prune mutations need worktree
 //!   file I/O, object preparation, claim sealing, or plan evaluation that no
 //!   caller on this path supplies. The pure row transitions (`edit`,
 //!   `ws.scope`, `ws.take`, `ws.drop`) serve on both paths: they stage the
@@ -50,14 +51,22 @@
 //! content-merge work with no producer here (`ops::prepare_rebase` needs one
 //! caller-resolved tree per root and keeps stale descendant trees, so the
 //! translator stages the whole moved set through one record batch preparer
-//! instead); `squash` serves the whole-delta linear case only (all paths, a
-//! single-child source, the emptied source dropped); `abandon` re-parents
+//! instead); `squash` moves selected paths (or all) from a single-child source
+//! into its destination, keeping the source's remainder and re-deriving its
+//! descendants; `split` partitions one change by path; and `abandon` re-parents
 //! descendants onto the abandoned commits' parents in the same batch as the
 //! change-state transitions (merge-commit targets need fan-in parent
-//! replacement with no producer here, so they stay refused); and `split`,
-//! `resolve`, and `revert` need path-subtraction, conflict, or reverse-delta
-//! tree derivation with no producer on this path, while their `ops::*`
-//! counterparts need caller-resolved trees.
+//! replacement with no producer here, so they stay refused).
+//!
+//! Path-level tree derivation (split, squash, revert, resolve) goes through
+//! [`crate::ops::tree_edit`]: `apply_delta` is a three-tree apply restricted to
+//! a selection that refuses `E_CONFLICTED` where both sides diverged, and
+//! `set_entry`/`lookup`/`conflicted_paths` address conflicted terms one path at
+//! a time. `resolve` rewrites every term tree at the path, keeping other
+//! conflicts as term lists. `revert` reverses the target's delta onto its single
+//! `onto` parent in a fresh change. `undo` ([`super::undo`]) inverts a
+//! retained operation's tracked deltas as exact facts. `op.prune` refuses,
+//! naming the missing operation-retention policy.
 //!
 //! Ref safety: each helper checks its transaction against the store before
 //! returning, and the lane keeps ref mutations safe after that. The batch
@@ -111,8 +120,8 @@ use crate::protocol::{
     WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
-    Content, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs, RevertReply,
-    UndoArgs, UndoReply,
+    Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
+    RevertReply, SplitArgs, SplitPlacement, UndoArgs, UndoReply,
 };
 use crate::index::{FileMode, RepoPath};
 use crate::workcopy::tree::TreeMode;
@@ -248,12 +257,7 @@ pub(crate) fn prepare_mutation_with(
         Request::WsRecover(m) => ws_recover_parts(ctx, m.request_id, &m.args)?,
         Request::Describe(m) => describe_parts(ctx, m.request_id, &m.args)?,
         Request::Edit(m) => edit_parts(ctx, m.request_id, &m.args)?,
-        Request::Split(_) => {
-            return Err(uncovered(
-                "split",
-                "`split` partitions one commit by path selection and needs its intermediate tree derived by path subtraction (ops/tree_edit.rs) with no producer on this path; `ops::prepare_split` needs a caller-resolved first_tree instead",
-            ));
-        }
+        Request::Split(m) => split_parts(ctx, m.request_id, &m.args)?,
         Request::Squash(m) => squash_parts(ctx, m.request_id, &m.args)?,
         Request::Rebase(m) => rebase_parts(ctx, m.request_id, &m.args)?,
         Request::Abandon(m) => abandon_parts(ctx, m.request_id, &m.args)?,
@@ -2318,16 +2322,215 @@ fn rebase_parts(
     })
 }
 
-/// Prepares `squash`: moves the whole delta of a source into its destination
-/// parent, dropping the emptied source. Only the whole-delta linear case is
-/// covered: all paths, the source a direct only child of the destination, and
-/// content-less source descendants. `ops::prepare_squash` absorbs intra-change
-/// chains only (its predecessor must live in the squashed change), so the
-/// cross-change composition stages here through one batch preparer.
+/// Prepares `split`: partitions one change's delta by path. The selected
+/// paths' changes form a new change; the source identity keeps the remainder.
+///
+/// The stack always ends in a commit carrying the source's full tree, so the
+/// source's descendants keep their trees and only re-parent onto it:
+/// - `SelectedFirst`: the new change (parent tree plus the selection) sits
+///   below the source identity, whose commit holds the full tree.
+/// - `SelectedSecond`: the source identity keeps the remainder (parent tree plus
+///   the unselected paths) below the new change, which holds the full tree.
 ///
 /// # Errors
-/// - [`ErrorCode::EHosted`] for selected paths, `keep_empty = true`,
-///   non-linear placement, siblings, and content-carrying descendants.
+/// - [`ErrorCode::EInvalid`] for `all` paths, an empty selection, a selection
+///   that changes nothing, or one that leaves nothing in the source.
+/// - [`ErrorCode::EHosted`] for merge sources or parents, conflicted trees, and
+///   several workspace bindings or a GitCompat workspace on the rewritten head.
+fn split_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &SplitArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let PathSelection::Paths(paths) = &args.paths else {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `split` needs paths: `all` would leave nothing to split",
+        ));
+    };
+    if paths.is_empty() {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `split` needs at least one path",
+        ));
+    }
+    let source = load_rewrite_target(store, &args.source)?;
+    let source_tree = resolved_tree_of(
+        &source.record,
+        "split",
+        "splitting a conflicted change needs merge evaluation with no producer on this path",
+    )?;
+    let parent_tree = single_parent_tree(store, &source.record, "split")?;
+    let selection = Selection::Paths(paths);
+    let selected = apply_delta(store, parent_tree, parent_tree, source_tree, selection)?;
+    let remainder = apply_delta(store, source_tree, source_tree, parent_tree, selection)?;
+    if selected.root == parent_tree {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `split` selects nothing: the selected paths do not change this change",
+        ));
+    }
+    if remainder.root == parent_tree {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `split` leaves nothing in the source: the selection covers the whole change",
+        ));
+    }
+    let mut objects = selected.objects;
+    push_unique(&mut objects, remainder.objects);
+    let selection_change = ChangeId::generate();
+    let records = Records::new(store);
+    let mut preparer = records.batch_preparer();
+    let (source_head, top_head, top_change, selection_head) = match args.placement {
+        SplitPlacement::SelectedFirst => {
+            let selection_head = preparer.add_native_commit(NativeCommitInput {
+                change_id: selection_change,
+                tree: Merge::resolved(selected.root),
+                parents: source.record.parents().to_vec(),
+                predecessor: None,
+                author: source.record.author()?,
+                committer: source.record.committer()?,
+                extra_headers: copy_extra_headers(&source.record),
+                message: args.description.clone(),
+                provenance: None,
+            })?;
+            let source_head = preparer.add_native_commit(preserved_input(
+                &source.record,
+                Merge::resolved(source_tree),
+                vec![selection_head],
+                Some(source.head),
+            )?)?;
+            (source_head, source_head, source.change, selection_head)
+        }
+        SplitPlacement::SelectedSecond => {
+            let source_head = preparer.add_native_commit(preserved_input(
+                &source.record,
+                Merge::resolved(remainder.root),
+                source.record.parents().to_vec(),
+                Some(source.head),
+            )?)?;
+            let selection_head = preparer.add_native_commit(NativeCommitInput {
+                change_id: selection_change,
+                tree: Merge::resolved(source_tree),
+                parents: vec![source_head],
+                predecessor: None,
+                author: source.record.author()?,
+                committer: source.record.committer()?,
+                extra_headers: copy_extra_headers(&source.record),
+                message: args.description.clone(),
+                provenance: None,
+            })?;
+            (source_head, selection_head, selection_change, selection_head)
+        }
+    };
+    let mut staged = vec![StagedRewrite {
+        change: source.change,
+        old: source.head,
+        new: source_head,
+        conflicted: false,
+    }];
+    let mut head_map = BTreeMap::from([(source.head, top_head)]);
+    let closure = descendants(store, &[source.head])?;
+    let rewritten: BTreeSet<Head> = closure
+        .iter()
+        .copied()
+        .chain(std::iter::once(source.head))
+        .collect();
+    for old in closure {
+        let record = records.get_commit(&old)?.ok_or_else(|| not_stored(&old))?;
+        let new_parents = map_strict(record.parents(), &rewritten, &head_map)?;
+        let input = preserved_input(&record, record.tree().clone(), new_parents, Some(old))?;
+        let new = preparer.add_native_commit(input)?;
+        head_map.insert(old, new);
+        staged.push(StagedRewrite {
+            change: record.change_id(),
+            old,
+            new,
+            conflicted: record.tree().as_resolved().is_none(),
+        });
+    }
+    let batch = preparer.finish()?;
+    objects.extend(batch.prepared_objects);
+    let mut rewrite_map: BTreeMap<Head, (ChangeId, Head)> = staged
+        .iter()
+        .map(|rewrite| (rewrite.old, (rewrite.change, rewrite.new)))
+        .collect();
+    rewrite_map.insert(source.head, (top_change, top_head));
+    let gated = gate_workspaces(ctx, "split", &args.workspaces)?;
+    let (mut workspace_facts, fence) = advance_workspaces(gated, session, "split", &rewrite_map)?;
+    let mut facts = batch.mutations;
+    facts.append(&mut workspace_facts);
+    let mut reply = rewrite_reply(
+        session,
+        request_id,
+        report_identity(ctx, args.identity.as_ref())?,
+        merge_report_of(args.merge.mode)?,
+        &staged,
+        Vec::new(),
+    )?;
+    let mut heads: Vec<ChangeHead> = staged
+        .iter()
+        .map(|rewrite| ChangeHead {
+            change: rewrite.change,
+            head: rewrite.new,
+        })
+        .collect();
+    heads.push(ChangeHead {
+        change: selection_change,
+        head: selection_head,
+    });
+    reply.outcome.heads = BoundedList::complete(heads)?;
+    Ok(Parts {
+        reply: Reply::Split(Box::new(reply)),
+        objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// The tree a change's only parent carries, or the empty tree for a root.
+/// Merge parents refuse: their trees need merge evaluation.
+fn single_parent_tree(store: &Store, record: &CommitRecord, method: &str) -> Result<Oid, CoreError> {
+    match record.parents() {
+        [] => empty_tree(store.hash_kind()),
+        [parent] => {
+            let commit = Records::new(store)
+                .get_commit(parent)?
+                .ok_or_else(|| not_stored(parent))?;
+            resolved_tree_of(
+                &commit,
+                method,
+                "a change against a conflicted parent needs merge evaluation with no producer on this path",
+            )
+        }
+        _ => Err(uncovered(
+            method,
+            "a merge commit needs merge evaluation with no producer on this path",
+        )),
+    }
+}
+
+/// Prepares `squash`: moves the selected paths of a source's delta into its
+/// destination parent. The source keeps its remainder; it is dropped only when
+/// emptied and `keep_empty` is false.
+///
+/// The source must be a direct only child of the destination, so the
+/// destination's tree is the source's parent tree and the move is one
+/// three-tree apply per side. Source descendants are re-derived over their new
+/// base with [`apply_delta`], so a descendant whose delta collides with the
+/// moved paths refuses `E_CONFLICTED` naming them. `ops::prepare_squash`
+/// absorbs intra-change chains only, so the cross-change composition stages
+/// here through one batch preparer.
+///
+/// # Errors
+/// - [`ErrorCode::EInvalid`] for an empty path list or a move that changes nothing.
+/// - [`ErrorCode::EConflicted`] for descendant collisions.
+/// - [`ErrorCode::EHosted`] for non-linear placement, siblings of the source,
+///   merge commits, and conflicted trees.
 fn squash_parts(
     ctx: &PrepareContext<'_>,
     request_id: RequestId,
@@ -2335,18 +2538,6 @@ fn squash_parts(
 ) -> Result<Parts, CoreError> {
     let store = ctx.store;
     let session = ctx.session;
-    if !matches!(args.paths, crate::protocol::PathSelection::All) {
-        return Err(uncovered(
-            "squash",
-            "squash of selected paths needs path-delta apply (ops/tree_edit.rs) with no producer on this path; supply all paths",
-        ));
-    }
-    if args.keep_empty {
-        return Err(uncovered(
-            "squash",
-            "squash with keep_empty=true keeps the emptied source and needs remainder-tree derivation with no producer on this path",
-        ));
-    }
     let source = load_rewrite_target(store, &args.source)?;
     let destination = load_rewrite_target(store, &args.destination)?;
     match source.record.parents() {
@@ -2376,12 +2567,41 @@ fn squash_parts(
             "squash with siblings of the source needs sibling tree re-derivation with no producer on this path",
         ));
     }
-    let source_tree = source.record.tree().as_resolved().copied().ok_or_else(|| {
-        uncovered(
-            "squash",
-            "squash of a conflicted source needs merge evaluation with no producer on this path",
-        )
-    })?;
+    let source_tree = resolved_tree_of(
+        &source.record,
+        "squash",
+        "squash of a conflicted source needs merge evaluation with no producer on this path",
+    )?;
+    let destination_tree = resolved_tree_of(
+        &destination.record,
+        "squash",
+        "squash into a conflicted destination needs merge evaluation with no producer on this path",
+    )?;
+    let selection = match &args.paths {
+        PathSelection::All => Selection::All,
+        PathSelection::Paths(paths) if paths.is_empty() => {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "method `squash` needs at least one path or all",
+            ));
+        }
+        PathSelection::Paths(paths) => Selection::Paths(paths),
+    };
+    // The source's parent is the destination, so its delta is the source tree
+    // against the destination tree. The selection moves from one side to the other.
+    let moved = apply_delta(store, destination_tree, destination_tree, source_tree, selection)?;
+    if moved.root == destination_tree {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "method `squash` moves nothing: the destination already carries the source content",
+        ));
+    }
+    let remainder = apply_delta(store, source_tree, source_tree, destination_tree, selection)?;
+    // The source is emptied when its remainder equals the destination; an
+    // emptied source is dropped unless the caller keeps it.
+    let keep_source = args.keep_empty || remainder.root != destination_tree;
+    let mut objects = moved.objects;
+    push_unique(&mut objects, remainder.objects);
     let message = match &args.description {
         Some(description) => description.clone(),
         None => ByteString::from(destination.record.message()),
@@ -2390,7 +2610,7 @@ fn squash_parts(
     let mut preparer = records.batch_preparer();
     let destination_input = NativeCommitInput {
         change_id: destination.change,
-        tree: Merge::from_vec(vec![source_tree]),
+        tree: Merge::resolved(moved.root),
         parents: destination.record.parents().to_vec(),
         predecessor: Some(destination.head),
         author: destination.record.author()?,
@@ -2400,23 +2620,36 @@ fn squash_parts(
         provenance: destination.record.provenance().cloned(),
     };
     let new_destination = preparer.add_native_commit(destination_input)?;
-    if new_destination == destination.head {
-        return Err(CoreError::new(
-            ErrorCode::EInvalid,
-            "method `squash` moves nothing: the destination already carries the source content",
-        ));
-    }
-    let mut head_map = BTreeMap::from([
-        (destination.head, new_destination),
-        (source.head, new_destination),
-    ]);
-    let mut new_trees = BTreeMap::from([(new_destination, source_tree)]);
+    let mut head_map = BTreeMap::from([(destination.head, new_destination)]);
+    let mut new_trees = BTreeMap::from([(new_destination, moved.root)]);
     let mut staged = vec![StagedRewrite {
         change: destination.change,
         old: destination.head,
         new: new_destination,
         conflicted: false,
     }];
+    // The old tree of every commit the moved set re-parents, by its old head.
+    let mut old_trees = BTreeMap::from([(source.head, source_tree)]);
+    // Descendants of the source re-parent onto the kept source, else the destination.
+    if keep_source {
+        let source_input = preserved_input(
+            &source.record,
+            Merge::resolved(remainder.root),
+            vec![new_destination],
+            Some(source.head),
+        )?;
+        let kept = preparer.add_native_commit(source_input)?;
+        head_map.insert(source.head, kept);
+        new_trees.insert(kept, remainder.root);
+        staged.push(StagedRewrite {
+            change: source.change,
+            old: source.head,
+            new: kept,
+            conflicted: false,
+        });
+    } else {
+        head_map.insert(source.head, new_destination);
+    }
     let closure = descendants(store, &[source.head])?;
     let rewritten: BTreeSet<Head> = closure
         .iter()
@@ -2432,46 +2665,67 @@ fn squash_parts(
                 "re-parenting a merge commit needs merge evaluation with no producer on this path",
             ));
         };
-        if *base != new_destination {
-            let base_tree = new_base_tree(store, "squash", &new_trees, base)?;
-            let kept = record.tree().as_resolved().copied().ok_or_else(|| {
-                uncovered(
-                    "squash",
-                    "re-parenting a conflicted commit needs merge evaluation with no producer on this path",
-                )
-            })?;
-            require_kept_tree("squash", &kept, &base_tree)?;
-        }
-        let input = preserved_input(&record, record.tree().clone(), new_parents, Some(old))?;
+        let [old_parent] = record.parents() else {
+            return Err(uncovered(
+                "squash",
+                "re-parenting a merge commit needs merge evaluation with no producer on this path",
+            ));
+        };
+        let base_tree = new_base_tree(store, "squash", &new_trees, base)?;
+        let old_parent_tree = *old_trees.get(old_parent).ok_or_else(|| not_stored(old_parent))?;
+        let child_tree = resolved_tree_of(
+            &record,
+            "squash",
+            "re-parenting a conflicted commit needs merge evaluation with no producer on this path",
+        )?;
+        let derived = apply_delta(store, base_tree, old_parent_tree, child_tree, Selection::All)?;
+        push_unique(&mut objects, derived.objects);
+        let input = preserved_input(
+            &record,
+            Merge::resolved(derived.root),
+            new_parents,
+            Some(old),
+        )?;
         let new = preparer.add_native_commit(input)?;
         head_map.insert(old, new);
-        if let Some(tree) = record.tree().as_resolved() {
-            new_trees.insert(new, *tree);
-        }
+        new_trees.insert(new, derived.root);
+        old_trees.insert(old, child_tree);
         staged.push(StagedRewrite {
             change: record.change_id(),
             old,
             new,
-            conflicted: record.tree().as_resolved().is_none(),
+            conflicted: false,
         });
     }
     let batch = preparer.finish()?;
-    let abandoned = prepare_abandon(
-        store,
-        AbandonRequest {
-            heads: vec![source.head],
-        },
-    )?;
-    let (mut facts, finals) = merge_changes_facts(store, batch.mutations, abandoned.facts)?;
-    let drained = finals
-        .get(&source.change)
-        .is_none_or(|entry| entry.heads.is_empty());
-    let gated = gate_workspaces(ctx, "squash", &args.workspaces)?;
-    let rewrite_map: BTreeMap<Head, (ChangeId, Head)> = staged
+    push_unique(&mut objects, batch.prepared_objects);
+    let mut rewrite_map: BTreeMap<Head, (ChangeId, Head)> = staged
         .iter()
         .map(|rewrite| (rewrite.old, (rewrite.change, rewrite.new)))
         .collect();
-    let (mut workspace_facts, fence) = advance_workspaces(gated, session, "squash", &rewrite_map)?;
+    let mut facts = batch.mutations;
+    let mut abandoned = Vec::new();
+    if !keep_source {
+        let drop_source = prepare_abandon(
+            store,
+            AbandonRequest {
+                heads: vec![source.head],
+            },
+        )?;
+        let (merged, finals) = merge_changes_facts(store, facts, drop_source.facts)?;
+        facts = merged;
+        if finals
+            .get(&source.change)
+            .is_none_or(|entry| entry.heads.is_empty())
+        {
+            abandoned.push(source.change);
+        }
+        // The emptied source's workspace content now lives on the destination.
+        rewrite_map.insert(source.head, (destination.change, new_destination));
+    }
+    let gated = gate_workspaces(ctx, "squash", &args.workspaces)?;
+    let (mut workspace_facts, fence) =
+        advance_workspaces(gated, session, "squash", &rewrite_map)?;
     facts.append(&mut workspace_facts);
     let reply = rewrite_reply(
         session,
@@ -2479,11 +2733,11 @@ fn squash_parts(
         report_identity(ctx, args.identity.as_ref())?,
         merge_report_of(args.merge.mode)?,
         &staged,
-        drained.then_some(source.change).into_iter().collect(),
+        abandoned,
     )?;
     Ok(Parts {
         reply: Reply::Squash(Box::new(reply)),
-        objects: batch.prepared_objects,
+        objects,
         facts,
         transaction: None,
         dependencies: Vec::new(),
@@ -3868,33 +4122,21 @@ mod tests {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
         let ctx = full_ctx(&store, session, None, Some(&clock), Some(&open_checkpoint));
-        // `new`, `claim.*`, `ws.new`, `describe`, `rebase`, `squash`, and
-        // `abandon` now serve through this context; later waves still name
-        // their missing preparation. `split` needs intermediate-tree
-        // derivation (ops/tree_edit.rs) with no producer here.
-        for request in [Request::Split(Box::new(WireMutation {
+        // `split`, `squash`, `resolve`, `revert`, and `undo` serve through this
+        // context; `op.prune` has no retention policy to apply, so it still
+        // refuses and names the machinery it lacks.
+        let request = Request::OpPrune(Box::new(WireMutation {
             request_id: request_id(),
-            args: SplitArgs {
-                source: change_target(),
-                paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
-                placement: SplitPlacement::SelectedFirst,
-                description: ByteString::from("part"),
-                identity: None,
-                merge: MergeSelection::default(),
-                workspaces: Vec::new(),
-            },
-        }))] {
-            let method = request.method();
-            let err = prepare_mutation_with(&ctx, request)
-                .expect_err("future wave stays refused through the context");
-            assert_eq!(err.code, ErrorCode::EHosted, "method `{}`", method.as_str());
-            assert!(
-                err.message.contains("ops/tree_edit.rs"),
-                "method `{}` names its missing producer: {}",
-                method.as_str(),
-                err.message
-            );
-        }
+            args: crate::protocol::OpPruneArgs {},
+        }));
+        let err = prepare_mutation_with(&ctx, request)
+            .expect_err("op.prune stays refused through the context");
+        assert_eq!(err.code, ErrorCode::EHosted);
+        assert!(
+            err.message.contains("operation-retention policy"),
+            "op.prune names its missing policy: {}",
+            err.message
+        );
     }
 
     fn claim_all_caps() -> Capabilities {
@@ -5048,27 +5290,6 @@ mod tests {
                     workspace: None,
                 },
             })),
-            Request::Split(Box::new(WireMutation {
-                request_id: request_id(),
-                args: SplitArgs {
-                    source: target,
-                    paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
-                    placement: SplitPlacement::SelectedFirst,
-                    description: ByteString::from("part"),
-                    identity: None,
-                    merge: MergeSelection::default(),
-                    workspaces: Vec::new(),
-                },
-            })),
-            Request::Resolve(Box::new(WireMutation {
-                request_id: request_id(),
-                args: ResolveArgs {
-                    target,
-                    path: RepoPath::new("x").expect("test path"),
-                    resolution: Resolution::AcceptSame,
-                    workspaces: Vec::new(),
-                },
-            })),
             Request::Revert(Box::new(WireMutation {
                 request_id: request_id(),
                 args: RevertArgs {
@@ -5672,6 +5893,242 @@ mod tests {
         );
     }
 
+    /// Seeds a stored tree holding one regular file per `(path, marker)` pair;
+    /// each blob's content is its marker byte.
+    fn seed_files(store: &Store, files: &[(&str, u8)]) -> Oid {
+        let empty = store
+            .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
+            .expect("prepare empty tree");
+        let mut root = empty.oid();
+        store.publish(vec![empty], &[]).expect("publish empty tree");
+        for (name, marker) in files {
+            let blob_bytes = [*marker];
+            let blob = store
+                .prepare(ObjectKind::Blob, 1, std::io::Cursor::new(blob_bytes), None)
+                .expect("prepare blob");
+            let blob_oid = blob.oid();
+            store.publish(vec![blob], &[]).expect("publish blob");
+            let path = RepoPath::new(name.as_bytes().to_vec()).expect("test path");
+            let entry = Some((TreeMode::File(FileMode::Regular), blob_oid));
+            let edit = set_entry(store, root, &path, entry).expect("set entry");
+            store.publish(edit.objects, &[]).expect("publish tree edit");
+            root = edit.root;
+        }
+        root
+    }
+
+    #[test]
+    fn resolve_side_collapses_a_single_path_conflict() {
+        let (_temp, store, session) = fixture();
+        let t1 = seed_files(&store, &[("x", 1)]);
+        let t2 = seed_files(&store, &[("x", 2)]);
+        let t3 = seed_files(&store, &[("x", 3)]);
+        let change = ChangeId::generate();
+        let input = NativeCommitInput {
+            change_id: change,
+            tree: Merge::from_vec(vec![t1, t2, t3]),
+            parents: Vec::new(),
+            predecessor: None,
+            author: signature(),
+            committer: signature(),
+            extra_headers: Vec::new(),
+            message: ByteString::from("conflicted"),
+            provenance: None,
+        };
+        let conflicted = Records::new(&store)
+            .prepare_native_commit(input)
+            .expect("prepare conflicted commit");
+        let head = conflicted.head;
+        store
+            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .expect("publish conflicted commit");
+        let request = Request::Resolve(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ResolveArgs {
+                target: ChangeRef {
+                    change,
+                    head: Some(head),
+                },
+                path: RepoPath::new("x").expect("test path"),
+                resolution: Resolution::Side { index: 0 },
+                workspaces: Vec::new(),
+            },
+        }));
+        let prepared = prepare_mutation(&store, session, request).expect("resolve prepares");
+        let Reply::Resolve(reply) = prepared.reply else {
+            panic!("resolve must answer its own reply");
+        };
+        assert!(reply.remaining.items.is_empty(), "the only path is resolved");
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish resolve");
+        let resolved = Records::new(&store)
+            .get_commit(&reply.change.head)
+            .expect("read resolved commit")
+            .expect("resolved commit is stored");
+        assert_eq!(resolved.tree().as_resolved(), Some(&t1));
+        assert_eq!(resolved.predecessor(), Some(head));
+    }
+
+    #[test]
+    fn revert_reverses_the_target_delta_in_a_fresh_change() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let base_tree = seed_files(&store, &[("x", 1)]);
+        let changed_tree = seed_files(&store, &[("x", 2)]);
+        let (parent, _) = seed_child_on_tree(&store, base_tree, Vec::new(), None, "parent");
+        let (target, target_change) =
+            seed_child_on_tree(&store, changed_tree, vec![parent], None, "target");
+        let request = Request::Revert(Box::new(WireMutation {
+            request_id: request_id(),
+            args: RevertArgs {
+                target: ChangeRef {
+                    change: target_change,
+                    head: Some(target),
+                },
+                onto: vec![target],
+                mainline: None,
+                description: None,
+                identity: None,
+                merge: MergeSelection::default(),
+            },
+        }));
+        let prepared = prepare_mutation_with(&ctx, request).expect("revert prepares");
+        let Reply::Revert(reply) = prepared.reply else {
+            panic!("revert must answer its own reply");
+        };
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish revert");
+        assert_ne!(reply.created.change, target_change, "a fresh change");
+        let created = Records::new(&store)
+            .get_commit(&reply.created.head)
+            .expect("read revert commit")
+            .expect("revert commit is stored");
+        assert_eq!(created.tree().as_resolved(), Some(&base_tree));
+        assert_eq!(created.parents(), &[target]);
+    }
+
+    #[test]
+    fn split_selected_first_stacks_the_selection_under_the_source_identity() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let parent_tree = seed_files(&store, &[("x", 1), ("y", 1)]);
+        let source_tree = seed_files(&store, &[("x", 2), ("y", 2)]);
+        let selected_tree = seed_files(&store, &[("x", 2), ("y", 1)]);
+        let (parent, _) = seed_child_on_tree(&store, parent_tree, Vec::new(), None, "parent");
+        let (source, source_change) =
+            seed_child_on_tree(&store, source_tree, vec![parent], None, "source");
+        let request = Request::Split(Box::new(WireMutation {
+            request_id: request_id(),
+            args: SplitArgs {
+                source: ChangeRef {
+                    change: source_change,
+                    head: Some(source),
+                },
+                paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
+                placement: SplitPlacement::SelectedFirst,
+                description: ByteString::from("part"),
+                identity: None,
+                merge: MergeSelection::default(),
+                workspaces: Vec::new(),
+            },
+        }));
+        let prepared = prepare_mutation_with(&ctx, request).expect("split prepares");
+        let Reply::Split(reply) = prepared.reply else {
+            panic!("split must answer its own reply");
+        };
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish split");
+        assert_eq!(reply.rewrites.items.len(), 1, "only the source identity moves");
+        let source_now = reply.rewrites.items[0].new;
+        let selection_head = reply
+            .outcome
+            .heads
+            .items
+            .iter()
+            .map(|head| head.head)
+            .find(|head| *head != source_now)
+            .expect("the selection commit is listed for discovery");
+        let selection = Records::new(&store)
+            .get_commit(&selection_head)
+            .expect("read selection commit")
+            .expect("selection commit is stored");
+        assert_eq!(selection.tree().as_resolved(), Some(&selected_tree));
+        assert_eq!(selection.parents(), &[parent]);
+        assert_eq!(commit_parents(&store, &source_now), vec![selection_head]);
+        assert_eq!(
+            Records::new(&store)
+                .get_commit(&source_now)
+                .expect("read source commit")
+                .expect("source commit is stored")
+                .tree()
+                .as_resolved(),
+            Some(&source_tree)
+        );
+    }
+
+    #[test]
+    fn squash_selected_path_keeps_the_remainder_as_the_source() {
+        let (_temp, store, session) = fixture();
+        let parent_tree = seed_files(&store, &[("x", 1), ("y", 1)]);
+        let source_tree = seed_files(&store, &[("x", 2), ("y", 2)]);
+        let moved_tree = seed_files(&store, &[("x", 2), ("y", 1)]);
+        let remainder_tree = seed_files(&store, &[("x", 1), ("y", 2)]);
+        let (dhead, dchange) =
+            seed_child_on_tree(&store, parent_tree, Vec::new(), None, "destination");
+        let (shead, schange) =
+            seed_child_on_tree(&store, source_tree, vec![dhead], None, "source");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            squash_request(
+                ChangeRef {
+                    change: schange,
+                    head: Some(shead),
+                },
+                ChangeRef {
+                    change: dchange,
+                    head: Some(dhead),
+                },
+                crate::protocol::PathSelection::Paths(vec![
+                    RepoPath::new("x").expect("test path"),
+                ]),
+                false,
+            ),
+        )
+        .expect("selected squash prepares");
+        let Reply::Squash(reply) = prepared.reply else {
+            panic!("squash must answer its own reply");
+        };
+        assert!(reply.abandoned.items.is_empty(), "the remainder keeps the source");
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish squash");
+        let new_destination = reply.rewrites.items[0].new;
+        let new_source = reply.rewrites.items[1].new;
+        assert_eq!(
+            Records::new(&store)
+                .get_commit(&new_destination)
+                .expect("read destination")
+                .expect("destination is stored")
+                .tree()
+                .as_resolved(),
+            Some(&moved_tree)
+        );
+        let source_commit = Records::new(&store)
+            .get_commit(&new_source)
+            .expect("read source")
+            .expect("source is stored");
+        assert_eq!(source_commit.tree().as_resolved(), Some(&remainder_tree));
+        assert_eq!(source_commit.parents(), &[new_destination]);
+    }
+
     fn squash_request(
         source: ChangeRef,
         destination: ChangeRef,
@@ -5750,41 +6207,19 @@ mod tests {
             change: dchange,
             head: Some(dhead),
         };
+        // An empty path list selects nothing to move.
         let err = prepare_mutation(
             &store,
             session,
             squash_request(
                 source,
                 destination,
-                crate::protocol::PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
+                crate::protocol::PathSelection::Paths(Vec::new()),
                 false,
             ),
         )
-        .expect_err("selected-paths squash stays refused");
-        assert_eq!(err.code, ErrorCode::EHosted);
-        assert!(
-            err.message.contains("ops/tree_edit.rs"),
-            "names derivation: {}",
-            err.message
-        );
-
-        let err = prepare_mutation(
-            &store,
-            session,
-            squash_request(
-                source,
-                destination,
-                crate::protocol::PathSelection::All,
-                true,
-            ),
-        )
-        .expect_err("keep_empty squash stays refused");
-        assert_eq!(err.code, ErrorCode::EHosted);
-        assert!(
-            err.message.contains("remainder"),
-            "names remainder: {}",
-            err.message
-        );
+        .expect_err("an empty selection moves nothing");
+        assert_eq!(err.code, ErrorCode::EInvalid);
 
         // A sibling of the source needs sibling re-derivation.
         let (_sibling, _) = seed_child(&store, dhead, None, "sibling");
