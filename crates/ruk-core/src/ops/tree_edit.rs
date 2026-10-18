@@ -356,21 +356,20 @@ impl<'a> Editor<'a> {
         let base_items = self.items(base)?;
         let from_items = self.items(from)?;
         let to_items = self.items(to)?;
-        let names: BTreeSet<Vec<u8>> = base_items
+        let names: BTreeSet<&Vec<u8>> = base_items
             .keys()
             .chain(from_items.keys())
             .chain(to_items.keys())
-            .cloned()
             .collect();
         let mut updates: Vec<(Vec<u8>, Node)> = Vec::new();
         for name in names {
-            let entry_base = base_items.get(&name).copied();
-            let entry_from = from_items.get(&name).copied();
-            let entry_to = to_items.get(&name).copied();
-            let child_path = child(path, &name);
+            let entry_base = base_items.get(name).copied();
+            let entry_from = from_items.get(name).copied();
+            let entry_to = to_items.get(name).copied();
+            let child_path = child(path, name);
             let next = self.apply_at(&child_path, entry_base, entry_from, entry_to)?;
             if next != entry_base {
-                updates.push((name, next));
+                updates.push((name.clone(), next));
             }
         }
         if updates.is_empty() {
@@ -446,16 +445,16 @@ impl<'a> Editor<'a> {
             .iter()
             .map(|node| self.items(*node))
             .collect::<Result<Vec<_>, _>>()?;
-        let names: BTreeSet<Vec<u8>> = maps.iter().flat_map(|map| map.keys().cloned()).collect();
+        let names: BTreeSet<&Vec<u8>> = maps.iter().flat_map(|map| map.keys()).collect();
         for name in names {
-            let entries: Vec<Node> = maps.iter().map(|map| map.get(&name).copied()).collect();
+            let entries: Vec<Node> = maps.iter().map(|map| map.get(name).copied()).collect();
             let Some(first) = entries.first() else {
                 continue;
             };
             if entries.iter().all(|entry| entry == first) {
                 continue;
             }
-            let path = child(dir, &name);
+            let path = child(dir, name);
             let all_dirs = entries.iter().all(|entry| dir_or_absent(*entry));
             if all_dirs && entries.iter().any(|entry| is_dir(*entry)) {
                 self.walk_conflicts(&path, &entries, out)?;
@@ -690,5 +689,29 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["clash".to_string(), "d/x".to_string()]);
         assert!(found.iter().all(|(_, terms)| *terms == 3));
+    }
+
+    #[test]
+    fn a_file_in_the_base_blocks_a_selected_directory_change() {
+        let fixture = Fixture::new("file-blocks-dir");
+        let base = fixture.tree(&[("a", "file")]);
+        let from = fixture.tree(&[]);
+        let to = fixture.tree(&[("a/x", "v")]);
+        let selected = paths(&["a/x"]);
+        let err = apply(&fixture, base, from, to, Selection::Paths(&selected))
+            .expect_err("a file cannot become a directory the delta fills");
+        assert_eq!(err.code, ErrorCode::EConflicted);
+        assert!(err.message.contains("at a"), "names the path: {}", err.message);
+    }
+
+    #[test]
+    fn removing_the_last_selected_entry_writes_the_empty_root() {
+        let fixture = Fixture::new("empty-root");
+        let base = fixture.tree(&[("x", "x0")]);
+        let empty = fixture.tree(&[]);
+        let selected = paths(&["x"]);
+        let emptied = apply(&fixture, base, base, empty, Selection::Paths(&selected))
+            .expect("removing the only entry applies");
+        assert_eq!(emptied, empty, "an emptied root is the empty tree");
     }
 }

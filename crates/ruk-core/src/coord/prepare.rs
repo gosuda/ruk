@@ -852,6 +852,7 @@ fn mint_empty_commit(
             "a commit over several parents needs tree-merge evaluation with no producer on this path; supply one parent or none",
         ));
     }
+    let (author, identity) = commit_signature(row, clock, method, over)?;
     // Read-only pre-checks before the tree publish below: a refused mint
     // must leave no state, so the checks `prepare_new` would run first run
     // here against committed state. They stay advisory — `prepare_new` and
@@ -874,7 +875,6 @@ fn mint_empty_commit(
             "commit message carries NUL",
         ));
     }
-    let (author, identity) = commit_signature(row, clock, method, over)?;
     let empty = store
         .hash_kind()
         .hash_git_object("tree", b"")
@@ -2789,6 +2789,18 @@ fn resolve_parts(
         .iter()
         .map(|term| lookup(store, *term, path))
         .collect::<Result<Vec<Node>, CoreError>>()?;
+    if entries
+        .iter()
+        .any(|entry| matches!(entry, Some((TreeMode::Tree, _))))
+    {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "path {} names a directory in the target: resolve addresses files, since resolving a directory would drop the nested conflicts beneath it",
+                String::from_utf8_lossy(path.as_bytes())
+            ),
+        ));
+    }
     let merged = Merge::try_from_vec(entries).map_err(CoreError::from)?;
     if merged.simplify().is_resolved() {
         return Err(CoreError::new(
@@ -5968,6 +5980,49 @@ mod tests {
             .expect("resolved commit is stored");
         assert_eq!(resolved.tree().as_resolved(), Some(&t1));
         assert_eq!(resolved.predecessor(), Some(head));
+    }
+
+    #[test]
+    fn resolve_refuses_a_directory_path_rather_than_dropping_nested_conflicts() {
+        let (_temp, store, session) = fixture();
+        let t1 = seed_files(&store, &[("d/x", 1)]);
+        let t2 = seed_files(&store, &[("d/x", 2)]);
+        let t3 = seed_files(&store, &[("d/x", 3)]);
+        let change = ChangeId::generate();
+        let input = NativeCommitInput {
+            change_id: change,
+            tree: Merge::from_vec(vec![t1, t2, t3]),
+            parents: Vec::new(),
+            predecessor: None,
+            author: signature(),
+            committer: signature(),
+            extra_headers: Vec::new(),
+            message: ByteString::from("conflicted"),
+            provenance: None,
+        };
+        let conflicted = Records::new(&store)
+            .prepare_native_commit(input)
+            .expect("prepare conflicted commit");
+        let head = conflicted.head;
+        store
+            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .expect("publish conflicted commit");
+        let request = Request::Resolve(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ResolveArgs {
+                target: ChangeRef {
+                    change,
+                    head: Some(head),
+                },
+                path: RepoPath::new("d").expect("test path"),
+                resolution: Resolution::Side { index: 0 },
+                workspaces: Vec::new(),
+            },
+        }));
+        let err = prepare_mutation(&store, session, request)
+            .expect_err("a directory path is refused");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        assert!(err.message.contains("names a directory"), "{}", err.message);
     }
 
     #[test]
