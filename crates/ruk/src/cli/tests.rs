@@ -1508,6 +1508,87 @@ fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
     (port, server)
 }
 
+/// Serves a fake git-lfs upload endpoint on loopback: the batch POST must
+/// carry `"operation":"upload"` and answers one object, either with an
+/// upload `href` to `/up/<oid>` (`mode == "upload"`) or with a bare entry
+/// meaning already present (`mode == "upload-present"`); `/up/<oid>`
+/// accepts the PUT and keeps its body. Returns the port plus the join
+/// handle for the request paths seen in order and the PUT body bytes.
+fn lfs_batch_upload_server(mode: &str) -> (u16, std::thread::JoinHandle<(Vec<String>, Vec<u8>)>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let mode = mode.to_owned();
+    // "upload" serves one batch POST plus one payload PUT;
+    // "upload-present" serves the batch POST only.
+    let expected = if mode == "upload" { 2 } else { 1 };
+    let server = std::thread::spawn(move || {
+        let mut paths = Vec::new();
+        let mut landed = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while paths.len() < expected && Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("accept: {err}"),
+            };
+            socket.set_nonblocking(false).expect("blocking");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let (head, body) = read_http_request(&socket);
+            let request_line = head.lines().next().unwrap_or_default().to_owned();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_owned();
+            let path = parts.next().unwrap_or_default().to_owned();
+            paths.push(path.clone());
+            if path.ends_with("/objects/batch") {
+                assert_eq!(method, "POST", "batch is a POST: {head:?}");
+                let text = String::from_utf8_lossy(&body);
+                assert!(
+                    text.contains("\"operation\":\"upload\""),
+                    "batch must offer an upload: {text:?}"
+                );
+                assert!(
+                    body.windows(BATCH_HEX.len())
+                        .any(|window| window == BATCH_HEX.as_bytes()),
+                    "batch must offer the pointer oid"
+                );
+                let entry = if mode == "upload" {
+                    format!(
+                        "{{\"oid\":\"{BATCH_HEX}\",\"size\":{},\"actions\":{{\"upload\":{{\"href\":\"http://127.0.0.1:{port}/up/{BATCH_HEX}\"}}}}}}",
+                        BATCH_PAYLOAD.len()
+                    )
+                } else {
+                    format!(
+                        "{{\"oid\":\"{BATCH_HEX}\",\"size\":{}}}",
+                        BATCH_PAYLOAD.len()
+                    )
+                };
+                let reply_body = format!("{{\"objects\":[{entry}]}}");
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.git-lfs+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply_body}",
+                    reply_body.len()
+                );
+                socket.write_all(reply.as_bytes()).expect("batch reply");
+            } else if let Some(oid) = path.strip_prefix("/up/") {
+                assert_eq!(method, "PUT", "payload send is a PUT: {head:?}");
+                assert_eq!(oid, BATCH_HEX, "payload path carries the oid");
+                landed = body;
+                let reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                socket.write_all(reply.as_bytes()).expect("upload reply");
+            } else {
+                panic!("unexpected path {path:?}");
+            }
+        }
+        (paths, landed)
+    });
+    (port, server)
+}
+
 #[test]
 fn lfs_payload_sync_downloads_via_batch() {
     let (root, env) = lfs_pointer_repo("lfs-batch-ok");
@@ -1569,6 +1650,72 @@ fn lfs_payload_sync_reports_batch_errors_as_missing() {
     assert!(text.contains("code 404: not found"), "got {text:?}");
     assert!(text.contains("\"synced\": []"), "got {text:?}");
     let _ = server.join().expect("server");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn lfs_payload_sync_uploads_via_batch() {
+    let (root, env) = lfs_pointer_repo("lfs-batch-upload");
+    // The sidecar already holds the payload: upload offers it, never fetches.
+    let mut ctx = repo_ctx(&root, env);
+    let store_root = ctx.store().expect("store").root().to_path_buf();
+    let sidecar =
+        ruk_core::store::lfs::sidecar_path(&store_root, BATCH_HEX).expect("sidecar path");
+    std::fs::create_dir_all(sidecar.parent().expect("sidecar dir")).expect("sidecar dirs");
+    std::fs::write(&sidecar, BATCH_PAYLOAD).expect("seed payload");
+    let (port, server) = lfs_batch_upload_server("upload");
+    super::state::config_write(
+        ctx.store().expect("store"),
+        "lfs.url",
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+    )
+    .expect("lfs.url");
+    let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &["--upload"]).expect("sync");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains(&format!("\"uploaded\": [\"{BATCH_HEX}\"]")),
+        "got {text:?}"
+    );
+    assert!(text.contains("\"missing\": []"), "got {text:?}");
+    let (paths, landed) = server.join().expect("server");
+    assert_eq!(
+        paths,
+        vec![
+            "/repo.git/info/lfs/objects/batch".to_owned(),
+            format!("/up/{BATCH_HEX}")
+        ]
+    );
+    assert_eq!(landed, BATCH_PAYLOAD);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn lfs_payload_sync_upload_skips_remote_present_objects() {
+    let (root, env) = lfs_pointer_repo("lfs-batch-upload-present");
+    let mut ctx = repo_ctx(&root, env);
+    let store_root = ctx.store().expect("store").root().to_path_buf();
+    let sidecar =
+        ruk_core::store::lfs::sidecar_path(&store_root, BATCH_HEX).expect("sidecar path");
+    std::fs::create_dir_all(sidecar.parent().expect("sidecar dir")).expect("sidecar dirs");
+    std::fs::write(&sidecar, BATCH_PAYLOAD).expect("seed payload");
+    let (port, server) = lfs_batch_upload_server("upload-present");
+    super::state::config_write(
+        ctx.store().expect("store"),
+        "lfs.url",
+        &format!("http://127.0.0.1:{port}/repo.git/info/lfs"),
+    )
+    .expect("lfs.url");
+    let out = run(verbs_transport::lfs_payload_sync, &mut ctx, &["--upload"]).expect("sync");
+    let text = String::from_utf8(out).expect("utf8");
+    // The remote already holds the payload: nothing sent, nothing reported.
+    assert!(text.contains("\"uploaded\": []"), "got {text:?}");
+    assert!(text.contains("\"missing\": []"), "got {text:?}");
+    let (paths, landed) = server.join().expect("server");
+    assert_eq!(
+        paths,
+        vec!["/repo.git/info/lfs/objects/batch".to_owned()]
+    );
+    assert!(landed.is_empty());
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
