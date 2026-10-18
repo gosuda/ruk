@@ -6,8 +6,9 @@
 //! streaming into a writer, buffered or streaming raw POSTs for pkt-line
 //! RPC bodies, `Content-Length` or chunked bodies, Basic/Bearer auth from
 //! the environment. No cookies, no keep-alive (every request sends
-//! `Connection: close` on a fresh connection); dumb-http stays a named
-//! gap in [`super::net`] and only LFS payloads plus smart-http get HTTP.
+//! `Connection: close` on a fresh connection); dumb-http file fetches go
+//! through [`super::dumb_http`], and only LFS payloads plus smart-http and
+//! dumb-http get HTTP.
 //!
 //! Oracle anchors: the git-lfs batch API
 //! (`https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md`:
@@ -108,9 +109,10 @@ pub fn auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {
 ///
 /// `GIT_AUTH_TOKEN` wins and is sent verbatim as `Bearer <value>`;
 /// otherwise `GIT_AUTH_USER` plus `GIT_AUTH_PASSWORD` are sent as
-/// `Basic <base64(user:pass)>`. This is deliberately narrower than git's
-/// credential-helper and `http.<url>.extraHeader` machinery (both stay
-/// named gaps, documented in [`super::smart_http`]): CI-style static
+/// `Basic <base64(user:pass)>`. This is the environment half of auth: the
+/// helper half lives in [`super::credentials::auth_header_for_url`], which
+/// tries the configured helper first and falls back here. `http.<url>.extraHeader`
+/// stays a named gap (documented in [`super::smart_http`]): CI-style static
 /// tokens are what this adapter needs.
 #[must_use]
 pub fn git_auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {

@@ -6,8 +6,8 @@
 //! are local, `ssh://` URLs and scp-like `host:path` spellings dial over
 //! SSH, `git://` URLs dial a git daemon over TCP, and `http(s)://` URLs
 //! route to the stateless smart-http client in [`super::smart_http`].
-//! Dumb-http (plain `objects/info/*` file fetches) stays the one HTTP
-//! named gap.
+//! Dumb-http fetch (plain `objects/info/*` file fetches) falls back to
+//! [`super::dumb_http`]; push over dumb-http stays the one HTTP named gap.
 //!
 //! The wire grammars stay owned in-process: [`open_stream`] only yields a
 //! duplex byte stream, and callers drive [`super::fetch::receive`] and
@@ -68,7 +68,8 @@ pub enum Endpoint {
         path: String,
     },
     /// `http(s)://` URLs: served by the stateless smart-http client in
-    /// [`super::smart_http`] (dumb-http file fetches stay a named gap).
+    /// [`super::smart_http`] (dumb-http file fetches fall back to
+    /// [`super::dumb_http`] for fetch; push stays refused).
     Http {
         /// Whether the scheme was `https`.
         secure: bool,
@@ -190,8 +191,10 @@ fn looks_like_explicit_ssh(spec: &str) -> bool {
 
 /// The refusal for dumb-http endpoints: a server that answers `info/refs`
 /// without a smart `application/x-*-advertisement` document serves static
-/// files only, which no client here reads. Smart-http upload-pack and
-/// receive-pack are served; dumb-http is the remaining HTTP gap.
+/// files only. Fetch falls back to [`super::dumb_http`], which reads them;
+/// push has no static-file half, so it reports this refusal. Smart-http
+/// upload-pack and receive-pack are served; push over dumb-http is the
+/// remaining HTTP gap.
 #[must_use]
 pub fn dumb_http_gap(url: &str) -> GitError {
     GitError::Unsupported {

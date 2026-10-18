@@ -44,7 +44,9 @@
 //! framing-decoding response reader.
 
 pub mod archive;
+pub mod credentials;
 pub mod dumb;
+pub mod dumb_http;
 pub mod fetch;
 pub mod hooks;
 pub mod http;
