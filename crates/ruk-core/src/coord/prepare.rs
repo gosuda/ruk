@@ -48,7 +48,12 @@
 //! committed, and the exact fact expectations add point compare-and-swap
 //! as a second layer.
 
+use super::claims::ClaimClock;
+use super::clock::Clock;
 use super::hosted::PreparedMutation;
+use super::policy::Policy;
+use super::rows::SessionRow;
+use crate::attestation::Checkpoint;
 use crate::change::{RequestId, SessionId};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
@@ -61,6 +66,31 @@ use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, R
 use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked};
 use crate::store::Store;
 use crate::store::types::FactMutation;
+
+/// Inputs beyond the store that identity synthesis, timestamped signatures,
+/// claim sealing, and land plans need.
+///
+/// Every field but `store`/`session` is optional so the legacy
+/// [`prepare_mutation`] wrapper (which has no session row, clocks, policy,
+/// or gate) keeps serving the ref-only arms. An arm whose required input is
+/// absent refuses with the same named [`ErrorCode::EHosted`] reason it gave
+/// before the context existed, never with an invented value. The socket
+/// dispatch path always supplies the full context through
+/// [`HostedCoordinator::prepare_for_dispatch`](super::hosted::HostedCoordinator::prepare_for_dispatch).
+pub(crate) struct PrepareContext<'a> {
+    pub(crate) store: &'a Store,
+    pub(crate) session: SessionId,
+    /// Identity row for signature synthesis; absent on the legacy path.
+    pub(crate) session_row: Option<&'a SessionRow>,
+    /// Wall clock for signature timestamps; absent on the legacy path.
+    pub(crate) clock: Option<&'a Clock>,
+    /// Monotonic claim clock for claim sealing; absent on the legacy path.
+    pub(crate) claim_clock: Option<&'a ClaimClock>,
+    /// Admission policy for land preparation; absent on the legacy path.
+    pub(crate) policy: Option<&'a Policy>,
+    /// Progress gate for attestation verification; absent on the legacy path.
+    pub(crate) checkpoint: Option<&'a Checkpoint<'a>>,
+}
 
 /// One method's lane parts: the precomputed reply, exact facts, the checked
 /// transaction, and the ref names it was validated against.
@@ -91,6 +121,34 @@ pub fn prepare_mutation(
     session: SessionId,
     request: Request,
 ) -> Result<PreparedMutation, CoreError> {
+    // No checkpoint: the legacy path refuses every arm that needs the
+    // attestation gate, so no caller reaches verification with a no-op gate.
+    let ctx = PrepareContext {
+        store,
+        session,
+        session_row: None,
+        clock: None,
+        claim_clock: None,
+        policy: None,
+        checkpoint: None,
+    };
+    prepare_mutation_with(&ctx, request)
+}
+
+/// Translates one bare mutation [`Request`] into lane-ready parts with the
+/// full coordinator context.
+///
+/// This is the entry the socket dispatch path uses; arms that need identity,
+/// time, policy, or the attestation gate serve only here, while the
+/// ref-only arms behave identically under both entries.
+///
+/// # Errors
+/// Same as [`prepare_mutation`], plus the named `E_HOSTED` refusal of any
+/// arm whose required context input is absent.
+pub(crate) fn prepare_mutation_with(
+    ctx: &PrepareContext<'_>,
+    request: Request,
+) -> Result<PreparedMutation, CoreError> {
     let method = request.method();
     let looks_mutation = request.request_id().is_some();
     if !looks_mutation {
@@ -103,13 +161,11 @@ pub fn prepare_mutation(
         ));
     }
     let parts = match &request {
-        Request::BookmarkSet(m) => bookmark_set_parts(store, session, m.request_id, &m.args)?,
-        Request::BookmarkDelete(m) => bookmark_delete_parts(store, session, m.request_id, &m.args)?,
-        Request::BookmarkResolve(m) => {
-            bookmark_resolve_parts(store, session, m.request_id, &m.args)?
-        }
-        Request::TagSet(m) => tag_set_parts(store, session, m.request_id, &m.args)?,
-        Request::TagDelete(m) => tag_delete_parts(store, session, m.request_id, &m.args)?,
+        Request::BookmarkSet(m) => bookmark_set_parts(ctx, m.request_id, &m.args)?,
+        Request::BookmarkDelete(m) => bookmark_delete_parts(ctx, m.request_id, &m.args)?,
+        Request::BookmarkResolve(m) => bookmark_resolve_parts(ctx, m.request_id, &m.args)?,
+        Request::TagSet(m) => tag_set_parts(ctx, m.request_id, &m.args)?,
+        Request::TagDelete(m) => tag_delete_parts(ctx, m.request_id, &m.args)?,
         Request::New(_) => {
             return Err(uncovered(
                 "new",
@@ -181,7 +237,7 @@ pub fn prepare_mutation(
         ));
     };
     Ok(PreparedMutation {
-        session,
+        session: ctx.session,
         request_id,
         request,
         reply: parts.reply,
@@ -235,11 +291,12 @@ fn check_ref_update(
 }
 
 fn bookmark_set_parts(
-    store: &Store,
-    session: SessionId,
+    ctx: &PrepareContext<'_>,
     request_id: RequestId,
     args: &BookmarkSetArgs,
 ) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
     let BookmarkTarget::Commit { oid } = &args.target else {
         return Err(uncovered(
             "bookmark.set",
@@ -268,11 +325,12 @@ fn bookmark_set_parts(
 }
 
 fn bookmark_delete_parts(
-    store: &Store,
-    session: SessionId,
+    ctx: &PrepareContext<'_>,
     request_id: RequestId,
     args: &BookmarkDeleteArgs,
 ) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
     let name = args.name.clone();
     let (facts, transaction) = check_ref_update(
         store,
@@ -293,11 +351,12 @@ fn bookmark_delete_parts(
 }
 
 fn bookmark_resolve_parts(
-    store: &Store,
-    session: SessionId,
+    ctx: &PrepareContext<'_>,
     request_id: RequestId,
     args: &BookmarkResolveArgs,
 ) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
     // No caller-supplied ref expectation exists for a resolve; the conflict
     // terms are the compare-and-swap, checked and lowered in a single read
     // so the terms and the clear expectation cannot disagree.
@@ -327,11 +386,12 @@ fn bookmark_resolve_parts(
 }
 
 fn tag_set_parts(
-    store: &Store,
-    session: SessionId,
+    ctx: &PrepareContext<'_>,
     request_id: RequestId,
     args: &TagSetArgs,
 ) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
     if args.annotation.is_some() {
         return Err(uncovered(
             "tag.set",
@@ -360,11 +420,12 @@ fn tag_set_parts(
 }
 
 fn tag_delete_parts(
-    store: &Store,
-    session: SessionId,
+    ctx: &PrepareContext<'_>,
     request_id: RequestId,
     args: &TagDeleteArgs,
 ) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
     let name = args.name.clone();
     let (facts, transaction) = check_ref_update(
         store,

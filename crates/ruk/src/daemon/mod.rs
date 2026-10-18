@@ -624,7 +624,7 @@ pub fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::read (op.log, claim.list, attest.list first pages served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
-            "ruk_core::coord::prepare_mutation plus HostedCoordinator::submit_prepared (ref mutations covered; the rest name their missing preparation)"
+            "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref mutations covered; the rest name their missing preparation)"
         }
     }
 }
@@ -2097,9 +2097,10 @@ async fn open_inner(
 /// `schema` answers locally. `session.open` opens a real session for the
 /// peer principal and answers the honest subset the coordinator returns;
 /// `session.resume` answers the full negotiated reply. Reads run through
-/// `HostedCoordinator::read` and mutations through `prepare_mutation` plus
-/// `submit_prepared`, both under the invocation's session; a missing
-/// session refuses, and uncovered methods name their missing path.
+/// `HostedCoordinator::read` and mutations through
+/// `HostedCoordinator::prepare_for_dispatch` plus `submit_prepared`, both
+/// under the invocation's session; a missing session refuses, and
+/// uncovered methods name their missing path.
 ///
 /// # Errors
 /// `E_INVALID` for an unknown shape or a session-bound method without a
@@ -2179,8 +2180,13 @@ pub async fn dispatch_method(
                     coordinator
                         .check_session(principal, session, cancel)
                         .await?;
+                    // The attestation gate follows invocation cancellation:
+                    // a cancelled call stops verification instead of
+                    // publishing rows it no longer waits for.
+                    let checkpoint =
+                        |_: ruk_core::attestation::Progress| cancel.check();
                     let prepared =
-                        ruk_core::coord::prepare_mutation(coordinator.store(), session, request)?;
+                        coordinator.prepare_for_dispatch(session, request, &checkpoint)?;
                     let request_id = prepared.request_id;
                     let reply = coordinator
                         .submit_prepared(principal, prepared, cancel)
