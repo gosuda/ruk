@@ -447,6 +447,114 @@ fn clone_fetch_push_local_cycle() {
 }
 
 #[test]
+fn receive_pack_enforces_store_lfs_policy() {
+    use ruk_core::store::types::ObjectKind;
+    use ruk_git::transport::Interrupt;
+    use ruk_git::transport::pack::{PackEntry, write_pack};
+    use ruk_git::transport::pktline::{Packet, decode_frame, encode_data};
+
+    const POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d0b46e9c\nsize 14\n";
+
+    fn pointer_pack(kind: HashKind) -> (String, Vec<u8>) {
+        let blob = kind.hash_git_object("blob", POINTER).expect("blob id");
+        let mut tree = b"100644 asset.bin\0".to_vec();
+        tree.extend_from_slice(blob.as_bytes());
+        let tree_id = kind.hash_git_object("tree", &tree).expect("tree id");
+        let commit = format!(
+            "tree {}\nauthor T <t@example.invalid> 0 +0000\ncommitter T <t@example.invalid> 0 +0000\n\npointer\n",
+            tree_id.to_hex()
+        );
+        let commit_id = kind
+            .hash_git_object("commit", commit.as_bytes())
+            .expect("commit id");
+        let entries = [
+            (blob, ObjectKind::Blob, POINTER.to_vec()),
+            (tree_id, ObjectKind::Tree, tree),
+            (commit_id, ObjectKind::Commit, commit.into_bytes()),
+        ];
+        let pack_entries: Vec<PackEntry<'_>> = entries
+            .iter()
+            .map(|(oid, kind, bytes)| PackEntry {
+                oid: *oid,
+                kind: *kind,
+                bytes,
+                base: None,
+            })
+            .collect();
+        let mut pack = Vec::new();
+        write_pack(&mut pack, kind, &pack_entries, &Interrupt::none()).expect("pack");
+        (commit_id.to_hex(), pack)
+    }
+
+    fn push_input(tip: &str, zero: &str, pack: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        encode_data(
+            &mut input,
+            format!("{zero} {tip} refs/heads/lfs\0report-status\n").as_bytes(),
+        )
+        .expect("frame");
+        input.extend_from_slice(b"0000");
+        input.extend_from_slice(pack);
+        input
+    }
+
+    fn report_lines(report: &[u8]) -> Vec<Vec<u8>> {
+        let mut bytes = report;
+        let mut sections = Vec::new();
+        for _ in 0..2 {
+            let mut lines = Vec::new();
+            loop {
+                let (packet, consumed) = decode_frame(bytes).expect("frame").expect("complete");
+                bytes = &bytes[consumed..];
+                match packet {
+                    Packet::Flush => break,
+                    Packet::Data(payload) => lines.push(payload.to_vec()),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            sections.push(lines);
+        }
+        sections.into_iter().nth(1).expect("report section")
+    }
+
+    let (root, _) = seeded_repo("lfs-policy", "l.txt", b"l\n");
+    let mut ctx = repo_ctx(&root, test_env(&root));
+    let kind = ctx.kind().expect("kind");
+    let (tip, pack) = pointer_pack(kind);
+    let zero = kind.zero_oid().to_hex();
+    // Default: no policy.toml, so pointers are refused.
+    ctx.env.stdin = Some(push_input(&tip, &zero, &pack));
+    let report = run(verbs_transport::receive_pack, &mut ctx, &[]).expect("receive reports ng");
+    let lines = report_lines(&report);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], b"unpack ok\n".to_vec());
+    assert!(
+        lines[1].starts_with(b"ng refs/heads/lfs "),
+        "got {:?}",
+        lines[1]
+    );
+    assert!(
+        String::from_utf8_lossy(&lines[1]).contains("E_UNSUPPORTED_LFS"),
+        "got {:?}",
+        lines[1]
+    );
+    // Opt-in: `lfs = "pointers"` records the bytes plainly.
+    std::fs::write(
+        root.join(".ruk").join("policy.toml"),
+        "version = 1\nlfs = \"pointers\"\n",
+    )
+    .expect("policy");
+    ctx.env.stdin = Some(push_input(&tip, &zero, &pack));
+    let report = run(verbs_transport::receive_pack, &mut ctx, &[]).expect("receive accepts");
+    let lines = report_lines(&report);
+    assert_eq!(
+        lines,
+        vec![b"unpack ok\n".to_vec(), b"ok refs/heads/lfs\n".to_vec()]
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn unsupported_verbs_report_closed_codes() {
     let base = temp_base("unsupported");
     let env = test_env(&base);

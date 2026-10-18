@@ -26,6 +26,7 @@ use ruk_core::ids::Oid;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::StoreRefs;
 use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
+use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
 use ruk_git::transport::pack::IngestLimits;
@@ -603,10 +604,19 @@ pub(crate) fn receive_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     let store = serve_store(ctx, args)?;
     let kind = store.hash_kind();
     let head = serve_head(&store)?;
+    let lfs = serve_lfs_mode(ctx, args);
     match ctx.env.stdin.as_deref() {
         Some(input) => {
             let mut out = Vec::new();
-            serve_receive_pack(input, &mut out, &store, kind, &head, &Interrupt::none())?;
+            serve_receive_pack(
+                input,
+                &mut out,
+                &store,
+                kind,
+                &head,
+                &Interrupt::none(),
+                lfs,
+            )?;
             Ok(out)
         }
         // Live pipes stream the advertisement and report straight to
@@ -627,8 +637,56 @@ pub(crate) fn receive_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
                 kind,
                 &head,
                 &Interrupt::none(),
+                lfs,
             )?;
             Ok(Vec::new())
+        }
+    }
+}
+
+/// Reads the LFS pointer policy for one serve verb: the `lfs` key of the
+/// store's `policy.toml`, resolved from the same repository directory the
+/// serve store comes from. Missing or unreadable policy fails closed to
+/// [`LfsMode::Deny`], the store default.
+fn serve_lfs_mode(ctx: &Ctx, args: &[String]) -> LfsMode {
+    serve_store_root(ctx, args)
+        .map(|root| mode_for_store(&root))
+        .unwrap_or_default()
+}
+
+/// Resolves the store directory one serve verb runs against: `<dir>/.ruk`
+/// (or `<dir>` itself for a bare store path) when the positional names it,
+/// else the first ancestor of the context root holding `.ruk`, mirroring
+/// [`serve_store`] discovery.
+fn serve_store_root(ctx: &Ctx, args: &[String]) -> Option<std::path::PathBuf> {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut dashdash = false;
+    for arg in args {
+        if dashdash {
+            positionals.push(arg);
+        } else if arg == "--" {
+            dashdash = true;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            continue;
+        } else {
+            positionals.push(arg);
+        }
+    }
+    if let Some(dir) = positionals.first() {
+        let path = std::path::Path::new(dir);
+        if path.join(".ruk").is_dir() {
+            return Some(path.join(".ruk"));
+        }
+        return Some(path.to_path_buf());
+    }
+    let mut dir = ctx.root.as_path();
+    loop {
+        if dir.join(".ruk").is_dir() {
+            return Some(dir.join(".ruk"));
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return None,
         }
     }
 }

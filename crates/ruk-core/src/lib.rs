@@ -52,3 +52,4 @@ pub use error::{CoreError, CoreModelError, ErrorCode, ExitClass};
 pub use heads::Head;
 pub use ids::{CommitKey, HashKind, Oid};
 pub use store::{PreparationBudget, Store, StoreError};
+pub use workcopy::lfs::{LfsMode, is_pointer, mode_for_store};

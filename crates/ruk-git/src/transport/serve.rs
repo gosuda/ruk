@@ -45,14 +45,14 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 
+use ruk_core::LfsMode;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
 use ruk_core::store::{FactMutation, Store};
-use ruk_core::LfsMode;
 
 use super::fetch::{commit_record_facts, verify_closure};
-use super::lfs::refusals_for_live;
 use super::hooks::{Quarantine, ReceiveHooks, run_hook, stage_quarantine};
+use super::lfs::refusals_for_live;
 use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, write_pack};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush, send};
 use super::proc_receive::{
@@ -668,12 +668,11 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     // pointer blob refuses exactly the live ref updates reaching it, with
     // the same in-band `ng` shape as hook refusals. This runs before
     // quarantine staging, so refused pushes never materialize.
-    if staged.is_some() {
+    if let Some(staged_pack) = staged.as_ref() {
         let live_tips: Vec<(usize, Oid)> = live
             .iter()
             .map(|(index, update)| (*index, update.new))
             .collect();
-        let staged_pack = staged.as_ref().expect("pack was ingested above");
         match refusals_for_live(store, staged_pack, kind, lfs, &live_tips, interrupt) {
             Ok(refusals) => {
                 for (index, reason) in refusals {
@@ -2088,15 +2087,9 @@ pub fn serve_command<R: Read, W: Write>(
         "upload-pack" => serve_upload_pack(reader, writer, store, kind, head, interrupt),
         // No repository directory travels with a bare command dispatch, so
         // no policy file is readable: fail closed to pointer refusal.
-        "receive-pack" => serve_receive_pack(
-            reader,
-            writer,
-            store,
-            kind,
-            head,
-            interrupt,
-            LfsMode::Deny,
-        ),
+        "receive-pack" => {
+            serve_receive_pack(reader, writer, store, kind, head, interrupt, LfsMode::Deny)
+        }
         "upload-archive" => {
             super::archive::serve_upload_archive(reader, writer, store, kind, head, interrupt)
         }

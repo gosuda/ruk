@@ -12,6 +12,8 @@
 //! [`LfsMode::Pointers`] (`lfs = "pointers"` in `policy.toml`) treats the
 //! bytes as ordinary content and never fetches payloads.
 
+use std::path::Path;
+
 use crate::error::{CoreError, ErrorCode};
 
 /// Upper bound on a Git LFS pointer file: strictly below 1024 bytes.
@@ -26,7 +28,7 @@ const SHA256_HEX_DIGITS: usize = 64;
 /// How the store treats a pointer-shaped blob.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum LfsMode {
+pub enum LfsMode {
     /// Pointer-shaped blobs are `E_UNSUPPORTED_LFS` in both directions.
     #[default]
     Deny,
@@ -41,7 +43,7 @@ pub(crate) enum LfsMode {
 /// the `oid sha256:` line, the `size` line, and at most one trailing empty
 /// line from a final newline. Any other content, ordering, or total size
 /// at or above [`MAX_POINTER_BYTES`] is not a pointer.
-pub(crate) fn is_pointer(bytes: &[u8]) -> bool {
+pub fn is_pointer(bytes: &[u8]) -> bool {
     // usize is at most 64 bits, so widening to u64 is lossless.
     if bytes.len() as u64 >= MAX_POINTER_BYTES {
         return false;
@@ -79,6 +81,30 @@ fn parse_size(line: &[u8]) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
 }
 
+/// Reads the LFS mode the store at `store_root` declares: the `lfs` key of
+/// `<store_root>/policy.toml`, the same file
+/// [`crate::coord`](crate::coord) parses as the coordinator policy.
+/// Transport servers (receive-pack) cannot resolve a coordinator owner,
+/// so this reads only the `lfs` key instead of the full policy; the key
+/// spelling and values stay canonical in
+/// `coord/policy.rs`, which this mirrors.
+///
+/// Fail-closed: a missing, unreadable, or unparseable file is
+/// [`LfsMode::Deny`], the same default a policy without the key selects.
+#[must_use]
+pub fn mode_for_store(store_root: &Path) -> LfsMode {
+    #[derive(serde::Deserialize)]
+    struct LfsKey {
+        #[serde(default)]
+        lfs: LfsMode,
+    }
+    std::fs::read(store_root.join("policy.toml"))
+        .ok()
+        .and_then(|bytes| toml::from_slice::<LfsKey>(&bytes).ok())
+        .map(|key| key.lfs)
+        .unwrap_or_default()
+}
+
 /// The error a pointer-shaped blob raises under [`LfsMode::Deny`].
 pub(crate) fn unsupported(path: &[u8]) -> CoreError {
     CoreError::new(
@@ -102,6 +128,29 @@ mod tests {
     #[test]
     fn canonical_pointer_matches() {
         assert!(is_pointer(&pointer()));
+    }
+
+    #[test]
+    fn mode_for_store_reads_the_lfs_key_and_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-lfs-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // Missing file is the store default.
+        assert_eq!(mode_for_store(&dir), LfsMode::Deny);
+        std::fs::write(dir.join("policy.toml"), "version = 1\nlfs = \"pointers\"\n")
+            .expect("policy");
+        assert_eq!(mode_for_store(&dir), LfsMode::Pointers);
+        std::fs::write(dir.join("policy.toml"), "version = 1\n").expect("policy");
+        assert_eq!(mode_for_store(&dir), LfsMode::Deny);
+        std::fs::write(dir.join("policy.toml"), "not toml [[[\n").expect("policy");
+        assert_eq!(mode_for_store(&dir), LfsMode::Deny);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
