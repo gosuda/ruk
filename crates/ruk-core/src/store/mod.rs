@@ -79,7 +79,7 @@ use crate::change::StoreId;
 use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
 use metadata::{Metadata, PublicationTxn};
-use recovery::{Committed, OpenSegment, Recovered};
+use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
 use segment::SegmentWriter;
 
 /// Longest delta chain accepted on write and read.
@@ -139,6 +139,9 @@ pub struct Store {
     budget: Arc<PreparationBudget>,
     guards: Arc<GenerationRegistry>,
     writer: Mutex<WriterState>,
+    /// Read-only descriptors for committed segments, opened once per id and
+    /// shared by every read through positional I/O. Dropped with the store.
+    segment_fds: SegmentFileCache,
     /// Serializes whole compaction passes against each other. Publications
     /// never take it; the swap takes the writer lock beneath it.
     compaction_lock: Mutex<()>,
@@ -339,12 +342,14 @@ impl Store {
         budget.register_scratch(root)?;
         let generation = meta.generation()?;
         let guards = Arc::new(GenerationRegistry::new(generation));
+        let segment_fds = SegmentFileCache::default();
         let committed = Committed {
             root,
             kind: format.kind,
             meta: &meta,
             budget: &budget,
             guards: &guards,
+            files: &segment_fds,
         };
         let recovered = match recovery::run(&committed) {
             Ok(recovered) => recovered,
@@ -358,9 +363,12 @@ impl Store {
                 return Err(err);
             }
         };
-        Ok(Self::assemble(
-            root, format, meta, budget, guards, recovered,
-        ))
+        // The recovery pass above warmed `segment_fds` (one open per sealed
+        // segment); the assembled store keeps warming it instead of
+        // reopening those segments on first serve.
+        let mut store = Self::assemble(root, format, meta, budget, guards, recovered);
+        store.segment_fds = segment_fds;
+        Ok(store)
     }
 
     fn assemble(
@@ -378,6 +386,7 @@ impl Store {
             io: IoCounters::default(),
             budget,
             guards,
+            segment_fds: SegmentFileCache::default(),
             writer: Mutex::new(WriterState {
                 active: None,
                 resume: recovered.open,
@@ -432,6 +441,7 @@ impl Store {
             meta: &self.meta,
             budget: &self.budget,
             guards: &self.guards,
+            files: &self.segment_fds,
         }
     }
 
@@ -1394,12 +1404,14 @@ mod tests {
             let generation = meta.generation().expect("healthy generation");
             let guards = Arc::new(GenerationRegistry::new(generation));
             shared.register_scratch(&root).expect("scratch accounting");
+            let files = SegmentFileCache::default();
             let committed = Committed {
                 root: &root,
                 kind: format.kind,
                 meta: &meta,
                 budget: &shared,
                 guards: &guards,
+                files: &files,
             };
             recovery::run(&committed).expect("healthy store recovers")
         };

@@ -479,12 +479,14 @@ mod tests {
         raw_put_object(&meta_path, oid.as_bytes(), &[]);
 
         let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
+        let files = crate::store::recovery::SegmentFileCache::default();
         let committed = crate::store::recovery::Committed {
             root: &store_dir,
             kind: HashKind::Sha1,
             meta: &meta,
             budget: &budget,
             guards: &reg,
+            files: &files,
         };
 
         // Decode using captured snapshot
@@ -539,12 +541,14 @@ mod tests {
         raw_put_segment(&meta_path, seg_id, &encoded_manifest);
 
         let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
+        let files = crate::store::recovery::SegmentFileCache::default();
         let committed = crate::store::recovery::Committed {
             root: &store_dir,
             kind: HashKind::Sha1,
             meta: &meta,
             budget: &budget,
             guards: &reg,
+            files: &files,
         };
 
         // Decode using captured snapshot: uses captured non-retired manifest!
