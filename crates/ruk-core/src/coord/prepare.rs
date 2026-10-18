@@ -54,7 +54,7 @@
 //! caller-resolved tree per root and keeps stale descendant trees, so the
 //! translator stages the whole moved set through one record batch preparer
 //! instead); `squash` moves selected paths (or all) from a single-child source
-//! into its destination, keeping the source's remainder and re-deriving its
+//! into its destination, keeping the source's tree and re-deriving its
 //! descendants; `split` partitions one change by path; and `abandon` re-parents
 //! descendants onto the abandoned commits' parents in the same batch as the
 //! change-state transitions (merge-commit targets need fan-in parent
@@ -2548,8 +2548,8 @@ fn single_parent_tree(store: &Store, record: &CommitRecord, method: &str) -> Res
 }
 
 /// Prepares `squash`: moves the selected paths of a source's delta into its
-/// destination parent. The source keeps its remainder; it is dropped only when
-/// emptied and `keep_empty` is false.
+/// destination parent. The source keeps its tree; it is dropped only when
+/// emptied (its tree already equals the moved tree) and `keep_empty` is false.
 ///
 /// The source must be a direct only child of the destination, so the
 /// destination's tree is the source's parent tree and the move is one
@@ -2629,12 +2629,13 @@ fn squash_parts(
             "method `squash` moves nothing: the destination already carries the source content",
         ));
     }
-    let remainder = apply_delta(store, source_tree, source_tree, destination_tree, selection)?;
-    // The source is emptied when its remainder equals the destination; an
-    // emptied source is dropped unless the caller keeps it.
-    let keep_source = args.keep_empty || remainder.root != destination_tree;
+    // The kept source keeps its own tree: the moved selection already lives on
+    // the new destination below it, so the source is emptied exactly when its
+    // tree equals the moved tree. Reverting the selected paths to the old
+    // destination (a "remainder") would revert the moved paths in the source
+    // and in every descendant re-derived onto it.
+    let keep_source = args.keep_empty || moved.root != source_tree;
     let mut objects = moved.objects;
-    push_unique(&mut objects, remainder.objects);
     let message = match &args.description {
         Some(description) => description.clone(),
         None => ByteString::from(destination.record.message()),
@@ -2667,13 +2668,13 @@ fn squash_parts(
     if keep_source {
         let source_input = preserved_input(
             &source.record,
-            Merge::resolved(remainder.root),
+            Merge::resolved(source_tree),
             vec![new_destination],
             Some(source.head),
         )?;
         let kept = preparer.add_native_commit(source_input)?;
         head_map.insert(source.head, kept);
-        new_trees.insert(kept, remainder.root);
+        new_trees.insert(kept, source_tree);
         staged.push(StagedRewrite {
             change: source.change,
             old: source.head,
@@ -6427,12 +6428,11 @@ mod tests {
     }
 
     #[test]
-    fn squash_selected_path_keeps_the_remainder_as_the_source() {
+    fn squash_selected_path_keeps_the_source_tree() {
         let (_temp, store, session) = fixture();
         let parent_tree = seed_files(&store, &[("x", 1), ("y", 1)]);
         let source_tree = seed_files(&store, &[("x", 2), ("y", 2)]);
         let moved_tree = seed_files(&store, &[("x", 2), ("y", 1)]);
-        let remainder_tree = seed_files(&store, &[("x", 1), ("y", 2)]);
         let (dhead, dchange) =
             seed_child_on_tree(&store, parent_tree, Vec::new(), None, "destination");
         let (shead, schange) =
@@ -6478,7 +6478,11 @@ mod tests {
             .get_commit(&new_source)
             .expect("read source")
             .expect("source is stored");
-        assert_eq!(source_commit.tree().as_resolved(), Some(&remainder_tree));
+        // The kept source keeps its own tree: the moved selection lives on the
+        // new destination below it, so the tip still carries the moved paths.
+        // A remainder (selected paths reverted to the old destination) would
+        // revert the moved change in the source and every descendant.
+        assert_eq!(source_commit.tree().as_resolved(), Some(&source_tree));
         assert_eq!(source_commit.parents(), &[new_destination]);
     }
 
