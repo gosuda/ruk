@@ -302,7 +302,10 @@ impl Store {
     ///
     /// Recovery validates every committed segment extent, truncates only an
     /// open segment's uncommitted tail, and verifies every committed object
-    /// identity. Missing or damaged committed bytes refuse the open.
+    /// identity unless the stored verified generation already covers the
+    /// current one (see the recovery module docs for the caching contract).
+    /// Missing or damaged committed bytes found by the passes that run
+    /// refuse the open.
     ///
     /// Once the metadata database is owned, and before recovery or any
     /// return, the validated format file is flushed again, and on POSIX the
@@ -1198,7 +1201,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::metadata_tests::{raw_put_object, raw_put_segment};
+    use super::metadata_tests::{raw_bump_generation, raw_put_object, raw_put_segment};
     use super::*;
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -2089,6 +2092,10 @@ mod tests {
         let acknowledged = std::fs::read(segment_file(&temp, 0)).expect("segment bytes");
         let store = reopen_over_damage(&temp, |meta| {
             raw_put_object(meta, seeded.victim.as_bytes(), &[0xFF; 3]);
+            // Row surgery alone leaves the verified generation covering the
+            // store, which a cached open would skip; the bump models damage
+            // from an unverified generation, which recovery must refuse.
+            raw_bump_generation(meta);
         });
 
         let err = store

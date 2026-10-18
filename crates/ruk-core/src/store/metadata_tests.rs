@@ -7,7 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use redb::{Database, MultimapTableDefinition, ReadableDatabase, TableDefinition, TableHandle};
+use redb::{
+    Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition,
+    TableHandle,
+};
 
 use std::sync::Arc;
 
@@ -278,6 +281,25 @@ pub(super) fn raw_put_segment(path: &Path, key: u64, value: &[u8]) {
     {
         let mut table = txn.open_table(RAW_SEGMENTS).expect("raw segments");
         table.insert(key, value).expect("raw insert");
+    }
+    txn.commit().expect("raw commit");
+}
+
+/// Advances the stored locator generation by one without recording it as
+/// verified, so the next recovery treats the generation as unverified.
+/// Tests use this alongside row surgery to model committed-state damage a
+/// cached open must still detect.
+pub(super) fn raw_bump_generation(path: &Path) {
+    let db = Database::open(path).expect("raw open");
+    let txn = db.begin_write().expect("raw write");
+    {
+        let mut table = txn.open_table(RAW_GENERATION).expect("raw generation");
+        let current: u64 = table
+            .get(())
+            .expect("raw get")
+            .map(|guard| guard.value())
+            .unwrap_or(0);
+        table.insert((), current + 1).expect("raw insert");
     }
     txn.commit().expect("raw commit");
 }

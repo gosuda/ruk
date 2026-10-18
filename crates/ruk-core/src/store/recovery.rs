@@ -12,16 +12,39 @@
 //!
 //! 1. every non-retired manifest's segment file must exist, hold at least
 //!    its committed extent, and contain only valid records (and, when
-//!    sealed, an intact footer and exactly its committed length);
+//!    sealed, an intact footer and exactly its committed length). This
+//!    manifest pass runs on every open;
 //! 2. an open segment's uncommitted tail, and only that, is truncated, after
 //!    the committed prefix verified;
 //! 3. every committed locator is resolved and its object identity verified
-//!    with bounded memory, paged so no metadata read spans payload I/O.
+//!    with bounded memory, paged so no metadata read spans payload I/O —
+//!    but only when the stored verified generation does not already cover
+//!    the current one (see below).
 //!
-//! Any missing or damaged committed byte is [`StoreError::Corrupt`]; the
-//! store does not open. Unknown files in the segment directory are never
-//! read, repaired, or deleted: a crash can orphan a created segment file and
-//! the append owner skips its name instead.
+//! Step 3 is cached, steps 1 and 2 are not. Recovery compares the committed
+//! locator generation against the `verified_generation` recorded in
+//! metadata by the last successful verification pass. When they match, the
+//! object identities were already proven for exactly this committed state
+//! and the pass is skipped; after a verification pass succeeds, recovery
+//! commits `verified_generation = generation` before returning, so the next
+//! open with no intervening publication skips it. Publication advances the
+//! generation without marking it verified, so the first open after a
+//! publish always pays the full verification: the cost lands on the
+//! writer's next open, amortized across the reads that follow.
+//!
+//! The trade-off is explicit: silent corruption that lands after a
+//! generation was verified, and leaves every segment record checksum
+//! intact (for example locator-row surgery in the metadata database),
+//! evades a cached open. Segment-file damage is still caught on every open
+//! by the manifest pass, every served read still verifies the chain it
+//! touches, and any generation the cache has not covered is fully
+//! verified.
+//!
+//! Any missing or damaged committed byte found by the passes that run is
+//! [`StoreError::Corrupt`]; the store does not open. Unknown files in the
+//! segment directory are never read, repaired, or deleted: a crash can
+//! orphan a created segment file and the append owner skips its name
+//! instead.
 
 use std::fs::File;
 use std::io::{self, BufReader};
@@ -244,7 +267,11 @@ pub(super) fn run(committed: &Committed<'_>) -> Result<Recovered, StoreError> {
             ));
         }
     }
-    verify_objects(committed)?;
+    let generation = committed.meta.generation()?;
+    if committed.meta.verified_generation()? != Some(generation) {
+        verify_objects(committed, generation)?;
+        committed.meta.set_verified_generation(generation)?;
+    }
     Ok(Recovered {
         next_segment_id,
         open,
@@ -283,8 +310,9 @@ fn verify_segment(
 }
 
 /// Verifies every committed object identity, one metadata page at a time.
-fn verify_objects(committed: &Committed<'_>) -> Result<(), StoreError> {
-    let generation = committed.meta.generation()?;
+/// Callers invoke this only for generations the verification cache does not
+/// cover; on success they record the generation as verified.
+fn verify_objects(committed: &Committed<'_>, generation: u64) -> Result<(), StoreError> {
     let mut after: Option<Oid> = None;
     loop {
         let page = committed.meta.object_page(after.as_ref(), VERIFY_PAGE)?;
