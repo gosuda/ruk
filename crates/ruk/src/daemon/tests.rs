@@ -1540,10 +1540,10 @@ async fn typed_describe_rewrites_message() {
     task.abort();
 }
 
-/// Socket-level proof that `split` stays honestly refused: partitioning by
-/// paths needs intermediate-tree derivation with no producer on this path.
+/// Socket-level proof that `split` reaches preparation and refuses an unstored
+/// source by name: the source resolves before any tree is derived.
 #[tokio::test]
-async fn typed_split_refusal_names_tree_derivation() {
+async fn typed_split_of_unstored_change_refuses_not_found() {
     let root = temp_root("typed-split");
     let repo_dir = root.join("repo");
     std::fs::create_dir_all(&repo_dir).expect("repo dir");
@@ -1595,10 +1595,10 @@ async fn typed_split_refusal_names_tree_derivation() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(5, &payload).await;
-    assert_eq!(report.code, "E_HOSTED");
+    assert_eq!(report.code, "E_NOT_FOUND");
     assert!(
-        report.message.contains("ops/tree_edit.rs"),
-        "split names its missing producer: {}",
+        report.message.contains("is not stored"),
+        "split resolves its source before partitioning: {}",
         report.message
     );
 
