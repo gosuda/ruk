@@ -442,9 +442,12 @@ fn spawn_retention(
     });
 }
 
-impl Drop for Registry {
-    /// Retires every hosted coordinator through `shutdown`.
-    fn drop(&mut self) {
+impl Registry {
+    /// Retires every hosted coordinator through `shutdown`: each lane
+    /// closes to new submissions, in-flight and queued work drains, and
+    /// each store handle flushes. Idempotent: shutting down twice retires
+    /// nothing the second time beyond repeating the idempotent calls.
+    pub fn shutdown_all(&self) {
         let retired: Vec<Arc<HostedCoordinator>> = self
             .inner
             .lock()
@@ -459,6 +462,13 @@ impl Drop for Registry {
         for coordinator in retired {
             coordinator.shutdown();
         }
+    }
+}
+
+impl Drop for Registry {
+    /// Retires every hosted coordinator through `shutdown`.
+    fn drop(&mut self) {
+        self.shutdown_all();
     }
 }
 
@@ -591,6 +601,43 @@ mod tests {
             1
         );
         assert!(registry.is_empty().expect("registry lock holds"));
+    }
+
+    #[test]
+    fn shutdown_all_retires_coordinators() {
+        use ruk_core::HashKind;
+        use ruk_core::coord::cancellation;
+        use ruk_core::error::ErrorCode;
+        use ruk_core::store::{PreparationBudget, Store};
+        use std::sync::Arc;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        Store::create(
+            &root.join("repo-a"),
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("scratch store initializes");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+        let handle = registry
+            .open_by_path(&root.join("repo-a"))
+            .expect("inside path opens");
+        let (_, _, coordinator) = registry.open(&handle).expect("open coordinates");
+        let (_guard, cancel) = cancellation();
+        runtime
+            .block_on(coordinator.retention_sweep(&cancel))
+            .expect("sweep serves before shutdown");
+        registry.shutdown_all();
+        let refused = runtime
+            .block_on(coordinator.retention_sweep(&cancel))
+            .expect_err("sweep after shutdown is refused");
+        assert_eq!(refused.code, ErrorCode::ECancelled);
+        drop(coordinator);
+        registry.shutdown_all();
     }
 
     #[test]

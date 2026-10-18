@@ -1124,3 +1124,48 @@ fn test_11_fail_closed_ambiguous_storage_error() {
     let err = lane.check_open().unwrap_err();
     assert_eq!(err.code, ErrorCode::ECoordinatorUnresponsive);
 }
+
+#[tokio::test]
+async fn test_12_shutdown_drains_queued_submissions() {
+    use crate::coord::cancel::cancellation;
+
+    let temp = TempRoot::new("shutdown-drain");
+    let store = Arc::new(test_store(&temp));
+    let clock = Clock::system();
+    let session_table = SessionTable::new(clock.clone());
+    let principal = Principal::from_peer_uid(1000);
+    let policy_source = Arc::new(PolicySource::open(&temp.store_dir(), principal.clone()));
+    let (lane, runner) = create_publication_lane(store, session_table, policy_source, clock);
+
+    let mut tasks = Vec::new();
+    for _ in 0..3 {
+        let lane = lane.clone();
+        tasks.push(tokio::spawn(async move {
+            let (_guard, cancel) = cancellation();
+            let candidate =
+                InternalCandidate::new(InternalPayload::Maintenance, Vec::new(), cancel, None)
+                    .expect("maintenance candidate");
+            lane.submit_internal(candidate).await
+        }));
+    }
+    // Every submission must reach the lane queue before shutdown: the
+    // channel is buffered, so one scheduling quantum each is ample, and
+    // the drain below only promises what is already queued.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    lane.close();
+    // Fire shutdown cancellation before the runner starts: the loop exits
+    // at once, so every reply below proves the post-loop drain committed.
+    let (run_handle, run_cancel) = cancellation();
+    drop(run_handle);
+    let outcome = runner.run(run_cancel).await;
+    assert_eq!(
+        outcome.unwrap_err().code,
+        ErrorCode::ECancelled,
+        "a cancelled run still reports cancellation"
+    );
+    for task in tasks {
+        task.await
+            .expect("submission task joins")
+            .expect("queued submission drains instead of failing");
+    }
+}

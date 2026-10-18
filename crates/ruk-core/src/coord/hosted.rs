@@ -30,7 +30,7 @@ use tokio::time::Instant;
 
 use super::admission::{
     Admission, AdmissionLimits, AdmissionRequest, Admitted, RepoAdmission, RequestClass,
-    WorkResources,
+    WorkResources, run_blocking,
 };
 pub use super::cancel::{Cancel, CancelHandle, cancellation};
 use super::claims::{
@@ -65,6 +65,7 @@ use crate::protocol::{
     SessionResumeReply, Timestamp, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
+use crate::store::CompactionStats;
 use crate::store::FactPageBudget;
 use crate::store::Store;
 use crate::store::types::{FactMutation, FactTable, PreparedObject};
@@ -233,10 +234,16 @@ impl HostedCoordinator {
     /// Orders lane drain and runner return.
     ///
     /// Closes the lane to new submissions and cancels the runner's blocking
-    /// waits. In-flight batches still settle under sole publication ownership.
+    /// waits. In-flight batches still settle under sole publication ownership
+    /// (each batch commits under its own uncancelled token), and queued
+    /// submissions drain before the runner returns. The store handle
+    /// retires best-effort: every committed byte was already synced by its
+    /// publication, so a flush failure here reports nothing new and the
+    /// next open truncates any uncommitted tail during recovery.
     pub fn shutdown(&self) {
         self.lane.close();
         self.shutdown_handle.cancel();
+        let _ = self.store.close();
     }
 
     /// Opens one session for `principal` and publishes its durable row.
@@ -1211,6 +1218,50 @@ impl HostedCoordinator {
         self.lane.submit_internal(candidate).await?;
         Ok(report)
     }
+
+    /// Compacts the store's segments and orders the swap in the lane.
+    ///
+    /// Runs [`Store::compact`] on the blocking pool (bulk copy outside the
+    /// lane, atomic locator swap inside the store) and, when the pass did
+    /// work, publishes one empty [`InternalPayload::Maintenance`] candidate
+    /// admitted under [`RequestClass::Maintenance`]. The lane commit
+    /// serializes the swap against concurrent publications and exercises
+    /// the retention ledger path, which the swap itself leaves untouched:
+    /// compaction moves object bytes, never fact rows, so the ledger has
+    /// no row to adjust and the freed bytes report here, not in the
+    /// ledger. Idle passes skip the lane exactly like idle sweeps.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ECancelled`] when `cancel` or shutdown fired.
+    /// - [`ErrorCode::EIo`] on store failures; [`ErrorCode::ECorrupt`] on
+    ///   committed damage, which quarantines the store.
+    /// - [`ErrorCode::ELimit`] when admission sheds the maintenance work.
+    pub async fn compact(&self, cancel: &Cancel) -> Result<CompactionStats, CoreError> {
+        cancel.check()?;
+        self.shutdown.check()?;
+        // The maintenance slot releases before the lane submission below
+        // admits again: the class may hold a single slot, and holding one
+        // permit across a second admission would shed itself.
+        let stats = {
+            let admitted = self.admit_maintenance(0, cancel).await?;
+            let store = Arc::clone(&self.store);
+            let (_admitted, compacted) =
+                run_blocking(admitted, cancel.clone(), move |_| store.compact()).await?;
+            compacted.map_err(CoreError::from)?
+        };
+        if !stats.did_work() {
+            return Ok(stats);
+        }
+        let admitted = self.admit_maintenance(0, cancel).await?;
+        let candidate = InternalCandidate::new(
+            InternalPayload::Maintenance,
+            Vec::new(),
+            cancel.clone(),
+            Some(admitted),
+        )?;
+        self.lane.submit_internal(candidate).await?;
+        Ok(stats)
+    }
 }
 
 /// Names the missing read path of one uncovered method for its refusal.
@@ -1632,6 +1683,74 @@ mod tests {
             head.retained.sessions,
             Usage::default(),
             "ledger must return to empty after the sweep deletion"
+        );
+
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    #[tokio::test]
+    async fn compact_merges_segments_orders_swap_in_lane_and_preserves_ledger() {
+        let (_temp, coord, _) = coordinator();
+        coord.store().set_segment_target_for_tests(1024);
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+
+        let mut blobs: Vec<(crate::ids::Oid, Vec<u8>)> = Vec::new();
+        for index in 0..12_u64 {
+            let mut state = 3000 + index;
+            let bytes: Vec<u8> = (0..300)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    state.to_be_bytes()[0]
+                })
+                .collect();
+            let len = u64::try_from(bytes.len()).expect("blob fits u64");
+            let prepared = coord
+                .store()
+                .prepare(ObjectKind::Blob, len, bytes.as_slice(), None)
+                .expect("prepare blob");
+            let oid = prepared.oid();
+            coord
+                .store()
+                .publish(vec![prepared], &[])
+                .expect("publish blob");
+            blobs.push((oid, bytes));
+        }
+        // Underfill the sealed sources so the pack-estimate gate fires.
+        coord.store().set_segment_target_for_tests(16384);
+        let stats = coord.compact(&cancel).await.expect("compact through lane");
+        assert!(stats.did_work(), "underfilled segments must merge");
+        assert!(stats.bytes_freed > 0, "retired sources must unlink");
+
+        for (oid, bytes) in &blobs {
+            let object = coord.store().read(*oid).expect("read compacted blob");
+            let mut actual = Vec::new();
+            use std::io::Read as _;
+            let mut spooled = object.bytes;
+            spooled.read_to_end(&mut actual).expect("read spool");
+            assert_eq!(&actual, bytes, "blob {oid} survives compaction");
+        }
+        // The maintenance lane commit ran (head exists) but moved no fact
+        // row, so the retention ledger is exactly untouched.
+        let head_bytes = coord
+            .store()
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("read head")
+            .expect("maintenance commit publishes the head");
+        let head = decode_head(coord.store(), &head_bytes).expect("decode head");
+        assert_eq!(
+            head.retained,
+            Retained {
+                receipts: Usage::default(),
+                sessions: Usage::default(),
+                ops: Usage::default(),
+            },
+            "compaction moves object bytes, never fact rows"
         );
 
         coord.shutdown();

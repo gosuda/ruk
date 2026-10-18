@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coord::admission::run_blocking;
-use crate::coord::cancel::Cancel;
+use crate::coord::cancel::{Cancel, cancellation};
 use crate::coord::clock::Clock;
 use crate::coord::policy::PolicySource;
 use crate::coord::session::SessionTable;
@@ -138,13 +138,34 @@ pub(crate) struct PublicationLaneRunner {
 }
 
 impl PublicationLaneRunner {
-    /// Runs the publication lane event loop until closed or cancelled.
+    /// Runs the publication lane event loop until closed or cancelled, then
+    /// drains every queued submission before returning.
+    ///
+    /// Shutdown never cancels an in-flight commit: each batch commits under
+    /// a fresh uncancelled token, so orderly shutdown settles admitted work
+    /// instead of failing it. The drain after the loop commits whatever the
+    /// loop did not reach (a deferred item plus every submit still queued)
+    /// the same way. Only a fatal storage failure stops the drain early and
+    /// latches the lane.
     ///
     /// # Errors
     /// Returns `CoreError` if a fatal or ambiguous storage failure closes the lane.
     pub(crate) async fn run(mut self, cancel: Cancel) -> Result<(), CoreError> {
         let mut deferred: Option<BatchItem> = None;
+        let outcome = self.run_loop(&cancel, &mut deferred).await;
+        if let Err(drain_err) = self.drain(deferred).await {
+            return Err(drain_err);
+        }
+        outcome
+    }
 
+    /// The batching event loop. Returns when the lane closes, the channel
+    /// ends, or shutdown cancels a receive wait.
+    async fn run_loop(
+        &mut self,
+        cancel: &Cancel,
+        deferred: &mut Option<BatchItem>,
+    ) -> Result<(), CoreError> {
         loop {
             cancel.check()?;
 
@@ -180,7 +201,7 @@ impl PublicationLaneRunner {
                             if accumulator.can_admit(&next_item) {
                                 accumulator.add(next_item);
                             } else {
-                                deferred = Some(next_item);
+                                *deferred = Some(next_item);
                                 break;
                             }
                         }
@@ -199,63 +220,99 @@ impl PublicationLaneRunner {
             if batch.is_empty() {
                 continue;
             }
+            self.commit_items(batch).await?;
+        }
 
-            let store = Arc::clone(&self.store);
-            let session_table = self.session_table.clone();
-            let policy_source = Arc::clone(&self.policy_source);
-            let clock = self.clock.clone();
-            let batch_cancel = cancel.clone();
+        Ok(())
+    }
 
-            let mut batch = batch;
-            let mut chosen_admitted = None;
-            for item in &mut batch {
-                let extracted = match item {
-                    BatchItem::Mutation { candidate, .. } => candidate.admitted.take(),
-                    BatchItem::Internal { candidate, .. } => candidate.admitted.take(),
-                };
-                if let Some(admitted) = extracted {
-                    chosen_admitted = Some(admitted);
-                    break;
-                }
-            }
-
-            let commit_outcome = match chosen_admitted {
-                Some(admitted) => {
-                    let (_admitted, outcome) =
-                        run_blocking(admitted, batch_cancel.clone(), move |cancel_ref| {
-                            commit_batch(
-                                &store,
-                                &session_table,
-                                &policy_source,
-                                &clock,
-                                batch,
-                                cancel_ref,
-                            )
-                        })
-                        .await?;
-                    outcome
-                }
-                None => commit_batch(
-                    &store,
-                    &session_table,
-                    &policy_source,
-                    &clock,
-                    batch,
-                    &batch_cancel,
-                ),
-            };
-
-            if let Err(err) = commit_outcome {
-                if err.code == ErrorCode::ECoordinatorUnresponsive {
-                    self.closed.store(true, Ordering::Release);
-                    if let Ok(mut guard) = self.closed_reason.lock() {
-                        *guard = Some(err.message.clone());
+    /// Commits every submission the loop did not reach: a deferred overflow
+    /// item plus each submit still queued, in accumulator-sized rounds.
+    /// Close commands and a dead channel end the drain; anything committed
+    /// reports to its original submitter.
+    async fn drain(&mut self, deferred: Option<BatchItem>) -> Result<(), CoreError> {
+        let mut accumulator = BatchAccumulator::new();
+        let mut pending = deferred.is_some();
+        if let Some(item) = deferred {
+            accumulator.add(item);
+        }
+        loop {
+            match self.rx.try_recv() {
+                Ok(LaneCommand::Submit(item)) => {
+                    if !accumulator.can_admit(&item) {
+                        let full =
+                            std::mem::replace(&mut accumulator, BatchAccumulator::new()).drain();
+                        self.commit_items(full).await?;
                     }
-                    return Err(err);
+                    accumulator.add(item);
+                    pending = true;
                 }
+                Ok(LaneCommand::Close) | Err(_) => break,
+            }
+        }
+        if pending {
+            self.commit_items(accumulator.drain()).await?;
+        }
+        Ok(())
+    }
+
+    /// Commits one batch under a fresh uncancelled token so shutdown waits
+    /// settle admitted work. A fatal storage failure latches the lane and
+    /// stops the caller; every other outcome already replied per item.
+    async fn commit_items(&mut self, mut batch: Vec<BatchItem>) -> Result<(), CoreError> {
+        let store = Arc::clone(&self.store);
+        let session_table = self.session_table.clone();
+        let policy_source = Arc::clone(&self.policy_source);
+        let clock = self.clock.clone();
+        let (_commit_guard, commit_cancel) = cancellation();
+
+        let mut chosen_admitted = None;
+        for item in &mut batch {
+            let extracted = match item {
+                BatchItem::Mutation { candidate, .. } => candidate.admitted.take(),
+                BatchItem::Internal { candidate, .. } => candidate.admitted.take(),
+            };
+            if let Some(admitted) = extracted {
+                chosen_admitted = Some(admitted);
+                break;
             }
         }
 
+        let commit_outcome = match chosen_admitted {
+            Some(admitted) => {
+                let (_admitted, outcome) =
+                    run_blocking(admitted, commit_cancel, move |cancel_ref| {
+                        commit_batch(
+                            &store,
+                            &session_table,
+                            &policy_source,
+                            &clock,
+                            batch,
+                            cancel_ref,
+                        )
+                    })
+                    .await?;
+                outcome
+            }
+            None => commit_batch(
+                &store,
+                &session_table,
+                &policy_source,
+                &clock,
+                batch,
+                &commit_cancel,
+            ),
+        };
+
+        if let Err(err) = commit_outcome {
+            if err.code == ErrorCode::ECoordinatorUnresponsive {
+                self.closed.store(true, Ordering::Release);
+                if let Ok(mut guard) = self.closed_reason.lock() {
+                    *guard = Some(err.message.clone());
+                }
+                return Err(err);
+            }
+        }
         Ok(())
     }
 }
