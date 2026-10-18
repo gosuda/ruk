@@ -12,6 +12,7 @@ pub mod new;
 pub mod rebase;
 pub mod resolve;
 pub mod revert;
+pub mod rewrite;
 pub mod split;
 pub mod squash;
 
@@ -27,6 +28,7 @@ pub use new::{NewRequest, NewResult, new, prepare_new};
 pub use rebase::{RebaseRequest, RebaseResult, prepare_rebase, rebase};
 pub use resolve::{ResolveRequest, ResolveResult, prepare_resolve, resolve};
 pub use revert::{RevertRequest, RevertResult, prepare_revert, revert};
+pub use rewrite::{children, descendants};
 pub use split::{SplitRequest, SplitResult, prepare_split, split};
 pub use squash::{SquashRequest, SquashResult, prepare_squash, squash};
 
