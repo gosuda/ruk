@@ -904,23 +904,6 @@ pub(crate) fn commit_record(store: &Store, oid: Oid) -> Result<CommitRecord, Git
         })
 }
 
-/// Reads the commit record behind one revision.
-pub(crate) fn read_commit(
-    store: &Store,
-    kind: HashKind,
-    rev: &str,
-) -> Result<(Oid, CommitRecord), GitError> {
-    let oid = resolve_rev(store, kind, rev)?;
-    let records = Records::new(store);
-    let record = records
-        .get_commit(&Head::Git { oid })
-        .map_err(GitError::from)?
-        .ok_or_else(|| GitError::NotFound {
-            detail: format!("object {} is not a stored commit", oid.to_hex()),
-        })?;
-    Ok((oid, record))
-}
-
 /// One queued commit in a date-ordered history walk: committer timestamp
 /// plus insertion sequence. The heap pops the newest timestamp first;
 /// equal timestamps pop in push order, so the first parent wins ties.
@@ -1206,39 +1189,6 @@ pub(crate) fn now_seconds() -> Result<i64, GitError> {
     })
 }
 
-/// Renders one commit header line block for `log` and `show`.
-pub(crate) fn render_commit_header(oid: Oid, record: &CommitRecord) -> Vec<u8> {
-    let mut out = format!("commit {}\n", oid.to_hex()).into_bytes();
-    if let Ok(author) = record.author() {
-        out.extend_from_slice(b"Author: ");
-        out.extend_from_slice(&author.render());
-        out.push(b'\n');
-    }
-    if let Ok(committer) = record.committer() {
-        out.extend_from_slice(b"Commit: ");
-        out.extend_from_slice(&committer.render());
-        out.push(b'\n');
-    }
-    out.push(b'\n');
-    for line_bytes in record.message().split(|byte| *byte == b'\n') {
-        out.extend_from_slice(b"    ");
-        out.extend_from_slice(line_bytes);
-        out.push(b'\n');
-    }
-    out.push(b'\n');
-    out
-}
-
-/// Joins output lines with a trailing newline each.
-pub(crate) fn join_lines(lines: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for mut item in lines {
-        out.append(&mut item);
-        out = line(out);
-    }
-    out
-}
-
 /// Looks up the configured fetch refspec lines for a remote.
 pub(crate) fn remote_fetch_specs(ctx: &Ctx, remote: &str) -> Vec<String> {
     let key = format!("remote.{remote}.fetch");
@@ -1295,15 +1245,6 @@ pub(crate) fn open_store_at(root: &std::path::Path) -> Result<Store, GitError> {
         std::sync::Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
     )
     .map_err(GitError::from)
-}
-
-/// Builds the `IndexKey` ordering helper other modules need for sorting.
-#[must_use]
-pub(crate) fn index_key_of(path: &RepoPath, stage: Stage) -> IndexKey {
-    IndexKey {
-        path: path.clone(),
-        stage,
-    }
 }
 
 /// Renders one file mode the way `ls-files -s` spells it.
