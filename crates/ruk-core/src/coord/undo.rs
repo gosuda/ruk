@@ -1,21 +1,25 @@
 //! `undo`: the inverse of a retained operation, as exact facts.
 //!
-//! Every delta an operation recorded names one tracked key with its value
-//! before and after the operation. Undo emits, per delta, a fact that expects
-//! the `after` value and writes the `before` value back. The facts are
-//! exact-compare-and-swap, so the lane refuses the whole undo with `E_STALE`
-//! when any touched key has moved since the operation committed: undo never
-//! overwrites a later write it did not observe.
+//! An operation's deltas name each tracked key it changed, with the value
+//! before and after. Undo emits, per key, a fact that expects the value the
+//! operation left (`after`) and writes the value it found (`before`). A key
+//! that has since moved is refused up front with `E_UNDO_CONFLICT`; the lane
+//! re-checks the same expectations at publication, so a concurrent commit
+//! surfaces as `E_STALE`. Undo never overwrites a later write it did not
+//! observe.
 //!
-//! Operations whose effects reach outside the tracked tables cannot be
-//! inverted from their deltas alone. Those methods are refused with
-//! `E_UNSUPPORTED_OPERATION` rather than guessed at.
+//! Operations whose effects reach outside the tracked tables cannot be inverted
+//! from their deltas alone. Those methods are refused with `E_UNDO_CONFLICT`
+//! rather than guessed at. Every [`Method`] is named in [`refuse_non_invertible`],
+//! so a new method must be classified before it can be undone.
+
+use std::collections::BTreeMap;
 
 use crate::change::OperationId;
 use crate::coord::oplog::{OpDeltaReader, read_header, tracked};
-use crate::coord::rows::{OpDelta, OpHeader, fact_table_from_name};
+use crate::coord::rows::{OpHeader, fact_table_from_name};
 use crate::error::{CoreError, ErrorCode};
-use crate::protocol::{Method, UndoSummary};
+use crate::protocol::{Method, Request, UndoSummary};
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
 
@@ -28,13 +32,22 @@ pub(crate) struct UndoPlan {
     pub(crate) summary: UndoSummary,
 }
 
+/// The operation an `undo` request inverts; every other request inverts none.
+pub(crate) fn undone_operation(request: &Request) -> Option<OperationId> {
+    match request {
+        Request::Undo(undo) => Some(undo.args.operation),
+        _ => None,
+    }
+}
+
 /// Builds the inverse of `operation` from its stored deltas.
 ///
 /// # Errors
 /// - [`ErrorCode::ENotFound`] when the operation is not retained (never
 ///   committed, or pruned).
 /// - [`ErrorCode::EUndoConflict`] for methods whose effects lie outside the
-///   tracked tables, naming the effect.
+///   tracked tables, and for a key that no longer holds the value the operation
+///   left.
 /// - [`ErrorCode::ECorrupt`] for a delta naming an unknown or untracked table.
 /// - Store and stream decoding failures.
 pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<UndoPlan, CoreError> {
@@ -46,6 +59,16 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
     })?;
     refuse_non_invertible(&header)?;
     let mut reader = OpDeltaReader::new(store, operation, header);
+    // Keyed by table name and key, each entry keeps the value before the first
+    // delta and the value after the last: the net change to that key.
+    let mut net: BTreeMap<(String, Vec<u8>), (Option<Vec<u8>>, Option<Vec<u8>>)> =
+        BTreeMap::new();
+    while let Some(delta) = reader.next_delta()? {
+        let slot = net
+            .entry((delta.table, delta.key))
+            .or_insert((delta.before, None));
+        slot.1 = delta.after;
+    }
     let mut plan = UndoPlan {
         facts: Vec::new(),
         summary: UndoSummary {
@@ -54,23 +77,82 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
             workspaces: 0,
         },
     };
-    while let Some(delta) = reader.next_delta()? {
-        plan.facts.push(inverse_fact(&mut plan.summary, delta)?);
+    for ((table_name, key), (before, after)) in net {
+        if before == after {
+            continue;
+        }
+        let table = inverse_table(&table_name)?;
+        count(&mut plan.summary, table);
+        let expected = match after {
+            Some(after) => FactExpectation::Value(after),
+            None => FactExpectation::Absent,
+        };
+        plan.facts.push(FactMutation {
+            table,
+            key,
+            expected,
+            value: before,
+        });
     }
+    refuse_diverged(store, operation, &plan.facts)?;
     Ok(plan)
 }
 
-/// Refuses operations whose effects the tracked deltas cannot restore.
+/// Classifies every method. Methods whose effects reach outside the tracked
+/// tables are refused; the rest change only tracked state (or none).
 fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
     let reason = match header.entry.method {
-        Method::Fetch => "fetch writes remote-tracking and shallow state outside the tracked tables",
+        Method::Fetch => {
+            "fetch writes remote-tracking and shallow state outside the tracked tables"
+        }
         Method::Push | Method::PushReconcile => {
             "push sends to a remote and records plans and observations outside the tracked tables"
         }
         Method::LandPrepare | Method::LandExecute => {
             "landing consumes land plans and moves a remote outside the tracked tables"
         }
-        _ => return Ok(()),
+        Method::Edit | Method::New => {
+            "a workspace checkout is materialized on disk outside the tracked tables and undo cannot restore it"
+        }
+        Method::SessionOpen
+        | Method::SessionResume
+        | Method::Schema
+        | Method::WsNew
+        | Method::WsScope
+        | Method::WsTake
+        | Method::WsDrop
+        | Method::WsRecover
+        | Method::Snapshot
+        | Method::Write
+        | Method::Describe
+        | Method::Rebase
+        | Method::Squash
+        | Method::Split
+        | Method::Abandon
+        | Method::Resolve
+        | Method::Revert
+        | Method::BookmarkSet
+        | Method::BookmarkDelete
+        | Method::BookmarkResolve
+        | Method::TagSet
+        | Method::TagDelete
+        | Method::ClaimAcquire
+        | Method::ClaimRelease
+        | Method::ClaimList
+        | Method::AttestAdd
+        | Method::AttestList
+        | Method::OpLog
+        | Method::OpPrune
+        | Method::Pin
+        | Method::Unpin
+        | Method::Undo
+        | Method::Status
+        | Method::Log
+        | Method::Diff
+        | Method::Show
+        | Method::File
+        | Method::Blame
+        | Method::Query => return Ok(()),
     };
     Err(CoreError::new(
         ErrorCode::EUndoConflict,
@@ -81,31 +163,48 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
     ))
 }
 
-/// The exact inverse fact of one delta, counting it into `summary`.
-fn inverse_fact(summary: &mut UndoSummary, delta: OpDelta) -> Result<FactMutation, CoreError> {
-    let table = fact_table_from_name(&delta.table).ok_or_else(|| {
+/// Resolves a stored table name to a tracked table, refusing anything else.
+fn inverse_table(name: &str) -> Result<FactTable, CoreError> {
+    let table = fact_table_from_name(name).ok_or_else(|| {
         CoreError::new(
             ErrorCode::ECorrupt,
-            format!("operation names unknown table `{}`", delta.table),
+            format!("operation names unknown table `{name}`"),
         )
     })?;
     if !tracked(table) {
         return Err(CoreError::new(
             ErrorCode::ECorrupt,
-            format!("operation names untracked table `{}`", delta.table),
+            format!("operation names untracked table `{name}`"),
         ));
     }
-    count(summary, table);
-    let expected = match delta.after {
-        Some(after) => FactExpectation::Value(after),
-        None => FactExpectation::Absent,
-    };
-    Ok(FactMutation {
-        table,
-        key: delta.key,
-        expected,
-        value: delta.before,
-    })
+    Ok(table)
+}
+
+/// Refuses the undo when any key no longer holds the value the operation left.
+fn refuse_diverged(
+    store: &Store,
+    operation: OperationId,
+    facts: &[FactMutation],
+) -> Result<(), CoreError> {
+    for fact in facts {
+        let current = store.fact(fact.table, &fact.key)?;
+        let holds = match &fact.expected {
+            FactExpectation::Value(after) => current.as_deref() == Some(after.as_slice()),
+            FactExpectation::Absent => current.is_none(),
+            FactExpectation::Any => true,
+        };
+        if !holds {
+            return Err(CoreError::new(
+                ErrorCode::EUndoConflict,
+                format!(
+                    "operation {} cannot be undone: a key in table {} has moved since the operation",
+                    operation.0,
+                    fact.table.table_name()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn count(summary: &mut UndoSummary, table: FactTable) {
@@ -152,7 +251,8 @@ mod tests {
             Self { root, store }
         }
 
-        /// Records one operation over `changes` and publishes its log entry.
+        /// Publishes the state `changes` make and the operation log entry that
+        /// records them, as the lane would.
         fn record(&self, method: Method, changes: &[FactMutation]) -> OperationId {
             let mut ops = CheckedOperationId::new(0, u64::MAX);
             let meta = OpMeta {
@@ -164,9 +264,11 @@ mod tests {
             let (id, mutations) = oplog::record(&mut ops, None, meta, changes)
                 .expect("record operation")
                 .expect("tracked change recorded");
+            let mut facts = changes.to_vec();
+            facts.extend(mutations);
             self.store
-                .publish(Vec::new(), &mutations)
-                .expect("publish operation");
+                .publish(Vec::new(), &facts)
+                .expect("publish operation and its state");
             id
         }
     }
@@ -210,6 +312,24 @@ mod tests {
         let err = prepare_undo(&fixture.store, id).expect_err("fetch cannot be inverted");
         assert_eq!(err.code, ErrorCode::EUndoConflict);
         assert!(err.message.contains("fetch"), "names the effect: {}", err.message);
+    }
+
+    #[test]
+    fn undo_refuses_a_key_that_moved_since_the_operation() {
+        let fixture = Fixture::new("diverged");
+        let id = fixture.record(Method::BookmarkSet, &[ref_set(b"refs/heads/main", b"new")]);
+        let moved = FactMutation {
+            table: FactTable::Refs,
+            key: b"refs/heads/main".to_vec(),
+            expected: FactExpectation::Value(b"new".to_vec()),
+            value: Some(b"later".to_vec()),
+        };
+        fixture
+            .store
+            .publish(Vec::new(), &[moved])
+            .expect("a later write lands");
+        let err = prepare_undo(&fixture.store, id).expect_err("the key has moved");
+        assert_eq!(err.code, ErrorCode::EUndoConflict);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::coord::retention;
 use crate::coord::rows::{self, CoordinatorHead, RECEIPT_HORIZON, ReceiptRow, SessionRow};
 use crate::coord::session::Authority;
 use crate::coord::session::SessionTable;
+use crate::coord::undo::undone_operation;
 use crate::coord::workspace;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
@@ -549,14 +550,6 @@ pub(crate) fn commit_batch(
     }
 
     Ok(())
-}
-
-/// The operation an `undo` request inverts; every other request inverts none.
-fn undone_operation(request: &Request) -> Option<OperationId> {
-    match request {
-        Request::Undo(undo) => Some(undo.args.operation),
-        _ => None,
-    }
 }
 
 fn validate_candidate(
