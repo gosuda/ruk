@@ -67,9 +67,12 @@ pub enum SmartService {
     /// `git-receive-pack`: the server accepts objects.
     ReceivePack,
     /// `git-upload-archive`: the server streams a tar archive. Only the
-    /// RPC half uses this name: the oracle probes protocol support through
-    /// `git-upload-pack` (`git/remote-curl.c` `connect_git`), so discovery
-    /// through this name is available but no client here requires it.
+    /// RPC half uses this name. Default servers refuse discovery through
+    /// it (`Service not enabled`, `git/http-backend.c` `select_service`;
+    /// archive discovery needs `http.uploadarchive`), and the oracle
+    /// probes protocol support through `git-upload-pack` instead
+    /// (`git/remote-curl.c` `stateless_connect`), so no client here
+    /// requires archive discovery.
     UploadArchive,
 }
 
@@ -670,7 +673,8 @@ pub struct ArchiveOutput {
 /// needs no advertisement caps, so it takes the base directly and skips the
 /// discovery round trip; the oracle likewise probes protocol support
 /// through `git-upload-pack`, not this service (`git/remote-curl.c`
-/// `connect_git`, and protocol v2 over HTTP is already a named gap here).
+/// `stateless_connect`, and protocol v2 over HTTP is already a named gap
+/// here).
 ///
 /// A `NACK` line naming an unknown revision is [`GitError::NotFound`]; any
 /// other refusal is [`GitError::Corrupt`]. No verb consumes this yet: the

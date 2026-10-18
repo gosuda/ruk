@@ -270,25 +270,22 @@ fn classify_helper(value: &str) -> Option<(String, Vec<String>)> {
     Some((program, words.map(str::to_owned).collect()))
 }
 
-/// Orders parsed rows for `url`: matching scoped rows first (file order),
-/// then top-level rows (file order). An empty value resets the chain, the
-/// way git's `helper =` (empty) clears previously accumulated helpers.
+/// Resolves the runnable helper chain for `url` in file order: rows run
+/// top to bottom, a scoped row only when its pattern matches `url`, a
+/// top-level row always. An empty value resets the chain, the way git's
+/// `helper =` (empty) clears previously accumulated helpers
+/// (`git/credential.c` appends in config read order).
 fn helper_commands_for(url: &str, entries: &[CredentialHelperRow]) -> Vec<(String, Vec<String>)> {
-    let mut ordered: Vec<&CredentialHelperRow> = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope_matches(scope, url))
-        })
-        .collect();
-    ordered.extend(entries.iter().filter(|entry| entry.scope.is_none()));
     let mut out = Vec::new();
-    for entry in ordered {
+    for entry in entries {
         if entry.value.trim().is_empty() {
             out.clear();
             continue;
+        }
+        if let Some(scope) = entry.scope.as_ref() {
+            if !scope_matches(scope, url) {
+                continue;
+            }
         }
         if let Some(command) = classify_helper(&entry.value) {
             if out.len() < MAX_HELPERS {
@@ -540,12 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn config_orders_scoped_before_top_level_and_honors_reset() {
+    fn config_keeps_file_order_and_honors_reset() {
         let entries = parse_config_entries(
             "[credential]\n\thelper = /bin/top\n[credential \"https://host.x/sub\"]\n\thelper = /bin/scoped\n",
         );
+        // File order, not scoped-first: git appends in config read order,
+        // so the top-level helper answers before the scoped one.
         let chain = helper_commands_for("https://host.x/sub/a", &entries);
-        assert_eq!(chain, vec![external_helper("/bin/scoped"), external_helper("/bin/top")]);
+        assert_eq!(chain, vec![external_helper("/bin/top"), external_helper("/bin/scoped")]);
         let other = helper_commands_for("https://elsewhere.x/a", &entries);
         assert_eq!(other, vec![external_helper("/bin/top")]);
         let reset = parse_config_entries("[credential]\n\thelper = /bin/a\n\thelper =\n\thelper = /bin/b\n");
