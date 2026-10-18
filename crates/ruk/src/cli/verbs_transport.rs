@@ -1320,13 +1320,15 @@ fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
     match &workspace.head {
         ruk_core::workspace::HeadRef::Symbolic(name) => {
             // Follow the full symref chain: a branch may itself point at
-            // another branch. A broken chain (cycle, too deep, dangling)
+            // another branch. A dangling, cyclic, or over-deep chain
             // advertises the zero OID, the same unborn signal as a branch
-            // with no commit.
-            let oid = ruk_core::refdata::resolve(&StoreRefs::new(store), name)
-                .ok()
-                .and_then(|resolved| resolved.oid)
-                .unwrap_or_else(|| store.hash_kind().zero_oid());
+            // with no commit. A store read failure is not unborn: it
+            // propagates so a corrupt store never serves a false HEAD.
+            let oid = match ruk_core::refdata::resolve(&StoreRefs::new(store), name) {
+                Ok(resolved) => resolved.oid.unwrap_or_else(|| store.hash_kind().zero_oid()),
+                Err(ruk_core::refdata::RefError::Read(err)) => return Err(GitError::from(err)),
+                Err(_) => store.hash_kind().zero_oid(),
+            };
             Ok(HeadAdvertisement {
                 oid,
                 symref: Some(name.as_bytes().to_vec()),
