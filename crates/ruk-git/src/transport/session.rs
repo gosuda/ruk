@@ -1,11 +1,11 @@
-//! Transport sessions: the network seam and the local native transport.
+//! Transport sessions: the seam and the local native transport.
 //!
-//! [`Transport`] is the trait later HTTPS/SSH adapters implement: open a
-//! duplex stream to one service. There are no network adapters in this
-//! slice, and deliberately no `Network` remote variant: [`Remote::parse`]
-//! accepts local paths and `file://` URLs and refuses network schemes with
-//! [`GitError::Unsupported`], which names the later slice instead of
-//! stubbing it.
+//! [`Transport`] is the trait a later HTTPS adapter implements: open a
+//! duplex stream to one service. SSH and git-daemon transports already live
+//! in [`super::net`], whose streams feed the owned wire clients directly.
+//! [`Remote`] stays local-only on purpose: [`Remote::parse`] accepts bare
+//! paths and `file://` URLs and refuses network schemes with
+//! [`GitError::Unsupported`], pointing at [`super::net::parse_endpoint`].
 //!
 //! A local native repository uses the same core streaming transfer path as
 //! the wire: [`local_fetch`] and [`local_push`] build real pack bytes from
@@ -81,7 +81,7 @@ pub trait Transport {
 }
 
 /// Where to fetch from or push to: a local path only. Network schemes are
-/// refused, naming the later slice.
+/// refused, naming the network endpoint parser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Remote {
     /// The local repository path.

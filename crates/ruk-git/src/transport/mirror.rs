@@ -20,8 +20,9 @@
 //!
 //! Deliberately out of scope (named gaps, not stubs):
 //!
-//! - network remotes: [`Remote::parse`](super::session::Remote::parse)
-//!   refuses non-local schemes with `Offline`;
+//! - HTTP remotes: [`parse_endpoint`](super::net::parse_endpoint) classifies
+//!   them, and the verbs refuse them as a named gap (no HTTP client in this
+//!   slice); SSH and git-daemon remotes fetch and push for real;
 //! - LFS content sync: pointer discovery needs `cat-file --batch-check
 //!   --batch-all-objects`, an object census the store API does not expose
 //!   (see the `fsck` verb docs), and payload transfer rides the LFS HTTP

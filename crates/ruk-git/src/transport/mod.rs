@@ -33,10 +33,12 @@
 //! - [`proc_receive`]: AGit `refs/for/` diversion to the `proc-receive` hook.
 //! - [`dumb`]: dumb-HTTP `info/refs` text and loose objects.
 //! - [`archive`]: the `upload-archive` server half (streaming tar).
-//! - [`session`]: the network transport seam and the local native transport.
+//! - [`session`]: the transport seam and the local native transport.
+//! - [`net`]: remote URL parsing plus the SSH and git-daemon transports
+//!   (HTTP stays a named gap: no client in this slice).
 //!
-//! Network adapters (HTTPS, SSH) implement [`session::Transport`] in a
-//! later slice; this module contains none.
+//! Later slices add an HTTPS adapter behind [`session::Transport`]; SSH
+//! and git-daemon streams already feed the owned wire clients directly.
 
 pub mod archive;
 pub mod dumb;
@@ -44,6 +46,7 @@ pub mod fetch;
 pub mod hooks;
 pub mod lfs;
 pub mod mirror;
+pub mod net;
 pub mod pack;
 pub mod pktline;
 pub mod private;
