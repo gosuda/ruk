@@ -1,181 +1,93 @@
 # Ruk
 
-Ruk is an agent-native version-control system designed for exact Git object interoperability, native transactional state, efficient concurrent workspaces, recoverable merge conflicts, and a typed agent protocol. It also targets Forgejo as a first-class consumer through a bounded backend patch.
+Ruk is an agent-native version control system built in Rust for multi-agent software development and hosted Git infrastructure. It pairs exact Git SHA-1 and SHA-256 object identity with a transactional store (`redb` metadata and zstd-compressed, CRC32C-framed object segments) so concurrent agents and services can coordinate without lockfile contention or worktree races. Unlike stock Git, which coordinates callers through filesystem lockfiles and untyped CLI text, Ruk provides a typed v1 protocol with idempotent mutation receipts, path claims, isolated workspaces, an operation log, and a single serialized publication lane per repository, alongside a Git-compatible CLI and a multi-repository daemon for Forgejo.
 
-## Current Executable Scope
+- **Agent-native protocol**: 46 typed v1 protocol methods (`ruk model`) and a stdio MCP server (`ruk mcp`) covering sessions (`session.open`, `session.resume`), path claims (`claim.acquire`, `claim.release`, `claim.list` with up to 3600s TTL), isolated workspaces (`ws.new`, `ws.scope`, `ws.take`, `ws.drop`, `ws.recover`), operation log queries (`op.log`, `undo`), and serialized publication lanes (2ms group-commit linger, up to 64 requests or 64 MiB per batch) with 7-day idempotent replay receipts.
+- **Native conflict algebra**: First-class `conflict-v1` records (`ruk encode-conflict`, `ruk decode-conflict`) preserve ordered `+`/`-` tree terms, parents, signatures, and headers without polluting Git commit headers, paired with syntax-aware merges across 21 pinned Tree-sitter grammars plus Markdown and MDX.
+- **Git CLI and wire interop**: `ruk git <verb>` (or invoking the binary as `git`) dispatches 58 advertised verbs (`crates/ruk/src/cli/dispatch.rs`) and passes 56/56 comparisons against Git 2.53.0 in `tasks/parity-harness/`. `ruk git migrate` imports existing `.git` repositories (loose objects, pack v2/v3, refs, and `HEAD`, 73/73 checks passing in `tasks/migration/`), while `ruk-git` implements transport over local paths, `file://`, `ssh://`, and `git://` (`http(s)://` is a named unimplemented gap).
+- **Verified storage integrity**: Every segment record carries a CRC32C header-and-payload checksum, and sealed segments end with a 24-byte `RUKSEAL1` CRC32C footer. `Store::open` validates segment manifests on every open, caches `verified_generation` in committed metadata so repeat opens skip full object-hash sweeps, and supports `RUK_VERIFY=full` to force full parallel object-identity verification on every open (exercised across 7 publication and recovery kill points in `crates/ruk-core/src/store/crash_tests.rs`).
+- **Measured dev-scale capacity**: In warm-cache CLI benchmarks on an 80-CPU, 754 GiB host (`tasks/capacity/RESULTS.md`, not the reference deployment or open-loop daemon load), Ruk p50 vs. Git 2.53.0 p50 is **22ms vs. 47ms** on `adv-1k` (2.1x faster) and **98ms vs. 149ms** on `page1` (1.5x faster), **61ms vs. 54ms** on `adv-10k`, **49ms vs. 10ms** on single-ref `lookup`, **49ms vs. 28ms** on `write`, **6.94s vs. 1.38s** on 10k-branch bare `clone`, and **990ms vs. 87ms** on incremental `fetch`.
 
-The current `ruk` executable implements three commands covering data models, schema reflection, and native conflict record encoding:
-
-* `ruk model`
-* `ruk encode-conflict`
-* `ruk decode-conflict`
-
-This executable slice does not accept repository operations. Commands such as commit, checkout, branch, merge, push, or fetch are not yet implemented. The JSON schema emitted by `ruk model` defines the method interfaces and framing parameters for the planned agent wire protocol, but those schemas represent interface contracts rather than operational method implementations.
-
-External Git and Forgejo checkouts used alongside this repository serve as development oracles and reference specifications. Ruk does not invoke the `git` binary at runtime and has no runtime dependency on Git or Forgejo.
-
-## Building
-
-Build the `ruk` CLI binary using Cargo with locked dependencies:
+## Usage example
 
 ```bash
-cargo build -p ruk --locked
+ruk git init demo && printf 'hello
+' > demo/a.txt
+ruk git -C demo add a.txt
+ruk git -C demo -c user.name=Alice -c user.email=alice@example.com commit -m "initial"
+# Initialized empty Ruk repository in /tmp/demo/.ruk/
+# [main (root-commit) 5f2d8c1] initial
+#  1 file changed, 1 insertion(+)
+#  create mode 100644 a.txt
 ```
 
-The compiled binary will be placed at `target/debug/ruk` (or `target/release/ruk` when using `--release`).
+---
 
-## Command Reference
+## Getting started
 
-### `ruk model`
-
-Outputs the protocol JSON schema document defining framing limits, closed error codes, supported object formats, and method definitions.
+Build the release binary with Cargo (requires Rust 1.99.1 per `rust-toolchain.toml`):
 
 ```bash
-ruk model [--format json]
+cargo build --release
 ```
 
-* `--format <json>`: Output schema format (default: `json`).
-
-### `ruk encode-conflict`
-
-Reads a JSON conflict description (`ConflictRecordInput`), validates field invariants and object identifier lengths for the selected hash kind, and writes the framed binary `conflict-v1` record to standard output.
+This produces `target/release/ruk`. Initialize a repository, stage a file, and commit through the Git-compatible CLI:
 
 ```bash
-ruk encode-conflict [--object-format sha1|sha256] [--input <path>]
+./target/release/ruk git init my-repo
+printf 'hello world
+' > my-repo/README.txt
+./target/release/ruk git -C my-repo add README.txt
+./target/release/ruk git -C my-repo -c user.name="Your Name" -c user.email="you@example.com" commit -m "first commit"
+./target/release/ruk git -C my-repo log --oneline
 ```
 
-* `--object-format <sha1|sha256>`: Hash algorithm of the target repository (default: `sha1`).
-* `--input <path>`: Path to JSON input file, or `-` for standard input (default: `-`).
-
-### `ruk decode-conflict`
-
-Reads a framed binary `conflict-v1` record, validates framing headers and field bounds, confirms that re-encoding reproduces the input byte-for-byte, and outputs the canonical JSON representation to standard output.
+To import an existing Git repository into a co-located `.ruk` store without modifying `.git`:
 
 ```bash
-ruk decode-conflict [--object-format sha1|sha256] [--input <path>]
+./target/release/ruk git migrate /path/to/git-repo
 ```
 
-* `--object-format <sha1|sha256>`: Hash algorithm of the target repository (default: `sha1`).
-* `--input <path>`: Path to binary record file, or `-` for standard input (default: `-`).
+---
 
-## Conflict Record Format & Minimal Example
+## Command surface
 
-A native conflict record retains ordered tree terms with signs `+,-,+,...,+`, ordered parents, signatures, extra headers, and message bytes. The codec validates the record without accessing a repository.
+`ruk` exposes native protocol, conflict, and service subcommands alongside the `ruk git` compatibility dispatcher:
 
-### Minimal JSON Input (`conflict.json`)
+| Command | Purpose |
+|---|---|
+| `ruk git <verb> [args...]` | Run the Git-compatible CLI interpreter (`init`, `add`, `commit`, `status`, `diff`, `log`, `branch`, `checkout`, `merge`, `stash`, `migrate`, `fetch`, `push`, and 45 other advertised verbs). |
+| `ruk new --repo <path> [--input <file\|->]` | Create a native commit atomically from a JSON `NewRequest` document. |
+| `ruk describe --repo <path> [--input <file\|->]` | Describe a commit or change from a JSON `DescribeRequest` document. |
+| `ruk model [--format json]` | Emit the draft 2020-12 JSON Schema for the v1 protocol, error codes, and 46 method contracts. |
+| `ruk encode-conflict` / `ruk decode-conflict` | Convert between JSON `ConflictRecordInput` documents and binary `conflict-v1` records (`--object-format sha1\|sha256`). |
+| `ruk mcp --repo <path>` | Serve the typed operation table over stdio as a Model Context Protocol (JSON-RPC 2.0) server. |
+| `ruk forgejo serve --config <path.toml>` | Run the hosted multi-repository Unix-socket daemon for Forgejo. |
 
-This sample uses synthetic object IDs to demonstrate the encoding. It does not refer to existing repository objects.
+---
 
-```json
-{
-  "trees": [
-    "1111111111111111111111111111111111111111",
-    "2222222222222222222222222222222222222222",
-    "3333333333333333333333333333333333333333"
-  ],
-  "parents": [
-    {
-      "type": "git",
-      "oid": "4444444444444444444444444444444444444444"
-    },
-    {
-      "type": "conflicted",
-      "key": "5555555555555555555555555555555555555555"
-    }
-  ],
-  "author": {
-    "name": "A U Thor",
-    "email": "author@example.com",
-    "timestamp": 1700000000,
-    "offset": "+0100"
-  },
-  "committer": {
-    "name": "C O Mitter",
-    "email": "committer@example.com",
-    "timestamp": 1700000100,
-    "offset": "-0000"
-  },
-  "extra_headers": [
-    {
-      "name": "change-id",
-      "value": "lkonztmnvsxytrwkxpvuutrmompwylqq"
-    }
-  ],
-  "message": "resolve later\n"
-}
-```
+## Capacity benchmarks (dev-scale)
 
-* **Trees**: Must contain an odd, non-zero number of real Git tree object IDs (40 hex characters for SHA-1, 64 hex characters for SHA-256).
-* **Parents**: An array of `Head` references tagged with `"type"`. A Git commit parent is `{"type": "git", "oid": "<hex>"}`. A parent that is itself a native conflict is `{"type": "conflicted", "key": "<hex>"}`.
-* **Signatures**: Contain `name`, `email`, numeric Unix `timestamp`, and `offset`. The timezone offset is a five-character string `[+-]DDDD` (such as `"+0100"` or `"-0000"`). The string representation keeps `-0000` distinct from `+0000`, matching Git ident rules.
-* **Extra headers**: Key-value pairs sorted canonically by name then value. Structural headers (`tree`, `parent`, `author`, `committer`) are rejected. If omitted, `extra_headers` defaults to `[]`.
+Measured by `bash tasks/capacity/run.sh` (`tasks/capacity/RESULTS.md`, commit `8487835b`, seed `0x52554b01`, warm cache, 80 CPUs / 754 GiB RAM). These are single-host CLI wall times, not the reference deployment hardware and not open-loop daemon admission under load:
 
-For a SHA-256 repository, provide 64-character hex strings for all tree IDs, parent OIDs, and conflict keys, and pass `--object-format sha256`.
+| Workload | Ruk p50 (ms) | Git 2.53.0 p50 (ms) | Notes |
+|---|---:|---:|---|
+| `adv-1k` | 22.0 | 47.0 | 1,000-branch ref advertisement (`60,057` bytes) |
+| `adv-10k` | 61.0 | 54.0 | 10,000-branch ref advertisement (`600,057` bytes) |
+| `lookup` | 49.0 | 10.0 | Single ref resolution (`refs/heads/b005000`) |
+| `page1` | 98.0 | 149.0 | First commit log page (`rows=20`) |
+| `write` | 49.0 | 28.0 | Single-path commit write (`paths=1`) |
+| `clone` | 6940.0 | 1376.0 | Bare `file://` clone of `large-10000` |
+| `fetch` | 990.0 | 87.0 | Incremental fetch (`+1` branch; includes first-open verification) |
 
-### Encoding and Decoding
+---
 
-Encode the JSON file to framed binary `conflict-v1` format:
+## Workspace layout
 
-```bash
-cargo run -p ruk --locked -- encode-conflict --object-format sha1 --input conflict.json > conflict.bin
-```
+- `crates/ruk-core`: Native v1 data model, jj-derived conflict algebra, composed and Tree-sitter syntax merge engines, `redb` + segment `Store`, revset engine, and coordinator (`PublicationLane`, sessions, leases, claims, receipts, `op.log`, `undo`).
+- `crates/ruk-git`: Exact Git object import/export, pack v2/v3 streaming ingest and generation, pkt-line wire protocol (`upload-pack`, `receive-pack`, `upload-archive`), and `file://`, `ssh://`, and `git://` transports.
+- `crates/ruk`: The `ruk` binary, including the Git-compatible CLI (`crates/ruk/src/cli/`), MCP stdio server (`crates/ruk/src/mcp/`), and Forgejo multi-repository daemon (`crates/ruk/src/daemon/`).
 
-Decode the binary record back to canonical JSON:
+## License
 
-```bash
-cargo run -p ruk --locked -- decode-conflict --object-format sha1 --input conflict.bin
-```
-
-Pipes and standard I/O roundtrips function identically:
-
-```bash
-cat conflict.json | cargo run -p ruk --locked -- encode-conflict --object-format sha1 | cargo run -p ruk --locked -- decode-conflict --object-format sha1
-```
-
-## Object and Fact Store
-
-`ruk_core::store::Store` provides the storage library. Repository commands such as commit, checkout, branch, merge, push, and fetch are not yet implemented.
-
-- **Prepare:** stream object bytes into bounded memory or disk spools. Use a committed local predecessor for delta compression when the delta meets the size threshold.
-- **Publish:** append prepared objects to segments, flush their bytes and new entries, then commit object locators and conditional metadata facts together in redb. A stale condition rejects the whole batch before append. A failure after append begins closes the writer until recovery.
-- **Read:** verify record checksums, decode content, and verify object identity. Release metadata transactions before payload I/O.
-- **Recover:** verify committed extents and object identities on open. Truncate only an open segment's uncommitted tail. Refuse service on committed corruption rather than roll back acknowledged state.
-
-The store preserves exact object bytes for both SHA-1 and SHA-256. Native conflicts remain distinct from Git objects. Resource reservations bound preparation and release with the prepared objects.
-
-Each store has a persistent `StoreId`, available through `Store::store_id()`. Reopening or moving the store preserves that identity. Creating an independent store generates a new identity. The identity is not an authorization token.
-
-The `format` file has exactly three LF-terminated lines: `ruk-store 1`, `object-format sha1` (or `sha256`), and `store-id <uuid>`. The UUID must be non-nil and use lowercase hyphenated form. Ruk rejects the earlier two-line marker with `E_VERSION` before opening metadata or starting recovery. It does not modify or automatically migrate the rejected store.
-
-On POSIX, initialization synchronizes the existing ancestor chain before creating missing directories. On Windows, you must provide an already durable parent and an absent store root; merely creating the parent directory is not enough. Ruk publishes the owned root exclusively and refuses to adopt an existing or interrupted layout. Opening a store flushes its validated format marker before recovery. A reported filesystem flush failure may require operator storage recovery; reopening alone does not repair failed writeback.
-
-## I/O and Framing Rules
-
-* **Data on stdout, diagnostics on stderr**: Successful commands emit raw bytes to stdout (binary payload for `encode-conflict`, JSON text for `model` and `decode-conflict`). Diagnostics, error descriptions, and hints are written exclusively to stderr in the format `ruk: <message>`, followed by optional `hint: <text>` lines.
-* **Exit codes**: Process exit codes correspond to Ruk's closed `ErrorCode` classification (e.g. status 1 for `E_INVALID`, `E_LIMIT`, and `E_IO`; status 2 for conflict states; status 3 for concurrency/lease conflicts; status 4 for transport/push rejections; status 5 for corruption).
-* **String-or-hex byte encoding**: Git commit messages, paths, author names, and header values are arbitrary byte strings. When encoded as JSON, valid UTF-8 sequences render as standard JSON strings. Non-UTF-8 bytes render as `{"hex": "<lowercase hex>"}` objects. Both representations are accepted on input; valid UTF-8 strings are emitted whenever possible.
-* **Bounded 16 MiB CLI input**: The CLI enforces `MAX_CONTROL_FRAME_BYTES` (16 MiB, or 16,777,216 bytes). Input streams (`--input`, standard input, files, or FIFOs) are bounded by reading at most `limit + 1` bytes (`read.take(limit + 1)`). If an input exceeds 16 MiB, Ruk terminates consumption immediately with `E_LIMIT` (`exit status 1`). A FIFO that exceeds the limit is rejected without waiting for its writer to close. A shorter stream still needs an end-of-file signal.
-* **JSON nesting**: CLI conflict input, protocol envelope decoders, and `ruk_core::protocol::decode_json` accept at most 128 open arrays or objects, counting the root. Deeper input fails with `E_INVALID`. The CLI and control-frame byte limits remain unchanged. The generic `decode_json` function does not impose a byte limit.
-* **Schema types and transport**: `SchemaReply.document`, `model_schema_json`, and `method_schema_json` use `schemars::Schema`. Schema roots must be objects or booleans; arrays, strings, numbers, and null are rejected. Schema replies use JSON frames, not postcard. Request and non-schema receipt encodings remain unchanged. The protocol remains v1, so schema consumers must update together.
-* **Checked JSON parsing**: Use `protocol::decode_json` for bounded parsing through Sonic, including tagged, untagged, and flattened Serde containers. The parser adds stack space when needed. Direct third-party deserialization does not enforce Ruk's nesting limit or stack policy.
-* **Negative zero**: Parsing normalizes `-0` and `-0.0` to positive zero. Exact floating-point parsing equivalence with other JSON libraries is not guaranteed.
-
-## Verification Instructions
-
-Developers can run workspace verification checks with Cargo:
-
-```bash
-# Run workspace behavioral test suite
-cargo nextest run --workspace --locked
-
-# Run strict clippy analysis across all targets
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-```
-
-Formatting, strict Clippy, and workspace tests passed on Linux. The CLI smoke covered both hash kinds, byte-preserving round trips, malformed input, and bounded file/FIFO reads. An external Rust consumer exercised the store's public APIs with independent byte and object-ID oracles, concurrent readers and writers, resource limits, and reopen cycles. Process-kill tests cover atomic publication and recovery at segment-sealing boundaries; they do not prove hardware power-loss durability.
-
-The CLI model renders deterministically. Its semantic changes are limited to the schema document definition and reference. Conflict outputs still match the saved bytes for both hash kinds. Behavioral tests cover object and boolean schema roots, rejected scalar roots, buffered Serde replay, and the 128-level input boundary.
-
-The workspace, including Windows-only code and tests, also passed cross-compilation checks for `x86_64-pc-windows-gnu`. The [CI workflow](.github/workflows/ci.yml) defines macOS and Windows jobs. Those jobs were not executed during local verification, so runtime behavior on those platforms remains unverified.
-
-See the [changelog](CHANGELOG.md) for implemented functionality. Repository operations remain outside this executable's current scope.
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for the full text.
