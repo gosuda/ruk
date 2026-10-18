@@ -912,18 +912,19 @@ fn mint_empty_commit(
         .hash_kind()
         .hash_git_object("tree", b"")
         .map_err(CoreError::from)?;
-    // Preparation only proposes: the empty tree stages into the lane objects
-    // the lane publishes atomically, never directly into the store.
-    let mut staged_empty = Vec::new();
+    // `prepare_new` below reads committed store state, so the deterministic
+    // empty tree must exist there first: publish it directly through the
+    // real store path. It carries no facts or records, so a later refusal
+    // still leaves no meaningful state, and the lane keeps publishing the
+    // minted commit atomically.
     if store.object_len(empty).map_err(CoreError::from)?.is_none() {
         let empty_bytes: &[u8] = b"";
-        staged_empty.push(
-            store
-                .prepare(ObjectKind::Tree, 0, empty_bytes, None)
-                .map_err(CoreError::from)?,
-        );
+        let staged = store
+            .prepare(ObjectKind::Tree, 0, empty_bytes, None)
+            .map_err(CoreError::from)?;
+        store.publish(vec![staged], &[]).map_err(CoreError::from)?;
     }
-    let mut prepared = prepare_new(
+    let prepared = prepare_new(
         store,
         NewRequest {
             tree: empty,
@@ -936,7 +937,6 @@ fn mint_empty_commit(
             provenance: None,
         },
     )?;
-    push_unique(&mut prepared.objects, staged_empty);
     Ok((prepared, identity))
 }
 
@@ -4534,11 +4534,10 @@ mod tests {
         };
         assert_eq!(identity.name, "Ada");
         assert_eq!(identity.source, IdentitySource::SessionClaim);
-        // The empty tree stages into the candidate (so the lane publishes it
-        // atomically) alongside the commit object.
-        assert_eq!(prepared.objects.len(), 2);
+        // The empty tree publishes standalone (so `prepare_new` resolves it)
+        // while the candidate carries only the commit object.
+        assert_eq!(prepared.objects.len(), 1);
         assert_eq!(prepared.objects[0].kind(), ObjectKind::Commit);
-        assert_eq!(prepared.objects[1].kind(), ObjectKind::Tree);
         let read = store.read(empty_tree_oid(&store)).expect("read empty tree");
         assert_eq!(read.kind, ObjectKind::Tree);
         assert!(!prepared.facts.is_empty());
@@ -4570,7 +4569,7 @@ mod tests {
             })),
         )
         .expect("second new prepares");
-        assert_eq!(repeat.objects.len(), 1, "the stored tree stages nothing twice");
+        assert_eq!(repeat.objects.len(), 1, "candidate carries only its commit");
         let Reply::New(repeat_reply) = repeat.reply else {
             panic!("new must answer its own reply");
         };
