@@ -317,12 +317,12 @@ struct FileScan<'a> {
 }
 
 /// Scans every line of one file's bytes.
-fn scan_all_matches(matcher: &Matcher, bytes: &[u8]) -> FileScan<'_> {
+fn scan_all_matches<'bytes>(matcher: &Matcher, bytes: &'bytes [u8]) -> FileScan<'bytes> {
     scan_impl(matcher, bytes, CountMatches::All)
 }
 
 /// Scans one file's bytes, stopping at its first hit (for `-l`).
-fn scan_first_hit(matcher: &Matcher, bytes: &[u8]) -> FileScan<'_> {
+fn scan_first_hit<'bytes>(matcher: &Matcher, bytes: &'bytes [u8]) -> FileScan<'bytes> {
     scan_impl(matcher, bytes, CountMatches::FirstHit)
 }
 
@@ -339,7 +339,7 @@ enum CountMatches {
 ///
 /// A single trailing newline does not add a phantom line; an empty file
 /// has no lines at all.
-fn scan_impl(matcher: &Matcher, bytes: &[u8], want: CountMatches) -> FileScan<'_> {
+fn scan_impl<'bytes>(matcher: &Matcher, bytes: &'bytes [u8], want: CountMatches) -> FileScan<'bytes> {
     let binary = bytes.contains(&0);
     let mut lines: Vec<&[u8]> = Vec::new();
     if !bytes.is_empty() {
