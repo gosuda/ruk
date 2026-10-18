@@ -68,6 +68,14 @@ pub enum GitError {
         /// What is invalid.
         detail: String,
     },
+    /// Malformed invocation: the caller must fix argv, the way the oracle's
+    /// `usage()`/`fatal()` exits 128. Closed-code mapping stays `EInvalid`;
+    /// only the process status differs (see [`GitError::exit_code`]).
+    #[error("usage: {detail}")]
+    Usage {
+        /// What the caller must fix.
+        detail: String,
+    },
     /// A configured resource limit rejected the request.
     #[error("limit: {detail}")]
     Limit {
@@ -136,7 +144,9 @@ impl GitError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Unsupported { .. } => ErrorCode::EUnsupportedGitCommand,
-            Self::InvalidOid { .. } | Self::Invalid { .. } => ErrorCode::EInvalid,
+            Self::InvalidOid { .. } | Self::Invalid { .. } | Self::Usage { .. } => {
+                ErrorCode::EInvalid
+            }
             Self::ObjectFormat { .. } => ErrorCode::EObjectFormat,
             Self::Corrupt { .. } => ErrorCode::ECorrupt,
             Self::Io { .. } => ErrorCode::EIo,
@@ -155,8 +165,14 @@ impl GitError {
     }
 
     /// Native process exit status for this failure.
+    ///
+    /// Usage errors exit 128 like the oracle's `usage()`/`fatal()`; every
+    /// other variant keeps the native 1-5 map through [`GitError::code`].
     #[must_use]
     pub fn exit_code(&self) -> u8 {
+        if matches!(self, Self::Usage { .. }) {
+            return 128;
+        }
         self.code().exit_code()
     }
 
