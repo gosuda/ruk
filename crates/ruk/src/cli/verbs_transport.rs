@@ -1318,31 +1318,39 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
     })
 }
 
-/// Reads the `HEAD` advertisement for a serve verb: the symbolic target for
-/// the `symref` capability and the OID for the `HEAD` line (zero unborn).
+/// Reads the `HEAD` advertisement for a serve verb: the terminal name of HEAD's
+/// chain for the `symref` capability, and its OID for the `HEAD` line (zero
+/// when unborn).
+///
+/// The chain goes through the core `HeadRef::resolve`, which counts HEAD's own
+/// link, as every other reader does. A dangling, cyclic, or over-deep chain
+/// advertises the zero OID. A store read failure is not unborn: it propagates,
+/// so a corrupt store never serves a false HEAD.
 fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
     let (workspace, _) = load_or_default(store)?;
-    match &workspace.head {
-        ruk_core::workspace::HeadRef::Symbolic(name) => {
-            // Follow the full symref chain: a branch may itself point at
-            // another branch. A dangling, cyclic, or over-deep chain
-            // advertises the zero OID, the same unborn signal as a branch
-            // with no commit. A store read failure is not unborn: it
-            // propagates so a corrupt store never serves a false HEAD.
-            let oid = match ruk_core::refdata::resolve(&StoreRefs::new(store), name) {
-                Ok(resolved) => resolved.oid.unwrap_or_else(|| store.hash_kind().zero_oid()),
-                Err(ruk_core::refdata::RefError::Read(err)) => return Err(GitError::from(err)),
-                Err(_) => store.hash_kind().zero_oid(),
-            };
-            Ok(HeadAdvertisement {
-                oid,
-                symref: Some(name.as_bytes().to_vec()),
-            })
-        }
-        ruk_core::workspace::HeadRef::Detached(oid) => Ok(HeadAdvertisement {
-            oid: *oid,
+    match workspace.head.resolve(&StoreRefs::new(store)) {
+        Ok(ruk_core::workspace::ResolvedHead::Detached(oid)) => Ok(HeadAdvertisement {
+            oid,
             symref: None,
         }),
+        Ok(ruk_core::workspace::ResolvedHead::Symbolic(resolved)) => Ok(HeadAdvertisement {
+            oid: resolved.oid.unwrap_or_else(|| store.hash_kind().zero_oid()),
+            symref: Some(resolved.terminal.as_bytes().to_vec()),
+        }),
+        Err(ruk_core::refdata::RefError::Read(err)) => Err(GitError::from(err)),
+        Err(_) => Ok(HeadAdvertisement {
+            oid: store.hash_kind().zero_oid(),
+            symref: first_hop(&workspace.head),
+        }),
+    }
+}
+
+/// The immediate target of a symbolic HEAD, for a broken chain that cannot name
+/// its terminal.
+fn first_hop(head: &ruk_core::workspace::HeadRef) -> Option<Vec<u8>> {
+    match head {
+        ruk_core::workspace::HeadRef::Symbolic(name) => Some(name.as_bytes().to_vec()),
+        ruk_core::workspace::HeadRef::Detached(_) => None,
     }
 }
 
