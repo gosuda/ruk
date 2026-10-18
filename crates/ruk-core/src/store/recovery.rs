@@ -50,6 +50,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::durability;
 use super::guards::{CapturedLink, GenerationRegistry, ObjectSnapshot};
@@ -63,6 +64,11 @@ use crate::ids::{HashKind, Oid};
 
 /// Locators verified per metadata page during recovery.
 const VERIFY_PAGE: usize = 256;
+/// Largest object-verification fan-out. Eight workers use a workstation
+/// without spawning a thread per core on large machines; each worker holds
+/// at most one transient decode against the shared preparation budget, so
+/// the extra residency stays far below the reference 2 GiB ceiling.
+const VERIFY_THREADS: usize = 8;
 /// Buffer in front of segment reads.
 const READ_BUFFER: usize = 64 * 1024;
 
@@ -309,19 +315,69 @@ fn verify_segment(
     Ok(verified)
 }
 
-/// Verifies every committed object identity, one metadata page at a time.
-/// Callers invoke this only for generations the verification cache does not
-/// cover; on success they record the generation as verified.
+/// Verifies every committed object identity. Callers invoke this only for
+/// generations the verification cache does not cover; on success they
+/// record the generation as verified.
+///
+/// Locators are collected with the same fast redb scan as before, so still
+/// no metadata read spans payload I/O, then verified across at most
+/// [`VERIFY_THREADS`] scoped workers. Sharing `committed` is safe: every
+/// metadata lookup opens and drops its own read transaction, guard
+/// registration is a short mutex critical section, and each worker holds at
+/// most one transient decode. Workers that observe another worker's failure
+/// stop early; the first failure decides the result.
 fn verify_objects(committed: &Committed<'_>, generation: u64) -> Result<(), StoreError> {
+    let mut locators = Vec::new();
     let mut after: Option<Oid> = None;
     loop {
         let page = committed.meta.object_page(after.as_ref(), VERIFY_PAGE)?;
         let Some((last, _)) = page.last() else {
-            return Ok(());
+            break;
         };
         after = Some(*last);
-        for (oid, location) in &page {
+        locators.extend(page);
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|width| width.get())
+        .unwrap_or(1)
+        .min(VERIFY_THREADS)
+        .min(locators.len().max(1));
+    if threads <= 1 {
+        for (oid, location) in &locators {
             committed.verify_object(*oid, location, generation)?;
         }
+        return Ok(());
     }
+    let cancel = AtomicBool::new(false);
+    let cancelled = &cancel;
+    let chunk = locators.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for batch in locators.chunks(chunk) {
+            handles.push(scope.spawn(move || {
+                for (oid, location) in batch {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    if let Err(err) = committed.verify_object(*oid, location, generation) {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Some(err);
+                    }
+                }
+                None
+            }));
+        }
+        let mut first: Option<StoreError> = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(result) => {
+                    if first.is_none() {
+                        first = result;
+                    }
+                }
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        first.map_or(Ok(()), Err)
+    })
 }
