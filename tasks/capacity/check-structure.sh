@@ -91,7 +91,8 @@ runtime "http-429-503" "HTTP 429/503 + Retry-After mapping lives in the Forgejo 
 printf -- '--- exact outcomes / no unrelated scan / bounded advertisement ---\n'
 has "typed-errors" "ErrorCode::" "$CORE/error.rs"
 has "bounded-pages" "FactPageBudget\|PageLimit" "$CORE"
-has "bounded-oplog-page" "walk_oplog_page\|MAX_PAGE_SIZE" "$CORE/coord"
+has "oplog-walker" "walk_oplog_page" "$CORE/coord/hosted.rs"
+has "oplog-visit-bound" "MAX_PAGE_SIZE" "$CORE/coord/hosted.rs"
 has "cursor-binding" "CursorWant\|binding mismatch\|stale" "$CORE/coord/leases.rs" "$CORE/coord/claims.rs"
 runtime "single-ref-no-scan" "indexed lookup without unrelated-ref scan needs profiling proof at 1M branches (run.sh lookup + adv-1M)"
 runtime "adv-budget" "1 GiB / 30 s unfiltered advertisement budget needs the 1M-branch run; dev scale covers 1k/10k only"

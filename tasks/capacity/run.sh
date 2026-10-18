@@ -343,6 +343,12 @@ fetch_setup() {
   # Seed a clone once per rep; fetch measures the incremental stream.
   rm -rf -- "$WORK/fetch-$backend-$r" || die "fetch cleanup failed"
   "$GITBIN" clone -q --bare "file://$LARGE10" "$WORK/fetch-$backend-$r" >/dev/null 2>&1 || return $?
+  if [ "$backend" = "ruk" ]; then
+    # A bare clone carries no .ruk store; migrate it (bare layout: the
+    # clone dir is its own git dir) so a ruk fetch failure names the verb
+    # gap instead of the missing store. Git reps never take this branch.
+    "$RUKBIN" git -C "$WORK/fetch-$backend-$r" migrate "$WORK/fetch-$backend-$r" "$WORK/fetch-$backend-$r" >/dev/null 2>&1 || return $?
+  fi
   # New upstream branch makes the fetch non-trivial.
   "$GITBIN" -C "$LARGE10" branch -f "fetchprobe_${backend}_${r}" "refs/heads/b000001" >/dev/null 2>&1 || return $?
   return 0
@@ -405,6 +411,7 @@ probe_ruk() {
     fetch)
       rm -rf -- "$WORK/probe-fetch" || die "probe cleanup failed"
       "$GITBIN" clone -q --bare "file://$LARGE10" "$WORK/probe-fetch" >/dev/null 2>&1 || die "probe setup failed"
+      "$RUKBIN" git -C "$WORK/probe-fetch" migrate "$WORK/probe-fetch" "$WORK/probe-fetch" >/dev/null 2>&1 || die "probe migrate failed"
       "$GITBIN" -C "$LARGE10" branch -f "fetchprobe_probe" "refs/heads/b000001" >/dev/null 2>&1 || die "probe setup failed"
       probe_cmd "$WORK/probe-fetch" fetch -q origin
       code="$?"
