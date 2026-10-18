@@ -13,9 +13,14 @@
 # Records offered/admitted/completed/rejected, source commit, host config.
 # Regenerates tasks/capacity/RESULTS.md from its own observed output.
 #
-# Ruk is invoked the parity-harness way: "$RUKBIN" git -C DIR ARGS.
-# If RUKBIN is absent/not executable, the ruk side records BLOCKED (with
-# reason) and the git baseline still runs.
+# Ruk is invoked the parity-harness way: "$RUKBIN" git -C DIR ARGS with argv
+# identical to the git baseline, against co-located `.ruk` stores (planted by
+# gen-fixture.sh --ruk). Each ruk workload first probes its exact CLI once; a
+# rejected verb records BLOCKED with the observed stderr instead of numbers.
+# Argv is never adjusted per backend: a flag ruk rejects blocks that workload
+# honestly. If RUKBIN is absent/not executable, or the fixture lacks `.ruk`
+# stores, the whole ruk side records BLOCKED (with reason) and the git
+# baseline still runs.
 #
 # Usage:
 #   bash tasks/capacity/run.sh --fixture DIR [--reps N] [--warmup N]
@@ -128,13 +133,23 @@ RESULTS_JSON="$WORK/results.json"
 printf '[\n' >"$RESULTS_JSON" || die "json init failed"
 FIRST_ROW=1
 row() {
-  # row <workload> <backend> <offered> <completed> <stats...> <extra-json>
+  # row <workload> <backend> <offered> <completed> <stats...> <extra>
+  # Every field passes through JSON encoding so quotes, backslashes, and
+  # newlines in notes (e.g. BLOCKED hook stderr) cannot corrupt results.json.
   if [ "$FIRST_ROW" -eq 0 ]; then
     printf ',\n' >>"$RESULTS_JSON" || die "json write failed"
   fi
   FIRST_ROW=0
-  printf '  {"workload":"%s","backend":"%s","offered":%s,"completed":%s,"stats":"%s","extra":"%s"}' \
-    "$1" "$2" "$3" "$4" "$5" "$6" >>"$RESULTS_JSON" || die "json write failed"
+  ROW_W="$1" ROW_B="$2" ROW_O="$3" ROW_C="$4" ROW_S="$5" ROW_E="$6" python3 -c '
+import json, os
+print("  " + json.dumps({
+    "workload": os.environ["ROW_W"],
+    "backend": os.environ["ROW_B"],
+    "offered": int(os.environ["ROW_O"]),
+    "completed": int(os.environ["ROW_C"]),
+    "stats": os.environ["ROW_S"],
+    "extra": os.environ["ROW_E"],
+}))' >>"$RESULTS_JSON" || die "json write failed"
 }
 
 run_workload() {
@@ -194,6 +209,12 @@ LARGE1="$FIXTURE/large-1000"
 SMALL0="$FIXTURE/small-000"
 [ -d "$LARGE10" ] || die "fixture lacks large-10000: run gen-fixture.sh"
 [ -d "$SMALL0" ] || die "fixture lacks small-000: run gen-fixture.sh"
+if [ "$RUK_OK" -eq 1 ]; then
+  if [ ! -d "$LARGE1/.ruk" ] || [ ! -d "$LARGE10/.ruk" ] || [ ! -d "$SMALL0/.ruk" ]; then
+    RUK_OK=0
+    RUK_NOTE="BLOCKED: fixture lacks .ruk stores (regenerate: bash tasks/capacity/gen-fixture.sh --out $FIXTURE --ruk $RUKBIN)"
+  fi
+fi
 
 # --- workload rep functions (each records one sample per measured rep) ------
 W_ADV_BYTES_1K=0
@@ -351,15 +372,75 @@ W_ADV_BYTES_1K="$(printf '%s' "$W_ADV_BYTES_1K" | tr -d ' ')"
 W_ADV_BYTES_10K="$(printf '%s' "$W_ADV_BYTES_10K" | tr -d ' ')"
 printf 'capacity run: adv bytes 1k=%s 10k=%s\n' "$W_ADV_BYTES_1K" "$W_ADV_BYTES_10K"
 
+# probe_cmd <repo> <args...>: one ruk invocation with the workload's exact
+# argv; prints the first rejection line on failure for the BLOCKED record.
+probe_cmd() {
+  repo="$1"
+  shift
+  err="$("$RUKBIN" git --no-pager -C "$repo" "$@" 2>&1)" || {
+    printf '%s' "$err" | head -n 1 | head -c 300
+    return 1
+  }
+}
+
+# probe_ruk <workload>: runs the workload's exact CLI once against ruk.
+# Prints the rejection reason and returns nonzero when ruk lacks the verb
+# form; argv here must stay identical to the rep functions below.
+probe_ruk() {
+  name="$1"
+  case "$name" in
+    adv-1k) probe_cmd "$LARGE1" show-ref ;;
+    adv-10k) probe_cmd "$LARGE10" show-ref ;;
+    lookup) probe_cmd "$LARGE10" rev-parse --verify --quiet "refs/heads/b005000^{commit}" ;;
+    page1) probe_cmd "$LARGE10" branch --list 'b*' ;;
+    write)
+      rm -rf -- "$WORK/probe-write" || die "probe cleanup failed"
+      cp -r -- "$SMALL0" "$WORK/probe-write" || die "probe setup copy failed"
+      printf 'probe\n' >"$WORK/probe-write/w_probe.txt" || die "probe payload failed"
+      probe_cmd "$WORK/probe-write" add "w_probe.txt" || return 1
+      probe_cmd "$WORK/probe-write" commit -qm "capacity probe" ;;
+    clone)
+      rm -rf -- "$WORK/probe-clone" || die "probe cleanup failed"
+      probe_cmd "$WORK" clone -q --bare "file://$LARGE10" "$WORK/probe-clone" ;;
+    fetch)
+      rm -rf -- "$WORK/probe-fetch" || die "probe cleanup failed"
+      "$GITBIN" clone -q --bare "file://$LARGE10" "$WORK/probe-fetch" >/dev/null 2>&1 || die "probe setup failed"
+      "$GITBIN" -C "$LARGE10" branch -f "fetchprobe_probe" "refs/heads/b000001" >/dev/null 2>&1 || die "probe setup failed"
+      probe_cmd "$WORK/probe-fetch" fetch -q origin
+      code="$?"
+      "$GITBIN" -C "$LARGE10" branch -q -D "fetchprobe_probe" >/dev/null 2>&1 || true
+      rm -rf -- "$WORK/probe-fetch" || die "probe cleanup failed"
+      return "$code" ;;
+    *) die "unknown workload for probe: $name" ;;
+  esac
+}
+
+maybe_run() {
+  # maybe_run <name> <backend> <reps> <setup> <rep> <extra> [warmup]:
+  # identical argv to run_workload, but a ruk backend first probes the
+  # workload's exact CLI once; a rejected verb records BLOCKED with the
+  # observed stderr instead of running reps that cannot succeed.
+  if [ "$2" != "ruk" ]; then
+    run_workload "$@" || die "workload failed: $1 $2"
+    return 0
+  fi
+  reason="$(probe_ruk "$1")" || {
+    row "$1" "ruk" "0" "0" "n=0 mean=NA min=NA p50=NA p95=NA p99=NA max=NA" "BLOCKED: $reason" || die "json write failed"
+    printf '%-14s %-6s BLOCKED %s\n' "$1" "$2" "$reason"
+    return 0
+  }
+  run_workload "$@" || die "workload failed: $1 $2"
+}
+
 run_backend() {
   b="$1"
-  run_workload "adv-1k" "$b" "$REPS" adv1k_setup adv1k_rep "bytes=$W_ADV_BYTES_1K"
-  run_workload "adv-10k" "$b" "$REPS" adv10k_setup adv10k_rep "bytes=$W_ADV_BYTES_10K"
-  run_workload "lookup" "$b" "$REPS" lookup_setup lookup_rep "ref=refs/heads/b005000"
-  run_workload "page1" "$b" "$REPS" page1_setup page1_rep "rows=20"
-  run_workload "write" "$b" "$REPS" write_setup write_rep "paths=1"
-  run_workload "clone" "$b" "$CLONE_REPS" clone_setup clone_rep "bare file://large-10000" 1
-  run_workload "fetch" "$b" "$REPS" fetch_setup fetch_rep "incremental +1 branch"
+  maybe_run "adv-1k" "$b" "$REPS" adv1k_setup adv1k_rep "bytes=$W_ADV_BYTES_1K"
+  maybe_run "adv-10k" "$b" "$REPS" adv10k_setup adv10k_rep "bytes=$W_ADV_BYTES_10K"
+  maybe_run "lookup" "$b" "$REPS" lookup_setup lookup_rep "ref=refs/heads/b005000"
+  maybe_run "page1" "$b" "$REPS" page1_setup page1_rep "rows=20"
+  maybe_run "write" "$b" "$REPS" write_setup write_rep "paths=1"
+  maybe_run "clone" "$b" "$CLONE_REPS" clone_setup clone_rep "bare file://large-10000" 1
+  maybe_run "fetch" "$b" "$REPS" fetch_setup fetch_rep "incremental +1 branch"
 }
 
 run_backend "git"
@@ -433,8 +514,10 @@ PYEOF
   printf -- '- Latencies are single-host CLI wall times, not end-to-end Forgejo operations and not\n'
   printf -- '  open-loop load at 1000 ops/s. Compare against profile SLOs only as order-of-magnitude\n'
   printf -- '  context, never as a pass claim.\n'
-  printf -- '- The ruk side runs the same CLI verbs via `ruk git`. Daemon/IPC admission, bulk classes,\n'
-  printf -- '  and Forgejo HTTP paths are out of scope for this scaffold.\n'
+  printf -- '- The ruk side runs the identical CLI argv via `ruk git -C <repo>` against co-located\n'
+  printf -- '  `.ruk` stores (see manifest.txt `ruk-stores`). Verbs ruk rejects record BLOCKED with\n'
+  printf -- '  the observed stderr instead of numbers; argv is never adjusted per backend.\n'
+  printf -- '- Daemon/IPC admission, bulk classes, and Forgejo HTTP paths are out of scope here.\n'
 } >"$SCRIPT_DIR/RESULTS.md" || die "RESULTS.md write failed"
 
 printf 'capacity run: done -> %s ; report -> %s\n' "$WORK" "$SCRIPT_DIR/RESULTS.md"

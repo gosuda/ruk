@@ -12,9 +12,17 @@
 # Usage:
 #   bash tasks/capacity/gen-fixture.sh --out DIR [--small N]
 #       [--branches "1000 10000"] [--shape mixed] [--large-commits C] [--full]
+#       [--ruk PATH]
 #   --full adds the 100000 and 1000000 steps (slow; needs a full-profile host).
+#   --ruk PATH (default: <root>/target/debug/ruk) also migrates every created
+#   repo into a co-located `.ruk` store (`ruk migrate <gitdir> <worktree>`),
+#   so run.sh can serve `ruk git -C <dir>` beside the git baseline. When the
+#   binary is missing, fixtures stay git-only with a manifest note.
 set -euo pipefail
 IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)" || exit 1
 
 GEN_VERSION="capacity-gen-0.1.0"
 SEED="${SEED:-0x52554b01}"
@@ -25,6 +33,7 @@ SHAPE="mixed"
 LARGE_COMMITS=200
 FULL=0
 GITBIN="${GITBIN:-/usr/bin/git}"
+RUKBIN="${RUKBIN:-$ROOT/target/debug/ruk}"
 
 die() {
   printf 'gen-fixture: %s\n' "$*" >&2
@@ -39,6 +48,7 @@ while [ "$#" -gt 0 ]; do
     --shape) SHAPE="${2:?missing --shape value}"; shift 2 ;;
     --large-commits) LARGE_COMMITS="${2:?missing --large-commits value}"; shift 2 ;;
     --full) FULL=1; shift ;;
+    --ruk) RUKBIN="${2:?missing --ruk value}"; shift 2 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -153,12 +163,33 @@ make_large() {
   "$GITBIN" -C "$dir" checkout -q main || die "final checkout failed"
 }
 
+# seed_ruk <dir>: migrate a git-created fixture repo into a co-located `.ruk`
+# store so `ruk git -C <dir>` serves it. Never fails: without an executable
+# ruk the fixtures stay git-only and run.sh records BLOCKED with a reason.
+seed_ruk() {
+  dir="$1"
+  if [ ! -x "$RUKBIN" ]; then
+    return 0
+  fi
+  if "$RUKBIN" git -C "$dir" migrate "$dir/.git" "$dir" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'gen-fixture: warning: ruk migrate failed for %s\n' "$dir" >&2
+}
+
+if [ -x "$RUKBIN" ]; then
+  RUK_INFO="$("$RUKBIN" git version 2>/dev/null || printf 'ruk git version failed')"
+else
+  RUK_INFO="unavailable: no executable at $RUKBIN"
+fi
 printf 'gen-fixture %s seed=%s shape=%s out=%s\n' "$GEN_VERSION" "$SEED" "$SHAPE" "$OUT"
+printf 'gen-fixture: ruk: %s\n' "$RUK_INFO"
 
 i=0
 while [ "$i" -lt "$SMALL_N" ]; do
   name="$(printf 'small-%03d' "$i")"
   make_small "$OUT/$name" "$i"
+  seed_ruk "$OUT/$name"
   i=$((i + 1))
 done
 printf 'gen-fixture: %d small repos done\n' "$SMALL_N"
@@ -172,6 +203,7 @@ printf '%s\n' "$BRANCH_STEPS" | tr ' ' '\n' | while IFS= read -r k; do
     die "step $k requires --full"
   fi
   make_large "$OUT/large-$k" "$k"
+  seed_ruk "$OUT/large-$k"
   printf 'gen-fixture: large-%s done\n' "$k"
 done
 
@@ -181,6 +213,8 @@ done
   printf 'shape: %s\n' "$SHAPE"
   printf 'date-utc: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'git: %s\n' "$("$GITBIN" --version)"
+  printf 'ruk: %s\n' "$RUK_INFO"
+  printf 'ruk-stores: %s\n' "$(find "$OUT" -maxdepth 2 -name .ruk 2>/dev/null | wc -l | tr -d ' ')"
   printf 'small-repos: %d\n' "$SMALL_N"
   printf 'branch-steps: %s\n' "$BRANCH_STEPS"
   printf 'large-base-commits: %d\n' "$LARGE_COMMITS"
