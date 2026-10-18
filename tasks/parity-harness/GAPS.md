@@ -31,7 +31,7 @@ exit codes: oracle=0 ruk=0
 - `index-pack` (exit 1): ruk: unsupported git command: index-pack: pack indexing is absent in this slice
 - `pack-objects` (exit 1): ruk: unsupported git command: pack-objects: pack generation is absent in this slice
 - `worktree` (exit 1): ruk: unsupported git command: worktree: multiple working trees need the workcopy lane
-- `init -b main` (exit 0): Initialized empty Ruk repository in /tmp/tmp.11yShKqAvR/ibprobe/.ruk/
+- `init -b main` (exit 0): Initialized empty Ruk repository in /tmp/tmp.ttpzaaJKGg/ibprobe/.ruk/
 - `hash-object f.txt` via -C from repo root (exit 0): 9117217ff36c2893110e6526d217e9596b16bb85
 
 ## passing rows (exact or oid-masked parity this run)
