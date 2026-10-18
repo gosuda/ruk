@@ -34,11 +34,14 @@
 //! - [`dumb`]: dumb-HTTP `info/refs` text and loose objects.
 //! - [`archive`]: the `upload-archive` server half (streaming tar).
 //! - [`session`]: the transport seam and the local native transport.
-//! - [`net`]: remote URL parsing plus the SSH and git-daemon transports
-//!   (HTTP stays a named gap: no client in this slice).
+//! - [`net`]: remote URL parsing plus the SSH, git-daemon and smart-http
+//!   transports (dumb-http stays the one HTTP named gap).
+//! - [`smart_http`]: stateless upload-pack/receive-pack over HTTP(S).
 //!
 //! Later slices add an HTTPS adapter behind [`session::Transport`]; SSH
-//! and git-daemon streams already feed the owned wire clients directly.
+//! and git-daemon streams already feed the owned wire clients directly,
+//! and smart-http POSTs feed the same ingest and report halves over a
+//! framing-decoding response reader.
 
 pub mod archive;
 pub mod dumb;
@@ -56,6 +59,7 @@ pub mod push;
 pub mod refadv;
 pub mod serve;
 pub mod session;
+pub mod smart_http;
 
 #[cfg(test)]
 #[path = "tests/notes_roundtrip.rs"]

@@ -478,7 +478,10 @@ fn read_section_lines<R: Read>(
 /// Reads one pack after negotiation: side-band demultiplexed when the
 /// server negotiated it, raw otherwise (raw packs end at the trailer and
 /// the connection is not reused).
-fn read_pack_section<R: Read>(
+///
+/// Shared with the smart-http fetch half, whose POST response carries the
+/// same post-negotiation bytes as the stateful stream.
+pub(crate) fn read_pack_section<R: Read>(
     pkt: &mut PktReader<R>,
     sideband: Option<usize>,
     kind: HashKind,

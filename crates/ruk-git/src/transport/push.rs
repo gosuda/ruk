@@ -508,7 +508,9 @@ pub fn push_over<R: Read + Write>(
     }
 }
 
-fn persist(
+/// Persists one plan state. Shared with the smart-http push half, which
+/// walks the same Prepared → Sending → Finalized/Uncertain states.
+pub(crate) fn persist(
     store: &Store,
     plan: &PushPlanRecord,
     kind: HashKind,
@@ -519,7 +521,9 @@ fn persist(
     Ok(())
 }
 
-fn persist_best_effort(store: &Store, plan: &PushPlanRecord, kind: HashKind) {
+/// Shared with the smart-http push half: the same best-effort
+/// `Uncertain` write after a send-side failure.
+pub(crate) fn persist_best_effort(store: &Store, plan: &PushPlanRecord, kind: HashKind) {
     let current = store
         .fact(FactTable::PushPlans, plan.id.as_bytes())
         .ok()
@@ -604,7 +608,12 @@ fn refuse_private_tips<'a>(
 /// A truncated or padded report is [`GitError::Corrupt`], never a partial
 /// success: the caller persists `Uncertain` instead of recording outcomes
 /// the server never acknowledged.
-fn check_report_covers_live(live: &[&PushUpdate], server: &[RefOutcome]) -> Result<(), GitError> {
+/// Shared with the smart-http push half, which answers the same coverage
+/// contract over its POST response.
+pub(crate) fn check_report_covers_live(
+    live: &[&PushUpdate],
+    server: &[RefOutcome],
+) -> Result<(), GitError> {
     let mut wanted: HashMap<&[u8], usize> = HashMap::with_capacity(live.len());
     for update in live {
         if wanted.insert(update.name.as_slice(), 1).is_some() {
@@ -791,7 +800,12 @@ fn push_over_inner<R: Read + Write>(
     Ok(report)
 }
 
-fn current_encoding(store: &Store, plan: &PushPlanRecord) -> Result<Option<Vec<u8>>, GitError> {
+/// Reads the stored encoding a plan persist must compare against. Shared
+/// with the smart-http push half.
+pub(crate) fn current_encoding(
+    store: &Store,
+    plan: &PushPlanRecord,
+) -> Result<Option<Vec<u8>>, GitError> {
     Ok(store.fact(FactTable::PushPlans, plan.id.as_bytes())?)
 }
 
@@ -1104,7 +1118,10 @@ fn pair_trees(
 
 /// Reads a report-status(-v2) response: demultiplexed when the server
 /// negotiated side-band, raw otherwise.
-fn read_report<R: Read>(
+///
+/// Shared with the smart-http push half, whose POST response carries the
+/// same report bytes as the stateful stream.
+pub(crate) fn read_report<R: Read>(
     pkt: &mut PktReader<R>,
     sideband: Option<usize>,
 ) -> Result<Vec<RefOutcome>, GitError> {

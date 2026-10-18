@@ -1,14 +1,13 @@
-//! Minimal HTTP/1.1 client for the git-lfs batch API only.
+//! Minimal HTTP/1.1 client for the git-lfs batch API and git smart-http.
 //!
 //! `std::net::TcpStream` plus TLS via `rustls`+`webpki-roots` (pure Rust,
-//! Mozilla roots; no platform glue). Scope is exactly what batch download
-//! needs: POST a JSON body, GET a payload URL streaming into a writer,
-//! `Content-Length` or chunked bodies, Basic/Bearer auth from the
-//! environment. No cookies, no keep-alive (every request sends
-//! `Connection: close` on a fresh connection), no git smart-http: the
-//! smart protocol over HTTP stays a named gap in [`super::net`]
-//! (`Endpoint::Http` keeps refusing for git verbs) and only LFS payload
-//! fetch and upload get HTTP.
+//! Mozilla roots; no platform glue). Scope is exactly what batch transfer
+//! and [`super::smart_http`] need: POST a JSON body, GET a payload URL
+//! streaming into a writer, buffered or streaming raw POSTs for pkt-line
+//! RPC bodies, `Content-Length` or chunked bodies, Basic/Bearer auth from
+//! the environment. No cookies, no keep-alive (every request sends
+//! `Connection: close` on a fresh connection); dumb-http stays a named
+//! gap in [`super::net`] and only LFS payloads plus smart-http get HTTP.
 //!
 //! Oracle anchors: the git-lfs batch API
 //! (`https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md`:
@@ -104,6 +103,25 @@ pub fn auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {
         })
 }
 
+/// An `Authorization` header from the git smart-http auth environment,
+/// when set.
+///
+/// `GIT_AUTH_TOKEN` wins and is sent verbatim as `Bearer <value>`;
+/// otherwise `GIT_AUTH_USER` plus `GIT_AUTH_PASSWORD` are sent as
+/// `Basic <base64(user:pass)>`. This is deliberately narrower than git's
+/// credential-helper and `http.<url>.extraHeader` machinery (both stay
+/// named gaps, documented in [`super::smart_http`]): CI-style static
+/// tokens are what this adapter needs.
+#[must_use]
+pub fn git_auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {
+    if let Some(token) = vars.get("GIT_AUTH_TOKEN").filter(|v| !v.is_empty()) {
+        return Some(("authorization".to_owned(), format!("Bearer {token}")));
+    }
+    let user = vars.get("GIT_AUTH_USER").filter(|v| !v.is_empty())?;
+    let password = vars.get("GIT_AUTH_PASSWORD").cloned().unwrap_or_default();
+    let encoded = base64_encode(format!("{user}:{password}").as_bytes());
+    Some(("authorization".to_owned(), format!("Basic {encoded}")))
+}
 /// Standard-alphabet base64 with padding, so Basic credentials need no new
 /// dependency for one short header value.
 fn base64_encode(bytes: &[u8]) -> String {
@@ -638,6 +656,176 @@ pub fn post_json(
         headers,
         body: reply,
     })
+}
+
+/// How one open response body ends: chunked wins over `Content-Length`
+/// (RFC 9112 §6.3), an absent length reads to EOF on the closed
+/// connection — the same precedence [`read_body`] uses for sinks.
+enum BodyFraming {
+    /// Exactly `rest` more bytes belong to the body.
+    Sized {
+        /// Bytes still owed.
+        rest: u64,
+    },
+    /// Chunked framing at `state`.
+    Chunked {
+        /// Where the next read resumes.
+        state: ChunkState,
+    },
+    /// The body ends with the connection.
+    ToEof,
+}
+
+/// Where a chunked read resumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkState {
+    /// Parse the next chunk-size line.
+    Size,
+    /// Emit `rest` more bytes of the current chunk.
+    Data {
+        /// Bytes still owed in this chunk.
+        rest: u64,
+    },
+    /// Consume the CRLF closing the current chunk.
+    DataEnd,
+    /// Consume trailers to the blank line.
+    Trailers,
+    /// The zero chunk and trailers are past: all reads are EOF.
+    Done,
+}
+
+/// One open response body: the reader positioned at the first body byte,
+/// owning the connection, decoding its framing as it reads, so pkt-line
+/// never sees chunk-size text. Dropping it closes the connection, so
+/// error statuses need no draining; the caller reports the status.
+///
+/// No `Debug`: the inner stream (notably the TLS session) has none.
+pub struct HttpBodyReader {
+    reader: BufReader<Stream>,
+    framing: BodyFraming,
+}
+
+fn io_failed(what: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned())
+}
+
+fn io_git(err: GitError) -> std::io::Error {
+    std::io::Error::other(err.to_string())
+}
+
+impl Read for HttpBodyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match &mut self.framing {
+            BodyFraming::Sized { rest } => {
+                if *rest == 0 {
+                    return Ok(0);
+                }
+                let want = usize::try_from((*rest).min(buf.len() as u64))
+                    .map_err(|_| io_failed("response length exceeds addressable memory"))?;
+                let got = self.reader.read(&mut buf[..want])?;
+                *rest -= got as u64;
+                Ok(got)
+            }
+            BodyFraming::ToEof => self.reader.read(buf),
+            BodyFraming::Chunked { state } => loop {
+                match *state {
+                    ChunkState::Done => return Ok(0),
+                    ChunkState::Size => {
+                        let line = read_line(&mut self.reader).map_err(io_git)?;
+                        let size_text = line
+                            .iter()
+                            .take_while(|byte| **byte != b';')
+                            .copied()
+                            .collect::<Vec<u8>>();
+                        let text = std::str::from_utf8(&size_text).map_err(|_| {
+                            io_failed("chunk size is not UTF-8")
+                        })?;
+                        let size = u64::from_str_radix(text, 16)
+                            .map_err(|_| io_failed("bad chunk size"))?;
+                        *state = if size == 0 {
+                            ChunkState::Trailers
+                        } else {
+                            ChunkState::Data { rest: size }
+                        };
+                    }
+                    ChunkState::Data { ref mut rest } => {
+                        let want = usize::try_from((*rest).min(buf.len() as u64))
+                            .map_err(|_| io_failed("chunk exceeds addressable memory"))?;
+                        let got = self.reader.read(&mut buf[..want])?;
+                        if got == 0 {
+                            return Err(io_failed("chunked body ended mid-chunk"));
+                        }
+                        *rest -= got as u64;
+                        if *rest == 0 {
+                            *state = ChunkState::DataEnd;
+                        }
+                        return Ok(got);
+                    }
+                    ChunkState::DataEnd => {
+                        if !read_line(&mut self.reader).map_err(io_git)?.is_empty() {
+                            return Err(io_failed("chunk misses its trailing CRLF"));
+                        }
+                        *state = ChunkState::Size;
+                    }
+                    ChunkState::Trailers => {
+                        if read_line(&mut self.reader).map_err(io_git)?.is_empty() {
+                            *state = ChunkState::Done;
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// POSTs `body` and returns the open response: status, headers, and a
+/// reader positioned at the body, decoding its framing as it reads. The
+/// caller reads straight into pkt-line framing and the pack ingest, which
+/// bounds memory no buffered cap could. Single-shot like [`put_bytes`]:
+/// smart RPC endpoints never redirect a POST, and re-sending a request
+/// body to a redirected host would need fresh credential scoping the
+/// caller cannot do blindly; a 3xx status surfaces for the caller to
+/// report.
+///
+/// # Errors
+/// Routing, framing, and transport failures as [`GitError`].
+pub fn post_open(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(HttpBodyReader, u16, Vec<(String, String)>), GitError> {
+    let (reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
+    let framing = open_framing(&headers)?;
+    Ok((
+        HttpBodyReader { reader, framing },
+        status,
+        headers,
+    ))
+}
+
+/// Picks the body framing for one open response from its headers: chunked
+/// wins over `Content-Length`, an absent length reads to EOF.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a bad declared length.
+fn open_framing(headers: &[(String, String)]) -> Result<BodyFraming, GitError> {
+    if header(headers, "transfer-encoding")
+        .is_some_and(|value| value.split(',').any(|token| token.trim() == "chunked"))
+    {
+        return Ok(BodyFraming::Chunked {
+            state: ChunkState::Size,
+        });
+    }
+    if let Some(length) = header(headers, "content-length") {
+        let declared: u64 = length.parse().map_err(|_| GitError::Invalid {
+            detail: format!("bad Content-Length {length:?}"),
+        })?;
+        return Ok(BodyFraming::Sized { rest: declared });
+    }
+    Ok(BodyFraming::ToEof)
 }
 
 /// PUTs `body` bytes and buffers the reply, capped at
@@ -1198,6 +1386,75 @@ mod tests {
             "{:?}",
             requests[0]
         );
+    }
+
+    #[test]
+    fn git_auth_env_surface() {
+        let vars = HashMap::from([("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned())]);
+        assert_eq!(
+            git_auth_header(&vars),
+            Some(("authorization".to_owned(), "Bearer tok".to_owned()))
+        );
+        // A bearer token wins over a user/password pair.
+        let vars = HashMap::from([
+            ("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned()),
+            ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
+            ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),
+        ]);
+        assert_eq!(git_auth_header(&vars).map(|(_, value)| value), Some("Bearer tok".to_owned()));
+        let vars = HashMap::from([
+            ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
+            ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),
+        ]);
+        assert_eq!(
+            git_auth_header(&vars),
+            Some(("authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned()))
+        );
+        assert_eq!(git_auth_header(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn post_open_decodes_chunked_before_pktline() {
+        let (port, server) = fake_raw_server(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\n0008NAK\n\r\n4\r\n0000\r\n0\r\n\r\n".to_vec(),
+        ]);
+        let (mut body, status, _) = post_open(
+            &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
+            &[("Content-Type", "application/x-git-upload-pack-request")],
+            b"0000",
+        )
+        .expect("post");
+        assert_eq!(status, 200);
+        let mut decoded = Vec::new();
+        body.read_to_end(&mut decoded).expect("read");
+        assert_eq!(decoded, b"0008NAK\n0000");
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].starts_with("POST /a.git/git-upload-pack HTTP/1.1\r\n"),
+            "{:?}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn post_open_honors_content_length() {
+        let (port, server) = fake_raw_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n0008NAK\n0000TRAILING".to_vec(),
+        ]);
+        let (mut body, status, _) = post_open(
+            &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
+            &[],
+            b"0000",
+        )
+        .expect("post");
+        assert_eq!(status, 200);
+        let mut decoded = Vec::new();
+        body.read_to_end(&mut decoded).expect("read");
+        // Exactly the declared 12 bytes: pkt-line never sees framing
+        // spill or the trailing connection bytes.
+        assert_eq!(decoded, b"0008NAK\n0000");
+        server.join().expect("server");
     }
 
     #[test]

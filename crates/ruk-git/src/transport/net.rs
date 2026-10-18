@@ -1,11 +1,13 @@
-//! Network remote endpoints: URL parsing plus the SSH and git-daemon
-//! transports.
+//! Network remote endpoints: URL parsing plus the SSH, git-daemon and
+//! smart-http transports.
 //!
 //! [`parse_endpoint`] classifies any remote string through `gix-url` (an
 //! existing dependency, so no new crates): bare paths and `file://` URLs
 //! are local, `ssh://` URLs and scp-like `host:path` spellings dial over
 //! SSH, `git://` URLs dial a git daemon over TCP, and `http(s)://` URLs
-//! parse to a named gap (this slice ships no HTTP client).
+//! route to the stateless smart-http client in [`super::smart_http`].
+//! Dumb-http (plain `objects/info/*` file fetches) stays the one HTTP
+//! named gap.
 //!
 //! The wire grammars stay owned in-process: [`open_stream`] only yields a
 //! duplex byte stream, and callers drive [`super::fetch::receive`] and
@@ -65,8 +67,8 @@ pub enum Endpoint {
         /// Repository path on the daemon.
         path: String,
     },
-    /// `http(s)://` URLs: parsed, then refused as a named gap (no HTTP
-    /// client in this slice).
+    /// `http(s)://` URLs: served by the stateless smart-http client in
+    /// [`super::smart_http`] (dumb-http file fetches stay a named gap).
     Http {
         /// Whether the scheme was `https`.
         secure: bool,
@@ -186,12 +188,15 @@ fn looks_like_explicit_ssh(spec: &str) -> bool {
     at < colon && !spec[..colon].contains('/')
 }
 
-/// The refusal for HTTP endpoints: parsed but unserved, a named gap.
+/// The refusal for dumb-http endpoints: a server that answers `info/refs`
+/// without a smart `application/x-*-advertisement` document serves static
+/// files only, which no client here reads. Smart-http upload-pack and
+/// receive-pack are served; dumb-http is the remaining HTTP gap.
 #[must_use]
-pub fn http_gap(url: &str) -> GitError {
+pub fn dumb_http_gap(url: &str) -> GitError {
     GitError::Unsupported {
         command: format!(
-            "{url}: http(s) remotes need an HTTP client (named gap; use a local path, file://, ssh:// or git://)"
+            "{url}: dumb-http remotes (plain objects/info/* file fetches) are a named gap; use a smart-http URL, a local path, file://, ssh:// or git://"
         ),
     }
 }
@@ -527,6 +532,10 @@ impl Write for Stream {
 
 /// Opens one duplex stream to a network endpoint: SSH spawns, git dials.
 ///
+/// Smart-http never opens a duplex stream: its stateless request/response
+/// pairs run through [`super::smart_http`], so an HTTP endpoint here is
+/// an internal routing error, not a gap.
+///
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
 /// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
@@ -550,7 +559,11 @@ pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitE
         Endpoint::Local { .. } => Err(GitError::Invalid {
             detail: "local endpoints need no network stream".to_owned(),
         }),
-        Endpoint::Http { url, .. } => Err(http_gap(url)),
+        Endpoint::Http { url, .. } => Err(GitError::Invalid {
+            detail: format!(
+                "{url}: http(s) endpoints use smart-http RPC, not duplex streams"
+            ),
+        }),
     }
 }
 
@@ -583,17 +596,29 @@ pub fn discover<R: Read + Write>(
     Ok(refs)
 }
 
-/// Discovers a network endpoint's refs: opens the stream, reads the
+/// Discovers a network endpoint's refs: one smart-http `info/refs` round
+/// trip for HTTP endpoints, otherwise opens the stream, reads the
 /// advertisement, hangs up.
 ///
 /// # Errors
-/// Routing errors from [`open_stream`], grammar failures from [`discover`].
+/// Routing errors from [`open_stream`], grammar failures from [`discover`]
+/// or the smart-http advertisement parse.
 pub fn discover_endpoint(
     endpoint: &Endpoint,
     service: Service,
     kind: HashKind,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
-    discover(open_stream(endpoint, service)?, kind)
+    match endpoint {
+        Endpoint::Http { url, .. } => {
+            let base = super::smart_http::normalize_base(url)?;
+            let smart = match service {
+                Service::UploadPack => super::smart_http::SmartService::UploadPack,
+                Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
+            };
+            Ok(super::smart_http::discover(&base, smart, kind)?.refs)
+        }
+        _ => discover(open_stream(endpoint, service)?, kind),
+    }
 }
 
 /// Maps wire refs onto local advertisement rows for refspec expansion:
