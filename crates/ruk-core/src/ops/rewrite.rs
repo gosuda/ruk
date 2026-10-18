@@ -3,17 +3,23 @@
 //! `describe`, `rebase`, `squash`, and `abandon` all re-parent the commits
 //! below their rewrite roots. The commit graph lives in the `Commits` table
 //! as parent lists with no separate child index, so descendants are found by
-//! paging every commit and walking down from the roots. Nothing here evaluates
-//! content: per-commit tree derivation stays with the callers' producers, and
-//! an unstored root simply has no children (existence is checked by the
-//! translator resolving its targets first).
+//! paging every commit and walking down from the roots. Only live commits
+//! count: rewrites never delete the superseded records they replace, and
+//! abandoned changes keep theirs, so parent links alone would drag stale
+//! generations (and dead changes) into the closure, and restaging one with
+//! `predecessor: Some(old)` then fails `E_STALE` in
+//! `ChangeEntry::replace_head`. Membership is therefore intersected with the
+//! current heads of every `Active` change from the `Changes` table. Nothing
+//! here evaluates content: per-commit tree derivation stays with the callers'
+//! producers, and an unstored root simply has no children (existence is
+//! checked by the translator resolving its targets first).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::error::CoreError;
 use crate::heads::Head;
 use crate::records::Records;
-use crate::records::types::RecordPageBudget;
+use crate::records::types::{ChangeState, RecordPageBudget};
 use crate::store::Store;
 
 /// Pages every stored commit with its parent list.
@@ -35,11 +41,40 @@ fn all_parents(store: &Store) -> Result<Vec<(Head, Vec<Head>)>, CoreError> {
     Ok(out)
 }
 
-/// Direct children of `head`: stored commits listing it as a parent, in key order.
+/// Current heads of every live change: the only commits a rewrite may restage.
+///
+/// Paging the `Changes` table (not the graph) is what makes the set sound:
+/// a superseded commit is absent from its change's heads, and an abandoned
+/// change contributes none of its heads, so neither can leak into a closure.
+fn live_heads(store: &Store) -> Result<BTreeSet<Head>, CoreError> {
+    let records = Records::new(store);
+    let budget = RecordPageBudget::new(4096, 1 << 26);
+    let mut after = None;
+    let mut live = BTreeSet::new();
+    loop {
+        let page = records.page_changes(after.as_ref(), budget)?;
+        for (_, entry) in &page.items {
+            if entry.state == ChangeState::Active {
+                live.extend(entry.heads.iter().copied());
+            }
+        }
+        after = page.next_cursor;
+        if !page.more {
+            break;
+        }
+    }
+    Ok(live)
+}
+
+/// Direct live children of `head`: current change heads listing it as a
+/// parent, in key order. Superseded and abandoned commits still name their
+/// parents, so without the liveness cut a stale sibling would read as a
+/// child needing rewrite (and break squash's no-sibling check).
 pub fn children(store: &Store, head: &Head) -> Result<Vec<Head>, CoreError> {
+    let live = live_heads(store)?;
     let mut out = Vec::new();
     for (child, parents) in all_parents(store)? {
-        if parents.contains(head) {
+        if live.contains(&child) && parents.contains(head) {
             out.push(child);
         }
     }
@@ -47,9 +82,13 @@ pub fn children(store: &Store, head: &Head) -> Result<Vec<Head>, CoreError> {
     Ok(out)
 }
 
-/// Every commit descended from `roots` (transitively), parent-first.
+/// Every live commit descended from `roots` (transitively), parent-first.
 ///
-/// Roots themselves are excluded even when one root descends from another;
+/// Only current heads of `Active` changes are members: superseded generations
+/// and abandoned commits are skipped even though their parent links still
+/// point into the closure, so a second rewrite in a chain restages live heads
+/// instead of failing `E_STALE` on their predecessors. Roots themselves are
+/// excluded even when one root descends from another;
 /// callers resolving several roots check that overlap separately. A rewritten
 /// parent always precedes its children: emission is topological over the
 /// closure (Kahn's algorithm, smallest head first), so a merge child follows
@@ -68,14 +107,16 @@ pub fn descendants(store: &Store, roots: &[Head]) -> Result<Vec<Head>, CoreError
         parent_map.insert(*child, parents.clone());
     }
     let root_set: BTreeSet<Head> = roots.iter().copied().collect();
+    let live = live_heads(store)?;
     let mut member: BTreeSet<Head> = BTreeSet::new();
     let mut queue: VecDeque<Head> = roots.iter().copied().collect();
     while let Some(head) = queue.pop_front() {
-        if let Some(children) = child_map.get(&head) {
-            for child in children {
-                if !root_set.contains(child) && member.insert(*child) {
-                    queue.push_back(*child);
-                }
+        let Some(children) = child_map.get(&head) else {
+            continue;
+        };
+        for child in children {
+            if live.contains(child) && !root_set.contains(child) && member.insert(*child) {
+                queue.push_back(*child);
             }
         }
     }
@@ -152,6 +193,33 @@ mod tests {
         }
 
         fn commit(&self, parents: Vec<Head>, message: &str) -> Head {
+            self.mint(parents, message, ChangeId::generate(), None)
+        }
+
+        fn commit_on(&self, parents: Vec<Head>, message: &str, change: ChangeId) -> Head {
+            self.mint(parents, message, change, None)
+        }
+
+        /// Restages `old` as a new head of `change`, the way describe/rebase
+        /// rewrite one closure member: the old record stays stored, but only
+        /// the new head stays a current head of the change.
+        fn rewrite(
+            &self,
+            old: Head,
+            parents: Vec<Head>,
+            message: &str,
+            change: ChangeId,
+        ) -> Head {
+            self.mint(parents, message, change, Some(old))
+        }
+
+        fn mint(
+            &self,
+            parents: Vec<Head>,
+            message: &str,
+            change: ChangeId,
+            predecessor: Option<Head>,
+        ) -> Head {
             let tree = self
                 .store
                 .prepare(ObjectKind::Tree, 0, Cursor::new(Vec::new()), None)
@@ -172,8 +240,8 @@ mod tests {
                     author: signature.clone(),
                     committer: signature,
                     message: ByteString::from(message),
-                    change_id: Some(ChangeId::generate()),
-                    predecessor: None,
+                    change_id: Some(change),
+                    predecessor,
                     provenance: None,
                 },
             )
@@ -183,6 +251,27 @@ mod tests {
                 .publish(prepared.objects, &prepared.facts)
                 .expect("publish fixture commit");
             head
+        }
+
+        /// Every closure member must still be a current head of its change:
+        /// restaging one with `predecessor: Some(old)` (what describe/rebase
+        /// do per member) hits `E_STALE` otherwise.
+        fn assert_restageable(&self, closure: &[Head]) {
+            let records = Records::new(&self.store);
+            for old in closure {
+                let record = records
+                    .get_commit(old)
+                    .expect("read commit")
+                    .expect("closure member is stored");
+                let entry = records
+                    .get_change(&record.change_id())
+                    .expect("read change")
+                    .expect("closure member has a change");
+                assert!(
+                    entry.contains_head(old),
+                    "stale {old:?} leaked into the rewrite closure"
+                );
+            }
         }
     }
 
@@ -236,6 +325,63 @@ mod tests {
         assert!(position(b) < position(d));
         assert!(position(c) < position(e));
         assert!(position(e) < position(d));
+    }
+
+    #[test]
+    fn chained_rewrites_close_over_live_heads_only() {
+        // A←B←C, then "describe B" rewrites B→B′ and C→C′. The old records
+        // stay stored with their parent links, but "describe A" must close
+        // over {B′, C′} only: restaging stale B used to fail E_STALE.
+        let fixture = Fixture::new("chain");
+        let change_b = ChangeId::generate();
+        let change_c = ChangeId::generate();
+        let a = fixture.commit(Vec::new(), "a");
+        let b = fixture.commit_on(vec![a], "b", change_b);
+        let c = fixture.commit_on(vec![b], "c", change_c);
+        let b2 = fixture.rewrite(b, vec![a], "b2", change_b);
+        let c2 = fixture.rewrite(c, vec![b2], "c2", change_c);
+        assert_eq!(children(&fixture.store, &a).expect("children"), vec![b2]);
+        let closure = descendants(&fixture.store, &[a]).expect("closure");
+        assert_eq!(closure, vec![b2, c2]);
+        fixture.assert_restageable(&closure);
+    }
+
+    #[test]
+    fn abandoned_commits_leave_the_closure() {
+        let fixture = Fixture::new("abandon");
+        let a = fixture.commit(Vec::new(), "a");
+        let b = fixture.commit(vec![a], "b");
+        crate::ops::abandon(&fixture.store, crate::ops::AbandonRequest { heads: vec![b] })
+            .expect("abandon");
+        assert!(
+            children(&fixture.store, &a)
+                .expect("children")
+                .is_empty()
+        );
+        assert!(
+            descendants(&fixture.store, &[a])
+                .expect("closure")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_siblings_do_not_read_as_children() {
+        // D←S (the squash source) plus D←X, where X is rebased onto E. The
+        // stale X record still names D, but the squash no-sibling check
+        // (`children(D) == [S]`) must not see it.
+        let fixture = Fixture::new("siblings");
+        let change_x = ChangeId::generate();
+        let d = fixture.commit(Vec::new(), "d");
+        let s = fixture.commit(vec![d], "s");
+        let e = fixture.commit(Vec::new(), "e");
+        let x = fixture.commit_on(vec![d], "x", change_x);
+        let x2 = fixture.rewrite(x, vec![e], "x2", change_x);
+        assert_eq!(children(&fixture.store, &d).expect("children"), vec![s]);
+        assert_eq!(
+            children(&fixture.store, &e).expect("moved child"),
+            vec![x2]
+        );
     }
 
     #[test]
