@@ -156,11 +156,7 @@ pub(crate) struct PhysicalReservation {
 impl PhysicalReservation {
     /// Reserve `[offset, offset + len)` on the already-open segment file.
     /// See [`reserve_prepublication`] for the platform contract.
-    pub(crate) fn reserve(
-        file: &File,
-        offset: u64,
-        len: u64,
-    ) -> Result<Self, AllocationError> {
+    pub(crate) fn reserve(file: &File, offset: u64, len: u64) -> Result<Self, AllocationError> {
         reserve_prepublication(file, offset, len).map(|receipt| Self { receipt })
     }
 

@@ -121,13 +121,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::conflict::{ConflictRecord, ConflictRecordInput, Signature, TzOffset};
 use crate::ids::{HashKind, Oid};
+use crate::store::capacity::{PendingReservation, ReservationState};
 use crate::store::metadata::Metadata;
 use crate::store::segment::{FOOTER_LEN, SEAL_MAGIC, SEGMENT_TARGET_BYTES, segment_file_name};
 use crate::store::types::{
     FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
     SegmentManifest,
 };
-use crate::store::capacity::{PendingReservation, ReservationState};
 use crate::store::{META_FILE, PreparationBudget, SEGMENTS_DIR, Store, StoreError};
 
 // ---------------------------------------------------------------------------

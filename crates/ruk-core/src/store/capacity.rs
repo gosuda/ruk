@@ -290,19 +290,17 @@ pub(crate) fn reconcile_stale_pending(
             })?;
             // Evidence the file was consulted post-recovery; the verdict is
             // unconditional (see above and the module docs).
-            let _observed_len: Option<u64> = std::fs::metadata(
-                segments_dir.join(segment_file_name(charge.segment)),
-            )
-            .map(|metadata| metadata.len())
-            .ok();
+            let _observed_len: Option<u64> =
+                std::fs::metadata(segments_dir.join(segment_file_name(charge.segment)))
+                    .map(|metadata| metadata.len())
+                    .ok();
         }
         let mut released = row.clone();
         released.state = ReservationState::Released;
         updates.push((key.clone(), released));
     }
-    let released = u64::try_from(updates.len()).map_err(|_| {
-        StoreError::Capacity("released pending-row count overflows u64".to_owned())
-    })?;
+    let released = u64::try_from(updates.len())
+        .map_err(|_| StoreError::Capacity("released pending-row count overflows u64".to_owned()))?;
     meta.release_pending(&updates)?;
     Ok(released)
 }

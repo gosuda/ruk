@@ -535,9 +535,7 @@ impl Metadata {
                     "pending reservation key already exists".to_owned(),
                 ));
             }
-            table
-                .insert(key, encoded.as_slice())
-                .map_err(storage)?;
+            table.insert(key, encoded.as_slice()).map_err(storage)?;
         }
         txn.commit()?;
         Ok(())
@@ -828,7 +826,8 @@ impl PublicationTxn {
             .transpose()?;
         let Some(current) = current else {
             return Err(StoreError::Invalid(
-                "pending reservation row is missing; persistence must precede reservation".to_owned(),
+                "pending reservation row is missing; persistence must precede reservation"
+                    .to_owned(),
             ));
         };
         if current.state != ReservationState::Pending {
@@ -836,9 +835,7 @@ impl PublicationTxn {
                 "pending reservation row is already settled".to_owned(),
             ));
         }
-        table
-            .insert(key, encoded.as_slice())
-            .map_err(storage)?;
+        table.insert(key, encoded.as_slice()).map_err(storage)?;
         Ok(())
     }
 
@@ -975,14 +972,11 @@ fn ensure_census(db: &Database) -> Result<(), StoreError> {
             .map_err(storage)?
             .map(|handle| handle.name().to_owned())
             .collect();
-        [
-            FactTable::LfsObjects.table_name(),
-            PENDING.name(),
-        ]
-        .into_iter()
-        .filter(|want| !names.iter().any(|name| name == want))
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
+        [FactTable::LfsObjects.table_name(), PENDING.name()]
+            .into_iter()
+            .filter(|want| !names.iter().any(|name| name == want))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
     };
     if missing.is_empty() {
         return Ok(());

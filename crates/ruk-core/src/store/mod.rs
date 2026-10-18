@@ -66,9 +66,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use capacity::CapacityLimits;
+pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
 pub use compact::CompactionStats;
 pub use error::StoreError;
-pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
 pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
 pub use metadata::{FactPage, FactPageBudget, FactRow};
 pub(crate) use metadata::{MAX_FACT_ROW_BYTES, decode, encode};
@@ -82,8 +82,8 @@ pub use types::{
 use crate::change::StoreId;
 use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
-use metadata::{Metadata, PublicationTxn};
 use crate::physical::{AllocationError as PhysicalAllocationError, PhysicalReservation};
+use metadata::{Metadata, PublicationTxn};
 use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
 use segment::SegmentWriter;
 
@@ -1306,8 +1306,9 @@ fn append(
     // post-operation re-query; the charge joins the batch for the stage
     // step. A refusal fails the publication closed here, before the bytes.
     let reserve_offset = active.writer.records_end();
-    let reservation = PhysicalReservation::reserve(active.writer.get_ref(), reserve_offset, record_len)
-        .map_err(map_allocation_error)?;
+    let reservation =
+        PhysicalReservation::reserve(active.writer.get_ref(), reserve_offset, record_len)
+            .map_err(map_allocation_error)?;
     let receipt = reservation.receipt();
     batch.charges.push(SegmentCharge {
         segment: active.id,
