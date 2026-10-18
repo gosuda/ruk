@@ -331,12 +331,21 @@ prove_fixture() {
   # --- cutover: consumer reads through the ruk CLI ---
   local cut_bad=0
   "${GITBIN}" -C "${dir}" log --oneline >"${ev}/cut-log.git" || die "git log failed"
-  if "${RUKBIN}" git -C "${dir}" log --oneline >"${ev}/cut-log.ruk" 2>/dev/null \
-    && cmp -s -- <(sort -- "${ev}/cut-log.git") <(sort -- "${ev}/cut-log.ruk") \
-    && [ "$(head -n 1 -- "${ev}/cut-log.git")" = "$(head -n 1 -- "${ev}/cut-log.ruk")" ]; then
-    :
-  else
+  if ! "${RUKBIN}" git -C "${dir}" log --oneline >"${ev}/cut-log.ruk" 2>/dev/null; then
     cut_bad=$((cut_bad + 1))
+  else
+    if cmp -s -- <(sort -- "${ev}/cut-log.git") <(sort -- "${ev}/cut-log.ruk") \
+      && [ "$(head -n 1 -- "${ev}/cut-log.git")" = "$(head -n 1 -- "${ev}/cut-log.ruk")" ]; then
+      record "${name}" "log-content" "PASS" "same commit set and tip via ruk CLI"
+    else
+      record "${name}" "log-content" "FAIL" "commit set or tip differs"
+    fi
+    if cmp -s -- "${ev}/cut-log.git" "${ev}/cut-log.ruk"; then
+      record "${name}" "log-order" "PASS" "log --oneline byte-identical incl. order"
+    else
+      diff -- "${ev}/cut-log.git" "${ev}/cut-log.ruk" >"${ev}/log-order.diff" || true
+      record "${name}" "log-order" "FAIL" "order differs; see log-order.diff (walk_history LIFO, not date order)"
+    fi
   fi
   "${GITBIN}" -C "${dir}" -c core.quotepath=false ls-tree -r HEAD >"${ev}/cut-tree.git" || die "git ls-tree failed"
   if "${RUKBIN}" git -C "${dir}" ls-tree -r HEAD >"${ev}/cut-tree.ruk" 2>/dev/null \
@@ -355,7 +364,7 @@ prove_fixture() {
     cut_bad=$((cut_bad + 1))
   fi
   if [ "${cut_bad}" -eq 0 ]; then
-    record "${name}" "cutover" "PASS" "log set+tip, ls-tree, cat-file identical via ruk CLI"
+    record "${name}" "cutover" "PASS" "ls-tree HEAD and cat-file HEAD identical via ruk CLI"
   else
     record "${name}" "cutover" "FAIL" "${cut_bad} consumer reads differ"
   fi
@@ -470,11 +479,17 @@ gen_results() {
     printf '%s\n' "  by the gitdir-intact and rollback checks."
     printf '%s\n' "- \`ruk git for-each-ref\` prints \`<oid> <ref>\` while git prints"
     printf '%s\n' "  \`<oid> <type><tab><ref>\`; the comparison normalizes to oid+refname, which is exact."
-    printf '%s\n' "- \`ruk git log\` order can differ from git when commit timestamps tie (deterministic"
-    printf '%s\n' "  fixtures share fixed dates): same commit set, same tip, different middle order."
-    printf '%s\n' "  The cutover check therefore compares the log as a set plus the tip line."
-    printf '%s\n' "- git quotes non-ASCII paths in ls-tree under a C locale (core.quotepath); ruk prints"
-    printf '%s\n' "  raw bytes. Comparisons run git with \`-c core.quotepath=false\`; bytes are identical."
+    printf '%s\n' "- \`ruk git log\` order is a LIFO discovery walk (\`walk_history\`,"
+    printf '%s\n' "  \`crates/ruk/src/cli/state.rs\`), not git's date-ordered default: on the merge"
+    printf '%s\n' "  fixture a parent sorts after its own ancestors (see basic/log-order.diff)."
+    printf '%s\n' "  Content (set+tip) is exact everywhere; byte order matched on all-distinct"
+    printf '%s\n' "  timestamps (big: 602 commits). This is a log-verb gap, not a migrate defect:"
+    printf '%s\n' "  every migrated object, ref, and OID is proven byte-identical above."
+    printf '%s\n' "- git C-quotes non-ASCII paths in ls-tree under a C locale (core.quotepath) but"
+    printf '%s\n' "  prints raw bytes under UTF-8 locales; ruk always prints raw bytes. Modes, OIDs,"
+    printf '%s\n' "  and name bytes are identical; comparisons pin git with"
+    printf '%s\n' "  \`-c core.quotepath=false\` for a deterministic oracle. Real display divergence,"
+    printf '%s\n' "  named here, not hidden."
     printf '%s\n' "- Worktree checkout, config conversion, and hooks are out of scope for migrate"
     printf '%s\n' "  (declared in the verb docs); this proof covers objects, refs, HEAD, and rollback only."
   } >"${md:?}" || die "cannot write ${md:?}"
