@@ -1,0 +1,8 @@
+# Capacity ledger (CapLedger)
+1. `store/capacity.rs`: one row per reserving publication keyed `(generation, seq)` holding `{estimate, state: Pending|Committed|Released, charges[]}`; quotas `max_pending_bytes`/`max_store_bytes`, unbounded by default.
+2. `publish` is two-phase under the writer lock: probe-plan in an aborted txn → quota admit (`Limit` before mutation) → pending Immediate commit → real txn → per-record + seal-footer `PhysicalReservation` → row settled `Committed` atomically with locators.
+3. `physical.rs`: `PhysicalReservation` is a receipt holder with no `Drop` (release is ledger-only); the still-open-handle re-query already lives inside `reserve_prepublication`, so no extension was needed.
+4. `metadata.rs`: publication-owned `pending_reservations` table, deliberately not a `FactTable`; census-tolerant for old stores (`lfs_objects` pattern), `Version` refusal for old binaries.
+5. Crash recovery, choice (a): a `Pending` row at open is always a dead publication (its commit would have marked it `Committed`), so files are re-checked as evidence and rows `Released`; holding them would pin quota for orphans compaction never visits.
+6. Evidence: `cargo check` clean for lib and tests; syscall probe shows the ledger's KEEP_SIZE-beyond-EOF path works on tmpfs and ZFS (UNSHARE rejected, never used since segments are append-only); new kill-point test `capacity_pending_kill_reconciles_to_released` added but not run (orchestrator gates).
+7. Gaps: coordinator never calls `Store::set_capacity_limits`; `Committed`/`Released` tombstones accumulate until a future compaction prune; `PreparationBudget` untouched (transient prep vs durable bytes have different lifetimes, so no second budget was built).
