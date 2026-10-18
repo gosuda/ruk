@@ -7,25 +7,33 @@
 //!
 //! Covered today: `bookmark.set` (commit and change targets),
 //! `bookmark.delete`, `bookmark.resolve`, `tag.set` (plain and annotated),
-//! `tag.delete`, `pin`, `unpin`, and `attest.add`. The annotated tag arm
-//! needs the coordinator clock and a tagger identity, and `attest.add`
-//! needs the attestation progress gate, so both stay refused on the legacy
-//! [`prepare_mutation`] path and serve only through [`prepare_mutation_with`].
-//! Everything else is honestly refused with [`ErrorCode::EHosted`]:
+//! `tag.delete`, `pin`, `unpin`, `attest.add`, `new`, `claim.acquire`,
+//! `claim.release`, and `ws.new`. The annotated tag arm needs the
+//! coordinator clock and a tagger identity, `new` and `ws.new` need the
+//! session identity row and the clock for signature synthesis, and
+//! `attest.add` needs the attestation progress gate, so those arms stay
+//! refused on the legacy [`prepare_mutation`] path and serve only through
+//! [`prepare_mutation_with`]. Everything else is honestly refused with
+//! [`ErrorCode::EHosted`]:
 //!
-//! * `claim.acquire` / `claim.release` seal against a claim clock whose
-//!   fence and overlap checks require sole lane ownership; preparing them
-//!   outside the lane could commit overlapping claims, so they stay refused
-//!   until a lane-owned sealer exists.
-//! * Workspace, change-rewrite, transport, land, undo, and prune mutations
-//!   need object preparation, claim sealing, workspace fencing, or plan
-//!   evaluation that no caller on this path supplies.
+//! * `claim.acquire` / `claim.release` validate here (path canonicalization
+//!   plus the session's `claim_paths` capability) and seal in the lane under
+//!   sole publication ownership: the fence and overlap checks need a
+//!   commit-time snapshot, so preparation stages no claim facts and mints
+//!   only the acquire id the sealed record must carry. The lane seals with
+//!   that id and writes the authoritative record back into the reply.
+//! * Workspace (beyond `ws.new` and the `new` workspace switch),
+//!   change-rewrite, transport, land, undo, and prune mutations need object
+//!   preparation, claim sealing, workspace fencing, or plan evaluation that
+//!   no caller on this path supplies.
 //!
 //! The nine `crate::ops`-adjacent methods were evaluated one by one against
 //! their protocol args and stay refused, each arm naming its missing piece:
-//! `new` carries parents, a description, an optional name/email identity, and
-//! an optional workspace switch, but no tree object and no timestamped
-//! signature, so no `NewRequest` can be built without inventing the commit;
+//! `new` mints the empty tree and synthesizes its signature from the session
+//! identity row plus the coordinator clock (multi-parent trees need merge
+//! evaluation with no producer here, so they stay refused); `ws.new` builds
+//! on the same mint for native workspaces and writes only the row — no
+//! worktree materialization happens in this call;
 //! protocol `describe` rewrites a change's description while `ops::describe`
 //! is a pure read of a commit or change with a different request shape, so
 //! no description-rewrite producer exists on this path and there are no lane
@@ -46,23 +54,28 @@
 //! committed, and the exact fact expectations add point compare-and-swap
 //! as a second layer.
 
-use super::claims::ClaimClock;
+use super::claims::{ClaimClock, canonical_paths, read_record};
 use super::clock::Clock;
 use super::hosted::PreparedMutation;
 use super::policy::Policy;
-use super::rows::SessionRow;
+use super::rows::{self, SessionRow, WorkspaceRow};
+use super::workspace;
 use crate::attestation::{Checkpoint, prepare_add};
-use crate::change::{RequestId, SessionId};
-use crate::conflict::TzOffset;
+use crate::bytes::ByteString;
+use crate::change::{ChangeId, ClaimId, RequestId, SessionId, WorkspaceId};
+use crate::conflict::{Signature, TzOffset};
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
+use crate::ops::{NewRequest, NewResult, PreparedOp, prepare_new};
 use crate::protocol::{
     AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply, BookmarkResolution,
     BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs, BookmarkSetReply, BookmarkTarget,
-    BoundedList, ChangeRef, IdentityClaim, MutationOutcome, PinArgs, PinReply, ReceiptRef, Reply,
-    Request, RequestDigest, TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp,
-    UnpinArgs, UnpinReply, Validate,
+    BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs, ClaimAcquireReply, ClaimRecord,
+    ClaimReleaseArgs, ClaimReleaseReply, EffectiveIdentity, IdentityClaim, IdentitySource,
+    MutationOutcome, NewArgs, NewReply, PinArgs, PinReply, ReceiptRef, Reply, Request,
+    RequestDigest, TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs,
+    UnpinReply, Validate, WorkspaceInit, WsNewArgs, WsNewReply,
 };
 use crate::records::Records;
 use crate::records::keys::head_key;
@@ -71,6 +84,9 @@ use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conf
 use crate::store::ObjectKind;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
+use crate::workspace::{
+    GitCompatWorkspace, NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState,
+};
 
 /// Inputs beyond the store that identity synthesis, timestamped signatures,
 /// claim sealing, and land plans need.
@@ -106,6 +122,7 @@ struct Parts {
     facts: Vec<FactMutation>,
     transaction: Option<RefTransaction>,
     dependencies: Vec<RefName>,
+    fence: Option<(WorkspaceId, WorkspaceStamp)>,
 }
 
 /// Translates one bare mutation [`Request`] into lane-ready parts.
@@ -176,12 +193,10 @@ pub(crate) fn prepare_mutation_with(
         Request::Pin(m) => pin_parts(ctx, m.request_id, &m.args)?,
         Request::Unpin(m) => unpin_parts(ctx, m.request_id, &m.args)?,
         Request::AttestAdd(m) => attest_add_parts(ctx, m.request_id, &m.args)?,
-        Request::New(_) => {
-            return Err(uncovered(
-                "new",
-                "`new` carries no tree object and its identity claim is name/email only, so no `ops::NewRequest` can be built without inventing the commit; the workspace switch also needs a fence no caller supplies",
-            ));
-        }
+        Request::New(m) => new_parts(ctx, m.request_id, &m.args)?,
+        Request::ClaimAcquire(m) => claim_acquire_parts(ctx, m.request_id, &m.args)?,
+        Request::ClaimRelease(m) => claim_release_parts(ctx, m.request_id, &m.args)?,
+        Request::WsNew(m) => ws_new_parts(ctx, m.request_id, &m.args)?,
         Request::Describe(_) => {
             return Err(uncovered(
                 "describe",
@@ -253,7 +268,7 @@ pub(crate) fn prepare_mutation_with(
         reply: parts.reply,
         objects: parts.objects,
         facts: parts.facts,
-        workspace_fence: None,
+        workspace_fence: parts.fence,
         ref_transaction: parts.transaction,
         ref_dependencies: parts.dependencies,
     })
@@ -333,6 +348,7 @@ fn bookmark_set_parts(
         facts,
         transaction: Some(transaction),
         dependencies: vec![name],
+        fence: None,
     })
 }
 
@@ -414,6 +430,7 @@ fn bookmark_delete_parts(
         facts,
         transaction: Some(transaction),
         dependencies: vec![name],
+        fence: None,
     })
 }
 
@@ -450,6 +467,7 @@ fn bookmark_resolve_parts(
         facts,
         transaction: Some(transaction),
         dependencies: vec![name],
+        fence: None,
     })
 }
 
@@ -483,6 +501,7 @@ fn tag_set_parts(
             facts,
             transaction: Some(transaction),
             dependencies: vec![name],
+            fence: None,
         });
     };
     let clock = ctx.clock.ok_or_else(|| {
@@ -564,6 +583,7 @@ fn tag_set_parts(
         facts,
         transaction: Some(transaction),
         dependencies: vec![name],
+        fence: None,
     })
 }
 
@@ -624,6 +644,7 @@ fn pin_parts(
         }],
         transaction: None,
         dependencies: Vec::new(),
+        fence: None,
     })
 }
 
@@ -657,6 +678,7 @@ fn unpin_parts(
         }],
         transaction: None,
         dependencies: Vec::new(),
+        fence: None,
     })
 }
 
@@ -722,6 +744,7 @@ fn attest_add_parts(
         facts: prepared.mutations,
         transaction: None,
         dependencies: Vec::new(),
+        fence: None,
     })
 }
 
@@ -749,6 +772,381 @@ fn tag_delete_parts(
         facts,
         transaction: Some(transaction),
         dependencies: vec![name],
+        fence: None,
+    })
+}
+/// Mints the empty tree when absent and stages one empty-tree commit through
+/// `ops::prepare_new`, synthesizing author and committer from `over` (the
+/// operation override) or the session identity.
+///
+/// The empty tree OID is content-addressed and deterministic. When absent it
+/// is published standalone with no facts — an object-only publication whose
+/// duplicates the store accepts idempotently — because `ops::prepare_new`
+/// only resolves stored trees and a staged-but-unpublished spool object is
+/// invisible to its check. No facts, oplog entries, or receipts are touched,
+/// so the lane's linearizable state is unaffected; the parent-storage and
+/// message-shape pre-checks below run read-only first, so every refusal path
+/// exits before any write and only a post-publish store failure could strand
+/// the universally reusable empty tree.
+///
+/// The change id is always freshly generated: `ops::prepare_new` with
+/// `change_id: None` would resolve the tree's stable by-OID mapping and pile
+/// every empty-tree commit onto one divergent change instead of minting a
+/// fresh one.
+///
+/// # Errors
+/// - [`ErrorCode::EHosted`] without the session row (no identity source) or
+///   the coordinator clock (no signature timestamp), or over several parents
+///   (no tree-merge producer exists on this path).
+/// - [`ErrorCode::EInvalid`] with neither an override nor a session identity,
+///   or with a malformed identity.
+/// - [`ErrorCode::ENotFound`] for an unstored parent.
+fn mint_empty_commit(
+    ctx: &PrepareContext<'_>,
+    method: &str,
+    parents: &[Head],
+    message: &ByteString,
+    over: Option<&IdentityClaim>,
+) -> Result<(PreparedOp<NewResult>, EffectiveIdentity), CoreError> {
+    let store = ctx.store;
+    let row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            method,
+            "minting an empty-tree commit needs the session identity row for its signature, which this path does not supply",
+        )
+    })?;
+    let clock = ctx.clock.ok_or_else(|| {
+        uncovered(
+            method,
+            "minting an empty-tree commit needs the coordinator clock for its signature timestamp, which this path does not supply",
+        )
+    })?;
+    if parents.len() > 1 {
+        return Err(uncovered(
+            method,
+            "a commit over several parents needs tree-merge evaluation with no producer on this path; supply one parent or none",
+        ));
+    }
+    let claim = over.or(row.identity.as_ref()).ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "method `{method}` needs an identity: neither the call nor the session carries one"
+            ),
+        )
+    })?;
+    claim.validate()?;
+    // Read-only pre-checks before the tree publish below: a refused mint
+    // must leave no state, so the checks `prepare_new` would run first run
+    // here against committed state. They stay advisory — `prepare_new` and
+    // the lane re-check authoritatively at commit time.
+    for parent in parents {
+        if Records::new(store).get_commit(parent)?.is_none() {
+            let describe = match parent {
+                Head::Git { oid } => oid.to_string(),
+                Head::Conflicted { key } => format!("{key:?}"),
+            };
+            return Err(CoreError::new(
+                ErrorCode::ENotFound,
+                format!("parent {describe} is not a stored commit"),
+            ));
+        }
+    }
+    if message.as_bytes().contains(&0) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "commit message carries NUL",
+        ));
+    }
+    let secs = clock.sample()?.timestamp().instant().as_second();
+    let author = Signature {
+        name: ByteString::from(claim.name.as_str()),
+        email: ByteString::from(claim.email.as_str()),
+        timestamp: secs,
+        offset: TzOffset::UTC,
+    };
+    let empty = store
+        .hash_kind()
+        .hash_git_object("tree", b"")
+        .map_err(CoreError::from)?;
+    if store.object_len(empty).map_err(CoreError::from)?.is_none() {
+        let empty_bytes: &[u8] = b"";
+        let staged = store
+            .prepare(ObjectKind::Tree, 0, empty_bytes, None)
+            .map_err(CoreError::from)?;
+        store.publish(vec![staged], &[]).map_err(CoreError::from)?;
+    }
+    let prepared = prepare_new(
+        store,
+        NewRequest {
+            tree: empty,
+            parents: parents.to_vec(),
+            author: author.clone(),
+            committer: author,
+            message: message.clone(),
+            change_id: Some(ChangeId::generate()),
+            predecessor: None,
+            provenance: None,
+        },
+    )?;
+    let identity = EffectiveIdentity {
+        name: claim.name.clone(),
+        email: claim.email.clone(),
+        source: if over.is_some() {
+            IdentitySource::OperationOverride
+        } else {
+            IdentitySource::SessionClaim
+        },
+    };
+    Ok((prepared, identity))
+}
+
+/// Prepares `new`: one empty-tree native change on `parents`, with an
+/// optional workspace switch onto the minted head.
+///
+/// The workspace switch fences the binding and moves a native workspace;
+/// switching a GitCompat workspace needs HEAD/index application with no
+/// producer on this path, so it stays refused.
+///
+/// # Errors
+/// Same as [`mint_empty_commit`], plus `E_NOT_FOUND` for an unknown
+/// workspace and `E_LEASE_LOST`/`E_STALE` from the switch fence.
+fn new_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &NewArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let (prepared, identity) = mint_empty_commit(
+        ctx,
+        "new",
+        &args.parents,
+        &args.description,
+        args.identity.as_ref(),
+    )?;
+    let mut outcome = pending_outcome(session, request_id);
+    outcome.identity = Some(identity);
+    let created = ChangeHead {
+        change: prepared.output.change_id,
+        head: prepared.output.head,
+    };
+    let objects = prepared.objects;
+    let mut facts = prepared.facts;
+    let mut state = None;
+    let mut fence = None;
+    if let Some(binding) = &args.workspace {
+        let observed = workspace::observe(store, binding.workspace)?;
+        observed.fence(session, binding.expected)?;
+        let WorkspaceState::Native(current) = &observed.row.state else {
+            return Err(uncovered(
+                "new",
+                "switching a GitCompat workspace needs HEAD/index application with no producer on this path",
+            ));
+        };
+        let next = WorkspaceState::Native(current.move_to(
+            binding.expected,
+            created.change,
+            created.head,
+        )?);
+        facts.push(observed.replace(WorkspaceRow {
+            state: next.clone(),
+            holder: session,
+        })?);
+        state = Some(next);
+        fence = Some((binding.workspace, binding.expected));
+    }
+    Ok(Parts {
+        reply: Reply::New(Box::new(NewReply {
+            outcome,
+            created,
+            state,
+        })),
+        objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence,
+    })
+}
+
+/// Prepares `claim.acquire` without sealing: canonicalizes the paths (pure)
+/// and checks them against the session's `claim_paths` capability, then
+/// mints the id the lane must seal with so the sealed record matches the
+/// precomputed reply.
+///
+/// The expiry below predicts `now + ttl`; the lane overwrites the whole
+/// record with the authoritative sealed one after settle, and failures never
+/// return a reply, so the prediction never escapes.
+///
+/// Consistency: the overlap check needs a linearizable commit-time snapshot
+/// (sole lane ownership), which preparation does not hold — hence no fence
+/// and no claim facts here. The lane re-checks capability-free validity
+/// (overlap, ttl) and the candidate's session admission at commit time.
+///
+/// # Errors
+/// - [`ErrorCode::EHosted`] without the session row (no capability source).
+/// - [`ErrorCode::EInvalid`] for an empty path set.
+/// - [`ErrorCode::EForbidden`] for a path outside the session's claim grant.
+fn claim_acquire_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ClaimAcquireArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "claim.acquire",
+            "checking the session's `claim_paths` capability needs the session identity row, which this path does not supply",
+        )
+    })?;
+    let paths = canonical_paths(args.paths.clone())?;
+    for path in &paths {
+        row.capabilities.require_claim(path)?;
+    }
+    let now = jiff::Timestamp::now();
+    let expires_at = Timestamp::new(
+        now.checked_add(jiff::SignedDuration::from_secs(i64::from(
+            args.ttl.seconds(),
+        )))
+        .unwrap_or(now),
+    );
+    Ok(Parts {
+        reply: Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+            outcome: pending_outcome(session, request_id),
+            claim: ClaimRecord {
+                claim: ClaimId::generate(),
+                holder: session,
+                paths,
+                mode: args.mode,
+                expires_at,
+            },
+        })),
+        objects: Vec::new(),
+        facts: Vec::new(),
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// Prepares `claim.release` without sealing: reads the stored record for an
+/// early holder check and predicts the reply. The lane re-reads and seals
+/// authoritatively at commit time and overwrites the record.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown claim.
+/// - [`ErrorCode::EForbidden`] for another session's claim.
+fn claim_release_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ClaimReleaseArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let Some(record) = read_record(ctx.store, args.claim)? else {
+        return Err(CoreError::new(ErrorCode::ENotFound, "claim does not exist"));
+    };
+    if record.holder != session {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            "claim belongs to another session",
+        ));
+    }
+    Ok(Parts {
+        reply: Reply::ClaimRelease(Box::new(ClaimReleaseReply {
+            outcome: pending_outcome(session, request_id),
+            released: record,
+        })),
+        objects: Vec::new(),
+        facts: Vec::new(),
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// Prepares `ws.new`: one workspace row, natively on a freshly minted
+/// empty-tree change over `parents`, or GitCompat at the given HEAD.
+///
+/// Only the row is written: worktree materialization is a post-commit daemon
+/// job, and the host root is validated but not stored (no row field carries
+/// it until W4). Native creation needs the session identity row and the
+/// coordinator clock for the inner commit's signature; GitCompat creation is
+/// context-free.
+///
+/// # Errors
+/// Same as [`mint_empty_commit`] for native workspaces, plus `E_LIMIT` for
+/// an oversized row and the target validation of a GitCompat HEAD.
+fn ws_new_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &WsNewArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let scope = args.scope.clone().unwrap_or(Scope::Full);
+    let id = WorkspaceId::generate();
+    let mut outcome = pending_outcome(session, request_id);
+    let (state, objects, mut facts) = match &args.init {
+        WorkspaceInit::Native { parents } => {
+            // `ws.new` carries no description: the inner change starts empty.
+            let empty_message = ByteString::from("");
+            let (prepared, identity) =
+                mint_empty_commit(ctx, "ws.new", parents, &empty_message, None)?;
+            outcome.identity = Some(identity);
+            let state = WorkspaceState::Native(NativeWorkspace::new(
+                prepared.output.change_id,
+                prepared.output.head,
+                scope,
+            ));
+            (state, prepared.objects, prepared.facts)
+        }
+        WorkspaceInit::GitCompat { head } => {
+            head.validate(store.hash_kind()).map_err(CoreError::from)?;
+            (
+                WorkspaceState::GitCompat(GitCompatWorkspace::new(head.clone(), scope)),
+                Vec::new(),
+                Vec::new(),
+            )
+        }
+    };
+    let encoded = rows::encode(
+        "workspace",
+        &WorkspaceRow {
+            state: state.clone(),
+            holder: session,
+        },
+    )?;
+    let key = rows::workspace_key(id).to_vec();
+    if key
+        .len()
+        .checked_add(encoded.len())
+        .is_none_or(|pair_bytes| {
+            u64::try_from(pair_bytes).is_ok_and(|bytes| bytes > rows::ROW_MAX_BYTES)
+        })
+    {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            "workspace row exceeds the publication row limit",
+        ));
+    }
+    facts.push(FactMutation {
+        table: FactTable::Workspaces,
+        key,
+        expected: FactExpectation::Absent,
+        value: Some(encoded),
+    });
+    Ok(Parts {
+        reply: Reply::WsNew(Box::new(WsNewReply {
+            outcome,
+            workspace: id,
+            state,
+        })),
+        objects,
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
     })
 }
 
@@ -762,7 +1160,7 @@ mod tests {
     use super::*;
     use crate::attestation::Progress;
     use crate::bytes::ByteString;
-    use crate::capability::{AttestKind, AttestResult, Capabilities};
+    use crate::capability::{AttestKind, AttestResult, Capabilities, PathPattern};
     use crate::change::{ChangeId, ClaimId, SessionId, WorkspaceId};
     use crate::commit::ProvenanceClaims;
     use crate::conflict::Signature;
@@ -772,10 +1170,12 @@ mod tests {
     use crate::ops::{NewRequest, prepare_new};
     use crate::protocol::{
         AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
-        BookmarkDeleteArgs, ChangeRef, ClaimListArgs, ClaimReleaseArgs, DescribeArgs, EditArgs,
-        IdentityClaim, MergeSelection, Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection,
-        PinArgs, RebaseArgs, RebaseScope, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
-        SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding,
+        BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
+        ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, IdentityClaim, MergeSelection,
+        Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection, PinArgs, RebaseArgs,
+        RebaseScope, Resolution, ResolveArgs, RevertArgs, SessionAuthority, SplitArgs,
+        SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding, WorkspaceInit,
+        WsNewArgs,
     };
     use crate::records::codec::encode_change_entry;
     use crate::records::keys::change_key;
@@ -1019,14 +1419,18 @@ mod tests {
             prepare_mutation(&store, session, annotated).expect_err("annotated tag stays refused");
         assert_eq!(err.code, ErrorCode::EHosted);
 
-        let release = Request::ClaimRelease(Box::new(WireMutation {
+        // `claim.acquire` validates against the session row, which the legacy
+        // path does not supply.
+        let acquire = Request::ClaimAcquire(Box::new(WireMutation {
             request_id: request_id(),
-            args: ClaimReleaseArgs {
-                claim: ClaimId::nil(),
+            args: ClaimAcquireArgs {
+                paths: vec![RepoPath::new("src").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
             },
         }));
         let err =
-            prepare_mutation(&store, session, release).expect_err("claim.release stays refused");
+            prepare_mutation(&store, session, acquire).expect_err("claim.acquire stays refused");
         assert_eq!(err.code, ErrorCode::EHosted);
     }
 
@@ -1503,20 +1907,28 @@ mod tests {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
         let ctx = full_ctx(&store, session, None, Some(&clock), Some(&open_checkpoint));
+        // `new`, `claim.*`, and `ws.new` now serve through this context; the
+        // next waves still name their missing preparation.
         for request in [
-            Request::New(Box::new(WireMutation {
+            Request::Describe(Box::new(WireMutation {
                 request_id: request_id(),
-                args: NewArgs {
-                    parents: Vec::new(),
-                    description: ByteString::from("new change"),
+                args: DescribeArgs {
+                    target: change_target(),
+                    description: ByteString::from("rewritten"),
                     identity: None,
-                    workspace: None,
+                    workspaces: Vec::new(),
                 },
             })),
-            Request::ClaimRelease(Box::new(WireMutation {
+            Request::Split(Box::new(WireMutation {
                 request_id: request_id(),
-                args: ClaimReleaseArgs {
-                    claim: ClaimId::nil(),
+                args: SplitArgs {
+                    source: change_target(),
+                    paths: PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
+                    placement: SplitPlacement::SelectedFirst,
+                    description: ByteString::from("part"),
+                    identity: None,
+                    merge: MergeSelection::default(),
+                    workspaces: Vec::new(),
                 },
             })),
         ] {
@@ -1527,6 +1939,562 @@ mod tests {
         }
     }
 
+    fn claim_all_caps() -> Capabilities {
+        Capabilities {
+            claim_paths: vec![PathPattern::parse("**").expect("claim pattern")],
+            ..Capabilities::default()
+        }
+    }
+
+    fn session_row_caps(identity: Option<IdentityClaim>, capabilities: Capabilities) -> SessionRow {
+        SessionRow {
+            principal: Principal::from_peer_uid(1000),
+            identity,
+            claims: ProvenanceClaims::default(),
+            capabilities,
+            secret_hash: [0; 32],
+            authority: SessionAuthority::Active {
+                idle_expires_at: Timestamp::new(jiff::Timestamp::now()),
+            },
+        }
+    }
+
+    fn ada_claim() -> IdentityClaim {
+        IdentityClaim {
+            name: "Ada".to_string(),
+            email: "ada@example.invalid".to_string(),
+        }
+    }
+
+    fn empty_tree_oid(store: &Store) -> Oid {
+        store
+            .hash_kind()
+            .hash_git_object("tree", b"")
+            .expect("empty tree hashes")
+    }
+
+    #[test]
+    fn new_mints_empty_tree_with_session_identity() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("root change"),
+                    identity: None,
+                    workspace: None,
+                },
+            })),
+        )
+        .expect("new prepares");
+        let Reply::New(reply) = prepared.reply else {
+            panic!("new must answer its own reply");
+        };
+        // A fresh change every time: never the tree's stable by-OID mapping.
+        assert_ne!(
+            reply.created.change,
+            ChangeId::from_oid(&empty_tree_oid(&store))
+        );
+        assert_eq!(reply.state, None);
+        let Some(identity) = reply.outcome.identity else {
+            panic!("new must report its recorded identity");
+        };
+        assert_eq!(identity.name, "Ada");
+        assert_eq!(identity.source, IdentitySource::SessionClaim);
+        // The empty tree publishes standalone (so `prepare_new` resolves it)
+        // while the candidate carries only the commit object.
+        assert_eq!(prepared.objects.len(), 1);
+        assert_eq!(prepared.objects[0].kind(), ObjectKind::Commit);
+        let read = store.read(empty_tree_oid(&store)).expect("read empty tree");
+        assert_eq!(read.kind, ObjectKind::Tree);
+        assert!(!prepared.facts.is_empty());
+        assert!(prepared.workspace_fence.is_none());
+        assert!(prepared.ref_transaction.is_none());
+
+        // The staged parts commit: the head resolves to a stored commit.
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish new");
+        assert!(
+            Records::new(&store)
+                .get_commit(&reply.created.head)
+                .expect("read commit")
+                .is_some()
+        );
+
+        // Minting again reuses the stored tree and mints another change.
+        let repeat = prepare_mutation_with(
+            &ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("second root"),
+                    identity: None,
+                    workspace: None,
+                },
+            })),
+        )
+        .expect("second new prepares");
+        assert_eq!(repeat.objects.len(), 1, "candidate carries only its commit");
+        let Reply::New(repeat_reply) = repeat.reply else {
+            panic!("new must answer its own reply");
+        };
+        assert_ne!(repeat_reply.created.change, reply.created.change);
+    }
+
+    #[test]
+    fn new_parents_and_override_identity() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let (parent, parent_change, _) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: vec![parent],
+                    description: ByteString::from("child"),
+                    identity: Some(IdentityClaim {
+                        name: "Bea".to_string(),
+                        email: "bea@example.invalid".to_string(),
+                    }),
+                    workspace: None,
+                },
+            })),
+        )
+        .expect("new on a parent prepares");
+        let Reply::New(reply) = prepared.reply else {
+            panic!("new must answer its own reply");
+        };
+        assert_ne!(reply.created.change, parent_change);
+        let Some(identity) = reply.outcome.identity else {
+            panic!("new must report its recorded identity");
+        };
+        assert_eq!(identity.name, "Bea");
+        assert_eq!(identity.source, IdentitySource::OperationOverride);
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish child");
+        let record = Records::new(&store)
+            .get_commit(&reply.created.head)
+            .expect("read commit")
+            .expect("child is stored");
+        assert_eq!(record.parents(), &[parent]);
+    }
+
+    #[test]
+    fn new_refuses_without_context_identity_or_merge() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let (parent, _, _) = seed_commit(&store, None);
+        let (other, _, _) = seed_commit(&store, None);
+
+        // Several parents need merge evaluation with no producer here.
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: vec![parent, other],
+                    description: ByteString::from("merge"),
+                    identity: None,
+                    workspace: None,
+                },
+            })),
+        )
+        .expect_err("multi-parent new stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+
+        // Neither an override nor a session identity is invalid, not hosted:
+        // no configuration ladder exists for the coordinator to consult.
+        let bare = session_row_caps(None, claim_all_caps());
+        let bare_ctx = full_ctx(&store, session, Some(&bare), Some(&clock), None);
+        let err = prepare_mutation_with(
+            &bare_ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("nobody"),
+                    identity: None,
+                    workspace: None,
+                },
+            })),
+        )
+        .expect_err("identity-less new is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+
+        // An unstored parent is not found.
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: vec![Head::Git { oid: oid(0x99) }],
+                    description: ByteString::from("ghost parent"),
+                    identity: None,
+                    workspace: None,
+                },
+            })),
+        )
+        .expect_err("unstored parent is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        // The legacy path carries no row or clock and stays refused.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("legacy"),
+                    identity: Some(ada_claim()),
+                    workspace: None,
+                },
+            })),
+        )
+        .expect_err("legacy new stays refused");
+        assert_eq!(err.code, ErrorCode::EHosted);
+    }
+
+    #[test]
+    fn new_workspace_switch_fences_native() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+
+        // Create the workspace through `ws.new`, then switch it with `new`.
+        let ws = prepare_mutation_with(
+            &ctx,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w2-test"),
+                    init: WorkspaceInit::Native {
+                        parents: Vec::new(),
+                    },
+                    scope: None,
+                },
+            })),
+        )
+        .expect("ws.new prepares");
+        store
+            .publish(ws.objects, &ws.facts)
+            .expect("publish workspace");
+        let Reply::WsNew(ws_reply) = ws.reply else {
+            panic!("ws.new must answer its own reply");
+        };
+        let before = ws_reply.state.stamp();
+        let binding = WorkspaceBinding {
+            workspace: ws_reply.workspace,
+            expected: before,
+        };
+        let switched = prepare_mutation_with(
+            &ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("switched"),
+                    identity: None,
+                    workspace: Some(binding),
+                },
+            })),
+        )
+        .expect("workspace switch prepares");
+        assert_eq!(switched.workspace_fence, Some((ws_reply.workspace, before)));
+        let Reply::New(switched_reply) = switched.reply else {
+            panic!("new must answer its own reply");
+        };
+        let Some(state) = switched_reply.state else {
+            panic!("a switch must answer the resulting state");
+        };
+        assert_eq!(state.stamp().sequence, before.sequence + 1);
+        let facts: Vec<_> = switched
+            .facts
+            .iter()
+            .filter(|fact| fact.table == crate::store::types::FactTable::Workspaces)
+            .collect();
+        assert_eq!(facts.len(), 1);
+        store
+            .publish(switched.objects, &switched.facts)
+            .expect("publish switch");
+
+        // A holder that is not the session loses the fence, not the call.
+        let holder = SessionId::generate();
+        let holder_row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let holder_ctx = full_ctx(&store, holder, Some(&holder_row), Some(&clock), None);
+        let err = prepare_mutation_with(
+            &holder_ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("seized"),
+                    identity: None,
+                    workspace: Some(WorkspaceBinding {
+                        workspace: ws_reply.workspace,
+                        expected: state.stamp(),
+                    }),
+                },
+            })),
+        )
+        .expect_err("foreign holder loses the fence");
+        assert_eq!(err.code, ErrorCode::ELeaseLost);
+
+        // An unknown workspace is not found.
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::New(Box::new(WireMutation {
+                request_id: request_id(),
+                args: NewArgs {
+                    parents: Vec::new(),
+                    description: ByteString::from("ghost workspace"),
+                    identity: None,
+                    workspace: Some(workspace_binding()),
+                },
+            })),
+        )
+        .expect_err("unknown workspace is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+    }
+
+    #[test]
+    fn claim_acquire_validates_without_sealing() {
+        let (_temp, store, session) = fixture();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), None, None);
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::ClaimAcquire(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimAcquireArgs {
+                    paths: vec![
+                        RepoPath::new("src/lib.rs").expect("test path"),
+                        RepoPath::new("src").expect("test path"),
+                    ],
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                    mode: ClaimMode::Enforce,
+                },
+            })),
+        )
+        .expect("claim.acquire prepares");
+        let Reply::ClaimAcquire(reply) = prepared.reply else {
+            panic!("claim.acquire must answer its own reply");
+        };
+        // Covered paths canonicalize to their ancestor; the id is minted but
+        // nothing seals outside the lane.
+        assert_eq!(
+            reply.claim.paths,
+            vec![RepoPath::new("src").expect("test path")]
+        );
+        assert_eq!(reply.claim.holder, session);
+        assert_ne!(reply.claim.claim, ClaimId::nil());
+        assert!(prepared.facts.is_empty());
+        assert!(prepared.objects.is_empty());
+        let stored = read_record(&store, reply.claim.claim).expect("read claim");
+        assert_eq!(stored, None, "prepare stages no claim facts");
+
+        // Outside the session's grant the same call is forbidden.
+        let narrow = session_row_caps(Some(ada_claim()), Capabilities::default());
+        let narrow_ctx = full_ctx(&store, session, Some(&narrow), None, None);
+        let err = prepare_mutation_with(
+            &narrow_ctx,
+            Request::ClaimAcquire(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimAcquireArgs {
+                    paths: vec![RepoPath::new("src").expect("test path")],
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                    mode: ClaimMode::Enforce,
+                },
+            })),
+        )
+        .expect_err("uncovered path is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        // An empty path set is invalid before any capability check.
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::ClaimAcquire(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimAcquireArgs {
+                    paths: Vec::new(),
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                    mode: ClaimMode::Enforce,
+                },
+            })),
+        )
+        .expect_err("empty claim paths are invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn claim_release_predicts_the_stored_record() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let claims =
+            crate::coord::claims::ClaimClock::open(&store, clock).expect("claim clock opens");
+        let sealed = crate::coord::claims::seal_acquire(
+            &store,
+            &claims,
+            session,
+            ClaimId::generate(),
+            ClaimAcquireArgs {
+                paths: vec![RepoPath::new("src").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+            },
+        )
+        .expect("seal fixture claim");
+        store
+            .publish(Vec::new(), &sealed.facts)
+            .expect("publish fixture claim");
+
+        // The legacy path serves releases: prediction is a read, and the
+        // lane re-seals authoritatively at commit time.
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRelease(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimReleaseArgs {
+                    claim: sealed.record.claim,
+                },
+            })),
+        )
+        .expect("claim.release prepares");
+        let Reply::ClaimRelease(reply) = prepared.reply else {
+            panic!("claim.release must answer its own reply");
+        };
+        assert_eq!(reply.released, sealed.record);
+        assert!(prepared.facts.is_empty());
+
+        // An unknown claim is not found.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRelease(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimReleaseArgs {
+                    claim: ClaimId::generate(),
+                },
+            })),
+        )
+        .expect_err("unknown claim is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        // Another session's claim is forbidden.
+        let holder = SessionId::generate();
+        let err = prepare_mutation(
+            &store,
+            holder,
+            Request::ClaimRelease(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimReleaseArgs {
+                    claim: sealed.record.claim,
+                },
+            })),
+        )
+        .expect_err("foreign claim is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn ws_new_creates_native_and_gitcompat_rows() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(Some(ada_claim()), claim_all_caps());
+        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), None);
+
+        // Native creation mints a fresh change and reports the session claim.
+        let prepared = prepare_mutation_with(
+            &ctx,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w2-native"),
+                    init: WorkspaceInit::Native {
+                        parents: Vec::new(),
+                    },
+                    scope: None,
+                },
+            })),
+        )
+        .expect("native ws.new prepares");
+        let Reply::WsNew(reply) = prepared.reply else {
+            panic!("ws.new must answer its own reply");
+        };
+        let Some(identity) = reply.outcome.identity else {
+            panic!("native ws.new must report its recorded identity");
+        };
+        assert_eq!(identity.source, IdentitySource::SessionClaim);
+        assert_eq!(
+            reply.state.scope(),
+            &crate::workspace::Scope::Full,
+            "an absent scope means the full tree"
+        );
+        assert!(prepared.workspace_fence.is_none());
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish native workspace");
+
+        // GitCompat creation is context-free: no identity, no clock.
+        let (parent, _, parent_oid) = seed_commit(&store, None);
+        let _ = parent;
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w2-git"),
+                    init: WorkspaceInit::GitCompat {
+                        head: crate::workspace::HeadRef::Detached(parent_oid),
+                    },
+                    scope: None,
+                },
+            })),
+        )
+        .expect("gitcompat ws.new prepares on the legacy path");
+        let Reply::WsNew(reply) = prepared.reply else {
+            panic!("ws.new must answer its own reply");
+        };
+        assert!(reply.outcome.identity.is_none());
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish gitcompat workspace");
+
+        // Native creation without an identity is invalid, even with a clock.
+        let bare = session_row_caps(None, claim_all_caps());
+        let bare_ctx = full_ctx(&store, session, Some(&bare), Some(&clock), None);
+        let err = prepare_mutation_with(
+            &bare_ctx,
+            Request::WsNew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: WsNewArgs {
+                    root: ByteString::from("/tmp/ruk-w2-bare"),
+                    init: WorkspaceInit::Native {
+                        parents: Vec::new(),
+                    },
+                    scope: None,
+                },
+            })),
+        )
+        .expect_err("identity-less ws.new is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+    }
     fn change_target() -> ChangeRef {
         ChangeRef {
             change: ChangeId::from_bytes([0x22; 16]),
