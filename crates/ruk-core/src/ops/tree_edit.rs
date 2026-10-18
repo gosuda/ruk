@@ -153,7 +153,10 @@ pub(crate) fn conflicted_paths(
     terms: &[Oid],
 ) -> Result<Vec<(RepoPath, usize)>, CoreError> {
     let editor = Editor::new(store, Selection::All)?;
-    let nodes: Vec<Node> = terms.iter().map(|oid| Some((TreeMode::Tree, *oid))).collect();
+    let nodes: Vec<Node> = terms
+        .iter()
+        .map(|oid| Some((TreeMode::Tree, *oid)))
+        .collect();
     let mut out = Vec::new();
     editor.walk_conflicts(&[], &nodes, &mut out)?;
     Ok(out)
@@ -287,7 +290,10 @@ impl<'a> Editor<'a> {
         }
         let mut bytes = Vec::new();
         object.bytes.read_to_end(&mut bytes).map_err(|err| {
-            CoreError::new(ErrorCode::EIo, format!("reading tree {}: {err}", oid.to_hex()))
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("reading tree {}: {err}", oid.to_hex()),
+            )
         })?;
         let items = parse_tree(self.kind, &bytes)?;
         Ok(items
@@ -620,7 +626,11 @@ mod tests {
         let merged = apply(&fixture, base, base, to, Selection::Paths(&selected)).expect("merge");
         assert_eq!(fixture.read(merged, "d/x").as_deref(), Some("x1"));
         assert_eq!(fixture.read(merged, "d/z").as_deref(), Some("z1"));
-        assert_eq!(fixture.read(merged, "d/y"), None, "deletion below d applies");
+        assert_eq!(
+            fixture.read(merged, "d/y"),
+            None,
+            "deletion below d applies"
+        );
         assert_eq!(fixture.read(merged, "e").as_deref(), Some("e0"));
     }
 
@@ -666,7 +676,10 @@ mod tests {
         let path = RepoPath::new(b"d/x".to_vec()).expect("path");
         let removed = set_entry(&fixture.store, tree, &path, None).expect("remove");
         let removed_root = publish_edit(&fixture, removed);
-        assert_eq!(lookup(&fixture.store, removed_root, &path).expect("lookup"), None);
+        assert_eq!(
+            lookup(&fixture.store, removed_root, &path).expect("lookup"),
+            None
+        );
         let dir = RepoPath::new(b"d".to_vec()).expect("path");
         assert_eq!(
             lookup(&fixture.store, removed_root, &dir).expect("lookup"),
@@ -701,7 +714,11 @@ mod tests {
         let err = apply(&fixture, base, from, to, Selection::Paths(&selected))
             .expect_err("a file cannot become a directory the delta fills");
         assert_eq!(err.code, ErrorCode::EConflicted);
-        assert!(err.message.contains("at a"), "names the path: {}", err.message);
+        assert!(
+            err.message.contains("at a"),
+            "names the path: {}",
+            err.message
+        );
     }
 
     #[test]

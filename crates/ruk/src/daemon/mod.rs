@@ -2185,8 +2185,7 @@ pub async fn dispatch_method(
                     // publishing rows it no longer waits for.
                     let checkpoint = |_: ruk_core::attestation::Progress| cancel.check();
                     let typed_id = request.request_id();
-                    let ready =
-                        coordinator.prepare_for_dispatch(session, request, &checkpoint)?;
+                    let ready = coordinator.prepare_for_dispatch(session, request, &checkpoint)?;
                     match ready {
                         ruk_core::coord::DispatchReady::Replay(reply) => {
                             ipc::encode_control(&ReplyEnvelope::success(typed_id, reply))

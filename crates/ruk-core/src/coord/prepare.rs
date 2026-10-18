@@ -102,16 +102,17 @@ use crate::conflict::{ExtraHeader, Signature, TzOffset};
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
+use crate::index::{FileMode, RepoPath};
 use crate::merge::Merge;
 use crate::merge::composed::{MergeMetadata, MergeMode, MergeNotices, MergeReport};
 use crate::merge::syntax::LANGUAGE_SET_VERSION;
-use crate::ops::{
-    AbandonRequest, EditRequest, NewRequest, NewResult, PreparedOp, prepare_abandon, prepare_edit,
-    prepare_new,
-};
 use crate::ops::revert::default_revert_message;
 use crate::ops::tree_edit::{
     Node, Selection, apply_delta, conflicted_paths, covered_by, empty_tree, lookup, set_entry,
+};
+use crate::ops::{
+    AbandonRequest, EditRequest, NewRequest, NewResult, PreparedOp, prepare_abandon, prepare_edit,
+    prepare_new,
 };
 use crate::ops::{children, descendants};
 use crate::protocol::{
@@ -120,20 +121,16 @@ use crate::protocol::{
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
     ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
     EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, LandPrepareArgs,
-    LandPrepareReply, MutationOutcome,
-    NewArgs, NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
-    RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
-    TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
-    WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs,
-    WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
+    LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply, RebaseArgs,
+    RebaseScope, ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs, SquashArgs,
+    TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply,
+    Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs,
+    WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
     Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
     RevertReply, SplitArgs, SplitPlacement, UndoArgs, UndoReply,
 };
-use crate::index::{FileMode, RepoPath};
-use crate::workcopy::tree::TreeMode;
-use std::num::NonZeroU32;
 use crate::records::Records;
 use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::head_key;
@@ -144,9 +141,11 @@ use crate::store::ObjectKind;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
 use crate::workcopy::journal_state::{NoJournal, ensure_idle};
+use crate::workcopy::tree::TreeMode;
 use crate::workspace::{
     GitCompatWorkspace, HeadRef, NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState,
 };
+use std::num::NonZeroU32;
 
 /// Inputs beyond the store that identity synthesis, timestamped signatures,
 /// claim sealing, and land plans need.
@@ -1146,7 +1145,9 @@ fn ws_new_parts(
         WorkspaceInit::GitCompat { head } => {
             head.validate(store.hash_kind()).map_err(CoreError::from)?;
             if let HeadRef::Detached(oid) = head {
-                let stored = Records::new(store).get_commit(&Head::Git { oid: *oid })?.is_some();
+                let stored = Records::new(store)
+                    .get_commit(&Head::Git { oid: *oid })?
+                    .is_some();
                 if !stored {
                     return Err(CoreError::new(
                         ErrorCode::ENotFound,
@@ -2463,7 +2464,12 @@ fn split_parts(
                 message: args.description.clone(),
                 provenance: None,
             })?;
-            (source_head, selection_head, selection_change, selection_head)
+            (
+                source_head,
+                selection_head,
+                selection_change,
+                selection_head,
+            )
         }
     };
     let mut staged = vec![StagedRewrite {
@@ -2535,7 +2541,11 @@ fn split_parts(
 
 /// The tree a change's only parent carries, or the empty tree for a root.
 /// Merge parents refuse: their trees need merge evaluation.
-fn single_parent_tree(store: &Store, record: &CommitRecord, method: &str) -> Result<Oid, CoreError> {
+fn single_parent_tree(
+    store: &Store,
+    record: &CommitRecord,
+    method: &str,
+) -> Result<Oid, CoreError> {
     match record.parents() {
         [] => empty_tree(store.hash_kind()),
         [parent] => {
@@ -2630,7 +2640,13 @@ fn squash_parts(
     };
     // The source's parent is the destination, so its delta is the source tree
     // against the destination tree. The selection moves from one side to the other.
-    let moved = apply_delta(store, destination_tree, destination_tree, source_tree, selection)?;
+    let moved = apply_delta(
+        store,
+        destination_tree,
+        destination_tree,
+        source_tree,
+        selection,
+    )?;
     if moved.root == destination_tree {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
@@ -2714,13 +2730,21 @@ fn squash_parts(
             ));
         };
         let base_tree = new_base_tree(store, "squash", &new_trees, base)?;
-        let old_parent_tree = *old_trees.get(old_parent).ok_or_else(|| not_stored(old_parent))?;
+        let old_parent_tree = *old_trees
+            .get(old_parent)
+            .ok_or_else(|| not_stored(old_parent))?;
         let child_tree = resolved_tree_of(
             &record,
             "squash",
             "re-parenting a conflicted commit needs merge evaluation with no producer on this path",
         )?;
-        let derived = apply_delta(store, base_tree, old_parent_tree, child_tree, Selection::All)?;
+        let derived = apply_delta(
+            store,
+            base_tree,
+            old_parent_tree,
+            child_tree,
+            Selection::All,
+        )?;
         push_unique(&mut objects, derived.objects);
         let input = preserved_input(
             &record,
@@ -2766,8 +2790,7 @@ fn squash_parts(
         rewrite_map.insert(source.head, (destination.change, new_destination));
     }
     let gated = gate_workspaces(ctx, "squash", &args.workspaces)?;
-    let (mut workspace_facts, fence) =
-        advance_workspaces(gated, session, "squash", &rewrite_map)?;
+    let (mut workspace_facts, fence) = advance_workspaces(gated, session, "squash", &rewrite_map)?;
     facts.append(&mut workspace_facts);
     let reply = rewrite_reply(
         session,
@@ -3034,8 +3057,9 @@ fn remaining_after(
         .into_iter()
         .filter(|(conflict, _)| !covered_by(conflict.as_bytes(), path))
         .map(|(conflict, count)| {
-            let terms = u32::try_from(count)
-                .map_err(|_| CoreError::new(ErrorCode::ECapacity, "conflict term count exceeds u32"))?;
+            let terms = u32::try_from(count).map_err(|_| {
+                CoreError::new(ErrorCode::ECapacity, "conflict term count exceeds u32")
+            })?;
             Ok(RemainingConflict {
                 path: conflict,
                 terms,
@@ -3139,13 +3163,7 @@ fn revert_parts(
             "commit message carries NUL",
         ));
     }
-    let reversed = apply_delta(
-        store,
-        onto_tree,
-        target_tree,
-        mainline_tree,
-        Selection::All,
-    )?;
+    let reversed = apply_delta(store, onto_tree, target_tree, mainline_tree, Selection::All)?;
     let (author, identity) = commit_signature(row, clock, "revert", args.identity.as_ref())?;
     let input = NativeCommitInput {
         change_id: ChangeId::generate(),
@@ -3519,11 +3537,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use super::super::land::load_plan;
     use super::super::policy::Principal;
     use super::*;
     use crate::attestation::Progress;
     use crate::bytes::ByteString;
-    use super::super::land::load_plan;
     use crate::capability::{AttestKind, AttestResult, Capabilities, PathPattern, RefPattern};
     use crate::change::{ChangeId, ClaimId, PlanId, SessionId, WorkspaceId};
     use crate::commit::ProvenanceClaims;
@@ -3536,12 +3554,11 @@ mod tests {
         AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
         BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
         ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs,
-        IdentityClaim, LandExecuteArgs, LandPrepareArgs, MergeSelection,
-        Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection, PinArgs, PushArgs,
-        PushAtomicity, PushReconcileArgs, PushSource, PushUpdate, RebaseArgs,
-        RebaseScope, RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
-        SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding,
-        WorkspaceInit, WsNewArgs,
+        IdentityClaim, LandExecuteArgs, LandPrepareArgs, MergeSelection, Mutation as WireMutation,
+        NewArgs, OpLogArgs, PathSelection, PinArgs, PushArgs, PushAtomicity, PushReconcileArgs,
+        PushSource, PushUpdate, RebaseArgs, RebaseScope, RemoteName, RemoteSpec, Resolution,
+        ResolveArgs, RevertArgs, SessionAuthority, SplitArgs, SplitPlacement, SquashArgs,
+        TagAnnotation, UnpinArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
     };
     use crate::records::codec::encode_change_entry;
     use crate::records::keys::change_key;
@@ -4324,7 +4341,13 @@ mod tests {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
         let row = session_row_caps(None, land_caps());
-        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
         let (head, change, oid) = seed_commit(&store, None);
         let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
             .expect("land.prepare serves");
@@ -4368,7 +4391,13 @@ mod tests {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
         let row = session_row_caps(None, Capabilities::default());
-        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
         let (head, change, _) = seed_commit(&store, None);
         let err = prepare_mutation_with(&ctx, land_request(change, Some(head)))
             .expect_err("land.prepare without the land grant is forbidden");
@@ -4380,7 +4409,13 @@ mod tests {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
         let row = session_row_caps(None, land_caps());
-        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
         let missing = ChangeId::generate();
         let err = prepare_mutation_with(&ctx, land_request(missing, None))
             .expect_err("unknown change is not found");
@@ -4398,7 +4433,13 @@ mod tests {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
         let row = session_row_caps(None, land_caps());
-        let ctx = full_ctx(&store, session, Some(&row), Some(&clock), Some(&open_checkpoint));
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
         let fetch = Request::Fetch(Box::new(WireMutation {
             request_id: request_id(),
             args: FetchArgs {
@@ -4408,8 +4449,7 @@ mod tests {
                 filter: FetchFilter::default(),
             },
         }));
-        let err =
-            prepare_mutation_with(&ctx, fetch).expect_err("fetch stays refused with context");
+        let err = prepare_mutation_with(&ctx, fetch).expect_err("fetch stays refused with context");
         assert_eq!(err.code, ErrorCode::EHosted);
         assert!(
             err.message.contains("transport job"),
@@ -5043,7 +5083,11 @@ mod tests {
         )
         .expect_err("an unstored commit is not found");
         assert_eq!(err.code, ErrorCode::ENotFound);
-        assert!(err.message.contains("not a stored commit"), "names the hazard: {}", err.message);
+        assert!(
+            err.message.contains("not a stored commit"),
+            "names the hazard: {}",
+            err.message
+        );
     }
     fn change_target() -> ChangeRef {
         ChangeRef {
@@ -6312,7 +6356,10 @@ mod tests {
         let Reply::Resolve(reply) = prepared.reply else {
             panic!("resolve must answer its own reply");
         };
-        assert!(reply.remaining.items.is_empty(), "the only path is resolved");
+        assert!(
+            reply.remaining.items.is_empty(),
+            "the only path is resolved"
+        );
         store
             .publish(prepared.objects, &prepared.facts)
             .expect("publish resolve");
@@ -6424,8 +6471,8 @@ mod tests {
                 workspaces: Vec::new(),
             },
         }));
-        let err = prepare_mutation(&store, session, request)
-            .expect_err("a directory path is refused");
+        let err =
+            prepare_mutation(&store, session, request).expect_err("a directory path is refused");
         assert_eq!(err.code, ErrorCode::EInvalid);
         assert!(err.message.contains("names a directory"), "{}", err.message);
     }
@@ -6505,7 +6552,11 @@ mod tests {
         store
             .publish(prepared.objects, &prepared.facts)
             .expect("publish split");
-        assert_eq!(reply.rewrites.items.len(), 1, "only the source identity moves");
+        assert_eq!(
+            reply.rewrites.items.len(),
+            1,
+            "only the source identity moves"
+        );
         let source_now = reply.rewrites.items[0].new;
         let selection_head = reply
             .outcome
@@ -6541,8 +6592,7 @@ mod tests {
         let moved_tree = seed_files(&store, &[("x", 2), ("y", 1)]);
         let (dhead, dchange) =
             seed_child_on_tree(&store, parent_tree, Vec::new(), None, "destination");
-        let (shead, schange) =
-            seed_child_on_tree(&store, source_tree, vec![dhead], None, "source");
+        let (shead, schange) = seed_child_on_tree(&store, source_tree, vec![dhead], None, "source");
         let prepared = prepare_mutation(
             &store,
             session,
@@ -6555,9 +6605,7 @@ mod tests {
                     change: dchange,
                     head: Some(dhead),
                 },
-                crate::protocol::PathSelection::Paths(vec![
-                    RepoPath::new("x").expect("test path"),
-                ]),
+                crate::protocol::PathSelection::Paths(vec![RepoPath::new("x").expect("test path")]),
                 false,
             ),
         )
@@ -6565,7 +6613,10 @@ mod tests {
         let Reply::Squash(reply) = prepared.reply else {
             panic!("squash must answer its own reply");
         };
-        assert!(reply.abandoned.items.is_empty(), "the remainder keeps the source");
+        assert!(
+            reply.abandoned.items.is_empty(),
+            "the remainder keeps the source"
+        );
         store
             .publish(prepared.objects, &prepared.facts)
             .expect("publish squash");

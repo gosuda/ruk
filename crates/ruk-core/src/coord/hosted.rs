@@ -1387,11 +1387,11 @@ mod tests {
 
     use super::*;
     use crate::ByteString;
+    use crate::attestation::Progress;
     use crate::capability::{AttestKind, AttestResult};
     use crate::change::{ClaimId, LeaseId, RequestId, StoreId};
     use crate::commit::ProvenanceClaims;
     use crate::coord::claims::{ClaimClock, seal_acquire};
-    use crate::attestation::Progress;
     use crate::coord::receipt;
     use crate::coord::rows::{ReceiptRow, Retained, SweepCursors, Usage, encode, receipt_key};
     use crate::heads::Head;
@@ -1403,10 +1403,10 @@ mod tests {
         MutationOutcome, OpLogArgs, PageCursor, PageLimit, PageRequest, PinArgs, QueryDigest,
         ReceiptRef, StatusArgs, TagSetArgs, Timestamp, UndoArgs, UndoReply, UndoSummary,
     };
-    use crate::store::types::{FactMutation, FactTable};
     use crate::refdata::{RefExpect, RefName};
     use crate::store::PreparationBudget;
     use crate::store::types::FactExpectation;
+    use crate::store::types::{FactMutation, FactTable};
     use crate::store::{ObjectKind, Store};
 
     static SEQ: AtomicU64 = AtomicU64::new(1);

@@ -75,8 +75,7 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
     let mut reader = OpDeltaReader::new(store, operation, header);
     // Keyed by table name and key, each entry keeps the value before the first
     // delta and the value after the last: the net change to that key.
-    let mut net: BTreeMap<(String, Vec<u8>), (Option<Vec<u8>>, Option<Vec<u8>>)> =
-        BTreeMap::new();
+    let mut net: BTreeMap<(String, Vec<u8>), (Option<Vec<u8>>, Option<Vec<u8>>)> = BTreeMap::new();
     while let Some(delta) = reader.next_delta()? {
         let slot = net
             .entry((delta.table, delta.key))
@@ -162,9 +161,10 @@ fn undo_ref_transaction(
         return Ok((None, Vec::new()));
     }
     let dependencies = updates.iter().map(|update| update.name.clone()).collect();
-    let transaction =
-        RefTransaction::new(store.hash_kind(), updates).map_err(CoreError::from)?;
-    transaction.check(&StoreRefs::new(store)).map_err(CoreError::from)?;
+    let transaction = RefTransaction::new(store.hash_kind(), updates).map_err(CoreError::from)?;
+    transaction
+        .check(&StoreRefs::new(store))
+        .map_err(CoreError::from)?;
     Ok((Some(transaction), dependencies))
 }
 
@@ -235,10 +235,7 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
     };
     Err(CoreError::new(
         ErrorCode::EUndoConflict,
-        format!(
-            "operation {} cannot be undone: {reason}",
-            header.entry.id.0
-        ),
+        format!("operation {} cannot be undone: {reason}", header.entry.id.0),
     ))
 }
 
@@ -327,8 +324,8 @@ mod tests {
     use crate::change::{CheckedOperationId, SessionId};
     use crate::coord::oplog::{self, OpMeta};
     use crate::ids::{HashKind, Oid};
-    use crate::refdata::RefTarget;
     use crate::protocol::Timestamp;
+    use crate::refdata::RefTarget;
     use crate::store::PreparationBudget;
 
     struct Fixture {
@@ -400,7 +397,10 @@ mod tests {
     fn undo_expects_each_after_value_and_writes_the_before_value() {
         let fixture = Fixture::new("inverse");
         let created = ref_target(1);
-        let id = fixture.record(Method::BookmarkSet, &[ref_set(b"refs/heads/main", &created)]);
+        let id = fixture.record(
+            Method::BookmarkSet,
+            &[ref_set(b"refs/heads/main", &created)],
+        );
         let plan = prepare_undo(&fixture.store, id).expect("undo prepares");
         assert_eq!(plan.facts.len(), 1);
         let fact = &plan.facts[0];
@@ -412,7 +412,10 @@ mod tests {
         );
         assert_eq!(fact.value, None, "a created key is removed again");
         assert_eq!(plan.summary.refs, 1);
-        let transaction = plan.ref_transaction.as_ref().expect("undo carries a ref transaction");
+        let transaction = plan
+            .ref_transaction
+            .as_ref()
+            .expect("undo carries a ref transaction");
         assert_eq!(transaction.updates().len(), 1);
         assert_eq!(
             plan.ref_dependencies,
@@ -453,7 +456,11 @@ mod tests {
         let id = fixture.record(Method::Fetch, &[ref_set(b"refs/remotes/origin/main", b"x")]);
         let err = prepare_undo(&fixture.store, id).expect_err("fetch cannot be inverted");
         assert_eq!(err.code, ErrorCode::EUndoConflict);
-        assert!(err.message.contains("fetch"), "names the effect: {}", err.message);
+        assert!(
+            err.message.contains("fetch"),
+            "names the effect: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -488,7 +495,11 @@ mod tests {
         );
         let err = prepare_undo(&fixture.store, id).expect_err("workspace rows never restore");
         assert_eq!(err.code, ErrorCode::EUndoConflict);
-        assert!(err.message.contains("workspace"), "names the hazard: {}", err.message);
+        assert!(
+            err.message.contains("workspace"),
+            "names the hazard: {}",
+            err.message
+        );
     }
 
     #[test]

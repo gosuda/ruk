@@ -374,8 +374,11 @@ mod tests {
                 .expect("future"),
         );
         let reply = sample_mutation_reply(session, req_id, digest, false, retained_until);
-        let encoded = encode("receipt", &ReceiptRow::new(session, req_id, reply).expect("row"))
-            .expect("encode");
+        let encoded = encode(
+            "receipt",
+            &ReceiptRow::new(session, req_id, reply).expect("row"),
+        )
+        .expect("encode");
         let key = receipt_key(session, req_id);
         store
             .publish(
