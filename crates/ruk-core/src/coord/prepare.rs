@@ -1300,6 +1300,9 @@ fn gate_workspaces(
     Ok(gated)
 }
 
+/// The workspace half of a prepared rewrite: row facts plus the lane fence.
+type WorkspaceAdvance = (Vec<FactMutation>, Option<(WorkspaceId, WorkspaceStamp)>);
+
 /// Advances a gated workspace onto its rewritten head. A workspace on an
 /// unaffected change keeps its state; the fence still guards its stamp. A
 /// GitCompat workspace on a rewritten head needs HEAD/index application with
@@ -1309,7 +1312,7 @@ fn advance_workspaces(
     session: SessionId,
     method: &str,
     rewrites: &BTreeMap<Head, (ChangeId, Head)>,
-) -> Result<(Vec<FactMutation>, Option<(WorkspaceId, WorkspaceStamp)>), CoreError> {
+) -> Result<WorkspaceAdvance, CoreError> {
     let Some((binding, observed)) = gated.into_iter().next() else {
         return Ok((Vec::new(), None));
     };
@@ -1654,7 +1657,7 @@ fn union_entries(
         return None;
     }
     Some(ChangeEntry {
-        state: old.state.clone(),
+        state: old.state,
         heads,
     })
 }
