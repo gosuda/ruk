@@ -51,6 +51,11 @@ sha2 = { version = "=0.11.1", default-features = false }
 hmac = { version = "=0.13.0", default-features = false }
 toml = { version = "=1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs", "process"] }
+# Minimal HTTPS for the git-lfs batch API only (transport::http): pure-Rust
+# TLS with Mozilla roots; no platform glue (native-tls is out of scope).
+# Direct count stays at two: ring arrives transitively via the feature.
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = { version = "=1.0.9" }
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading"] }
 ssh-key = { version = "=0.6.7", default-features = false, features = ["ed25519", "std"] }
 roaring = { version = "=0.11.5", default-features = false, features = ["std"] }

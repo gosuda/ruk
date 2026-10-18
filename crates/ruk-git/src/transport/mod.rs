@@ -44,6 +44,7 @@ pub mod archive;
 pub mod dumb;
 pub mod fetch;
 pub mod hooks;
+pub mod http;
 pub mod lfs;
 pub mod mirror;
 pub mod net;

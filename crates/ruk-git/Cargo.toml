@@ -23,6 +23,8 @@ tracing.workspace = true
 serde.workspace = true
 sonic-rs.workspace = true
 postcard.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
 
 [lints]
 workspace = true
