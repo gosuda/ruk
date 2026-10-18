@@ -425,18 +425,23 @@ fn receive_v2<R: Read + Write>(
                     }
                     b"wanted-refs" => read_section_lines(pkt, &mut Vec::new())?,
                     b"packfile" => {
-                        if sideband_all {
-                            let mut band =
-                                SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
-                            let pack = ingest_pack(&mut band, kind, store, limits, interrupt)?;
-                            progress = band.drain_to_end()?;
-                            staged = Some(pack);
-                        } else {
-                            // A raw packfile section ends at its trailer; the
-                            // connection is not reused afterwards.
-                            staged =
-                                Some(ingest_pack(pkt.get_mut(), kind, store, limits, interrupt)?);
-                        }
+                        // Protocol v2 multiplexes the packfile section on
+                        // sideband whether or not `sideband-all` was
+                        // negotiated: live servers send band-1 pack bytes
+                        // with band-2 progress either way (verified against
+                        // git 2.53.0), so this arm always demultiplexes. A
+                        // raw pack here is corrupt, not a legacy shape.
+                        let mut band =
+                            SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
+                        let pack = ingest_pack(&mut band, kind, store, limits, interrupt)?;
+                        progress = band.drain_to_end()?;
+                        staged = Some(pack);
+                        // The packfile section closes the response: live
+                        // servers send one flush for section and response,
+                        // then hold the connection open in silence. Reading
+                        // on would block forever, so the loop ends here;
+                        // negotiation sections always precede the pack.
+                        break;
                     }
                     _ => read_section_lines(pkt, &mut Vec::new())?,
                 }
@@ -982,6 +987,51 @@ mod tests {
         assert!(text.contains(two), "offers the have");
         assert!(text.contains("done\n"), "sends done once the round ends");
         assert_eq!(received.staged.oids().len(), 16);
+        verify_closure(
+            &store,
+            &received.staged,
+            &req.wants,
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("complete pack verifies");
+    }
+
+    #[test]
+    fn v2_packfile_section_demultiplexes_sideband() {
+        // Live v2 servers multiplex the packfile section (band-1 pack,
+        // band-2 progress) without any `sideband-all` negotiation; a raw
+        // pack here must fail, never silently ingest.
+        let store = test_store(HashKind::Sha1);
+        let pack = include_bytes!("fixtures/basic.pack");
+        let mut script = Vec::new();
+        script.extend(frame(b"version 2\n"));
+        script.extend(frame(b"fetch=shallow wait-for-done\n"));
+        script.extend(b"0000");
+        script.extend(frame(b"packfile\n"));
+        let mut banded = vec![0x01];
+        banded.extend_from_slice(&pack[..pack.len() / 2]);
+        script.extend(frame(&banded));
+        script.extend(frame(b"\x02progress\n"));
+        let mut banded = vec![0x01];
+        banded.extend_from_slice(&pack[pack.len() / 2..]);
+        script.extend(frame(&banded));
+        script.extend(b"0000");
+        let req = FetchWireRequest {
+            wants: vec![oid(FOUR)],
+            haves: Vec::new(),
+            filter: None,
+            depth: None,
+            shallow: Vec::new(),
+            list_refs: false,
+            ref_prefixes: Vec::new(),
+        };
+        let (received, written) = receive_from_script(script, HashKind::Sha1, &store, &req);
+        let text = String::from_utf8_lossy(&written);
+        assert!(text.contains("command=fetch"), "speaks v2");
+        assert_eq!(received.staged.oids().len(), 16);
+        assert!(received.progress.progress.starts_with(b"progress\n"));
         verify_closure(
             &store,
             &received.staged,
