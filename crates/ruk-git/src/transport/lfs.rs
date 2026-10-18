@@ -8,9 +8,14 @@
 //!
 //! The gate polices what a push *introduces*: staged blobs whose bytes
 //! match [`is_pointer`] refuse exactly the live ref updates whose new-tip
-//! closure reaches them. Pointer blobs already committed (recorded under
-//! an earlier `pointers` policy) stay settled state — a mode flip does not
-//! rewrite history, and unreachable pack extras are stored the way hook
+//! closure reaches them through staged objects. The walk never leaves the
+//! pack: a staged blob is reachable from a new tip only through staged
+//! objects, because every committed object references only objects that
+//! already existed when it was committed. Committed history is traversed
+//! never and buffered never, so the gate costs scale with the push, not
+//! the repository. Pointer blobs already committed (recorded under an
+//! earlier `pointers` policy) stay settled state — a mode flip does not
+//! rewrite history — and unreachable pack extras are stored the way hook
 //! refusals leave unreferenced objects. Under [`LfsMode::Pointers`] there
 //! is nothing to do: ingest already records the bytes plainly and payloads
 //! are never fetched, exactly what the policy promises.
@@ -20,20 +25,14 @@
 //! `size <digits>`); `git/builtin/receive-pack.c` (per-ref `ng` verdicts).
 
 use std::collections::{HashSet, VecDeque};
-use std::ops::Deref;
 
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::store::Store;
 use ruk_core::store::types::ObjectKind;
 use ruk_core::{LfsMode, is_pointer};
 
+use super::Interrupt;
 use super::pack::{StagedPack, object_links};
-use super::{Interrupt, read_object};
 use crate::GitError;
-
-/// Largest committed object pulled through the pointer walk. Committed
-/// blobs carry no links, so their bodies are never buffered at all.
-const WALK_OBJECT_BYTES: u64 = 512 << 20;
 
 /// The refusal line for a ref update whose closure introduces a pointer
 /// blob under [`LfsMode::Deny`]. One line, so it travels intact into the
@@ -58,14 +57,14 @@ pub fn staged_pointers(staged: &StagedPack) -> Vec<Oid> {
         .collect()
 }
 
-/// New tips whose closure (over staged plus committed objects) reaches one
-/// of `pointers`. Each tip walks independently with interrupt checks; a
-/// missing object fails closed rather than silently accepting.
+/// New tips whose staged closure reaches one of `pointers`. Each tip walks
+/// independently with interrupt checks; links outside the staged pack end
+/// their branch, since committed objects only reference pre-existing
+/// objects and can never lead to a newly introduced blob.
 ///
 /// # Errors
-/// Closure read failures and [`GitError::Corrupt`] for malformed payloads.
+/// [`GitError::Corrupt`] for malformed staged payloads.
 pub fn tips_reaching_pointers(
-    store: &Store,
     staged: &StagedPack,
     kind: HashKind,
     tips: &[Oid],
@@ -75,18 +74,17 @@ pub fn tips_reaching_pointers(
     let mut refused = HashSet::new();
     for tip in tips {
         interrupt.check("scanning pushed objects for LFS pointers")?;
-        if reaches_pointer(store, staged, kind, *tip, pointers, interrupt)? {
+        if reaches_pointer(staged, kind, *tip, pointers, interrupt)? {
             refused.insert(*tip);
         }
     }
     Ok(refused)
 }
 
-/// Whether `tip`'s closure contains a pointer blob. Committed objects are
-/// traversed for links but never content-checked: only staged blobs are
-/// newly introduced by this push.
+/// Whether `tip` reaches a pointer blob through staged objects only.
+/// Committed links (and blobs of any age) end their branch: only staged
+/// blobs are newly introduced by this push.
 fn reaches_pointer(
-    store: &Store,
     staged: &StagedPack,
     kind: HashKind,
     tip: Oid,
@@ -103,57 +101,15 @@ fn reaches_pointer(
         if pointers.contains(&oid) {
             return Ok(true);
         }
-        let Some(bytes) = linked_bytes(store, staged, oid)? else {
+        let Some((obj_kind, bytes)) = staged.payload(oid) else {
             continue;
         };
-        queue.extend(links_of(bytes.kind(), &bytes, kind)?);
+        if matches!(obj_kind, ObjectKind::Blob) {
+            continue;
+        }
+        queue.extend(links_of(obj_kind, bytes, kind)?);
     }
     Ok(false)
-}
-
-/// Linkable bytes for one object: the kind plus a borrow of the resident
-/// staged payload or of one committed read. Committed blobs carry no links
-/// and map to nothing, so their bodies are never buffered.
-enum LinkedBytes<'a> {
-    Borrowed(ObjectKind, &'a [u8]),
-    Owned(ObjectKind, Vec<u8>),
-}
-
-impl LinkedBytes<'_> {
-    fn kind(&self) -> ObjectKind {
-        match self {
-            Self::Borrowed(kind, _) | Self::Owned(kind, _) => *kind,
-        }
-    }
-}
-
-impl Deref for LinkedBytes<'_> {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(_, bytes) => bytes,
-            Self::Owned(_, bytes) => bytes,
-        }
-    }
-}
-
-fn linked_bytes<'a>(
-    store: &Store,
-    staged: &'a StagedPack,
-    oid: Oid,
-) -> Result<Option<LinkedBytes<'a>>, GitError> {
-    if let Some((kind, bytes)) = staged.payload(oid) {
-        if matches!(kind, ObjectKind::Blob) {
-            return Ok(None);
-        }
-        return Ok(Some(LinkedBytes::Borrowed(kind, bytes)));
-    }
-    let (kind, bytes) = read_object(store, oid, WALK_OBJECT_BYTES)?;
-    if matches!(kind, ObjectKind::Blob) {
-        return Ok(None);
-    }
-    Ok(Some(LinkedBytes::Owned(kind, bytes)))
 }
 
 /// The traversal edges of one object: tree, parents, tree entries, and tag
@@ -171,15 +127,14 @@ fn links_of(kind: ObjectKind, payload: &[u8], hash: HashKind) -> Result<Vec<Oid>
 }
 
 /// Command indices whose ref update the push must refuse under `mode`:
-/// every non-delete live update whose new-tip closure introduces a pointer
+/// every non-delete live update whose new tip reaches a staged pointer
 /// blob. `live` pairs command order with the update's new tip, the way the
 /// serve half tracks verdicts. Under [`LfsMode::Pointers`] the refusals are
 /// always empty.
 ///
 /// # Errors
-/// Closure read failures (fail closed, never silently accept).
+/// [`GitError::Corrupt`] for malformed staged payloads.
 pub fn refusals_for_live(
-    store: &Store,
     staged: &StagedPack,
     kind: HashKind,
     mode: LfsMode,
@@ -199,7 +154,7 @@ pub fn refusals_for_live(
         .map(|(_, tip)| *tip)
         .filter(|tip| *tip != zero)
         .collect();
-    let refused = tips_reaching_pointers(store, staged, kind, &tips, &pointers, interrupt)?;
+    let refused = tips_reaching_pointers(staged, kind, &tips, &pointers, interrupt)?;
     let reason = refused_reason();
     Ok(live
         .iter()
@@ -281,15 +236,9 @@ mod tests {
         )
         .expect("ingest");
         let pointers: HashSet<Oid> = HashSet::from([blob_oid]);
-        let refused = tips_reaching_pointers(
-            &store,
-            &staged,
-            kind,
-            &[commit_oid],
-            &pointers,
-            &Interrupt::none(),
-        )
-        .expect("walk");
+        let refused =
+            tips_reaching_pointers(&staged, kind, &[commit_oid], &pointers, &Interrupt::none())
+                .expect("walk");
         assert!(refused.contains(&commit_oid));
     }
 
@@ -306,29 +255,44 @@ mod tests {
             &Interrupt::none(),
         )
         .expect("ingest");
+        // Never staged and never stored: links outside the pack end the
+        // branch without touching the store at all.
+        let foreign = kind.hash_git_object("blob", b"just text\n").expect("id");
+        let pointers: HashSet<Oid> = HashSet::from([blob_oid]);
+        let refused =
+            tips_reaching_pointers(&staged, kind, &[foreign], &pointers, &Interrupt::none())
+                .expect("walk");
+        assert!(refused.is_empty());
+    }
+
+    #[test]
+    fn committed_tip_reaches_no_staged_pointer() {
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+        let (pack, blob_oid, _) = pointer_pack(kind);
+        let staged = ingest_pack(
+            &pack[..],
+            kind,
+            &store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("ingest");
+        // A committed blob's branch stops at once: committed objects only
+        // reference pre-existing objects, so they can never lead to a
+        // newly introduced blob.
         let plain = b"just text\n";
         let prepared = store
-            .prepare(
-                ruk_core::store::types::ObjectKind::Blob,
-                plain.len() as u64,
-                &plain[..],
-                None,
-            )
+            .prepare(ObjectKind::Blob, plain.len() as u64, &plain[..], None)
             .expect("plain blob");
         let plain_oid = prepared.oid();
         store
             .publish(vec![prepared], &[])
             .expect("publish plain blob");
         let pointers: HashSet<Oid> = HashSet::from([blob_oid]);
-        let refused = tips_reaching_pointers(
-            &store,
-            &staged,
-            kind,
-            &[plain_oid],
-            &pointers,
-            &Interrupt::none(),
-        )
-        .expect("walk");
+        let refused =
+            tips_reaching_pointers(&staged, kind, &[plain_oid], &pointers, &Interrupt::none())
+                .expect("walk");
         assert!(refused.is_empty());
     }
 }

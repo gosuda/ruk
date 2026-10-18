@@ -85,22 +85,26 @@ fn parse_size(line: &[u8]) -> bool {
 /// `<store_root>/policy.toml`, the same file
 /// [`crate::coord`](crate::coord) parses as the coordinator policy.
 /// Transport servers (receive-pack) cannot resolve a coordinator owner,
-/// so this reads only the `lfs` key instead of the full policy; the key
-/// spelling and values stay canonical in
+/// so this reads only the `version` and `lfs` keys instead of the full
+/// policy; both stay canonical in
 /// `coord/policy.rs`, which this mirrors.
 ///
-/// Fail-closed: a missing, unreadable, or unparseable file is
-/// [`LfsMode::Deny`], the same default a policy without the key selects.
+/// Fail-closed: a missing, unreadable, or unparseable file — or any
+/// version but the one this build reads — is [`LfsMode::Deny`], the same
+/// default a policy without the key selects. A future-format file never
+/// enables pointer recording here while the coordinator still refuses it.
 #[must_use]
 pub fn mode_for_store(store_root: &Path) -> LfsMode {
     #[derive(serde::Deserialize)]
     struct LfsKey {
+        version: i64,
         #[serde(default)]
         lfs: LfsMode,
     }
     std::fs::read(store_root.join("policy.toml"))
         .ok()
         .and_then(|bytes| toml::from_slice::<LfsKey>(&bytes).ok())
+        .filter(|key| key.version == 1)
         .map(|key| key.lfs)
         .unwrap_or_default()
 }
@@ -150,6 +154,13 @@ mod tests {
         assert_eq!(mode_for_store(&dir), LfsMode::Deny);
         std::fs::write(dir.join("policy.toml"), "not toml [[[\n").expect("policy");
         assert_eq!(mode_for_store(&dir), LfsMode::Deny);
+        std::fs::write(dir.join("policy.toml"), "version = 2\nlfs = \"pointers\"\n")
+            .expect("policy");
+        assert_eq!(
+            mode_for_store(&dir),
+            LfsMode::Deny,
+            "a future policy version never enables pointers here"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

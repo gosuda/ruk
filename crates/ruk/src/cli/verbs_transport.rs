@@ -834,10 +834,16 @@ fn serve_lfs_mode(ctx: &Ctx, args: &[String]) -> LfsMode {
         .unwrap_or_default()
 }
 
-/// Resolves the store directory one serve verb runs against: `<dir>/.ruk`
-/// (or `<dir>` itself for a bare store path) when the positional names it,
-/// else the first ancestor of the context root holding `.ruk`, mirroring
-/// [`serve_store`] discovery.
+/// Resolves the store directory one serve verb runs against, mirroring
+/// [`serve_store`] discovery: `<dir>` itself when the positional names it,
+/// else the first ancestor of the context root holding a store.
+///
+/// Every candidate is probed in the open path's precedence — `<repo>/.ruk`
+/// first (the layout the CLI creates), then `<repo>/.ruk/store` (the
+/// documented store root the daemon binds its coordinator policy beside),
+/// then the directory itself — and only a directory carrying a store
+/// `format` file wins, so the policy is always read beside the store files
+/// the verb actually opened.
 fn serve_store_root(ctx: &Ctx, args: &[String]) -> Option<std::path::PathBuf> {
     let mut positionals: Vec<&str> = Vec::new();
     let mut dashdash = false;
@@ -853,22 +859,32 @@ fn serve_store_root(ctx: &Ctx, args: &[String]) -> Option<std::path::PathBuf> {
         }
     }
     if let Some(dir) = positionals.first() {
-        let path = std::path::Path::new(dir);
-        if path.join(".ruk").is_dir() {
-            return Some(path.join(".ruk"));
-        }
-        return Some(path.to_path_buf());
+        return store_dir_beneath(std::path::Path::new(dir));
     }
     let mut dir = ctx.root.as_path();
     loop {
-        if dir.join(".ruk").is_dir() {
-            return Some(dir.join(".ruk"));
+        if let Some(root) = store_dir_beneath(dir) {
+            return Some(root);
         }
         match dir.parent() {
             Some(parent) => dir = parent,
             None => return None,
         }
     }
+}
+
+/// The store directory beneath one repository directory, if any: the first
+/// candidate in open precedence whose `format` file marks an initialized
+/// store (`Store::create` writes `format` last, so its presence proves an
+/// openable store lives there).
+fn store_dir_beneath(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    [
+        dir.join(".ruk"),
+        dir.join(".ruk").join("store"),
+        dir.to_path_buf(),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.join("format").is_file())
 }
 
 /// Serves `upload-pack`: advertises refs, negotiates wants/haves, and emits

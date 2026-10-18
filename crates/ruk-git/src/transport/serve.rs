@@ -666,14 +666,16 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     }
     // LFS policy gate over what the pack introduces: under `Deny` a
     // pointer blob refuses exactly the live ref updates reaching it, with
-    // the same in-band `ng` shape as hook refusals. This runs before
-    // quarantine staging, so refused pushes never materialize.
+    // the same in-band `ng` shape as hook refusals. The verdicts land
+    // before quarantine staging so hooks and the CAS path skip refused
+    // refs; the staged objects still publish unreachable afterwards, the
+    // way hook refusals leave unreferenced objects behind.
     if let Some(staged_pack) = staged.as_ref() {
         let live_tips: Vec<(usize, Oid)> = live
             .iter()
             .map(|(index, update)| (*index, update.new))
             .collect();
-        match refusals_for_live(store, staged_pack, kind, lfs, &live_tips, interrupt) {
+        match refusals_for_live(staged_pack, kind, lfs, &live_tips, interrupt) {
             Ok(refusals) => {
                 for (index, reason) in refusals {
                     results[index] = Some(Err(reason));
