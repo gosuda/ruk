@@ -14,7 +14,11 @@
 //! compaction against [`Store::publish`]. The session-open segment (active
 //! or recovered) is excluded from the retire set, so publications always
 //! land outside the rewrite and no root insertion is ever lost or left
-//! pointing at a retired segment. A rescan under the final lock copies any
+//! pointing at a retired segment. Only sealed segments join the retire
+//! set: a sealed `records_end` is final, so the unlocked copy never reads
+//! past the snapshot extent even when a segment rolls mid-pass, and an
+//! unsealed segment minted after the open snapshot is excluded rather than
+//! copied against a stale extent. A rescan under the final lock copies any
 //! straggler before the swap as defense in depth. Whole-run serialization
 //! across concurrent compactions comes from a dedicated compaction mutex,
 //! keeping two rewrites from retiring each other's fresh segments.
@@ -105,11 +109,11 @@ impl Store {
     }
 
     fn compact_guarded(&self) -> Result<CompactionStats, StoreError> {
-        let manifests = self.observe(self.meta.all_manifests())?;
-        let generation = self.observe(self.meta.generation())?;
-        // The session-open segment stays writable for the whole pass, so it
-        // can never join the retire set: publications land there or on ids
-        // minted after this snapshot, both outside the rewrite.
+        // Snapshot the session-open segments under the writer lock BEFORE
+        // reading manifests: a segment rolling between the two snapshots
+        // must already be excluded here, otherwise it would join the retire
+        // set with the stale pre-roll `records_end` and any object written
+        // after the manifest snapshot would read past that extent.
         let (target, open) = {
             let writer = self.lock_writer()?;
             if let Some(reason) = writer.closed.as_ref() {
@@ -120,12 +124,20 @@ impl Store {
             open.extend(writer.resume.as_ref().map(|resume| resume.id));
             (writer.target_bytes(), open)
         };
+        let manifests = self.observe(self.meta.all_manifests())?;
+        let generation = self.observe(self.meta.generation())?;
+        // The session-open segment stays writable for the whole pass, so it
+        // can never join the retire set: publications land there or on ids
+        // minted after this snapshot, both outside the rewrite. Only sealed
+        // segments join `live`: their `records_end` is final, so the
+        // unlocked copy reads a consistent point in time even if a roll
+        // lands between the snapshots above.
         let mut live: HashMap<u64, SegmentManifest> = HashMap::new();
         let mut previously_retired: Vec<SegmentManifest> = Vec::new();
         for manifest in manifests {
             if manifest.retired {
                 previously_retired.push(manifest);
-            } else if !open.contains(&manifest.id) {
+            } else if manifest.sealed && !open.contains(&manifest.id) {
                 live.insert(manifest.id, manifest);
             }
         }
@@ -453,11 +465,6 @@ impl Store {
         }
         writer.next_segment_id = next_id.max(writer.next_segment_id);
         self.seal_current(staged)?;
-        if let Some(current) = staged.current.take() {
-            let mut current = current;
-            current.writer.seal().map_err(StoreError::from)?;
-            staged.segments.push(current);
-        }
         for fresh in &staged.segments {
             durability::sync_file(fresh.writer.get_ref())?;
         }
@@ -749,13 +756,15 @@ mod tests {
                         let oid = publish_blob(store_ref, &bytes);
                         expected_ref.lock().expect("poisoned").insert(oid, bytes);
                         if index == 3 {
-                            let _ = store_ref.compact();
+                            store_ref
+                                .compact()
+                                .expect("concurrent compact stays healthy");
                         }
                     }
                 });
             }
-            let _ = store.compact();
-            let _ = store.compact();
+            store.compact().expect("concurrent compact stays healthy");
+            store.compact().expect("concurrent compact stays healthy");
         });
         let guard = expected.lock().expect("poisoned");
         assert_eq!(guard.len(), 8 + 4 * 8);
