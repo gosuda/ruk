@@ -208,14 +208,18 @@ impl HostedCoordinator {
 
     /// Prepares one mutation with the full coordinator context.
     ///
-    /// Loads the session row, samples the coordinator clock, opens the
-    /// claim clock, loads policy, and runs the per-method translation with
-    /// all of it, so ref/data methods that need identity, time, or the
-    /// attestation gate can prepare. The socket dispatch path calls this
-    /// with a cancellation-aware `checkpoint`; arms whose required input
-    /// is absent (an unknown session has no row) refuse honestly, and
+    /// Loads the session row and runs the per-method translation with the
+    /// coordinator clock and the caller's attestation gate, so ref/data
+    /// methods that need identity, time, or verification can prepare. The
+    /// socket dispatch path calls this with a cancellation-aware
+    /// `checkpoint`; arms whose required input is absent (an unknown
+    /// session has no row) refuse honestly, and
     /// [`HostedCoordinator::submit_prepared`] still enforces session
     /// authority and holder binding afterwards.
+    ///
+    /// Policy and the claim clock stay out of this path until a prepared
+    /// arm consumes them: loading them here would fail long-covered
+    /// mutations on policy or clock rows those arms never read.
     ///
     /// # Errors
     /// - [`ErrorCode::EInvalid`] when the request is not a mutation.
@@ -224,8 +228,7 @@ impl HostedCoordinator {
     /// - [`ErrorCode::EStale`], [`ErrorCode::ENotFound`],
     ///   [`ErrorCode::EDivergent`], or [`ErrorCode::EForbidden`] from the
     ///   per-method translation.
-    /// - [`ErrorCode::EIo`] from clock sampling, [`ErrorCode::EPolicy`]
-    ///   from policy load, and store errors from the session-row read.
+    /// - Store errors from the session-row read.
     pub fn prepare_for_dispatch(
         &self,
         session: SessionId,
@@ -238,15 +241,13 @@ impl HostedCoordinator {
             .fact(FactTable::Sessions, &key)?
             .map(|bytes| decode_session(&self.store, &key, &bytes))
             .transpose()?;
-        let policy = self.policies.load()?;
-        let claim_clock = ClaimClock::open(&self.store, self.clock.clone())?;
         let ctx = PrepareContext {
             store: &self.store,
             session,
             session_row: session_row.as_ref(),
             clock: Some(&self.clock),
-            claim_clock: Some(&claim_clock),
-            policy: Some(&policy),
+            claim_clock: None,
+            policy: None,
             checkpoint: Some(checkpoint),
         };
         prepare_mutation_with(&ctx, request)
