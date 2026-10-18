@@ -12,6 +12,13 @@
 //! from their deltas alone. Those methods are refused with `E_UNDO_CONFLICT`
 //! rather than guessed at. Every [`Method`] is named in [`refuse_non_invertible`],
 //! so a new method must be classified before it can be undone.
+//!
+//! The boundary has three layers: the method allowlist below refuses effects
+//! outside every tracked table (remotes, and materialized workcopy checkouts);
+//! [`refuse_restoring_workspaces`] refuses the tracked-but-fencing-monotonic
+//! workspace rows a rewrite may advance; and [`refuse_diverged`] refuses keys
+//! that moved since the operation, with the lane re-checking the same
+//! expectations at publication.
 
 use std::collections::BTreeMap;
 
@@ -182,7 +189,12 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
         Method::LandPrepare | Method::LandExecute => {
             "landing consumes land plans and moves a remote outside the tracked tables"
         }
-        Method::Edit | Method::New => {
+        Method::Edit
+        | Method::New
+        | Method::WsNew
+        | Method::WsScope
+        | Method::WsTake
+        | Method::WsDrop => {
             "a workspace checkout is materialized on disk outside the tracked tables and undo cannot restore it"
         }
         Method::SessionOpen
@@ -481,6 +493,30 @@ mod tests {
         let err = prepare_undo(&fixture.store, id).expect_err("workspace rows never restore");
         assert_eq!(err.code, ErrorCode::EUndoConflict);
         assert!(err.message.contains("workspace"), "names the hazard: {}", err.message);
+    }
+
+    #[test]
+    fn undo_refuses_every_workspace_moving_method() {
+        // The allowlist boundary: any method that moves a materialized
+        // checkout is refused up front, not merely at its workspace delta.
+        for method in [
+            Method::Edit,
+            Method::New,
+            Method::WsNew,
+            Method::WsScope,
+            Method::WsTake,
+            Method::WsDrop,
+        ] {
+            let fixture = Fixture::new("ws-methods");
+            let id = fixture.record(method, &[ref_set(b"refs/heads/main", &ref_target(9))]);
+            let err = prepare_undo(&fixture.store, id).expect_err("workspace movers stay refused");
+            assert_eq!(err.code, ErrorCode::EUndoConflict);
+            assert!(
+                err.message.contains("materialized"),
+                "{method:?} names the checkout hazard: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
