@@ -127,7 +127,11 @@ enum Command {
     /// `<aa>/<bb>/<oid>` trees, hash-verified before staging); without
     /// it, the verb POSTs one git-lfs batch download request to `lfs.url`
     /// (falling back to `remote.origin.lfsurl`), set via `ruk config`.
-    /// Stdout is JSON `{"synced": [...], "missing": [{"oid","error"}]}`.
+    /// With `--upload` the direction flips: reachable payloads already
+    /// verified in the sidecar are offered to the same endpoint via one
+    /// batch upload request plus a PUT per answered upload action.
+    /// Stdout is JSON
+    /// `{"synced": [...], "missing": [{"oid","error"}], "uploaded": [...]}`.
     LfsPayloadSync {
         /// Repository root holding a Ruk store.
         #[arg(long)]
@@ -135,6 +139,9 @@ enum Command {
         /// Local source directory for payload files.
         #[arg(long)]
         from: Option<String>,
+        /// Upload sidecar payloads to the LFS endpoint instead of downloading.
+        #[arg(long)]
+        upload: bool,
     },
 }
 
@@ -187,7 +194,7 @@ fn run(cli: Cli) -> Result<Vec<u8>, CoreError> {
             let description = ruk_core::ops::describe(&store, request)?;
             render(&description)
         }
-        Command::LfsPayloadSync { repo, from } => cli::lfs_payload_sync_native(repo, from)
+        Command::LfsPayloadSync { repo, from, upload } => cli::lfs_payload_sync_native(repo, from, upload)
             .map_err(|err| CoreError::new(err.code(), err.to_string())),
         Command::Forgejo {
             command: ForgejoCommand::Serve { config },

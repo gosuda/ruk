@@ -458,11 +458,15 @@ fn open_ctx(
 pub(crate) fn lfs_payload_sync_native(
     repo: PathBuf,
     from: Option<String>,
+    upload: bool,
 ) -> Result<Vec<u8>, GitError> {
     let mut env = CliEnv::capture();
     env.cwd = repo;
     let mut ctx = open_ctx(env, None, None, false, Vec::new(), true)?;
-    let args = from.map_or_else(Vec::new, |dir| vec!["--from".to_owned(), dir]);
+    let mut args = from.map_or_else(Vec::new, |dir| vec!["--from".to_owned(), dir]);
+    if upload {
+        args.push("--upload".to_owned());
+    }
     verbs_transport::lfs_payload_sync(&mut ctx, &args)
 }
 
