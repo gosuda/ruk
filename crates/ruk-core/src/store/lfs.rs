@@ -164,6 +164,10 @@ pub fn stage_verified(
         )));
     }
     std::fs::rename(&tmp_path, &final_path)?;
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent() {
+        super::durability::sync_dir(parent)?;
+    }
     Ok(final_path)
 }
 
@@ -185,6 +189,9 @@ fn stage_copy(src: &Path, tmp: &Path) -> Result<(String, u64), StoreError> {
             .map_err(|_| StoreError::Invalid("file read exceeds u64".to_owned()))?;
     }
     std::io::Write::flush(&mut output)?;
+    // Durability before the rename publishes the name: a crash must never
+    // leave a complete=true row pointing at a torn payload file.
+    output.sync_all()?;
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for byte in digest {

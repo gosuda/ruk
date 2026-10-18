@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ruk_core::LfsMode;
 use ruk_core::change::OperationId;
 use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::ids::HashKind;
@@ -336,11 +337,35 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
             short: Some('f'),
             takes_value: false,
         },
+        FlagSpec {
+            long: "lfs",
+            short: None,
+            takes_value: true,
+        },
     ];
     let opts = collect(args, &specs)?;
     let src_arg = opts.positionals.first().ok_or_else(|| GitError::Invalid {
-        detail: "usage: migrate [--bare] [--force] <git-dir> [<dest-dir>]".to_owned(),
+        detail:
+            "usage: migrate [--bare] [--force] [--lfs deny|pointers|full] <git-dir> [<dest-dir>]"
+                .to_owned(),
     })?;
+    // The fresh store carries no policy.toml, so its mode would always
+    // read Deny: the flag declares the intended LFS mode for the ingest
+    // decision. The default keeps Deny/Pointers migrations byte-identical
+    // to a build without this slice; only an explicit `--lfs full` copies
+    // payloads. The store's durable mode still comes from its policy.toml
+    // afterwards — set `lfs = "full"` there before `lfs_payload_sync`.
+    let lfs_mode = match opts.single("lfs")?.as_deref() {
+        None | Some("deny") => LfsMode::Deny,
+        Some("pointers") => LfsMode::Pointers,
+        Some("full") => LfsMode::Full,
+        Some(_) => {
+            return Err(GitError::Invalid {
+                detail: "usage: migrate [--bare] [--force] [--lfs deny|pointers|full] <git-dir> [<dest-dir>]"
+                    .to_owned(),
+            });
+        }
+    };
     let resolve = |arg: &str| -> std::path::PathBuf {
         let path = std::path::Path::new(arg);
         if path.is_absolute() {
@@ -411,7 +436,11 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
         .publish(Vec::new(), &[mutation])
         .map_err(GitError::from)?;
     import_remote_config(&git_dir, &store)?;
-    let lfs = ingest_lfs_sidecar(&git_dir, &store)?;
+    let lfs = if lfs_mode == LfsMode::Full {
+        ingest_lfs_sidecar(&git_dir, &store)?
+    } else {
+        None
+    };
     let mut out = format!(
         "Migrated {} objects and {} refs from {} [{kind}]\n",
         report.objects,
@@ -430,13 +459,12 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
 /// into the store sidecar, publishing one `lfs_objects` presence row per
 /// payload in a single facts-only transaction.
 ///
-/// Every file whose name is 64 hex digits is hash- and size-verified
-/// against its name before staging; failures skip nonfatally with a
-/// warning count in the migrate report, never an error. A missing
-/// `lfs/objects/` directory means no payloads and no report line. The
-/// rows are inert under `Deny`/`Pointers`, so the ingest runs regardless
-/// of the store's LFS mode: `Full` reconciliation simply finds the
-/// payloads already present.
+/// Full mode only (see `migrate --lfs full`): under `Deny`/`Pointers` this
+/// never runs, so those migrations stay byte-identical to a build without
+/// this slice. Every file whose name is 64 hex digits is hash- and
+/// size-verified against its name before staging; failures skip nonfatally
+/// with a warning count in the migrate report, never an error. A missing
+/// `lfs/objects/` directory means no payloads and no report line.
 fn ingest_lfs_sidecar(
     git_dir: &std::path::Path,
     store: &Store,

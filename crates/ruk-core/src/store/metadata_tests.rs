@@ -404,6 +404,27 @@ fn open_refuses_a_foreign_file() {
 }
 
 #[test]
+fn open_restores_a_missing_lfs_objects_table() {
+    let dir = TestDir::new("open-missing-lfs-objects");
+    drop(create(&dir));
+    {
+        let db = Database::open(dir.meta_path()).expect("raw open");
+        let txn = db.begin_write().expect("raw write");
+        let lfs: TableDefinition<'static, &'static [u8], &'static [u8]> =
+            TableDefinition::new("lfs_objects");
+        assert!(txn.delete_table(lfs).expect("delete table"));
+        txn.commit().expect("raw commit");
+    }
+    let meta = Metadata::open(&dir.meta_path()).expect("open restores lfs_objects");
+    assert_eq!(
+        meta.fact(FactTable::LfsObjects, b"k")
+            .expect("read restored table"),
+        None,
+        "restored table opens empty"
+    );
+}
+
+#[test]
 fn open_refuses_a_database_missing_a_census_table() {
     let dir = TestDir::new("open-missing-table");
     drop(create(&dir));

@@ -120,6 +120,22 @@ enum Command {
         #[arg(long, default_value = "-")]
         input: String,
     },
+    /// Reconcile LFS sidecar payloads against reachable pointers.
+    ///
+    /// Requires `lfs = "full"` in the store policy. Payloads come from
+    /// `--from` (a local directory holding `<oid>` files or
+    /// `<aa>/<bb>/<oid>` trees, hash-verified before staging); without
+    /// it, absent payloads are listed in `missing`. Stdout is JSON
+    /// `{"synced": [...], "missing": [...]}`; a remote batch-API adapter
+    /// is the follow-up.
+    LfsPayloadSync {
+        /// Repository root holding a Ruk store.
+        #[arg(long)]
+        repo: std::path::PathBuf,
+        /// Local source directory for payload files.
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -171,6 +187,8 @@ fn run(cli: Cli) -> Result<Vec<u8>, CoreError> {
             let description = ruk_core::ops::describe(&store, request)?;
             render(&description)
         }
+        Command::LfsPayloadSync { repo, from } => cli::lfs_payload_sync_native(repo, from)
+            .map_err(|err| CoreError::new(err.code(), err.to_string())),
         Command::Forgejo {
             command: ForgejoCommand::Serve { config },
         } => {

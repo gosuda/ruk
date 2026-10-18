@@ -453,6 +453,19 @@ fn open_ctx(
     })
 }
 
+/// Runs `ruk lfs-payload-sync`: a native subcommand that shares the
+/// verb's store plumbing without entering the `git` compatibility table.
+pub(crate) fn lfs_payload_sync_native(
+    repo: PathBuf,
+    from: Option<String>,
+) -> Result<Vec<u8>, GitError> {
+    let mut env = CliEnv::capture();
+    env.cwd = repo;
+    let mut ctx = open_ctx(env, None, None, false, Vec::new(), true)?;
+    let args = from.map_or_else(Vec::new, |dir| vec!["--from".to_owned(), dir]);
+    verbs_transport::lfs_payload_sync(&mut ctx, &args)
+}
+
 /// Opens a store for repo-optional verbs when one is already there.
 fn open_existing(root: &Path, git_dir: &Option<PathBuf>) -> Result<Store, GitError> {
     let budget = Arc::new(PreparationBudget::reference_defaults());

@@ -30,7 +30,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 58 advertised verbs in alphabetical order.
+/// The 59 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -185,13 +185,6 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: false,
         summary: "Create an empty Ruk repository",
         run: verbs_repo::init,
-    },
-    Verb {
-        name: "lfs_payload_sync",
-        oracle: "git/builtin/fsck.c",
-        needs_repo: true,
-        summary: "Reconcile LFS sidecar payloads against reachable pointers",
-        run: verbs_transport::lfs_payload_sync,
     },
     Verb {
         name: "log",

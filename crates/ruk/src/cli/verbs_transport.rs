@@ -26,10 +26,10 @@ use std::path::PathBuf;
 
 use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::mode_for_store;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::StoreRefs;
 use ruk_core::store::{FactExpectation, FactMutation, FactTable, ObjectKind, Store};
+use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
 use ruk_git::transport::fetch::{self, FetchWireRequest};
@@ -1442,12 +1442,16 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
 /// Reconciles the LFS sidecar against reachable pointers: every pointer
 /// blob reachable from live refs (the same ref-tips plus
 /// commit/tree walk [`fsck`] uses) must have a verified payload in
-/// `<store>/lfs/objects/`.
+/// `<store>/lfs/objects/` plus a `complete=true` presence row.
 ///
-/// Pointers already verified are no-ops, so re-runs are idempotent; each
-/// fetched payload stages through a temp file with an atomic rename plus
-/// one fact-row publication, so a kill leaves at most one temp file and
-/// already-synced payloads stay synced. Payload bytes come from
+/// Full mode only: under `Deny` or `Pointers` the verb refuses, so both
+/// modes stay byte-identical to a build without this slice. Pointers
+/// already verified with a row present are no-ops, so re-runs are
+/// idempotent; each fetched payload stages through a temp file with an
+/// atomic rename plus one fact-row publication, so a kill leaves at most
+/// one temp file and already-synced payloads stay synced. A verified file
+/// whose row is absent (rename committed, publication lost) gets its row
+/// republished and counts as synced. Payload bytes come from
 /// `--from <dir>` (a local directory holding `<oid>` files or
 /// `<aa>/<bb>/<oid>` trees, hash-verified before staging); without it,
 /// every absent payload lands in `missing`. Remote batch-API download is
@@ -1472,6 +1476,12 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             detail: "usage: lfs_payload_sync [--from <dir>]".to_owned(),
         });
     }
+    let store = ctx.store()?;
+    if mode_for_store(store.root()) != LfsMode::Full {
+        return Err(GitError::Invalid {
+            detail: "lfs_payload_sync needs lfs = \"full\" in the store policy.toml".to_owned(),
+        });
+    }
     let from = match opts.single("from")? {
         None => None,
         Some(dir) => {
@@ -1483,7 +1493,6 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
             })
         }
     };
-    let store = ctx.store()?;
     let kind = ctx.kind()?;
     let mut tips = Vec::new();
     for (_, target) in list_refs(store)? {
@@ -1525,6 +1534,21 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
     let mut mutations = Vec::new();
     for (hex, size) in &pointers {
         if sidecar::sidecar_verified(store.root(), hex, *size) {
+            // The file survived; the row may not have (rename committed,
+            // publication lost). Repair the row so file and fact agree.
+            let row = store
+                .fact(FactTable::LfsObjects, &sidecar::record_key(hex))
+                .map_err(GitError::from)?;
+            if row.is_none() {
+                synced.push(hex.clone());
+                mutations.push(sidecar::upsert_mutation(
+                    hex,
+                    &sidecar::LfsObjectRecord {
+                        size: *size,
+                        complete: true,
+                    },
+                ));
+            }
             continue;
         }
         let staged = match &from {
