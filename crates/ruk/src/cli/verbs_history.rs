@@ -354,7 +354,15 @@ fn commit_message(
         (None, []) => Err(GitError::Invalid {
             detail: "commit needs -m <message> (no editor is implemented)".to_owned(),
         }),
-        (None, _) => Ok(parts.join("\n\n")),
+        // Git terminates the joined `-m` paragraphs with a newline (`-m one`
+        // stores `one\n`), so the stored bytes match the oracle exactly.
+        (None, _) => {
+            let mut message = parts.join("\n\n");
+            if !message.ends_with('\n') {
+                message.push('\n');
+            }
+            Ok(message)
+        }
     }
 }
 
@@ -1204,7 +1212,13 @@ fn render_commit_line(
         .as_bytes(),
     );
     out.push(b'\n');
-    for message_line in record.message().split(|byte| *byte == b'\n') {
+    // Git's pretty printer chomps trailing newlines before indenting: the
+    // stored `one\n` renders as `    one\n`, not `    one\n    \n`.
+    let mut body = record.message();
+    while body.last() == Some(&b'\n') {
+        body = &body[..body.len() - 1];
+    }
+    for message_line in body.split(|byte| *byte == b'\n') {
         out.extend_from_slice(b"    ");
         out.extend_from_slice(message_line);
         out.push(b'\n');
