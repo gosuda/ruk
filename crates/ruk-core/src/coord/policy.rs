@@ -711,6 +711,44 @@ pub(crate) struct PolicySource {
     cache: Mutex<Option<Parsed>>,
 }
 
+/// Reads the LFS pointer mode the store at `store_root` declares, parsed
+/// through the real coordinator policy loader: any document
+/// [`PolicySource::load`] would reject — unknown fields, a bad
+/// `[[principal]]`, an unsupported version, malformed TOML, an oversized or
+/// non-regular file — fails closed to [`LfsMode::Deny`], never `Pointers`.
+/// A missing file selects the owner-only default, whose mode is the store
+/// default. The `owner` alias resolves against the on-disk owner of the
+/// store directory, the same choice the daemon registry makes when it binds
+/// a coordinator, so transport servers and the coordinator read one policy.
+pub(crate) fn lfs_mode_for_store(store_root: &Path) -> LfsMode {
+    let Some(owner) = store_owner(store_root) else {
+        return LfsMode::Deny;
+    };
+    PolicySource::open(store_root, owner)
+        .load()
+        .map(|policy| policy.lfs())
+        .unwrap_or_default()
+}
+
+/// The principal the coordinator policy source resolves the `owner` alias
+/// against for `store_root`: the on-disk owner of the store directory on
+/// Unix, the process identity elsewhere. `None` where no owner identity is
+/// readable; callers fail closed.
+fn store_owner(store_root: &Path) -> Option<Principal> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(store_root)
+            .ok()
+            .map(|metadata| Principal::from_peer_uid(metadata.uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = store_root;
+        super::endpoint::owner().ok()
+    }
+}
+
 impl PolicySource {
     /// Binds the source to `store_root/policy.toml`. Nothing is read.
     #[must_use]

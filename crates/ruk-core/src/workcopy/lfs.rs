@@ -82,31 +82,20 @@ fn parse_size(line: &[u8]) -> bool {
 }
 
 /// Reads the LFS mode the store at `store_root` declares: the `lfs` key of
-/// `<store_root>/policy.toml`, the same file
-/// [`crate::coord`](crate::coord) parses as the coordinator policy.
-/// Transport servers (receive-pack) cannot resolve a coordinator owner,
-/// so this reads only the `version` and `lfs` keys instead of the full
-/// policy; both stay canonical in
-/// `coord/policy.rs`, which this mirrors.
+/// `<store_root>/policy.toml`, parsed through the coordinator policy loader
+/// in `coord/policy.rs`, which stays canonical for the full document shape.
+/// Transport servers (receive-pack) resolve the `owner` alias the same way
+/// the daemon registry does, so both read one policy.
 ///
-/// Fail-closed: a missing, unreadable, or unparseable file — or any
-/// version but the one this build reads — is [`LfsMode::Deny`], the same
-/// default a policy without the key selects. A future-format file never
-/// enables pointer recording here while the coordinator still refuses it.
+/// Fail-closed: a missing file selects the owner-only default, and any
+/// document the coordinator would refuse — unknown fields, a bad
+/// `[[principal]]`, an unsupported version, malformed TOML, an oversized or
+/// non-regular file, an unreadable owner — is [`LfsMode::Deny`], the same
+/// default a policy without the key selects. A file the coordinator refuses
+/// never enables pointer recording here.
 #[must_use]
 pub fn mode_for_store(store_root: &Path) -> LfsMode {
-    #[derive(serde::Deserialize)]
-    struct LfsKey {
-        version: i64,
-        #[serde(default)]
-        lfs: LfsMode,
-    }
-    std::fs::read(store_root.join("policy.toml"))
-        .ok()
-        .and_then(|bytes| toml::from_slice::<LfsKey>(&bytes).ok())
-        .filter(|key| key.version == 1)
-        .map(|key| key.lfs)
-        .unwrap_or_default()
+    crate::coord::lfs_mode_for_store(store_root)
 }
 
 /// The error a pointer-shaped blob raises under [`LfsMode::Deny`].
@@ -161,6 +150,32 @@ mod tests {
             LfsMode::Deny,
             "a future policy version never enables pointers here"
         );
+        // A file the coordinator policy loader rejects never enables
+        // pointers here, even with `lfs = "pointers"` set.
+        for (name, policy) in [
+            (
+                "unknown top-level key",
+                "version = 1\nlfs = \"pointers\"\nunknown = 1\n",
+            ),
+            (
+                "malformed principal",
+                "version = 1\nlfs = \"pointers\"\n[[principal]]\nname = \"bogus\"\n",
+            ),
+            (
+                "bad session_idle",
+                "version = 1\nlfs = \"pointers\"\nsession_idle = \"yesterday\"\n",
+            ),
+        ] {
+            std::fs::write(dir.join("policy.toml"), policy).expect("policy");
+            assert_eq!(mode_for_store(&dir), LfsMode::Deny, "{name} fails closed");
+        }
+        // A fully valid policy with principals still honors the key.
+        std::fs::write(
+            dir.join("policy.toml"),
+            "version = 1\nlfs = \"pointers\"\n[[principal]]\nname = \"owner\"\n",
+        )
+        .expect("policy");
+        assert_eq!(mode_for_store(&dir), LfsMode::Pointers);
         std::fs::remove_dir_all(&dir).ok();
     }
 
