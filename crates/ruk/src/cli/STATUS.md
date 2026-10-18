@@ -1,6 +1,6 @@
 # CLI verb status
 
-57 verbs, one row each. Statuses: **implemented** (real native-store
+59 verbs, one row each. Statuses: **implemented** (real native-store
 transitions), **partial** (resolves and validates, then completes only the
 cases its backing covers), **unsupported** (typed `Unsupported` with the
 reason; exit code 1 through `GitError::exit_code`).
@@ -58,6 +58,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
 | fsck | implemented | reachable refs, history, trees, blobs, and index rows; unreachable-object (`dangling`) reporting needs the absent object census |
 | gc | unsupported | no repack or prune lane in this slice |
+| grep | implemented | subset: `-l`, `-c`, `-n`, `-e`, `-i`, `-w`, `-F`, `-E` (last of `-F`/`-E` wins), `-H`/`--with-filename`/`--no-filename`, one `<commit>` for tree scope; 0 hit / 1 no hit / 128 bad use; no pathspecs, no `.rukignore`, always-Rust-regex patterns |
 | hash-object | implemented | `-t blob/tree/commit`, `-w` stores; works outside a repository without `-w` |
 | help | implemented | verb list and per-verb summaries |
 | index-pack | unsupported | declared absent for this slice |
@@ -92,6 +93,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | tag | implemented | lightweight, annotated (`-a`/`-m`), list with globs, delete |
 | update-index | implemented | `--cacheinfo`, `--stdin`, `--add`, `--remove`, `--assume-unchanged`, `--skip-worktree`, `--refresh` |
 | update-ref | implemented | expected-value CAS, `-d`, `-m` reflog rows |
+| upload-archive | implemented | serves archives over the upload-archive protocol |
 | upload-pack | unsupported | `ruk-git` holds the client half; serving fetches is absent |
 | verify-pack | implemented | header, version, and trailer validation plus full verify-mode ingest with staged output dropped |
 | version | implemented | reports `CARGO_PKG_VERSION` |
@@ -101,7 +103,9 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 ## Known divergences from Git
 
 - Exit statuses are the native 1–5 map (`ErrorCode::exit_code`), not Git's
-  128/129 conventions; unknown verbs and unsupported families exit 1.
+  128/129 conventions; unknown verbs and unsupported families exit 1. The
+  one exception is `grep` usage errors, which exit 128 through
+  `GitError::Usage` (its no-match exit stays 1).
 - `--bare` unifies the store layout (`.ruk/` under the root); no separate
   bare format exists.
 - `diff` hunks come from a simple bounded LCS differ, split every 20

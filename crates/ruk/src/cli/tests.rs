@@ -16,6 +16,7 @@ use ruk_core::store::{FactTable, PreparationBudget, Store};
 
 use super::dispatch::{VERBS, lookup};
 use super::verbs_branch;
+use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_objects;
 use super::verbs_repo;
@@ -115,11 +116,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_56_names() {
-    assert_eq!(VERBS.len(), 58);
+    assert_eq!(VERBS.len(), 59);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 58);
+    assert_eq!(names.len(), 59);
     for name in [
         "add",
         "archive",
@@ -139,6 +140,7 @@ fn verb_table_covers_56_names() {
         "for-each-ref",
         "fsck",
         "gc",
+        "grep",
         "hash-object",
         "help",
         "index-pack",
@@ -1730,5 +1732,79 @@ fn lfs_payload_sync_without_endpoint_reports_a_clear_error() {
         "got {text:?}"
     );
     assert!(text.contains("set lfs.url"), "got {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_fixed_string_match() {
+    let (root, env) = seeded_repo("grep-fixed", "a.txt", b"alpha one\nbeta two\nalpha three\n");
+    let mut ctx = repo_ctx(&root, env);
+    // One file searched: no filename prefix, like the oracle.
+    let out = run(verbs_grep::grep, &mut ctx, &["-F", "alpha"]).expect("grep");
+    assert_eq!(out, b"alpha one\nalpha three\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_name_only_lists_files() {
+    let (root, env) = seeded_repo("grep-names", "a.txt", b"alpha one\n");
+    std::fs::write(root.join("b.txt"), b"alpha four\n").expect("second file");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_grep::grep, &mut ctx, &["-l", "alpha"]).expect("grep -l");
+    assert_eq!(out, b"a.txt\nb.txt\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_count_reports_per_file_hits() {
+    let (root, env) = seeded_repo("grep-count", "a.txt", b"alpha one\nbeta two\nalpha three\n");
+    std::fs::write(root.join("b.txt"), b"no hit here\n").expect("second file");
+    let mut ctx = repo_ctx(&root, env);
+    // Files without hits are omitted, like the oracle.
+    let out = run(verbs_grep::grep, &mut ctx, &["-c", "alpha"]).expect("grep -c");
+    assert_eq!(out, b"a.txt:2\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_line_numbers() {
+    let (root, env) = seeded_repo("grep-lines", "a.txt", b"alpha one\nbeta two\nalpha three\n");
+    std::fs::write(root.join("b.txt"), b"alpha four\n").expect("second file");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_grep::grep, &mut ctx, &["-n", "alpha"]).expect("grep -n");
+    assert_eq!(out, b"a.txt:1:alpha one\na.txt:3:alpha three\nb.txt:1:alpha four\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_no_match_exits_one() {
+    let (root, env) = seeded_repo("grep-empty", "a.txt", b"alpha one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(verbs_grep::grep, &mut ctx, &["zzz-nope"]).expect_err("no match");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_tree_scope_searches_commit() {
+    let (root, env) = seeded_repo("grep-tree", "a.txt", b"alpha one\nbeta two\n");
+    // Untracked worktree-only content must not leak into tree scope.
+    std::fs::write(root.join("worktree-only.txt"), b"alpha hidden\n").expect("untracked");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_grep::grep, &mut ctx, &["alpha", "HEAD"]).expect("grep HEAD");
+    assert_eq!(out, b"HEAD:a.txt:alpha one\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn grep_bad_invocation_exits_128() {
+    let (root, env) = seeded_repo("grep-usage", "a.txt", b"alpha one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(verbs_grep::grep, &mut ctx, &[]).expect_err("no pattern");
+    assert_eq!(err.exit_code(), 128, "{err}");
+    let err = run(verbs_grep::grep, &mut ctx, &["-E", "(["]).expect_err("bad regex");
+    assert_eq!(err.exit_code(), 128, "{err}");
+    let err = run(verbs_grep::grep, &mut ctx, &["alpha", "no-such-rev"]).expect_err("bad rev");
+    assert_eq!(err.exit_code(), 128, "{err}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
