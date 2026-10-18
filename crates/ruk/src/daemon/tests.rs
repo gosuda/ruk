@@ -19,7 +19,7 @@ use super::{
     InvocationOpen, OutcomeLedger, Registry, SessionOpened, serve_connection,
 };
 use ruk_core::bytes::ByteString;
-use ruk_core::change::{LeaseId, OperationId, RequestId, SessionId, StoreId};
+use ruk_core::change::{LeaseId, OperationId, PlanId, RequestId, SessionId, StoreId};
 use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
@@ -27,8 +27,9 @@ use ruk_core::index::RepoPath;
 use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
     BookmarkSetArgs, BookmarkTarget, ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs,
-    ClaimTtl, DescribeArgs, EditArgs, IdentityClaim, Method, NewArgs, OpLogArgs, PageCursor,
-    PageLimit, PageRequest, PathSelection, PinArgs, QueryDigest, Reply, ReplyBody, ReplyEnvelope,
+    ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs, IdentityClaim,
+    LandExecuteArgs, Method, NewArgs, OpLogArgs, PageCursor, PageLimit, PageRequest,
+    PathSelection, PinArgs, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope,
     SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
     TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
@@ -1828,6 +1829,127 @@ async fn typed_snapshot_refusal_names_job_split() {
     assert!(
         report.message.contains("workcopy::snapshot"),
         "snapshot names its missing producer: {}",
+        report.message
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `fetch` stays honestly refused: staging remote
+/// objects plus the transfer runs in a transport job with no producer here.
+#[tokio::test]
+async fn typed_fetch_refusal_names_transport_job() {
+    let root = temp_root("typed-fetch");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-fetch",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-fetch",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let fetch_args = FetchArgs {
+        remote: RemoteSpec::Named {
+            name: RemoteName::new("origin").expect("remote name"),
+        },
+        refs: FetchRefs::AllBranches,
+        depth: None,
+        filter: FetchFilter::default(),
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "fetch",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&fetch_args).expect("fetch args encode")),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(5, &payload).await;
+    assert_eq!(report.code, "E_HOSTED");
+    assert!(
+        report.message.contains("transport job"),
+        "fetch names its missing job: {}",
+        report.message
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+/// Socket-level proof that `land.execute` stays honestly refused: the local
+/// leg publishes eagerly outside the lane and the remote leg lives in
+/// transport, so no prepare/job split exists on this path.
+#[tokio::test]
+async fn typed_land_execute_refusal_names_plan() {
+    let root = temp_root("typed-land-execute");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-typed-land-execute",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-typed-land-execute",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let execute_args = LandExecuteArgs {
+        plan: PlanId::generate(),
+        candidate: Oid::from_bytes(&[0x31; 20]).expect("candidate oid"),
+    };
+    let payload = Driver::typed_open(
+        &store_repo,
+        "land.execute",
+        Some(&RequestId::generate().to_string()),
+        Some(sonic_rs::to_string(&execute_args).expect("land.execute args encode")),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(5, &payload).await;
+    assert_eq!(report.code, "E_HOSTED");
+    assert!(
+        report.message.contains("load_plan"),
+        "land.execute names its plan machinery: {}",
         report.message
     );
 
