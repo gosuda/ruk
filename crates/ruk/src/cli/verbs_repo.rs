@@ -163,6 +163,11 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: Some('b'),
             takes_value: true,
         },
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let src = opts.positionals.first().ok_or_else(|| GitError::Invalid {

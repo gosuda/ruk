@@ -3479,6 +3479,11 @@ pub(crate) fn rev_parse(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             takes_value: false,
         },
         FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+        FlagSpec {
             long: "git-dir",
             short: None,
             takes_value: false,

@@ -75,6 +75,11 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: Some('p'),
             takes_value: false,
         },
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
