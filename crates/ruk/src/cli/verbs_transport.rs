@@ -4,12 +4,12 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via `smart_http::fetch_pack` | `--prune` drops orphaned remote-tracking refs (pull-mirror parity); dumb-http is the remaining HTTP gap |
+//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via `smart_http::fetch_pack` with a `dumb_http` fallback when the smart advertisement is absent | `--prune` drops orphaned remote-tracking refs (pull-mirror parity) |
 //! | `pull` | fetch + fast-forward | local, SSH/git and HTTP remotes (fast-forward only) |
-//! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); dumb-http is the remaining HTTP gap |
+//! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
-//! | `archive` | no archive writer | unsupported |
+//! | `archive` | no archive writer; the `git-upload-archive` smart-http client exists in transport but no verb consumes it | unsupported |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
 //! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
@@ -129,8 +129,9 @@ enum Target {
 
 /// Resolves a remote name or URL: configured names read their URL first,
 /// then `file://` URLs and bare paths land local, and SSH, git-daemon
-/// and HTTP URLs route network (HTTP serves smart-http; dumb-http stays
-/// the named gap and refuses at discovery).
+/// and HTTP URLs route network (HTTP serves smart-http, falling back to
+/// dumb-http file fetches when the smart advertisement is absent; push
+/// over dumb-http still refuses at discovery).
 ///
 /// Oracle: `git/builtin/fetch.c` (remote resolution).
 fn resolve_target(ctx: &Ctx, target: &str) -> Result<Target, GitError> {
@@ -159,6 +160,13 @@ enum FetchSource {
         base: String,
         /// The upload-pack advertisement from discovery.
         adv: ruk_git::transport::refadv::Advertisement,
+    },
+    /// A dumb-http base: the smart advertisement was absent, so discovery
+    /// fell back to the text `info/refs` file (the same fallback `git`
+    /// makes). The fetch walks loose objects plus listed packs.
+    DumbHttp {
+        /// Normalized RPC base URL.
+        base: String,
     },
 }
 
@@ -190,13 +198,24 @@ pub(crate) fn run_fetch(
         Target::Net(endpoint) => match endpoint {
             Endpoint::Http { url, .. } => {
                 let base = ruk_git::transport::smart_http::normalize_base(&url)?;
-                let adv = ruk_git::transport::smart_http::discover(
+                match ruk_git::transport::smart_http::discover(
                     &base,
                     ruk_git::transport::smart_http::SmartService::UploadPack,
                     dest_kind,
-                )?;
-                let advertised = net::to_local_refs(adv.refs.clone())?;
-                (FetchSource::Http { base, adv }, advertised)
+                ) {
+                    Ok(adv) => {
+                        let advertised = net::to_local_refs(adv.refs.clone())?;
+                        (FetchSource::Http { base, adv }, advertised)
+                    }
+                    Err(err)
+                        if ruk_git::transport::dumb_http::is_dumb_gap(&err) =>
+                    {
+                        let adv = ruk_git::transport::dumb_http::discover(&base, dest_kind)?;
+                        let advertised = net::to_local_refs(adv.refs.clone())?;
+                        (FetchSource::DumbHttp { base }, advertised)
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             _ => {
                 let advertised = net::to_local_refs(net::discover_endpoint(
@@ -212,7 +231,7 @@ pub(crate) fn run_fetch(
     for spec_text in spec_texts {
         match &source {
             FetchSource::Local(src) => pairs.extend(expand_spec(src, &advertised, spec_text)?),
-            FetchSource::Net(_) | FetchSource::Http { .. } => {
+            FetchSource::Net(_) | FetchSource::Http { .. } | FetchSource::DumbHttp { .. } => {
                 pairs.extend(expand_spec_net(&advertised, dest, spec_text)?)
             }
         }
@@ -374,6 +393,16 @@ pub(crate) fn run_fetch(
                 &ref_mutations,
             )?;
         }
+        FetchSource::DumbHttp { base } => {
+            fetch_pack_dumb(
+                dest,
+                base,
+                remote_label,
+                &request,
+                &tracking,
+                &ref_mutations,
+            )?;
+        }
     }
     let mut out = lines.concat().into_bytes();
     out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
@@ -435,6 +464,38 @@ fn fetch_pack_http(
     let received = ruk_git::transport::smart_http::fetch_pack(
         base,
         adv,
+        dest,
+        request,
+        IngestLimits::default(),
+        &Interrupt::none(),
+    )?;
+    publish_received(
+        dest,
+        received,
+        request,
+        remote_label,
+        tracking,
+        ref_mutations,
+    )
+}
+
+/// Runs the pack-equivalent half of a dumb-http fetch: walks loose objects
+/// plus listed packs and publishes through the same verify-and-publish
+/// tail as [`fetch_pack_http`]. Push over dumb-http stays refused: static
+/// files accept no pack, so [`push_net`] lets the discovery-time
+/// [`net::dumb_http_gap`] refusal propagate.
+///
+/// Oracle: `git/builtin/fetch.c`, `git/remote-curl.c` (dumb fallback).
+fn fetch_pack_dumb(
+    dest: &Store,
+    base: &str,
+    remote_label: &str,
+    request: &FetchWireRequest,
+    tracking: &[(RefName, RefTarget)],
+    ref_mutations: &[FactMutation],
+) -> Result<(), GitError> {
+    let received = ruk_git::transport::dumb_http::fetch_pack(
+        base,
         dest,
         request,
         IngestLimits::default(),

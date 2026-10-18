@@ -19,18 +19,21 @@
 //! break on the first verdict to send `done`; there is no second round
 //! here.
 //!
-//! Auth is Bearer from `GIT_AUTH_TOKEN`, else Basic from `GIT_AUTH_USER`
-//! plus `GIT_AUTH_PASSWORD` (see [`crate::transport::http::git_auth_header`]).
-//! Git credential helpers and `http.<url>.extraHeader` stay named gaps:
-//! no config parser for the latter exists, and the former is an
-//! interactive-process contract this client does not run.
+//! Auth tries the git credential helper first
+//! ([`crate::transport::credentials::auth_header_for_url`]: `git credential
+//! fill` for the endpoint, non-fatal to anonymous attempts), then Bearer
+//! from `GIT_AUTH_TOKEN`, else Basic from `GIT_AUTH_USER` plus
+//! `GIT_AUTH_PASSWORD` (see [`crate::transport::http::git_auth_header`]).
+//! `http.<url>.extraHeader` stays a named gap: no config parser for it
+//! exists.
 //!
 //! Named gaps beside this module: dumb-http (a server answering
-//! `info/refs` without the smart advertisement document), protocol v2
-//! over HTTP (needs the `Git-Protocol` header plus command RPCs),
-//! `git-upload-archive` over HTTP (no archive-reading verb consumes it),
-//! and POST redirects (smart RPC endpoints never emit them; a 3xx names
-//! its `Location` in the error).
+//! `info/refs` without the smart advertisement document; fetch falls back
+//! to [`crate::transport::dumb_http`]), protocol v2 over HTTP (needs the
+//! `Git-Protocol` header plus command RPCs), `git-upload-archive` over
+//! HTTP (the client lives in [`fetch_archive`] but no archive-reading
+//! verb consumes it), and POST redirects (smart RPC endpoints never emit
+//! them; a 3xx names its `Location` in the error).
 //!
 //! Oracle anchors: `git/remote-curl.c` (`discover_refs`, `check_smart_http`,
 //! `rpc_service`, `fetch_git`), `git/fetch-pack.c` (`--stateless-rpc`
@@ -40,12 +43,13 @@
 //! (commands to flush, pack to end of body), `git/Documentation/gitprotocol-http.adoc`.
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{Cursor, Read as _};
 
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::Store;
 
 use super::Interrupt;
+use super::credentials;
 use super::fetch::{self, FetchWireRequest, ReceivedPack};
 use super::http;
 use super::net;
@@ -62,6 +66,8 @@ pub enum SmartService {
     UploadPack,
     /// `git-receive-pack`: the server accepts objects.
     ReceivePack,
+    /// `git-upload-archive`: the server streams a tar archive.
+    UploadArchive,
 }
 
 impl SmartService {
@@ -71,6 +77,7 @@ impl SmartService {
         match self {
             Self::UploadPack => "git-upload-pack",
             Self::ReceivePack => "git-receive-pack",
+            Self::UploadArchive => "git-upload-archive",
         }
     }
 
@@ -130,11 +137,13 @@ pub fn rpc_url(base: &str, service: SmartService) -> String {
     format!("{base}/{}", service.name())
 }
 
-/// Builds owned request headers from `extra` plus the environment auth
-/// header, when the environment carries one. Pure for tests; live callers
-/// pass the process environment.
+/// Builds owned request headers from `extra` plus the helper-then-
+/// environment auth header for `url`, when either carries credentials.
+/// [`request_headers_with`] is the pure seam tests inject a stub helper
+/// through; live callers pass the process environment.
 #[must_use]
 pub fn request_headers(
+    url: &str,
     vars: &HashMap<String, String>,
     extra: &[(&str, &str)],
 ) -> Vec<(String, String)> {
@@ -142,15 +151,37 @@ pub fn request_headers(
         .iter()
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
-    if let Some((name, value)) = http::git_auth_header(vars) {
+    if let Some((name, value)) = credentials::auth_header_for_url(url, vars) {
+        out.push((name, value));
+    }
+    out
+}
+
+/// Builds owned request headers from `extra` plus the auth header the
+/// `runner` helper chain (or, failing that, `vars`) yields for `url`.
+#[must_use]
+pub fn request_headers_with(
+    url: &str,
+    vars: &HashMap<String, String>,
+    extra: &[(&str, &str)],
+    helpers: &[(String, Vec<String>)],
+    runner: impl Fn(&str, &[String], &[u8]) -> Option<Vec<u8>>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = extra
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+    if let Some((name, value)) =
+        credentials::auth_header_for_url_with(url, vars, helpers, runner)
+    {
         out.push((name, value));
     }
     out
 }
 
 /// Collects the process environment for [`request_headers`].
-fn live_headers(extra: &[(&str, &str)]) -> Vec<(String, String)> {
-    request_headers(&std::env::vars().collect(), extra)
+fn live_headers(url: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    request_headers(url, &std::env::vars().collect(), extra)
 }
 
 /// Borrows owned headers for the HTTP client.
@@ -190,7 +221,7 @@ pub fn discover(
     kind: HashKind,
 ) -> Result<Advertisement, GitError> {
     let url = refs_url(base, service);
-    let owned = live_headers(&[("Accept", "*/*")]);
+    let owned = live_headers(&url, &[("Accept", "*/*")]);
     let mut body = Vec::new();
     let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
     check_status(&url, status)?;
@@ -322,7 +353,7 @@ pub fn fetch_pack(
     let url = rpc_url(base, SmartService::UploadPack);
     let request_type = SmartService::UploadPack.request_type();
     let result_type = SmartService::UploadPack.result_type();
-    let owned = live_headers(&[
+    let owned = live_headers(&url, &[
         ("Content-Type", request_type.as_str()),
         ("Accept", result_type.as_str()),
     ]);
@@ -570,7 +601,7 @@ fn push_pack_inner(
     let url = rpc_url(base, SmartService::ReceivePack);
     let request_type = SmartService::ReceivePack.request_type();
     let result_type = SmartService::ReceivePack.result_type();
-    let owned = live_headers(&[
+    let owned = live_headers(&url, &[
         ("Content-Type", request_type.as_str()),
         ("Accept", result_type.as_str()),
     ]);
@@ -593,6 +624,116 @@ fn push_pack_inner(
     plan.finalize(report.clone())?;
     push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
     Ok(report)
+}
+
+/// One `git-upload-archive` request: the revision to archive. Only `tar`
+/// is spoken (the server default when the format line is absent), so the
+/// request carries no format choice.
+#[derive(Debug)]
+pub struct ArchiveWireRequest {
+    /// Revision as spelled (`HEAD`, a ref, or a full OID).
+    pub rev: String,
+}
+
+/// Builds the `git-upload-archive` RPC body: one `argument --format=tar`
+/// line, one `argument <rev>` line, and the closing flush — the same
+/// framing `git/builtin/archive.c` (`run_remote_archiver`) sends and
+/// [`crate::transport::archive::serve_upload_archive`] reads.
+pub fn archive_request_body(rev: &str) -> Result<Vec<u8>, GitError> {
+    if rev.is_empty() || rev.bytes().any(|byte| byte == b'\n' || byte == 0) {
+        return Err(GitError::Invalid {
+            detail: format!("archive revision is not one line: {rev:?}"),
+        });
+    }
+    let mut out = Vec::new();
+    pktline::encode_data(&mut out, b"argument --format=tar\n")?;
+    pktline::encode_data(&mut out, format!("argument {rev}\n").as_bytes())?;
+    pktline::encode_flush(&mut out);
+    Ok(out)
+}
+
+/// One fetched archive: the raw tar stream plus any progress text the
+/// server sent on band 2.
+#[derive(Debug)]
+pub struct ArchiveOutput {
+    /// The tar bytes in arrival order.
+    pub tar: Vec<u8>,
+    /// Progress text gathered from side-band 2.
+    pub progress: pktline::RemoteMessages,
+}
+
+/// Fetches one tar archive over smart-http: POSTs the argument payload to
+/// `<base>/git-upload-archive` and demuxes the sideband tar. Discovery
+/// works through [`discover`] with [`SmartService::UploadArchive`]; this
+/// POST half needs no advertisement caps, so it takes the base directly.
+///
+/// A `NACK` line naming an unknown revision is [`GitError::NotFound`]; any
+/// other refusal is [`GitError::Corrupt`]. No verb consumes this yet: the
+/// `archive` verb writes no archives, local or remote, so the client stays
+/// a named gap at the verb layer.
+///
+/// # Errors
+/// Grammar failures are [`GitError::Corrupt`]; see [`check_status`] for
+/// transport failures.
+pub fn fetch_archive(
+    base: &str,
+    req: &ArchiveWireRequest,
+    interrupt: &Interrupt,
+) -> Result<ArchiveOutput, GitError> {
+    let body = archive_request_body(&req.rev)?;
+    let url = rpc_url(base, SmartService::UploadArchive);
+    let request_type = SmartService::UploadArchive.request_type();
+    let result_type = SmartService::UploadArchive.result_type();
+    let owned = live_headers(
+        &url,
+        &[
+            ("Content-Type", request_type.as_str()),
+            ("Accept", result_type.as_str()),
+        ],
+    );
+    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
+    check_status(&url, status)?;
+    if http::header(&reply, "content-type") != Some(result_type.as_str()) {
+        return Err(GitError::Corrupt {
+            detail: format!("{url}: upload-archive RPC answered a non-archive content type"),
+        });
+    }
+    let mut pkt = PktReader::new(reader, interrupt.clone());
+    let first = pkt.read_line("the archive acknowledgement")?.to_vec();
+    if let Some(rest) = first.strip_prefix(b"NACK ") {
+        let message = String::from_utf8_lossy(rest).into_owned();
+        if message.contains("unknown revision") {
+            return Err(GitError::NotFound {
+                detail: format!("{url}: unknown revision {:?}", req.rev),
+            });
+        }
+        return Err(GitError::Corrupt {
+            detail: format!("{url}: upload-archive refused: {message}"),
+        });
+    }
+    if first != b"ACK" {
+        return Err(GitError::Corrupt {
+            detail: format!(
+                "{url}: upload-archive answered {}",
+                first.escape_ascii()
+            ),
+        });
+    }
+    match pkt.read_packet()? {
+        pktline::Packet::Flush => {}
+        other => {
+            return Err(GitError::Corrupt {
+                detail: format!("{url}: upload-archive misses its flush, got {other:?}"),
+            });
+        }
+    }
+    let mut sideband = pktline::SidebandReader::new(&mut pkt, pktline::LARGE_PACKET_MAX);
+    let mut tar = Vec::new();
+    sideband.read_to_end(&mut tar).map_err(|err| GitError::Io {
+        detail: format!("{url}: cannot read the archive stream: {err}"),
+    })?;
+    let progress = sideband.messages().clone();
+    Ok(ArchiveOutput { tar, progress })
 }
 
 #[cfg(test)]
@@ -646,8 +787,16 @@ mod tests {
 
     #[test]
     fn auth_header_surface() {
+        // Failing runner plus empty chain: pure environment behavior,
+        // hermetic against any configured helper.
         let vars = HashMap::from([("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned())]);
-        let headers = request_headers(&vars, &[("Accept", "*/*")]);
+        let headers = request_headers_with(
+            "https://host.x/a.git",
+            &vars,
+            &[("Accept", "*/*")],
+            &[],
+            |_, _, _| None,
+        );
         assert!(headers.contains(&("Accept".to_owned(), "*/*".to_owned())));
         assert!(headers.contains(&("authorization".to_owned(), "Bearer tok".to_owned())));
         // A bearer token wins over a user/password pair.
@@ -656,18 +805,38 @@ mod tests {
             ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
             ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),
         ]);
-        let headers = request_headers(&vars, &[]);
+        let headers = request_headers_with("https://host.x/a.git", &vars, &[], &[], |_, _, _| None);
         assert_eq!(headers.len(), 1);
         let vars = HashMap::from([
             ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
             ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),
         ]);
-        let headers = request_headers(&vars, &[]);
+        let headers = request_headers_with("https://host.x/a.git", &vars, &[], &[], |_, _, _| None);
         assert_eq!(
             headers,
             vec![("authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned())]
         );
-        assert!(request_headers(&HashMap::new(), &[]).is_empty());
+        assert!(
+            request_headers_with("https://host.x/a.git", &HashMap::new(), &[], &[], |_, _, _| None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn helper_answer_wins_over_the_environment() {
+        let helpers = vec![("/bin/helper".to_owned(), Vec::new())];
+        let vars = HashMap::from([("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned())]);
+        let headers = request_headers_with(
+            "https://host.x/a.git",
+            &vars,
+            &[],
+            &helpers,
+            |_, _, _| Some(b"username=alice\npassword=s3cret\n".to_vec()),
+        );
+        assert_eq!(
+            headers,
+            vec![("authorization".to_owned(), "Basic YWxpY2U6czNjcmV0".to_owned())]
+        );
     }
 
     /// One recorded request: head text plus raw body bytes.
@@ -1060,5 +1229,127 @@ mod tests {
             matches!(err, GitError::PushUncertain { .. }),
             "unexpected {err:?}"
         );
+    }
+
+    #[test]
+    fn archive_shapes_match_the_service() {
+        assert_eq!(
+            SmartService::UploadArchive.name(),
+            "git-upload-archive"
+        );
+        assert_eq!(
+            SmartService::UploadArchive.advertisement_type(),
+            "application/x-git-upload-archive-advertisement"
+        );
+        assert_eq!(
+            SmartService::UploadArchive.request_type(),
+            "application/x-git-upload-archive-request"
+        );
+        assert_eq!(
+            SmartService::UploadArchive.result_type(),
+            "application/x-git-upload-archive-result"
+        );
+        assert_eq!(
+            refs_url("https://host.x/a.git", SmartService::UploadArchive),
+            "https://host.x/a.git/info/refs?service=git-upload-archive"
+        );
+        assert_eq!(
+            rpc_url("https://host.x/a.git", SmartService::UploadArchive),
+            "https://host.x/a.git/git-upload-archive"
+        );
+        assert!(archive_request_body("").is_err());
+        assert!(archive_request_body("HEAD\nevil").is_err());
+    }
+
+    #[test]
+    fn archive_fetches_a_sideband_tar() {
+        let tar = b"fake-tar-bytes".to_vec();
+        let mut body = Vec::new();
+        pktline::encode_data(&mut body, b"ACK\n").expect("ack");
+        pktline::encode_flush(&mut body);
+        body.extend_from_slice(&sideband_frame(&tar));
+        body.extend_from_slice(b"0000");
+        let (base, server) = fake_smart_server(vec![(
+            200,
+            vec![(
+                "Content-Type".to_owned(),
+                SmartService::UploadArchive.result_type(),
+            )],
+            body,
+            false,
+        )]);
+        let out = fetch_archive(
+            &base,
+            &ArchiveWireRequest {
+                rev: "HEAD".to_owned(),
+            },
+            &Interrupt::none(),
+        )
+        .expect("archive");
+        assert_eq!(out.tar, tar);
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        let post = &requests[0];
+        assert!(
+            post.head
+                .starts_with("POST /a.git/git-upload-archive HTTP/1.1\r\n"),
+            "{:?}",
+            post.head
+        );
+        assert!(
+            post.head
+                .contains("Content-Type: application/x-git-upload-archive-request"),
+            "{:?}",
+            post.head
+        );
+        assert!(
+            post.head
+                .contains("Accept: application/x-git-upload-archive-result"),
+            "{:?}",
+            post.head
+        );
+        assert!(
+            post.body
+                .windows(b"argument --format=tar\n".len())
+                .any(|w| w == b"argument --format=tar\n"),
+            "no format line in {:?}",
+            post.body.escape_ascii().to_string()
+        );
+        assert!(
+            post.body
+                .windows(b"argument HEAD\n".len())
+                .any(|w| w == b"argument HEAD\n"),
+            "no revision line in {:?}",
+            post.body.escape_ascii().to_string()
+        );
+        assert!(post.body.ends_with(b"0000"), "no closing flush");
+    }
+
+    #[test]
+    fn archive_maps_unknown_revisions_to_not_found() {
+        let mut body = Vec::new();
+        pktline::encode_data(&mut body, b"NACK unknown revision nope\n").expect("nack");
+        let (base, server) = fake_smart_server(vec![(
+            200,
+            vec![(
+                "Content-Type".to_owned(),
+                SmartService::UploadArchive.result_type(),
+            )],
+            body,
+            false,
+        )]);
+        let err = fetch_archive(
+            &base,
+            &ArchiveWireRequest {
+                rev: "nope".to_owned(),
+            },
+            &Interrupt::none(),
+        )
+        .expect_err("unknown revision");
+        assert!(
+            matches!(err, GitError::NotFound { .. }),
+            "unexpected {err:?}"
+        );
+        server.join().expect("server");
     }
 }
