@@ -163,7 +163,8 @@ fn stage_file(
             detail: format!("reading link {}: {err}", full.display()),
         })?;
         let bytes = target.as_os_str().as_encoded_bytes().to_vec();
-        return stage_bytes(ctx, kind, FileMode::Symlink, &bytes, fill, file_stat(&full, &meta));
+        let stat = super::state::stat_from_meta(&meta).ok();
+        return stage_bytes(ctx, kind, FileMode::Symlink, &bytes, fill, stat);
     }
     let mode = file_mode_of(&meta);
     let bytes = read_worktree_file(&ctx.file_base, path.as_bytes())?;
@@ -175,18 +176,10 @@ fn stage_file(
             detail: format!("file {} exceeds the object bound", shown(path)),
         });
     }
-    stage_bytes(ctx, kind, mode, &bytes, fill, file_stat(&full, &meta))
-}
-
-/// Lstats `full` after its bytes were read so the stored tuple describes the
-/// hashed content, not a pre-read instant a concurrent edit could have
-/// moved past. A file that vanishes mid-stage keeps the pre-read tuple:
-/// staging still succeeds exactly as before, and the next scan rehashes.
-fn file_stat(full: &std::path::Path, meta: &std::fs::Metadata) -> Option<StatData> {
-    std::fs::symlink_metadata(full)
-        .ok()
-        .and_then(|fresh| super::state::stat_from_meta(&fresh).ok())
-        .or_else(|| super::state::stat_from_meta(meta).ok())
+    // The tuple is captured before the content read: a concurrent edit can
+    // only stale it (the next scan rehashes), never validate foreign bytes.
+    let stat = super::state::stat_from_meta(&meta).ok();
+    stage_bytes(ctx, kind, mode, &bytes, fill, stat)
 }
 
 /// Builds the entry for staged bytes under one fill discipline and prepares

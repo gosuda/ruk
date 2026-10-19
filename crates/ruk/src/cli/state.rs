@@ -393,9 +393,13 @@ pub(crate) fn trust_index_entry(
 }
 
 /// Re-reads lstat data for freshly-written worktree paths into their
-/// stage-zero rows, so the next dirty scan trusts them. Paths without a
-/// stage-zero row, with an unchanged tuple, or that fail to stat keep
-/// their rows untouched; unmerged and gitlink rows are never rewritten.
+/// stage-zero rows, so the next dirty scan trusts them. A row is refreshed
+/// only after its current bytes are read back and match the row's blob:
+/// an edit between the write and the lstat then fails the comparison and
+/// leaves the row stale instead of validating foreign bytes. Paths without
+/// a stage-zero row, with an unchanged tuple, or that fail to stat or
+/// verify keep their rows untouched; unmerged and gitlink rows are never
+/// rewritten.
 pub(crate) fn refresh_stats_after_write(
     ctx: &Ctx,
     store: &Store,
@@ -429,6 +433,20 @@ pub(crate) fn refresh_stats_after_write(
             continue;
         };
         if entry.mode() == FileMode::Gitlink || entry.stat() == Some(fresh) {
+            continue;
+        }
+        let current = if entry.mode() == FileMode::Symlink {
+            std::fs::read_link(&full)
+                .map(|target| target.as_os_str().as_encoded_bytes().to_vec())
+                .ok()
+        } else {
+            std::fs::read(&full).ok()
+        };
+        let Some(current) = current else {
+            continue;
+        };
+        let (_, want) = super::tree::read_object_bytes(store, entry.oid())?;
+        if current != want {
             continue;
         }
         let next = IndexEntry::new(entry.oid(), entry.mode(), Some(fresh), entry.flags())

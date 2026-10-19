@@ -41,6 +41,7 @@ mod capacity;
 mod compact;
 mod delta;
 pub mod durability;
+mod group;
 mod guards;
 mod metadata;
 mod prepare;
@@ -123,6 +124,13 @@ struct IoCounters {
     fact_page_calls: AtomicU64,
     /// Payload reads that reached the metadata chain.
     metadata_calls: AtomicU64,
+    /// Publications that committed, one per [`Store::publish`] call.
+    publications: AtomicU64,
+    /// Publication transactions committed. A group shares one, so this is at
+    /// most `publications`.
+    publication_commits: AtomicU64,
+    /// Segment files synced by publications.
+    segment_syncs: AtomicU64,
 }
 
 /// A copy of [`Store`]'s I/O counters at one instant.
@@ -135,6 +143,12 @@ pub struct IoStats {
     pub fact_rows: u64,
     pub fact_page_calls: u64,
     pub metadata_calls: u64,
+    /// Publications that committed.
+    pub publications: u64,
+    /// Publication transactions committed; a group of publications shares one.
+    pub publication_commits: u64,
+    /// Segment files synced by publications.
+    pub segment_syncs: u64,
 }
 
 pub struct Store {
@@ -154,6 +168,10 @@ pub struct Store {
     compaction_lock: Mutex<()>,
     quarantine: Mutex<Option<String>>,
     quarantined: AtomicBool,
+    /// Submissions waiting for the writer, drained by the next writer holder.
+    queue: group::Queue,
+    /// The commit linger window in nanoseconds (`RUK_COMMIT_LINGER_MS`).
+    commit_linger_nanos: AtomicU64,
 }
 
 /// State owned by the serialized publication writer.
@@ -475,6 +493,8 @@ impl Store {
             compaction_lock: Mutex::new(()),
             quarantine: Mutex::new(None),
             quarantined: AtomicBool::new(false),
+            queue: group::Queue::default(),
+            commit_linger_nanos: AtomicU64::new(group::nanos(group::linger_from_env())),
         }
     }
 
@@ -802,6 +822,9 @@ impl Store {
             fact_rows: self.io.fact_rows.load(Ordering::Relaxed),
             fact_page_calls: self.io.fact_page_calls.load(Ordering::Relaxed),
             metadata_calls: self.io.metadata_calls.load(Ordering::Relaxed),
+            publications: self.io.publications.load(Ordering::Relaxed),
+            publication_commits: self.io.publication_commits.load(Ordering::Relaxed),
+            segment_syncs: self.io.segment_syncs.load(Ordering::Relaxed),
         }
     }
     /// A bounded page of raw fact rows strictly after `after` in key order.
@@ -870,6 +893,11 @@ impl Store {
     /// of the commit step latches quarantine as well.
     ///
     /// A quarantined store refuses before it reports a closed writer.
+    ///
+    /// Concurrent calls group: each publication waits in a queue, and the
+    /// caller holding the writer commits the queue in as few transactions as
+    /// the keys allow (see the `group` module). Every caller still receives
+    /// the outcome its publication would have had alone.
     pub fn publish(
         &self,
         objects: Vec<PreparedObject>,
@@ -882,7 +910,21 @@ impl Store {
                 generation: self.observe(self.meta.generation())?,
             });
         }
-        let mut writer = self.lock_writer()?;
+        let outcome = self.publish_grouped(objects, facts);
+        if outcome.is_ok() {
+            self.io.publications.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Commits one publication with the writer held: the probe, the pending
+    /// reservation, the real transaction, then append and commit.
+    fn publish_locked(
+        &self,
+        writer: &mut WriterState,
+        objects: &[&PreparedObject],
+        facts: &[FactMutation],
+    ) -> Result<Publication, StoreError> {
         // A read may have latched quarantine while this call waited for the
         // writer; nothing commits on a store already known to be corrupt.
         self.refuse_if_quarantined()?;
@@ -898,11 +940,11 @@ impl Store {
         // re-validation below identical.
         let staged = (|| {
             let probe_txn = self.observe(self.meta.begin_publication(facts))?;
-            let probe_plan = self.observe(self.plan(&probe_txn, &objects))?;
+            let probe_plan = self.observe(self.plan(&probe_txn, objects))?;
             drop(probe_txn);
             let pending = self.persist_pending(&probe_plan)?;
             let txn = self.observe(self.meta.begin_publication(facts))?;
-            let plan = self.observe(self.plan(&txn, &objects))?;
+            let plan = self.observe(self.plan(&txn, objects))?;
             Ok::<_, StoreError>((pending, txn, plan))
         })();
         let (pending, txn, plan) = match staged {
@@ -944,7 +986,7 @@ impl Store {
                 plan.fresh.len(),
             );
         }
-        match self.write_and_commit(&mut writer, txn, plan, profile, pending) {
+        match self.write_and_commit(writer, txn, plan, profile, pending) {
             Ok(publication) => Ok(publication),
             Err(err) => {
                 writer.closed = Some(format!(
@@ -960,12 +1002,12 @@ impl Store {
     fn plan<'a>(
         &self,
         txn: &PublicationTxn,
-        objects: &'a [PreparedObject],
+        objects: &[&'a PreparedObject],
     ) -> Result<Plan<'a>, StoreError> {
         let mut order = Vec::with_capacity(objects.len());
         let mut fresh = Vec::new();
         let mut seen: HashMap<Oid, (ObjectKind, u64)> = HashMap::with_capacity(objects.len());
-        for object in objects {
+        for &object in objects {
             let oid = object.oid();
             self.check_prepared(object)?;
             order.push(oid);
@@ -1189,7 +1231,8 @@ impl Store {
         crash_tests::crash_at("after_append");
 
         let sync_start = ProfileClock::now(profile);
-        batch.sync_files(writer)?;
+        let synced = batch.sync_files(writer)?;
+        self.io.segment_syncs.fetch_add(synced, Ordering::Relaxed);
         let sync_files_ms = sync_start.elapsed_ms();
         #[cfg(test)]
         crash_tests::crash_at("after_segment_sync");
@@ -1213,6 +1256,7 @@ impl Store {
         let stage_ms = stage_start.elapsed_ms();
         let commit_start = ProfileClock::now(profile);
         self.observe(txn.commit())?;
+        self.io.publication_commits.fetch_add(1, Ordering::Relaxed);
         let commit_ms = commit_start.elapsed_ms();
         if profile {
             eprintln!(
@@ -1290,14 +1334,20 @@ impl Batch {
     }
 
     /// Flushes every segment this publication touched.
-    fn sync_files(&self, writer: &WriterState) -> Result<(), StoreError> {
+    fn sync_files(&self, writer: &WriterState) -> Result<u64, StoreError> {
+        let mut synced = 0;
         for segment in &self.sealed {
             durability::sync_file(segment.writer.get_ref())?;
+            synced += 1;
         }
         match writer.active.as_ref() {
-            Some(active) if self.active_touched => durability::sync_file(active.writer.get_ref()),
-            _ => Ok(()),
+            Some(active) if self.active_touched => {
+                durability::sync_file(active.writer.get_ref())?;
+                synced += 1;
+            }
+            _ => {}
         }
+        Ok(synced)
     }
 
     /// The final manifest rows of every touched segment.
@@ -2868,5 +2918,133 @@ mod tests {
             .expect("publish after the move")
             .objects[0];
         assert_eq!(read_all(&store, later), later_payload);
+    }
+
+    #[test]
+    fn sequential_publications_commit_one_at_a_time() {
+        use std::time::Duration;
+
+        let temp = TempRoot::new("group-sequential");
+        let store = create(&temp, HashKind::Sha1);
+        store.set_commit_linger(Duration::ZERO);
+        let before = store.io_stats();
+        for seed in 0..5 {
+            store
+                .publish(vec![blob(&store, &pseudo(256, seed))], &[])
+                .expect("sequential publish");
+        }
+        let after = store.io_stats();
+        assert_eq!(after.publications - before.publications, 5);
+        assert_eq!(after.publication_commits - before.publication_commits, 5);
+    }
+
+    #[test]
+    fn concurrent_publications_share_commits_and_land_intact() {
+        use std::time::Duration;
+
+        const WRITERS: usize = 4;
+        const COMMITS: usize = 20;
+        let seed_of = |writer: usize, seq: usize| {
+            u64::try_from(writer * COMMITS + seq).expect("seed fits u64") + 1
+        };
+        let temp = TempRoot::new("group-commit");
+        let store = Arc::new(create(&temp, HashKind::Sha1));
+        store.set_commit_linger(Duration::from_millis(10));
+        let before = store.io_stats();
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let store = Arc::clone(&store);
+                scope.spawn(move || {
+                    for seq in 0..COMMITS {
+                        let payload = pseudo(512, seed_of(writer, seq));
+                        let expected = blob_oid(HashKind::Sha1, &payload);
+                        let key = format!("refs/heads/w{writer}-{seq}");
+                        let tip = format!("tip-{writer}-{seq}");
+                        let fact = mutation(
+                            FactTable::Refs,
+                            key.as_bytes(),
+                            FactExpectation::Absent,
+                            Some(tip.as_bytes()),
+                        );
+                        let publication = store
+                            .publish(vec![blob(&store, &payload)], &[fact])
+                            .expect("grouped publication commits");
+                        assert_eq!(publication.objects, vec![expected]);
+                    }
+                });
+            }
+        });
+        let after = store.io_stats();
+        let total = u64::try_from(WRITERS * COMMITS).expect("publication count fits u64");
+        let publications = after.publications - before.publications;
+        let commits = after.publication_commits - before.publication_commits;
+        let syncs = after.segment_syncs - before.segment_syncs;
+        assert_eq!(publications, total);
+        assert!(
+            commits < total,
+            "{commits} metadata commits for {total} publications: nothing grouped"
+        );
+        assert!(
+            syncs < total,
+            "{syncs} segment syncs for {total} publications: nothing grouped"
+        );
+        drop(store);
+
+        let reopened = reopen(&temp);
+        for writer in 0..WRITERS {
+            for seq in 0..COMMITS {
+                let payload = pseudo(512, seed_of(writer, seq));
+                assert_eq!(
+                    read_all(&reopened, blob_oid(HashKind::Sha1, &payload)),
+                    payload
+                );
+                let key = format!("refs/heads/w{writer}-{seq}");
+                assert_eq!(
+                    reopened
+                        .fact(FactTable::Refs, key.as_bytes())
+                        .expect("read grouped fact"),
+                    Some(format!("tip-{writer}-{seq}").into_bytes())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_claims_on_one_fact_admit_exactly_one_publisher() {
+        use std::time::Duration;
+
+        let temp = TempRoot::new("group-conflict");
+        let store = Arc::new(create(&temp, HashKind::Sha1));
+        store.set_commit_linger(Duration::from_millis(5));
+        let outcomes: Vec<Result<Publication, StoreError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4u8)
+                .map(|n| {
+                    let store = Arc::clone(&store);
+                    scope.spawn(move || {
+                        let payload = vec![n; 64];
+                        let tip = [n];
+                        let fact = mutation(
+                            FactTable::Refs,
+                            b"refs/heads/contested",
+                            FactExpectation::Absent,
+                            Some(&tip[..]),
+                        );
+                        store.publish(vec![blob(&store, &payload)], &[fact])
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("publisher thread"))
+                .collect()
+        });
+        let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(winners, 1, "exactly one absent-expectation claim may commit");
+        for loser in outcomes.iter().filter_map(|outcome| outcome.as_ref().err()) {
+            assert!(
+                matches!(loser, StoreError::StaleFact { .. }),
+                "a losing claim must fail as stale, got: {loser}"
+            );
+        }
     }
 }

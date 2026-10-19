@@ -28,7 +28,7 @@ use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage};
+use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage, StatData};
 use ruk_core::ops::{NewRequest, new as ops_new};
 use ruk_core::refdata::{RefChange, RefExpect, RefTarget, RefUpdate};
 use ruk_core::workspace::HeadRef;
@@ -1915,6 +1915,8 @@ fn execute_apply(ctx: &Ctx, plans: &[ApplyPlan], target: ApplyTarget) -> Result<
         // refresh when the index transaction above staged the same results.
         // Deletes name `/dev/null`, never a repository path.
         if target != ApplyTarget::Worktree {
+            let store = ctx.store()?;
+            let kind = ctx.kind()?;
             let written: Vec<Vec<u8>> = plans
                 .iter()
                 .filter(|plan| !plan.is_delete)
@@ -2711,8 +2713,10 @@ fn am_continue(
     let (workspace, workspace_raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     let mut objects = Vec::new();
-    // Each entry: the index row plus staged content (`None` removes it).
-    let mut touched: Vec<(RepoPath, Option<(FileMode, Vec<u8>)>)> = Vec::new();
+    // Each entry: the index row plus staged content and its lstat tuple
+    // (`None` removes it). The tuple is captured before the content read so
+    // a concurrent edit can only stale it, never validate foreign bytes.
+    let mut touched: Vec<(RepoPath, Option<(FileMode, Vec<u8>, Option<StatData>)>)> = Vec::new();
     for file in &message.patches {
         let old_path = strip_path(&file.old_path, strip)?;
         let new_path = strip_path(&file.new_path, strip)?;
@@ -2732,6 +2736,7 @@ fn am_continue(
                 String::from_utf8_lossy(&new_path)
             ),
         })?;
+        let stat = super::state::stat_from_meta(&meta).ok();
         let (mode, bytes) = if meta.file_type().is_symlink() {
             let target = std::fs::read_link(&full).map_err(|err| GitError::Io {
                 detail: format!("reading link {}: {err}", full.display()),
@@ -2758,18 +2763,15 @@ fn am_continue(
             (mode, read_worktree_file(&ctx.file_base, &new_path)?)
         };
         let new_repo = RepoPath::new(new_path).map_err(to_core_invalid)?;
-        touched.push((new_repo, Some((mode, bytes))));
+        touched.push((new_repo, Some((mode, bytes, stat))));
     }
     for (repo, staged) in &touched {
         let before = read_path_rows(store, kind, repo)?;
         match staged {
             None => mutations.extend(path_row_mutations(repo, &before, &[])?),
-            Some((mode, bytes)) => {
-                let fresh = std::fs::symlink_metadata(&full)
-                    .ok()
-                    .and_then(|current| super::state::stat_from_meta(&current).ok());
+            Some((mode, bytes, stat)) => {
                 let entry =
-                    IndexEntry::for_blob(kind, *mode, bytes, fresh).map_err(to_core_invalid)?;
+                    IndexEntry::for_blob(kind, *mode, bytes, *stat).map_err(to_core_invalid)?;
                 let len = u64::try_from(bytes.len()).map_err(|_| GitError::Limit {
                     detail: "resolved blob exceeds the length range".to_owned(),
                 })?;

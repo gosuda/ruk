@@ -289,7 +289,6 @@ fn apply_patterns(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
             .mutate_index(workspace.stamp)
             .map_err(core_invalid)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-        mutations.push(super::state::index_stamp_mutation()?);
         store
             .publish(Vec::new(), &mutations)
             .map_err(GitError::from)?;

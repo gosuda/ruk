@@ -519,7 +519,6 @@ fn cmd_add(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>, 
     )?);
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-    mutations.push(super::state::index_stamp_mutation()?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     ctx.emit_stderr(format!("Cloning into {path_text:?}...\n").as_bytes());
     Ok(Vec::new())
@@ -803,7 +802,6 @@ fn write_flat_index(
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-    mutations.push(super::state::index_stamp_mutation()?);
     child
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;

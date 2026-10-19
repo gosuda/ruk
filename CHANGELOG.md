@@ -20,6 +20,7 @@ Entries describe implemented, unreleased functionality.
 - Atomic publication of prepared objects and conditional metadata facts. Stale conditions reject the batch before append; failures after append begins close the writer until recovery.
 - Startup verification of committed extents and object identities, truncation of uncommitted open tails, and refusal of service on committed corruption.
 - Checksum- and identity-verified object reads that release metadata transactions before payload I/O.
+- Group commit for concurrent `Store::publish` calls: publications waiting for the writer share one publication transaction when their keys do not conflict. `RUK_COMMIT_LINGER_MS` sets an optional linger window (default 0, capped at 50 ms). Each caller still receives the outcome its publication would have had alone.
 
 ### Changed
 

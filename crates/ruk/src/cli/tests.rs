@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ruk_core::ids::HashKind;
 use ruk_core::store::{FactTable, PreparationBudget, Store};
@@ -9095,6 +9095,75 @@ fn wave_l_stat_cache_clean_repo_reports_empty_status() {
     assert!(out.is_empty(), "clean status not empty: {out:?}");
     let out = run(verbs_history::diff, &mut ctx, &[]).expect("diff");
     assert!(out.is_empty(), "clean diff not empty: {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_l_stat_cache_old_files_trust_without_rehash() {
+    // Backdated mtimes sit strictly below the index write stamp, so the
+    // trust rule takes its clean branch in production code (the unit test
+    // pins the verdict; this drives the scan through it).
+    let base = temp_base("wave-l-statcache-old");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    let past = SystemTime::now() - Duration::from_secs(120);
+    for name in ["old-a.txt", "old-b.txt", "old-c.txt"] {
+        let full = root.join(name);
+        std::fs::write(&full, format!("{name} body\n")).expect("seed file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&full)
+            .expect("open")
+            .set_modified(past)
+            .expect("backdate");
+    }
+    let mut ctx = repo_ctx(&root, env);
+    verbs_stage::add(
+        &mut ctx,
+        &[
+            "old-a.txt".to_owned(),
+            "old-b.txt".to_owned(),
+            "old-c.txt".to_owned(),
+        ],
+    )
+    .expect("add");
+    verbs_history::commit(&mut ctx, &["-m".to_owned(), "seed".to_owned()]).expect("commit");
+    {
+        let store = ctx.store().expect("store");
+        let stamp = super::state::read_index_stamp(store).expect("stamp");
+        let rows = super::state::scan_index(store, ctx.kind().expect("kind")).expect("scan");
+        let mut zeros = 0;
+        for (_, stage, entry) in &rows {
+            if *stage == ruk_core::index::Stage::Zero {
+                zeros += 1;
+                let stat = entry.stat().expect("row lacks stat");
+                assert!(
+                    stat.mtime.secs < stamp,
+                    "row mtime not below the stamp; the scan would rehash"
+                );
+            }
+        }
+        assert_eq!(zeros, 3);
+    }
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("status");
+    assert!(
+        out.is_empty(),
+        "old files not clean: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let out = run(verbs_history::diff, &mut ctx, &[]).expect("diff");
+    assert!(out.is_empty(), "old files diff not empty: {out:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
