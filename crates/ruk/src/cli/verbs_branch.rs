@@ -2096,6 +2096,12 @@ fn switch_head_to_merging(ctx: &mut Ctx, head: HeadRef) -> Result<Vec<u8>, GitEr
             }
         }
     }
+    let written: Vec<Vec<u8>> = differing
+        .iter()
+        .filter(|path| new_map.contains_key(*path))
+        .cloned()
+        .collect();
+    super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     emit_post_checkout(ctx, kind, old)?;
     Ok(Vec::new())
 }
@@ -2242,6 +2248,7 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     let mut worktree_writes: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    let mut written: Vec<Vec<u8>> = Vec::new();
     for wanted in tree_paths {
         let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
         let (mode, oid) = match tree_entries.get(path.as_bytes()) {
@@ -2269,6 +2276,7 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
         if update_worktree {
             let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
             worktree_writes.push((full, body.clone()));
+            written.push(path.as_bytes().to_vec());
         }
         if update_index {
             let before = read_path_rows(store, kind, &path)?;
@@ -2280,6 +2288,7 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     if !mutations.is_empty() {
         let next = workspace.mutate_index(workspace.stamp)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+        mutations.push(super::state::index_stamp_mutation()?);
         store
             .publish(Vec::new(), &mutations)
             .map_err(GitError::from)?;
@@ -2293,6 +2302,12 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
         std::fs::write(&full, body).map_err(|err| GitError::Io {
             detail: format!("writing {}: {err}", full.display()),
         })?;
+    }
+    // A tree-sourced worktree-only restore writes bytes the untouched rows
+    // do not name; every other shape writes exactly what the rows hash.
+    let rows_describe_files = update_index || source_tree.is_none();
+    if rows_describe_files {
+        super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     }
     Ok(Vec::new())
 }
@@ -2311,6 +2326,7 @@ fn checkout_conflict_paths(
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
     let mut worktree_writes: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    let mut written: Vec<Vec<u8>> = Vec::new();
     for wanted in paths {
         let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
         let rows = read_path_rows(store, kind, &path)?;
@@ -2325,6 +2341,7 @@ fn checkout_conflict_paths(
         if !staged_only {
             let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
             worktree_writes.push((full, body));
+            written.push(path.as_bytes().to_vec());
         }
         if !worktree_only {
             let before = read_path_rows(store, kind, &path)?;
@@ -2340,6 +2357,7 @@ fn checkout_conflict_paths(
     if !mutations.is_empty() {
         let next = workspace.mutate_index(workspace.stamp)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+        mutations.push(super::state::index_stamp_mutation()?);
         store
             .publish(Vec::new(), &mutations)
             .map_err(GitError::from)?;
@@ -2353,6 +2371,11 @@ fn checkout_conflict_paths(
         std::fs::write(&full, body).map_err(|err| GitError::Io {
             detail: format!("writing {}: {err}", full.display()),
         })?;
+    }
+    // Worktree-only restores leave rows unmerged, which carry no stage-zero
+    // row to refresh; resolving restores write exactly the resolved bytes.
+    if !worktree_only {
+        super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     }
     Ok(Vec::new())
 }
@@ -2880,6 +2903,10 @@ fn restore_staged(ctx: &Ctx, opts: &super::Collected, tree: Oid) -> Result<(), G
 fn restore_worktree(ctx: &Ctx, opts: &super::Collected) -> Result<(), GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
+    // A `--source` restore writes foreign bytes the index rows do not name,
+    // so only an index-sourced restore may refresh row stats: otherwise the
+    // rows would bless bytes they never hashed (false clean).
+    let from_index = opts.single("source")?.is_none();
     let entries = match opts.single("source")? {
         Some(rev) => {
             let oid = resolve_rev(store, kind, &rev)?;
@@ -2898,6 +2925,7 @@ fn restore_worktree(ctx: &Ctx, opts: &super::Collected) -> Result<(), GitError> 
             map
         }
     };
+    let mut written: Vec<Vec<u8>> = Vec::new();
     for positional in &opts.positionals {
         let path = super::verbs_stage::repo_path_of(ctx, positional.as_bytes())?;
         let oid = entries
@@ -2909,12 +2937,16 @@ fn restore_worktree(ctx: &Ctx, opts: &super::Collected) -> Result<(), GitError> 
         let full = join_base(&ctx.file_base, path.as_bytes())?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
-                detail: format!("creating {}: {err}", parent.display()),
+                detail: format!("creating {}: {err}", full.display()),
             })?;
         }
         std::fs::write(&full, body).map_err(|err| GitError::Io {
             detail: format!("writing {}: {err}", full.display()),
         })?;
+        written.push(path.as_bytes().to_vec());
+    }
+    if from_index {
+        super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     }
     Ok(())
 }
@@ -3390,6 +3422,7 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     index_mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    index_mutations.push(super::state::index_stamp_mutation()?);
     store
         .publish(Vec::new(), &index_mutations)
         .map_err(GitError::from)?;
@@ -3418,6 +3451,12 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
             }
         }
     }
+    let written: Vec<Vec<u8>> = differing
+        .iter()
+        .filter(|path| new_map.contains_key(*path))
+        .cloned()
+        .collect();
+    super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     if quiet {
         return Ok(Vec::new());
     }
@@ -3592,6 +3631,8 @@ pub(crate) fn sync_worktree_to_index(ctx: &Ctx) -> Result<(), GitError> {
             })?;
         }
     }
+    let written: Vec<Vec<u8>> = wanted.keys().cloned().collect();
+    super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     Ok(())
 }
 
@@ -6613,6 +6654,7 @@ fn restore_stash_index(
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;

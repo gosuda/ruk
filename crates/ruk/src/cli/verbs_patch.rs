@@ -1904,11 +1904,23 @@ fn execute_apply(ctx: &Ctx, plans: &[ApplyPlan], target: ApplyTarget) -> Result<
             .mutate_index(workspace.stamp)
             .map_err(to_core_invalid)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+        mutations.push(super::state::index_stamp_mutation()?);
         store.publish(objects, &mutations).map_err(GitError::from)?;
     }
     if target != ApplyTarget::IndexOnly {
         for plan in plans {
             write_plan_worktree(ctx, plan)?;
+        }
+        // Worktree-only applies leave the rows naming old bytes: only
+        // refresh when the index transaction above staged the same results.
+        // Deletes name `/dev/null`, never a repository path.
+        if target != ApplyTarget::Worktree {
+            let written: Vec<Vec<u8>> = plans
+                .iter()
+                .filter(|plan| !plan.is_delete)
+                .map(|plan| plan.new_path.clone())
+                .collect();
+            super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
         }
     }
     Ok(())
@@ -2534,6 +2546,7 @@ fn am_apply_message(
         .mutate_index(workspace.stamp)
         .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
     let tree = build_index_tree(store, kind, &merged_rows(&staged))?;
@@ -2584,6 +2597,12 @@ fn am_apply_message(
             (TreeMode::from(*result_mode), Some(result.clone())),
         );
     }
+    let written: Vec<Vec<u8>> = results
+        .iter()
+        .filter(|entry| !entry.4)
+        .map(|entry| entry.1.clone())
+        .collect();
+    super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     Ok(format!("Applying: {}\n", message.subject).into_bytes())
 }
 
@@ -2746,8 +2765,11 @@ fn am_continue(
         match staged {
             None => mutations.extend(path_row_mutations(repo, &before, &[])?),
             Some((mode, bytes)) => {
+                let fresh = std::fs::symlink_metadata(&full)
+                    .ok()
+                    .and_then(|current| super::state::stat_from_meta(&current).ok());
                 let entry =
-                    IndexEntry::for_blob(kind, *mode, bytes, None).map_err(to_core_invalid)?;
+                    IndexEntry::for_blob(kind, *mode, bytes, fresh).map_err(to_core_invalid)?;
                 let len = u64::try_from(bytes.len()).map_err(|_| GitError::Limit {
                     detail: "resolved blob exceeds the length range".to_owned(),
                 })?;
@@ -2769,6 +2791,7 @@ fn am_continue(
         .mutate_index(workspace.stamp)
         .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(workspace_raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
     let tree = build_index_tree(store, kind, &merged_rows(&staged))?;

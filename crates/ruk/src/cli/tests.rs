@@ -9051,3 +9051,153 @@ fn wave_j_edit_description_needs_terminal() {
     assert!(err.to_string().contains("terminal"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn wave_l_stat_cache_clean_repo_reports_empty_status() {
+    // Fifty tracked files, added and committed: every stage-zero row carries
+    // lstat data, and status/diff output matches the pre-cache behavior.
+    let base = temp_base("wave-l-statcache-clean");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    for index in 0..50 {
+        let name = format!("f-{index:02}.txt");
+        std::fs::write(root.join(&name), format!("body {index}\n")).expect("seed file");
+    }
+    let mut ctx = repo_ctx(&root, env);
+    let adds: Vec<String> = (0..50).map(|index| format!("f-{index:02}.txt")).collect();
+    verbs_stage::add(&mut ctx, &adds).expect("add all");
+    verbs_history::commit(&mut ctx, &["-m".to_owned(), "seed".to_owned()]).expect("commit");
+    {
+        let rows =
+            super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+                .expect("scan");
+        let mut zeros = 0;
+        for (_, stage, entry) in &rows {
+            if *stage == ruk_core::index::Stage::Zero {
+                zeros += 1;
+                assert!(entry.stat().is_some(), "stage-zero row lacks stat");
+            }
+        }
+        assert_eq!(zeros, 50);
+    }
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("status");
+    assert!(out.is_empty(), "clean status not empty: {out:?}");
+    let out = run(verbs_history::diff, &mut ctx, &[]).expect("diff");
+    assert!(out.is_empty(), "clean diff not empty: {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_l_stat_cache_touch_stays_clean_edit_reports_modified() {
+    let (root, env) = seeded_repo("wave-l-statcache-dirty", "note.txt", b"one\ntwo\n");
+    let mut ctx = repo_ctx(&root, env);
+    // Same bytes rewritten: the mtime moves but the content hashes clean.
+    std::fs::write(root.join("note.txt"), b"one\ntwo\n").expect("touch");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("status");
+    assert!(
+        out.is_empty(),
+        "touch reported dirty: {}",
+        String::from_utf8_lossy(&out)
+    );
+    // A real edit reports an unstaged modification naming the path.
+    std::fs::write(root.join("note.txt"), b"one\nTWO\n").expect("edit");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("status");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        text.contains('M') && text.contains("note.txt"),
+        "edit missed: {text}"
+    );
+    let out = run(verbs_history::diff, &mut ctx, &[]).expect("diff");
+    assert!(
+        String::from_utf8_lossy(&out).contains("note.txt"),
+        "diff missed the edit"
+    );
+    // `commit -a` refreshes the row; the tree goes clean and carries stat.
+    run(verbs_history::commit, &mut ctx, &["-a", "-m", "edit"]).expect("commit -a");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("status");
+    assert!(
+        out.is_empty(),
+        "post-commit status not empty: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let rows = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("scan");
+    let Some(row) = rows.iter().find(|(path, stage, _)| {
+        path.as_bytes() == b"note.txt" && *stage == ruk_core::index::Stage::Zero
+    }) else {
+        panic!("row for note.txt");
+    };
+    assert!(row.2.stat().is_some(), "refreshed row lacks stat");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_l_stat_cache_trust_rule() {
+    use ruk_core::index::{FileMode, IndexEntry, IndexFlags, StatData, StatTime};
+    let kind = HashKind::Sha1;
+    let stamp = StatTime {
+        secs: 1_700_000_000,
+        nanos: 0,
+    };
+    let stat = StatData {
+        ctime: stamp,
+        mtime: stamp,
+        dev: 7,
+        ino: 8,
+        uid: 9,
+        gid: 10,
+        size: 6,
+    };
+    let entry =
+        IndexEntry::for_blob(kind, FileMode::Regular, b"hello\n", Some(stat)).expect("entry");
+    let clean = |fresh: &StatData, mode: FileMode, stamp_secs: Option<i64>| {
+        matches!(
+            super::state::trust_index_entry(&entry, fresh, mode, stamp_secs),
+            super::state::StatTrust::Clean
+        )
+    };
+    assert!(clean(&stat, FileMode::Regular, Some(stamp.secs + 10)));
+    // An equal second is racy: the index write may share the file's second.
+    assert!(!clean(&stat, FileMode::Regular, Some(stamp.secs)));
+    assert!(!clean(&stat, FileMode::Regular, Some(stamp.secs - 10)));
+    assert!(!clean(&stat, FileMode::Regular, None));
+    let resized = StatData { size: 7, ..stat };
+    assert!(!clean(&resized, FileMode::Regular, Some(stamp.secs + 10)));
+    assert!(!clean(&stat, FileMode::Executable, Some(stamp.secs + 10)));
+    let intent = IndexEntry::intent_to_add(kind, FileMode::Regular, None).expect("intent");
+    assert!(matches!(
+        super::state::trust_index_entry(&intent, &stat, FileMode::Regular, Some(stamp.secs + 10)),
+        super::state::StatTrust::Rehash
+    ));
+    let oid = kind.hash_git_object("blob", b"hello\n").expect("oid");
+    let assumed = IndexEntry::new(
+        oid,
+        FileMode::Regular,
+        Some(stat),
+        IndexFlags {
+            assume_unchanged: true,
+            ..IndexFlags::default()
+        },
+    )
+    .expect("assumed");
+    assert!(matches!(
+        super::state::trust_index_entry(
+            &assumed,
+            &stat,
+            FileMode::Regular,
+            Some(stamp.secs + 10)
+        ),
+        super::state::StatTrust::Rehash
+    ));
+}

@@ -1022,6 +1022,7 @@ fn read_tree_empty(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     let (workspace, raw) = load_or_default(store)?;
     let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;
@@ -1129,6 +1130,7 @@ fn read_tree_merge(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     let (workspace, raw) = load_or_default(store)?;
     let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;
@@ -1755,6 +1757,7 @@ fn rerere_replay(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
         let mut all = mutations;
         all.push(workspace_mutation(raw.as_deref(), &next)?);
+        all.push(super::state::index_stamp_mutation()?);
         store.publish(Vec::new(), &all).map_err(GitError::from)?;
         out.extend_from_slice(
             format!(

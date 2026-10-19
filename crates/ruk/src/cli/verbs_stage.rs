@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ruk_core::ids::HashKind;
-use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
+use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage, StatData};
 use ruk_core::store::Store;
 use ruk_git::GitError;
 
@@ -96,6 +96,7 @@ pub(crate) fn add(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     Ok(Vec::new())
 }
@@ -162,7 +163,7 @@ fn stage_file(
             detail: format!("reading link {}: {err}", full.display()),
         })?;
         let bytes = target.as_os_str().as_encoded_bytes().to_vec();
-        return stage_bytes(ctx, kind, FileMode::Symlink, &bytes, fill);
+        return stage_bytes(ctx, kind, FileMode::Symlink, &bytes, fill, file_stat(&full, &meta));
     }
     let mode = file_mode_of(&meta);
     let bytes = read_worktree_file(&ctx.file_base, path.as_bytes())?;
@@ -174,23 +175,37 @@ fn stage_file(
             detail: format!("file {} exceeds the object bound", shown(path)),
         });
     }
-    stage_bytes(ctx, kind, mode, &bytes, fill)
+    stage_bytes(ctx, kind, mode, &bytes, fill, file_stat(&full, &meta))
+}
+
+/// Lstats `full` after its bytes were read so the stored tuple describes the
+/// hashed content, not a pre-read instant a concurrent edit could have
+/// moved past. A file that vanishes mid-stage keeps the pre-read tuple:
+/// staging still succeeds exactly as before, and the next scan rehashes.
+fn file_stat(full: &std::path::Path, meta: &std::fs::Metadata) -> Option<StatData> {
+    std::fs::symlink_metadata(full)
+        .ok()
+        .and_then(|fresh| super::state::stat_from_meta(&fresh).ok())
+        .or_else(|| super::state::stat_from_meta(meta).ok())
 }
 
 /// Builds the entry for staged bytes under one fill discipline and prepares
 /// the blob object for publication. Content fills always emit the object:
 /// the store deduplicates by OID at publish, so a known blob costs one
-/// prepared frame, never a second record.
+/// prepared frame, never a second record. The worktree lstat tuple travels
+/// with the entry so dirty scans can trust it; an unstattable file leaves
+/// the row stat-less and scans rehash, exactly as before.
 fn stage_bytes(
     ctx: &Ctx,
     kind: HashKind,
     mode: FileMode,
     bytes: &[u8],
     fill: AddFill,
+    stat: Option<StatData>,
 ) -> Result<(IndexEntry, Vec<ruk_core::store::PreparedObject>), GitError> {
     let entry = match fill {
-        AddFill::Content => IndexEntry::for_blob(kind, mode, bytes, None),
-        AddFill::Intent => IndexEntry::intent_to_add(kind, FileMode::Regular, None),
+        AddFill::Content => IndexEntry::for_blob(kind, mode, bytes, stat),
+        AddFill::Intent => IndexEntry::intent_to_add(kind, FileMode::Regular, stat),
     }
     .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
     match fill {
@@ -306,6 +321,7 @@ pub(crate) fn mv(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     mutations.extend(path_row_mutations(&dst, &before_dst, &after)?);
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     let src_file = join_base(&ctx.file_base, src.as_bytes())?;
     let dst_file = join_base(&ctx.file_base, dst.as_bytes())?;
     if let Some(parent) = dst_file.parent() {
@@ -385,6 +401,7 @@ pub(crate) fn rm(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;
@@ -544,6 +561,7 @@ pub(crate) fn update_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     Ok(Vec::new())
 }
@@ -1091,7 +1109,22 @@ pub(crate) fn status_plan_with_mode(
     let mut blobs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut unstaged = Vec::new();
     let mut untracked = Vec::new();
+    let stamp = super::state::read_index_stamp(store);
+    let mut index_entries: BTreeMap<Vec<u8>, &IndexEntry> = BTreeMap::new();
+    for (path, stage, entry) in &rows {
+        if *stage == Stage::Zero {
+            index_entries.insert(path.as_bytes().to_vec(), entry);
+        }
+    }
+    let mut present: HashSet<Vec<u8>> = HashSet::new();
     for entry in walk_worktree(&ctx.file_base)? {
+        present.insert(entry.path.clone());
+        let clean = index_entries
+            .get(&entry.path)
+            .is_some_and(|cached| is_stat_clean(ctx, cached, &entry.path, stamp));
+        if clean {
+            continue;
+        }
         let bytes = read_entry_bytes(ctx, &entry)?;
         blobs.insert(entry.path.clone(), bytes);
     }
@@ -1112,7 +1145,7 @@ pub(crate) fn status_plan_with_mode(
     }
     for (path, _, _) in &rows {
         let key = path.as_bytes().to_vec();
-        if !blobs.contains_key(&key) && !unmerged.contains_key(&key) {
+        if !present.contains(&key) && !unmerged.contains_key(&key) {
             unstaged.push((key, 'D'));
         }
     }
@@ -1534,6 +1567,35 @@ fn read_entry_bytes(ctx: &Ctx, entry: &WorktreeEntry) -> Result<Vec<u8>, GitErro
                 })
         }
     }
+}
+/// Reports whether the worktree file at `path` is proven unchanged by its
+/// index row: the cached tuple matches a fresh lstat and the file's mtime
+/// predates the index write stamp. Never fails: any lookup or stat error
+/// answers false and the caller hashes, exactly as without the cache.
+pub(crate) fn is_stat_clean(
+    ctx: &Ctx,
+    entry: &IndexEntry,
+    path: &[u8],
+    stamp: Option<i64>,
+) -> bool {
+    let Ok(full) = join_base(&ctx.file_base, path) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
+        return false;
+    };
+    let mode = if meta.file_type().is_symlink() {
+        FileMode::Symlink
+    } else {
+        file_mode_of(&meta)
+    };
+    let Ok(fresh) = super::state::stat_from_meta(&meta) else {
+        return false;
+    };
+    matches!(
+        super::state::trust_index_entry(entry, &fresh, mode, stamp),
+        super::state::StatTrust::Clean
+    )
 }
 
 /// Renders porcelain v1 lines (`## <branch>`, `XY <path>`,

@@ -24,7 +24,9 @@ use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::index::{FileMode, IndexEntry, PathEntries, RepoPath, Stage, row_delta};
+use ruk_core::index::{
+    FileMode, IndexEntry, PathEntries, RepoPath, Stage, StatData, StatTime, row_delta,
+};
 use ruk_core::records::Records;
 use ruk_core::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate, resolve,
@@ -236,6 +238,213 @@ pub(crate) fn path_row_mutations(
         });
     }
     Ok(mutations)
+}
+
+/// Index write-stamp key: wall-clock seconds of the last index-row mutation,
+/// written in the same publication as the rows (git's `.git/index` mtime).
+/// Dirty scans trust a matching stat tuple only when the file's mtime
+/// predates this stamp; an equal-or-newer mtime rehashes (racy-clean).
+const INDEX_STAMP_KEY: &[u8] = b"cli/index/stamp";
+
+/// Builds the index write-stamp mutation for the current wall time. Callers
+/// push exactly one per index publication, next to the workspace mutation:
+/// one publication carries one stamp key, and duplicate keys are rejected.
+///
+/// Required for every publication that writes rows carrying worktree stat
+/// (`add`, dirty-scan refreshes, post-write backfills): the stamp is the
+/// racy-clean floor those rows are trusted against. Publications of
+/// stat-less rows (checkouts and resets from trees, `--cacheinfo`) need no
+/// stamp since their rows always rehash; row-less publications must not
+/// stamp since that would only retire live cache entries early.
+pub(crate) fn index_stamp_mutation() -> Result<FactMutation, GitError> {
+    let value = sonic_rs::to_vec(&now_seconds()?).map_err(|err| GitError::Io {
+        detail: format!("index stamp encode: {err}"),
+    })?;
+    Ok(FactMutation {
+        table: FactTable::WsIndex,
+        key: INDEX_STAMP_KEY.to_vec(),
+        expected: FactExpectation::Any,
+        value: Some(value),
+    })
+}
+
+/// Reads the index write stamp: `None` for pre-upgrade stores or unreadable
+/// rows, where every dirty scan rehashes until the next index write stamps.
+pub(crate) fn read_index_stamp(store: &Store) -> Option<i64> {
+    let raw = store.fact(FactTable::WsIndex, INDEX_STAMP_KEY).ok()??;
+    sonic_rs::from_slice::<i64>(&raw).ok()
+}
+
+/// Captures a worktree path's lstat tuple without following symlinks, the
+/// way git stats the link itself. Device, inode, and owner stay zero off
+/// Unix; there the modification time stands in for a missing creation time,
+/// mirroring the workcopy stat cache.
+///
+/// # Errors
+/// [`GitError::Io`] when a filesystem timestamp does not fit the stat tuple.
+pub(crate) fn stat_from_meta(meta: &std::fs::Metadata) -> Result<StatData, GitError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let nanos = |value: i64, what: &str| {
+            u32::try_from(value).map_err(|_| GitError::Io {
+                detail: format!("filesystem reported a bad {what} time"),
+            })
+        };
+        Ok(StatData {
+            ctime: StatTime {
+                secs: meta.ctime(),
+                nanos: nanos(meta.ctime_nsec(), "creation")?,
+            },
+            mtime: StatTime {
+                secs: meta.mtime(),
+                nanos: nanos(meta.mtime_nsec(), "modification")?,
+            },
+            dev: meta.dev(),
+            ino: meta.ino(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            size: meta.len(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let convert = |time: std::time::SystemTime| -> Result<StatTime, GitError> {
+            let out_of_range = || GitError::Io {
+                detail: "filesystem reported a bad timestamp".to_owned(),
+            };
+            match time.duration_since(std::time::UNIX_EPOCH) {
+                Ok(after) => Ok(StatTime {
+                    secs: i64::try_from(after.as_secs()).map_err(|_| out_of_range())?,
+                    nanos: after.subsec_nanos(),
+                }),
+                Err(before) => {
+                    let back = before.duration();
+                    let secs =
+                        i64::try_from(back.as_secs()).map_err(|_| out_of_range())?;
+                    if back.subsec_nanos() == 0 {
+                        return Ok(StatTime { secs: -secs, nanos: 0 });
+                    }
+                    Ok(StatTime {
+                        secs: -secs - 1,
+                        nanos: 1_000_000_000 - back.subsec_nanos(),
+                    })
+                }
+            }
+        };
+        let mtime = meta
+            .modified()
+            .map_err(|err| GitError::Io {
+                detail: format!("reading a modification time: {err}"),
+            })
+            .and_then(convert)?;
+        let ctime = meta
+            .created()
+            .ok()
+            .map(convert)
+            .transpose()?
+            .unwrap_or(mtime);
+        Ok(StatData {
+            ctime,
+            mtime,
+            dev: 0,
+            ino: 0,
+            uid: 0,
+            gid: 0,
+            size: meta.len(),
+        })
+    }
+}
+
+/// What the stat cache says about one worktree file. A named type, never a flag.
+pub(crate) enum StatTrust {
+    /// The cached stat proves the bytes unchanged: skip the content read.
+    Clean,
+    /// Hash the bytes and compare, exactly as without the cache.
+    Rehash,
+}
+
+/// Applies the trust rule to an index row and a fresh lstat tuple: clean
+/// only when the row names real worktree state (no intent, assume-unchanged,
+/// or skip-worktree flags, no gitlink), the mode matches, the full tuple is
+/// unchanged, and the file's mtime predates the index write stamp. An
+/// equal-or-newer mtime rehashes: a same-second edit could otherwise keep
+/// the tuple unchanged (racy-clean). Missing stats or stamps always rehash.
+pub(crate) fn trust_index_entry(
+    entry: &IndexEntry,
+    fresh: &StatData,
+    mode: FileMode,
+    stamp_secs: Option<i64>,
+) -> StatTrust {
+    let flags = entry.flags();
+    if flags.intent_to_add || flags.assume_unchanged || flags.skip_worktree {
+        return StatTrust::Rehash;
+    }
+    if entry.mode() == FileMode::Gitlink || mode != entry.mode() {
+        return StatTrust::Rehash;
+    }
+    if entry.stat() != Some(*fresh) {
+        return StatTrust::Rehash;
+    }
+    match stamp_secs {
+        Some(stamp) if fresh.mtime.secs < stamp => StatTrust::Clean,
+        _ => StatTrust::Rehash,
+    }
+}
+
+/// Re-reads lstat data for freshly-written worktree paths into their
+/// stage-zero rows, so the next dirty scan trusts them. Paths without a
+/// stage-zero row, with an unchanged tuple, or that fail to stat keep
+/// their rows untouched; unmerged and gitlink rows are never rewritten.
+pub(crate) fn refresh_stats_after_write(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    paths: &[Vec<u8>],
+) -> Result<(), GitError> {
+    let (workspace, raw) = load_or_default(store)?;
+    let mut mutations = Vec::new();
+    for path_bytes in paths {
+        let Ok(path) = RepoPath::new(path_bytes.clone()) else {
+            continue;
+        };
+        let Ok(full) = super::tree::join_base(&ctx.file_base, path_bytes) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(&full) else {
+            continue;
+        };
+        let Ok(fresh) = stat_from_meta(&meta) else {
+            continue;
+        };
+        let before = read_path_rows(store, kind, &path)?;
+        if before
+            .iter()
+            .any(|(stage, _, _)| *stage != Stage::Zero)
+        {
+            continue;
+        }
+        let Some((_, entry, _)) = before.iter().find(|(stage, _, _)| *stage == Stage::Zero)
+        else {
+            continue;
+        };
+        if entry.mode() == FileMode::Gitlink || entry.stat() == Some(fresh) {
+            continue;
+        }
+        let next = IndexEntry::new(entry.oid(), entry.mode(), Some(fresh), entry.flags())
+            .map_err(to_core_invalid)?;
+        mutations.extend(path_row_mutations(&path, &before, &[(Stage::Zero, next)])?);
+    }
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    let next = workspace
+        .mutate_index(workspace.stamp)
+        .map_err(GitError::from)?;
+    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(index_stamp_mutation()?);
+    store.publish(Vec::new(), &mutations).map_err(GitError::from)?;
+    Ok(())
 }
 
 /// Scans every CLI index row in key order.

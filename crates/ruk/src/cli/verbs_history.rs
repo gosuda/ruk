@@ -477,20 +477,30 @@ fn refresh_tracked(ctx: &Ctx) -> Result<(), GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let (workspace, raw) = load_or_default(store)?;
+    let stamp = super::state::read_index_stamp(store);
     let mut mutations = Vec::new();
     let mut objects = Vec::new();
-    for (path, stage, _) in scan_index(store, kind)? {
+    for (path, stage, entry) in scan_index(store, kind)? {
         if stage != Stage::Zero {
+            continue;
+        }
+        if super::verbs_stage::is_stat_clean(ctx, &entry, path.as_bytes(), stamp) {
             continue;
         }
         let before = read_path_rows(store, kind, &path)?;
         match super::verbs_stage::stage_worktree_file(ctx, kind, &path) {
-            Ok((entry, staged)) => {
-                objects.extend(staged);
+            Ok((fresh, prepared)) => {
+                let unchanged = before
+                    .iter()
+                    .any(|(known, known_entry, _)| *known == Stage::Zero && *known_entry == fresh);
+                if unchanged {
+                    continue;
+                }
+                objects.extend(prepared);
                 mutations.extend(super::state::path_row_mutations(
                     &path,
                     &before,
-                    &[(Stage::Zero, entry)],
+                    &[(Stage::Zero, fresh)],
                 )?);
             }
             Err(GitError::Io { .. }) => {
@@ -504,6 +514,7 @@ fn refresh_tracked(ctx: &Ctx) -> Result<(), GitError> {
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     Ok(())
 }
@@ -4834,6 +4845,7 @@ fn apply_merge_plan(ctx: &Ctx, plan: &MergePlan) -> Result<Vec<(Vec<u8>, IndexEn
         .mutate_index(workspace.stamp)
         .map_err(|err| GitError::from(CoreError::from(err)))?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store
         .publish(prepared, &mutations)
         .map_err(GitError::from)?;
@@ -4845,6 +4857,7 @@ fn apply_merge_plan(ctx: &Ctx, plan: &MergePlan) -> Result<Vec<(Vec<u8>, IndexEn
 /// Nothing outside `writes` is listed, read, or touched.
 fn sync_lane_worktree(ctx: &Ctx, writes: &[(Vec<u8>, LaneWrite)]) -> Result<(), GitError> {
     let store = ctx.store()?;
+    let kind = ctx.kind()?;
     for (path, write) in writes {
         let full = super::tree::join_base(&ctx.file_base, path)?;
         match write {
@@ -4904,6 +4917,8 @@ fn sync_lane_worktree(ctx: &Ctx, writes: &[(Vec<u8>, LaneWrite)]) -> Result<(), 
             }
         }
     }
+    let written: Vec<Vec<u8>> = writes.iter().map(|(path, _)| path.clone()).collect();
+    super::state::refresh_stats_after_write(ctx, store, kind, &written)?;
     Ok(())
 }
 
@@ -5186,6 +5201,7 @@ fn restore_abort_index(ctx: &Ctx, verb: &str) -> Result<(), GitError> {
         .mutate_index(workspace.stamp)
         .map_err(|err| GitError::from(CoreError::from(err)))?;
     mutations.push(workspace_mutation(raw_ws.as_deref(), &next)?);
+    mutations.push(super::state::index_stamp_mutation()?);
     store
         .publish(Vec::new(), &mutations)
         .map_err(GitError::from)?;
@@ -7495,8 +7511,22 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
             );
         }
     }
+    let stamp = super::state::read_index_stamp(store);
+    let mut lookup: BTreeMap<Vec<u8>, &IndexEntry> = BTreeMap::new();
+    for (path, stage, entry) in &rows {
+        if *stage == Stage::Zero {
+            lookup.insert(path.as_bytes().to_vec(), entry);
+        }
+    }
     let mut pairs = Vec::new();
     for entry in super::tree::walk_worktree(&ctx.file_base)? {
+        let clean = lookup
+            .get(&entry.path)
+            .is_some_and(|cached| super::verbs_stage::is_stat_clean(ctx, cached, &entry.path, stamp));
+        if clean {
+            index_map.remove(&entry.path);
+            continue;
+        }
         let bytes = entry_bytes(ctx, &entry)?;
         match index_map.remove(&entry.path) {
             None => {
