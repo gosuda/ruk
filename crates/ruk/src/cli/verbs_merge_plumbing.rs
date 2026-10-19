@@ -582,11 +582,17 @@ pub(crate) fn merge_file_cmd(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, 
     Ok(Vec::new())
 }
 
-/// Builds the exit-1 conflict report; the markers already carry the detail.
-fn conflict_error(_merged: &[u8], path: &str) -> GitError {
-    GitError::Invalid {
-        detail: format!("merge-file: {path}: merged with conflicts"),
+/// Builds the exit-1 conflict report with the merged bytes inline (the
+/// interpreter drops stdout on failure, so markers ride in the detail).
+fn conflict_error(merged: &[u8], path: &str) -> GitError {
+    let mut detail = format!("merge-file: {path}: merged with conflicts\n");
+    if merged.len() > MAX_ERROR_MERGED {
+        detail.push_str(&String::from_utf8_lossy(&merged[..MAX_ERROR_MERGED]));
+        detail.push_str("\n[merge-file: output truncated]\n");
+    } else {
+        detail.push_str(&String::from_utf8_lossy(merged));
     }
+    GitError::Invalid { detail }
 }
 
 /// Largest conflict output embedded in an error detail.
