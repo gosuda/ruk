@@ -59,7 +59,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | cherry-pick | implemented | per-commit three-way replay (syntax lane, text fallback); `-n`, `-m`, `-x`; `--continue`/`--skip`/`--abort` over `CHERRY_PICK_HEAD` + todo state |
 | clean | implemented | `-f`/`-d`/`-n`/`-e`; `.rukignore` skipped by default, `-x` includes ignored, `-X` only ignored; files under untracked dirs need `-d` |
 | clone | implemented | local paths only; branches, tags, remote-tracking refs, `HEAD` branch, fetch refspec config; network sources are `Offline` |
-| commit | implemented | `-m` (required, no editor), `-a`, `--amend` via `ops::edit`; empty tree-matching commits refuse; concludes `MERGE_HEAD` merges with two parents |
+| commit | implemented | multi `-m`, `-a`, `--amend` (reuses `HEAD` message), `-F`, `--allow-empty`, `--allow-empty-message`, `-C`/`-c`, `--author`, `--date`, `--signoff`, `--squash`, `--fixup`, `--reset-author`, `--cleanup`, `--template`, `--dry-run`, `--status`/`--no-status`/`--no-edit`/`--verbose` no-op, `--no-verify` no-op, `--edit` with a source (unsupported alone); concludes `MERGE_HEAD` merges |
 | commit-tree | implemented | canonical payload, parents verified as stored commits |
 | config | implemented | `--local` scope only; `--global`/`--system`/`--worktree` are `Unsupported` |
 | count-objects | implemented | `<n> objects, <bytes>` from the store census, no payload I/O |
@@ -117,7 +117,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | show-ref | implemented | `--head`, `--verify`, `--tags`, `--heads`, patterns |
 | sparse-checkout | implemented | `init`/`set` (patterns, `--stdin`, `--no-reapply`)/`list`/`disable`/`reapply` over `.ruk/info/sparse-checkout` + `core.sparseCheckout`; out-of-cone stage-zero rows carry skip-worktree, worktree holds only matches; dirty rewrites refuse; `--cone` is `Unsupported`; branch-switch checkouts and `status` ignore the sparse set |
 | stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; oracle two-commit shape (index + `WIP` parents); apply refuses only staged or worktree changes on paths the stash touches |
-| status | implemented | `--porcelain`, `--short`, `--branch`, long format; staged renames always paired when identical, `-M` pairs by similarity staged and worktree |
+| status | implemented | `--porcelain=v1`/`v2`, `--short`, `--long`, `--branch`, `--null`, `-u`/`--untracked-files`, `--ignored`, `--show-stash`, `--ahead-behind`/`--no-ahead-behind`, `--renames`/`--find-renames`/`-M`/`--no-renames`, `-v`/`-vv` diffs, `--no-column`/`--ignore-submodules` no-op, `--column` unsupported; staged renames always paired when identical, `-M` pairs by similarity staged and worktree |
 | stripspace | implemented | trailing-blank collapse; `--strip-comments` |
 | submodule | implemented | `add` (local clone, gitlink + `.rukmodules`), `status` (`--cached`/`--recursive`), `init`, `deinit` (refuses dirty trees without `--force`), `update` (`--init`/`--recursive`/`--remote`), `summary`, `foreach` (`--recursive`); `absorbgitdirs` is `Unsupported` (child `.ruk` needs no gitdir absorption) |
 | switch | implemented | `-c`/`-C`, `--detach`, `--orphan`, `-t`/`--no-track`, `--guess`/`--no-guess`, `-f`, `-m`/`--conflict`, remote guess with tracking |

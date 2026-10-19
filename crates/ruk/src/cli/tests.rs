@@ -6867,3 +6867,302 @@ fn wave_j_diff_raw_rename_old_first() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 
 }
+/// Reads the message of the current `HEAD` commit.
+fn wave_j_head_message(ctx: &mut Ctx) -> String {
+    let store = ctx.store().expect("store");
+    let tip = super::state::head_oid(store).expect("head");
+    let record = super::state::commit_record(store, tip).expect("record");
+    String::from_utf8_lossy(record.message()).into_owned()
+}
+
+#[test]
+fn wave_j_commit_file_signoff_cleanup_template() {
+    let (root, env) = seeded_repo("wavej-commit-file", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let msg = root.join("msg.txt");
+    std::fs::write(&msg, b"# comment\nreal subject\n\nbody text\n").expect("msg");
+    let msg_arg = msg.to_str().expect("utf8").to_owned();
+    run(verbs_history::commit, &mut ctx, &[&"-F", &msg_arg, &"-s"]).expect("commit -F -s");
+    assert_eq!(
+        wave_j_head_message(&mut ctx),
+        "real subject\n\nbody text\n\nSigned-off-by: Ada <ada@example.invalid>\n"
+    );
+    // A `#` subject strips to empty under the default cleanup ...
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let err = run(verbs_history::commit, &mut ctx, &["-m", "# gone"]).expect_err("stripped");
+    assert!(err.to_string().contains("empty commit message"), "{err}");
+    // ... but verbatim keeps it, and templates seed the message as-is.
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "# keep me", "--cleanup=verbatim"],
+    )
+    .expect("verbatim");
+    assert_eq!(wave_j_head_message(&mut ctx), "# keep me\n");
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let tpl = root.join("tpl.txt");
+    std::fs::write(&tpl, b"templated\n").expect("template");
+    let tpl_arg = tpl.to_str().expect("utf8").to_owned();
+    run(verbs_history::commit, &mut ctx, &[&"--template", &tpl_arg]).expect("template");
+    assert_eq!(wave_j_head_message(&mut ctx), "templated\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_commit_squash_fixup_amend() {
+    let (root, env) = seeded_repo("wavej-squash", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let base =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
+    std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &[&"--fixup", &base]).expect("fixup");
+    assert_eq!(wave_j_head_message(&mut ctx), "fixup! seed\n\n");
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &[&"--squash", &base, &"-m", &"extra body"],
+    )
+    .expect("squash -m");
+    assert_eq!(
+        wave_j_head_message(&mut ctx),
+        "squash! seed\n\nextra body\n"
+    );
+    // A sourceless amend reuses the `HEAD` message like the oracle's editor
+    // seed; `--reset-author` renews authorship on the same path.
+    run(verbs_history::commit, &mut ctx, &["--amend"]).expect("amend");
+    assert_eq!(
+        wave_j_head_message(&mut ctx),
+        "squash! seed\n\nextra body\n"
+    );
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["--amend", "--reset-author"],
+    )
+    .expect("reset-author");
+    assert_eq!(
+        wave_j_head_message(&mut ctx),
+        "squash! seed\n\nextra body\n"
+    );
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let fixup_arg = format!("--fixup=amend:{base}");
+    let err = run(verbs_history::commit, &mut ctx, &[fixup_arg.as_str(), "-m", "x"])
+        .expect_err("fixup amend -m");
+    assert!(err.to_string().contains("cannot be used together"), "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_commit_rejections() {
+    let (root, env) = seeded_repo("wavej-commit-reject", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let msg = root.join("msg.txt");
+    std::fs::write(&msg, b"file body\n").expect("msg");
+    let msg_arg = msg.to_str().expect("utf8").to_owned();
+    let err = run(verbs_history::commit, &mut ctx, &[&"-m", &"x", &"-F", &msg_arg])
+        .expect_err("-m -F");
+    assert!(err.to_string().contains("cannot be combined"), "{err}");
+    let err = run(verbs_history::commit, &mut ctx, &["-m", "x", "--reset-author"])
+        .expect_err("reset-author");
+    assert!(
+        err.to_string().contains("only with -C, -c or --amend"),
+        "{err}"
+    );
+    let err = run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "x", "--reset-author", "--author=Bo <bo@example.invalid>"],
+    )
+    .expect_err("reset-author author");
+    assert!(err.to_string().contains("cannot be used together"), "{err}");
+    let err = run(verbs_history::commit, &mut ctx, &["--edit"]).expect_err("--edit");
+    assert!(err.to_string().contains("interactive editor"), "{err}");
+    // `--edit` with a message source is a no-op editor, not an error.
+    run(verbs_history::commit, &mut ctx, &["-m", "edited", "--edit"]).expect("edit -m");
+    assert_eq!(wave_j_head_message(&mut ctx), "edited\n");
+    let err = run(verbs_history::commit, &mut ctx, &["-m", "x", "--cleanup=bogus"])
+        .expect_err("cleanup");
+    assert!(err.to_string().contains("bad --cleanup"), "{err}");
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let err = run(verbs_history::commit, &mut ctx, &["-m", ""]).expect_err("empty");
+    assert!(err.to_string().contains("empty commit message"), "{err}");
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "", "--allow-empty-message"],
+    )
+    .expect("allow-empty-message");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_status_porcelain_v2_null() {
+    let (root, env) = seeded_repo("wavej-v2", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
+    std::fs::write(root.join("new.txt"), b"new\n").expect("untracked");
+    let out = run(
+        verbs_stage::status,
+        &mut ctx,
+        &["--porcelain=v2", "--branch"],
+    )
+    .expect("v2");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("# branch.head main\n"), "head: {text}");
+    assert!(text.contains("# branch.oid "), "oid: {text}");
+    assert!(!text.contains("# branch.upstream"), "no upstream: {text}");
+    assert!(text.contains("1 .M N... 100644 100644 100644 "), "ordinary: {text}");
+    assert!(text.contains(" f.txt\n"), "path: {text}");
+    assert!(text.contains("? new.txt\n"), "untracked: {text}");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain=v1", "--branch"])
+        .expect("v1");
+    assert!(
+        String::from_utf8_lossy(&out).contains("## main\n"),
+        "v1 branch"
+    );
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--null"])
+        .expect("null");
+    assert!(out.contains(&b'\0'), "NUL terminated");
+    assert!(!out.contains(&b'\n'), "no newlines: {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_status_untracked_ignored() {
+    let (root, env) = seeded_repo("wavej-untracked", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir_all(root.join("sub")).expect("mkdir");
+    std::fs::write(root.join("sub").join("a.txt"), b"a\n").expect("a");
+    std::fs::write(root.join("sub").join("b.txt"), b"b\n").expect("b");
+    std::fs::write(root.join("top.txt"), b"top\n").expect("top");
+    std::fs::write(root.join(".rukignore"), b"*.log\n").expect("ignore");
+    std::fs::write(root.join("debug.log"), b"log\n").expect("log");
+    // Default `normal` collapses the clean directory and hides ignored files.
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("normal");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("?? sub/\n"), "collapsed: {text}");
+    assert!(!text.contains("sub/a.txt"), "not listed: {text}");
+    assert!(text.contains("?? top.txt\n"), "top: {text}");
+    assert!(!text.contains("debug.log"), "hidden: {text}");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--ignored"])
+        .expect("ignored");
+    assert!(
+        String::from_utf8_lossy(&out).contains("!! debug.log\n"),
+        "ignored shown"
+    );
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "-uall"]).expect("all");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("?? sub/a.txt\n"), "all lists: {text}");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "-uno"]).expect("no");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("??"),
+        "hidden untracked"
+    );
+    let err = run(verbs_stage::status, &mut ctx, &["--porcelain", "-ubogus"])
+        .expect_err("bad mode");
+    assert!(err.to_string().contains("bad --untracked-files"), "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_status_ahead_behind_stash() {
+    let (root, env) = seeded_repo("wavej-ab", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    run(
+        verbs_branch::branch,
+        &mut ctx,
+        &["--set-upstream-to", "side"],
+    )
+    .expect("set upstream");
+    lane_commit(&mut ctx, &root, "g.txt", b"two\n", "ahead work");
+    let out = run(verbs_stage::status, &mut ctx, &[]).expect("long");
+    assert!(
+        String::from_utf8_lossy(&out).contains("Your branch is ahead of 'side' by 1 commit.\n"),
+        "tracking: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--branch"])
+        .expect("v1 branch");
+    assert!(
+        String::from_utf8_lossy(&out).contains("## main...side [ahead 1]\n"),
+        "v1 tracking"
+    );
+    let out = run(
+        verbs_stage::status,
+        &mut ctx,
+        &["--porcelain=v2", "--branch"],
+    )
+    .expect("v2 upstream");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("# branch.upstream side\n"), "upstream: {text}");
+    assert!(text.contains("# branch.ab +1 -0\n"), "ab: {text}");
+    let out = run(
+        verbs_stage::status,
+        &mut ctx,
+        &["--porcelain", "--branch", "--no-ahead-behind"],
+    )
+    .expect("no ab");
+    assert!(
+        String::from_utf8_lossy(&out).contains("## main...side\n"),
+        "suppressed"
+    );
+    std::fs::write(root.join("f.txt"), b"one\nwip\n").expect("modify");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    let out = run(verbs_stage::status, &mut ctx, &["--show-stash"]).expect("stash");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("nothing to commit, working tree clean\n"), "clean: {text}");
+    assert!(
+        text.contains("Your stash currently has 1 entry\n"),
+        "stash: {text}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_status_verbose_column_renames() {
+    let (root, env) = seeded_repo("wavej-verbose", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(verbs_stage::status, &mut ctx, &["--column"]).expect_err("column");
+    assert!(err.to_string().contains("--column"), "{err}");
+    std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let out = run(verbs_stage::status, &mut ctx, &["-v"]).expect("verbose");
+    assert!(
+        String::from_utf8_lossy(&out).contains("diff --git a/f.txt b/f.txt\n"),
+        "staged diff"
+    );
+    // Identical-blob staged moves pair; `--no-renames` keeps add+delete.
+    std::fs::write(root.join("g.txt"), b"one\ntwo\n").expect("copy");
+    run(verbs_stage::add, &mut ctx, &["g.txt"]).expect("add g");
+    run(verbs_stage::rm, &mut ctx, &["f.txt"]).expect("rm f");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("rename");
+    assert!(
+        String::from_utf8_lossy(&out).contains("R  f.txt -> g.txt\n"),
+        "paired: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--no-renames"])
+        .expect("no renames");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("R  "),
+        "unpaired: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
