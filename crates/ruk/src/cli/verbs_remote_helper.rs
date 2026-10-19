@@ -71,7 +71,9 @@
 //!   refuses before the helper is ever invoked unless `--force` is given.
 //! - An `import` batch naming only unknown or unexportable refs answers
 //!   `done` alone (an empty fast-import, a no-op), so cloning an empty
-//!   store warns instead of failing. `list` advertises only refs the
+//!   store warns instead of failing. Tag-only batches ride on a carrier
+//!   branch (`HEAD`'s, else the first) because the exporter needs a
+//!   named ref to hang history on. `list` advertises only refs the
 //!   exporter can emit (commits and tags peeling to commits); anything
 //!   else in the store stays invisible to the stock side.
 //! - `signed-tags` is not advertised, so pushes arrive with signatures
@@ -287,16 +289,35 @@ fn helper_alias(url: &str, remote: &str) -> String {
     "_".to_owned()
 }
 
-/// Maps one advertised ref to the name the `import` stream must carry:
-/// branch and tag tips move into the private namespace, everything else
-/// keeps its real name.
+/// Maps one advertised ref to the full name the `import` stream must
+/// carry for `commit`/`reset` lines: branches move under
+/// `refs/ruk/<alias>/heads/`, tags under `refs/tags/ruk/<alias>/`.
+///
+/// Bare tag names resolve against `refs/tags/` first, mirroring the
+/// importer (both emitters spell lightweight resets full but annotated
+/// tags short), so `reset refs/tags/v2` maps exactly like a bare tag
+/// would. `tag` command lines take a separate short spelling (see the
+/// `tag` arm in [`remap_stream`]): stock fast-import prefixes every
+/// `tag` name with `refs/tags/`, so only short names survive it.
 fn map_import_name(session: &HelperSession, name: &str) -> String {
-    for (prefix, kind) in [("refs/heads/", "heads"), ("refs/tags/", "tags")] {
-        if let Some(rest) = name.strip_prefix(prefix)
-            && !rest.is_empty()
-        {
-            return format!("refs/ruk/{}/{kind}/{rest}", session.alias);
-        }
+    let resolved;
+    let full = if name.starts_with("refs/") {
+        name
+    } else {
+        resolved = format!("refs/tags/{name}");
+        &resolved
+    };
+    if let Some(rest) = full
+        .strip_prefix("refs/heads/")
+        .filter(|rest| !rest.is_empty())
+    {
+        return format!("refs/ruk/{}/heads/{rest}", session.alias);
+    }
+    if let Some(rest) = full
+        .strip_prefix("refs/tags/")
+        .filter(|rest| !rest.is_empty())
+    {
+        return format!("refs/tags/ruk/{}/{rest}", session.alias);
     }
     name.to_owned()
 }
@@ -383,7 +404,7 @@ pub(crate) fn serve_commands<R: BufRead + Send, W: std::io::Write + Send>(
             writer
                 .write_all(
                     format!(
-                        "connect\nimport\nexport\nrefspec refs/heads/*:refs/ruk/{0}/heads/*\nrefspec refs/tags/*:refs/ruk/{0}/tags/*\noption\nobject-format\n\n",
+                        "connect\nimport\nexport\nrefspec refs/heads/*:refs/ruk/{0}/heads/*\nrefspec refs/tags/*:refs/tags/ruk/{0}/*\noption\nobject-format\n\n",
                         session.alias
                     )
                     .as_bytes(),
@@ -648,12 +669,48 @@ fn run_import_batch<R: BufRead, W: std::io::Write>(
         writer.flush().map_err(io_error)?;
         return Ok(());
     }
+    if !exportable.iter().any(|name| name.starts_with("refs/heads/")) {
+        // Tag-only batches name no exporting branch ref, which the
+        // exporter refuses: carry the tag history on the `HEAD` branch
+        // (else the first branch), whose commits land harmlessly in the
+        // private namespace while giving the tag blocks history to
+        // point at. No branches at all stays an honest error below.
+        if let Some(carrier) = carrier_branch(&store)? {
+            exportable.insert(0, carrier);
+        }
+    }
     let mut ctx = helper_ctx(session, store)?;
     let stream = verbs_fastio::fast_export(&mut ctx, &exportable)?;
     let stream = remap_stream(&stream, session)?;
     writer.write_all(&stream).map_err(io_error)?;
     writer.flush().map_err(io_error)?;
     Ok(())
+}
+
+/// Picks one branch to carry a tag-only batch: the `HEAD` target when
+/// it resolves to an exportable branch, else the first exportable
+/// branch in ref order.
+fn carrier_branch(store: &Store) -> Result<Option<String>, GitError> {
+    let (workspace, _) = load_or_default(store)?;
+    let mut candidates: Vec<String> = Vec::new();
+    if let ruk_core::workspace::HeadRef::Symbolic(name) = &workspace.head {
+        candidates.push(String::from_utf8_lossy(name.as_bytes()).into_owned());
+    }
+    for (name, target) in list_refs(store)? {
+        if !matches!(target, RefTarget::Direct(_)) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        if text.starts_with("refs/heads/") && !candidates.contains(&text) {
+            candidates.push(text);
+        }
+    }
+    for candidate in &candidates {
+        if let Some(resolved) = resolve_import_name(store, candidate)? {
+            return Ok(Some(resolved));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolves one `import` name to the full ref the exporter takes.
@@ -830,17 +887,42 @@ fn remap_stream(stream: &[u8], session: &HelperSession) -> Result<Vec<u8>, GitEr
             copy_data_slice(&mut cursor, text, &mut out)?;
             continue;
         }
+        // `commit` and `reset` lines take full refnames, which both
+        // importers accept verbatim; `tag` lines must stay short because
+        // stock fast-import prefixes the name with `refs/tags/` itself,
+        // so a full mapped tag name would land doubled.
         let mut rewritten = false;
-        for prefix in ["commit ", "reset ", "tag "] {
-            if let Some(name) = text.strip_prefix(prefix) {
-                let mapped = map_import_name(session, name);
-                if mapped != name {
-                    out.extend_from_slice(prefix.as_bytes());
-                    out.extend_from_slice(mapped.as_bytes());
-                    out.push(b'\n');
-                    rewritten = true;
-                }
-                break;
+        if let Some(name) = text
+            .strip_prefix("commit ")
+            .or_else(|| text.strip_prefix("reset "))
+        {
+            let prefix = if text.starts_with("commit ") {
+                "commit "
+            } else {
+                "reset "
+            };
+            let mapped = map_import_name(session, name);
+            if mapped != name {
+                out.extend_from_slice(prefix.as_bytes());
+                out.extend_from_slice(mapped.as_bytes());
+                out.push(b'\n');
+                rewritten = true;
+            }
+        } else if let Some(name) = text.strip_prefix("tag ") {
+            let rest = name.strip_prefix("refs/tags/").unwrap_or(name);
+            let in_tag_space =
+                !name.starts_with("refs/") || name.starts_with("refs/tags/");
+            let already = rest
+                .strip_prefix("ruk/")
+                .and_then(|tail| tail.strip_prefix(session.alias.as_str()))
+                .and_then(|tail| tail.strip_prefix('/'));
+            if in_tag_space && !rest.is_empty() && already.is_none() {
+                out.extend_from_slice(b"tag ");
+                out.extend_from_slice(
+                    format!("ruk/{}/{}", session.alias, rest).as_bytes(),
+                );
+                out.push(b'\n');
+                rewritten = true;
             }
         }
         if !rewritten {

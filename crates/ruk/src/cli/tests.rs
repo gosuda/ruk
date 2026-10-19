@@ -7897,7 +7897,7 @@ fn wave_k_remote_helper_capabilities() {
         .expect("capabilities");
     assert_eq!(
         out,
-        b"connect\nimport\nexport\nrefspec refs/heads/*:refs/ruk/test/heads/*\nrefspec refs/tags/*:refs/ruk/test/tags/*\noption\nobject-format\n\n"
+        b"connect\nimport\nexport\nrefspec refs/heads/*:refs/ruk/test/heads/*\nrefspec refs/tags/*:refs/tags/ruk/test/*\noption\nobject-format\n\n"
     );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -8085,7 +8085,7 @@ fn wave_k_remote_helper_verb_entry() {
         "caps first: {text:?}"
     );
     assert!(
-        text.contains("/heads/*\nrefspec refs/tags/*:refs/ruk/"),
+        text.contains("/heads/*\nrefspec refs/tags/*:refs/tags/ruk/"),
         "both refspecs: {text:?}"
     );
     assert!(text.contains("refs/heads/main\n"), "list follows: {text:?}");
@@ -8156,11 +8156,40 @@ fn wave_k_remote_helper_import_maps_heads_not_tags() {
         "branch mapped: {text:?}"
     );
     assert!(
-        text.contains("reset refs/ruk/test/tags/v1\n"),
+        text.contains("reset refs/tags/ruk/test/v1\n"),
         "lightweight tag rides the private namespace: {text:?}"
     );
     assert!(
         !text.contains("reset refs/tags/v1\n"),
+        "no bare tag name leaks: {text:?}"
+    );
+    assert!(text.ends_with("done\n"), "stream ends done: {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_import_maps_annotated_tags() {
+    let (root, env) = seeded_repo("wavek-helperatag", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env.clone());
+    run(verbs_branch::tag, &mut ctx, &["-a", "-m", "note", "v2"]).expect("annotated");
+    drop(ctx);
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"import refs/tags/v2\n\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("import");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("tag ruk/test/v2\n"),
+        "annotated tag mapped short: {text:?}"
+    );
+    assert!(
+        !text.contains("tag refs/tags/v2\n"),
         "no bare tag name leaks: {text:?}"
     );
     assert!(text.ends_with("done\n"), "stream ends done: {text:?}");
