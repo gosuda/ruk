@@ -2783,9 +2783,15 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         reachable.extend(visited.iter().copied());
         match commit {
             Some(commit) => commits.push(commit),
+            // A ref aimed past commits resolves to the chain's terminal
+            // oid (a tree through a tag, a blob, a tree itself): the
+            // terminal is reachable, and a terminal tree walks its subtree.
             None => {
-                if super::tree::read_object_bytes(store, tip)?.0 == ObjectKind::Tree {
-                    mark_tree(store, kind, tip, &mut reachable)?;
+                if let Some(&terminal) = visited.last() {
+                    if super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree
+                    {
+                        mark_tree(store, kind, terminal, &mut reachable)?;
+                    }
                 }
             }
         }
@@ -3108,9 +3114,6 @@ fn sync_via_batch(
     missing: &mut Vec<(String, String)>,
     mutations: &mut Vec<FactMutation>,
 ) -> Result<(), GitError> {
-    use ruk_core::store::lfs as sidecar;
-    use ruk_git::transport::http::{self, BatchEntry};
-
     let Some(endpoint) = ctx
         .config_get("lfs.url")
         .or_else(|| ctx.config_get("remote.origin.lfsurl"))
@@ -3325,7 +3328,7 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
 /// transfer the upload half of [`lfs_payload_sync`] runs).
 ///
 /// Best-effort by design: a non-`Full` policy, no batch endpoint
-/// (`lfs.url`, then `remote.<name>.lfsurl`, then `<push-url>/info/lfs` for
+/// (`lfs.url`, then `remote.<name>.lfsurl`, then `<fetch-url>/info/lfs` for
 /// http(s) remotes), or no outgoing pointers skip silently, and
 /// per-object misses go to stderr without failing the push that follows.
 /// Only a refused batch document itself fails.
