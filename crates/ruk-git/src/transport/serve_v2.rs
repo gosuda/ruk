@@ -73,11 +73,7 @@ fn corrupt(detail: impl Into<String>) -> GitError {
 /// ```
 #[must_use]
 pub fn git_protocol_requests_v2(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        value
-            .split(':')
-            .any(|token| token.trim() == "version=2")
-    })
+    value.is_some_and(|value| value.split(':').any(|token| token.trim() == "version=2"))
 }
 
 /// The v2 capability advertisement this server speaks: `agent`, `ls-refs`
@@ -309,10 +305,7 @@ fn check_object_format(format: Option<&[u8]>, kind: HashKind) -> Result<(), GitE
         b"sha256" => HashKind::Sha256,
         _ => {
             return Err(GitError::ObjectFormat {
-                detail: format!(
-                    "client uses unknown object format {}",
-                    value.escape_ascii()
-                ),
+                detail: format!("client uses unknown object format {}", value.escape_ascii()),
             });
         }
     };
@@ -451,16 +444,17 @@ fn peel_tag(store: &Store, oid: Oid, kind: HashKind) -> Result<Option<Oid>, GitE
         }
         current = next;
     }
-    Err(corrupt(format!("tag {oid} nests deeper than {MAX_TAG_DEPTH}")))
+    Err(corrupt(format!(
+        "tag {oid} nests deeper than {MAX_TAG_DEPTH}"
+    )))
 }
 
 /// The OID a tag object points at: the hex after its `object ` header line.
 fn parse_tag_target(bytes: &[u8], kind: HashKind) -> Result<Option<Oid>, GitError> {
     for line in bytes.split(|b| *b == b'\n') {
         if let Some(hex) = line.strip_prefix(b"object ") {
-            let text = std::str::from_utf8(hex).map_err(|_| {
-                corrupt(format!("tag target is not ASCII: {}", hex.escape_ascii()))
-            })?;
+            let text = std::str::from_utf8(hex)
+                .map_err(|_| corrupt(format!("tag target is not ASCII: {}", hex.escape_ascii())))?;
             return parse_oid_for(text, kind)
                 .map(Some)
                 .map_err(|err| match err {
@@ -837,25 +831,36 @@ mod tests {
         script.extend_from_slice(&frame(b"unborn\n"));
         script.extend_from_slice(b"0000");
         let mut out = Vec::new();
-        serve_upload_pack_v2(&script[..], &mut out, &store, kind, &unborn, &Interrupt::none())
-            .expect("serve");
+        serve_upload_pack_v2(
+            &script[..],
+            &mut out,
+            &store,
+            kind,
+            &unborn,
+            &Interrupt::none(),
+        )
+        .expect("serve");
         let mut pkt = past_advertisement(&out, kind);
         let refs = super::super::refadv::read_ls_refs(&mut pkt, kind).expect("ls-refs");
         assert_eq!(refs.len(), 1, "only the unborn HEAD: {refs:?}");
         assert_eq!(refs[0].name, b"HEAD");
         assert_eq!(refs[0].oid, None);
-        assert_eq!(
-            refs[0].symref_target,
-            Some(b"refs/heads/main".to_vec())
-        );
+        assert_eq!(refs[0].symref_target, Some(b"refs/heads/main".to_vec()));
         // Without `unborn` the empty repository lists nothing.
         let mut bare = Vec::new();
         bare.extend_from_slice(&frame(b"command=ls-refs\n"));
         bare.extend_from_slice(b"0001");
         bare.extend_from_slice(b"0000");
         let mut out = Vec::new();
-        serve_upload_pack_v2(&bare[..], &mut out, &store, kind, &unborn, &Interrupt::none())
-            .expect("serve");
+        serve_upload_pack_v2(
+            &bare[..],
+            &mut out,
+            &store,
+            kind,
+            &unborn,
+            &Interrupt::none(),
+        )
+        .expect("serve");
         let mut pkt = past_advertisement(&out, kind);
         let refs = super::super::refadv::read_ls_refs(&mut pkt, kind).expect("ls-refs");
         assert!(refs.is_empty(), "silent unborn HEAD: {refs:?}");
@@ -865,9 +870,8 @@ mod tests {
     fn ls_refs_peels_annotated_tags() {
         let kind = HashKind::Sha1;
         let store = server_store();
-        let tag_bytes = format!(
-            "object {FOUR}\ntype commit\ntag v1\ntagger test <t@t> 0 +0000\n\nv1\n"
-        );
+        let tag_bytes =
+            format!("object {FOUR}\ntype commit\ntag v1\ntagger test <t@t> 0 +0000\n\nv1\n");
         let prepared = store
             .prepare(
                 ObjectKind::Tag,
@@ -877,9 +881,7 @@ mod tests {
             )
             .expect("prepare tag");
         let tag_oid = prepared.oid();
-        store
-            .publish(vec![prepared], &[])
-            .expect("publish tag");
+        store.publish(vec![prepared], &[]).expect("publish tag");
         set_ref(&store, kind, b"refs/tags/v1", tag_oid);
         let out = serve_session(&ls_refs_command(&[]), &store, kind);
         let mut pkt = past_advertisement(&out, kind);
@@ -935,8 +937,15 @@ mod tests {
             !sections.staged.contains(oid(THREE)),
             "the offered have stays out of the pack"
         );
-        verify_closure(&dest, &sections.staged, &[oid(FOUR)], None, &[], &Interrupt::none())
-            .expect("closure verifies");
+        verify_closure(
+            &dest,
+            &sections.staged,
+            &[oid(FOUR)],
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("closure verifies");
     }
 
     #[test]
@@ -948,9 +957,7 @@ mod tests {
         let mut script = Vec::new();
         script.extend_from_slice(&frame(b"command=fetch\n"));
         script.extend_from_slice(b"0001");
-        script.extend_from_slice(&frame(
-            format!("want {FOUR}\n").as_bytes(),
-        ));
+        script.extend_from_slice(&frame(format!("want {FOUR}\n").as_bytes()));
         script.extend_from_slice(&frame(format!("have {THREE}\n").as_bytes()));
         script.extend_from_slice(b"0000");
         let caps = server_capabilities(kind);
@@ -1058,10 +1065,7 @@ mod tests {
             &Interrupt::none(),
         )
         .expect_err("format mismatch");
-        assert!(
-            matches!(err, GitError::ObjectFormat { .. }),
-            "got {err:?}"
-        );
+        assert!(matches!(err, GitError::ObjectFormat { .. }), "got {err:?}");
     }
 
     #[test]
@@ -1086,7 +1090,14 @@ mod tests {
             &Interrupt::none(),
         )
         .expect("full history served");
-        verify_closure(&dest, &sections.staged, &[oid(FOUR)], None, &[], &Interrupt::none())
-            .expect("closure verifies");
+        verify_closure(
+            &dest,
+            &sections.staged,
+            &[oid(FOUR)],
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("closure verifies");
     }
 }

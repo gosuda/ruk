@@ -458,13 +458,10 @@ pub(crate) static VERBS: &[Verb] = &[
 /// match always wins and the fallback can never shadow one.
 #[must_use]
 pub(crate) fn lookup(name: &str) -> Option<&'static Verb> {
-    VERBS
-        .iter()
-        .find(|verb| verb.name == name)
-        .or_else(|| {
-            name.strip_prefix("git-")
-                .and_then(|rest| VERBS.iter().find(|verb| verb.name == rest))
-        })
+    VERBS.iter().find(|verb| verb.name == name).or_else(|| {
+        name.strip_prefix("git-")
+            .and_then(|rest| VERBS.iter().find(|verb| verb.name == rest))
+    })
 }
 
 /// Renders `ruk version`.

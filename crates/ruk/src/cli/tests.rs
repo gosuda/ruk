@@ -1190,25 +1190,17 @@ fn serve_argv_maps_ssh_argv0_and_ruk_spellings() {
     }
     // `ruk upload-pack <dir>` (and `git upload-pack <dir>`) from a shell.
     for prog in ["ruk", "git"] {
-        let argv = vec![
-            prog.to_owned(),
-            "upload-pack".to_owned(),
-            "repo".to_owned(),
-        ];
+        let argv = vec![prog.to_owned(), "upload-pack".to_owned(), "repo".to_owned()];
         assert_eq!(super::serve_argv(&argv).expect("plain spelling"), argv);
     }
     // Untouched: ordinary verbs and the `ruk git` path keep their dispatch.
     assert!(super::serve_argv(&["ruk".to_owned(), "status".to_owned()]).is_none());
     assert!(super::serve_argv(&["ruk".to_owned()]).is_none());
     assert!(super::serve_argv(&[]).is_none());
-    assert!(super::serve_argv(
-        &[
-            "ruk".to_owned(),
-            "git".to_owned(),
-            "upload-pack".to_owned()
-        ]
-    )
-    .is_none());
+    assert!(
+        super::serve_argv(&["ruk".to_owned(), "git".to_owned(), "upload-pack".to_owned()])
+            .is_none()
+    );
     // Dashed names resolve through the dispatch table like `git.c`.
     for (dashed, plain) in [
         ("git-upload-pack", "upload-pack"),
