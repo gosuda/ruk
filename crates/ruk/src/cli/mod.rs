@@ -23,6 +23,7 @@
 //! `commands[]`) and `git/builtin/<verb>.c` per verb, named in each
 //! `verbs_*` header and in `STATUS.md`.
 
+pub(crate) mod coordinator;
 pub(crate) mod dispatch;
 pub(crate) mod rename;
 pub(crate) mod state;
@@ -343,6 +344,14 @@ pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8
     }
     if verb == "--version" || verb == "-v" {
         return Ok((dispatch::version_text(), Vec::new()));
+    }
+    // Hidden sidecar verb: `ruk coordinator <repo>` serves one repository's
+    // commit lane. It stays out of the advertised table (and its count) the
+    // way git keeps its dashed server commands off `git help`.
+    if verb == "coordinator" {
+        let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, false)?;
+        let stdout = coordinator::serve(&mut ctx, &verb_args)?;
+        return Ok((stdout, std::mem::take(&mut ctx.stderr)));
     }
     let entry = dispatch::lookup(&verb).ok_or_else(|| GitError::Unsupported {
         command: verb.clone(),
