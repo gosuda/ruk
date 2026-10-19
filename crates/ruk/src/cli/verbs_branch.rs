@@ -2231,9 +2231,9 @@ fn switch_orphan(ctx: &mut Ctx, name: &str, quiet: bool) -> Result<Vec<u8>, GitE
             detail: format!("branch {name:?} already exists"),
         });
     }
-    let empty = kind
-        .hash_git_object("tree", b"")
-        .map_err(|err| GitError::from(CoreError::from(err)))?;
+    // The empty tree hashes without existing: store it so the index reset
+    // below can read it back.
+    let empty = store_object(store, ruk_core::store::ObjectKind::Tree, Vec::new())?;
     let (workspace, raw) = load_or_default(store)?;
     let next = workspace.checkout(workspace.stamp, HeadRef::Symbolic(branch_name(name)?))?;
     let mut mutations = reset_index_to(store, kind, empty)?;
@@ -2524,11 +2524,18 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     }
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let (rev, paths) = match opts.positionals.as_slice() {
-        [] => (None, &[][..]),
-        [single] if single == "--" => (None, &[][..]),
-        [single] => (Some(single.clone()), &[][..]),
-        [first, rest @ ..] if *first == *"--" => (None, rest),
+    // `collect` strips `--`, so count the raw argv tokens after it: when
+    // every positional follows `--` the whole list is paths, and a revision
+    // is only taken when a positional precedes the separator.
+    let paths_after = args
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(0, |at| args.len() - at - 1);
+    let positionals = opts.positionals.as_slice();
+    let (rev, paths): (Option<String>, &[String]) = match positionals {
+        [] => (None, &[]),
+        _ if paths_after == positionals.len() => (None, positionals),
+        [single] => (Some(single.clone()), &[]),
         [first, rest @ ..] => (Some(first.clone()), rest),
     };
     if !paths.is_empty() {
