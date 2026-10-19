@@ -26,6 +26,10 @@ gix-transport = { version = "=0.61.0" }
 gix-ref = { version = "=0.69.0" }
 gix-url = { version = "=0.40.0" }
 flate2 = { version = "=1.1.10" }
+# Zip archives (`ruk archive --format=zip`): writer only (stored + deflate
+# through the already-pinned flate2); none of the aes/bzip2/lzma/ppmd/zstd
+# readers the default feature set would pull in.
+zip = { version = "=9.0.5", default-features = false, features = ["deflate-flate2"] }
 memmap2 = { version = "=0.9.11" }
 bstr = { version = "=1.13.1", default-features = false, features = ["std"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
