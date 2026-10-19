@@ -41,7 +41,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | verb | status | notes |
 | --- | --- | --- |
 | add | implemented | explicit paths, `-u`, `-A`, `-N`; worktree bytes hashed per file |
-| archive | unsupported | no archive writer in this slice |
+| archive | implemented | `--format=tar` (server default) and `--format=zip` (client-side transcode of the tar); `--prefix`, `-o`, path limits |
 | branch | implemented | list/create/delete/rename; `-d` checks ancestry, `-D` forces |
 | bundle | unsupported | no bundle format in this slice |
 | cat-file | implemented | `-p`, `-t`, `-s`, `-e` over the bounded object reader |
