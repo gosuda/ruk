@@ -23,7 +23,7 @@
 //! walk; `-L :<funcname>` and `/regex/` ranges are rejected with the
 //! accepted shapes named.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ruk_core::commit::CommitRecord;
 use ruk_core::heads::Head;
@@ -305,8 +305,20 @@ fn blame_committed(
     let mut queue: Vec<usize> = (0..tip_lines.len()).collect();
     let mut current_lines = tip_lines.clone();
     let mut commit = tip;
+    // Replace refs redirect every read (`commit_record` maps the replaced
+    // oid to its replacement) while the walk advances through raw parent
+    // oids. When a replacement's own history reaches back to the replaced
+    // oid (first replaced by its child second, whose parent is first), the
+    // raw parent re-redirects to the replacement and the same commits
+    // revisit forever. Stop on the second visit and attribute leftovers to
+    // the effective (redirected) commit.
+    let mut visited: HashSet<Oid> = HashSet::new();
 
     loop {
+        if !visited.insert(commit) {
+            assign_remaining(&mut origins, &queue, replace_redirect(store, commit));
+            break;
+        }
         let record = commit_record(store, commit)?;
         let Some(parent) = first_parent_oid(&record) else {
             // Root commit: everything still unassigned entered here, at
