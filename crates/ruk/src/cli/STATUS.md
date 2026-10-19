@@ -81,7 +81,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | index-pack | implemented | ingest plus publication with commit-record facts; `-v`, `--stdin`; no `.idx` (the store keeps no loose/pack split); thin bases must already be committed |
 | init | implemented | `--object-format`, `--bare`, reinit; unborn `HEAD` on `refs/heads/main` |
 | interpret-trailers | implemented | trailer-block parse; `--only-trailers`/`--only-input`/`--parse`/`--unfold`/`--trailer`/`--where`/`--key` |
-| log | implemented | `--oneline`, `-n`/`--max-count` |
+| log | implemented | `--oneline`, `-n`/`--max-count`, `--follow`, `-S`/`-G`, `--merges`/`--no-merges`, `--first-parent`, `--left-right`/`--cherry-pick` (symmetric ranges), `--topo-order`/`--date-order`, `--date`/`--relative-date`, `--abbrev[=N]`, `%P`/`%T`/`%S`, `--pretty=full`/`fuller`/`email`/`raw`, `--summary`/`--shortstat`/`--numstat`/`--dirstat`, `--show-notes`/`--no-notes`, `--decorate=short`/`full`/`no`, `--source`, `--simplify-by-decoration`, `--branches`/`--tags`/`--remotes`/`--exclude`, `--all`, `--boundary` |
 | ls-files | implemented | `-s`, `-u`, `--others`, `--error-unmatch` |
 | ls-remote | implemented | local, `ssh://`, `git://`, smart-http v2→v0, dumb-http text fallback |
 | ls-tree | implemented | `-r`, `--name-only`; gitlinks report as commits |

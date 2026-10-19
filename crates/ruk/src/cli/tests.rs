@@ -5896,6 +5896,348 @@ fn fastio_request_pull_template() {
     assert!(err.to_string().contains("request-pull -p"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+// Wave J (LogFlags): `log` flag parity.
+// ---------------------------------------------------------------------------
+
+/// Builds a three-commit repo: seed, a one-line change, and a new file.
+fn log_flags_repo(case: &str) -> (PathBuf, CliEnv) {
+    let (root, env) = seeded_repo(case, "a.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env.clone());
+    lane_commit(&mut ctx, &root, "a.txt", b"one\ntwo\n", "add two");
+    lane_commit(&mut ctx, &root, "b.txt", b"bee\n", "add b");
+    (root, env)
+}
+
+#[test]
+fn log_merges_filter() {
+    let (root, env) = log_flags_repo("logflags-merges");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::checkout, &mut ctx, &["-b", "feature"]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "f.txt", b"feat\n", "feature work");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    lane_commit(&mut ctx, &root, "m.txt", b"main\n", "main work");
+    run(verbs_history::merge, &mut ctx, &["feature"]).expect("merge");
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--merges"])
+        .expect("merges");
+    assert_eq!(String::from_utf8_lossy(&out).lines().count(), 1);
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--no-merges"])
+        .expect("no-merges");
+    assert_eq!(String::from_utf8_lossy(&out).lines().count(), 5);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_pickaxe_s_and_g() {
+    let (root, env) = log_flags_repo("logflags-pickaxe");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "-S", "two"]).expect("-S");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("add two"), "got {text}");
+    assert!(!text.contains("add b"), "got {text}");
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "-G", "bee"]).expect("-G");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("add b"), "got {text}");
+    assert!(!text.contains("add two"), "got {text}");
+    let err = run(verbs_history::log, &mut ctx, &["-G", "(["]).expect_err("bad -G");
+    assert!(err.to_string().contains("bad -G regex"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_first_parent_hides_side_branch() {
+    let (root, env) = log_flags_repo("logflags-firstparent");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "s.txt", b"side\n", "side work");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    lane_commit(&mut ctx, &root, "m.txt", b"main\n", "main work");
+    run(verbs_history::merge, &mut ctx, &["side"]).expect("merge");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--first-parent"],
+    )
+    .expect("first-parent");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(!text.contains("side work"), "got {text}");
+    assert!(text.contains("main work"), "got {text}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_format_placeholders_and_colon_alias() {
+    let (root, env) = log_flags_repo("logflags-format");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--format:%H %P %T %s"],
+    )
+    .expect("format colon");
+    let line = String::from_utf8_lossy(&out).into_owned();
+    let fields: Vec<&str> = line.trim().split(' ').collect();
+    assert!(fields.len() >= 4, "got {line}");
+    assert!(fields[0].len() >= 40, "got {line}");
+    assert!(fields[2].len() >= 40, "got {line}");
+    assert!(line.contains("add b"), "got {line}");
+    let out = run(verbs_history::log, &mut ctx, &["--format=%h %s", "-n", "1"])
+        .expect("format eq");
+    assert!(
+        String::from_utf8_lossy(&out).contains("add b"),
+        "got {:?}",
+        out
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_pretty_shapes() {
+    let (root, env) = log_flags_repo("logflags-pretty");
+    let mut ctx = repo_ctx(&root, env);
+    for (flag, marker) in [
+        ("--pretty=full", "Commit: "),
+        ("--pretty=fuller", "CommitDate: "),
+        ("--pretty=email", "Subject: [PATCH]"),
+        ("--pretty=raw", "\ntree "),
+    ] {
+        let out = run(verbs_history::log, &mut ctx, &[flag, "-n", "1"]).expect(flag);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains(marker), "{flag} got {text}");
+    }
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_extra_stat_shapes() {
+    let (root, env) = log_flags_repo("logflags-stat");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_history::log, &mut ctx, &["--numstat", "-n", "1"]).expect("numstat");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("\tb.txt"), "got {text}");
+    let out =
+        run(verbs_history::log, &mut ctx, &["--shortstat", "-n", "1"]).expect("shortstat");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("1 file changed"), "got {text}");
+    let out = run(verbs_history::log, &mut ctx, &["--summary", "-n", "1"]).expect("summary");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("create mode"), "got {text}");
+    let out = run(verbs_history::log, &mut ctx, &["--dirstat", "-n", "1"]).expect("dirstat");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains('%'), "got {text}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_date_shapes_and_abbrev() {
+    let (root, env) = log_flags_repo("logflags-date");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--format=%ad", "--date=short", "-n", "1"],
+    )
+    .expect("date short");
+    let text = String::from_utf8_lossy(&out).trim().to_owned();
+    assert_eq!(text.len(), 10, "got {text}");
+    assert_eq!(text.as_bytes()[4], b'-', "got {text}");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--format=%ad", "--relative-date", "-n", "1"],
+    )
+    .expect("relative");
+    assert!(
+        String::from_utf8_lossy(&out).contains("ago"),
+        "got {:?}",
+        out
+    );
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--abbrev=12", "-n", "1"],
+    )
+    .expect("abbrev");
+    let line = String::from_utf8_lossy(&out).into_owned();
+    assert_eq!(line.split(' ').next().map(str::len), Some(12), "got {line}");
+    let err = run(verbs_history::log, &mut ctx, &["--date=bogus"]).expect_err("bad date");
+    assert!(err.to_string().contains("bad --date"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_follow_tracks_rename() {
+    let (root, env) = seeded_repo("logflags-follow", "old.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "old.txt", b"v1\nv2\n", "grow old");
+    std::fs::rename(root.join("old.txt"), root.join("new.txt")).expect("rename");
+    run(verbs_stage::add, &mut ctx, &["new.txt"]).expect("add new");
+    run(verbs_stage::rm, &mut ctx, &["old.txt"]).expect("rm old");
+    run(verbs_history::commit, &mut ctx, &["-m", "rename old to new"]).expect("commit");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--follow", "--", "new.txt"],
+    )
+    .expect("follow");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("grow old"), "got {text}");
+    assert!(text.contains("rename old to new"), "got {text}");
+    let err = run(verbs_history::log, &mut ctx, &["--follow"]).expect_err("follow needs path");
+    assert!(err.to_string().contains("--follow"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_source_and_left_right() {
+    let (root, env) = log_flags_repo("logflags-source");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "s.txt", b"side\n", "side work");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    lane_commit(&mut ctx, &root, "m.txt", b"main\n", "main work");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--format=%H %S %s", "main...side"],
+    )
+    .expect("symmetric source");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains(" side "), "got {text}");
+    assert!(text.contains(" main "), "got {text}");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--left-right", "main...side"],
+    )
+    .expect("left-right");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.lines().any(|line| line.starts_with('<')), "got {text}");
+    assert!(text.lines().any(|line| line.starts_with('>')), "got {text}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_branches_tags_exclude() {
+    let (root, env) = log_flags_repo("logflags-refs");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::branch, &mut ctx, &["kept"]).expect("branch kept");
+    run(verbs_branch::tag, &mut ctx, &["v1"]).expect("tag");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--branches=ke*"],
+    )
+    .expect("branches glob");
+    assert!(
+        String::from_utf8_lossy(&out).contains("add b"),
+        "got {:?}",
+        out
+    );
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--tags"]).expect("tags");
+    assert!(
+        String::from_utf8_lossy(&out).contains("add b"),
+        "got {:?}",
+        out
+    );
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "s.txt", b"side\n", "side work");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--all"]).expect("all");
+    assert!(
+        String::from_utf8_lossy(&out).contains("side work"),
+        "got {:?}",
+        out
+    );
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--all", "--exclude=refs/heads/side"],
+    )
+    .expect("exclude side");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("side work"),
+        "got {:?}",
+        out
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_notes_boundary_decorate() {
+    let (root, env) = log_flags_repo("logflags-notes");
+    let mut ctx = repo_ctx(&root, env);
+    let head = notes_tip(&mut ctx);
+    run(verbs_notes::notes, &mut ctx, &["add", "-m", "reviewed", head.as_str()])
+        .expect("note add");
+    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"])
+        .expect("show-notes");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("reviewed"), "got {text}");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--show-notes", "--no-notes", "-n", "1"],
+    )
+    .expect("no-notes");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("reviewed"),
+        "got {:?}",
+        out
+    );
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--decorate=full", "-n", "1"],
+    )
+    .expect("decorate full");
+    assert!(
+        String::from_utf8_lossy(&out).contains("refs/heads/main"),
+        "got {:?}",
+        out
+    );
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--boundary", "HEAD~1..HEAD"],
+    )
+    .expect("boundary");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.lines().any(|line| line.starts_with('-')), "got {text}");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--simplify-by-decoration"],
+    )
+    .expect("simplify");
+    assert_eq!(String::from_utf8_lossy(&out).lines().count(), 1, "got {:?}", out);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_topo_order_cherry_pick_smoke() {
+    let (root, env) = log_flags_repo("logflags-topo");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "s.txt", b"side\n", "side work");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    lane_commit(&mut ctx, &root, "m.txt", b"main\n", "main work");
+    for flag in ["--topo-order", "--date-order"] {
+        let out = run(verbs_history::log, &mut ctx, &["--oneline", flag]).expect(flag);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("side work"), "{flag} got {text}");
+        assert!(text.contains("add b"), "{flag} got {text}");
+    }
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--cherry-pick", "--left-right", "main...side"],
+    )
+    .expect("cherry-pick");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("side work"), "got {text}");
+    assert!(text.contains("main work"), "got {text}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
 
 #[test]
 fn wave_j_branch_copy_and_filters() {
