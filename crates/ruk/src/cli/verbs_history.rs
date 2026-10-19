@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use regex::bytes::Regex;
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::error::CoreError;
@@ -35,7 +36,6 @@ use ruk_core::merge::composed::route::{MergeOutcome, merge_file};
 use ruk_core::merge::syntax::grammar::{Cancel, GrammarRegistry, dispatch};
 use ruk_core::merge::syntax::registry_providers;
 use ruk_core::ops::{EditRequest, NewRequest, edit as ops_edit, new as ops_new};
-use regex::bytes::Regex;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::ObjectKind as MergeLaneObjectKind;
 use ruk_core::store::Store as MergeLaneStore;
@@ -46,10 +46,9 @@ use ruk_git::GitError;
 use super::state::{
     IdentityRole, SequencerState, WalkQueue, commit_record, head_oid, identity, is_ancestor,
     list_refs, load_or_default, merge_base as state_merge_base, merged_rows, now_seconds,
-    pseudo_delete,
-    pseudo_read, pseudo_read_oid, pseudo_write, read_path_rows, read_ref, replace_redirect,
-    resolve_rev, scan_index, sequencer_delete, sequencer_read, sequencer_write, walk_history,
-    walk_record, workspace_mutation,
+    pseudo_delete, pseudo_read, pseudo_read_oid, pseudo_write, read_path_rows, read_ref,
+    replace_redirect, resolve_rev, scan_index, sequencer_delete, sequencer_read, sequencer_write,
+    walk_history, walk_record, workspace_mutation,
 };
 use super::tree::{
     TreeMode, WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree,
@@ -473,7 +472,8 @@ fn check_reset_author(opts: &super::Collected) -> Result<(), GitError> {
             detail: "options '--reset-author' and '--author' cannot be used together".to_owned(),
         });
     }
-    let reused = opts.single("reuse-message")?.is_some() || opts.single("reedit-message")?.is_some();
+    let reused =
+        opts.single("reuse-message")?.is_some() || opts.single("reedit-message")?.is_some();
     if !opts.is_set("amend") && !reused {
         return Err(GitError::Invalid {
             detail: "--reset-author can be used only with -C, -c or --amend".to_owned(),
@@ -1119,7 +1119,9 @@ fn extract_word_arg(
 /// the repo-relative working directory, which [`collect`] cannot spell.
 /// Returns the kept args and the request: `Some(None)` is bare,
 /// `Some(Some(path))` carries the prefix.
-fn extract_relative_arg(args: &[String]) -> Result<(Vec<String>, Option<Option<String>>), GitError> {
+fn extract_relative_arg(
+    args: &[String],
+) -> Result<(Vec<String>, Option<Option<String>>), GitError> {
     let mut kept = Vec::with_capacity(args.len());
     let mut relative = None;
     for arg in args {
@@ -1199,10 +1201,8 @@ struct DiffExtras {
 /// never injects — keeps its exact behavior.
 fn inject_diff_extras(opts: &mut super::Collected, extras: DiffExtras) {
     if let Some(threshold) = extras.copies {
-        opts.present.insert(
-            "diff-copies".to_owned(),
-            vec![Some(threshold.to_string())],
-        );
+        opts.present
+            .insert("diff-copies".to_owned(), vec![Some(threshold.to_string())]);
     }
     match extras.word_mode {
         WordDiffMode::Off => {}
@@ -1211,10 +1211,8 @@ fn inject_diff_extras(opts: &mut super::Collected, extras: DiffExtras) {
                 .insert("diff-word".to_owned(), vec![Some("plain".to_owned())]);
         }
         WordDiffMode::Porcelain => {
-            opts.present.insert(
-                "diff-word".to_owned(),
-                vec![Some("porcelain".to_owned())],
-            );
+            opts.present
+                .insert("diff-word".to_owned(), vec![Some("porcelain".to_owned())]);
         }
     }
     // `--word-diff-regex=<regex>` arrives via its declared spec; a
@@ -1306,10 +1304,12 @@ fn diff_no_index(
             .map_err(|err| GitError::from(CoreError::from(err)))?;
         sides.push((mode, oid, bytes));
     }
-    let [(old_mode, old_oid, old_bytes), (new_mode, new_oid, new_bytes)] =
-        sides.try_into().map_err(|_: Vec<_>| GitError::Invalid {
-            detail: "usage: diff --no-index <path> <path>".to_owned(),
-        })?;
+    let [
+        (old_mode, old_oid, old_bytes),
+        (new_mode, new_oid, new_bytes),
+    ] = sides.try_into().map_err(|_: Vec<_>| GitError::Invalid {
+        detail: "usage: diff --no-index <path> <path>".to_owned(),
+    })?;
     if old_oid == new_oid && old_mode == new_mode {
         // Identical inputs: the oracle prints nothing (not even headers).
         return write_output_file(ctx, &opts, Vec::new());
@@ -1327,7 +1327,11 @@ fn diff_no_index(
         similarity: None,
         is_copy: false,
     };
-    write_output_file(ctx, &opts, render_pairs(ctx, std::slice::from_ref(&pair), &opts)?)
+    write_output_file(
+        ctx,
+        &opts,
+        render_pairs(ctx, std::slice::from_ref(&pair), &opts)?,
+    )
 }
 
 /// Resolves one revision with the spellings [`resolve_rev`] lacks: `@` for
@@ -1873,9 +1877,7 @@ fn parse_date_mode(text: &str) -> Result<DateMode, GitError> {
             command: "--date=format:... is not supported".to_owned(),
         }),
         _ => Err(GitError::Invalid {
-            detail: format!(
-                "bad --date {text:?}: want default|relative|short|iso|raw|unix"
-            ),
+            detail: format!("bad --date {text:?}: want default|relative|short|iso|raw|unix"),
         }),
     }
 }
@@ -1919,8 +1921,7 @@ fn civil_of(stamp: i64, offset: TzOffset) -> CivilDate {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let full_year = if month <= 2 { year + 1 } else { year };
     let weekday = usize::try_from(days.rem_euclid(7)).expect("weekday remainder fits in seven");
-    let month_index =
-        usize::try_from(month - 1).expect("parsed month 1..=12 gives index 0..=11");
+    let month_index = usize::try_from(month - 1).expect("parsed month 1..=12 gives index 0..=11");
     CivilDate {
         year: full_year,
         month,
@@ -2214,24 +2215,18 @@ fn render_pretty_shape(
     let mut out = Vec::new();
     match line.pretty {
         PrettyKind::Default => {
-            out.extend_from_slice(
-                format!("commit {id}{source_text}{decoration}\n").as_bytes(),
-            );
+            out.extend_from_slice(format!("commit {id}{source_text}{decoration}\n").as_bytes());
             out.extend_from_slice(&indented_message(record.message()));
             out.push(b'\n');
             return Ok(out);
         }
         PrettyKind::Full => {
-            out.extend_from_slice(
-                format!("commit {id}{source_text}{decoration}\n").as_bytes(),
-            );
+            out.extend_from_slice(format!("commit {id}{source_text}{decoration}\n").as_bytes());
             push_ident(&mut out, "Author: ", &author);
             push_ident(&mut out, "Commit: ", &committer);
         }
         PrettyKind::Fuller => {
-            out.extend_from_slice(
-                format!("commit {id}{source_text}{decoration}\n").as_bytes(),
-            );
+            out.extend_from_slice(format!("commit {id}{source_text}{decoration}\n").as_bytes());
             push_ident(&mut out, "Author:     ", &author);
             out.extend_from_slice(
                 format!(
@@ -2280,9 +2275,7 @@ fn render_pretty_shape(
             return Ok(out);
         }
         PrettyKind::Raw => {
-            out.extend_from_slice(
-                format!("commit {}{source_text}\n", oid.to_hex()).as_bytes(),
-            );
+            out.extend_from_slice(format!("commit {}{source_text}\n", oid.to_hex()).as_bytes());
             out.extend_from_slice(
                 format!("tree {}\n", commit_tree_oid(record)?.to_hex()).as_bytes(),
             );
@@ -5495,9 +5488,7 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     if simplify {
         shown.retain(|shown| decorations.contains_key(&shown.oid));
     }
-    if cherry_pick
-        && let Some((left, right)) = sym_sides
-    {
+    if cherry_pick && let Some((left, right)) = sym_sides {
         shown = cherry_pick_filter(ctx, store, &shown, left, right)?;
     }
     if topo_order {
@@ -5537,8 +5528,7 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let mut out = Vec::new();
     for shown in &shown {
         let decoration = decoration_text(&decorations, &shown.oid, full_names);
-        let source_text =
-            source.then(|| tip_names.get(&shown.origin).cloned().unwrap_or_default());
+        let source_text = source.then(|| tip_names.get(&shown.origin).cloned().unwrap_or_default());
         let mut block = render_commit_line_full(
             &line,
             &shown.oid,
@@ -5999,10 +5989,8 @@ fn commit_passes_pickaxe(
         }
         let (old_body, new_body) = pair_bodies(ctx, pair)?;
         if let Some(needle) = needle {
-            let old_count =
-                count_occurrences(old_body.as_deref().unwrap_or_default(), needle);
-            let new_count =
-                count_occurrences(new_body.as_deref().unwrap_or_default(), needle);
+            let old_count = count_occurrences(old_body.as_deref().unwrap_or_default(), needle);
+            let new_count = count_occurrences(new_body.as_deref().unwrap_or_default(), needle);
             if old_count != new_count {
                 return Ok(true);
             }
@@ -6033,11 +6021,7 @@ fn commit_passes_pickaxe(
 /// Fingerprints one commit's first-parent change for `--cherry-pick`: the
 /// sorted multiset of added/removed lines (binary sides contribute their
 /// path, the way a patch-id still distinguishes them), joined on NUL.
-fn patch_fingerprint(
-    ctx: &Ctx,
-    store: &Store,
-    record: &CommitRecord,
-) -> Result<Vec<u8>, GitError> {
+fn patch_fingerprint(ctx: &Ctx, store: &Store, record: &CommitRecord) -> Result<Vec<u8>, GitError> {
     let tree = commit_tree_oid(record)?;
     let mut parent_tree = None;
     if let Some(parent) = record
@@ -6280,7 +6264,9 @@ fn render_numstat(changes: &[FileChange]) -> Vec<u8> {
         if change.binary {
             out.extend_from_slice(format!("-\t-\t{name}\n").as_bytes());
         } else {
-            out.extend_from_slice(format!("{}\t{}\t{name}\n", change.added, change.removed).as_bytes());
+            out.extend_from_slice(
+                format!("{}\t{}\t{name}\n", change.added, change.removed).as_bytes(),
+            );
         }
     }
     out
@@ -7838,11 +7824,7 @@ struct CopySource {
 /// text uses the shared line-Dice [`similarity`]. Renames win over copies:
 /// callers run [`apply_pair_renames`] first, so consumed deletions never
 /// resurface here.
-fn apply_pair_copies(
-    ctx: &Ctx,
-    pairs: &mut Vec<TreePair>,
-    threshold: u8,
-) -> Result<(), GitError> {
+fn apply_pair_copies(ctx: &Ctx, pairs: &mut Vec<TreePair>, threshold: u8) -> Result<(), GitError> {
     const MAX_SCORE_BYTES: usize = 1 << 20;
     let store = ctx.store()?;
     let mut sources: Vec<CopySource> = Vec::new();
@@ -7855,10 +7837,7 @@ fn apply_pair_copies(
             None => read_object_bytes(store, oid)?.1,
         };
         sources.push(CopySource {
-            path: pair
-                .old_path
-                .clone()
-                .unwrap_or_else(|| pair.path.clone()),
+            path: pair.old_path.clone().unwrap_or_else(|| pair.path.clone()),
             oid,
             link: matches!(mode, TreeMode::Gitlink),
             body: if body.len() > MAX_SCORE_BYTES {
@@ -7890,7 +7869,8 @@ fn apply_pair_copies(
         let new_link = matches!(new_mode, TreeMode::Gitlink);
         let mut best: Option<(Vec<u8>, u8)> = None;
         for source in sources.iter() {
-            let Some(score) = copy_score(source, new_oid, new_link, new_gated.as_deref(), threshold)
+            let Some(score) =
+                copy_score(source, new_oid, new_link, new_gated.as_deref(), threshold)
             else {
                 continue;
             };
@@ -7983,7 +7963,9 @@ fn render_pairs(
     }
     if opts.is_set("binary") {
         return Err(GitError::Unsupported {
-            command: "diff --binary is not supported: GIT binary patch literal output is never emitted".to_owned(),
+            command:
+                "diff --binary is not supported: GIT binary patch literal output is never emitted"
+                    .to_owned(),
         });
     }
     if opts.is_set("exit-code") {
@@ -8492,9 +8474,7 @@ fn render_pair_numstat(hunks: &[CountedHunk]) -> Vec<u8> {
         if hunk.binary {
             out.extend_from_slice(format!("-\t-\t{name}\n").as_bytes());
         } else {
-            out.extend_from_slice(
-                format!("{}\t{}\t{name}\n", hunk.added, hunk.removed).as_bytes(),
-            );
+            out.extend_from_slice(format!("{}\t{}\t{name}\n", hunk.added, hunk.removed).as_bytes());
         }
     }
     out
@@ -8702,7 +8682,10 @@ fn unified_pair(
     let old_oid = pair.old.map(|(_, oid)| oid);
     let new_oid = pair.new.map(|(_, oid)| oid);
     let content_changed = old_oid != new_oid;
-    let sizes = (old.map_or(0, |body| body.len()), new.map_or(0, |body| body.len()));
+    let sizes = (
+        old.map_or(0, |body| body.len()),
+        new.map_or(0, |body| body.len()),
+    );
     if pair.old_path.is_some() && !content_changed {
         return Ok((out, 0, 0, false, sizes));
     }
@@ -8936,7 +8919,8 @@ fn ws_key(line: &[u8], ws: WsFold, eol: bool) -> Vec<u8> {
 /// Reports whether a line is blank for `--ignore-blank-lines`: empty or
 /// only `[ \t\r]`.
 fn is_blank_line(line: &[u8]) -> bool {
-    line.iter().all(|&byte| matches!(byte, b' ' | b'\t' | b'\r'))
+    line.iter()
+        .all(|&byte| matches!(byte, b' ' | b'\t' | b'\r'))
 }
 
 /// Splits an op-change mask into windows with `radius` context lines,
@@ -9223,12 +9207,7 @@ fn push_gap_bytes<'a>(tokens: &mut Vec<&'a [u8]>, line: &'a [u8], start: usize, 
 /// `plain` wraps words inline (`[-gone-]{+new+}`) and re-splits physical
 /// lines; `porcelain` prints per-kind runs (` `/`-`/`+`) with newlines as
 /// bare `~` lines, as in the oracle.
-fn render_word_run(
-    out: &mut Vec<u8>,
-    old_run: &[&[u8]],
-    new_run: &[&[u8]],
-    render: &PairRender,
-) {
+fn render_word_run(out: &mut Vec<u8>, old_run: &[&[u8]], new_run: &[&[u8]], render: &PairRender) {
     let mut old_toks: Vec<&[u8]> = Vec::new();
     for line in old_run {
         old_toks.extend(word_tokens(line, render.word_regex.as_ref()));

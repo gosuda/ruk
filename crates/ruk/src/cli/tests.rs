@@ -5917,11 +5917,9 @@ fn log_merges_filter() {
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "m.txt", b"main\n", "main work");
     run(verbs_history::merge, &mut ctx, &["feature"]).expect("merge");
-    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--merges"])
-        .expect("merges");
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--merges"]).expect("merges");
     assert_eq!(String::from_utf8_lossy(&out).lines().count(), 1);
-    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--no-merges"])
-        .expect("no-merges");
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--no-merges"]).expect("no-merges");
     assert_eq!(String::from_utf8_lossy(&out).lines().count(), 5);
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -5968,21 +5966,17 @@ fn log_first_parent_hides_side_branch() {
 fn log_format_placeholders_and_colon_alias() {
     let (root, env) = log_flags_repo("logflags-format");
     let mut ctx = repo_ctx(&root, env);
-    let out = run(verbs_history::log, &mut ctx, &["--format=%H %P %T %s"])
-        .expect("format placeholders");
+    let out =
+        run(verbs_history::log, &mut ctx, &["--format=%H %P %T %s"]).expect("format placeholders");
     let err = run(verbs_history::log, &mut ctx, &["--format:%H"]).expect_err("colon");
-    assert!(
-        err.to_string().contains("unknown option"),
-        "got {err:?}"
-    );
+    assert!(err.to_string().contains("unknown option"), "got {err:?}");
     let line = String::from_utf8_lossy(&out).into_owned();
     let fields: Vec<&str> = line.trim().split(' ').collect();
     assert!(fields.len() >= 4, "got {line}");
     assert!(fields[0].len() >= 40, "got {line}");
     assert!(fields[2].len() >= 40, "got {line}");
     assert!(line.contains("add b"), "got {line}");
-    let out = run(verbs_history::log, &mut ctx, &["--format=%h %s", "-n", "1"])
-        .expect("format eq");
+    let out = run(verbs_history::log, &mut ctx, &["--format=%h %s", "-n", "1"]).expect("format eq");
     assert!(
         String::from_utf8_lossy(&out).contains("add b"),
         "got {:?}",
@@ -6027,8 +6021,7 @@ fn log_extra_stat_shapes() {
     let out = run(verbs_history::log, &mut ctx, &["--numstat", "-n", "1"]).expect("numstat");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(text.contains("\tb.txt"), "got {text}");
-    let out =
-        run(verbs_history::log, &mut ctx, &["--shortstat", "-n", "1"]).expect("shortstat");
+    let out = run(verbs_history::log, &mut ctx, &["--shortstat", "-n", "1"]).expect("shortstat");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(text.contains("1 file changed"), "got {text}");
     let out = run(verbs_history::log, &mut ctx, &["--summary", "-n", "1"]).expect("summary");
@@ -6094,7 +6087,12 @@ fn log_follow_tracks_rename() {
     std::fs::rename(root.join("old.txt"), root.join("new.txt")).expect("rename");
     run(verbs_stage::add, &mut ctx, &["new.txt"]).expect("add new");
     run(verbs_stage::rm, &mut ctx, &["old.txt"]).expect("rm old");
-    run(verbs_history::commit, &mut ctx, &["-m", "rename old to new"]).expect("commit");
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "rename old to new"],
+    )
+    .expect("commit");
     let out = run(
         verbs_history::log,
         &mut ctx,
@@ -6133,8 +6131,14 @@ fn log_source_and_left_right() {
     )
     .expect("left-right");
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.lines().any(|line| line.starts_with("< ")), "got {text}");
-    assert!(text.lines().any(|line| line.starts_with("> ")), "got {text}");
+    assert!(
+        text.lines().any(|line| line.starts_with("< ")),
+        "got {text}"
+    );
+    assert!(
+        text.lines().any(|line| line.starts_with("> ")),
+        "got {text}"
+    );
     // Custom formats carry no side marks, as in the oracle.
     let out = run(
         verbs_history::log,
@@ -6144,7 +6148,8 @@ fn log_source_and_left_right() {
     .expect("format suppresses marks");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(
-        text.lines().all(|line| !line.starts_with('<') && !line.starts_with('>')),
+        text.lines()
+            .all(|line| !line.starts_with('<') && !line.starts_with('>')),
         "got {text}"
     );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -6201,10 +6206,13 @@ fn log_notes_boundary_decorate() {
     let (root, env) = log_flags_repo("logflags-notes");
     let mut ctx = repo_ctx(&root, env);
     let head = notes_tip(&mut ctx);
-    run(verbs_notes::notes, &mut ctx, &["add", "-m", "reviewed", head.as_str()])
-        .expect("note add");
-    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"])
-        .expect("show-notes");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["add", "-m", "reviewed", head.as_str()],
+    )
+    .expect("note add");
+    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"]).expect("show-notes");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(text.contains("reviewed"), "got {text}");
     let out = run(
@@ -6225,19 +6233,17 @@ fn log_notes_boundary_decorate() {
         &["add", "--ref", "review", "-m", "looks good", head.as_str()],
     )
     .expect("note add custom");
-    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"])
-        .expect("other ref hidden");
+    let out =
+        run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"]).expect("other ref hidden");
     assert!(
         !String::from_utf8_lossy(&out).contains("looks good"),
         "got {:?}",
         out
     );
-    ctx.env.vars.insert(
-        "GIT_NOTES_REF".to_owned(),
-        "refs/notes/review".to_owned(),
-    );
-    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"])
-        .expect("env ref");
+    ctx.env
+        .vars
+        .insert("GIT_NOTES_REF".to_owned(), "refs/notes/review".to_owned());
+    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"]).expect("env ref");
     assert!(
         String::from_utf8_lossy(&out).contains("looks good"),
         "got {:?}",
@@ -6261,7 +6267,10 @@ fn log_notes_boundary_decorate() {
     )
     .expect("boundary");
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.lines().any(|line| line.starts_with("- ")), "got {text}");
+    assert!(
+        text.lines().any(|line| line.starts_with("- ")),
+        "got {text}"
+    );
     // A disjoint exclusion borders nothing, so no boundary rows print.
     run(verbs_branch::checkout, &mut ctx, &["-b", "adrift"]).expect("checkout -b");
     lane_commit(&mut ctx, &root, "z.txt", b"adrift\n", "adrift work");
@@ -6283,7 +6292,12 @@ fn log_notes_boundary_decorate() {
         &["--oneline", "--simplify-by-decoration"],
     )
     .expect("simplify");
-    assert_eq!(String::from_utf8_lossy(&out).lines().count(), 1, "got {:?}", out);
+    assert_eq!(
+        String::from_utf8_lossy(&out).lines().count(),
+        1,
+        "got {:?}",
+        out
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -6296,8 +6310,7 @@ fn log_topo_orders_shared_root_last() {
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "m.txt", b"main\n", "main work");
     run(verbs_history::merge, &mut ctx, &["side"]).expect("merge");
-    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--topo-order"])
-        .expect("topo");
+    let out = run(verbs_history::log, &mut ctx, &["--oneline", "--topo-order"]).expect("topo");
     let text = String::from_utf8_lossy(&out).into_owned();
     let position = |needle: &str| {
         text.lines()
@@ -6361,21 +6374,30 @@ fn wave_j_branch_copy_and_filters() {
     let (root, env) = seeded_repo("wavej-branch", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
     run(verbs_branch::branch, &mut ctx, &["-c", "copied"]).expect("copy");
-    let out = String::from_utf8(run(verbs_branch::branch, &mut ctx, &[]).expect("list")).expect("utf8");
+    let out =
+        String::from_utf8(run(verbs_branch::branch, &mut ctx, &[]).expect("list")).expect("utf8");
     assert!(out.contains("copied"), "got {out:?}");
     let out = String::from_utf8(
         run(verbs_branch::branch, &mut ctx, &["--merged", "HEAD"]).expect("merged"),
-    ).expect("utf8");
+    )
+    .expect("utf8");
     assert!(out.contains("main"), "got {out:?}");
     let out = String::from_utf8(
-        run(verbs_branch::branch, &mut ctx, &["--format=%(refname:short)"]).expect("format"),
-    ).expect("utf8");
+        run(
+            verbs_branch::branch,
+            &mut ctx,
+            &["--format=%(refname:short)"],
+        )
+        .expect("format"),
+    )
+    .expect("utf8");
     assert!(out.contains("main"), "got {out:?}");
-    let out = String::from_utf8(
-        run(verbs_branch::branch, &mut ctx, &["--sort=-refname"]).expect("sort"),
-    ).expect("utf8");
+    let out =
+        String::from_utf8(run(verbs_branch::branch, &mut ctx, &["--sort=-refname"]).expect("sort"))
+            .expect("utf8");
     assert!(out.contains("main"), "got {out:?}");
-    let err = run(verbs_branch::branch, &mut ctx, &["--edit-description"]).expect_err("edit-description");
+    let err =
+        run(verbs_branch::branch, &mut ctx, &["--edit-description"]).expect_err("edit-description");
     assert!(err.to_string().contains("editor"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -6388,17 +6410,20 @@ fn wave_j_tag_filters_cleanup_and_format() {
     run(verbs_branch::tag, &mut ctx, &["v2"]).expect("lightweight");
     let out = String::from_utf8(
         run(verbs_branch::tag, &mut ctx, &["--contains", "HEAD"]).expect("contains"),
-    ).expect("utf8");
+    )
+    .expect("utf8");
     assert!(out.contains("v1"), "got {out:?}");
     let out = String::from_utf8(
         run(verbs_branch::tag, &mut ctx, &["--format=%(refname:short)"]).expect("format"),
-    ).expect("utf8");
+    )
+    .expect("utf8");
     assert!(out.contains("v1"), "got {out:?}");
     run(
         verbs_branch::tag,
         &mut ctx,
         &["-a", "-m", "  spaced  ", "--cleanup=verbatim", "v3"],
-    ).expect("verbatim");
+    )
+    .expect("verbatim");
     let err = run(verbs_branch::tag, &mut ctx, &["-e", "v4"]).expect_err("edit");
     assert!(err.to_string().contains("editor"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -6410,8 +6435,14 @@ fn wave_j_switch_orphan_and_track() {
     let mut ctx = repo_ctx(&root, env);
     run(verbs_branch::switch, &mut ctx, &["--orphan", "fresh"]).expect("orphan");
     let out = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["--abbrev-ref", "HEAD"]).expect("abbrev"),
-    ).expect("utf8");
+        run(
+            verbs_history::rev_parse,
+            &mut ctx,
+            &["--abbrev-ref", "HEAD"],
+        )
+        .expect("abbrev"),
+    )
+    .expect("utf8");
     assert!(out.trim() == "fresh", "got {out:?}");
     let err = run(verbs_branch::switch, &mut ctx, &["--conflict", "merge"]).expect_err("conflict");
     assert!(err.to_string().contains("--merge"), "got {err:?}");
@@ -6426,7 +6457,12 @@ fn wave_j_checkout_orphan_source_and_stages() {
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("back");
     std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
-    run(verbs_branch::checkout, &mut ctx, &["--source", "HEAD", "--", "f.txt"]).expect("source");
+    run(
+        verbs_branch::checkout,
+        &mut ctx,
+        &["--source", "HEAD", "--", "f.txt"],
+    )
+    .expect("source");
     let err = run(verbs_branch::checkout, &mut ctx, &["-p", "--", "f.txt"]).expect_err("patch");
     assert!(err.to_string().contains("interactive"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -6458,13 +6494,10 @@ fn wave_j_diff_word_plain_marks_words() {
         run(verbs_history::diff, &mut ctx, &["--word-diff=plain"]).expect("word"),
     )
     .expect("utf8");
-    assert!(
-        out.contains("alpha beta [-gamma-]{+DELTA+}"),
-        "got {out:?}"
-    );
+    assert!(out.contains("alpha beta [-gamma-]{+DELTA+}"), "got {out:?}");
     assert!(out.contains("line2"), "got {out:?}");
-    let plain = String::from_utf8(run(verbs_history::diff, &mut ctx, &[]).expect("plain"))
-        .expect("utf8");
+    let plain =
+        String::from_utf8(run(verbs_history::diff, &mut ctx, &[]).expect("plain")).expect("utf8");
     assert!(!plain.contains("[-"), "got {plain:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -6501,9 +6534,16 @@ fn wave_j_diff_word_none_and_regex() {
     )
     .expect("utf8");
     assert!(custom.contains("[-gamma-]{+DELTA+}"), "got {custom:?}");
-    let err = run(verbs_history::diff, &mut ctx, &["--word-diff", "--word-diff-regex=([)"])
-        .expect_err("bad regex");
-    assert!(err.to_string().contains("bad --word-diff-regex"), "got {err:?}");
+    let err = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["--word-diff", "--word-diff-regex=([)"],
+    )
+    .expect_err("bad regex");
+    assert!(
+        err.to_string().contains("bad --word-diff-regex"),
+        "got {err:?}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -6544,7 +6584,10 @@ fn wave_j_diff_named_gaps_fail_loudly() {
         "--color-moved",
     ] {
         let err = run(verbs_history::diff, &mut ctx, &[flag]).expect_err(flag);
-        assert!(err.to_string().contains("not supported"), "flag {flag}: got {err:?}");
+        assert!(
+            err.to_string().contains("not supported"),
+            "flag {flag}: got {err:?}"
+        );
     }
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -6570,27 +6613,39 @@ fn wave_j_diff_find_copies_pairs_additions() {
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add f");
     run(verbs_stage::add, &mut ctx, &["cp.txt"]).expect("add cp");
     let plain = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--cached", "--name-status"]).expect("plain"),
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--cached", "--name-status"],
+        )
+        .expect("plain"),
     )
     .expect("utf8");
     assert!(plain.contains("A\tcp.txt"), "got {plain:?}");
     let out = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--cached", "-C", "--name-status"])
-            .expect("copies"),
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-C", "--name-status"],
+        )
+        .expect("copies"),
     )
     .expect("utf8");
     assert!(out.contains("C100\tf.txt\tcp.txt"), "got {out:?}");
     // No pathspec: the oracle pairs copies before filtering, so scoping to
     // the copy alone would hide its source the same way.
-    let patch = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--cached", "-C"]).expect("patch"),
-    )
-    .expect("utf8");
+    let patch =
+        String::from_utf8(run(verbs_history::diff, &mut ctx, &["--cached", "-C"]).expect("patch"))
+            .expect("utf8");
     assert!(patch.contains("copy from f.txt"), "got {patch:?}");
     assert!(patch.contains("copy to cp.txt"), "got {patch:?}");
     let off = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--cached", "-C0", "--name-status"])
-            .expect("c0"),
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-C0", "--name-status"],
+        )
+        .expect("c0"),
     )
     .expect("utf8");
     assert!(off.contains("A\tcp.txt"), "got {off:?}");
@@ -6646,8 +6701,9 @@ fn wave_j_diff_text_diffs_binaries() {
     let (root, env) = seeded_repo("wavej-diff-text", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
     std::fs::write(root.join("b.dat"), b"a\x00b\n").expect("binary");
-    let out = String::from_utf8(run(verbs_history::diff, &mut ctx, &["--", "b.dat"]).expect("diff"))
-        .expect("utf8");
+    let out =
+        String::from_utf8(run(verbs_history::diff, &mut ctx, &["--", "b.dat"]).expect("diff"))
+            .expect("utf8");
     assert!(out.contains("Binary files"), "got {out:?}");
     let text = String::from_utf8(
         run(verbs_history::diff, &mut ctx, &["--text", "--", "b.dat"]).expect("text"),
@@ -6711,17 +6767,34 @@ fn wave_j_diff_inter_hunk_fuses_close_hunks() {
             .count()
     };
     let split = run(verbs_history::diff, &mut ctx, &["-U1", "--", "h.txt"]).expect("split");
-    assert_eq!(count(&split), 3, "got {:?}", String::from_utf8_lossy(&split));
+    assert_eq!(
+        count(&split),
+        3,
+        "got {:?}",
+        String::from_utf8_lossy(&split)
+    );
     let fused = run(
         verbs_history::diff,
         &mut ctx,
         &["-U1", "--inter-hunk-context=20", "--", "h.txt"],
     )
     .expect("fused");
-    assert_eq!(count(&fused), 1, "got {:?}", String::from_utf8_lossy(&fused));
-    let err = run(verbs_history::diff, &mut ctx, &["--inter-hunk-context=bogus"])
-        .expect_err("bad inter");
-    assert!(err.to_string().contains("bad --inter-hunk-context"), "got {err:?}");
+    assert_eq!(
+        count(&fused),
+        1,
+        "got {:?}",
+        String::from_utf8_lossy(&fused)
+    );
+    let err = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["--inter-hunk-context=bogus"],
+    )
+    .expect_err("bad inter");
+    assert!(
+        err.to_string().contains("bad --inter-hunk-context"),
+        "got {err:?}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -6739,7 +6812,10 @@ fn wave_j_diff_prefixes_rewrite_every_line() {
         .expect("prefix"),
     )
     .expect("utf8");
-    assert!(out.contains("diff --git SRC/f.txt DST/f.txt"), "got {out:?}");
+    assert!(
+        out.contains("diff --git SRC/f.txt DST/f.txt"),
+        "got {out:?}"
+    );
     assert!(out.contains("--- SRC/f.txt"), "got {out:?}");
     assert!(out.contains("+++ DST/f.txt"), "got {out:?}");
     let lined = String::from_utf8(
@@ -6763,25 +6839,25 @@ fn wave_j_diff_machine_sections() {
         .expect("utf8");
     assert!(raw.starts_with(":100644 100644 "), "got {raw:?}");
     assert!(raw.contains(" M\tf.txt\n"), "got {raw:?}");
-    let numstat = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--numstat"]).expect("numstat"),
-    )
-    .expect("utf8");
+    let numstat =
+        String::from_utf8(run(verbs_history::diff, &mut ctx, &["--numstat"]).expect("numstat"))
+            .expect("utf8");
     assert_eq!(numstat, "1\t1\tf.txt\n");
-    let short = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--shortstat"]).expect("shortstat"),
-    )
-    .expect("utf8");
+    let short =
+        String::from_utf8(run(verbs_history::diff, &mut ctx, &["--shortstat"]).expect("shortstat"))
+            .expect("utf8");
     assert!(
         short.contains("1 file changed, 1 insertion(+), 1 deletion(-)"),
         "got {short:?}"
     );
     std::fs::write(root.join("n2.txt"), b"new\n").expect("new file");
-    let summary = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--summary"]).expect("summary"),
-    )
-    .expect("utf8");
-    assert!(summary.contains(" create mode 100644 n2.txt"), "got {summary:?}");
+    let summary =
+        String::from_utf8(run(verbs_history::diff, &mut ctx, &["--summary"]).expect("summary"))
+            .expect("utf8");
+    assert!(
+        summary.contains(" create mode 100644 n2.txt"),
+        "got {summary:?}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -6831,7 +6907,12 @@ fn wave_j_diff_no_index_compares_files() {
     std::fs::write(root.join("a.txt"), b"a1\na2\n").expect("a");
     std::fs::write(root.join("b.txt"), b"a1\nb2\n").expect("b");
     let out = String::from_utf8(
-        run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt", "b.txt"]).expect("no-index"),
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--no-index", "a.txt", "b.txt"],
+        )
+        .expect("no-index"),
     )
     .expect("utf8");
     assert!(out.contains("diff --git a/a.txt b/b.txt"), "got {out:?}");
@@ -6846,11 +6927,19 @@ fn wave_j_diff_no_index_compares_files() {
     )
     .expect("utf8");
     assert_eq!(status, "M\ta.txt\n");
-    let same = run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt", "a.txt"])
-        .expect("identical");
+    let same = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["--no-index", "a.txt", "a.txt"],
+    )
+    .expect("identical");
     assert!(same.is_empty(), "got {same:?}");
-    let err = run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt", "missing.txt"])
-        .expect_err("missing");
+    let err = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["--no-index", "a.txt", "missing.txt"],
+    )
+    .expect_err("missing");
     assert!(err.to_string().contains("missing.txt"), "got {err:?}");
     let err = run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt"]).expect_err("arity");
     assert!(err.to_string().contains("usage"), "got {err:?}");
@@ -6875,12 +6964,12 @@ fn wave_j_show_machine_sections_and_output() {
     let (root, env) = seeded_repo("wavej-show-sections", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
     lane_commit(&mut ctx, &root, "f.txt", b"alpha beta gamma\n", "second");
-    let raw = String::from_utf8(run(verbs_history::show, &mut ctx, &["HEAD", "--raw"]).expect("raw"))
-        .expect("utf8");
+    let raw =
+        String::from_utf8(run(verbs_history::show, &mut ctx, &["HEAD", "--raw"]).expect("raw"))
+            .expect("utf8");
     assert!(raw.contains(" M\tf.txt\n"), "got {raw:?}");
     assert!(raw.contains("second"), "got {raw:?}");
-    let stdout = run(verbs_history::show, &mut ctx, &["HEAD", "--output=sh.out"])
-        .expect("output");
+    let stdout = run(verbs_history::show, &mut ctx, &["HEAD", "--output=sh.out"]).expect("output");
     assert!(stdout.is_empty(), "got {stdout:?}");
     let file = std::fs::read(root.join("sh.out")).expect("read back");
     assert!(
@@ -6896,8 +6985,8 @@ fn wave_j_diff_no_patch_suppresses_patch() {
     let mut ctx = repo_ctx(&root, env);
     std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
     let stat = run(verbs_history::diff, &mut ctx, &["--stat"]).expect("stat");
-    let suppressed = run(verbs_history::diff, &mut ctx, &["--stat", "--no-patch"])
-        .expect("no-patch");
+    let suppressed =
+        run(verbs_history::diff, &mut ctx, &["--stat", "--no-patch"]).expect("no-patch");
     assert_eq!(suppressed, stat);
     let empty = run(verbs_history::diff, &mut ctx, &["--no-patch"]).expect("empty");
     assert!(empty.is_empty(), "got {empty:?}");
@@ -6991,11 +7080,10 @@ fn wave_j_commit_file_signoff_cleanup_template() {
 fn wave_j_commit_squash_fixup_amend() {
     let (root, env) = seeded_repo("wavej-squash", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
-    let base =
-        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev"))
-            .expect("utf8")
-            .trim()
-            .to_owned();
+    let base = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
     std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     run(verbs_history::commit, &mut ctx, &[&"--fixup", &base]).expect("fixup");
@@ -7032,8 +7120,12 @@ fn wave_j_commit_squash_fixup_amend() {
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     let fixup_arg = format!("--fixup=amend:{base}");
-    let err = run(verbs_history::commit, &mut ctx, &[fixup_arg.as_str(), "-m", "x"])
-        .expect_err("fixup amend -m");
+    let err = run(
+        verbs_history::commit,
+        &mut ctx,
+        &[fixup_arg.as_str(), "-m", "x"],
+    )
+    .expect_err("fixup amend -m");
     assert!(err.to_string().contains("cannot be used together"), "{err}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -7047,11 +7139,19 @@ fn wave_j_commit_rejections() {
     let msg = root.join("msg.txt");
     std::fs::write(&msg, b"file body\n").expect("msg");
     let msg_arg = msg.to_str().expect("utf8").to_owned();
-    let err = run(verbs_history::commit, &mut ctx, &[&"-m", &"x", &"-F", &msg_arg])
-        .expect_err("-m -F");
+    let err = run(
+        verbs_history::commit,
+        &mut ctx,
+        &[&"-m", &"x", &"-F", &msg_arg],
+    )
+    .expect_err("-m -F");
     assert!(err.to_string().contains("cannot be combined"), "{err}");
-    let err = run(verbs_history::commit, &mut ctx, &["-m", "x", "--reset-author"])
-        .expect_err("reset-author");
+    let err = run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "x", "--reset-author"],
+    )
+    .expect_err("reset-author");
     assert!(
         err.to_string().contains("only with -C, -c or --amend"),
         "{err}"
@@ -7059,7 +7159,12 @@ fn wave_j_commit_rejections() {
     let err = run(
         verbs_history::commit,
         &mut ctx,
-        &["-m", "x", "--reset-author", "--author=Bo <bo@example.invalid>"],
+        &[
+            "-m",
+            "x",
+            "--reset-author",
+            "--author=Bo <bo@example.invalid>",
+        ],
     )
     .expect_err("reset-author author");
     assert!(err.to_string().contains("cannot be used together"), "{err}");
@@ -7068,8 +7173,12 @@ fn wave_j_commit_rejections() {
     // `--edit` with a message source is a no-op editor, not an error.
     run(verbs_history::commit, &mut ctx, &["-m", "edited", "--edit"]).expect("edit -m");
     assert_eq!(wave_j_head_message(&mut ctx), "edited\n");
-    let err = run(verbs_history::commit, &mut ctx, &["-m", "x", "--cleanup=bogus"])
-        .expect_err("cleanup");
+    let err = run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "x", "--cleanup=bogus"],
+    )
+    .expect_err("cleanup");
     assert!(err.to_string().contains("bad --cleanup"), "{err}");
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
@@ -7100,17 +7209,23 @@ fn wave_j_status_porcelain_v2_null() {
     assert!(text.contains("# branch.head main\n"), "head: {text}");
     assert!(text.contains("# branch.oid "), "oid: {text}");
     assert!(!text.contains("# branch.upstream"), "no upstream: {text}");
-    assert!(text.contains("1 .M N... 100644 100644 100644 "), "ordinary: {text}");
+    assert!(
+        text.contains("1 .M N... 100644 100644 100644 "),
+        "ordinary: {text}"
+    );
     assert!(text.contains(" f.txt\n"), "path: {text}");
     assert!(text.contains("? new.txt\n"), "untracked: {text}");
-    let out = run(verbs_stage::status, &mut ctx, &["--porcelain=v1", "--branch"])
-        .expect("v1");
+    let out = run(
+        verbs_stage::status,
+        &mut ctx,
+        &["--porcelain=v1", "--branch"],
+    )
+    .expect("v1");
     assert!(
         String::from_utf8_lossy(&out).contains("## main\n"),
         "v1 branch"
     );
-    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--null"])
-        .expect("null");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--null"]).expect("null");
     assert!(out.contains(&b'\0'), "NUL terminated");
     assert!(!out.contains(&b'\n'), "no newlines: {out:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -7133,8 +7248,7 @@ fn wave_j_status_untracked_ignored() {
     assert!(!text.contains("sub/a.txt"), "not listed: {text}");
     assert!(text.contains("?? top.txt\n"), "top: {text}");
     assert!(!text.contains("debug.log"), "hidden: {text}");
-    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--ignored"])
-        .expect("ignored");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--ignored"]).expect("ignored");
     assert!(
         String::from_utf8_lossy(&out).contains("!! debug.log\n"),
         "ignored shown"
@@ -7147,8 +7261,8 @@ fn wave_j_status_untracked_ignored() {
         !String::from_utf8_lossy(&out).contains("??"),
         "hidden untracked"
     );
-    let err = run(verbs_stage::status, &mut ctx, &["--porcelain", "-ubogus"])
-        .expect_err("bad mode");
+    let err =
+        run(verbs_stage::status, &mut ctx, &["--porcelain", "-ubogus"]).expect_err("bad mode");
     assert!(err.to_string().contains("bad --untracked-files"), "{err}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -7172,8 +7286,7 @@ fn wave_j_status_ahead_behind_stash() {
         "tracking: {}",
         String::from_utf8_lossy(&out)
     );
-    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--branch"])
-        .expect("v1 branch");
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--branch"]).expect("v1 branch");
     assert!(
         String::from_utf8_lossy(&out).contains("## main...side [ahead 1]\n"),
         "v1 tracking"
@@ -7185,7 +7298,10 @@ fn wave_j_status_ahead_behind_stash() {
     )
     .expect("v2 upstream");
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.contains("# branch.upstream side\n"), "upstream: {text}");
+    assert!(
+        text.contains("# branch.upstream side\n"),
+        "upstream: {text}"
+    );
     assert!(text.contains("# branch.ab +1 -0\n"), "ab: {text}");
     let out = run(
         verbs_stage::status,
@@ -7201,7 +7317,10 @@ fn wave_j_status_ahead_behind_stash() {
     run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
     let out = run(verbs_stage::status, &mut ctx, &["--show-stash"]).expect("stash");
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.contains("nothing to commit, working tree clean\n"), "clean: {text}");
+    assert!(
+        text.contains("nothing to commit, working tree clean\n"),
+        "clean: {text}"
+    );
     assert!(
         text.contains("Your stash currently has 1 entry\n"),
         "stash: {text}"
@@ -7232,8 +7351,12 @@ fn wave_j_status_verbose_column_renames() {
         "paired: {}",
         String::from_utf8_lossy(&out)
     );
-    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "--no-renames"])
-        .expect("no renames");
+    let out = run(
+        verbs_stage::status,
+        &mut ctx,
+        &["--porcelain", "--no-renames"],
+    )
+    .expect("no renames");
     assert!(
         !String::from_utf8_lossy(&out).contains("R  "),
         "unpaired: {}",

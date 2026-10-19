@@ -252,9 +252,9 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             && arg.len() > 2
             && !arg.contains('=')
             && arg[1..].chars().all(|ch| {
-                specs.iter().any(|spec| {
-                    spec.short == Some(ch) && !spec.takes_value
-                })
+                specs
+                    .iter()
+                    .any(|spec| spec.short == Some(ch) && !spec.takes_value)
             })
         {
             for ch in arg[1..].chars() {
@@ -664,9 +664,7 @@ fn copy_branch(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
                 format!("branch: Copied from {old}"),
             )?;
             if skipped {
-                ctx.emit_stderr(
-                    b"warning: no identity configured; skipping reflog creation\n",
-                );
+                ctx.emit_stderr(b"warning: no identity configured; skipping reflog creation\n");
             }
         }
     }
@@ -807,7 +805,11 @@ fn list_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
         }
         // Ancestry filters need a concrete tip; symbolic/unborn rows cannot
         // satisfy them, so they drop out when any such filter is present.
-        if !merged.is_empty() || !no_merged.is_empty() || !contains.is_empty() || !no_contains.is_empty() {
+        if !merged.is_empty()
+            || !no_merged.is_empty()
+            || !contains.is_empty()
+            || !no_contains.is_empty()
+        {
             let Some(tip) = tip else { continue };
             let mut ok = true;
             for base in &merged {
@@ -1903,11 +1905,12 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
                 });
             }
             None => {
-                let (mode, oid) = index_entries.get(path.as_bytes()).ok_or_else(|| {
-                    GitError::NotFound {
-                        detail: format!("pathspec did not match: {wanted:?}"),
-                    }
-                })?;
+                let (mode, oid) =
+                    index_entries
+                        .get(path.as_bytes())
+                        .ok_or_else(|| GitError::NotFound {
+                            detail: format!("pathspec did not match: {wanted:?}"),
+                        })?;
                 (*mode, *oid)
             }
         };
@@ -1960,11 +1963,13 @@ fn checkout_conflict_paths(
     for wanted in paths {
         let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
         let rows = read_path_rows(store, kind, &path)?;
-        let (_, entry, _) = rows.iter().find(|(s, _, _)| *s == stage).ok_or_else(|| {
-            GitError::Invalid {
+        let (_, entry, _) = rows
+            .iter()
+            .find(|(s, _, _)| *s == stage)
+            .ok_or_else(|| GitError::Invalid {
                 detail: format!("path {wanted:?} is not unmerged"),
-            }
-        })?.clone();
+            })?
+            .clone();
         let (_, body) = read_object_bytes(store, entry.oid())?;
         if !staged_only {
             let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
@@ -1972,10 +1977,13 @@ fn checkout_conflict_paths(
         }
         if !worktree_only {
             let before = read_path_rows(store, kind, &path)?;
-            let resolved =
-                IndexEntry::new(entry.oid(), entry.mode(), None, IndexFlags::default())
-                    .map_err(|err| GitError::from(CoreError::from(err)))?;
-            mutations.extend(path_row_mutations(&path, &before, &[(Stage::Zero, resolved)])?);
+            let resolved = IndexEntry::new(entry.oid(), entry.mode(), None, IndexFlags::default())
+                .map_err(|err| GitError::from(CoreError::from(err)))?;
+            mutations.extend(path_row_mutations(
+                &path,
+                &before,
+                &[(Stage::Zero, resolved)],
+            )?);
         }
     }
     if !mutations.is_empty() {
@@ -2146,11 +2154,12 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if let Some(name) = opts.single("create")? {
         let start = opts.positionals.first().map(String::as_str);
         let out = checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?;
-        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
+        if opts.is_set("track")
+            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
+        {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
-                    detail: "cannot set up tracking information; starting point is HEAD"
-                        .to_owned(),
+                    detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
                 });
             };
             record_tracking(ctx.store()?, &name, start)?;
@@ -2160,11 +2169,12 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if let Some(name) = opts.single("force-create")? {
         let start = opts.positionals.first().map(String::as_str);
         let out = checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"))?;
-        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
+        if opts.is_set("track")
+            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
+        {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
-                    detail: "cannot set up tracking information; starting point is HEAD"
-                        .to_owned(),
+                    detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
                 });
             };
             record_tracking(ctx.store()?, &name, start)?;
@@ -2676,8 +2686,7 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
                 stages.len() == 1
                     && stages[0].0 == Stage::Zero
                     && stages[0].1.oid() == *oid
-                    && stages[0].1.mode()
-                        == mode.as_index_mode().unwrap_or(FileMode::Regular)
+                    && stages[0].1.mode() == mode.as_index_mode().unwrap_or(FileMode::Regular)
             }
             // A missing index row where the old tree names one is a staged
             // deletion; a present row where it names none is a staged
@@ -2722,8 +2731,8 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
     let (workspace, raw) = load_or_default(store)?;
     let mut index_mutations = Vec::new();
     for path in &differing {
-        let repo_path = RepoPath::new(path.clone())
-            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        let repo_path =
+            RepoPath::new(path.clone()).map_err(|err| GitError::from(CoreError::from(err)))?;
         let before = read_path_rows(store, kind, &repo_path)?;
         let after = match new_map.get(path) {
             Some((mode, oid)) => {
@@ -4498,7 +4507,11 @@ fn list_tags(
                 continue;
             }
         }
-        if !merged.is_empty() || !no_merged.is_empty() || !contains.is_empty() || !no_contains.is_empty() {
+        if !merged.is_empty()
+            || !no_merged.is_empty()
+            || !contains.is_empty()
+            || !no_contains.is_empty()
+        {
             let Some(tip) = peeled else { continue };
             // Tags resolve to commits, blobs, or trees; ancestry filters only
             // apply to commit tips, so non-commit tags drop out when such a
@@ -4749,7 +4762,9 @@ fn create_tag(
         Some(rev) => resolve_rev(store, kind, rev)?,
         None => head_oid(store)?,
     };
-    let cleanup = opts.single("cleanup")?.unwrap_or_else(|| "strip".to_owned());
+    let cleanup = opts
+        .single("cleanup")?
+        .unwrap_or_else(|| "strip".to_owned());
     let pointed = if opts.is_set("annotate")
         || opts.single("message")?.is_some()
         || opts.single("file")?.is_some()

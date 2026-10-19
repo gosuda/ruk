@@ -22,8 +22,7 @@ use ruk_git::GitError;
 
 use super::state::{
     MAX_OBJECT_BYTES, head_oid, load_or_default, path_row_mutations, read_path_rows, read_ref,
-    scan_index, stash_high_water, stash_read, unmerged_paths, walk_history,
-    workspace_mutation,
+    scan_index, stash_high_water, stash_read, unmerged_paths, walk_history, workspace_mutation,
 };
 use super::tree::{
     TreeMode, WorktreeEntry, WorktreeType, commit_tree_oid, flatten_tree, join_base,
@@ -771,9 +770,7 @@ fn check_ignore_submodules(arg: &str) -> Result<(), GitError> {
     match value {
         "all" | "untracked" | "dirty" | "none" => Ok(()),
         _ => Err(GitError::Invalid {
-            detail: format!(
-                "bad {arg:?}: want --ignore-submodules[=all|untracked|dirty|none]"
-            ),
+            detail: format!("bad {arg:?}: want --ignore-submodules[=all|untracked|dirty|none]"),
         }),
     }
 }
@@ -917,7 +914,10 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if null && format == StatusFormat::Long {
         format = StatusFormat::Porcelain(PorcelainVersion::V1);
     }
-    let untracked_mode = untracked_opts.last().copied().unwrap_or(UntrackedMode::Normal);
+    let untracked_mode = untracked_opts
+        .last()
+        .copied()
+        .unwrap_or(UntrackedMode::Normal);
     let ahead_behind = if opts.is_set("no-ahead-behind") {
         AheadBehind::Off
     } else {
@@ -959,11 +959,7 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 }
                 _ => None,
             };
-            let stash = if show_stash {
-                stash_count(store)?
-            } else {
-                0
-            };
+            let stash = if show_stash { stash_count(store)? } else { 0 };
             let ignored = opts.is_set("ignored").then(|| plan.ignored.clone());
             let branch = long_branch_label(store)?;
             let mut out = render_long_full(
@@ -1569,10 +1565,7 @@ fn render_porcelain(
     let mut lines: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     for path in staged_map.keys().chain(unstaged_map.keys()) {
         if plan.renames.iter().any(|(old, _, _)| old == *path)
-            || plan
-                .renames_unstaged
-                .iter()
-                .any(|(old, _, _)| old == *path)
+            || plan.renames_unstaged.iter().any(|(old, _, _)| old == *path)
         {
             continue;
         }
@@ -1969,11 +1962,7 @@ fn ahead_behind_counts(
 
 /// Renders the oracle's long-format tracking sentence for one branch, or
 /// `None` without a configured upstream (or before the first commit).
-fn tracking_sentence(
-    ctx: &Ctx,
-    store: &Store,
-    branch: &str,
-) -> Result<Option<String>, GitError> {
+fn tracking_sentence(ctx: &Ctx, store: &Store, branch: &str) -> Result<Option<String>, GitError> {
     let Some(upstream) = branch_upstream(ctx, store, branch) else {
         return Ok(None);
     };
@@ -2038,9 +2027,9 @@ fn porcelain_v1_branch(
                             (0, 0) => {}
                             (ahead, 0) => line.push_str(&format!(" [ahead {ahead}]")),
                             (0, behind) => line.push_str(&format!(" [behind {behind}]")),
-                            (ahead, behind) => line.push_str(
-                                &format!(" [ahead {ahead}, behind {behind}]"),
-                            ),
+                            (ahead, behind) => {
+                                line.push_str(&format!(" [ahead {ahead}, behind {behind}]"))
+                            }
                         }
                     }
                 }
@@ -2181,8 +2170,7 @@ pub(crate) fn render_long_full(
             let word = if *code == 'D' { "deleted" } else { "modified" };
             section.extend_from_slice(&status_entry(word, path));
         }
-        let mut renamed: Vec<&(Vec<u8>, Vec<u8>, u8)> =
-            plan.renames_unstaged.iter().collect();
+        let mut renamed: Vec<&(Vec<u8>, Vec<u8>, u8)> = plan.renames_unstaged.iter().collect();
         renamed.sort_by(|left, right| left.1.cmp(&right.1));
         for (old, new, _) in renamed {
             let display = format!(
