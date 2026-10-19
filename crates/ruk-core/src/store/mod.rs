@@ -709,6 +709,32 @@ impl Store {
                 .map(|location| location.map(|location| location.decoded_len)),
         )
     }
+    /// Every committed object: identity, kind, and decoded length, in
+    /// raw-digest order. The object census behind `cat-file
+    /// --batch-all-objects --batch-check` and unreachable-object sweeps:
+    /// kinds and lengths come straight from the locator rows, so the scan
+    /// does no payload I/O. Each page is its own read transaction; the
+    /// returned snapshot is not transactional with later reads.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for storage damage, which also latches
+    /// quarantine; quarantine refuses.
+    pub fn iter_objects(&self) -> Result<Vec<(Oid, ObjectKind, u64)>, StoreError> {
+        self.refuse_if_quarantined()?;
+        let mut out = Vec::new();
+        let mut after: Option<Oid> = None;
+        loop {
+            let page = self.observe(self.meta.object_page(after.as_ref(), 1024))?;
+            if page.is_empty() {
+                return Ok(out);
+            }
+            after = page.last().map(|(oid, _)| *oid);
+            out.extend(
+                page.into_iter()
+                    .map(|(oid, location)| (oid, location.kind, location.decoded_len)),
+            );
+        }
+    }
 
     /// Decodes a prepared, not yet committed object and verifies its
     /// identity, the same proof publication and readers get later. A delta
