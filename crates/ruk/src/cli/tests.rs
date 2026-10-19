@@ -19,6 +19,7 @@ use super::verbs_bisect;
 use super::verbs_blame;
 use super::verbs_branch;
 use super::verbs_bundle;
+use super::verbs_fastio;
 use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_merge_plumbing;
@@ -125,11 +126,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 90);
+    assert_eq!(VERBS.len(), 94);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 90);
+    assert_eq!(names.len(), 94);
     for name in [
         "add",
         "am",
@@ -157,6 +158,8 @@ fn verb_table_covers_advertised_names() {
         "credential",
         "describe",
         "diff",
+        "fast-export",
+        "fast-import",
         "fetch",
         "fmt-merge-msg",
         "for-each-ref",
@@ -186,12 +189,14 @@ fn verb_table_covers_advertised_names() {
         "pack-objects",
         "pull",
         "push",
+        "range-diff",
         "rebase",
         "receive-pack",
         "read-tree",
         "reflog",
         "remote",
         "replace",
+        "request-pull",
         "rerere",
         "reset",
         "restore",
@@ -5086,7 +5091,10 @@ fn read_tree_merge_stages_conflicts() {
         std::fs::read(root.join("f.txt")).expect("read"),
         b"c\n"
     );
-    // A clean three-way collapses back to stage zero.
+    // A clean three-way collapses back to stage zero (clear the stopped
+    // stages first: `-m` refuses an unmerged index).
+    run(verbs_merge_plumbing::read_tree, &mut ctx, &["--reset", base.as_str()])
+        .expect("reset clears");
     run(
         verbs_merge_plumbing::read_tree,
         &mut ctx,
