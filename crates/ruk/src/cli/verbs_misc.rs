@@ -5,7 +5,7 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `clean` | index scan vs worktree walk | implemented (`-f`/`-d`/`-n`/`-x` inert/`-e`; no ignore rules exist so every untracked path is a candidate) |
+//! | `clean` | index scan vs worktree walk | implemented (`-f`/`-d`/`-n`/`-e`; `.rukignore` skipped by default, `-x` includes ignored, `-X` only ignored) |
 //! | `describe` | breadth-first walk to the nearest tag | implemented (`--tags`/`--exact-match`/`--long`/`--abbrev`/`--always`) |
 //! | `reflog` | `Reflogs` rows `update-ref -m` writes | implemented (`show`/`list`/`expire --expire=now|never|<N>.days.ago`/`delete <ref>@{n}`) |
 //! | `shortlog` | ancestry walk grouped by author | implemented (`-s`/`-n`/`-e`, ranges) |
@@ -230,11 +230,10 @@ fn parents_of(store: &Store, oid: Oid) -> Result<Vec<Oid>, GitError> {
 
 /// Removes untracked worktree files.
 ///
-/// Oracle: `git/builtin/clean.c`. There is no ignore matcher anywhere in
-/// this tree, so every untracked path is a candidate and `-x` is inert;
-/// `-X` (only ignored) therefore removes nothing. Without `-d`, files
-/// inside wholly-untracked directories stay, the way the oracle refuses to
-/// descend into them.
+/// Oracle: `git/builtin/clean.c`. Candidates skip `.rukignore` matches
+/// unless `-x` widens the run to ignored paths too; `-X` keeps only
+/// ignored paths. Without `-d`, files inside wholly-untracked directories
+/// stay, the way the oracle refuses to descend into them.
 pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -300,12 +299,13 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         }
     }
     let excludes = opts.all("exclude")?;
+    let ignore_rules = load_ignore_rules(&ctx.file_base)?;
     let limits: Vec<Vec<u8>> = opts
         .positionals
         .iter()
         .map(|limit| limit.as_bytes().to_vec())
         .collect();
-    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    let mut candidates: Vec<(Vec<u8>, bool)> = Vec::new();
     for entry in walk_worktree(&ctx.file_base)? {
         if tracked.contains(&entry.path) {
             continue;
@@ -324,20 +324,23 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         {
             continue;
         }
-        candidates.push(entry.path);
+        let ignored = path_is_ignored(&ignore_rules, &text).is_some();
+        if ignored && !opts.is_set("ignored") && !opts.is_set("only-ignored") {
+            continue;
+        }
+        candidates.push((entry.path, ignored));
+    }
+    // `-X` keeps only ignored paths.
+    if opts.is_set("only-ignored") {
+        candidates.retain(|(_, ignored)| *ignored);
     }
     candidates.sort();
-    // `-X` keeps only ignored paths; with no ignore rules that set is
-    // empty, so the run is a no-op by construction.
-    if opts.is_set("only-ignored") {
-        candidates.clear();
-    }
     if dry {
         if opts.is_set("quiet") {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for path in &candidates {
+        for (path, _) in &candidates {
             out.extend_from_slice(b"Would remove ");
             out.extend_from_slice(path);
             out.push(b'\n');
@@ -346,7 +349,7 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     }
     let mut out = Vec::new();
     let mut emptied: Vec<PathBuf> = Vec::new();
-    for path in &candidates {
+    for (path, _) in &candidates {
         let full = ctx.file_base.join(String::from_utf8_lossy(path).as_ref());
         match std::fs::remove_file(&full) {
             Ok(()) => {}
@@ -2585,6 +2588,30 @@ mod tests {
         call(clean, &mut ctx, &["-f", "-d"]).expect("clean -d");
         assert!(!root.join("sub/dir/u.txt").exists());
         assert!(call(clean, &mut ctx, &[]).is_err(), "clean needs -f");
+        let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn clean_respects_rukignore() {
+        let (root, mut ctx) = fresh("clean-ignore");
+        commit_file(&mut ctx, &root, "a.txt", b"a\n", "seed");
+        std::fs::write(root.join("keep.txt"), b"k\n").expect("write");
+        std::fs::write(root.join("skip.log"), b"s\n").expect("write");
+        std::fs::write(root.join(".rukignore"), b"*.log\n").expect("write");
+        let preview = String::from_utf8(call(clean, &mut ctx, &["-n"]).expect("dry run"))
+            .expect("utf8");
+        assert!(preview.contains("keep.txt"), "got {preview:?}");
+        assert!(!preview.contains("skip.log"), "got {preview:?}");
+        let preview = String::from_utf8(call(clean, &mut ctx, &["-n", "-x"]).expect("with -x"))
+            .expect("utf8");
+        assert!(preview.contains("skip.log"), "got {preview:?}");
+        let preview = String::from_utf8(call(clean, &mut ctx, &["-n", "-X"]).expect("only -X"))
+            .expect("utf8");
+        assert!(!preview.contains("keep.txt"), "got {preview:?}");
+        assert!(preview.contains("skip.log"), "got {preview:?}");
+        call(clean, &mut ctx, &["-f", "-X"]).expect("clean -X");
+        assert!(root.join("keep.txt").exists());
+        assert!(!root.join("skip.log").exists());
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }
 

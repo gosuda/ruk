@@ -56,7 +56,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | checkout | implemented | branch switch, detach, `-b`/`-B`, path restore |
 | cherry | implemented | `upstream [head [base]]`, `+`/`-` by tree-diff content patch-id, `-v` |
 | cherry-pick | implemented | per-commit three-way replay (syntax lane, text fallback); `-n`, `-m`, `-x`; `--continue`/`--skip`/`--abort` over `CHERRY_PICK_HEAD` + todo state |
-| clean | implemented | `-f`/`-d`/`-n`/`-e`; `-x` inert and `-X` empty (no ignore rules); files under untracked dirs need `-d` |
+| clean | implemented | `-f`/`-d`/`-n`/`-e`; `.rukignore` skipped by default, `-x` includes ignored, `-X` only ignored; files under untracked dirs need `-d` |
 | clone | implemented | local paths only; branches, tags, remote-tracking refs, `HEAD` branch, fetch refspec config; network sources are `Offline` |
 | commit | implemented | `-m` (required, no editor), `-a`, `--amend` via `ops::edit`; empty tree-matching commits refuse; concludes `MERGE_HEAD` merges with two parents |
 | commit-tree | implemented | canonical payload, parents verified as stored commits |
