@@ -4804,6 +4804,25 @@ fn submodule_status_summary_foreach_and_gap() {
     let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
 }
 
+#[test]
+fn submodule_deinit_refuses_dirty_without_force() {
+    let (root, env, child_root, _) = submodule_case("submodule-deinit");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("vendor/lib/lib.txt"), b"dirty\n").expect("dirty file");
+    let err = run(verbs_submodule::submodule, &mut ctx, &["deinit", "vendor/lib"])
+        .expect_err("refuses");
+    assert!(err.to_string().contains("--force"), "got {err:?}");
+    assert!(root.join("vendor/lib/lib.txt").exists());
+    run(
+        verbs_submodule::submodule,
+        &mut ctx,
+        &["deinit", "--force", "vendor/lib"],
+    )
+    .expect("force");
+    assert!(!root.join("vendor/lib").exists());
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
+}
 // ---------------------------------------------------------------------------
 // sparse + merge-plumbing lane: sparse-checkout, merge-file, merge-tree,
 // read-tree, checkout-index, rerere

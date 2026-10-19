@@ -115,7 +115,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; oracle two-commit shape (index + `WIP` parents); apply refuses only staged or worktree changes on paths the stash touches |
 | status | implemented | `--porcelain`, `--short`, `--branch`, long format; staged renames always paired when identical, `-M` pairs by similarity staged and worktree |
 | stripspace | implemented | trailing-blank collapse; `--strip-comments` |
-| submodule | implemented | `add` (local clone, gitlink + `.rukmodules`), `status` (`--cached`/`--recursive`), `init`, `deinit`, `update` (`--init`/`--recursive`/`--remote`), `summary`, `foreach` (`--recursive`); `absorbgitdirs` is `Unsupported` (child `.ruk` needs no gitdir absorption) |
+| submodule | implemented | `add` (local clone, gitlink + `.rukmodules`), `status` (`--cached`/`--recursive`), `init`, `deinit` (refuses dirty trees without `--force`), `update` (`--init`/`--recursive`/`--remote`), `summary`, `foreach` (`--recursive`); `absorbgitdirs` is `Unsupported` (child `.ruk` needs no gitdir absorption) |
 | switch | implemented | `-c`/`-C`, `--detach`, remote guess |
 | symbolic-ref | implemented | `HEAD` moves the workspace row; other names are ref symrefs |
 | tag | implemented | lightweight, annotated (`-a`/`-m`), list with globs, delete |

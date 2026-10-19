@@ -5,7 +5,7 @@
 //! | `add` | local clone into `<path>/.ruk` + gitlink row + `.rukmodules` row | implemented (local paths only; `--name`, `--branch/-b`, `--force`, `--depth`) |
 //! | `status` | index gitlink vs child `HEAD`, `--cached` index-vs-`HEAD` | implemented (`--recursive`, `--cached`) |
 //! | `init` | copies `.rukmodules` urls into `submodule.<name>.url` config | implemented |
-//! | `deinit` | drops the child directory, keeps the gitlink + `.rukmodules` | implemented (`--force`) |
+//! | `deinit` | drops the child directory, keeps the gitlink + `.rukmodules` | implemented (refuses dirty trees without `--force`) |
 //! | `update` | `--init` clones, then checks the child out at the gitlink oid | implemented (`--init`/`--recursive`/`--remote`/`--depth`; `--merge`/`--rebase` are `Unsupported`) |
 //! | `summary` | index gitlink vs `HEAD` gitlink per submodule | implemented (commit subjects omitted) |
 //! | `foreach` | runs `sh -c` in each initialized child | implemented (`--recursive`) |
@@ -1106,10 +1106,11 @@ fn cmd_deinit(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let entries = select_entries(&load_modules(ctx, store, kind)?, rest)?;
-    let _ = opts;
+    let force = opts.is_set("force");
     let mut out = Vec::new();
     for entry in &entries {
         let child_root = ctx.root.join(&entry.path);
+        refuse_dirty_child(entry, &child_root, kind, force)?;
         if child_root.is_dir() {
             std::fs::remove_dir_all(&child_root).map_err(|err| GitError::Io {
                 detail: format!("removing {}: {err}", child_root.display()),
@@ -1120,6 +1121,96 @@ fn cmd_deinit(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8
         let _ = config_unset(store, &format!("submodule.{}.branch", entry.name));
     }
     Ok(out)
+}
+
+/// Refuses to clear a dirty child worktree unless `force` discards it.
+fn refuse_dirty_child(
+    entry: &SubmoduleEntry,
+    child_root: &Path,
+    kind: HashKind,
+    force: bool,
+) -> Result<(), GitError> {
+    if force || !child_root.is_dir() {
+        return Ok(());
+    }
+    let Some(child_store) = open_child_store(child_root)? else {
+        return Ok(());
+    };
+    if child_is_dirty(&child_store, kind, child_root)? {
+        return Err(GitError::Invalid {
+            detail: format!(
+                "submodule {:?} has local changes; use --force to discard them",
+                entry.path
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Reports whether the child worktree differs from its `HEAD`.
+///
+/// Staged drift compares index rows against the `HEAD` tree; worktree drift
+/// re-hashes tracked file bytes (symlinks read as their target). Untracked
+/// files never block, matching the oracle's tracked-changes refusal.
+fn child_is_dirty(child: &Store, kind: HashKind, root: &Path) -> Result<bool, GitError> {
+    let rows = scan_index(child, kind)?;
+    if rows.iter().any(|(_, stage, _)| *stage != Stage::Zero) {
+        return Ok(true);
+    }
+    let head_tree = head_tree_map(child, kind)?;
+    let mut indexed: BTreeMap<Vec<u8>, (TreeMode, Oid)> = BTreeMap::new();
+    for (path, stage, entry) in &rows {
+        if *stage == Stage::Zero {
+            indexed.insert(
+                path.as_bytes().to_vec(),
+                (TreeMode::from(entry.mode()), entry.oid()),
+            );
+        }
+    }
+    if indexed.len() != head_tree.len() {
+        return Ok(true);
+    }
+    for (path, mode_oid) in &indexed {
+        if head_tree.get(path) != Some(mode_oid) {
+            return Ok(true);
+        }
+    }
+    for (path, stage, entry) in &rows {
+        if *stage != Stage::Zero || entry.mode() == FileMode::Gitlink {
+            continue;
+        }
+        let full = join_base(root, path.as_bytes())?;
+        let meta = match std::fs::symlink_metadata(&full) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(err) => {
+                return Err(GitError::Io {
+                    detail: format!("statting {}: {err}", full.display()),
+                });
+            }
+        };
+        if meta.file_type().is_dir() {
+            return Ok(true);
+        }
+        let bytes = if meta.file_type().is_symlink() {
+            std::fs::read_link(&full)
+                .map_err(|err| GitError::Io {
+                    detail: format!("reading link {}: {err}", full.display()),
+                })?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec()
+        } else {
+            std::fs::read(&full).map_err(|err| GitError::Io {
+                detail: format!("reading {}: {err}", full.display()),
+            })?
+        };
+        let oid = kind.hash_git_object("blob", &bytes).map_err(to_core)?;
+        if oid != entry.oid() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
