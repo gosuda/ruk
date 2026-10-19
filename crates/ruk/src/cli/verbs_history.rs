@@ -2154,8 +2154,8 @@ fn render_commit_line(
 
 /// Renders one commit's identity line with `--source` text: `source` is
 /// the reaching ref name, empty when `--source` is off or the tip is
-/// unnamed. Oneline form is `<short> <source> <subject>`; the header form
-/// appends the source after the oid, before decorations.
+/// unnamed. Oneline form is `<short>[ <source>][ (<deco>)] <subject>`;
+/// the header form appends the source after the oid, before decorations.
 fn render_commit_line_full(
     line: &CommitLine,
     oid: &Oid,
@@ -2172,9 +2172,9 @@ fn render_commit_line_full(
         let subject = first_subject_line(record.message());
         let short = short_hex_len(oid, line.abbrev_len);
         if source.is_empty() {
-            return Ok(format!("{short} {subject}\n").into_bytes());
+            return Ok(format!("{short}{decoration} {subject}\n").into_bytes());
         }
-        return Ok(format!("{short} {source} {subject}\n").into_bytes());
+        return Ok(format!("{short} {source}{decoration} {subject}\n").into_bytes());
     }
     if line.pretty != PrettyKind::Default {
         return render_pretty_shape(line, oid, record, decoration, source);
@@ -2404,16 +2404,11 @@ fn decoration_map(store: &Store) -> Result<HashMap<Oid, Vec<String>>, GitError> 
     }
     let (workspace, _) = load_or_default(store)?;
     if let HeadRef::Symbolic(name) = &workspace.head {
-        let branch = name
-            .to_utf8()
-            .unwrap_or_default()
-            .trim_start_matches("refs/heads/")
-            .to_owned();
         if let Some(oid) = resolve_ref_target(store, read_ref(store, name)?)? {
             let full = name.to_utf8().unwrap_or_default().to_owned();
             let entry = map.entry(oid).or_default();
             entry.retain(|existing| existing != &full);
-            entry.insert(0, format!("HEAD -> {branch}"));
+            entry.insert(0, format!("HEAD -> {full}"));
         }
     }
     Ok(map)
@@ -2427,18 +2422,30 @@ fn short_ref_name(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-/// Renders the `%d` text for one commit: ` (HEAD -> main, v1)` with its
-/// leading space, or empty when undecorated.
-fn decoration_text(map: &HashMap<Oid, Vec<String>>, oid: &Oid, full: bool) -> String {
+/// Renders the `%d` text for one commit with shortened names:
+/// ` (HEAD -> main, v1)` with its leading space, or empty when undecorated.
+fn decoration_text_short(map: &HashMap<Oid, Vec<String>>, oid: &Oid) -> String {
+    decoration_text_impl(map, oid, false)
+}
+
+/// Renders the `%d` text for one commit with full ref names:
+/// ` (HEAD -> refs/heads/main)`, or empty when undecorated.
+fn decoration_text_full(map: &HashMap<Oid, Vec<String>>, oid: &Oid) -> String {
+    decoration_text_impl(map, oid, true)
+}
+
+fn decoration_text_impl(map: &HashMap<Oid, Vec<String>>, oid: &Oid, full: bool) -> String {
     match map.get(oid) {
         Some(names) if !names.is_empty() => {
-            let list: Vec<&str> = names
+            let list: Vec<String> = names
                 .iter()
                 .map(|name| {
                     if full {
-                        name.as_str()
+                        name.clone()
+                    } else if let Some(target) = name.strip_prefix("HEAD -> ") {
+                        format!("HEAD -> {}", short_ref_name(target))
                     } else {
-                        short_ref_name(name)
+                        short_ref_name(name).to_owned()
                     }
                 })
                 .collect();
@@ -5055,7 +5062,9 @@ fn clear_lane_state(ctx: &Ctx, verb: &str, head_key: Option<&str>) -> Result<(),
 /// `--first-parent`, `--left-right`/`--cherry-pick` (sides come from the
 /// first `A...B` range; without one every commit reads as right-side `>`),
 /// `--topo-order`, `--date-order` (the walk already pops newest
-/// committer-date first, so this is accepted as the default order),
+/// committer-date first, so this is accepted as the default order; with
+/// no revisions either order walks every ref so the order reads across
+/// branches, while named revisions still walk just their tips),
 /// `--date=<fmt>`/`--relative-date`, `--abbrev[=<n>]`, `--summary`,
 /// `--shortstat`, `--numstat`, `--dirstat`, `--show-notes[=<ref>]`/
 /// `--no-notes`, `--decorate=<short|full|auto|no>`, `--source`,
@@ -5311,10 +5320,19 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
     let (mut tips, exclude) = parse_log_revs(store, kind, &rev_positionals, default_tip)?;
     let excludes = opts.all("exclude")?;
+    // An explicit order with no revisions walks every ref: the order only
+    // reads across branches when both sides are walked. Named revisions,
+    // `--all`, and ref filters keep their own tip sets.
+    let order_all = (opts.is_set("topo-order") || opts.is_set("date-order"))
+        && rev_positionals.is_empty()
+        && ref_filters.is_empty()
+        && !opts.is_set("all");
     // Tip labels feed `--source` text and `--left-right` sides; the first
     // symmetric range fixes left vs right.
     let mut tip_names: HashMap<Oid, String> = HashMap::new();
-    for (oid, name) in log_ref_tips(store, opts.is_set("all"), &ref_filters, &excludes)? {
+    for (oid, name) in
+        log_ref_tips(store, opts.is_set("all") || order_all, &ref_filters, &excludes)?
+    {
         if !tips.contains(&oid) {
             tips.push(oid);
         }
@@ -5405,8 +5423,12 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         line.abbrev_len = len;
         line.abbrev = true;
     }
+    // `--decorate=auto` never decorates here: automatic decorations print
+    // only on a terminal, and this interpreter never renders to one. Bare
+    // `--decorate` still means short names.
     let decorate = !opts.is_set("no-decorate")
-        && (opts.is_set("decorate") || decorate_mode.as_deref().is_some_and(|mode| mode != "no"));
+        && (opts.is_set("decorate")
+            || decorate_mode.as_deref().is_some_and(|mode| mode == "short" || mode == "full"));
     let full_names = decorate_mode.as_deref() == Some("full");
     let simplify = opts.is_set("simplify-by-decoration");
     let decorations = if decorate || line.format.is_some() || simplify {
@@ -5554,7 +5576,11 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let source = opts.is_set("source");
     let mut out = Vec::new();
     for shown in &shown {
-        let decoration = decoration_text(&decorations, &shown.oid, full_names);
+        let decoration = if full_names {
+            decoration_text_full(&decorations, &shown.oid)
+        } else {
+            decoration_text_short(&decorations, &shown.oid)
+        };
         let source_text = source.then(|| tip_names.get(&shown.origin).cloned().unwrap_or_default());
         let mut block = render_commit_line_full(
             &line,
@@ -5613,7 +5639,11 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         out.extend_from_slice(&block);
     }
     for (_, oid, record) in &boundary {
-        let decoration = decoration_text(&decorations, oid, full_names);
+        let decoration = if full_names {
+            decoration_text_full(&decorations, oid)
+        } else {
+            decoration_text_short(&decorations, oid)
+        };
         let mut block = render_commit_line_full(&line, oid, record, &decoration, "")?;
         if line.format.is_none() {
             prefix_mark(&mut block, b'-');
@@ -6263,6 +6293,7 @@ fn log_commit_extra(
     }
     let mut changes = tree_file_changes(ctx, parent_tree, tree)?;
     if !wants.is_empty() {
+        split_offspec_renames(store, &mut changes, wants)?;
         changes.retain(|change| change_matches(change, wants));
     }
     let mut out = Vec::new();
@@ -6280,6 +6311,55 @@ fn log_commit_extra(
         out.extend_from_slice(&render_dirstat(&changes));
     }
     Ok(out)
+}
+
+/// Splits paired renames straddling the pathspec back into one-sided
+/// changes, mirroring filter-before-pairing for the stat shapes (which
+/// pair identical blobs inside [`tree_file_changes`], past any flag
+/// layer): a rename with only its new side in spec becomes the addition
+/// of that side with full line counts, and vice versa for deletions.
+fn split_offspec_renames(
+    store: &Store,
+    changes: &mut Vec<FileChange>,
+    wants: &[Vec<u8>],
+) -> Result<(), GitError> {
+    for change in changes.iter_mut() {
+        let (Some((old_path, _, _)), Some((new_path, _, _))) =
+            (&change.old, &change.new)
+        else {
+            continue;
+        };
+        if old_path == new_path {
+            continue;
+        }
+        let old_in = wants.iter().any(|want| path_wanted(old_path, want));
+        let new_in = wants.iter().any(|want| path_wanted(new_path, want));
+        if old_in == new_in {
+            continue;
+        }
+        if new_in {
+            let Some((_, new_mode, new_oid)) = change.new.clone() else {
+                continue;
+            };
+            let body = stat_body(store, new_mode, new_oid)?;
+            change.old = None;
+            change.added = split_lines(&body).len();
+            change.removed = 0;
+            change.binary = body.contains(&0);
+            change.sizes = (0, body.len());
+        } else {
+            let Some((_, old_mode, old_oid)) = change.old.clone() else {
+                continue;
+            };
+            let body = stat_body(store, old_mode, old_oid)?;
+            change.new = None;
+            change.added = 0;
+            change.removed = split_lines(&body).len();
+            change.binary = body.contains(&0);
+            change.sizes = (body.len(), 0);
+        }
+    }
+    Ok(())
 }
 
 /// Renders `--numstat` rows: `added<TAB>deleted<TAB>path`, `-` counts for
@@ -6526,10 +6606,14 @@ fn log_commit_diff(
         parent_tree = Some(commit_tree_oid(&commit_record(store, *parent)?)?);
     }
     let mut pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
-    apply_pair_renames(ctx, &mut pairs, rename_mode)?;
+    // The pathspec bounds pairing first: sides outside it never pair, so
+    // a rename with only its new side in spec prints as an addition (and
+    // vice versa), exactly as the oracle orders diffcore. `--follow`
+    // supplies both tracked sides, so its renames still pair.
     if !wants.is_empty() {
         pairs.retain(|pair| pair_matches(pair, wants));
     }
+    apply_pair_renames(ctx, &mut pairs, rename_mode)?;
     render_pairs(ctx, &pairs, opts)
 }
 
@@ -6782,7 +6866,11 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         && (opts.is_set("decorate") || decorate_mode.as_deref().is_some_and(|mode| mode != "no"));
     let full_names = decorate_mode.as_deref() == Some("full");
     let decoration = if decorate || line.format.is_some() {
-        decoration_text(&decoration_map(store)?, &oid, full_names)
+        if full_names {
+            decoration_text_full(&decoration_map(store)?, &oid)
+        } else {
+            decoration_text_short(&decoration_map(store)?, &oid)
+        }
     } else {
         String::new()
     };
