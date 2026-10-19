@@ -1772,7 +1772,10 @@ fn split_trailers(text: &str) -> (Vec<String>, Vec<Trailer>) {
             index += 1;
             continue;
         }
-        let colon = text_line.find(':').expect("trailer line holds a colon");
+        let Some(colon) = text_line.find(':') else {
+            index += 1;
+            continue;
+        };
         let token = text_line[..colon].trim().to_owned();
         let mut value = text_line[colon + 1..].trim().to_owned();
         index += 1;
@@ -1789,6 +1792,30 @@ fn split_trailers(text: &str) -> (Vec<String>, Vec<Trailer>) {
         lines[..start].iter().map(|s| (*s).to_owned()).collect(),
         trailers,
     )
+}
+
+/// Parses one `--trailer` argument in `key=value` or `key: value` form,
+/// splitting at the earliest separator the way the oracle accepts both.
+/// A bare `key` carries an empty value.
+fn parse_trailer_arg(extra: &str) -> Result<Trailer, GitError> {
+    let equals = extra.find('=');
+    let colon = extra.find(':');
+    let cut = match (equals, colon) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+    match cut {
+        Some(index) => Ok(Trailer {
+            token: extra[..index].trim().to_owned(),
+            value: extra[index + 1..].trim().to_owned(),
+        }),
+        None => Ok(Trailer {
+            token: extra.trim().to_owned(),
+            value: String::new(),
+        }),
+    }
 }
 
 /// Parses and formats commit-message trailers.
@@ -1838,7 +1865,7 @@ pub(crate) fn interpret_trailers(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u
     let opts = collect(args, &specs)?;
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: interpret-trailers [--only-trailers] [--trailer=<k=v>] < input"
+            detail: "usage: interpret-trailers [--only-trailers] [--trailer=<key[=: ]value>] < input"
                 .to_owned(),
         });
     }
@@ -1861,16 +1888,7 @@ pub(crate) fn interpret_trailers(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u
     let text = String::from_utf8_lossy(&raw).into_owned();
     let (mut body, mut trailers) = split_trailers(&text);
     for extra in opts.all("trailer")? {
-        match extra.split_once('=') {
-            Some((token, value)) => trailers.push(Trailer {
-                token: token.trim().to_owned(),
-                value: value.trim().to_owned(),
-            }),
-            None => trailers.push(Trailer {
-                token: extra.trim().to_owned(),
-                value: String::new(),
-            }),
-        }
+        trailers.push(parse_trailer_arg(&extra)?);
     }
     if trailers.iter().any(|t| {
         t.token.is_empty()
