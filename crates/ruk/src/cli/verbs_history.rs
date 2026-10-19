@@ -298,7 +298,7 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         None => false,
         Some(tip) => commit_tree_oid(&commit_record(store, tip)?)? == tree,
     };
-    if tree_unchanged && !opts.is_set("allow-empty") {
+    if tree_unchanged && !opts.is_set("allow-empty") && !fixup_allows_empty(&opts) {
         return Err(GitError::Invalid {
             detail: "nothing to commit, working tree clean".to_owned(),
         });
@@ -488,10 +488,24 @@ enum FixupKind {
     /// `--fixup <commit>`: `fixup! <subject>`, combinable with `-m`.
     Fixup,
     /// `--fixup=amend:<commit>`: `amend! <subject>` plus the full target
-    /// message, never with `-m`.
+    /// message, never with `-m`; lifts the empty-tree refusal.
     Amend,
-    /// `--fixup=reword:<commit>`: `reword! <subject>`; `-m` is ignored.
+    /// `--fixup=reword:<commit>`: the oracle assigns the same `amend!`
+    /// subject line (no `reword!` spelling exists in its sources) with the
+    /// full target message, refuses `-m` and `-a` like the reword-option
+    /// check, and likewise lifts the empty-tree refusal.
     Reword,
+}
+
+/// Reports whether `--fixup=amend:`/`reword:` lifts the empty-tree refusal:
+/// the oracle sets `allow_empty` for both spellings.
+fn fixup_allows_empty(opts: &super::Collected) -> bool {
+    opts.single("fixup").ok().flatten().is_some_and(|value| {
+        matches!(
+            parse_fixup_flag(&value),
+            (FixupKind::Amend, _) | (FixupKind::Reword, _)
+        )
+    })
 }
 
 /// Splits `--fixup=[(amend|reword):]<commit>` into its kind and revision.
@@ -654,9 +668,19 @@ fn resolve_commit_message(
         });
     }
     let fixup_parsed = fixup.as_deref().map(parse_fixup_flag);
-    if have_m && fixup_parsed.is_some_and(|(kind, _)| kind == FixupKind::Amend) {
+    if have_m
+        && fixup_parsed.is_some_and(|(kind, _)| {
+            matches!(kind, FixupKind::Amend | FixupKind::Reword)
+        })
+    {
+        let shape = fixup.as_deref().unwrap_or("--fixup");
         return Err(GitError::Invalid {
-            detail: "options '-m' and '--fixup=amend:...' cannot be used together".to_owned(),
+            detail: format!("options '-m' and '--fixup={shape}' cannot be used together"),
+        });
+    }
+    if fixup_parsed.is_some_and(|(kind, _)| kind == FixupKind::Reword) && opts.is_set("all") {
+        return Err(GitError::Invalid {
+            detail: "reword option of '--fixup' and '--all' cannot be used together".to_owned(),
         });
     }
     // Git terminates the joined `-m` paragraphs with a newline (`-m one`
@@ -694,8 +718,7 @@ fn resolve_commit_message(
         let subject = commit_subject(store, kind, rev)?;
         let prefix = match fixup_kind {
             FixupKind::Fixup => "fixup",
-            FixupKind::Amend => "amend",
-            FixupKind::Reword => "reword",
+            FixupKind::Amend | FixupKind::Reword => "amend",
         };
         let mut text = format!("{prefix}! {subject}\n\n");
         match fixup_kind {
@@ -705,11 +728,10 @@ fn resolve_commit_message(
                     text.push_str(&extra);
                 }
             }
-            FixupKind::Reword => {}
             // An `amend!` target carries its full message (or just the
             // body when the subject already says `amend!`), so the new
             // message stays actionable for autosquash.
-            FixupKind::Amend => {
+            FixupKind::Amend | FixupKind::Reword => {
                 let oid = resolve_local(store, kind, rev)?;
                 let full =
                     String::from_utf8_lossy(commit_record(store, oid)?.message()).into_owned();

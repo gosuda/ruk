@@ -7132,6 +7132,21 @@ fn wave_j_commit_squash_fixup_amend() {
         wave_j_head_message(&mut ctx),
         "squash! seed\n\nextra body\n"
     );
+    // Both `amend:` spellings lift the empty-tree refusal on a clean tree;
+    // `reword:` shares the `amend!` subject line, never `reword!`.
+    let amend_arg = format!("--fixup=amend:{base}");
+    run(verbs_history::commit, &mut ctx, &[amend_arg.as_str()]).expect("empty amend fixup");
+    assert_eq!(wave_j_head_message(&mut ctx), "amend! seed\n\nseed\n");
+    assert_eq!(head_parent_count(&mut ctx), 1);
+    let reword_arg = format!("--fixup=reword:{base}");
+    run(verbs_history::commit, &mut ctx, &[reword_arg.as_str()]).expect("empty reword fixup");
+    assert_eq!(wave_j_head_message(&mut ctx), "amend! seed\n\nseed\n");
+    let err = run(verbs_history::commit, &mut ctx, &[reword_arg.as_str(), "-m", "x"])
+        .expect_err("fixup reword -m");
+    assert!(err.to_string().contains("cannot be used together"), "{err}");
+    let err = run(verbs_history::commit, &mut ctx, &[reword_arg.as_str(), "-a"])
+        .expect_err("fixup reword -a");
+    assert!(err.to_string().contains("cannot be used together"), "{err}");
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     let fixup_arg = format!("--fixup=amend:{base}");
@@ -7371,7 +7386,9 @@ fn wave_j_status_verbose_column_renames() {
         "staged diff"
     );
     // Identical-blob staged moves pair; `--no-renames` keeps add+delete.
-    std::fs::write(root.join("g.txt"), b"one\ntwo\n").expect("copy");
+    // The copy must equal the HEAD blob: exact pairing matches index
+    // additions against HEAD deletions by oid.
+    std::fs::write(root.join("g.txt"), b"one\n").expect("copy");
     run(verbs_stage::add, &mut ctx, &["g.txt"]).expect("add g");
     run(verbs_stage::rm, &mut ctx, &["f.txt"]).expect("rm f");
     let out = run(verbs_stage::status, &mut ctx, &["--porcelain"]).expect("rename");
