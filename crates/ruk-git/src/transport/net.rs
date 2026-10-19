@@ -733,6 +733,63 @@ mod tests {
     }
 
     #[test]
+    fn archive_session_flows_over_fake_ssh() {
+        // The fake server speaks `upload-archive` on stdin/stdout: it
+        // checks the spawned remote command, consumes the argument
+        // framing, and answers ACK plus a sideband tar.
+        use std::io::Write as _;
+        let rev = "HEAD";
+        let request_len = super::super::smart_http::archive_request_body(rev)
+            .expect("request")
+            .len();
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-net-archive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let script = dir.join("fake-ssh-archive.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$2\" = \"git-upload-archive '/srv/a.git'\" ] || exit 99\nhead -c {request_len} > /dev/null\nprintf '0008ACK\\n0000'\nprintf '0007\\001hi'\nprintf '0000'\n"
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+        // Local endpoints route to the store, never to a stream.
+        assert!(
+            open_archive_stream(&Endpoint::Local {
+                path: PathBuf::from("/srv/a.git"),
+            })
+            .is_err(),
+            "local archive needs no stream"
+        );
+        let stream = ssh_connect_with(
+            "far.test",
+            None,
+            None,
+            Service::UploadArchive,
+            "/srv/a.git",
+            script.to_str().expect("utf8"),
+            None,
+        )
+        .expect("spawn");
+        let tar = fetch_archive_stream(stream, rev).expect("archive");
+        assert_eq!(tar, b"hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parses_local_and_file_endpoints() {
         assert_eq!(
             parse_endpoint("/srv/repos/a").expect("path"),

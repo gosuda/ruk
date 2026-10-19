@@ -1735,6 +1735,240 @@ fn archive_local_streams_tar() {
 }
 
 #[test]
+fn archive_refusals_pin_exit_codes() {
+    // An unreachable SSH remote fails at dial time, not as a named gap:
+    // the ssh/git-daemon duplex session is served.
+    let (root, env) = seeded_repo("uarchive-gap", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--remote=ssh://127.0.0.1:1/srv/a.git", "HEAD"],
+    )
+    .expect_err("ssh archive must fail");
+    assert!(
+        !matches!(err, ruk_git::GitError::Unsupported { .. }),
+        "took the gap path: {err}"
+    );
+    assert_eq!(err.exit_code(), 1, "{err}");
+    // A NACK naming an unknown revision surfaces NotFound, not a corrupt stream.
+    let body = pkt_frame(b"NACK unknown revision nope\n");
+    let (base, log) = smart_http_server(vec![(
+        body,
+        "application/x-git-upload-archive-result",
+    )]);
+    let remote = format!("--remote={base}");
+    let err = run(verbs_transport::archive, &mut ctx, &[&remote, "nope"])
+        .expect_err("unknown revision must fail");
+    assert!(matches!(err, ruk_git::GitError::NotFound { .. }), "{err}");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    log.recv_timeout(Duration::from_secs(30))
+        .expect("server finished the RPC");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+/// Lists tar members as (full name, typeflag, payload).
+fn tar_members(tar: &[u8]) -> Vec<(Vec<u8>, u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 512 <= tar.len() {
+        let header = &tar[pos..pos + 512];
+        pos += 512;
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        let name_end = header[..100].iter().position(|byte| *byte == 0).unwrap_or(100);
+        let prefix_end = header[345..500].iter().position(|byte| *byte == 0).unwrap_or(155);
+        let mut name = header[345..345 + prefix_end].to_vec();
+        if !name.is_empty() {
+            name.push(b'/');
+        }
+        name.extend_from_slice(&header[..name_end]);
+        let size_end = header[124..136]
+            .iter()
+            .position(|byte| *byte == 0 || *byte == b' ')
+            .unwrap_or(12);
+        let text = std::str::from_utf8(&header[124..124 + size_end]).unwrap_or("");
+        let size = if text.trim().is_empty() {
+            0
+        } else {
+            usize::from_str_radix(text.trim(), 8).expect("octal size")
+        };
+        let data = tar[pos..pos + size].to_vec();
+        pos += size.div_ceil(512) * 512;
+        out.push((name, header[156], data));
+    }
+    out
+}
+
+/// Seeds `a.txt` plus `b.txt`: nested trees are out of reach in this
+/// slice (the index lane stages no directories and `mktree` refuses
+/// `040000`), so directory and pax shapes are covered by synthetic-tar
+/// unit tests beside the rewrap code instead.
+fn seeded_two_file_repo(case: &str) -> (PathBuf, CliEnv) {
+    let (root, env) = seeded_repo(case, "a.txt", b"a\n");
+    std::fs::write(root.join("b.txt"), b"b\n").expect("seed");
+    let mut ctx = repo_ctx(&root, env.clone());
+    verbs_stage::add(&mut ctx, &["b.txt".to_owned()]).expect("add");
+    verbs_history::commit(&mut ctx, &["-m".to_owned(), "two".to_owned()]).expect("commit");
+    (root, env)
+}
+
+#[test]
+fn archive_prefix_prepends_member_names() {
+    let (root, env) = seeded_two_file_repo("uarchive-prefix");
+    let mut ctx = repo_ctx(&root, env);
+    let plain = run(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("plain");
+    let out = run(verbs_transport::archive, &mut ctx, &["--prefix=lead/", "HEAD"])
+        .expect("prefixed");
+    let plain_members = tar_members(&plain);
+    let members = tar_members(&out);
+    assert!(
+        members.iter().any(|(_, flag, _)| *flag == b'g'),
+        "global header survives the rewrap"
+    );
+    assert_eq!(
+        members.iter().filter(|(_, flag, _)| *flag == b'g').count(),
+        1,
+        "exactly one global header: {members:?}"
+    );
+    for (name, flag, _) in &members {
+        if *flag == b'g' || *flag == b'x' {
+            assert!(
+                !name.starts_with(b"lead/"),
+                "metadata header takes no prefix: {name:?}"
+            );
+            continue;
+        }
+        assert!(
+            name.starts_with(b"lead/"),
+            "member takes the prefix: {name:?}"
+        );
+    }
+    let stripped: Vec<Vec<u8>> = members
+        .iter()
+        .filter(|(_, flag, _)| *flag != b'g' && *flag != b'x')
+        .map(|(name, _, _)| name[b"lead/".len()..].to_vec())
+        .collect();
+    let plain_names: Vec<Vec<u8>> = plain_members
+        .iter()
+        .filter(|(_, flag, _)| *flag != b'g' && *flag != b'x')
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    assert_eq!(stripped, plain_names, "prefix only prepends");
+    // A missing trailing slash normalizes to one.
+    let bare = run(verbs_transport::archive, &mut ctx, &["--prefix=lead", "HEAD"])
+        .expect("bare prefix");
+    assert_eq!(bare, out, "prefix without a slash matches");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_output_writes_file() {
+    let (root, env) = seeded_repo("uarchive-output", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    let dest = root.join("out.tar");
+    let arg = format!("--output={}", dest.display());
+    let out = run(verbs_transport::archive, &mut ctx, &[&arg, "HEAD"]).expect("output");
+    assert!(out.is_empty(), "file output keeps stdout empty");
+    let file = std::fs::read(&dest).expect("archive file");
+    let direct = run(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("direct");
+    assert_eq!(file, direct, "file bytes match the stdout stream");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_paths_limit_members() {
+    let (root, env) = seeded_two_file_repo("uarchive-paths");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_transport::archive, &mut ctx, &["HEAD", "b.txt"]).expect("limited");
+    let names: Vec<Vec<u8>> = tar_members(&out)
+        .iter()
+        .filter(|(_, flag, _)| *flag != b'g' && *flag != b'x')
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    assert_eq!(names, vec![b"b.txt".to_vec()], "{names:?}");
+    let file = run(verbs_transport::archive, &mut ctx, &["HEAD", "a.txt"]).expect("file");
+    let file_names: Vec<Vec<u8>> = tar_members(&file)
+        .iter()
+        .filter(|(_, flag, _)| *flag != b'g' && *flag != b'x')
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    assert_eq!(file_names, vec![b"a.txt".to_vec()], "{file_names:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_format_zip_names_its_gap() {
+    let (root, env) = seeded_repo("uarchive-zip", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(verbs_transport::archive, &mut ctx, &["--format=zip", "HEAD"])
+        .expect_err("zip must fail");
+    assert!(
+        matches!(err, ruk_git::GitError::Unsupported { .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("zip"), "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_over_git_daemon_streams_tar() {
+    use std::io::{Read as _, Write as _};
+    let tar = b"daemon-tar-bytes".to_vec();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut prefix = [0u8; 4];
+        socket.read_exact(&mut prefix).expect("length prefix");
+        let len = usize::from_str_radix(std::str::from_utf8(&prefix).expect("hex"), 16)
+            .expect("length");
+        let mut body = vec![0u8; len - 4];
+        socket.read_exact(&mut body).expect("request body");
+        assert!(
+            body.starts_with(b"git-upload-archive /srv/a.git\0"),
+            "daemon request names the archive service: {body:?}"
+        );
+        let mut args = Vec::new();
+        loop {
+            let mut head = [0u8; 4];
+            socket.read_exact(&mut head).expect("frame head");
+            if &head == b"0000" {
+                break;
+            }
+            let n = usize::from_str_radix(std::str::from_utf8(&head).expect("hex"), 16)
+                .expect("frame length");
+            let mut frame = vec![0u8; n - 4];
+            socket.read_exact(&mut frame).expect("frame body");
+            args.push(frame);
+        }
+        assert!(
+            args.iter().any(|arg| arg == b"argument HEAD\n"),
+            "client sends the revision: {args:?}"
+        );
+        let mut reply = pkt_frame(b"ACK\n");
+        reply.extend_from_slice(b"0000");
+        let mut frame = format!("{:04x}", tar.len() + 5).into_bytes();
+        frame.push(1);
+        frame.extend_from_slice(&tar);
+        reply.extend_from_slice(&frame);
+        reply.extend_from_slice(b"0000");
+        socket.write_all(&reply).expect("reply");
+    });
+    let (root, env) = seeded_repo("uarchive-daemon", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    let remote = format!("--remote=git://127.0.0.1:{port}/srv/a.git");
+    let out = run(verbs_transport::archive, &mut ctx, &[&remote, "HEAD"]).expect("daemon archive");
+    assert_eq!(out, b"daemon-tar-bytes");
+    server.join().expect("server");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn sequencer_absent_reads_clean() {
     let (root, env) = seeded_repo("seq", "s.txt", b"s\n");
     let mut ctx = repo_ctx(&root, env);
