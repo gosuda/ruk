@@ -23,11 +23,38 @@
 //! - Only `ruk::` (local-path) URLs resolve; anything else is `NotFound`
 //!   naming the path. There is deliberately no `fetch`/`push` (pack) or
 //!   `connect` capability, so git always takes the `import`/`export` path.
-//! - No `refspec` capability is advertised (the implied `*:*` applies), so
-//!   `import` streams name the real refs. A stock-git `fetch` therefore
-//!   writes those same names through its own fast-import: remote-tracking
-//!   refs still update from `FETCH_HEAD`, but same-named local branches
-//!   converge to the fetched values instead of staying untouched.
+//! - `connect` is advertised first, so stock git takes the native pack
+//!   protocol for every fetch and push: `connect git-upload-pack` and
+//!   `connect git-receive-pack` spawn the matching serve verb
+//!   (`upload-pack`/`receive-pack` over the same `<dir>`) as a child and
+//!   proxy stdio both ways until EOF, exactly like `git-remote-ext`
+//!   proxies its `ext::` command. Packs carry exact objects with full
+//!   parentage, so oids survive the round trip bit-for-bit (including
+//!   merges, whose dropped-`from` fast-export form cannot). The
+//!   `import`/`export` path stays as the fallback git takes when `connect`
+//!   answers `fallback` or dies.
+//! - Two refspecs are advertised, `refs/heads/*:refs/ruk/<alias>/heads/*`
+//!   and `refs/tags/*:refs/ruk/<alias>/tags/*`, with `<alias>` derived
+//!   from the helper URL (or `_`). They matter on the fallback path and
+//!   for push: stock `push` dies without at least one `refspec`
+//!   capability (`push_refs_with_export` checks the set before exporting),
+//!   and its `^<private>` exclusion assumes the private ref tracks the
+//!   remote state. `import` streams rewrite branch and tag names into the
+//!   namespace; a fetch therefore never touches same-named local
+//!   branches, and remote-tracking refs still update from `FETCH_HEAD`.
+//!   Keeping every imported name inside the namespace also keeps the
+//!   stock side's first ref transaction empty: a real-named tag written
+//!   during a clone trips git's empty-repo fast path (`initial ref
+//!   transaction called with existing refs`).
+//!
+//! Fallback fidelity limit: stock fast-export omits `from`/`merge` lines
+//! for rev-list-excluded parents, so an incremental fallback push stores
+//! parentless (re-oided) commits. The `connect` path never has this
+//! shape; the fallback reports success per applied ref regardless.
+//! - Refs outside `refs/heads/*` and `refs/tags/*` ride `import` streams
+//!   under their real names (neither refspec has an opinion on them),
+//!   matching the old implied-`*:*` behavior for notes, stash, and
+//!   replacement refs.
 //! - `option depth` (and the other `deepen-*` spellings) is accepted and
 //!   ignored: the import always carries full history, never a shallow
 //!   boundary. `option dry-run true` skips the store write but still
@@ -101,6 +128,8 @@ pub(crate) struct HelperSession {
     pub(crate) env: CliEnv,
     /// `option dry-run true`: parse and report, never publish.
     pub(crate) dry_run: bool,
+    /// Private-namespace alias from the helper URL (or `_`).
+    pub(crate) alias: String,
 }
 
 /// Runs `ruk remote-helper <remote> [<url>]` against captured stdin.
@@ -136,7 +165,6 @@ pub(crate) fn remote_helper(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
             });
         }
     };
-    let _ = remote;
     let input = super::read_stdin_bytes(&ctx.env)?;
     let root = helper_root(&ctx.env, url)?;
     // Fail fast on an unresolvable URL before reading any commands.
@@ -145,6 +173,7 @@ pub(crate) fn remote_helper(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
         root,
         env: ctx.env.clone(),
         dry_run: false,
+        alias: helper_alias(url, remote),
     };
     let mut reader = std::io::BufReader::new(input.as_slice());
     let mut out = Vec::new();
@@ -194,16 +223,19 @@ pub(crate) fn run_remote_helper(remote: String, url: String) -> std::process::Ex
         let _ = writeln!(std::io::stderr(), "ruk {HELPER_ARG0}: {err}");
         return ExitCode::from(err.exit_code());
     }
-    let _ = remote;
     let mut session = HelperSession {
         root,
         env,
         dry_run: false,
+        alias: helper_alias(&url, &remote),
     };
-    let stdin = std::io::stdin();
-    let mut reader = std::io::BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
+    // Handle-level descriptors, never held locks: `BufReader<Stdin>` and
+    // `Stdout` lock internally per call and are both `Send`, so the
+    // `connect` proxy may borrow them on scoped threads. Holding
+    // `stdin.lock()`/`stdout.lock()` across the session would deadlock
+    // those threads on the global locks.
+    let mut reader = std::io::BufReader::new(std::io::stdin());
+    let mut writer = std::io::stdout();
     match serve_commands(&mut session, &mut reader, &mut writer) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -211,6 +243,62 @@ pub(crate) fn run_remote_helper(remote: String, url: String) -> std::process::Ex
             ExitCode::from(err.exit_code())
         }
     }
+}
+
+/// Derives the private-namespace alias from the helper address.
+///
+/// The address (argv[1], stable across clone/fetch/push for one remote)
+/// sanitizes to `[A-Za-z0-9-]` runs, trimmed and capped; anything
+/// unusable falls back to the remote name when it is already ref-safe,
+/// else `_`. Two addresses can sanitize alike, but that only costs a
+/// full-history send: the importer still refuses unresolvable parents
+/// loudly instead of publishing a corrupt closure.
+fn helper_alias(url: &str, remote: &str) -> String {
+    let stripped = url
+        .strip_prefix("ruk::")
+        .or_else(|| url.strip_prefix("ruk://"))
+        .unwrap_or(url);
+    let mut token = String::with_capacity(stripped.len());
+    for char in stripped.chars() {
+        if char.is_ascii_alphanumeric() {
+            token.push(char);
+        } else if !token.ends_with('-') {
+            token.push('-');
+        }
+    }
+    let trimmed = token.trim_matches('-');
+    let capped = trimmed
+        .char_indices()
+        .nth(48)
+        .map_or(trimmed, |(index, _)| &trimmed[..index]);
+    if !capped.is_empty()
+        && RefName::new(format!("refs/ruk/{capped}/heads/main")).is_ok()
+    {
+        return capped.to_owned();
+    }
+    if !remote.is_empty()
+        && remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        && RefName::new(format!("refs/ruk/{remote}/heads/main")).is_ok()
+    {
+        return remote.to_owned();
+    }
+    "_".to_owned()
+}
+
+/// Maps one advertised ref to the name the `import` stream must carry:
+/// branch and tag tips move into the private namespace, everything else
+/// keeps its real name.
+fn map_import_name(session: &HelperSession, name: &str) -> String {
+    for (prefix, kind) in [("refs/heads/", "heads"), ("refs/tags/", "tags")] {
+        if let Some(rest) = name.strip_prefix(prefix)
+            && !rest.is_empty()
+        {
+            return format!("refs/ruk/{}/{kind}/{rest}", session.alias);
+        }
+    }
+    name.to_owned()
 }
 
 /// Strips the `ruk::` (or bare `ruk://`) scheme to a repository root.
@@ -273,7 +361,7 @@ fn helper_ctx(session: &HelperSession, store: Store) -> Result<Ctx, GitError> {
 /// `reader` must stay incremental (never read to EOF first): an `export`
 /// payload shares the pipe with later commands, and an `import` answer
 /// must flush before git sends anything else.
-pub(crate) fn serve_commands<R: BufRead, W: std::io::Write>(
+pub(crate) fn serve_commands<R: BufRead + Send, W: std::io::Write + Send>(
     session: &mut HelperSession,
     reader: &mut R,
     writer: &mut W,
@@ -288,8 +376,18 @@ pub(crate) fn serve_commands<R: BufRead, W: std::io::Write>(
             continue;
         }
         if command == "capabilities" {
+            // The private-namespace refspec keeps pushed history
+            // incremental (`push_refs_with_export` excludes from the
+            // private ref) and fetches off local branches; stock `push`
+            // dies without at least one `refspec` capability.
             writer
-                .write_all(b"import\nexport\noption\nobject-format\n\n")
+                .write_all(
+                    format!(
+                        "connect\nimport\nexport\nrefspec refs/heads/*:refs/ruk/{0}/heads/*\nrefspec refs/tags/*:refs/ruk/{0}/tags/*\noption\nobject-format\n\n",
+                        session.alias
+                    )
+                    .as_bytes(),
+                )
                 .map_err(io_error)?;
             writer.flush().map_err(io_error)?;
         } else if command == "list" || command == "list for-push" {
@@ -300,6 +398,11 @@ pub(crate) fn serve_commands<R: BufRead, W: std::io::Write>(
             run_import_batch(session, name, reader, writer)?;
         } else if command == "export" {
             run_export(session, reader, writer)?;
+        } else if let Some(service) = command.strip_prefix("connect ") {
+            run_connect(session, service, reader, writer)?;
+            // The pack connection owns both descriptors from here: the
+            // helper exits when it ends, per the protocol.
+            return Ok(());
         } else {
             return Err(GitError::Unsupported {
                 command: format!("remote-helper command {command:?}"),
@@ -547,6 +650,7 @@ fn run_import_batch<R: BufRead, W: std::io::Write>(
     }
     let mut ctx = helper_ctx(session, store)?;
     let stream = verbs_fastio::fast_export(&mut ctx, &exportable)?;
+    let stream = remap_stream(&stream, session)?;
     writer.write_all(&stream).map_err(io_error)?;
     writer.flush().map_err(io_error)?;
     Ok(())
@@ -698,6 +802,228 @@ fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> Result<usi
     }
 }
 
+/// Rewrites one exported stream's top-level branch and tag names into
+/// the private namespace, copying `data` blocks verbatim so payload
+/// bytes never confuse the scan.
+///
+/// Only lines [`map_import_name`] moves are rewritten (`commit`,
+/// `reset`, and `tag` alike); anything else passes through untouched. A
+/// corrupt stream (truncated `data`) fails closed instead of emitting a
+/// half-renamed script.
+fn remap_stream(stream: &[u8], session: &HelperSession) -> Result<Vec<u8>, GitError> {
+    let mut out = Vec::with_capacity(stream.len());
+    let mut cursor = stream;
+    while !cursor.is_empty() {
+        let end = cursor
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(cursor.len(), |pos| pos + 1);
+        let (line, rest) = cursor.split_at(end);
+        cursor = rest;
+        let text = command_text(line);
+        if text == "done" {
+            out.extend_from_slice(b"done\n");
+            return Ok(out);
+        }
+        if is_data_header(text) {
+            out.extend_from_slice(line);
+            copy_data_slice(&mut cursor, text, &mut out)?;
+            continue;
+        }
+        let mut rewritten = false;
+        for prefix in ["commit ", "reset ", "tag "] {
+            if let Some(name) = text.strip_prefix(prefix) {
+                let mapped = map_import_name(session, name);
+                if mapped != name {
+                    out.extend_from_slice(prefix.as_bytes());
+                    out.extend_from_slice(mapped.as_bytes());
+                    out.push(b'\n');
+                    rewritten = true;
+                }
+                break;
+            }
+        }
+        if !rewritten {
+            out.extend_from_slice(line);
+            if !line.ends_with(b"\n") {
+                out.push(b'\n');
+            }
+        }
+    }
+    Err(GitError::Invalid {
+        detail: "export stream ended before done".to_owned(),
+    })
+}
+
+/// Copies one `data` block from a byte slice, advancing the cursor past
+/// it. Mirrors [`copy_data_block`] for already-buffered streams.
+fn copy_data_slice(
+    cursor: &mut &[u8],
+    header: &str,
+    out: &mut Vec<u8>,
+) -> Result<(), GitError> {
+    if let Some(marker) = header.strip_prefix("data<<") {
+        if marker.is_empty() {
+            return Err(GitError::Invalid {
+                detail: "data heredoc needs a marker".to_owned(),
+            });
+        }
+        loop {
+            let end = cursor
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or_else(|| GitError::Invalid {
+                    detail: "export stream ended inside a data heredoc".to_owned(),
+                })?;
+            let (line, rest) = cursor.split_at(end + 1);
+            *cursor = rest;
+            out.extend_from_slice(line);
+            if command_text(line) == marker {
+                return Ok(());
+            }
+        }
+    }
+    let digits = header.strip_prefix("data ").unwrap_or(header);
+    let count: u64 = digits.parse().map_err(|_| GitError::Invalid {
+        detail: format!("bad data length {digits:?}"),
+    })?;
+    if count > MAX_OBJECT_BYTES {
+        return Err(GitError::Limit {
+            detail: format!("data block of {count} bytes exceeds the object bound"),
+        });
+    }
+    let width = usize::try_from(count).map_err(|_| GitError::Limit {
+        detail: "data block does not fit in memory".to_owned(),
+    })?;
+    if cursor.len() < width {
+        return Err(GitError::Invalid {
+            detail: "export stream ended inside a data block".to_owned(),
+        });
+    }
+    let (body, rest) = cursor.split_at(width);
+    out.extend_from_slice(body);
+    *cursor = rest;
+    Ok(())
+}
+
+/// Serves one `connect <service>` command by proxying the native pack
+/// protocol to the matching serve verb as a child process.
+///
+/// Maps `git-upload-pack` to `ruk upload-pack <dir>` (fetch) and
+/// `git-receive-pack` to `ruk receive-pack <dir>` (push), spawned from
+/// the current executable so a `PATH` symlink keeps working. Replies
+/// with the empty line (connected), then pumps the caller-side reader
+/// to the child and the child to the caller-side writer on two scoped
+/// threads until both directions hit EOF — the same full-duplex shape
+/// `git-remote-ext` runs for `ext::` commands. Borrowing the live
+/// reader (instead of re-locking global stdio, which the session
+/// already holds and would deadlock) also drains any bytes the caller
+/// buffered ahead. The child inherits stderr, so serve-side diagnostics
+/// reach the terminal. Returns after the connection ends (the helper
+/// exits); a nonzero child status surfaces as `Io`.
+///
+/// The request/response lockstep guarantees no pipelined bytes sit past
+/// the command line: git waits for this reply before emitting any
+/// protocol bytes.
+///
+/// # Errors
+/// [`GitError::Unsupported`] for unknown services, [`GitError::Io`] for
+/// spawn, proxy, or serve-child failures.
+fn run_connect<R: std::io::BufRead + Send, W: std::io::Write + Send>(
+    session: &HelperSession,
+    service: &str,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), GitError> {
+    let verb = match service {
+        "git-upload-pack" => "upload-pack",
+        "git-receive-pack" => "receive-pack",
+        _ => {
+            return Err(GitError::Unsupported {
+                command: format!("remote-helper connect service {service:?}"),
+            });
+        }
+    };
+    let exe = std::env::current_exe().map_err(io_error)?;
+    let mut child = std::process::Command::new(exe)
+        .arg(verb)
+        .arg(session.root.as_os_str())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(io_error)?;
+    writer.write_all(b"\n").map_err(io_error)?;
+    writer.flush().map_err(io_error)?;
+    let mut stdin = child.stdin.take().ok_or_else(|| GitError::Io {
+        detail: "pack server stdin is unavailable".to_owned(),
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| GitError::Io {
+        detail: "pack server stdout is unavailable".to_owned(),
+    })?;
+    // Two pumps, one per direction: either side may stream while the
+    // other idles (pack negotiation interleaves reads and writes), so a
+    // single half-duplex copy would stall. Each chunk flushes on the
+    // server-to-caller leg; without it block buffering holds pack bytes
+    // back and both ends wait forever. Scoped threads borrow the live
+    // descriptors (owned by this call, joined before it returns), so no
+    // pump outlives the connection and a panic still joins its sibling.
+    std::thread::scope(|scope| {
+        let uplink = scope.spawn(|| pump(reader, &mut stdin, false));
+        let downlink = scope.spawn(|| pump(&mut stdout, writer, true));
+        let uplink = uplink.join();
+        let downlink = downlink.join();
+        uplink
+            .map_err(|_| GitError::Io {
+                detail: "pack upload pump failed".to_owned(),
+            })?
+            .map_err(io_error)?;
+        downlink
+            .map_err(|_| GitError::Io {
+                detail: "pack download pump failed".to_owned(),
+            })?
+            .map_err(io_error)
+    })?;
+    let status = child.wait().map_err(io_error)?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(GitError::Io {
+        detail: format!("pack server for {service} exited {status}"),
+    })
+}
+
+/// Copies `reader` to `writer`, forwarding every short read at once and
+/// flushing every chunk when asked (the pipe-to-terminal leg).
+///
+/// One `read` call per turn, never a fill loop: the pack protocol is
+/// strict request/response (git sends a small request, then waits for
+/// the server), so batching reads to a full buffer holds one side's
+/// bytes while both ends wait — a four-way deadlock on the first round
+/// trip. The 32 KiB chunk only bounds memory per turn.
+fn pump(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    flush: bool,
+) -> std::io::Result<()> {
+    let mut chunk = vec![0u8; 32 << 10];
+    loop {
+        match reader.read(&mut chunk)? {
+            0 => {
+                if flush {
+                    writer.flush()?;
+                }
+                return Ok(());
+            }
+            count => {
+                writer.write_all(&chunk[..count])?;
+                if flush {
+                    writer.flush()?;
+                }
+            }
+        }
+    }
+}
+
 /// Reports whether one stream line opens a `data` block.
 fn is_data_header(text: &str) -> bool {
     text == "data" || text.starts_with("data ") || text.starts_with("data<<")
@@ -734,6 +1060,10 @@ fn copy_data_block<R: BufRead>(reader: &mut R, header: &str, out: &mut Vec<u8>) 
             detail: format!("data block of {count} bytes exceeds the object bound"),
         });
     }
+    // A `data <n>` block is exactly n payload bytes (the payload carries
+    // its own trailing newline when it has one); the next byte already
+    // starts the following line, so no delimiter is consumed here. This
+    // mirrors the importer's `read_data`, which reads exactly `count`.
     let mut remaining = count;
     while remaining > 0 {
         let want = remaining.min(DATA_COPY_CHUNK);
@@ -747,14 +1077,6 @@ fn copy_data_block<R: BufRead>(reader: &mut R, header: &str, out: &mut Vec<u8>) 
         out.extend_from_slice(&chunk);
         remaining -= want;
     }
-    let mut newline = [0u8; 1];
-    reader.read_exact(&mut newline).map_err(io_error)?;
-    if newline != [b'\n'] {
-        return Err(GitError::Invalid {
-            detail: "data block misses its trailing newline".to_owned(),
-        });
-    }
-    out.push(b'\n');
     Ok(())
 }
 
