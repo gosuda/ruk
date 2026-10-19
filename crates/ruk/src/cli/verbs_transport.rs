@@ -4,7 +4,7 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via `smart_http::fetch_pack` with a `dumb_http` fallback when the smart advertisement is absent | `--prune` drops orphaned remote-tracking refs (pull-mirror parity) |
+//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via a protocol-v2 probe first (`smart_http::fetch_pack_v2` over `ls-refs` refs) with a v0 `smart_http::fetch_pack` fallback, then `dumb_http` when the smart advertisement is absent | `--prune` drops orphaned remote-tracking refs (pull-mirror parity) |
 //! | `pull` | fetch + fast-forward | local, SSH/git and HTTP remotes (fast-forward only) |
 //! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
@@ -13,7 +13,7 @@
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
 //! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
-//! | `ls-remote` | local `session::advertise` or one `net::discover` round trip | SSH/git and smart-http remotes served; dumb-http is the remaining HTTP gap |
+//! | `ls-remote` | local `session::advertise` or one `net::discover` round trip; HTTP remotes probe protocol v2 first (`ls-refs`) | SSH/git and smart-http remotes served; dumb-http is the remaining HTTP gap |
 //!
 //! Oracle anchors: `git/builtin/fetch.c`, `git/builtin/pull.c`,
 //! `git/builtin/push.c`, `git/builtin/receive-pack.c`,
@@ -37,6 +37,7 @@ use ruk_git::transport::mirror::{prune_for_spec, push_mirror_updates};
 use ruk_git::transport::net::{self, Endpoint};
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::push::{PushUpdate, PushWireRequest};
+use ruk_git::transport::refadv::Capabilities;
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
 use ruk_git::transport::session::{
     AdvertisedLocalRef, LocalFetchRequest, Service, advertise, local_fetch, local_push,
@@ -161,6 +162,15 @@ enum FetchSource {
         /// The upload-pack advertisement from discovery.
         adv: ruk_git::transport::refadv::Advertisement,
     },
+    /// A smart-http v2 base plus its capability advertisement: refs came
+    /// from one `ls-refs` RPC and the fetch POSTs `command=fetch`
+    /// (stateless, so no connection is held).
+    HttpV2 {
+        /// Normalized RPC base URL.
+        base: String,
+        /// The v2 capability advertisement from the `Git-Protocol` probe.
+        caps: Capabilities,
+    },
     /// A dumb-http base: the smart advertisement was absent, so discovery
     /// fell back to the text `info/refs` file (the same fallback `git`
     /// makes). The fetch walks loose objects plus listed packs.
@@ -202,21 +212,37 @@ pub(crate) fn run_fetch(
         Target::Net(endpoint) => match endpoint {
             Endpoint::Http { url, .. } => {
                 let base = ruk_git::transport::smart_http::normalize_base(&url)?;
-                match ruk_git::transport::smart_http::discover(
-                    &base,
-                    ruk_git::transport::smart_http::SmartService::UploadPack,
-                    dest_kind,
-                ) {
-                    Ok(adv) => {
-                        let advertised = net::to_local_refs(adv.refs.clone())?;
-                        (FetchSource::Http { base, adv }, advertised)
+                // Protocol v2 first: one `Git-Protocol` probe, then refs
+                // from `ls-refs`. `None` is a v0 (or dumb-http) server,
+                // which the v0 discovery below owns.
+                match ruk_git::transport::smart_http::discover_v2_caps(&base, dest_kind)? {
+                    Some(caps) => {
+                        let refs = ruk_git::transport::smart_http::ls_refs_v2(
+                            &base,
+                            &caps,
+                            dest_kind,
+                            &[],
+                            &Interrupt::none(),
+                        )?;
+                        let advertised = net::to_local_refs(refs)?;
+                        (FetchSource::HttpV2 { base, caps }, advertised)
                     }
-                    Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
-                        let adv = ruk_git::transport::dumb_http::discover(&base, dest_kind)?;
-                        let advertised = net::to_local_refs(adv.refs.clone())?;
-                        (FetchSource::DumbHttp { base }, advertised)
-                    }
-                    Err(err) => return Err(err),
+                    None => match ruk_git::transport::smart_http::discover(
+                        &base,
+                        ruk_git::transport::smart_http::SmartService::UploadPack,
+                        dest_kind,
+                    ) {
+                        Ok(adv) => {
+                            let advertised = net::to_local_refs(adv.refs.clone())?;
+                            (FetchSource::Http { base, adv }, advertised)
+                        }
+                        Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
+                            let adv = ruk_git::transport::dumb_http::discover(&base, dest_kind)?;
+                            let advertised = net::to_local_refs(adv.refs.clone())?;
+                            (FetchSource::DumbHttp { base }, advertised)
+                        }
+                        Err(err) => return Err(err),
+                    },
                 }
             }
             _ => {
@@ -233,7 +259,10 @@ pub(crate) fn run_fetch(
     for spec_text in spec_texts {
         match &source {
             FetchSource::Local(src) => pairs.extend(expand_spec(src, &advertised, spec_text)?),
-            FetchSource::Net(_) | FetchSource::Http { .. } | FetchSource::DumbHttp { .. } => {
+            FetchSource::Net(_)
+            | FetchSource::Http { .. }
+            | FetchSource::HttpV2 { .. }
+            | FetchSource::DumbHttp { .. } => {
                 pairs.extend(expand_spec_net(&advertised, dest, spec_text)?)
             }
         }
@@ -421,6 +450,9 @@ fn fetch_objects_only(
         FetchSource::Http { .. } => {
             fetch_pack_http(dest, source, remote_label, &request, &[], &[])?;
         }
+        FetchSource::HttpV2 { .. } => {
+            fetch_pack_http_v2(dest, source, remote_label, &request, &[], &[])?;
+        }
         FetchSource::DumbHttp { base } => {
             fetch_pack_dumb(dest, base, remote_label, &request, &[], &[])?;
         }
@@ -483,6 +515,43 @@ fn fetch_pack_http(
     let received = ruk_git::transport::smart_http::fetch_pack(
         base,
         adv,
+        dest,
+        request,
+        IngestLimits::default(),
+        &Interrupt::none(),
+    )?;
+    publish_received(
+        dest,
+        received,
+        request,
+        remote_label,
+        tracking,
+        ref_mutations,
+    )
+}
+
+/// Runs the pack half of a smart-http v2 fetch: POSTs `command=fetch` and
+/// publishes through the same verify-and-publish tail as
+/// [`fetch_pack_http`]. The base and capabilities ride in `source`, which
+/// is always the [`FetchSource::HttpV2`] discovery established.
+///
+/// Oracle: `git/builtin/fetch.c`, `git/remote-curl.c` (`fetch_git`).
+fn fetch_pack_http_v2(
+    dest: &Store,
+    source: &FetchSource,
+    remote_label: &str,
+    request: &FetchWireRequest,
+    tracking: &[(RefName, RefTarget)],
+    ref_mutations: &[FactMutation],
+) -> Result<(), GitError> {
+    let FetchSource::HttpV2 { base, caps } = source else {
+        return Err(GitError::Invalid {
+            detail: "smart-http v2 fetch needs an HTTP v2 source".to_owned(),
+        });
+    };
+    let received = ruk_git::transport::smart_http::fetch_pack_v2(
+        base,
+        caps,
         dest,
         request,
         IngestLimits::default(),
@@ -2462,11 +2531,35 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             let src = open_store_at(&root)?;
             advertise(&src)?
         }
-        Target::Net(endpoint) => net::to_local_refs(net::discover_endpoint(
-            &endpoint,
-            Service::UploadPack,
-            ctx.kind()?,
-        )?)?,
+        Target::Net(endpoint) => {
+            // Over v2, ls-remote is ls-refs: one `Git-Protocol` probe,
+            // then the refs RPC. Anything else keeps the v0 discovery.
+            let refs = match &endpoint {
+                Endpoint::Http { url, .. } => {
+                    let base =
+                        ruk_git::transport::smart_http::normalize_base(url)?;
+                    match ruk_git::transport::smart_http::discover_v2_caps(
+                        &base,
+                        ctx.kind()?,
+                    )? {
+                        Some(caps) => ruk_git::transport::smart_http::ls_refs_v2(
+                            &base,
+                            &caps,
+                            ctx.kind()?,
+                            &[],
+                            &Interrupt::none(),
+                        )?,
+                        None => net::discover_endpoint(
+                            &endpoint,
+                            Service::UploadPack,
+                            ctx.kind()?,
+                        )?,
+                    }
+                }
+                _ => net::discover_endpoint(&endpoint, Service::UploadPack, ctx.kind()?)?,
+            };
+            net::to_local_refs(refs)?
+        }
     };
     Ok(render_ls_remote(
         &advertised,
@@ -2509,4 +2602,135 @@ fn render_ls_remote(
         }
     }
     line(out)
+}
+
+#[cfg(test)]
+mod archive_rewrap_tests {
+    use super::*;
+
+    fn member_bytes(name: &[u8], typeflag: u8, data: &[u8]) -> Vec<u8> {
+        let (prefix, short) = split_tar_name(name).expect("test name splits");
+        let mut header = [0u8; 512];
+        header[..short.len()].copy_from_slice(short);
+        header[345..345 + prefix.len()].copy_from_slice(prefix);
+        octal_into(&mut header[100..108], 0o644);
+        octal_into(&mut header[124..136], data.len() as u64);
+        header[156] = typeflag;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        checksum_header(&mut header);
+        let mut out = header.to_vec();
+        emit_member(
+            &mut out,
+            &TarMember {
+                header: [0u8; 512],
+                data: data.to_vec(),
+            },
+        );
+        out[..512].copy_from_slice(&header);
+        out
+    }
+
+    fn tar_of(members: &[(&[u8], u8, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, flag, data) in members {
+            out.extend_from_slice(&member_bytes(name, *flag, data));
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        out
+    }
+
+    /// Logical (flag, path, payload) triples with `x` records resolved.
+    fn logical(tar: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        let mut pending: Option<Vec<u8>> = None;
+        while pos + 512 <= tar.len() {
+            let mut header = [0u8; 512];
+            header.copy_from_slice(&tar[pos..pos + 512]);
+            pos += 512;
+            if header.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let size = parse_octal(&header[124..136], "size").expect("size") as usize;
+            let data = tar[pos..pos + size].to_vec();
+            pos += size.div_ceil(512) * 512;
+            let flag = header[156];
+            if flag == b'x' {
+                pending = Some(data);
+                continue;
+            }
+            let path = match pending.take().and_then(|records| pax_path_record(&records)) {
+                Some(path) => path,
+                None => member_path(&header, &data, flag).expect("name"),
+            };
+            out.push((flag, path, data));
+        }
+        out
+    }
+
+    #[test]
+    fn rewrap_prefixes_members_and_skips_metadata() {
+        let tar = tar_of(&[
+            (b"pax_global_header", b'g', b"1 comment=abc\n"),
+            (b"a.txt", b'0', b"a\n"),
+            (b"sub/", b'5', b""),
+            (b"sub/b.txt", b'0', b"b\n"),
+        ]);
+        let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
+        let members = logical(&out);
+        assert_eq!(members[0].0, b'g');
+        assert_eq!(members[0].1, b"pax_global_header");
+        let named: Vec<Vec<u8>> = members[1..].iter().map(|(_, path, _)| path.clone()).collect();
+        assert_eq!(named, vec![b"lead/a.txt", b"lead/sub/", b"lead/sub/b.txt"]);
+        assert_eq!(members[1].2, b"a\n");
+    }
+
+    #[test]
+    fn rewrap_paths_keep_parents_and_drop_others() {
+        let tar = tar_of(&[
+            (b"a.txt", b'0', b"a\n"),
+            (b"sub/", b'5', b""),
+            (b"sub/b.txt", b'0', b"b\n"),
+        ]);
+        let limited = rewrap_archive_tar(tar, None, &["sub".to_owned()]).expect("rewrap");
+        let names: Vec<Vec<u8>> = logical(&limited)
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert_eq!(names, vec![b"sub/".to_vec(), b"sub/b.txt".to_vec()]);
+    }
+
+    #[test]
+    fn rewrap_prefix_tracks_pax_records() {
+        let long: Vec<u8> = core::iter::repeat(b'n').take(120).collect();
+        let mut sub_path = b"sub/".to_vec();
+        sub_path.extend_from_slice(&long);
+        let record = ext_record_bytes("path", &sub_path);
+        let mut tar = member_bytes(b"h.paxheader", b'x', &record);
+        tar.extend_from_slice(&member_bytes(&sub_path, b'0', b"data\n"));
+        tar.extend_from_slice(&[0u8; 1024]);
+        let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
+        let members = logical(&out);
+        assert_eq!(members.len(), 1);
+        let mut wanted = b"lead/".to_vec();
+        wanted.extend_from_slice(&sub_path);
+        assert_eq!(members[0].1, wanted);
+        assert_eq!(members[0].2, b"data\n");
+    }
+
+    #[test]
+    fn rewrap_unsplittable_rename_gains_a_pax_header() {
+        // Splits (slash at 150) but not after the prefix moves it to 155.
+        let mut name = core::iter::repeat(b'a').take(150).collect::<Vec<u8>>();
+        name.push(b'/');
+        name.extend_from_slice(&core::iter::repeat(b'b').take(40).collect::<Vec<u8>>());
+        let tar = tar_of(&[(name.as_slice(), b'0', b"deep\n")]);
+        let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
+        let members = logical(&out);
+        assert_eq!(members.len(), 1);
+        let mut wanted = b"lead/".to_vec();
+        wanted.extend_from_slice(&name);
+        assert_eq!(members[0].1, wanted);
+    }
 }

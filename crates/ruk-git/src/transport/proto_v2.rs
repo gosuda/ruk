@@ -26,7 +26,7 @@ use ruk_core::store::Store;
 
 use super::fetch::Filter;
 use super::pack::{IngestLimits, StagedPack, ingest_pack};
-use super::pktline::{self, Packet, PktReader, RemoteMessages, SidebandReader, send};
+use super::pktline::{self, Packet, PktReader, RemoteMessages, SidebandReader};
 use super::refadv::{self, Capabilities};
 use super::Interrupt;
 use crate::GitError;
@@ -420,14 +420,6 @@ fn corrupt(detail: impl Into<String>) -> GitError {
     }
 }
 
-/// Sends an assembled v2 command request over a duplex stream.
-pub fn send_command<W: std::io::Write + ?Sized>(
-    writer: &mut W,
-    bytes: &[u8],
-) -> Result<(), GitError> {
-    send(writer, bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +532,8 @@ mod tests {
             ofs_delta: true,
             sideband_all: false,
         };
-        let text = String::from_utf8_lossy(&fetch_request(&caps, HashKind::Sha1, &cmd).expect("r"));
+        let bytes = fetch_request(&caps, HashKind::Sha1, &cmd).expect("r");
+        let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("thin-pack\n"), "{text}");
         assert!(text.contains("ofs-delta\n"), "{text}");
     }
