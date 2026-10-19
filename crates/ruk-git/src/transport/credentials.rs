@@ -410,24 +410,24 @@ fn is_shell_helper(program: &str, args: &[String]) -> bool {
 }
 
 /// The shell line git runs for a `!` helper: the configured command
-/// verbatim plus the `get` operation (`git/credential.c`
-/// `credential_do`).
-fn shell_command_line(line: &str) -> String {
-    format!("{line} get")
+/// verbatim plus the credential operation (`git/credential.c`
+/// `credential_do` appends `get`, `store`, or `erase`).
+fn shell_command_line(line: &str, op: &str) -> String {
+    format!("{line} {op}")
 }
 
-/// Spawns one external helper as `<program> get <args...>` — or, for a `!`
-/// shell helper, as `sh -c "<command> get"` — with `input` on stdin,
+/// Spawns one external helper as `<program> <op> <args...>` — or, for a `!`
+/// shell helper, as `sh -c "<command> <op>"` — with `input` on stdin,
 /// bounded by [`HELPER_TIMEOUT`] on a monotonic deadline. A refusal, a
 /// non-zero exit, an unreadable answer, or a timeout is `None`.
-fn run_helper(program: &str, args: &[String], input: &[u8]) -> Option<Vec<u8>> {
+fn run_helper_op(program: &str, args: &[String], op: &str, input: &[u8]) -> Option<Vec<u8>> {
     let mut command = if is_shell_helper(program, args) {
         let mut shell = Command::new("sh");
-        shell.arg("-c").arg(shell_command_line(&args[1]));
+        shell.arg("-c").arg(shell_command_line(&args[1], op));
         shell
     } else {
         let mut direct = Command::new(program);
-        direct.arg("get").args(args);
+        direct.arg(op).args(args);
         direct
     };
     let mut child = command
@@ -501,6 +501,12 @@ pub fn credential_fill_with(
     None
 }
 
+/// The three-argument seam the URL fill keeps: the operation is always
+/// `get`, so `store`/`erase` callers use [`run_helper_op`] directly.
+fn run_helper(program: &str, args: &[String], input: &[u8]) -> Option<Vec<u8>> {
+    run_helper_op(program, args, "get", input)
+}
+
 /// Fills credentials for `url` through the live config plus live helper
 /// processes. Empty when no external helper is configured or none answers.
 #[must_use]
@@ -510,6 +516,175 @@ pub fn credential_fill(url: &str) -> Option<(String, String)> {
         return None;
     }
     credential_fill_with(url, &helpers, run_helper)
+}
+
+/// Largest stdin description the bare `credential` verb accepts: real
+/// descriptions are a handful of short lines, so anything larger is a
+/// caller error, not a credential.
+pub const MAX_CREDENTIAL_INPUT: usize = 64 << 10;
+
+/// Parses a `git credential` description from stdin bytes: `key=value`
+/// lines up to the first blank line, mirroring how the oracle reads its
+/// `struct credential` (`git/credential.c` `credential_read`). Lines
+/// without `=` and empty keys never name a field and are skipped; later
+/// duplicates are kept in order so the caller can echo the description
+/// back verbatim.
+#[must_use]
+pub fn parse_credential_input(bytes: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(bytes).lines() {
+        if line.is_empty() {
+            break;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        out.push((key.to_owned(), value.to_owned()));
+    }
+    out
+}
+
+/// Serializes a description for a helper's stdin: one `key=value` line per
+/// pair plus the terminating blank line.
+fn credential_input_bytes(desc: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, value) in desc {
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    out
+}
+
+/// Reads one field out of a parsed description.
+fn credential_field<'a>(desc: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    desc.iter()
+        .find(|(known, _)| known == key)
+        .map(|(_, value)| value.as_str())
+}
+
+/// Derives the URL helper scoping uses from a description: the `url=` field
+/// verbatim when present, else `protocol://host[/path]` synthesized from
+/// the components (`git/credential.c` hands helpers the same description
+/// and helpers scope on what they recognize; the config chain here scopes
+/// on URL prefix, so the components must become a URL). `None` runs only
+/// unscoped helpers.
+#[must_use]
+pub fn credential_scope_url(desc: &[(String, String)]) -> Option<String> {
+    if let Some(url) = credential_field(desc, "url") {
+        if !url.is_empty() {
+            return Some(url.to_owned());
+        }
+    }
+    let protocol = credential_field(desc, "protocol")?;
+    let host = credential_field(desc, "host")?;
+    if protocol.is_empty() || host.is_empty() {
+        return None;
+    }
+    match credential_field(desc, "path") {
+        Some(path) if !path.is_empty() => Some(format!("{protocol}://{host}/{path}")),
+        _ => Some(format!("{protocol}://{host}")),
+    }
+}
+
+/// Resolves the runnable helper chain for a description through the live
+/// config: scoped rows match the derived scope URL, unscoped rows always
+/// run. A description without scope runs only unscoped helpers (every
+/// scoped pattern fails a prefix match against the empty URL).
+#[must_use]
+pub fn helper_chain_for(desc: &[(String, String)]) -> Vec<(String, Vec<String>)> {
+    match credential_scope_url(desc) {
+        Some(url) => helper_commands(&url),
+        None => helper_commands(""),
+    }
+}
+
+/// Overwrites `key` in `pairs` in place, appending it when absent, so a
+/// `fill` answer echoes the input description with the found fields.
+fn upsert_credential(pairs: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some(slot) = pairs.iter_mut().find(|(known, _)| known == key) {
+        slot.1 = value.to_owned();
+    } else {
+        pairs.push((key.to_owned(), value.to_owned()));
+    }
+}
+
+/// Fills a parsed description through `runner`, the injectable seam tests
+/// use: `runner` receives `(program, args, op, stdin)` and answers the
+/// stdout bytes (or `None` for a refused operation). Only the `get`
+/// operation runs, and the first answer carrying a username wins; the
+/// returned pairs echo the input description with the found `username=`
+/// (and a non-empty `password=`) merged in, the way the oracle prints the
+/// filled credential. An input `password=` survives a helper answer that
+/// names no password.
+#[must_use]
+pub fn credential_fill_desc_with(
+    desc: &[(String, String)],
+    helpers: &[(String, Vec<String>)],
+    runner: impl Fn(&str, &[String], &str, &[u8]) -> Option<Vec<u8>>,
+) -> Option<Vec<(String, String)>> {
+    let input = credential_input_bytes(desc);
+    for (program, args) in helpers {
+        let Some(out) = runner(program, args, "get", &input) else {
+            continue;
+        };
+        if let Some((username, password)) = parse_fill_output(&out) {
+            let mut merged = desc.to_vec();
+            upsert_credential(&mut merged, "username", &username);
+            if !password.is_empty() {
+                upsert_credential(&mut merged, "password", &password);
+            }
+            return Some(merged);
+        }
+    }
+    None
+}
+
+/// Runs one fire-and-forget operation (`store` for `approve`, `erase` for
+/// `reject`) across the whole chain: every helper runs and every answer is
+/// ignored, mirroring `git/credential.c` `credential_do`, which only the
+/// `get` operation short-circuits.
+pub fn credential_store_op_desc_with(
+    desc: &[(String, String)],
+    op: &str,
+    helpers: &[(String, Vec<String>)],
+    runner: impl Fn(&str, &[String], &str, &[u8]) -> Option<Vec<u8>>,
+) {
+    let input = credential_input_bytes(desc);
+    for (program, args) in helpers {
+        let _ = runner(program, args, op, &input);
+    }
+}
+
+/// Fills a parsed description through the live config plus live helper
+/// processes. Empty when no external helper is configured or none answers.
+#[must_use]
+pub fn credential_fill_desc(desc: &[(String, String)]) -> Option<Vec<(String, String)>> {
+    let helpers = helper_chain_for(desc);
+    if helpers.is_empty() {
+        return None;
+    }
+    credential_fill_desc_with(desc, &helpers, run_helper_op)
+}
+
+/// Approves a parsed description through the live helpers (`store` across
+/// the whole chain). Helper failures are silent: there is nothing to
+/// report back to a `store` caller.
+pub fn credential_approve_desc(desc: &[(String, String)]) {
+    let helpers = helper_chain_for(desc);
+    credential_store_op_desc_with(desc, "store", &helpers, run_helper_op);
+}
+
+/// Rejects a parsed description through the live helpers (`erase` across
+/// the whole chain), silent like its `store` sibling.
+pub fn credential_reject_desc(desc: &[(String, String)]) {
+    let helpers = helper_chain_for(desc);
+    credential_store_op_desc_with(desc, "erase", &helpers, run_helper_op);
 }
 
 /// Standard-alphabet base64 with padding for one Basic value (the same
@@ -830,6 +1005,109 @@ mod tests {
         assert!(
             started.elapsed() < HELPER_TIMEOUT + Duration::from_secs(5),
             "helper overran its budget"
+        );
+    }
+
+    #[test]
+    fn credential_input_parses_to_the_first_blank_line() {
+        let desc = parse_credential_input(b"protocol=https\nhost=host.x\n\nusername=late\n");
+        assert_eq!(
+            desc,
+            vec![
+                ("protocol".to_owned(), "https".to_owned()),
+                ("host".to_owned(), "host.x".to_owned()),
+            ]
+        );
+        // Lines without `=` and empty keys never name a field.
+        let desc = parse_credential_input(b"protocol=https\nbare\n=empty\npath=a=b\n\n");
+        assert_eq!(
+            desc,
+            vec![
+                ("protocol".to_owned(), "https".to_owned()),
+                ("path".to_owned(), "a=b".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_scope_prefers_url_then_components() {
+        let desc = vec![
+            ("url".to_owned(), "https://host.x/a.git".to_owned()),
+            ("protocol".to_owned(), "https".to_owned()),
+            ("host".to_owned(), "host.x".to_owned()),
+        ];
+        assert_eq!(
+            credential_scope_url(&desc),
+            Some("https://host.x/a.git".to_owned())
+        );
+        let desc = vec![
+            ("protocol".to_owned(), "https".to_owned()),
+            ("host".to_owned(), "host.x".to_owned()),
+            ("path".to_owned(), "a.git".to_owned()),
+        ];
+        assert_eq!(
+            credential_scope_url(&desc),
+            Some("https://host.x/a.git".to_owned())
+        );
+        let desc = vec![("protocol".to_owned(), "https".to_owned())];
+        assert_eq!(credential_scope_url(&desc), None);
+    }
+
+    #[test]
+    fn credential_desc_fill_merges_the_answer_into_the_description() {
+        let desc = vec![
+            ("protocol".to_owned(), "https".to_owned()),
+            ("host".to_owned(), "host.x".to_owned()),
+        ];
+        let out = credential_fill_desc_with(
+            &desc,
+            &[external_helper("/bin/helper")],
+            |program, _args, op, input| {
+                assert_eq!(program, "/bin/helper");
+                assert_eq!(op, "get");
+                assert_eq!(input, b"protocol=https\nhost=host.x\n\n");
+                Some(b"username=alice\npassword=s3cret\n".to_vec())
+            },
+        );
+        assert_eq!(
+            out,
+            Some(vec![
+                ("protocol".to_owned(), "https".to_owned()),
+                ("host".to_owned(), "host.x".to_owned()),
+                ("username".to_owned(), "alice".to_owned()),
+                ("password".to_owned(), "s3cret".to_owned()),
+            ])
+        );
+        // A helper answer without a username is no answer.
+        assert_eq!(
+            credential_fill_desc_with(
+                &desc,
+                &[external_helper("/bin/helper")],
+                |_, _, _, _| Some(b"password=orphan\n".to_vec())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn credential_desc_store_runs_every_helper_with_its_operation() {
+        let desc = vec![("protocol".to_owned(), "https".to_owned())];
+        let seen = std::sync::Mutex::new(Vec::new());
+        credential_store_op_desc_with(
+            &desc,
+            "store",
+            &[external_helper("/bin/a"), external_helper("/bin/b")],
+            |program, _, op, _| {
+                seen.lock().expect("seen").push((program.to_owned(), op.to_owned()));
+                None
+            },
+        );
+        assert_eq!(
+            seen.lock().expect("seen").as_slice(),
+            &[
+                ("/bin/a".to_owned(), "store".to_owned()),
+                ("/bin/b".to_owned(), "store".to_owned()),
+            ]
         );
     }
 }
