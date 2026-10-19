@@ -643,6 +643,89 @@ fn fetch_prune_drops_orphaned_tracking_ref() {
 }
 
 #[test]
+fn fetch_advances_tracking_ref_through_new_commits_but_refuses_rewind() {
+    // The fast-forward check runs after the fetched objects publish: moving
+    // an existing tracking ref through commits unknown before the fetch
+    // fast-forwards, while a genuine rewind is refused with its objects
+    // kept, the way git keeps the pack on a refused ref update.
+    let (src, _) = seeded_repo("ffwd-src", "f.txt", b"f\n");
+    let (dst, _) = seeded_repo("ffwd-dst", "g.txt", b"g\n");
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        run(
+            verbs_repo::remote,
+            &mut dst_ctx,
+            &["add", "origin", src.to_str().expect("utf8")],
+        )
+        .expect("remote add");
+        run(
+            verbs_transport::fetch,
+            &mut dst_ctx,
+            &["origin", "refs/heads/main:refs/remotes/origin/main"],
+        )
+        .expect("first fetch");
+    }
+    let (tip2, side) = {
+        let mut src_ctx = repo_ctx(&src, test_env(&src));
+        run(verbs_branch::checkout, &mut src_ctx, &["-b", "side"]).expect("checkout -b side");
+        std::fs::write(src.join("side.txt"), b"side\n").expect("side file");
+        run(verbs_stage::add, &mut src_ctx, &["side.txt"]).expect("add side");
+        run(verbs_history::commit, &mut src_ctx, &["-m", "side work"]).expect("commit side");
+        let store = src_ctx.store().expect("store");
+        let side = super::state::resolve_rev(store, src_ctx.kind().expect("kind"), "refs/heads/side")
+            .expect("side tip");
+        run(verbs_branch::checkout, &mut src_ctx, &["main"]).expect("checkout main");
+        std::fs::write(src.join("h.txt"), b"h\n").expect("new file");
+        run(verbs_stage::add, &mut src_ctx, &["h.txt"]).expect("add");
+        run(verbs_history::commit, &mut src_ctx, &["-m", "second"]).expect("commit main");
+        let tip2 = super::state::head_oid(src_ctx.store().expect("store")).expect("src tip");
+        (tip2, side)
+    };
+    {
+        let mut dst_ctx = repo_ctx(&dst, test_env(&dst));
+        let out = run(
+            verbs_transport::fetch,
+            &mut dst_ctx,
+            &["origin", "refs/heads/main:refs/remotes/origin/main"],
+        )
+        .expect("second fetch fast-forwards through new commits");
+        assert!(
+            String::from_utf8_lossy(&out).contains(&tip2.to_hex()),
+            "got {:?}",
+            out
+        );
+        let landed = super::state::resolve_rev(
+            dst_ctx.store().expect("store"),
+            dst_ctx.kind().expect("kind"),
+            "refs/remotes/origin/main",
+        )
+        .expect("tracking tip");
+        assert_eq!(tip2, landed);
+        let out = run(
+            verbs_transport::fetch,
+            &mut dst_ctx,
+            &["origin", "refs/heads/side:refs/remotes/origin/main"],
+        )
+        .expect("rewind is a refusal, not an error");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("non-fast-forward"), "got {text}");
+        let kept = super::state::resolve_rev(
+            dst_ctx.store().expect("store"),
+            dst_ctx.kind().expect("kind"),
+            "refs/remotes/origin/main",
+        )
+        .expect("tracking tip after refusal");
+        assert_eq!(tip2, kept);
+        assert!(
+            ruk_git::transport::has_object(dst_ctx.store().expect("store"), side).expect("has side"),
+            "refused tip's objects stay"
+        );
+    }
+    let _ = std::fs::remove_dir_all(src.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(dst.parent().expect("parent"));
+}
+
+#[test]
 fn push_mirror_syncs_refs_and_deletes_stale() {
     let (src, _) = seeded_repo("mirror-src", "m.txt", b"m\n");
     let src_tip = {
