@@ -607,7 +607,7 @@ fn parse_line_range(spec: &str, total: usize) -> Result<(usize, usize), GitError
         Some((start, end)) => (start, Some(end)),
         None => (spec, None),
     };
-    let absolute = |text: &str, total: usize| -> Result<usize, GitError> {
+    let absolute = |text: &str| -> Result<usize, GitError> {
         if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(shapes());
         }
@@ -627,7 +627,7 @@ fn parse_line_range(spec: &str, total: usize) -> Result<(usize, usize), GitError
         if text.strip_prefix('+').is_some() {
             return Err(shapes());
         }
-        absolute(text, total)
+        absolute(text)
     };
     let start = bound(start_text)?;
     let end = match end_text {
@@ -635,7 +635,7 @@ fn parse_line_range(spec: &str, total: usize) -> Result<(usize, usize), GitError
         Some("") => total,
         Some(text) => {
             if let Some(count_text) = text.strip_prefix('+') {
-                let count: usize = absolute(count_text, total)?;
+                let count: usize = absolute(count_text)?;
                 if count == 0 {
                     return Err(shapes());
                 }
