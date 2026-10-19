@@ -1052,8 +1052,10 @@ fn read_tree_merge(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
             let head_map = tree_path_map(store, kind, head_tree_of(ctx)?)?;
             let mut head_index_map = BTreeMap::new();
             for (path, (mode, oid)) in &head_map {
-                head_index_map
-                    .insert(path.clone(), (mode.as_index_mode().map_err(core_err)?, *oid));
+                head_index_map.insert(
+                    path.clone(),
+                    (mode.as_index_mode().map_err(core_err)?, *oid),
+                );
             }
             if stage_zero_map(store, kind)? != head_index_map {
                 return Err(GitError::Invalid {
