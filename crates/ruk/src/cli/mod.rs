@@ -41,6 +41,7 @@ pub(crate) mod verbs_misc;
 pub(crate) mod verbs_notes;
 pub(crate) mod verbs_objects;
 pub(crate) mod verbs_patch;
+pub(crate) mod verbs_remote_helper;
 pub(crate) mod verbs_repo;
 pub(crate) mod verbs_sparse;
 pub(crate) mod verbs_stage;
