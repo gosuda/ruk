@@ -947,7 +947,6 @@ fn unsupported_verbs_report_closed_codes() {
         verbs_objects::index_pack,
         verbs_objects::count_objects,
         verbs_transport::gc,
-        verbs_transport::archive,
         verbs_transport::bundle,
         verbs_repo::worktree,
     ] {
@@ -1669,6 +1668,66 @@ fn ls_remote_over_smart_http_lists_refs() {
     assert!(text.contains("refs/heads/main"), "{text}");
     log.recv_timeout(Duration::from_secs(30))
         .expect("server finished discovery");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_over_smart_http_streams_tar() {
+    let tar = b"fake-tar-bytes".to_vec();
+    let mut body = pkt_frame(b"ACK\n");
+    body.extend_from_slice(b"0000");
+    let mut frame = format!("{:04x}", tar.len() + 5).into_bytes();
+    frame.push(1);
+    frame.extend_from_slice(&tar);
+    body.extend_from_slice(&frame);
+    body.extend_from_slice(b"0000");
+    let (base, log) = smart_http_server(vec![(
+        body,
+        "application/x-git-upload-archive-result",
+    )]);
+    let (root, env) = seeded_repo("uarchive-http", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    let remote = format!("--remote={base}");
+    let out = run(verbs_transport::archive, &mut ctx, &[&remote, "HEAD"]).expect("http archive");
+    assert_eq!(out, tar);
+    let requests = log
+        .recv_timeout(Duration::from_secs(30))
+        .expect("server finished the RPC");
+    assert_eq!(requests.len(), 1);
+    let (head, req_body) = &requests[0];
+    assert!(
+        head.starts_with("POST /a.git/git-upload-archive HTTP/1.1\r\n"),
+        "{head:?}"
+    );
+    assert!(
+        req_body
+            .windows(b"argument --format=tar\n".len())
+            .any(|w| w == b"argument --format=tar\n"),
+        "no format line in {req_body:?}"
+    );
+    assert!(
+        req_body
+            .windows(b"argument HEAD\n".len())
+            .any(|w| w == b"argument HEAD\n"),
+        "no revision line in {req_body:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_local_streams_tar() {
+    let (root, env) = seeded_repo("uarchive-local", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("local archive");
+    assert!(out.len() >= 1024, "tar ends with two zero blocks: {}", out.len());
+    assert!(
+        out[out.len() - 1024..].iter().all(|byte| *byte == 0),
+        "missing tar trailer"
+    );
+    assert!(
+        out.windows(b"a.txt".len()).any(|w| w == b"a.txt"),
+        "tar names the file"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
