@@ -50,6 +50,8 @@ pub enum Service {
     UploadPack,
     /// `git-receive-pack`: the server accepts objects.
     ReceivePack,
+    /// `git-upload-archive`: the server streams a tar archive.
+    UploadArchive,
 }
 
 impl Service {
@@ -59,6 +61,7 @@ impl Service {
         match self {
             Self::UploadPack => "git-upload-pack",
             Self::ReceivePack => "git-receive-pack",
+            Self::UploadArchive => "git-upload-archive",
         }
     }
 }

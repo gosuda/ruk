@@ -615,6 +615,7 @@ pub fn discover_endpoint(
             let smart = match service {
                 Service::UploadPack => super::smart_http::SmartService::UploadPack,
                 Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
+                Service::UploadArchive => super::smart_http::SmartService::UploadArchive,
             };
             Ok(super::smart_http::discover(&base, smart, kind)?.refs)
         }
@@ -622,6 +623,75 @@ pub fn discover_endpoint(
     }
 }
 
+/// Opens one duplex stream for `git-upload-archive`: SSH spawns
+/// `git-upload-archive '<path>'`, git dials the daemon with the
+/// `git-upload-archive` service request. Local and HTTP endpoints are
+/// refused: locals read the store directly and HTTP uses the stateless
+/// [`super::smart_http::fetch_archive`] RPC instead.
+///
+/// # Errors
+/// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
+/// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
+pub fn open_archive_stream(endpoint: &Endpoint) -> Result<Stream, GitError> {
+    open_stream(endpoint, Service::UploadArchive)
+}
+
+/// Runs one `upload-archive` session over an open stream: sends the
+/// `argument --format=tar` + `argument <rev>` request framing the
+/// [`super::archive::serve_upload_archive`] half reads, then demuxes the
+/// reply exactly like the smart-http client tail (`ACK`, flush, sideband
+/// tar). The archive carries no advertisement, so unlike [`discover`] this
+/// sends the request first and reads second.
+///
+/// A `NACK` line is [`GitError::NotFound`] when it names an unknown
+/// revision and [`GitError::Corrupt`] otherwise, matching the smart-http
+/// tail.
+///
+/// # Errors
+/// Grammar failures are [`GitError::Corrupt`]; see [`open_archive_stream`]
+/// for transport failures.
+pub fn fetch_archive_stream<R: Read + Write>(stream: R, rev: &str) -> Result<Vec<u8>, GitError> {
+    use std::io::Read as _;
+
+    let request = super::smart_http::archive_request_body(rev)?;
+    let mut pkt = PktReader::new(stream, Interrupt::none());
+    pktline::send(pkt.get_mut(), &request).map_err(|err| GitError::Io {
+        detail: format!("cannot send the archive request: {err}"),
+    })?;
+    let first = pkt.read_line("the archive acknowledgement")?.to_vec();
+    if let Some(rest) = first.strip_prefix(b"NACK ") {
+        let message = String::from_utf8_lossy(rest).into_owned();
+        if message.contains("unknown revision") {
+            return Err(GitError::NotFound {
+                detail: format!("remote archive revision {rev:?} is unknown: {message}"),
+            });
+        }
+        return Err(GitError::Corrupt {
+            detail: format!("remote archive refused {rev:?}: {message}"),
+        });
+    }
+    if first != b"ACK" {
+        return Err(GitError::Corrupt {
+            detail: format!("upload-archive answered {}", first.escape_ascii()),
+        });
+    }
+    match pkt.read_packet()? {
+        pktline::Packet::Flush => {}
+        other => {
+            return Err(GitError::Corrupt {
+                detail: format!("upload-archive misses its flush, got {other:?}"),
+            });
+        }
+    }
+    let mut sideband = pktline::SidebandReader::new(&mut pkt, pktline::LARGE_PACKET_MAX);
+    let mut tar = Vec::new();
+    sideband.read_to_end(&mut tar).map_err(|err| GitError::Io {
+        detail: format!("cannot read the archive stream: {err}"),
+    })?;
+    Ok(tar)
+}
+
+/// Maps wire refs onto local advertisement rows for refspec expansion:
 /// Maps wire refs onto local advertisement rows for refspec expansion:
 /// direct tips stay direct, symrefs stay symbolic, peeled `^{}` dupes and
 /// unborn entries without a target drop out.
