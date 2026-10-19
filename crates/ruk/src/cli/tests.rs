@@ -4823,6 +4823,7 @@ fn submodule_deinit_refuses_dirty_without_force() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
 }
+
 // ---------------------------------------------------------------------------
 // sparse + merge-plumbing lane: sparse-checkout, merge-file, merge-tree,
 // read-tree, checkout-index, rerere

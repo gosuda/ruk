@@ -31,7 +31,7 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::{ObjectKind, Store};
 use ruk_git::GitError;
 
-use super::state::{commit_record, head_oid, now_seconds};
+use super::state::{commit_record, head_oid, now_seconds, replace_redirect};
 use super::tree::{commit_tree_oid, flatten_tree, read_object_bytes};
 use super::{Ctx, FlagSpec, collect};
 
@@ -116,7 +116,7 @@ pub(crate) fn blame(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     // on `HEAD`, the way the oracle blames the working tree by default.
     let (tip, worktree) = match rev_text {
         Some(rev) => {
-            let oid = super::verbs_history::resolve_local(store, kind, &rev)?;
+            let oid = replace_redirect(store, super::verbs_history::resolve_local(store, kind, &rev)?);
             commit_record(store, oid)?;
             (oid, None)
         }

@@ -37,8 +37,8 @@ use ruk_git::GitError;
 use super::state::{
     AppliedRef, StashSlot, apply_refs, branch_name, config_read, config_unset, config_write,
     create_branch, head_oid, is_ancestor, list_refs, load_or_default, merged_rows,
-    path_row_mutations, read_path_rows, reflog_alloc, resolve_branch_target, resolve_rev,
-    scan_index, stash_alloc, stash_drop, stash_read, stash_write, workspace_mutation,
+    path_row_mutations, read_path_rows, reflog_alloc, replace_redirect, resolve_branch_target,
+    resolve_rev, scan_index, stash_alloc, stash_drop, stash_read, stash_write, workspace_mutation,
 };
 use super::tree::{
     TreeMode, WorktreeType, build_index_tree, commit_tree_oid, flatten_tree, join_base,
@@ -815,7 +815,7 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
         }
         [single] => (std::slice::from_ref(single), None),
         [rev, rest @ ..] => {
-            let oid = resolve_rev(store, kind, rev)?;
+            let oid = replace_redirect(store, resolve_rev(store, kind, rev)?);
             (rest, Some(peel_to_tree(store, kind, oid)?))
         }
     };

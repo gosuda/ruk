@@ -743,8 +743,17 @@ fn ref_to_git(err: impl Into<CoreError>) -> GitError {
 ///
 /// Accepts full ref names, `HEAD`, short branch names, raw hex, `<rev>~<n>`,
 /// `<rev>^<n>`, and one trailing `^{<type>}` / `^{}` peel; anything else
-/// fails the way `rev-parse --verify` fails.
+/// fails the way `rev-parse --verify` fails. Never consults
+/// `refs/replace/*`: replacement-aware verbs redirect explicitly, and the
+/// `replace` verb itself resolves through [`resolve_rev_raw`].
 pub(crate) fn resolve_rev(store: &Store, kind: HashKind, rev: &str) -> Result<Oid, GitError> {
+    resolve_rev_raw(store, kind, rev)
+}
+
+/// Resolves user revision syntax without replace redirection, for the
+/// `replace` verb (which names stored objects) and the `notes` verb (which
+/// annotates stored objects, not their replacements).
+pub(crate) fn resolve_rev_raw(store: &Store, kind: HashKind, rev: &str) -> Result<Oid, GitError> {
     let (inner, peel) = split_peel_suffix(rev);
     let (base, steps) = split_suffix_steps(inner)?;
     let oid = resolve_base(store, kind, base)?;
@@ -968,15 +977,11 @@ fn walk_parents(store: &Store, mut oid: Oid, steps: Vec<SuffixStep>) -> Result<O
     Ok(oid)
 }
 
-/// Reads the `count`-th parent (1-based) of one stored commit.
+/// Reads the `count`-th parent (1-based) of one stored commit, following
+/// `refs/replace/*` so `~`/`^` steps walk replacement parents.
 fn nth_parent(store: &Store, oid: Oid, count: usize) -> Result<Oid, GitError> {
     let records = Records::new(store);
-    let record = records
-        .get_commit(&Head::Git { oid })
-        .map_err(GitError::from)?
-        .ok_or_else(|| GitError::NotFound {
-            detail: format!("object {} is not a stored commit", oid.to_hex()),
-        })?;
+    let record = walk_record(store, &records, oid)?;
     record
         .parents()
         .iter()
@@ -1003,8 +1008,58 @@ pub(crate) fn head_oid(store: &Store) -> Result<Oid, GitError> {
     }
 }
 
-/// Reads the commit record behind one object id.
+/// Follows `refs/replace/<hex>` chains, returning the effective object id.
+///
+/// With no replace refs the lookup misses and the input returns unchanged,
+/// so callers keep their behavior until a `replace` ref lands. Loops stop
+/// at the first repeated id instead of spinning; raw revision resolution
+/// (`resolve_rev`), blob/tree bytes, and transport paths never call this,
+/// so pack integrity and `rev-parse` spellings are unaffected.
+pub(crate) fn replace_redirect(store: &Store, oid: Oid) -> Oid {
+    let mut current = oid;
+    let mut seen: Vec<Oid> = Vec::new();
+    for _ in 0..16 {
+        if seen.contains(&current) {
+            return current;
+        }
+        seen.push(current);
+        let name = match RefName::new(format!("refs/replace/{}", current.to_hex())) {
+            Ok(name) => name,
+            Err(_) => return current,
+        };
+        let target = match StoreRefs::new(store).get(&name) {
+            Ok(target) => target,
+            Err(_) => return current,
+        };
+        let Some(next) = peel_replace_target(store, target) else {
+            return current;
+        };
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Follows one replace target through symbolic links, giving up on loops.
+fn peel_replace_target(store: &Store, mut target: Option<RefTarget>) -> Option<Oid> {
+    for _ in 0..16 {
+        match target {
+            None => return None,
+            Some(RefTarget::Direct(oid)) => return Some(oid),
+            Some(RefTarget::Symbolic(name)) => {
+                target = StoreRefs::new(store).get(&name).ok()?;
+            }
+        }
+    }
+    None
+}
+
+/// Reads the commit record behind one object id, following `refs/replace/*`
+/// so history walks render the replacement commit.
 pub(crate) fn commit_record(store: &Store, oid: Oid) -> Result<CommitRecord, GitError> {
+    let oid = replace_redirect(store, oid);
     Records::new(store)
         .get_commit(&Head::Git { oid })
         .map_err(GitError::from)?
@@ -1055,8 +1110,14 @@ pub(crate) fn commit_stamp(record: &CommitRecord) -> i64 {
 }
 
 /// Fetches one commit record for a history walk, naming the missing object
-/// the way the walk callers report it.
-pub(crate) fn walk_record(records: &Records<'_>, oid: Oid) -> Result<CommitRecord, GitError> {
+/// the way the walk callers report it. Follows `refs/replace/*` so every
+/// walk step renders the replacement commit, not just the tips.
+pub(crate) fn walk_record(
+    store: &Store,
+    records: &Records<'_>,
+    oid: Oid,
+) -> Result<CommitRecord, GitError> {
+    let oid = replace_redirect(store, oid);
     records
         .get_commit(&Head::Git { oid })
         .map_err(GitError::from)?
@@ -1065,28 +1126,73 @@ pub(crate) fn walk_record(records: &Records<'_>, oid: Oid) -> Result<CommitRecor
         })
 }
 
-/// Queues one unseen commit for a date-ordered walk, fetching its record
-/// for the timestamp key. Already-seen oids are a no-op.
-pub(crate) fn enqueue(
-    records: &Records<'_>,
-    seen: &mut HashSet<Oid>,
-    pending: &mut HashMap<Oid, CommitRecord>,
-    heap: &mut BinaryHeap<PendingCommit>,
-    seq: &mut u64,
-    oid: Oid,
-) -> Result<(), GitError> {
-    if !seen.insert(oid) {
-        return Ok(());
+/// Date-ordered walk queue: committer-timestamp heap with insertion order
+/// breaking ties, so a child always precedes its parents while unrelated
+/// branches interleave strictly by date.
+pub(crate) struct WalkQueue {
+    seen: HashSet<Oid>,
+    pending: HashMap<Oid, CommitRecord>,
+    heap: BinaryHeap<PendingCommit>,
+    seq: u64,
+}
+
+impl WalkQueue {
+    /// Starts an empty queue.
+    pub(crate) fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            pending: HashMap::new(),
+            heap: BinaryHeap::new(),
+            seq: 0,
+        }
     }
-    let record = walk_record(records, oid)?;
-    heap.push(PendingCommit {
-        stamp: commit_stamp(&record),
-        seq: *seq,
-        oid,
-    });
-    *seq += 1;
-    pending.insert(oid, record);
-    Ok(())
+
+    /// Queues one unseen commit, fetching its record for the timestamp key.
+    /// Already-seen oids are a no-op. The oid passes through
+    /// `refs/replace/*` first, so every walk step follows replacements.
+    pub(crate) fn enqueue(
+        &mut self,
+        store: &Store,
+        records: &Records<'_>,
+        oid: Oid,
+    ) -> Result<(), GitError> {
+        let oid = replace_redirect(store, oid);
+        if !self.seen.insert(oid) {
+            return Ok(());
+        }
+        let record = walk_record(store, records, oid)?;
+        self.heap.push(PendingCommit {
+            stamp: commit_stamp(&record),
+            seq: self.seq,
+            oid,
+        });
+        self.seq += 1;
+        self.pending.insert(oid, record);
+        Ok(())
+    }
+
+    /// Marks one oid as already visited without queueing it, so excluded
+    /// tips never emit. Callers pass replacement-space oids.
+    pub(crate) fn mark_seen(&mut self, oid: Oid) {
+        self.seen.insert(oid);
+    }
+
+    /// Pops the next queued commit with its record, skipping drained entries.
+    pub(crate) fn pop(&mut self) -> Option<(Oid, CommitRecord)> {
+        while let Some(next) = self.heap.pop() {
+            let oid = next.oid();
+            if let Some(record) = self.pending.remove(&oid) {
+                return Some((oid, record));
+            }
+        }
+        None
+    }
+}
+
+impl Default for WalkQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Collects every ancestor of `tips` in `git log` order: committer-date
@@ -1104,31 +1210,17 @@ pub(crate) fn walk_history(
     limit: Option<usize>,
 ) -> Result<Vec<(Oid, CommitRecord)>, GitError> {
     let records = Records::new(store);
-    let mut seen: HashSet<Oid> = HashSet::new();
-    let mut pending: HashMap<Oid, CommitRecord> = HashMap::new();
-    let mut heap: BinaryHeap<PendingCommit> = BinaryHeap::new();
-    let mut seq: u64 = 0;
+    let mut queue = WalkQueue::new();
     for tip in tips {
-        enqueue(&records, &mut seen, &mut pending, &mut heap, &mut seq, *tip)?;
+        queue.enqueue(store, &records, *tip)?;
     }
     let mut out = Vec::new();
-    while let Some(next) = heap.pop() {
-        let oid = next.oid;
-        let Some(record) = pending.remove(&oid) else {
-            continue;
-        };
+    while let Some((oid, record)) = queue.pop() {
         for parent in record.parents() {
             let Some(parent_oid) = head_oid_of(parent) else {
                 continue;
             };
-            enqueue(
-                &records,
-                &mut seen,
-                &mut pending,
-                &mut heap,
-                &mut seq,
-                parent_oid,
-            )?;
+            queue.enqueue(store, &records, parent_oid)?;
         }
         out.push((oid, record));
         if limit.is_some_and(|max| out.len() >= max) {
@@ -1141,13 +1233,15 @@ pub(crate) fn walk_history(
 /// Decides whether `ancestor` reaches `descendant` through first-or-later
 /// parent links.
 pub(crate) fn is_ancestor(store: &Store, ancestor: Oid, descendant: Oid) -> Result<bool, GitError> {
-    if ancestor == descendant {
+    let ancestor = replace_redirect(store, ancestor);
+    let mut queue = vec![replace_redirect(store, descendant)];
+    if ancestor == queue[0] {
         return Ok(true);
     }
     let records = Records::new(store);
     let mut seen: HashMap<Oid, bool> = HashMap::new();
-    let mut queue = vec![descendant];
     while let Some(oid) = queue.pop() {
+        let oid = replace_redirect(store, oid);
         if oid == ancestor {
             return Ok(true);
         }
@@ -1155,12 +1249,7 @@ pub(crate) fn is_ancestor(store: &Store, ancestor: Oid, descendant: Oid) -> Resu
             continue;
         }
         seen.insert(oid, true);
-        let record = records
-            .get_commit(&Head::Git { oid })
-            .map_err(GitError::from)?
-            .ok_or_else(|| GitError::NotFound {
-                detail: format!("object {} is not a stored commit", oid.to_hex()),
-            })?;
+        let record = walk_record(store, &records, oid)?;
         for parent in record.parents() {
             if let Some(parent_oid) = head_oid_of(parent) {
                 queue.push(parent_oid);
@@ -1176,20 +1265,18 @@ pub(crate) fn merge_base(store: &Store, left: Oid, right: Oid) -> Result<Oid, Gi
     if left == right {
         return Ok(left);
     }
+    let left = replace_redirect(store, left);
+    let right = replace_redirect(store, right);
     let records = Records::new(store);
     let mut left_seen: HashMap<Oid, bool> = HashMap::new();
     let mut queue = vec![left];
     while let Some(oid) = queue.pop() {
+        let oid = replace_redirect(store, oid);
         if left_seen.contains_key(&oid) {
             continue;
         }
         left_seen.insert(oid, true);
-        let record = records
-            .get_commit(&Head::Git { oid })
-            .map_err(GitError::from)?
-            .ok_or_else(|| GitError::NotFound {
-                detail: format!("object {} is not a stored commit", oid.to_hex()),
-            })?;
+        let record = walk_record(store, &records, oid)?;
         for parent in record.parents() {
             if let Some(parent_oid) = head_oid_of(parent) {
                 queue.push(parent_oid);
@@ -1199,6 +1286,7 @@ pub(crate) fn merge_base(store: &Store, left: Oid, right: Oid) -> Result<Oid, Gi
     let mut queue = vec![right];
     let mut right_seen: HashMap<Oid, bool> = HashMap::new();
     while let Some(oid) = queue.pop() {
+        let oid = replace_redirect(store, oid);
         if left_seen.contains_key(&oid) {
             return Ok(oid);
         }
@@ -1206,12 +1294,7 @@ pub(crate) fn merge_base(store: &Store, left: Oid, right: Oid) -> Result<Oid, Gi
             continue;
         }
         right_seen.insert(oid, true);
-        let record = records
-            .get_commit(&Head::Git { oid })
-            .map_err(GitError::from)?
-            .ok_or_else(|| GitError::NotFound {
-                detail: format!("object {} is not a stored commit", oid.to_hex()),
-            })?;
+        let record = walk_record(store, &records, oid)?;
         for parent in record.parents() {
             if let Some(parent_oid) = head_oid_of(parent) {
                 queue.push(parent_oid);

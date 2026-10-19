@@ -21,7 +21,7 @@
 //! `git/builtin/diff.c`, `git/builtin/merge-base.c`,
 //! `git/builtin/rev-list.c`, `git/builtin/rev-parse.c`.
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::Signature;
@@ -43,11 +43,11 @@ use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
 use super::state::{
-    IdentityRole, PendingCommit, SequencerState, commit_record, enqueue, head_oid, identity,
-    is_ancestor, list_refs, load_or_default, merge_base as state_merge_base, merged_rows,
-    now_seconds, pseudo_delete, pseudo_read, pseudo_read_oid, pseudo_write, read_path_rows,
-    read_ref, resolve_rev, scan_index, sequencer_delete, sequencer_read, sequencer_write,
-    walk_history, workspace_mutation,
+    IdentityRole, SequencerState, commit_record, head_oid, identity, is_ancestor, list_refs,
+    load_or_default, merge_base as state_merge_base, merged_rows, now_seconds, pseudo_delete,
+    pseudo_read, pseudo_read_oid, pseudo_write, read_path_rows, read_ref, replace_redirect,
+    resolve_rev, scan_index, sequencer_delete, sequencer_read, sequencer_write, walk_history,
+    workspace_mutation,
 };
 use super::tree::{
     TreeMode, WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree,
@@ -679,7 +679,7 @@ fn blob_oid_for_path(
         });
     }
     let oid = resolve_local(store, kind, rev_part)?;
-    let tree = peel_to_tree(store, kind, oid)?;
+    let tree = peel_to_tree(store, kind, replace_redirect(store, oid))?;
     for (path, _, blob) in flatten_tree(store, kind, tree)? {
         if path == path_part.as_bytes() {
             return Ok(blob);
@@ -816,12 +816,12 @@ pub(crate) fn walk_history_excluding(
     let mut seen: HashSet<Oid> = HashSet::new();
     let mut stack: Vec<Oid> = exclude.to_vec();
     while let Some(oid) = stack.pop() {
+        let oid = super::state::replace_redirect(store, oid);
         if !seen.insert(oid) {
             continue;
         }
-        let record = match records.get_commit(&Head::Git { oid }) {
-            Ok(Some(record)) => record,
-            _ => continue,
+        let Ok(record) = super::state::walk_record(store, &records, oid) else {
+            continue;
         };
         for parent in record.parents() {
             if let Some(parent_oid) = parent.as_git().copied() {
@@ -829,30 +829,20 @@ pub(crate) fn walk_history_excluding(
             }
         }
     }
-    let mut pending: HashMap<Oid, CommitRecord> = HashMap::new();
-    let mut heap: BinaryHeap<PendingCommit> = BinaryHeap::new();
-    let mut seq: u64 = 0;
+    let mut queue = super::state::WalkQueue::new();
+    for oid in &seen {
+        queue.mark_seen(*oid);
+    }
     for tip in tips {
-        enqueue(&records, &mut seen, &mut pending, &mut heap, &mut seq, *tip)?;
+        queue.enqueue(store, &records, *tip)?;
     }
     let mut out = Vec::new();
-    while let Some(next) = heap.pop() {
-        let oid = next.oid();
-        let Some(record) = pending.remove(&oid) else {
-            continue;
-        };
+    while let Some((oid, record)) = queue.pop() {
         for parent in record.parents() {
             let Some(parent_oid) = parent.as_git().copied() else {
                 continue;
             };
-            enqueue(
-                &records,
-                &mut seen,
-                &mut pending,
-                &mut heap,
-                &mut seq,
-                parent_oid,
-            )?;
+            queue.enqueue(store, &records, parent_oid)?;
         }
         out.push((oid, record));
         if limit.is_some_and(|max| out.len() >= max) {
@@ -4438,8 +4428,10 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     let track_renames = rev_b.is_some() || staged;
     let pairs = match (rev, rev_b) {
         (Some(one), Some(two)) => {
-            let old_tree = peel_to_tree(store, kind, resolve_local(store, kind, &one)?)?;
-            let new_tree = peel_to_tree(store, kind, resolve_local(store, kind, &two)?)?;
+            let old_oid = replace_redirect(store, resolve_local(store, kind, &one)?);
+            let new_oid = replace_redirect(store, resolve_local(store, kind, &two)?);
+            let old_tree = peel_to_tree(store, kind, old_oid)?;
+            let new_tree = peel_to_tree(store, kind, new_oid)?;
             tree_pairs(ctx, Some(old_tree), Some(new_tree))?
         }
         (rev, None) => match (rev, staged) {
@@ -4639,7 +4631,7 @@ fn staged_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
 fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let oid = resolve_rev(store, kind, rev)?;
+    let oid = replace_redirect(store, resolve_rev(store, kind, rev)?);
     let tree = peel_to_tree(store, kind, oid)?;
     let mut tree_map = BTreeMap::new();
     for (path, mode, oid) in flatten_tree(store, kind, tree)? {
@@ -4699,7 +4691,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
 fn rev_staged_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let oid = resolve_rev(store, kind, rev)?;
+    let oid = replace_redirect(store, resolve_rev(store, kind, rev)?);
     let tree = peel_to_tree(store, kind, oid)?;
     let mut index_map = BTreeMap::new();
     for (path, stage, entry) in scan_index(store, kind)? {
