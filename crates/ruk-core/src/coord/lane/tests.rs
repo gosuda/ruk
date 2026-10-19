@@ -40,6 +40,7 @@ use crate::protocol::{
     MutationOutcome, ReceiptRef, Reply, Request, RequestDigest, SessionOpenArgs, Timestamp,
     WorkspaceInit, WsNewArgs, WsNewReply,
 };
+use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
 use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject};
 use crate::store::{PreparationBudget, Store, StoreError};
 use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState};
@@ -157,7 +158,7 @@ fn make_candidate(
 ) -> MutationCandidate {
     let (req, reply) = dummy_mutation_request(request_id);
     let (handle, cancel) = cancellation();
-    std::mem::forget(handle);
+    let _keep = std::mem::ManuallyDrop::new(handle);
 
     MutationCandidate::new(
         session,
@@ -1219,7 +1220,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
             },
         }));
         let (handle, cancel) = cancellation();
-        std::mem::forget(handle);
+        let _keep = std::mem::ManuallyDrop::new(handle);
         let candidate = MutationCandidate::new(
             Arc::clone(session),
             principal.clone(),
@@ -1304,4 +1305,451 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
         .expect("second acquire answers")
         .expect_err("overlapping acquire is claimed");
     assert_eq!(err.code, ErrorCode::EClaimed);
+}
+
+/// Builds a branch-write candidate shaped like a prepared `git.commit`:
+/// a CAS transaction moving `branch`, the branch as read premise, and the
+/// matching `Refs` fact.
+fn branch_write_candidate(
+    session: Arc<SessionLive>,
+    principal: Principal,
+    branch: &str,
+    oid_byte: u8,
+) -> MutationCandidate {
+    let name = RefName::new(branch).expect("valid branch name");
+    let oid = crate::ids::Oid::from_bytes(&[oid_byte; 20]).expect("test oid");
+    let transaction = RefTransaction::new(
+        HashKind::Sha1,
+        vec![RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Absent,
+            change: RefChange::Set(RefTarget::Direct(oid)),
+        }],
+    )
+    .expect("valid ref transaction");
+    let fact = FactMutation {
+        table: FactTable::Refs,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Absent,
+        value: Some(vec![oid_byte; 20]),
+    };
+    let request_id = RequestId::generate();
+    let (req, reply) = dummy_mutation_request(request_id);
+    let (handle, cancel) = cancellation();
+    let _keep = std::mem::ManuallyDrop::new(handle);
+    MutationCandidate::new(
+        session,
+        principal,
+        request_id,
+        req,
+        reply,
+        Vec::new(),
+        vec![fact],
+        None,
+        Some(transaction),
+        vec![name],
+        cancel,
+        None,
+    )
+    .expect("valid branch candidate")
+}
+
+/// Builds a premise-read candidate: no write, just a `ref_dependencies`
+/// pin on `branch`.
+fn ref_read_candidate(
+    session: Arc<SessionLive>,
+    principal: Principal,
+    branch: &str,
+) -> MutationCandidate {
+    let request_id = RequestId::generate();
+    let (req, reply) = dummy_mutation_request(request_id);
+    let (handle, cancel) = cancellation();
+    let _keep = std::mem::ManuallyDrop::new(handle);
+    MutationCandidate::new(
+        session,
+        principal,
+        request_id,
+        req,
+        reply,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        vec![RefName::new(branch).expect("valid branch name")],
+        cancel,
+        None,
+    )
+    .expect("valid read candidate")
+}
+
+fn ref_test_setup(
+    tag: &str,
+) -> (
+    TempRoot,
+    Store,
+    Clock,
+    SessionTable,
+    PolicySource,
+    Principal,
+    SignedDuration,
+) {
+    let temp = TempRoot::new(tag);
+    let store = test_store(&temp);
+    let clock = Clock::system();
+    let session_table = SessionTable::new(clock.clone());
+    let principal = Principal::from_peer_uid(1000);
+    let policy_source = PolicySource::open(&temp.store_dir(), principal.clone());
+    let idle = SignedDuration::from_hours(24);
+    (
+        temp,
+        store,
+        clock,
+        session_table,
+        policy_source,
+        principal,
+        idle,
+    )
+}
+
+/// Disjoint branch writes share one batch and both land: the relaxed gate
+/// admits `b1` + `b2` together and the shared publication persists both refs.
+#[test]
+fn test_13_disjoint_ref_writes_share_one_batch() {
+    let (_temp, store, clock, session_table, policy_source, principal, idle) =
+        ref_test_setup("disjoint-refs");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+
+    let cand1 = branch_write_candidate(session1, principal.clone(), "refs/heads/b1", 0x11);
+    let cand2 = branch_write_candidate(session2, principal, "refs/heads/b2", 0x22);
+    let item1 = BatchItem::Mutation {
+        candidate: Box::new(cand1),
+        reply_tx: None,
+    };
+    let item2 = BatchItem::Mutation {
+        candidate: Box::new(cand2),
+        reply_tx: None,
+    };
+
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&item1));
+    accumulator.add(item1);
+    assert!(
+        accumulator.can_admit(&item2),
+        "disjoint branch writes must share one batch"
+    );
+    accumulator.add(item2);
+
+    let (handle, cancel) = cancellation();
+    let _keep = std::mem::ManuallyDrop::new(handle);
+    commit_batch(
+        &store,
+        &session_table,
+        &policy_source,
+        &clock,
+        accumulator.drain(),
+        &cancel,
+    )
+    .expect("shared batch commits");
+    assert!(
+        store
+            .fact(FactTable::Refs, b"refs/heads/b1")
+            .expect("read b1")
+            .is_some(),
+        "b1 landed from the shared batch"
+    );
+    assert!(
+        store
+            .fact(FactTable::Refs, b"refs/heads/b2")
+            .expect("read b2")
+            .is_some(),
+        "b2 landed from the shared batch"
+    );
+}
+
+/// Same-branch writes still serialize: the second `b1` mover defers so CAS
+/// decides the winner and the loser retries client-side.
+#[test]
+fn test_14_same_branch_writes_serialize_across_batches() {
+    let (_temp, _store, _clock, session_table, _policy_source, principal, idle) =
+        ref_test_setup("same-branch-refs");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+
+    let cand1 = branch_write_candidate(session1, principal.clone(), "refs/heads/b1", 0x11);
+    let cand2 = branch_write_candidate(session2, principal, "refs/heads/b1", 0x22);
+    let item1 = BatchItem::Mutation {
+        candidate: Box::new(cand1),
+        reply_tx: None,
+    };
+    let item2 = BatchItem::Mutation {
+        candidate: Box::new(cand2),
+        reply_tx: None,
+    };
+
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&item1));
+    accumulator.add(item1);
+    assert!(
+        !accumulator.can_admit(&item2),
+        "same-branch write must defer to the next batch"
+    );
+}
+
+/// Read/write premise conflicts serialize in both arrival orders, while a
+/// disjoint reader shares: a writer arriving after a reader would
+/// invalidate the premise the reader was validated against, and a reader
+/// arriving after a writer premises on a value the batch is moving.
+#[test]
+fn test_15_ref_read_write_premise_conflicts_serialize() {
+    let (_temp, _store, _clock, session_table, _policy_source, principal, idle) =
+        ref_test_setup("ref-read-write");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+    let session3 = test_session(&session_table, &principal, idle);
+    let session4 = test_session(&session_table, &principal, idle);
+
+    // Reader first, writer second: the write hits the admitted read premise.
+    let reader = ref_read_candidate(session1, principal.clone(), "refs/heads/main");
+    let writer = branch_write_candidate(session2, principal.clone(), "refs/heads/main", 0x11);
+    let reader_item = BatchItem::Mutation {
+        candidate: Box::new(reader),
+        reply_tx: None,
+    };
+    let writer_item = BatchItem::Mutation {
+        candidate: Box::new(writer),
+        reply_tx: None,
+    };
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&reader_item));
+    accumulator.add(reader_item);
+    assert!(
+        !accumulator.can_admit(&writer_item),
+        "write after a read premise on the same ref must defer"
+    );
+
+    // Writer first, reader second: the read premise hits the admitted write.
+    let writer2 = branch_write_candidate(session3, principal.clone(), "refs/heads/main", 0x11);
+    let reader2 = ref_read_candidate(session4, principal.clone(), "refs/heads/main");
+    let writer_item2 = BatchItem::Mutation {
+        candidate: Box::new(writer2),
+        reply_tx: None,
+    };
+    let reader_item2 = BatchItem::Mutation {
+        candidate: Box::new(reader2),
+        reply_tx: None,
+    };
+    let mut accumulator2 = BatchAccumulator::new();
+    assert!(accumulator2.can_admit(&writer_item2));
+    accumulator2.add(writer_item2);
+    assert!(
+        !accumulator2.can_admit(&reader_item2),
+        "read premise after a write on the same ref must defer"
+    );
+}
+
+/// A ref-less item and a ref-touching item share one batch: disjoint reader
+/// and writer premises never intersect.
+#[test]
+fn test_16_refless_and_ref_touching_share_one_batch() {
+    let (_temp, _store, _clock, session_table, _policy_source, principal, idle) =
+        ref_test_setup("refless-ref");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+
+    let plain = make_candidate(
+        session1,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let writer = branch_write_candidate(session2, principal, "refs/heads/b9", 0x33);
+    let plain_item = BatchItem::Mutation {
+        candidate: Box::new(plain),
+        reply_tx: None,
+    };
+    let writer_item = BatchItem::Mutation {
+        candidate: Box::new(writer),
+        reply_tx: None,
+    };
+
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&plain_item));
+    accumulator.add(plain_item);
+    assert!(
+        accumulator.can_admit(&writer_item),
+        "ref-less and ref-touching items must share one batch"
+    );
+}
+
+/// Builds a symbolic-link candidate: a CAS transaction setting `from` to
+/// point at `to`, plus the matching `Refs` fact and read premise.
+fn symbolic_link_candidate(
+    session: Arc<SessionLive>,
+    principal: Principal,
+    from: &str,
+    to: &str,
+) -> MutationCandidate {
+    let name = RefName::new(from).expect("valid branch name");
+    let target = RefName::new(to).expect("valid target name");
+    let transaction = RefTransaction::new(
+        HashKind::Sha1,
+        vec![RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Absent,
+            change: RefChange::Set(RefTarget::Symbolic(target.clone())),
+        }],
+    )
+    .expect("valid ref transaction");
+    let fact = FactMutation {
+        table: FactTable::Refs,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Absent,
+        value: Some(target.as_bytes().to_vec()),
+    };
+    let request_id = RequestId::generate();
+    let (req, reply) = dummy_mutation_request(request_id);
+    let (handle, cancel) = cancellation();
+    let _keep = std::mem::ManuallyDrop::new(handle);
+    MutationCandidate::new(
+        session,
+        principal,
+        request_id,
+        req,
+        reply,
+        Vec::new(),
+        vec![fact],
+        None,
+        Some(transaction),
+        vec![name],
+        cancel,
+        None,
+    )
+    .expect("valid link candidate")
+}
+
+/// A ref and its child never share a batch: the per-item checks validate
+/// against the same pre-batch snapshot and the store never re-checks the
+/// directory/file invariant at publish time, so the gate refuses the pair
+/// in both arrival orders.
+#[test]
+fn test_17_ref_child_pairs_serialize_across_batches() {
+    let (_temp, _store, _clock, session_table, _policy_source, principal, idle) =
+        ref_test_setup("ref-child");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+    let session3 = test_session(&session_table, &principal, idle);
+    let session4 = test_session(&session_table, &principal, idle);
+
+    let parent = branch_write_candidate(session1, principal.clone(), "refs/heads/a", 0x11);
+    let child = branch_write_candidate(session2, principal.clone(), "refs/heads/a/b", 0x22);
+    let parent_item = BatchItem::Mutation {
+        candidate: Box::new(parent),
+        reply_tx: None,
+    };
+    let child_item = BatchItem::Mutation {
+        candidate: Box::new(child),
+        reply_tx: None,
+    };
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&parent_item));
+    accumulator.add(parent_item);
+    assert!(
+        !accumulator.can_admit(&child_item),
+        "child ref after its parent prefix must defer"
+    );
+
+    let child2 = branch_write_candidate(session3, principal.clone(), "refs/heads/a/b", 0x22);
+    let parent2 = branch_write_candidate(session4, principal.clone(), "refs/heads/a", 0x11);
+    let child_item2 = BatchItem::Mutation {
+        candidate: Box::new(child2),
+        reply_tx: None,
+    };
+    let parent_item2 = BatchItem::Mutation {
+        candidate: Box::new(parent2),
+        reply_tx: None,
+    };
+    let mut accumulator2 = BatchAccumulator::new();
+    assert!(accumulator2.can_admit(&child_item2));
+    accumulator2.add(child_item2);
+    assert!(
+        !accumulator2.can_admit(&parent_item2),
+        "parent prefix after its child ref must defer"
+    );
+}
+
+/// Links joining into a cycle never share a batch, while two links aimed
+/// at one target do: cycle halves meet through the target sets in both
+/// arrival orders, and target/target overlap alone stays shareable.
+#[test]
+fn test_18_symbolic_cycle_halves_serialize_across_batches() {
+    let (_temp, _store, _clock, session_table, _policy_source, principal, idle) =
+        ref_test_setup("link-cycle");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+    let session3 = test_session(&session_table, &principal, idle);
+    let session4 = test_session(&session_table, &principal, idle);
+    let session5 = test_session(&session_table, &principal, idle);
+    let session6 = test_session(&session_table, &principal, idle);
+
+    let forward =
+        symbolic_link_candidate(session1, principal.clone(), "refs/heads/a", "refs/heads/b");
+    let backward =
+        symbolic_link_candidate(session2, principal.clone(), "refs/heads/b", "refs/heads/a");
+    let forward_item = BatchItem::Mutation {
+        candidate: Box::new(forward),
+        reply_tx: None,
+    };
+    let backward_item = BatchItem::Mutation {
+        candidate: Box::new(backward),
+        reply_tx: None,
+    };
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&forward_item));
+    accumulator.add(forward_item);
+    assert!(
+        !accumulator.can_admit(&backward_item),
+        "closing half of a symbolic cycle must defer"
+    );
+
+    let backward2 =
+        symbolic_link_candidate(session3, principal.clone(), "refs/heads/b", "refs/heads/a");
+    let forward2 =
+        symbolic_link_candidate(session4, principal.clone(), "refs/heads/a", "refs/heads/b");
+    let backward_item2 = BatchItem::Mutation {
+        candidate: Box::new(backward2),
+        reply_tx: None,
+    };
+    let forward_item2 = BatchItem::Mutation {
+        candidate: Box::new(forward2),
+        reply_tx: None,
+    };
+    let mut accumulator2 = BatchAccumulator::new();
+    assert!(accumulator2.can_admit(&backward_item2));
+    accumulator2.add(backward_item2);
+    assert!(
+        !accumulator2.can_admit(&forward_item2),
+        "opening half after the closing half must defer"
+    );
+
+    // Two links sharing one target commit no joint invariant: both admit.
+    let left = symbolic_link_candidate(session5, principal.clone(), "refs/heads/a", "refs/heads/b");
+    let right =
+        symbolic_link_candidate(session6, principal.clone(), "refs/heads/c", "refs/heads/b");
+    let left_item = BatchItem::Mutation {
+        candidate: Box::new(left),
+        reply_tx: None,
+    };
+    let right_item = BatchItem::Mutation {
+        candidate: Box::new(right),
+        reply_tx: None,
+    };
+    let mut accumulator3 = BatchAccumulator::new();
+    assert!(accumulator3.can_admit(&left_item));
+    accumulator3.add(left_item);
+    assert!(
+        accumulator3.can_admit(&right_item),
+        "links sharing one target must share one batch"
+    );
 }

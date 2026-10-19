@@ -2883,22 +2883,21 @@ mod tests {
         let _ = runner.abort();
     }
 
-    /// Concurrent lane commits on distinct branches take separate batches:
-    /// the lane admits at most one ref-moving mutation per batch
-    /// (`can_admit` refuses a second item that touches refs), so four
-    /// submissions cost four store publications. Distinct ref_updates
-    /// still never CAS-conflict, so all four land exactly attributed with
-    /// nothing lost or retried.
+    /// Concurrent lane commits on distinct branches share batches: the
+    /// lane admits ref-moving mutations with disjoint write-sets into one
+    /// batch (`can_admit` refuses only overlapping ref writes and
+    /// read/write premise conflicts), so four submissions cost fewer than
+    /// four store publications. Distinct ref_updates never CAS-conflict,
+    /// so all four land exactly attributed with nothing lost or retried.
     ///
-    /// This pins the batching boundary from the lane side: cross-ref
-    /// batching would need a product change to the batch gate, not a
-    /// test change. The equalities below are structural, not timing:
-    /// they hold regardless of how the submissions overlap. (CLI
-    /// processes cannot even reach this layer concurrently: one store
-    /// holds one `HEAD`, and sequential CLI submissions arrive hundreds
-    /// of milliseconds apart, far outside the 50 ms windows.)
+    /// Same-branch pairs still serialize: they collide on the branch name
+    /// and the loser retries client-side (covered by
+    /// `same_branch_race_resolves` and the lane `test_14`). (CLI
+    /// processes cannot reach this layer concurrently with attribution:
+    /// one store holds one `HEAD`, and sequential CLI submissions arrive
+    /// hundreds of milliseconds apart, far outside the 50 ms windows.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn concurrent_cross_ref_commits_take_separate_batches() {
+    async fn concurrent_cross_ref_commits_share_one_batch() {
         use std::time::Duration;
 
         use crate::change::ChangeId;
@@ -2977,12 +2976,18 @@ mod tests {
         }
 
         let before = coord.store().io_stats();
+        // Rendezvous so all four submissions hit the lane within
+        // microseconds of each other, well inside the 2 ms accumulate
+        // window regardless of task-startup jitter.
+        let barrier = Arc::new(tokio::sync::Barrier::new(BRANCHES));
         let mut tasks = Vec::with_capacity(BRANCHES);
         for (branch_no, session) in sessions.into_iter().enumerate() {
             let coord = Arc::clone(&coord);
             let owner = owner.clone();
             let cancel = cancel.clone();
+            let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
                 let branch =
                     RefName::new(format!("refs/heads/lane-{branch_no}")).expect("branch name");
                 submit(
@@ -3029,10 +3034,8 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), BRANCHES, "distinct branch tips");
 
-        // The boundary pin: four submissions, four publications, four
-        // metadata commits. If a future batch-gate change folds
-        // distinct-ref mutations into shared batches, these equalities
-        // fail and deserve a conscious update, not a retry.
+        // The batching proof: four submissions in fewer store publications,
+        // each costing at most one metadata commit.
         let after = coord.store().io_stats();
         let total = u64::try_from(BRANCHES).expect("submission count fits u64");
         assert_eq!(
@@ -3042,13 +3045,13 @@ mod tests {
         );
         let publications = after.publications - before.publications;
         let commits = after.publication_commits - before.publication_commits;
-        assert_eq!(
-            publications, total,
-            "one batch per ref-moving submission: {after:?} vs {before:?}"
+        assert!(
+            publications < total,
+            "lane batches concurrent cross-ref submissions: {after:?} vs {before:?}"
         );
-        assert_eq!(
-            commits, total,
-            "one metadata commit per batch: {after:?} vs {before:?}"
+        assert!(
+            commits <= publications,
+            "no batch splits metadata commits: {after:?} vs {before:?}"
         );
 
         coord.shutdown();

@@ -3,7 +3,9 @@
 //! Enforces bounded group commit: linger at most 2ms, aggregate at most 64 requests
 //! and at most 64 MiB of prepared publication bytes. Large single transactions
 //! (>64 MiB) commit as their own dedicated single-item batches. Overlapping touched
-//! keys or semantic ref/claim dependencies are separated into sequential batches.
+//! keys, overlapping ref write-sets, and ref read/write premise conflicts are
+//! separated into sequential batches; disjoint ref writes share one batch in
+//! arrival order. Claim touches still seal the batch.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -15,7 +17,7 @@ use crate::coord::lane::candidate::{InternalCandidate, MutationCandidate};
 use crate::coord::rows;
 use crate::error::CoreError;
 use crate::protocol::{Reply, Request};
-use crate::refdata::RefName;
+use crate::refdata::{RefChange, RefTarget};
 use crate::store::types::FactTable;
 
 /// Maximum requests aggregated into a single group commit batch.
@@ -98,16 +100,77 @@ impl BatchItem {
             .is_some_and(|keys| keys.contains(&r_key[..]))
     }
 
-    /// Returns `true` if this item mutates or references refs.
+    /// Ref key bytes this item writes: its transaction targets plus its
+    /// `Refs` fact keys.
+    ///
+    /// Two items sharing a batch must hold disjoint write-sets: same-branch
+    /// commits collide on the branch name, which is exactly the CAS
+    /// serialization the store would enforce anyway.
     #[must_use]
-    pub(crate) fn touches_refs(&self) -> bool {
-        let Self::Mutation { candidate, .. } = self else {
-            return false;
+    pub(crate) fn ref_write_keys(&self) -> Vec<Vec<u8>> {
+        let facts = match self {
+            Self::Mutation { candidate, .. } => {
+                let mut keys: Vec<Vec<u8>> = candidate
+                    .ref_transaction
+                    .iter()
+                    .flat_map(|tx| tx.updates())
+                    .map(|update| update.name.as_bytes().to_vec())
+                    .collect();
+                keys.extend(
+                    candidate
+                        .facts
+                        .iter()
+                        .filter(|f| f.table == FactTable::Refs)
+                        .map(|f| f.key.clone()),
+                );
+                return keys;
+            }
+            Self::Internal { candidate, .. } => &candidate.facts,
         };
+        facts
+            .iter()
+            .filter(|f| f.table == FactTable::Refs)
+            .map(|f| f.key.clone())
+            .collect()
+    }
 
-        candidate.ref_transaction.is_some()
-            || !candidate.ref_dependencies.is_empty()
-            || candidate.facts.iter().any(|f| f.table == FactTable::Refs)
+    /// Ref key bytes this item symbolically points at: the targets of its
+    /// `Symbolic` transaction updates.
+    ///
+    /// Two links may share one target, but a writer moving a targeted ref
+    /// (or a link aimed at a written ref) would join two separately
+    /// validated chains into an over-deep chain or a cycle, so either
+    /// direction defers. Target/target overlap alone stays shareable.
+    #[must_use]
+    pub(crate) fn ref_target_keys(&self) -> Vec<Vec<u8>> {
+        let Self::Mutation { candidate, .. } = self else {
+            return Vec::new();
+        };
+        candidate
+            .ref_transaction
+            .iter()
+            .flat_map(|tx| tx.updates())
+            .filter_map(|update| match &update.change {
+                RefChange::Set(RefTarget::Symbolic(name)) => Some(name.as_bytes().to_vec()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ref key bytes this item premise-reads: its `ref_dependencies`.
+    ///
+    /// A writer arriving after a reader still conflicts: the write would
+    /// invalidate the premise the reader was validated against.
+    #[must_use]
+    pub(crate) fn ref_read_keys(&self) -> Vec<Vec<u8>> {
+        let Self::Mutation { candidate, .. } = self else {
+            return Vec::new();
+        };
+        candidate
+            .ref_dependencies
+            .iter()
+            .map(|name| name.as_bytes().to_vec())
+            .collect()
     }
 
     /// Returns `true` if this item mutates or checks claims.
@@ -157,7 +220,13 @@ pub(crate) struct BatchAccumulator {
     items: Vec<BatchItem>,
     total_bytes: u64,
     touched_keys: HashMap<FactTable, HashSet<Vec<u8>>>,
-    has_refs: bool,
+    /// Ref key bytes already written by admitted items (transaction targets
+    /// plus `Refs` fact keys).
+    touched_ref_writes: HashSet<Vec<u8>>,
+    /// Ref key bytes already symbolically targeted by admitted items.
+    touched_ref_targets: HashSet<Vec<u8>>,
+    /// Ref key bytes already premise-read by admitted items (`ref_dependencies`).
+    touched_ref_reads: HashSet<Vec<u8>>,
     has_claims: bool,
     is_large_single_tx: bool,
 }
@@ -170,7 +239,9 @@ impl BatchAccumulator {
             items: Vec::with_capacity(MAX_BATCH_REQUESTS),
             total_bytes: 0,
             touched_keys: HashMap::new(),
-            has_refs: false,
+            touched_ref_writes: HashSet::new(),
+            touched_ref_targets: HashSet::new(),
+            touched_ref_reads: HashSet::new(),
             has_claims: false,
             is_large_single_tx: false,
         }
@@ -227,8 +298,45 @@ impl BatchAccumulator {
             return false;
         }
 
-        if item.touches_refs() && self.has_refs {
-            return false;
+        // Disjoint-ref sharing: an item whose ref writes hit an admitted
+        // write (equal or directory/file-colliding), target, or read
+        // premise defers, as does an item whose read premise or symbolic
+        // target hits an admitted write. Same-branch commits always
+        // collide on the branch name (CAS serializes them; the loser
+        // retries client-side), while disjoint branches share one batch.
+        // The store never re-checks ref invariants at publish time and
+        // every transaction validates against the same pre-batch
+        // snapshot, so the gate must also refuse pairs the per-item
+        // checks cannot see together: a ref with its child, and two
+        // links joining into a cycle. Read/read and target/target
+        // overlap stay shareable: neither invalidates the other.
+        for key in item.ref_write_keys() {
+            if self
+                .touched_ref_writes
+                .iter()
+                .any(|known| ref_keys_collide(&key, known))
+                || self.touched_ref_targets.contains(&key)
+                || self
+                    .touched_ref_reads
+                    .iter()
+                    .any(|known| ref_keys_collide(&key, known))
+            {
+                return false;
+            }
+        }
+        for key in item.ref_target_keys() {
+            if self.touched_ref_writes.contains(&key) {
+                return false;
+            }
+        }
+        for key in item.ref_read_keys() {
+            if self
+                .touched_ref_writes
+                .iter()
+                .any(|known| ref_keys_collide(&key, known))
+            {
+                return false;
+            }
         }
 
         if item.touches_claims() && self.has_claims {
@@ -255,6 +363,16 @@ impl BatchAccumulator {
 
         self.total_bytes = self.total_bytes.saturating_add(item_bytes);
 
+        for key in item.ref_write_keys() {
+            self.touched_ref_writes.insert(key);
+        }
+        for key in item.ref_target_keys() {
+            self.touched_ref_targets.insert(key);
+        }
+        for key in item.ref_read_keys() {
+            self.touched_ref_reads.insert(key);
+        }
+
         match &item {
             BatchItem::Mutation { candidate, .. } => {
                 for fact in &candidate.facts {
@@ -262,15 +380,9 @@ impl BatchAccumulator {
                         .entry(fact.table)
                         .or_default()
                         .insert(fact.key.clone());
-                    if fact.table == FactTable::Refs {
-                        self.has_refs = true;
-                    }
                     if fact.table == FactTable::Claims {
                         self.has_claims = true;
                     }
-                }
-                if candidate.ref_transaction.is_some() || !candidate.ref_dependencies.is_empty() {
-                    self.has_refs = true;
                 }
                 // Semantic claim touch, not just Claims facts: claim
                 // operations seal in the lane after batching, so a fact scan
@@ -312,4 +424,17 @@ impl BatchAccumulator {
     pub(crate) fn drain(self) -> Vec<BatchItem> {
         self.items
     }
+}
+
+/// Directory/file collision between two ref key byte strings: equal, or
+/// one a proper `a/b` directory prefix of the other. Mirrors the
+/// [`crate::refdata::RefTransaction::check`] collision rule for names two
+/// separately validated transactions would otherwise commit together.
+#[must_use]
+fn ref_keys_collide(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    long.len() > short.len() && long.starts_with(short) && long.get(short.len()) == Some(&b'/')
 }

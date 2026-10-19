@@ -144,21 +144,26 @@ fn commit_parents(payload: &str) -> Vec<String> {
         .collect()
 }
 
-/// Four commits on four branches land exactly attributed: each branch holds
-/// its own commit parented on the seed, with no cross-talk, and each
-/// publication costs its own metadata commit.
+/// Four sequential commits on four branches land exactly attributed: each
+/// branch holds its own commit parented on the seed, with no cross-talk.
 ///
 /// Sequential on purpose. One store holds one `HEAD`, so concurrent
 /// checkout-then-commit processes cannot attribute branches (every commit
-/// captures whichever checkout finished last). And sequential CLI
-/// submissions never share a burst: the coordinator retires idle bursts
-/// after 50 ms and the store caps group-commit linger at 50 ms, while CLI
-/// submissions arrive hundreds of milliseconds apart. The equality below
-/// pins that boundary from the other side: if it ever fails with fewer
-/// commits than publications, CLI batching improved and this test needs a
-/// conscious update.
+/// captures whichever checkout finished last), and concurrent same-HEAD
+/// racers would CAS-retry instead of batching. Sequential CLI submissions
+/// also never share a burst: the coordinator retires idle bursts after
+/// 50 ms and the store caps group-commit linger at 50 ms, while CLI
+/// submissions arrive hundreds of milliseconds apart. Cross-branch
+/// batching is proven where overlap is real instead: concurrent lane
+/// submissions on disjoint refs share one batch (see
+/// `concurrent_cross_ref_commits_share_one_batch` in
+/// `ruk_core::coord::hosted`), and the lane admission rules are pinned by
+/// `coord::lane` tests 13-16. The equalities below pin the sequential
+/// boundary from the other side: four spaced-out publications cost four
+/// metadata commits, which pins process spacing as the boundary rather
+/// than the batch gate.
 #[test]
-fn cross_branch_commits_stay_isolated() {
+fn sequential_cross_branch_commits_attribute_exactly() {
     const N: usize = 4;
     let idle = &[("RUK_COORDINATOR_IDLE_MS", "10000")];
     let repo = fresh_repo("cross");
@@ -203,8 +208,9 @@ fn cross_branch_commits_stay_isolated() {
         N + 1,
         "seed plus four commits:\n{stdout}"
     );
-    // No sharing across processes: four spaced-out publications cost four
-    // metadata commits.
+    // No sharing across sequential processes: four spaced-out publications
+    // cost four metadata commits. Concurrent lane submissions on disjoint
+    // refs do share; sequential CLI cannot overlap the burst windows.
     wait_for(
         &repo.join(".ruk").join("coordinator.stats"),
         true,
