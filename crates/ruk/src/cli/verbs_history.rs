@@ -1737,7 +1737,7 @@ fn render_commit_line_full(
         return Ok(format!("{short} {source} {subject}\n").into_bytes());
     }
     if line.pretty != PrettyKind::Default {
-        return render_pretty_shape(line, oid, record, decoration);
+        return render_pretty_shape(line, oid, record, decoration, source);
     }
     let id = if line.abbrev {
         short_hex_len(oid, line.abbrev_len)
@@ -1774,12 +1774,15 @@ fn render_commit_line_full(
 
 /// Renders the `--pretty=full`/`fuller`/`email`/`raw` shapes: full adds the
 /// committer line, fuller adds both date lines, email renders mbox
-/// headers, and raw renders the stored header lines verbatim.
+/// headers, and raw renders the stored header lines verbatim. `--source`
+/// text rides after the oid on the `commit `-shaped openers, mirroring the
+/// default header; mbox has no slot for it and leaves it out.
 fn render_pretty_shape(
     line: &CommitLine,
     oid: &Oid,
     record: &CommitRecord,
     decoration: &str,
+    source: &str,
 ) -> Result<Vec<u8>, GitError> {
     let broken = |role: &str| GitError::Corrupt {
         detail: format!("bad {role} ident"),
@@ -1791,21 +1794,32 @@ fn render_pretty_shape(
     } else {
         oid.to_hex()
     };
+    let source_text = if source.is_empty() {
+        String::new()
+    } else {
+        format!(" {source}")
+    };
     let mut out = Vec::new();
     match line.pretty {
         PrettyKind::Default => {
-            out.extend_from_slice(format!("commit {id}{decoration}\n").as_bytes());
+            out.extend_from_slice(
+                format!("commit {id}{source_text}{decoration}\n").as_bytes(),
+            );
             out.extend_from_slice(&indented_message(record.message()));
             out.push(b'\n');
             return Ok(out);
         }
         PrettyKind::Full => {
-            out.extend_from_slice(format!("commit {id}{decoration}\n").as_bytes());
+            out.extend_from_slice(
+                format!("commit {id}{source_text}{decoration}\n").as_bytes(),
+            );
             push_ident(&mut out, "Author: ", &author);
             push_ident(&mut out, "Commit: ", &committer);
         }
         PrettyKind::Fuller => {
-            out.extend_from_slice(format!("commit {id}{decoration}\n").as_bytes());
+            out.extend_from_slice(
+                format!("commit {id}{source_text}{decoration}\n").as_bytes(),
+            );
             push_ident(&mut out, "Author:     ", &author);
             out.extend_from_slice(
                 format!(
@@ -1854,7 +1868,9 @@ fn render_pretty_shape(
             return Ok(out);
         }
         PrettyKind::Raw => {
-            out.extend_from_slice(format!("commit {}\n", oid.to_hex()).as_bytes());
+            out.extend_from_slice(
+                format!("commit {}{source_text}\n", oid.to_hex()).as_bytes(),
+            );
             out.extend_from_slice(
                 format!("tree {}\n", commit_tree_oid(record)?.to_hex()).as_bytes(),
             );
@@ -4978,7 +4994,23 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             || opts.is_set("name-status")
             || extra_stats);
     let show_notes = opts.is_set("show-notes") && !opts.is_set("no-notes");
-    let notes_default = notes_ref.flatten();
+    // `--show-notes=<ref>` wins; otherwise the notes ref resolves the way
+    // the notes verb resolves it: `GIT_NOTES_REF`, then `core.notesRef`,
+    // then the default ref.
+    let notes_refname: Option<String> = if show_notes {
+        match notes_ref.flatten() {
+            Some(given) => Some(given),
+            None => Some(
+                ctx.env
+                    .get("GIT_NOTES_REF")
+                    .map(str::to_owned)
+                    .or_else(|| ctx.config_get("core.notesRef"))
+                    .unwrap_or_else(|| "refs/notes/commits".to_owned()),
+            ),
+        }
+    } else {
+        None
+    };
     let follow_mode = match rename_mode {
         super::rename::RenameMode::Similar(_) => rename_mode,
         super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => {
@@ -5094,7 +5126,7 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             && let Some(note) = super::verbs_notes::note_for_commit(
                 store,
                 kind,
-                notes_default.as_deref(),
+                notes_refname.as_deref(),
                 &shown.oid,
             )?
         {
@@ -5119,12 +5151,13 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
                 )?);
             }
         }
-        if left_right {
+        // Custom `--format` blocks carry no side marks, as in the oracle.
+        if left_right && line.format.is_none() {
             let marker = match sym_sides {
                 Some((left, _)) if shown.origin == left => b'<',
                 _ => b'>',
             };
-            block.insert(0, marker);
+            prefix_mark(&mut block, marker);
         }
         if graph {
             block = graph_block(&block);
@@ -5134,7 +5167,9 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     for (_, oid, record) in &boundary {
         let decoration = decoration_text(&decorations, oid, full_names);
         let mut block = render_commit_line_full(&line, oid, record, &decoration, "")?;
-        block.insert(0, b'-');
+        if line.format.is_none() {
+            prefix_mark(&mut block, b'-');
+        }
         if graph {
             block = graph_block(&block);
         }
@@ -5796,6 +5831,19 @@ fn render_dirstat(changes: &[FileChange]) -> Vec<u8> {
     out
 }
 
+/// Prefixes one rendered block with a `--left-right` (`<`/`>`) or
+/// `--boundary` (`-`) mark the way the oracle prints mark-before-id:
+/// `commit < <oid>` for `commit `-shaped blocks, `< <oid> <subject>` for
+/// oneline form. Custom `--format` blocks carry no marks at all.
+fn prefix_mark(block: &mut Vec<u8>, marker: u8) {
+    const COMMIT: &[u8] = b"commit ";
+    if block.starts_with(COMMIT) {
+        block.splice(COMMIT.len()..COMMIT.len(), [marker, b' ']);
+    } else {
+        block.splice(0..0, [marker, b' ']);
+    }
+}
+
 /// Renders one note for `--show-notes` the way the oracle appends it after
 /// the message: a `Notes:` header with the body indented four spaces.
 fn render_note(note: &[u8]) -> Vec<u8> {
@@ -5842,15 +5890,30 @@ fn commit_line_of(opts: &super::Collected) -> Result<CommitLine, GitError> {
         Some(text) => Some(parse_log_format(strip_format_prefix(&text))?),
         None => None,
     };
+    // An explicit `--pretty` always decides the shape: only `oneline`
+    // keeps the short form, so `--pretty=full` (and its siblings) override
+    // a bare `--oneline` flag the way a more specific spelling should.
     if format.is_none() {
         if let Some(text) = opts.single("pretty")? {
             match text.as_str() {
                 "oneline" => oneline = true,
                 "short" | "medium" => oneline = false,
-                "full" => pretty = PrettyKind::Full,
-                "fuller" => pretty = PrettyKind::Fuller,
-                "email" => pretty = PrettyKind::Email,
-                "raw" => pretty = PrettyKind::Raw,
+                "full" => {
+                    oneline = false;
+                    pretty = PrettyKind::Full;
+                }
+                "fuller" => {
+                    oneline = false;
+                    pretty = PrettyKind::Fuller;
+                }
+                "email" => {
+                    oneline = false;
+                    pretty = PrettyKind::Email;
+                }
+                "raw" => {
+                    oneline = false;
+                    pretty = PrettyKind::Raw;
+                }
                 _ => format = parse_pretty_arg(&text)?,
             }
         }

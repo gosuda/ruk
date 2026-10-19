@@ -6455,6 +6455,18 @@ fn log_pretty_shapes() {
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains(marker), "{flag} got {text}");
     }
+    // An explicit pretty overrides a bare `--oneline`.
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--pretty=full", "-n", "1"],
+    )
+    .expect("pretty over oneline");
+    assert!(
+        String::from_utf8_lossy(&out).contains("Commit: "),
+        "got {:?}",
+        out
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -6562,8 +6574,20 @@ fn log_source_and_left_right() {
     )
     .expect("left-right");
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.lines().any(|line| line.starts_with('<')), "got {text}");
-    assert!(text.lines().any(|line| line.starts_with('>')), "got {text}");
+    assert!(text.lines().any(|line| line.starts_with("< ")), "got {text}");
+    assert!(text.lines().any(|line| line.starts_with("> ")), "got {text}");
+    // Custom formats carry no side marks, as in the oracle.
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--format=%s", "--left-right", "main...side"],
+    )
+    .expect("format suppresses marks");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        text.lines().all(|line| !line.starts_with('<') && !line.starts_with('>')),
+        "got {text}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -6635,6 +6659,31 @@ fn log_notes_boundary_decorate() {
         "got {:?}",
         out
     );
+    // A custom ref stays hidden unless named: `GIT_NOTES_REF` names it.
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["add", "--ref", "review", "-m", "looks good", head.as_str()],
+    )
+    .expect("note add custom");
+    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"])
+        .expect("other ref hidden");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("looks good"),
+        "got {:?}",
+        out
+    );
+    ctx.env.vars.insert(
+        "GIT_NOTES_REF".to_owned(),
+        "refs/notes/review".to_owned(),
+    );
+    let out = run(verbs_history::log, &mut ctx, &["--show-notes", "-n", "1"])
+        .expect("env ref");
+    assert!(
+        String::from_utf8_lossy(&out).contains("looks good"),
+        "got {:?}",
+        out
+    );
     let out = run(
         verbs_history::log,
         &mut ctx,
@@ -6653,7 +6702,7 @@ fn log_notes_boundary_decorate() {
     )
     .expect("boundary");
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.lines().any(|line| line.starts_with('-')), "got {text}");
+    assert!(text.lines().any(|line| line.starts_with("- ")), "got {text}");
     let out = run(
         verbs_history::log,
         &mut ctx,
