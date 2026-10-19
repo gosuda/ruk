@@ -2095,15 +2095,18 @@ fn scan_tar_comment(raw: &[u8]) -> Result<Option<String>, GitError> {
             });
         }
         let size = parse_tar_size(&header[124..136])?;
+        let size = usize::try_from(size).map_err(|_| GitError::Corrupt {
+            detail: "tar size exceeds the address range".to_owned(),
+        })?;
         offset += 512;
         let kind = header[156];
         if kind == b'g' || kind == b'x' {
-            let end = offset.saturating_add(size as usize).min(raw.len());
+            let end = offset.saturating_add(size).min(raw.len());
             if let Some(hex) = scan_pax_comment(&raw[offset..end]) {
                 return Ok(Some(hex));
             }
         }
-        offset = offset.saturating_add(((size + 511) / 512) as usize * 512);
+        offset = offset.saturating_add(((size + 511) / 512) * 512);
     }
     Ok(None)
 }
