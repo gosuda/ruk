@@ -1,6 +1,6 @@
 # CLI verb status
 
-78 verbs, one row each. Statuses: **implemented** (real native-store
+81 verbs, one row each. Statuses: **implemented** (real native-store
 transitions), **partial** (resolves and validates, then completes only the
 cases its backing covers), **unsupported** (typed `Unsupported` with the
 reason; exit code 1 through `GitError::exit_code`).
@@ -41,6 +41,8 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | verb | status | notes |
 | --- | --- | --- |
 | add | implemented | explicit paths, `-u`, `-A`, `-N`; worktree bytes hashed per file |
+| am | implemented | mbox apply plus commit; `--signoff`, `-k`, `--continue`/`--skip`/`--abort`/`--quit` over `AM_STATE`; dirty index refused; no `-3` |
+| apply | implemented | hunk match with offset search; `--index`/`--cached`/`--check`/`--stat`/`--numstat`/`--reverse`/`-p`; no binary patches or gitlinks |
 | annotate | implemented | alias of `blame` through the same first-parent LCS attribution |
 | archive | implemented | `--format=tar` (server default) and `--format=zip` (client-side transcode of the tar); `--prefix`, `-o`, path limits |
 | bisect | implemented | `start`/`bad`/`good`/`skip`/`reset`/`log`/`terms`/`run` over an ancestor paint-down; midpoint minimizes `|total-2·weight|` (~log2 steps); `--first-parent`, `--no-checkout`, `--term-*`; `BISECT_*` pseudo-heads under `cli/pseudo/`; `replay`/`visualize` are `Unsupported` |
@@ -66,6 +68,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | fetch | implemented | refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; local, `ssh://`, `git://`, smart-http v2→v0, dumb-http fetch fallback; `--lfs` pulls payloads for fetched tips under `LfsMode::Full` (mirror parity) |
 | fmt-merge-msg | implemented | subject from the `FETCH_HEAD` pseudo record; `-m`, `--log[=n]`/`--no-log`, `--stdin`/file |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
+| format-patch | implemented | mbox to stdout (or `-o` files); `-n`, `--numbered`/`--no-numbered`, `-U`; merge commits refused; raw UTF-8 subjects |
 | fsck | implemented | reachable refs, history, trees, blobs, and index rows; `--dangling`/`--unreachable` list `dangling <kind> <oid>` from the census minus the ref closure |
 | gc | implemented | prune unreachable (ref closure + detached `HEAD`/index/stash/`FETCH_HEAD`/sequencer/reflog pins, delta-base closure in store) then compact; `--aggressive` repeats compaction, `--auto` exits quietly with no work, `--dry-run` reports, `--prune=now` (default) prunes and `--prune=never` compacts only (other dates are `Unsupported`: no object ages, no grace period) |
 | get-tar-commit-id | implemented | stdin tar `comment` pax scan; honest miss when no id is stored |

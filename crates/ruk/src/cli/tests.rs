@@ -22,6 +22,7 @@ use super::verbs_bundle;
 use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_objects;
+use super::verbs_patch;
 use super::verbs_repo;
 use super::verbs_stage;
 use super::verbs_transport;
@@ -120,14 +121,16 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 78);
+    assert_eq!(VERBS.len(), 81);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 78);
+    assert_eq!(names.len(), 81);
     for name in [
         "add",
+        "am",
         "annotate",
+        "apply",
         "archive",
         "bisect",
         "blame",
@@ -152,6 +155,7 @@ fn verb_table_covers_advertised_names() {
         "fetch",
         "fmt-merge-msg",
         "for-each-ref",
+        "format-patch",
         "fsck",
         "gc",
         "get-tar-commit-id",
@@ -4379,5 +4383,218 @@ fn bisect_run_finds_first_bad() {
     assert!(text.contains(&planted), "got {text:?}");
     assert_eq!(bisect_head(&mut ctx), planted);
     run(verbs_bisect::bisect, &mut ctx, &["reset"]).expect("reset");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+// ---------------------------------------------------------------------------
+// email-patch lane: format-patch, apply, am
+// ---------------------------------------------------------------------------
+
+#[test]
+fn patch_round_trip_format_patch_am() {
+    let (root, env) = seeded_repo("patch-roundtrip", "f.txt", b"one\ntwo\nthree\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "gone.txt", b"bye\n", "add gone");
+    std::fs::write(root.join("f.txt"), b"one\nTWO\nthree\n").expect("write f");
+    std::fs::write(root.join("new.txt"), b"fresh\n").expect("write new");
+    run(verbs_stage::add, &mut ctx, &["f.txt", "new.txt"]).expect("add");
+    run(verbs_stage::rm, &mut ctx, &["gone.txt"]).expect("rm");
+    run(verbs_history::commit, &mut ctx, &["-m", "swap gone for new"]).expect("commit");
+    let tip = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("tip"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    let mbox = run(verbs_patch::format_patch, &mut ctx, &["HEAD~2..HEAD"]).expect("format-patch");
+    let text = String::from_utf8(mbox.clone()).expect("utf8");
+    assert!(
+        text.contains("Subject: [PATCH 1/2] add gone"),
+        "got {text:?}"
+    );
+    assert!(
+        text.contains("Subject: [PATCH 2/2] swap gone for new"),
+        "got {text:?}"
+    );
+    // `-o` writes one file per patch outside the repository.
+    let out_dir = root.parent().expect("parent").join("patch-out");
+    let out_flag = format!("--output-directory={}", out_dir.display());
+    run(
+        verbs_patch::format_patch,
+        &mut ctx,
+        &["HEAD~2..HEAD", out_flag.as_str()],
+    )
+    .expect("format-patch -o");
+    assert_eq!(
+        std::fs::read_dir(&out_dir).expect("read dir").count(),
+        2,
+        "got {:?}",
+        std::fs::read_dir(&out_dir).expect("readdir")
+    );
+    // Rewind to the base and replay the mbox onto it.
+    run(verbs_branch::reset, &mut ctx, &["--hard", "HEAD~2"]).expect("reset");
+    assert!(!root.join("new.txt").exists());
+    ctx.env.stdin = Some(mbox);
+    let applied = run(verbs_patch::am, &mut ctx, &[]).expect("am");
+    let applied_text = String::from_utf8(applied).expect("utf8");
+    assert!(
+        applied_text.contains("Applying: add gone"),
+        "got {applied_text:?}"
+    );
+    assert!(
+        applied_text.contains("Applying: swap gone for new"),
+        "got {applied_text:?}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"one\nTWO\nthree\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("new.txt")).expect("read"),
+        b"fresh\n"
+    );
+    assert!(!root.join("gone.txt").exists());
+    let log = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--oneline", "-n", "2"]).expect("log"),
+    )
+    .expect("utf8");
+    assert!(
+        log.contains("swap gone for new") && log.contains("add gone"),
+        "got {log:?}"
+    );
+    // The replayed history resolves to the original tip tree.
+    let diff = run(verbs_history::diff, &mut ctx, &[tip.as_str()]).expect("diff");
+    assert!(diff.is_empty(), "round-trip tree differs: {diff:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn apply_check_stat_reverse_index() {
+    let (root, env) = seeded_repo(
+        "patch-apply",
+        "f.txt",
+        b"line1\nline2\nline3\nline4\nline5\nline6\n",
+    );
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("old.txt"), b"bye\n").expect("write old");
+    run(verbs_stage::add, &mut ctx, &["old.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "add old"]).expect("commit");
+    // The first hunk claims offset 5 for content living at lines 4-6, so
+    // only the offset search can place it.
+    let patch = b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -5,3 +5,3 @@\n line4\n-line5\n+LINE5\n line6\ndiff --git a/created.txt b/created.txt\nnew file mode 100644\n--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\ndiff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-bye\n";
+    ctx.env.stdin = Some(patch.to_vec());
+    run(verbs_patch::apply, &mut ctx, &["--check"]).expect("check");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"line1\nline2\nline3\nline4\nline5\nline6\n"
+    );
+    assert!(!root.join("created.txt").exists());
+    let stat = String::from_utf8(run(verbs_patch::apply, &mut ctx, &["--stat"]).expect("stat"))
+        .expect("utf8");
+    assert!(
+        stat.contains("f.txt") && stat.contains("created.txt") && stat.contains("old.txt"),
+        "got {stat:?}"
+    );
+    let numstat = String::from_utf8(
+        run(verbs_patch::apply, &mut ctx, &["--numstat"]).expect("numstat"),
+    )
+    .expect("utf8");
+    assert!(numstat.contains("1\t1\tf.txt"), "got {numstat:?}");
+    run(verbs_patch::apply, &mut ctx, &[]).expect("apply");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"line1\nline2\nline3\nline4\nLINE5\nline6\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("created.txt")).expect("read"),
+        b"hello\nworld\n"
+    );
+    assert!(!root.join("old.txt").exists());
+    // A worktree-only apply leaves the index on the old blobs.
+    assert!(index_stages(&mut ctx, "created.txt").is_empty());
+    let rows =
+        super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+            .expect("scan");
+    let (_, _, entry) = rows
+        .iter()
+        .find(|(path, stage, _)| path.as_bytes() == b"f.txt" && stage.as_u8() == 0)
+        .expect("index f");
+    let (_, body) = super::tree::read_object_bytes(ctx.store().expect("store"), entry.oid())
+        .expect("blob");
+    assert_eq!(body, b"line1\nline2\nline3\nline4\nline5\nline6\n");
+    run(verbs_patch::apply, &mut ctx, &["--reverse"]).expect("reverse");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"line1\nline2\nline3\nline4\nline5\nline6\n"
+    );
+    assert!(!root.join("created.txt").exists());
+    assert_eq!(
+        std::fs::read(root.join("old.txt")).expect("read"),
+        b"bye\n"
+    );
+    run(verbs_patch::apply, &mut ctx, &["--index"]).expect("index");
+    assert_eq!(
+        std::fs::read(root.join("created.txt")).expect("read"),
+        b"hello\nworld\n"
+    );
+    assert!(!index_stages(&mut ctx, "created.txt").is_empty());
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn am_abort_restores_session() {
+    let (root, env) = seeded_repo("patch-am-abort", "f.txt", b"one\ntwo\nthree\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"one\nTWO\nthree\n", "change two");
+    let mbox = run(verbs_patch::format_patch, &mut ctx, &["HEAD~1..HEAD"]).expect("format-patch");
+    run(verbs_branch::reset, &mut ctx, &["--hard", "HEAD~1"]).expect("reset");
+    let base = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("base"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    // Corrupt one context line so the hunk no longer matches anything.
+    let bad_text = String::from_utf8(mbox.clone())
+        .expect("utf8")
+        .replace(" one\n", " oneX\n");
+    ctx.env.stdin = Some(bad_text.into_bytes());
+    let err = run(verbs_patch::am, &mut ctx, &[]).expect_err("am fails");
+    assert!(
+        err.to_string().contains("am --abort"),
+        "got {err:?}"
+    );
+    // The failure leaves HEAD, the worktree, and the session behind.
+    let head = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("head"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    assert_eq!(head, base);
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"one\ntwo\nthree\n"
+    );
+    assert!(
+        super::state::pseudo_read(ctx.store().expect("store"), "AM_STATE")
+            .expect("state")
+            .is_some()
+    );
+    run(verbs_patch::am, &mut ctx, &["--abort"]).expect("abort");
+    let head = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("head"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    assert_eq!(head, base);
+    assert!(
+        super::state::pseudo_read(ctx.store().expect("store"), "AM_STATE")
+            .expect("state")
+            .is_none()
+    );
+    // The good mbox still applies after the abort.
+    ctx.env.stdin = Some(mbox);
+    let out = run(verbs_patch::am, &mut ctx, &[]).expect("am");
+    assert!(
+        String::from_utf8(out).expect("utf8").contains("Applying: change two")
+    );
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"one\nTWO\nthree\n"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

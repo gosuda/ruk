@@ -1,4 +1,4 @@
-//! Verb table: the 78 advertised names and their handlers.
+//! Verb table: the 81 advertised names and their handlers.
 //!
 //! The shape mirrors `git.c:commands[]`: one row per verb with its oracle
 //! anchor, whether it needs a repository, a one-line summary, and the entry
@@ -16,6 +16,7 @@ use super::verbs_history;
 use super::verbs_meta;
 use super::verbs_misc;
 use super::verbs_objects;
+use super::verbs_patch;
 use super::verbs_repo;
 use super::verbs_stage;
 use super::verbs_transport;
@@ -36,7 +37,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 78 advertised verbs in alphabetical order.
+/// The 81 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -46,11 +47,25 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_stage::add,
     },
     Verb {
+        name: "am",
+        oracle: "git/builtin/am.c",
+        needs_repo: true,
+        summary: "Apply a series of patches from a mailbox",
+        run: verbs_patch::am,
+    },
+    Verb {
         name: "annotate",
         oracle: "git/builtin/blame.c",
         needs_repo: true,
         summary: "Annotate each line with its introducing commit",
         run: verbs_blame::blame,
+    },
+    Verb {
+        name: "apply",
+        oracle: "git/builtin/apply.c",
+        needs_repo: true,
+        summary: "Apply a patch to files and/or to the index",
+        run: verbs_patch::apply,
     },
     Verb {
         name: "archive",
@@ -219,6 +234,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Output information on each ref",
         run: verbs_branch::for_each_ref,
+    },
+    Verb {
+        name: "format-patch",
+        oracle: "git/builtin/log.c",
+        needs_repo: true,
+        summary: "Prepare patches for e-mail submission",
+        run: verbs_patch::format_patch,
     },
     Verb {
         name: "fsck",
