@@ -298,15 +298,11 @@ pub(crate) fn run_fetch(
             .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
         if !plan.force_all && !fetched.force {
             if let Some(old) = current_as_direct(&current) {
-                // An unresolvable ancestry walk (shallow boundary, missing
-                // parent) refuses this ref, never the whole fetch: the
-                // objects already published stay either way.
-                let fast_forward = match is_ancestor(dest, old, oid) {
-                    Ok(reaches) => reaches,
-                    Err(GitError::NotFound { .. }) => false,
-                    Err(err) => return Err(err),
-                };
-                if !fast_forward {
+                // Runs after phase one publishes, so the new tip's ancestry
+                // resolves from committed state. A lookup failure still
+                // aborts the fetch: only a proven non-ancestor refuses the
+                // ref, and the published objects stay either way.
+                if !is_ancestor(dest, old, oid)? {
                     lines.push(format!(
                         "! rejected {} (non-fast-forward)\n",
                         name.to_utf8().unwrap_or_default()
