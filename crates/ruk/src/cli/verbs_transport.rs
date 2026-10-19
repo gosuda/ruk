@@ -170,10 +170,13 @@ enum FetchSource {
     },
 }
 
-/// Expands refspecs, negotiates the pack, and updates refs atomically.
+/// Expands refspecs, negotiates the pack, and updates refs.
 ///
 /// `remote update` shares this path: it passes the remote's configured
-/// refspecs with its own prune flag.
+/// refspecs with its own prune flag. Objects publish first and ref updates
+/// second: the fast-forward check walks the new tip's ancestry, which needs
+/// the just-fetched objects in the store (checking against the old object
+/// set rejects every advance through newly-fetched commits).
 ///
 /// Oracle: `git/builtin/fetch.c`, `git/builtin/remote.c` (`update`).
 pub(crate) fn run_fetch(
@@ -263,6 +266,25 @@ pub(crate) fn run_fetch(
     if pairs.is_empty() && pruned.is_empty() {
         return write_fetch_head(ctx, &[]);
     }
+    // Wants cover every advertised tip, including refs this fetch may later
+    // refuse to move: like git, refused ref updates keep their objects.
+    let wants: Vec<Oid> = pairs.iter().map(|fetched| fetched.oid).collect();
+    let haves: Vec<Oid> = list_refs(dest)?
+        .into_iter()
+        .filter_map(|(_, target)| match target {
+            RefTarget::Direct(oid) => Some(oid),
+            RefTarget::Symbolic(_) => None,
+        })
+        .collect();
+    if !pairs.is_empty() {
+        // Phase one: publish the objects with no ref deltas. The
+        // fast-forward check below walks the new tips' ancestry, which only
+        // resolves once these objects are in the store.
+        fetch_objects_only(dest, &source, remote_label, wants, haves, plan.depth)?;
+    }
+    // Phase two: the fast-forward check runs against the committed object
+    // set, so advances through newly-fetched commits resolve. A refused
+    // update keeps the published objects; only the tracking ref stays.
     let mut updates = Vec::new();
     let mut tracking = Vec::new();
     let mut lines = Vec::new();
@@ -314,20 +336,20 @@ pub(crate) fn run_fetch(
             name.to_utf8().unwrap_or_default()
         ));
     }
-    let wants: Vec<Oid> = pairs.iter().map(|fetched| fetched.oid).collect();
-    let haves: Vec<Oid> = list_refs(dest)?
-        .into_iter()
-        .filter_map(|(_, target)| match target {
-            RefTarget::Direct(oid) => Some(oid),
-            RefTarget::Symbolic(_) => None,
-        })
-        .collect();
-    let prepared = ruk_core::refs::prepare_checked_transaction(
-        dest,
-        &ruk_core::refdata::RefTransaction::new(dest_kind, updates)
-            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?,
-    )?;
-    let mut ref_mutations = prepared.into_mutations();
+    let mut ref_mutations = if updates.is_empty() {
+        Vec::new()
+    } else {
+        ruk_core::refs::prepare_checked_transaction(
+            dest,
+            &ruk_core::refdata::RefTransaction::new(dest_kind, updates)
+                .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?,
+        )?
+        .into_mutations()
+    };
+    ref_mutations.extend(fetch::observation_mutations(
+        remote_label.as_bytes(),
+        &tracking,
+    ));
     for name in &pruned {
         ref_mutations.push(FactMutation {
             table: FactTable::RemoteObservations,
@@ -336,24 +358,41 @@ pub(crate) fn run_fetch(
             value: None,
         });
     }
-    if pairs.is_empty() {
-        // Prune-only: no objects move, so the ref deletes (plus their
-        // observation cleanup) publish without a pack round-trip.
+    if !ref_mutations.is_empty() {
+        // Ref updates only: the objects published in phase one stay even
+        // when every update below is a prune delete or a refusal left no
+        // updates at all.
         dest.publish(Vec::new(), &ref_mutations)?;
-        let mut out = lines.concat().into_bytes();
-        out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
-        return Ok(out);
     }
+    let mut out = lines.concat().into_bytes();
+    out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
+    Ok(out)
+}
+
+/// Publishes one fetch's objects with no ref deltas: phase one of
+/// [`run_fetch`], shared by every transport. Ref updates (and their
+/// fast-forward check) publish separately in phase two, once the new tips'
+/// ancestry resolves against the store.
+///
+/// Oracle: `git/builtin/fetch.c`.
+fn fetch_objects_only(
+    dest: &Store,
+    source: &FetchSource,
+    remote_label: &str,
+    wants: Vec<Oid>,
+    haves: Vec<Oid>,
+    depth: Option<u32>,
+) -> Result<(), GitError> {
     let request = FetchWireRequest {
         wants,
         haves,
         filter: None,
-        depth: plan.depth,
+        depth,
         shallow: Vec::new(),
         list_refs: false,
         ref_prefixes: Vec::new(),
     };
-    match &source {
+    match source {
         FetchSource::Local(src) => {
             local_fetch(
                 dest,
@@ -365,46 +404,23 @@ pub(crate) fn run_fetch(
                     filter: None,
                     depth: request.depth,
                 },
-                &tracking,
-                &ref_mutations,
+                &[],
+                &[],
                 IngestLimits::default(),
                 &Interrupt::none(),
             )?;
         }
         FetchSource::Net(endpoint) => {
-            fetch_pack_net(
-                dest,
-                endpoint,
-                remote_label,
-                &request,
-                &tracking,
-                &ref_mutations,
-            )?;
+            fetch_pack_net(dest, endpoint, remote_label, &request, &[], &[])?;
         }
         FetchSource::Http { .. } => {
-            fetch_pack_http(
-                dest,
-                &source,
-                remote_label,
-                &request,
-                &tracking,
-                &ref_mutations,
-            )?;
+            fetch_pack_http(dest, source, remote_label, &request, &[], &[])?;
         }
         FetchSource::DumbHttp { base } => {
-            fetch_pack_dumb(
-                dest,
-                base,
-                remote_label,
-                &request,
-                &tracking,
-                &ref_mutations,
-            )?;
+            fetch_pack_dumb(dest, base, remote_label, &request, &[], &[])?;
         }
     }
-    let mut out = lines.concat().into_bytes();
-    out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
-    Ok(out)
+    Ok(())
 }
 
 /// Runs the pack half of a network fetch over one upload-pack connection:
