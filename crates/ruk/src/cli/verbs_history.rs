@@ -28,18 +28,26 @@ use ruk_core::conflict::Signature;
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::index::{RepoPath, Stage};
+use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
+use ruk_core::merge::composed::MergeMode;
+use ruk_core::merge::composed::host::ComposedRequest;
+use ruk_core::merge::composed::route::{MergeOutcome, merge_file};
+use ruk_core::merge::syntax::grammar::{Cancel, GrammarRegistry, dispatch};
+use ruk_core::merge::syntax::registry_providers;
 use ruk_core::ops::{EditRequest, NewRequest, edit as ops_edit, new as ops_new};
+use ruk_core::store::ObjectKind as MergeLaneObjectKind;
+use ruk_core::store::Store as MergeLaneStore;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::Store;
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
 use super::state::{
-    IdentityRole, PendingCommit, commit_record, enqueue, head_oid, identity, is_ancestor,
-    list_refs, load_or_default, merge_base as state_merge_base, merged_rows, now_seconds,
-    read_path_rows, read_ref, resolve_rev, scan_index, sequencer_read, walk_history,
-    workspace_mutation,
+    IdentityRole, PendingCommit, SequencerState, commit_record, enqueue, head_oid, identity,
+    is_ancestor, list_refs, load_or_default, merge_base as state_merge_base, merged_rows,
+    now_seconds, pseudo_delete, pseudo_read, pseudo_read_oid, pseudo_write, read_path_rows,
+    read_ref, resolve_rev, scan_index, sequencer_delete, sequencer_read, sequencer_write,
+    walk_history, workspace_mutation,
 };
 use super::tree::{
     TreeMode, WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree,
@@ -606,7 +614,7 @@ fn extract_short_len(args: &[String]) -> Result<(Vec<String>, Option<usize>), Gi
 /// Resolves one revision with the spellings [`resolve_rev`] lacks: `@` for
 /// `HEAD` (plus `@~`/`@^` suffixes) and `<rev>:<path>` / `:<path>` blob
 /// paths. Reflog `@{...}` fails closed with a clear message.
-fn resolve_local(store: &Store, kind: HashKind, rev: &str) -> Result<Oid, GitError> {
+pub(crate) fn resolve_local(store: &Store, kind: HashKind, rev: &str) -> Result<Oid, GitError> {
     if rev == "@" {
         return head_oid(store);
     }
@@ -728,7 +736,7 @@ fn resolve_range_side(store: &Store, kind: HashKind, side: &str) -> Result<Oid, 
 /// honoring `A..B` (exclude `A`), `A...B` (exclude merge bases), `^A`, and
 /// `A^!` (include `A`, exclude its parents). Plain revs are included.
 /// `default` fills the tips when nothing was included.
-fn parse_log_revs(
+pub(crate) fn parse_log_revs(
     store: &Store,
     kind: HashKind,
     positionals: &[String],
@@ -1360,10 +1368,12 @@ fn graph_block(block: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Joins history lines with the fast-forward merge of one branch.
+/// Joins history lines with the fast-forward merge of one branch, or a real
+/// three-way merge through the lane when both sides moved.
 ///
-/// Oracle: `git/builtin/merge.c`. Only fast-forwards complete here; a merge
-/// that needs content resolution fails before touching any state.
+/// Oracle: `git/builtin/merge.c`. Fast-forwards keep their path; anything
+/// else plans `{base, ours, theirs}` over the syntax lane with the bounded
+/// text merge as the `Declined` fallback.
 pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -1411,15 +1421,18 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
-    if opts.is_set("abort") || opts.is_set("quit") {
-        return no_sequencer("merge", "abort");
+    if opts.is_set("abort") {
+        return merge_abort(ctx);
+    }
+    if opts.is_set("quit") {
+        return merge_quit(ctx);
     }
     if opts.is_set("continue") {
-        return no_sequencer("merge", "continue");
+        return merge_continue(ctx);
     }
-    if opts.is_set("no-ff") {
-        return Err(GitError::Unsupported {
-            command: "merge --no-ff needs the merge lane".to_owned(),
+    if opts.positionals.len() > 1 {
+        return Err(GitError::Invalid {
+            detail: "usage: merge <rev>".to_owned(),
         });
     }
     let rev = opts.positionals.first().ok_or_else(|| GitError::Invalid {
@@ -1428,8 +1441,9 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let tip = resolve_rev(store, kind, rev)?;
-    let _ = opts.single("message")?;
+    let message = opts.single("message")?;
     let quiet = opts.is_set("quiet");
+    let no_ff = opts.is_set("no-ff");
     let current = match head_oid(store) {
         Ok(tip) => tip,
         Err(_) => {
@@ -1440,16 +1454,247 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     if current == tip {
         return Ok(hush_merge(b"Already up to date.\n".to_vec(), quiet));
     }
-    if is_ancestor(store, current, tip)? {
+    let ff = is_ancestor(store, current, tip)?;
+    if opts.is_set("ff-only") && !ff {
+        return Err(GitError::Invalid {
+            detail: "Not possible to fast-forward, aborting.".to_owned(),
+        });
+    }
+    if ff && !no_ff {
         let out = merge_fast_forward(ctx, rev, current, tip)?;
         return Ok(hush_merge(out, quiet));
     }
     if is_ancestor(store, tip, current)? {
         return Ok(hush_merge(b"Already up to date.\n".to_vec(), quiet));
     }
-    Err(GitError::Unsupported {
-        command: "non-fast-forward merge needs the merge lane".to_owned(),
-    })
+    let out = merge_content(ctx, rev, current, tip, message)?;
+    Ok(hush_merge(out, quiet))
+}
+
+/// Merges one tip through the three-way lane: plans, guards, applies, and
+/// either commits the merge or leaves conflict state behind.
+fn merge_content(
+    ctx: &Ctx,
+    rev: &str,
+    current: Oid,
+    tip: Oid,
+    message: Option<String>,
+) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let rows = require_clean_index(store, kind)?;
+    let base = state_merge_base(store, current, tip).map_err(|err| match err {
+        GitError::NotFound { .. } => GitError::Invalid {
+            detail: "refusing to merge unrelated histories".to_owned(),
+        },
+        other => other,
+    })?;
+    let label = branch_label_of(ctx)?;
+    let default_message = format!("Merge {rev} into {label}");
+    // A `--no-ff` fast-forward has an empty ours side: take theirs wholesale.
+    if base == current {
+        snapshot_abort_index(ctx, "merge")?;
+        let ours_tree = commit_tree_oid(&commit_record(store, current)?)?;
+        let theirs_tree = commit_tree_oid(&commit_record(store, tip)?)?;
+        let staged = take_tree_state(ctx, ours_tree, theirs_tree)?;
+        let new_oid = lane_commit(
+            ctx,
+            build_index_tree(store, kind, &staged)?,
+            vec![current, tip],
+            message.unwrap_or(default_message),
+        )?;
+        pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
+        pseudo_delete(store, "abort-index/merge")?;
+        let subject = message_subject(ctx, &new_oid)?;
+        return commit_summary(
+            ctx,
+            Some(commit_tree_oid(&commit_record(store, current)?)?),
+            commit_tree_oid(&commit_record(store, new_oid)?)?,
+            &new_oid,
+            &label,
+            &subject,
+        );
+    }
+    let base_tree = commit_tree_oid(&commit_record(store, base)?)?;
+    let ours_tree = commit_tree_oid(&commit_record(store, current)?)?;
+    let theirs_tree = commit_tree_oid(&commit_record(store, tip)?)?;
+    let plan = plan_merge_trees(ctx, base_tree, ours_tree, theirs_tree, "HEAD", rev)?;
+    let ours_map = lane_tree_map(store, kind, ours_tree)?;
+    guard_lane_worktree(ctx, &rows, &ours_map, &plan, "merge")?;
+    snapshot_abort_index(ctx, "merge")?;
+    let staged = apply_merge_plan(ctx, &plan)?;
+    if !plan.conflicted.is_empty() {
+        let text = message.unwrap_or(default_message);
+        write_merge_state(ctx, &current, &tip, &text)?;
+        return Err(merge_conflict_error(&plan));
+    }
+    let new_oid = lane_commit(
+        ctx,
+        build_index_tree(store, kind, &staged)?,
+        vec![current, tip],
+        message.unwrap_or(default_message),
+    )?;
+    pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
+    pseudo_delete(store, "abort-index/merge")?;
+    let mut out = b"Merge made by the 'ort' strategy.\n".to_vec();
+    let changes = tree_file_changes(ctx, Some(ours_tree), commit_tree_oid(&commit_record(store, new_oid)?)?)?;
+    out.extend_from_slice(&render_file_stat(&changes));
+    Ok(out)
+}
+
+/// Stages one tree wholesale over another: paths the target holds resolve to
+/// `Take`, paths only the old tree holds resolve to `Deleted`.
+fn take_tree_state(
+    ctx: &Ctx,
+    ours_tree: Oid,
+    target_tree: Oid,
+) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let rows = require_clean_index(store, kind)?;
+    let target = lane_tree_map(store, kind, target_tree)?;
+    let ours_map = lane_tree_map(store, kind, ours_tree)?;
+    let mut keys = std::collections::BTreeSet::new();
+    keys.extend(target.keys().cloned());
+    keys.extend(ours_map.keys().cloned());
+    let mut resolutions = Vec::with_capacity(keys.len());
+    for path in keys {
+        match target.get(&path) {
+            Some((mode, oid)) => resolutions.push((
+                path,
+                PathResolution::Take {
+                    mode: mode.as_index_mode()?,
+                    oid: *oid,
+                },
+            )),
+            None => resolutions.push((path, PathResolution::Deleted)),
+        }
+    }
+    let plan = MergePlan {
+        resolutions,
+        auto_merged: Vec::new(),
+        conflicted: Vec::new(),
+    };
+    guard_lane_worktree(ctx, &rows, &ours_map, &plan, "merge")?;
+    apply_merge_plan(ctx, &plan)
+}
+
+/// Writes `ORIG_HEAD`, `MERGE_HEAD`, `MERGE_MSG`, and the sequencer record.
+fn write_merge_state(
+    ctx: &Ctx,
+    current: &Oid,
+    tip: &Oid,
+    message: &str,
+) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
+    pseudo_write(store, "MERGE_HEAD", tip.to_hex().into_bytes())?;
+    pseudo_write(store, "MERGE_MSG", message.as_bytes().to_vec())?;
+    sequencer_write(
+        store,
+        "merge",
+        &SequencerState {
+            verb: "merge".to_owned(),
+            head_hex: current.to_hex(),
+            target_hex: tip.to_hex(),
+            message: message.to_owned(),
+        },
+    )
+}
+
+/// Renders the oracle-style conflict report for a stopped merge.
+fn merge_conflict_error(plan: &MergePlan) -> GitError {
+    let mut detail = String::new();
+    for path in &plan.auto_merged {
+        detail.push_str(&format!("Auto-merging {path}\n"));
+    }
+    for path in &plan.conflicted {
+        detail.push_str(&format!("CONFLICT (content): Merge conflict in {path}\n"));
+    }
+    detail.push_str("Automatic merge failed; fix conflicts and then commit the result.");
+    GitError::Invalid { detail }
+}
+
+/// Concludes a conflicted merge from the resolved index: the shared body of
+/// `merge --continue` and an explicit `commit` over `MERGE_HEAD`.
+fn conclude_merge(ctx: &mut Ctx, message: Option<String>) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let rows = scan_index(store, kind)?;
+    if rows.iter().any(|(_, stage, _)| *stage != Stage::Zero) {
+        return Err(GitError::Invalid {
+            detail: "you have not concluded your merge (MERGE_HEAD exists)".to_owned(),
+        });
+    }
+    let merge_head = pseudo_read_oid(store, "MERGE_HEAD")?.ok_or_else(|| GitError::Corrupt {
+        detail: "MERGE_HEAD is missing".to_owned(),
+    })?;
+    let text = match message {
+        Some(text) => text,
+        None => pseudo_read(store, "MERGE_MSG")?
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|| format!("Merge {} into {}", merge_head.to_hex(), branch_label_of(ctx).unwrap_or_default())),
+    };
+    let head = head_oid(store)?;
+    let old_tree = commit_tree_oid(&commit_record(store, head)?)?;
+    let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
+    let new_oid = lane_commit(ctx, tree, vec![head, merge_head], text)?;
+    sequencer_delete(store, "merge")?;
+    pseudo_delete(store, "MERGE_HEAD")?;
+    pseudo_delete(store, "MERGE_MSG")?;
+    pseudo_delete(store, "abort-index/merge")?;
+    let label = branch_label_of(ctx)?;
+    let subject = message_subject(ctx, &new_oid)?;
+    commit_summary(ctx, Some(old_tree), tree, &new_oid, &label, &subject)
+}
+
+/// Reads the subject line of one commit message.
+fn message_subject(ctx: &Ctx, oid: &Oid) -> Result<String, GitError> {
+    let store = ctx.store()?;
+    let record = commit_record(store, *oid)?;
+    let message = record.message();
+    Ok(String::from_utf8_lossy(&message).lines().next().unwrap_or_default().to_owned())
+}
+
+/// Resumes a conflicted merge from the resolved index.
+fn merge_continue(ctx: &mut Ctx) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    if sequencer_read(store, "merge")?.is_none() {
+        return no_sequencer("merge", "continue");
+    }
+    conclude_merge(ctx, None)
+}
+
+/// Abandons a conflicted merge, restoring the pre-merge index and worktree.
+fn merge_abort(ctx: &mut Ctx) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let Some(seq) = sequencer_read(store, "merge")? else {
+        return no_sequencer("merge", "abort");
+    };
+    let orig = Oid::from_hex(&seq.head_hex).map_err(|_| GitError::Corrupt {
+        detail: "merge sequencer head does not decode".to_owned(),
+    })?;
+    if head_oid(store)? != orig {
+        super::verbs_branch::move_branch_to(ctx, orig)?;
+    }
+    restore_abort_index(ctx, "merge")?;
+    sequencer_delete(store, "merge")?;
+    pseudo_delete(store, "MERGE_HEAD")?;
+    pseudo_delete(store, "MERGE_MSG")?;
+    Ok(Vec::new())
+}
+
+/// Drops merge state while keeping the index and worktree as they are.
+fn merge_quit(ctx: &mut Ctx) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    if sequencer_read(store, "merge")?.is_none() {
+        return no_sequencer("merge", "quit");
+    }
+    sequencer_delete(store, "merge")?;
+    pseudo_delete(store, "MERGE_HEAD")?;
+    pseudo_delete(store, "MERGE_MSG")?;
+    pseudo_delete(store, "abort-index/merge")?;
+    Ok(Vec::new())
 }
 
 /// Drops merge output for `--quiet`, keeping the exit status as the signal.
@@ -1730,6 +1975,1183 @@ pub(crate) fn revert(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     Err(GitError::Unsupported {
         command: "revert needs the merge lane".to_owned(),
     })
+}
+
+// ===========================================================================
+// Merge lane: three-way content merge over the syntax/conflict machinery.
+// ===========================================================================
+//
+// One engine serves `merge`, `cherry-pick`, `revert`, and `rebase` replay:
+// the caller supplies `{base, ours, theirs}` trees plus worktree labels and
+// gets per-path resolutions. Each content path goes through
+// `merge::composed::route::merge_file` (syntax/plain/composed engines over
+// the pinned tree-sitter grammars) first; the bounded line-based diff3 below
+// runs only when the syntax stage answers `Declined` (or no language claims
+// the path). Conflicted paths land in the index at stages 1/2/3 with
+// `MERGE_HEAD`-family state left behind, the way the oracle leaves the
+// sequencer; clean merges produce a real commit with the right parents.
+//
+// The worktree sync here is deliberately scoped: only paths the operation
+// touches are written or removed, and removals cover only paths the
+// pre-operation index tracked. The generic `sync_worktree_to_index` walks
+// the whole worktree and would delete untracked files, so the lane never
+// calls it.
+
+/// How one path resolves in a three-way merge.
+enum PathResolution {
+    /// Keep the stored blob at stage zero.
+    Take { mode: FileMode, oid: Oid },
+    /// New content: publish the bytes as a blob, then stage zero.
+    NewBlob { mode: FileMode, bytes: Vec<u8> },
+    /// No rows for this path.
+    Deleted,
+    /// Stage 1/2/3 rows plus worktree bytes (`None` leaves the worktree).
+    Conflict {
+        stages: Vec<(Stage, IndexEntry)>,
+        worktree: Option<Vec<u8>>,
+    },
+}
+
+/// Per-path plan for one `{base, ours, theirs}` merge.
+struct MergePlan {
+    /// One entry per touched path, in index order.
+    resolutions: Vec<(Vec<u8>, PathResolution)>,
+    /// Display paths both sides changed (clean or not), for `Auto-merging`.
+    auto_merged: Vec<String>,
+    /// Display paths left conflicted.
+    conflicted: Vec<String>,
+}
+
+/// One pending pick for the sequencer verbs: everything `--continue` needs.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PickTodo {
+    /// Picked commit hex.
+    oid: String,
+    /// Base tree side hex (`""` for a root pick).
+    base: String,
+    /// Theirs tree side hex.
+    theirs: String,
+    /// Commit message to record when this pick lands.
+    message: String,
+    /// Theirs worktree label for conflict markers.
+    label: String,
+}
+
+/// Builds a stage row entry for one blob oid.
+fn lane_entry(mode: FileMode, oid: Oid) -> Result<IndexEntry, GitError> {
+    IndexEntry::new(oid, mode, None, IndexFlags::default())
+        .map_err(|err| GitError::from(CoreError::from(err)))
+}
+
+/// Reads one blob body through a small oid-keyed cache.
+fn lane_blob(
+    store: &MergeLaneStore,
+    cache: &mut HashMap<Oid, Vec<u8>>,
+    oid: Oid,
+) -> Result<Vec<u8>, GitError> {
+    if let Some(hit) = cache.get(&oid) {
+        return Ok(hit.clone());
+    }
+    let (kind, body) = read_object_bytes(store, oid)?;
+    if kind != MergeLaneObjectKind::Blob {
+        return Err(GitError::Invalid {
+            detail: format!("object {} is not a blob", oid.to_hex()),
+        });
+    }
+    cache.insert(oid, body.clone());
+    Ok(body)
+}
+
+/// Flattens one tree to a path map for the lane.
+fn lane_tree_map(
+    store: &MergeLaneStore,
+    kind: HashKind,
+    tree: Oid,
+) -> Result<BTreeMap<Vec<u8>, (TreeMode, Oid)>, GitError> {
+    let mut out = BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, tree)? {
+        out.insert(path, (mode, oid));
+    }
+    Ok(out)
+}
+
+/// Splits bytes into lines keeping terminators; empty input has no lines.
+/// (The existing `split_lines` strips terminators for display; the merge
+/// lane needs them to reproduce file bytes exactly.)
+fn lane_split_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            out.push(&bytes[start..index + 1]);
+            start = index + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push(&bytes[start..]);
+    }
+    out
+}
+
+/// One replaced block: `a[a_start..a_end]` becomes `b[b_start..b_end]`.
+#[derive(Clone, Copy, Debug)]
+struct Hunk {
+    a_start: usize,
+    a_end: usize,
+    b_start: usize,
+    b_end: usize,
+}
+
+/// Myers O(ND) hunks between two line slices, or `None` past the bounds.
+///
+/// The trace cap keeps memory under ~16 MiB; giving up means the caller
+/// reports a whole-file conflict, never a wrong merge.
+fn myers_hunks(a: &[&[u8]], b: &[&[u8]]) -> Option<Vec<Hunk>> {
+    // Every index below fits `i32`: inputs past 40,000 lines decline up
+    // front, so each `try_into` below is infallible in practice and `None`
+    // stays the honest answer for anything unexpected.
+    let total = a.len().checked_add(b.len())?;
+    if total == 0 {
+        return Some(Vec::new());
+    }
+    if total > 40_000 {
+        return None;
+    }
+    let n = i32::try_from(a.len()).ok()?;
+    let m = i32::try_from(b.len()).ok()?;
+    let max = i32::try_from(total).ok()?;
+    let width = usize::try_from(max)
+        .ok()?
+        .checked_mul(2)?
+        .checked_add(1)?;
+    let off = i64::from(max);
+    let cell = |v: &[i32], k: i64| -> Option<i32> {
+        let idx = usize::try_from(off + k).ok()?;
+        Some(*v.get(idx)?)
+    };
+    let mut v = vec![0i32; width];
+    let mut trace: Vec<Vec<i32>> = Vec::new();
+    let row_cap = (4_000_000 / width).max(64);
+    let mut done: Option<i32> = None;
+    for d in 0..=max {
+        let dd = i64::from(d);
+        for k in (-dd..=dd).step_by(2) {
+            let down = k == -dd
+                || (k != dd && cell(&v, k - 1).unwrap_or(0) < cell(&v, k + 1).unwrap_or(0));
+            let mut x = if down { cell(&v, k + 1)? } else { cell(&v, k - 1)? + 1 };
+            let mut y = x - i32::try_from(k).ok()?;
+            while x < n && y >= 0 && y < m && a[usize::try_from(x).ok()?] == b[usize::try_from(y).ok()?] {
+                x += 1;
+                y += 1;
+            }
+            let idx = usize::try_from(off + k).ok()?;
+            *v.get_mut(idx)? = x;
+            if x >= n && y >= m {
+                done = Some(d);
+                break;
+            }
+        }
+        trace.push(v.clone());
+        if trace.len() > row_cap {
+            return None;
+        }
+        if done.is_some() {
+            break;
+        }
+    }
+    let depth = done?;
+    if depth == 0 {
+        return Some(Vec::new());
+    }
+    enum Op {
+        Ins { pos: usize, b0: usize, b1: usize },
+        Del { a0: usize, a1: usize },
+    }
+    let depth_usize = usize::try_from(depth).ok()?;
+    let mut ops = Vec::new();
+    let (mut x, mut y) = (i64::from(n), i64::from(m));
+    for dd in (1..=depth_usize).rev() {
+        let prev = trace.get(dd - 1)?;
+        let k = x - y;
+        let di = i64::try_from(dd).ok()?;
+        let go_down =
+            k == -di || (k != di && cell(prev, k - 1).unwrap_or(0) < cell(prev, k + 1).unwrap_or(0));
+        let k_prev = if go_down { k + 1 } else { k - 1 };
+        let x_prev = i64::from(cell(prev, k_prev)?);
+        let y_prev = x_prev - k_prev;
+        while x > x_prev && y > y_prev {
+            x -= 1;
+            y -= 1;
+        }
+        if x == x_prev {
+            ops.push(Op::Ins {
+                pos: usize::try_from(x).ok()?,
+                b0: usize::try_from(y_prev).ok()?,
+                b1: usize::try_from(y).ok()?,
+            });
+        } else {
+            ops.push(Op::Del {
+                a0: usize::try_from(x_prev).ok()?,
+                a1: usize::try_from(x).ok()?,
+            });
+        }
+        x = x_prev;
+        y = y_prev;
+    }
+    ops.reverse();
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut bpos = 0;
+    for op in ops {
+        let next = match op {
+            Op::Ins { pos, b0, b1 } => {
+                bpos = b1;
+                Hunk {
+                    a_start: pos,
+                    a_end: pos,
+                    b_start: b0,
+                    b_end: b1,
+                }
+            }
+            Op::Del { a0, a1 } => Hunk {
+                a_start: a0,
+                a_end: a1,
+                b_start: bpos,
+                b_end: bpos,
+            },
+        };
+        if let Some(last) = hunks.last_mut() {
+            if last.a_end == next.a_start && last.b_end == next.b_start {
+                last.a_end = next.a_end;
+                last.b_end = next.b_end;
+                continue;
+            }
+        }
+        hunks.push(next);
+    }
+    Some(hunks)
+}
+
+/// Splices one side's hunks over a base range into borrowed lines.
+fn splice_lines<'a>(
+    base: &'a [&[u8]],
+    hunks: &[Hunk],
+    start: usize,
+    end: usize,
+    side: &'a [&[u8]],
+) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    for hunk in hunks {
+        if hunk.a_start < start || hunk.a_end > end {
+            continue;
+        }
+        out.extend_from_slice(&base[pos..hunk.a_start]);
+        out.extend_from_slice(&side[hunk.b_start..hunk.b_end]);
+        pos = hunk.a_end;
+    }
+    out.extend_from_slice(&base[pos..end]);
+    out
+}
+
+/// Appends lines, adding a missing trailing newline per line.
+fn push_lines(out: &mut Vec<u8>, lines: &[&[u8]]) {
+    for line in lines {
+        out.extend_from_slice(line);
+        if !line.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+    }
+}
+
+/// Appends one `<<<<<<<`/`=======`/`>>>>>>>` block.
+fn push_conflict(
+    out: &mut Vec<u8>,
+    ours_label: &str,
+    ours: &[&[u8]],
+    theirs_label: &str,
+    theirs: &[&[u8]],
+) {
+    out.extend_from_slice(format!("<<<<<<< {ours_label}\n").as_bytes());
+    push_lines(out, ours);
+    out.extend_from_slice(b"=======\n");
+    push_lines(out, theirs);
+    out.extend_from_slice(format!(">>>>>>> {theirs_label}\n").as_bytes());
+}
+
+/// Bounded line-based three-way merge: the lane's fallback when the syntax
+/// stage declines a path. Returns the merged bytes plus whether any hunk
+/// conflicted, or `None` when the input is past the bounds (the caller then
+/// reports a whole-file conflict).
+fn diff3_merge(
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    ours_label: &str,
+    theirs_label: &str,
+) -> Option<(Vec<u8>, bool)> {
+    const MAX_TEXT_TRIPLET: usize = 8 << 20;
+    if base.len() + ours.len() + theirs.len() > MAX_TEXT_TRIPLET {
+        return None;
+    }
+    let a = lane_split_lines(base);
+    let o = lane_split_lines(ours);
+    let t = lane_split_lines(theirs);
+    let hunks_o = myers_hunks(&a, &o)?;
+    let hunks_t = myers_hunks(&a, &t)?;
+    let mut bounds: Vec<(usize, usize)> = hunks_o
+        .iter()
+        .map(|h| (h.a_start, h.a_end))
+        .chain(hunks_t.iter().map(|h| (h.a_start, h.a_end)))
+        .collect();
+    bounds.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(bounds.len());
+    for bound in bounds {
+        if let Some(last) = merged.last_mut() {
+            if bound.0 <= last.1 {
+                last.1 = last.1.max(bound.1);
+                continue;
+            }
+        }
+        merged.push(bound);
+    }
+    let mut out = Vec::new();
+    let mut conflicted = false;
+    let mut pos = 0;
+    for (start, end) in merged {
+        for line in &a[pos..start] {
+            out.extend_from_slice(line);
+        }
+        let in_o: Vec<&Hunk> = hunks_o
+            .iter()
+            .filter(|h| h.a_start >= start && h.a_end <= end)
+            .collect();
+        let in_t: Vec<&Hunk> = hunks_t
+            .iter()
+            .filter(|h| h.a_start >= start && h.a_end <= end)
+            .collect();
+        match (in_o.is_empty(), in_t.is_empty()) {
+            (false, false) => {
+                let ours_lines = splice_lines(&a, &hunks_o, start, end, &o);
+                let theirs_lines = splice_lines(&a, &hunks_t, start, end, &t);
+                if ours_lines == theirs_lines {
+                    push_lines(&mut out, &ours_lines);
+                } else {
+                    conflicted = true;
+                    push_conflict(&mut out, ours_label, &ours_lines, theirs_label, &theirs_lines);
+                }
+            }
+            (true, false) => {
+                push_lines(&mut out, &splice_lines(&a, &hunks_t, start, end, &t));
+            }
+            (false, true) => {
+                push_lines(&mut out, &splice_lines(&a, &hunks_o, start, end, &o));
+            }
+            (true, true) => {}
+        }
+        pos = end;
+    }
+    for line in &a[pos..] {
+        out.extend_from_slice(line);
+    }
+    Some((out, conflicted))
+}
+
+/// One path's three side views: tree mode plus blob/commit oid each.
+#[derive(Clone, Copy, Debug)]
+struct PathSides {
+    base: Option<(TreeMode, Oid)>,
+    ours: Option<(TreeMode, Oid)>,
+    theirs: Option<(TreeMode, Oid)>,
+}
+
+/// The per-operation merge scope: blob cache, syntax registry, labels.
+struct LaneScope<'a> {
+    blobs: HashMap<Oid, Vec<u8>>,
+    registry: GrammarRegistry<'a>,
+    cancel: Cancel,
+    ours_label: String,
+    theirs_label: String,
+}
+
+impl LaneScope<'_> {
+    /// Stages for whichever sides are present, in stage order.
+    fn stages(&self, sides: &PathSides) -> Result<Vec<(Stage, IndexEntry)>, GitError> {
+        let mut out = Vec::new();
+        for (side, stage) in [
+            (sides.base, Stage::Base),
+            (sides.ours, Stage::Ours),
+            (sides.theirs, Stage::Theirs),
+        ] {
+            if let Some((mode, oid)) = side {
+                out.push((stage, lane_entry(mode.as_index_mode()?, oid)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// File modes for all three present sides.
+    fn modes(&self, sides: &PathSides) -> Result<(FileMode, FileMode, FileMode), GitError> {
+        let one = |side: Option<(TreeMode, Oid)>| -> Result<FileMode, GitError> {
+            side.map(|(mode, _)| mode.as_index_mode())
+                .transpose()
+                .map(|mode| mode.unwrap_or(FileMode::Regular))
+        };
+        Ok((one(sides.base)?, one(sides.ours)?, one(sides.theirs)?))
+    }
+}
+
+/// Resolves one path both sides changed, syntax lane first and the bounded
+/// text merge only on `Declined`.
+fn resolve_content(
+    ctx: &Ctx,
+    scope: &mut LaneScope<'_>,
+    path: &[u8],
+    sides: &PathSides,
+) -> Result<PathResolution, GitError> {
+    let store = ctx.store()?;
+    // A side can be absent on genuinely conflicting shapes (add/add has no
+    // base, modify/delete misses a side); those degrade to conflict stages
+    // instead of failing the whole operation.
+    let (Some(base), Some(ours), Some(theirs)) = (sides.base, sides.ours, sides.theirs) else {
+        let survivor = sides.ours.or(sides.theirs);
+        let worktree = survivor
+            .map(|(_, oid)| lane_blob(store, &mut scope.blobs, oid))
+            .transpose()?;
+        return Ok(PathResolution::Conflict {
+            stages: scope.stages(sides)?,
+            worktree,
+        });
+    };
+    let (base_mode, ours_mode, theirs_mode) = scope.modes(sides)?;
+    let mode = if ours_mode != base_mode {
+        ours_mode
+    } else {
+        theirs_mode
+    };
+    if base_mode == FileMode::Gitlink
+        || ours_mode == FileMode::Gitlink
+        || theirs_mode == FileMode::Gitlink
+    {
+        return Ok(PathResolution::Conflict {
+            stages: scope.stages(sides)?,
+            worktree: None,
+        });
+    }
+    let base_bytes = lane_blob(store, &mut scope.blobs, base.1)?;
+    let ours_bytes = lane_blob(store, &mut scope.blobs, ours.1)?;
+    let theirs_bytes = lane_blob(store, &mut scope.blobs, theirs.1)?;
+    if base_bytes.contains(&0) || ours_bytes.contains(&0) || theirs_bytes.contains(&0) {
+        return Ok(PathResolution::Conflict {
+            stages: scope.stages(sides)?,
+            worktree: Some(ours_bytes),
+        });
+    }
+    let first_line = base_bytes.split(|byte| *byte == b'\n').next();
+    let language =
+        dispatch(path, first_line, None).map_err(|err| GitError::from(CoreError::from(err)))?;
+    if let Some(language) = language {
+        let request = ComposedRequest {
+            path: ruk_core::ByteString::from(path.to_vec()),
+            language,
+            base: &base_bytes,
+            ours: &ours_bytes,
+            theirs: &theirs_bytes,
+            mode: MergeMode::Syntax,
+        };
+        match merge_file(request, &scope.registry, &scope.cancel) {
+            Ok(MergeOutcome::Merged { bytes, .. }) => {
+                return Ok(PathResolution::NewBlob { mode, bytes });
+            }
+            Ok(MergeOutcome::Declined { .. }) => {}
+            Err(ruk_core::merge::syntax::grammar::SyntaxError::Cancelled(detail)) => {
+                return Err(GitError::Cancelled { detail });
+            }
+            Err(_) => {}
+        }
+    }
+    match diff3_merge(
+        &base_bytes,
+        &ours_bytes,
+        &theirs_bytes,
+        &scope.ours_label,
+        &scope.theirs_label,
+    ) {
+        Some((bytes, false)) => Ok(PathResolution::NewBlob { mode, bytes }),
+        Some((bytes, true)) => Ok(PathResolution::Conflict {
+            stages: scope.stages(sides)?,
+            worktree: Some(bytes),
+        }),
+        None => {
+            let mut markers = Vec::new();
+            push_conflict(
+                &mut markers,
+                &scope.ours_label,
+                &lane_split_lines(&ours_bytes),
+                &scope.theirs_label,
+                &lane_split_lines(&theirs_bytes),
+            );
+            Ok(PathResolution::Conflict {
+                stages: scope.stages(sides)?,
+                worktree: Some(markers),
+            })
+        }
+    }
+}
+
+/// One union path plus its merge context for resolution.
+struct PathInput<'a> {
+    path: &'a [u8],
+    /// The path is a directory prefix of another union path: any file side
+    /// here is a file/directory conflict.
+    dir_clash: bool,
+    sides: PathSides,
+}
+
+/// Converts one tree side to its index file mode.
+fn side_file_mode(side: (TreeMode, Oid)) -> Result<(FileMode, Oid), GitError> {
+    Ok((side.0.as_index_mode()?, side.1))
+}
+
+/// Resolves one union path from its three side views.
+fn resolve_path(
+    ctx: &Ctx,
+    scope: &mut LaneScope<'_>,
+    input: &PathInput,
+    auto_merged: &mut Vec<String>,
+) -> Result<PathResolution, GitError> {
+    let store = ctx.store()?;
+    let shown = String::from_utf8_lossy(input.path).into_owned();
+    let sides = &input.sides;
+    // A file in any side colliding with a directory prefix elsewhere in the
+    // union is a file/directory conflict; every present side (including the
+    // base) keeps its stage, and the worktree keeps whichever side is a file.
+    if input.dir_clash {
+        let survivor = sides.ours.or(sides.theirs);
+        let worktree = survivor
+            .map(|(_, oid)| lane_blob(store, &mut scope.blobs, oid))
+            .transpose()?;
+        return Ok(PathResolution::Conflict {
+            stages: scope.stages(sides)?,
+            worktree,
+        });
+    }
+    match (sides.base, sides.ours, sides.theirs) {
+        (None, None, None) => Ok(PathResolution::Deleted),
+        (None, Some(side), None) | (None, None, Some(side)) => {
+            let (mode, oid) = side_file_mode(side)?;
+            Ok(PathResolution::Take { mode, oid })
+        }
+        (None, Some(one), Some(other)) => {
+            auto_merged.push(shown);
+            if one == other {
+                let (mode, oid) = side_file_mode(one)?;
+                return Ok(PathResolution::Take { mode, oid });
+            }
+            // Add/add with different bodies always conflicts: no base exists
+            // to reconcile the two additions against.
+            let ours_bytes = lane_blob(store, &mut scope.blobs, one.1)?;
+            let theirs_bytes = lane_blob(store, &mut scope.blobs, other.1)?;
+            let worktree = if ours_bytes.contains(&0) || theirs_bytes.contains(&0) {
+                ours_bytes
+            } else {
+                let mut markers = Vec::new();
+                push_conflict(
+                    &mut markers,
+                    &scope.ours_label,
+                    &lane_split_lines(&ours_bytes),
+                    &scope.theirs_label,
+                    &lane_split_lines(&theirs_bytes),
+                );
+                markers
+            };
+            Ok(PathResolution::Conflict {
+                stages: scope.stages(sides)?,
+                worktree: Some(worktree),
+            })
+        }
+        (Some(_), None, None) => Ok(PathResolution::Deleted),
+        (Some(_), Some(ours_side), None) => {
+            auto_merged.push(shown);
+            let (_, oid) = side_file_mode(ours_side)?;
+            Ok(PathResolution::Conflict {
+                stages: scope.stages(sides)?,
+                worktree: Some(lane_blob(store, &mut scope.blobs, oid)?),
+            })
+        }
+        (Some(_), None, Some(theirs_side)) => {
+            auto_merged.push(shown);
+            let (_, oid) = side_file_mode(theirs_side)?;
+            Ok(PathResolution::Conflict {
+                stages: scope.stages(sides)?,
+                worktree: Some(lane_blob(store, &mut scope.blobs, oid)?),
+            })
+        }
+        (Some(base_side), Some(ours_side), Some(theirs_side)) => {
+            if ours_side == base_side {
+                let (mode, oid) = side_file_mode(theirs_side)?;
+                return Ok(PathResolution::Take { mode, oid });
+            }
+            if theirs_side == base_side {
+                let (mode, oid) = side_file_mode(ours_side)?;
+                return Ok(PathResolution::Take { mode, oid });
+            }
+            if ours_side == theirs_side {
+                auto_merged.push(shown);
+                let (mode, oid) = side_file_mode(ours_side)?;
+                return Ok(PathResolution::Take { mode, oid });
+            }
+            auto_merged.push(shown);
+            resolve_content(ctx, scope, input.path, sides)
+        }
+    }
+}
+
+/// Plans one `{base, ours, theirs}` tree merge over every union path.
+fn plan_merge_trees(
+    ctx: &Ctx,
+    base_tree: Oid,
+    ours_tree: Oid,
+    theirs_tree: Oid,
+    ours_label: &str,
+    theirs_label: &str,
+) -> Result<MergePlan, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let base_map = lane_tree_map(store, kind, base_tree)?;
+    let ours_map = lane_tree_map(store, kind, ours_tree)?;
+    let theirs_map = lane_tree_map(store, kind, theirs_tree)?;
+    let providers = registry_providers()
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    let mut registry = GrammarRegistry::new();
+    for provider in &providers {
+        registry.insert(provider);
+    }
+    let mut scope = LaneScope {
+        blobs: HashMap::new(),
+        registry,
+        cancel: Cancel::never(),
+        ours_label: ours_label.to_owned(),
+        theirs_label: theirs_label.to_owned(),
+    };
+    let mut keys = std::collections::BTreeSet::new();
+    for map in [&base_map, &ours_map, &theirs_map] {
+        keys.extend(map.keys().cloned());
+    }
+    let mut dir_prefixes = std::collections::HashSet::new();
+    for key in &keys {
+        for (index, byte) in key.iter().enumerate() {
+            if *byte == b'/' {
+                dir_prefixes.insert(key[..index].to_vec());
+            }
+        }
+    }
+    let mut plan = MergePlan {
+        resolutions: Vec::new(),
+        auto_merged: Vec::new(),
+        conflicted: Vec::new(),
+    };
+    for path in keys {
+        let input = PathInput {
+            path: &path,
+            dir_clash: dir_prefixes.contains(&path),
+            sides: PathSides {
+                base: base_map.get(&path).copied(),
+                ours: ours_map.get(&path).copied(),
+                theirs: theirs_map.get(&path).copied(),
+            },
+        };
+        let resolution = resolve_path(ctx, &mut scope, &input, &mut plan.auto_merged)?;
+        if matches!(resolution, PathResolution::Conflict { .. }) {
+            plan.conflicted
+                .push(String::from_utf8_lossy(&path).into_owned());
+        }
+        plan.resolutions.push((path, resolution));
+    }
+    Ok(plan)
+}
+
+/// One scoped worktree write: only merge-touched paths are ever addressed.
+enum LaneWrite {
+    /// Materialize a stored blob.
+    Blob { mode: FileMode, oid: Oid },
+    /// Write marker or survivor bytes as a regular file.
+    Bytes(Vec<u8>),
+    /// Remove a tracked path the merge dropped.
+    Remove,
+}
+
+/// Applies one plan: publishes new blobs, swaps index rows per touched path,
+/// and syncs exactly those worktree paths. Returns the merged stage-zero
+/// rows for tree building.
+fn apply_merge_plan(
+    ctx: &Ctx,
+    plan: &MergePlan,
+) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let mut prepared = Vec::new();
+    let mut staged: Vec<(Vec<u8>, IndexEntry)> = Vec::new();
+    let mut mutations = Vec::new();
+    let mut writes: Vec<(Vec<u8>, LaneWrite)> = Vec::new();
+    for (path, resolution) in &plan.resolutions {
+        let repo_path = RepoPath::new(path.clone())
+            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        let before = read_path_rows(store, kind, &repo_path)?;
+        let after: Vec<(Stage, IndexEntry)> = match resolution {
+            PathResolution::Take { mode, oid } => {
+                let entry = lane_entry(*mode, *oid)?;
+                staged.push((path.clone(), entry.clone()));
+                writes.push((
+                    path.clone(),
+                    LaneWrite::Blob {
+                        mode: *mode,
+                        oid: *oid,
+                    },
+                ));
+                vec![(Stage::Zero, entry)]
+            }
+            PathResolution::NewBlob { mode, bytes } => {
+                let entry = IndexEntry::for_blob(kind, *mode, bytes, None)
+                    .map_err(|err| GitError::from(CoreError::from(err)))?;
+                let len = u64::try_from(bytes.len()).map_err(|_| GitError::Limit {
+                    detail: "merged blob exceeds the length range".to_owned(),
+                })?;
+                prepared.push(
+                    store
+                        .prepare(
+                            MergeLaneObjectKind::Blob,
+                            len,
+                            std::io::Cursor::new(bytes.clone()),
+                            None,
+                        )
+                        .map_err(GitError::from)?,
+                );
+                staged.push((path.clone(), entry.clone()));
+                writes.push((
+                    path.clone(),
+                    LaneWrite::Blob {
+                        mode: *mode,
+                        oid: entry.oid(),
+                    },
+                ));
+                vec![(Stage::Zero, entry)]
+            }
+            PathResolution::Deleted => {
+                writes.push((path.clone(), LaneWrite::Remove));
+                Vec::new()
+            }
+            PathResolution::Conflict { stages, worktree } => {
+                if let Some(bytes) = worktree {
+                    writes.push((path.clone(), LaneWrite::Bytes(bytes.clone())));
+                }
+                stages.clone()
+            }
+        };
+        mutations.extend(super::state::path_row_mutations(
+            &repo_path,
+            &before,
+            &after,
+        )?);
+    }
+    let (workspace, raw) = load_or_default(store)?;
+    let next = workspace
+        .mutate_index(workspace.stamp)
+        .map_err(|err| GitError::from(CoreError::from(err)))?;
+    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    store
+        .publish(prepared, &mutations)
+        .map_err(GitError::from)?;
+    sync_lane_worktree(ctx, &writes)?;
+    Ok(staged)
+}
+
+/// Writes exactly the addressed worktree paths: files, links, removals.
+/// Nothing outside `writes` is listed, read, or touched.
+fn sync_lane_worktree(ctx: &Ctx, writes: &[(Vec<u8>, LaneWrite)]) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    for (path, write) in writes {
+        let full = super::tree::join_base(&ctx.file_base, path)?;
+        match write {
+            LaneWrite::Remove => {
+                if full.is_symlink() || full.is_file() {
+                    std::fs::remove_file(&full).map_err(|err| GitError::Io {
+                        detail: format!("removing {}: {err}", full.display()),
+                    })?;
+                }
+                prune_empty_parents(&full, &ctx.file_base);
+            }
+            LaneWrite::Blob { mode, oid } => {
+                if *mode == FileMode::Gitlink {
+                    continue;
+                }
+                if *mode == FileMode::Symlink {
+                    write_lane_link(store, *oid, &full)?;
+                    continue;
+                }
+                let (_, body) = read_object_bytes(store, *oid)?;
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
+                        detail: format!("creating {}: {err}", parent.display()),
+                    })?;
+                }
+                if full.is_symlink() {
+                    std::fs::remove_file(&full).map_err(|err| GitError::Io {
+                        detail: format!("removing {}: {err}", full.display()),
+                    })?;
+                }
+                std::fs::write(&full, body).map_err(|err| GitError::Io {
+                    detail: format!("writing {}: {err}", full.display()),
+                })?;
+                #[cfg(unix)]
+                if *mode == FileMode::Executable {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|err| GitError::Io {
+                            detail: format!("chmod {}: {err}", full.display()),
+                        })?;
+                }
+            }
+            LaneWrite::Bytes(bytes) => {
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
+                        detail: format!("creating {}: {err}", parent.display()),
+                    })?;
+                }
+                if full.is_symlink() {
+                    std::fs::remove_file(&full).map_err(|err| GitError::Io {
+                        detail: format!("removing {}: {err}", full.display()),
+                    })?;
+                }
+                std::fs::write(&full, bytes).map_err(|err| GitError::Io {
+                    detail: format!("writing {}: {err}", full.display()),
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Removes newly-empty parent directories up to (not including) the base.
+fn prune_empty_parents(full: &std::path::Path, base: &std::path::Path) {
+    let mut dir = full.parent();
+    while let Some(candidate) = dir {
+        if candidate == base {
+            break;
+        }
+        if std::fs::remove_dir(candidate).is_err() {
+            break;
+        }
+        dir = candidate.parent();
+    }
+}
+
+/// Materializes one symlink worktree path from its target blob.
+fn write_lane_link(store: &MergeLaneStore, oid: Oid, full: &std::path::Path) -> Result<(), GitError> {
+    let (_, body) = read_object_bytes(store, oid)?;
+    #[cfg(unix)]
+    {
+        let text = std::str::from_utf8(&body).map_err(|_| GitError::Invalid {
+            detail: "symlink target is not valid UTF-8".to_owned(),
+        })?;
+        if full.is_symlink() || full.exists() {
+            std::fs::remove_file(full).map_err(|err| GitError::Io {
+                detail: format!("removing {}: {err}", full.display()),
+            })?;
+        }
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
+                detail: format!("creating {}: {err}", parent.display()),
+            })?;
+        }
+        std::os::unix::fs::symlink(text, full).map_err(|err| GitError::Io {
+            detail: format!("linking {}: {err}", full.display()),
+        })?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (text_placeholder(&body), full);
+        Err(GitError::Unsupported {
+            command: "checkout of symlinks on this platform".to_owned(),
+        })
+    }
+}
+
+#[cfg(not(unix))]
+fn text_placeholder(body: &[u8]) -> &[u8] {
+    body
+}
+
+/// Refuses to start a merge-like operation over unmerged index rows.
+fn require_clean_index(
+    store: &MergeLaneStore,
+    kind: HashKind,
+) -> Result<Vec<(RepoPath, Stage, IndexEntry)>, GitError> {
+    let rows = scan_index(store, kind)?;
+    if rows.iter().any(|(_, stage, _)| *stage != Stage::Zero) {
+        return Err(GitError::Invalid {
+            detail: "unmerged paths must be resolved first".to_owned(),
+        });
+    }
+    Ok(rows)
+}
+
+/// Refuses when the worktree disagrees with the index on a path the plan
+/// rewrites, so a merge never silently discards local changes. Paths the
+/// plan leaves alone are never inspected.
+fn guard_lane_worktree(
+    ctx: &Ctx,
+    rows: &[(RepoPath, Stage, IndexEntry)],
+    ours_map: &BTreeMap<Vec<u8>, (TreeMode, Oid)>,
+    plan: &MergePlan,
+    verb: &str,
+) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    let mut stage_zero: HashMap<&[u8], &IndexEntry> = HashMap::new();
+    for (path, stage, entry) in rows {
+        if *stage == Stage::Zero {
+            stage_zero.insert(path.as_bytes(), entry);
+        }
+    }
+    let mut cache: HashMap<Oid, Vec<u8>> = HashMap::new();
+    let mut blocked: Vec<String> = Vec::new();
+    for (path, resolution) in &plan.resolutions {
+        let touched = match resolution {
+            PathResolution::Take { mode, oid } => ours_map.get(path).is_none_or(|(head_mode, head_oid)| {
+                head_mode.as_index_mode().ok() != Some(*mode) || head_oid != oid
+            }),
+            PathResolution::NewBlob { mode, bytes } => match ours_map.get(path) {
+                None => true,
+                Some((head_mode, head_oid)) => {
+                    head_mode.as_index_mode().ok() != Some(*mode)
+                        || lane_blob(store, &mut cache, *head_oid)
+                            .ok()
+                            .is_none_or(|head_bytes| head_bytes != *bytes)
+                }
+            },
+            PathResolution::Deleted => ours_map.contains_key(path),
+            PathResolution::Conflict { .. } => true,
+        };
+        if !touched {
+            continue;
+        }
+        let dirty = match stage_zero.get(path.as_slice()) {
+            Some(entry) if entry.mode() == FileMode::Gitlink => false,
+            Some(entry) => {
+                let full = super::tree::join_base(&ctx.file_base, path)?;
+                if entry.mode() == FileMode::Symlink {
+                    let target = std::fs::read_link(&full).ok().map(|link| {
+                        link.as_os_str().as_encoded_bytes().to_vec()
+                    });
+                    let wanted = lane_blob(store, &mut cache, entry.oid()).ok();
+                    target != wanted
+                } else {
+                    let body = std::fs::read(&full).ok();
+                    let wanted = lane_blob(store, &mut cache, entry.oid()).ok();
+                    body != wanted
+                }
+            }
+            None => {
+                let full = super::tree::join_base(&ctx.file_base, path).ok();
+                full.is_some_and(|path| path.is_symlink() || path.is_file())
+            }
+        };
+        if dirty {
+            blocked.push(String::from_utf8_lossy(path).into_owned());
+        }
+    }
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    blocked.sort();
+    let mut detail = format!(
+        "error: Your local changes to the following files would be overwritten by {verb}:\n"
+    );
+    for path in &blocked {
+        detail.push_str(&format!("\t{path}\n"));
+    }
+    detail.push_str("Please commit your changes or stash them before you merge.");
+    Err(GitError::Invalid { detail })
+}
+
+/// Records one commit on the current branch (or detached `HEAD`) and moves
+/// it forward, returning the new tip.
+fn lane_commit(ctx: &Ctx, tree: Oid, parents: Vec<Oid>, message: String) -> Result<Oid, GitError> {
+    let store = ctx.store()?;
+    let author = identity(ctx, IdentityRole::Author)?;
+    let committer = identity(ctx, IdentityRole::Committer)?;
+    let request = NewRequest {
+        tree,
+        parents: parents.into_iter().map(|oid| Head::Git { oid }).collect(),
+        author,
+        committer,
+        message: ruk_core::ByteString::from(message.as_str()),
+        change_id: None,
+        predecessor: None,
+        provenance: None,
+    };
+    let result = ops_new(store, request).map_err(GitError::from)?;
+    let new_oid = result
+        .oid
+        .or_else(|| result.head.as_git().copied())
+        .ok_or_else(|| GitError::Invalid {
+            detail: "new commit has no git identity".to_owned(),
+        })?;
+    advance_head_to(ctx, new_oid)?;
+    Ok(new_oid)
+}
+
+/// Snapshots the merged index rows for a future `--abort` restore.
+fn snapshot_abort_index(ctx: &Ctx, verb: &str) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let rows = scan_index(store, kind)?;
+    let mut serial: Vec<(Vec<u8>, u8, Vec<u8>)> = Vec::with_capacity(rows.len());
+    for (path, stage, entry) in &rows {
+        let bytes = sonic_rs::to_vec(entry).map_err(|err| GitError::Io {
+            detail: format!("abort snapshot encode: {err}"),
+        })?;
+        serial.push((path.as_bytes().to_vec(), stage.as_u8(), bytes));
+    }
+    let value = sonic_rs::to_vec(&serial).map_err(|err| GitError::Io {
+        detail: format!("abort snapshot encode: {err}"),
+    })?;
+    pseudo_write(store, &format!("abort-index/{verb}"), value)
+}
+
+/// Restores the `--abort` snapshot: index rows return exactly, worktree
+/// files for snapshot paths are rewritten, and anything staged meanwhile
+/// leaves the index (its worktree files stay, never deleted here).
+fn restore_abort_index(ctx: &Ctx, verb: &str) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let key = format!("abort-index/{verb}");
+    let Some(raw) = pseudo_read(store, &key)? else {
+        return Ok(());
+    };
+    let serial: Vec<(Vec<u8>, u8, Vec<u8>)> =
+        sonic_rs::from_slice(&raw).map_err(|_| GitError::Corrupt {
+            detail: format!("abort snapshot for {verb} does not decode"),
+        })?;
+    let mut wanted: BTreeMap<Vec<u8>, Vec<(Stage, IndexEntry)>> = BTreeMap::new();
+    for (path, stage_num, bytes) in &serial {
+        let stage = Stage::from_u8(*stage_num).map_err(|err| GitError::from(CoreError::from(err)))?;
+        let entry: IndexEntry =
+            sonic_rs::from_slice(bytes).map_err(|_| GitError::Corrupt {
+                detail: format!("abort snapshot for {verb} does not decode"),
+            })?;
+        entry
+            .validate(kind)
+            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        wanted.entry(path.clone()).or_default().push((stage, entry));
+    }
+    let mut present: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for (path, _, _) in scan_index(store, kind)? {
+        present.insert(path.as_bytes().to_vec());
+    }
+    let mut mutations = Vec::new();
+    let mut writes: Vec<(Vec<u8>, LaneWrite)> = Vec::new();
+    let mut keys: std::collections::BTreeSet<Vec<u8>> = wanted.keys().cloned().collect();
+    keys.extend(present.iter().cloned());
+    for path in keys {
+        let repo_path = RepoPath::new(path.clone())
+            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        let before = read_path_rows(store, kind, &repo_path)?;
+        let after = wanted.get(&path).cloned().unwrap_or_default();
+        mutations.extend(super::state::path_row_mutations(
+            &repo_path,
+            &before,
+            &after,
+        )?);
+        if let Some(rows) = wanted.get(&path) {
+            if let Some((_, entry)) = rows.iter().find(|(stage, _)| *stage == Stage::Zero) {
+                writes.push((
+                    path.clone(),
+                    LaneWrite::Blob {
+                        mode: entry.mode(),
+                        oid: entry.oid(),
+                    },
+                ));
+            } else {
+                writes.push((path.clone(), LaneWrite::Remove));
+            }
+        }
+    }
+    let (workspace, raw_ws) = load_or_default(store)?;
+    let next = workspace
+        .mutate_index(workspace.stamp)
+        .map_err(|err| GitError::from(CoreError::from(err)))?;
+    mutations.push(workspace_mutation(raw_ws.as_deref(), &next)?);
+    store
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
+    // Restoring the pre-operation worktree must not delete files the user
+    // created meanwhile: filter removals to snapshot paths only when the
+    // worktree file is tracked there... snapshot removals only address paths
+    // the snapshot knew, which is exactly right.
+    sync_lane_worktree(ctx, &writes)?;
+    pseudo_delete(store, &key)?;
+    Ok(())
+}
+
+/// Writes sequencer + todo + head state for a stopped pick/merge/rebase.
+fn write_lane_state(
+    ctx: &Ctx,
+    verb: &str,
+    head_key: Option<&str>,
+    orig_hex: &str,
+    current_hex: &str,
+    message: &str,
+    todos: &[PickTodo],
+) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    sequencer_write(
+        store,
+        verb,
+        &SequencerState {
+            verb: verb.to_owned(),
+            head_hex: orig_hex.to_owned(),
+            target_hex: current_hex.to_owned(),
+            message: message.to_owned(),
+        },
+    )?;
+    if let Some(key) = head_key {
+        pseudo_write(store, key, current_hex.as_bytes().to_vec())?;
+    }
+    let value = sonic_rs::to_vec(todos).map_err(|err| GitError::Io {
+        detail: format!("sequencer todo encode: {err}"),
+    })?;
+    pseudo_write(store, &format!("todo/{verb}"), value)?;
+    Ok(())
+}
+
+/// Reads the pending todo list for a sequencer verb.
+fn read_lane_todos(store: &MergeLaneStore, verb: &str) -> Result<Option<Vec<PickTodo>>, GitError> {
+    let Some(raw) = pseudo_read(store, &format!("todo/{verb}"))? else {
+        return Ok(None);
+    };
+    sonic_rs::from_slice(&raw)
+        .map_err(|_| GitError::Corrupt {
+            detail: format!("sequencer todo for {verb} does not decode"),
+        })
+        .map(Some)
+}
+
+/// Deletes every lane record for a finished or aborted verb.
+fn clear_lane_state(ctx: &Ctx, verb: &str, head_key: Option<&str>) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    sequencer_delete(store, verb)?;
+    if let Some(key) = head_key {
+        pseudo_delete(store, key)?;
+    }
+    pseudo_delete(store, &format!("todo/{verb}"))?;
+    pseudo_delete(store, &format!("abort-index/{verb}"))?;
+    Ok(())
 }
 
 /// Shows commit logs from tips, newest committer-date first.

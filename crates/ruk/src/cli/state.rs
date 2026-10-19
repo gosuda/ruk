@@ -62,10 +62,10 @@ pub(crate) const MAX_OBJECT_BYTES: u64 = 512 << 20;
 
 /// In-progress multi-step operation, one record per verb name.
 ///
-/// No verb in this slice leaves one behind: content merge is absent, so every
-/// merge-like verb either fast-forwards or fails before writing state. The
-/// schema, its readers, and `--abort`/`--quit`/`--continue` (which report the
-/// absence the way Git does) are real; writers arrive with the merge lane.
+/// The merge lane writes one when content resolution stops at conflicts;
+/// `--continue` resumes it, `--abort` reverts it, `--quit` drops it, and the
+/// `--abort`/`--quit`/`--continue` spellings without state report the absence
+/// the way Git does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SequencerState {
     /// Verb that owns the state (`merge`, `rebase`, `cherry-pick`, `revert`).
@@ -392,6 +392,109 @@ pub(crate) fn sequencer_read(
         })
     })
     .transpose()
+}
+
+/// Writes one sequencer record, replacing any record the verb left behind.
+pub(crate) fn sequencer_write(store: &Store, verb: &str, state: &SequencerState) -> Result<(), GitError> {
+    let mut key = SEQUENCER_PREFIX.to_vec();
+    key.extend_from_slice(verb.as_bytes());
+    let value = sonic_rs::to_vec(state).map_err(|err| GitError::Io {
+        detail: format!("sequencer record encode: {err}"),
+    })?;
+    store
+        .publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::Pins,
+                key,
+                expected: FactExpectation::Any,
+                value: Some(value),
+            }],
+        )
+        .map_err(GitError::from)?;
+    Ok(())
+}
+
+/// Deletes one sequencer record, tolerating an already-absent row.
+pub(crate) fn sequencer_delete(store: &Store, verb: &str) -> Result<(), GitError> {
+    let mut key = SEQUENCER_PREFIX.to_vec();
+    key.extend_from_slice(verb.as_bytes());
+    store
+        .publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::Pins,
+                key,
+                expected: FactExpectation::Any,
+                value: None,
+            }],
+        )
+        .map_err(GitError::from)?;
+    Ok(())
+}
+
+/// Pseudo-head key: `MERGE_HEAD`, `ORIG_HEAD`, `CHERRY_PICK_HEAD`,
+/// `REVERT_HEAD`, `MERGE_MSG`, and per-verb todo lists all live under
+/// `cli/pseudo/`, the same table as `FETCH_HEAD`.
+fn pseudo_key(name: &str) -> Vec<u8> {
+    let mut key = b"cli/pseudo/".to_vec();
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+/// Reads one pseudo-head record as raw bytes.
+pub(crate) fn pseudo_read(store: &Store, name: &str) -> Result<Option<Vec<u8>>, GitError> {
+    store.fact(FactTable::Pins, &pseudo_key(name)).map_err(GitError::from)
+}
+
+/// Writes one pseudo-head record, replacing any previous value.
+pub(crate) fn pseudo_write(store: &Store, name: &str, value: Vec<u8>) -> Result<(), GitError> {
+    store
+        .publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::Pins,
+                key: pseudo_key(name),
+                expected: FactExpectation::Any,
+                value: Some(value),
+            }],
+        )
+        .map_err(GitError::from)?;
+    Ok(())
+}
+
+/// Deletes one pseudo-head record, tolerating an already-absent row.
+pub(crate) fn pseudo_delete(store: &Store, name: &str) -> Result<(), GitError> {
+    store
+        .publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::Pins,
+                key: pseudo_key(name),
+                expected: FactExpectation::Any,
+                value: None,
+            }],
+        )
+        .map_err(GitError::from)?;
+    Ok(())
+}
+
+/// Reads one pseudo-head record as an object id.
+pub(crate) fn pseudo_read_oid(store: &Store, name: &str) -> Result<Option<Oid>, GitError> {
+    let Some(raw) = pseudo_read(store, name)? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&raw).map_err(|_| GitError::Corrupt {
+        detail: format!("{name} is not valid UTF-8"),
+    })?;
+    Oid::from_hex(text.trim()).map_or_else(
+        |_| {
+            Err(GitError::Corrupt {
+                detail: format!("{name} does not hold an object id"),
+            })
+        },
+        |oid| Ok(Some(oid)),
+    )
 }
 
 /// Reads one stash slot by number.
