@@ -5,7 +5,7 @@
 //! | verb | backing | status |
 //! | --- | --- | --- |
 //! | `hash-object` | `HashKind::hash_git_object` + optional store write | implemented |
-//! | `cat-file` | bounded transport object read | implemented (`-p`, `-t`, `-s`, `-e`) |
+//! | `cat-file` | bounded transport object read | implemented (`-p`, `-t`, `-s`, `-e`, `--batch-check [--batch-all-objects]`) |
 //! | `mktree` | canonical tree build + publish | implemented |
 //! | `commit-tree` | canonical commit payload + publish | implemented |
 //! | `write-tree` | index tree build | implemented |
@@ -205,10 +205,28 @@ pub(crate) fn cat_file(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             short: Some('e'),
             takes_value: false,
         },
+        FlagSpec {
+            long: "batch-check",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "batch-all-objects",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
+    if opts.is_set("batch-all-objects") && !opts.is_set("batch-check") {
+        return Err(GitError::Invalid {
+            detail: "cat-file --batch-all-objects requires --batch-check".to_owned(),
+        });
+    }
+    if opts.is_set("batch-check") {
+        return batch_check(ctx, &opts);
+    }
     let [rev] = opts.positionals.as_slice() else {
         return Err(GitError::Invalid {
             detail: "usage: cat-file (-p|-t|-s|-e) <object>".to_owned(),
@@ -240,6 +258,54 @@ pub(crate) fn cat_file(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         return Ok(line(body.len().to_string().into_bytes()));
     }
     Ok(Vec::new())
+}
+
+/// Prints `<oid> <type> <size>` per object without payload I/O: the whole
+/// census for `--batch-all-objects`, else one line per revision read from
+/// standard input (unknown revisions report `<rev> missing`, the way the
+/// oracle's batch-check mode does).
+///
+/// Oracle: `git/builtin/cat-file.c` (`batch_check`).
+fn batch_check(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    if opts.is_set("batch-all-objects") {
+        if !opts.positionals.is_empty() {
+            return Err(GitError::Invalid {
+                detail: "cat-file --batch-all-objects takes no object argument".to_owned(),
+            });
+        }
+        let mut out = Vec::new();
+        for (oid, object_kind, len) in store.iter_objects().map_err(GitError::from)? {
+            out.extend_from_slice(
+                format!("{} {} {len}\n", oid.to_hex(), kind_name_of(object_kind)).as_bytes(),
+            );
+        }
+        return Ok(out);
+    }
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: cat-file --batch-check [--batch-all-objects] (revisions on stdin)".to_owned(),
+        });
+    }
+    let stdin = super::read_stdin_text(&ctx.env)?;
+    let mut out = Vec::new();
+    for input in stdin.lines() {
+        let rev = input.split_whitespace().next().unwrap_or_default();
+        if rev.is_empty() {
+            continue;
+        }
+        let oid = super::state::resolve_rev(store, kind, rev)
+            .or_else(|_| ruk_git::parse_oid_for(rev, kind));
+        match oid.and_then(|oid| read_object_bytes(store, oid).map(|read| (oid, read))) {
+            Err(_) => out.extend_from_slice(format!("{rev} missing\n").as_bytes()),
+            Ok((oid, (object_kind, body))) => out.extend_from_slice(
+                format!("{} {} {}\n", oid.to_hex(), kind_name_of(object_kind), body.len())
+                    .as_bytes(),
+            ),
+        }
+    }
+    Ok(out)
 }
 
 /// Names one stored object kind.
