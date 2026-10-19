@@ -179,6 +179,9 @@ enum FetchSource {
         base: String,
         /// The upload-pack advertisement from discovery.
         adv: ruk_git::transport::refadv::Advertisement,
+        /// Resolved `http.extraHeader` rows for the base, reused by the
+        /// fetch POST (stateless, so no connection is held).
+        extra_headers: Vec<(String, String)>,
     },
     /// A smart-http v2 base plus its capability advertisement: refs came
     /// from one `ls-refs` RPC and the fetch POSTs `command=fetch`
@@ -188,6 +191,8 @@ enum FetchSource {
         base: String,
         /// The v2 capability advertisement from the `Git-Protocol` probe.
         caps: Capabilities,
+        /// Resolved `http.extraHeader` rows for the base.
+        extra_headers: Vec<(String, String)>,
     },
     /// A dumb-http base: the smart advertisement was absent, so discovery
     /// fell back to the text `info/refs` file (the same fallback `git`
@@ -195,7 +200,76 @@ enum FetchSource {
     DumbHttp {
         /// Normalized RPC base URL.
         base: String,
+        /// Resolved `http.extraHeader` rows for the base.
+        extra_headers: Vec<(String, String)>,
     },
+}
+
+/// Splits one flat config name into its `http.extraHeader` scope:
+/// `Some(None)` for bare `http.extraHeader`, `Some(Some(scope))` for
+/// `http.<scope>.extraHeader` with the scope in its original case, `None`
+/// for anything else. Section and key match case-insensitively, like git's
+/// config; the scope keeps its case for URL matching.
+fn extra_header_scope(name: &str) -> Option<Option<String>> {
+    let rest = name.to_ascii_lowercase().strip_prefix("http.")?.to_owned();
+    if rest == "extraheader" {
+        return Some(None);
+    }
+    rest.strip_suffix(".extraheader").and_then(|scope| {
+        if scope.is_empty() {
+            None
+        } else {
+            let raw = &name["http.".len()..name.len() - ".extraheader".len()];
+            Some(Some(raw.to_owned()))
+        }
+    })
+}
+
+/// Resolves the `http.extraHeader` request headers for `url` from every
+/// config layer, low to high precedence: git-config files, then the repo
+/// store, then `-c` / `--config-env` overrides in order given. Store rows
+/// stay single-valued (`ruk config` keeps last-wins); multivalued rows
+/// come from the files and from repeated `-c` flags. An empty value resets
+/// the accumulated list.
+fn http_extra_headers(ctx: &Ctx, url: &str) -> Vec<(String, String)> {
+    use ruk_git::transport::{credentials, http};
+    let mut rows = credentials::http_extra_header_rows();
+    if let Ok(store) = ctx.store() {
+        if let Ok(pairs) = super::state::config_list(store) {
+            let mut scoped = Vec::new();
+            let mut unscoped = None;
+            for (name, value) in &pairs {
+                match extra_header_scope(name) {
+                    Some(None) => unscoped = Some(value.clone()),
+                    Some(Some(scope)) => scoped.push((scope, value.clone())),
+                    None => {}
+                }
+            }
+            if let Some(value) = unscoped {
+                rows.push(http::ExtraHeaderRow {
+                    scope: None,
+                    value,
+                });
+            }
+            scoped.sort();
+            for (scope, value) in scoped {
+                rows.push(http::ExtraHeaderRow {
+                    scope: Some(scope),
+                    value,
+                });
+            }
+        }
+    }
+    for (key, value) in &ctx.cli_config {
+        match extra_header_scope(key) {
+            Some(scope) => rows.push(http::ExtraHeaderRow {
+                scope,
+                value: value.clone(),
+            }),
+            None => {}
+        }
+    }
+    http::extra_headers_for_url(url, &rows)
 }
 
 /// Expands refspecs, negotiates the pack, and updates refs.
@@ -234,12 +308,14 @@ pub(crate) fn run_fetch(
         Target::Net(endpoint) => match endpoint {
             Endpoint::Http { url, .. } => {
                 let base = ruk_git::transport::smart_http::normalize_base(&url)?;
+                let extra_headers = http_extra_headers(ctx, &base);
                 // Highest protocol first: one `Git-Protocol` GET parses
                 // v2 caps or the v0 document; only dumb-http falls through.
                 match ruk_git::transport::smart_http::discover_versioned(
                     &base,
                     ruk_git::transport::smart_http::SmartService::UploadPack,
                     dest_kind,
+                    &extra_headers,
                 ) {
                     Ok(ruk_git::transport::smart_http::VersionedDiscovery::V2(caps)) => {
                         let refs = ruk_git::transport::smart_http::ls_refs_v2(
@@ -248,18 +324,36 @@ pub(crate) fn run_fetch(
                             dest_kind,
                             &[],
                             &Interrupt::none(),
+                            &extra_headers,
                         )?;
                         let advertised = net::to_local_refs(refs)?;
-                        (FetchSource::HttpV2 { base, caps }, advertised)
+                        (
+                            FetchSource::HttpV2 {
+                                base,
+                                caps,
+                                extra_headers,
+                            },
+                            advertised,
+                        )
                     }
                     Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => {
                         let advertised = net::to_local_refs(adv.refs.clone())?;
-                        (FetchSource::Http { base, adv }, advertised)
+                        (
+                            FetchSource::Http { base, adv, extra_headers },
+                            advertised,
+                        )
                     }
                     Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
-                        let adv = ruk_git::transport::dumb_http::discover(&base, dest_kind)?;
+                        let adv = ruk_git::transport::dumb_http::discover(
+                            &base,
+                            dest_kind,
+                            &extra_headers,
+                        )?;
                         let advertised = net::to_local_refs(adv.refs.clone())?;
-                        (FetchSource::DumbHttp { base }, advertised)
+                        (
+                            FetchSource::DumbHttp { base, extra_headers },
+                            advertised,
+                        )
                     }
                     Err(err) => return Err(err),
                 }
@@ -473,8 +567,8 @@ fn fetch_objects_only(
         FetchSource::HttpV2 { .. } => {
             fetch_pack_http_v2(dest, source, remote_label, &request, &[], &[])?;
         }
-        FetchSource::DumbHttp { base } => {
-            fetch_pack_dumb(dest, base, remote_label, &request, &[], &[])?;
+        FetchSource::DumbHttp { .. } => {
+            fetch_pack_dumb(dest, source, remote_label, &request, &[], &[])?;
         }
     }
     Ok(())
@@ -527,7 +621,12 @@ fn fetch_pack_http(
     tracking: &[(RefName, RefTarget)],
     ref_mutations: &[FactMutation],
 ) -> Result<(), GitError> {
-    let FetchSource::Http { base, adv } = source else {
+    let FetchSource::Http {
+        base,
+        adv,
+        extra_headers,
+    } = source
+    else {
         return Err(GitError::Invalid {
             detail: "smart-http fetch needs an HTTP source".to_owned(),
         });
@@ -539,6 +638,7 @@ fn fetch_pack_http(
         request,
         IngestLimits::default(),
         &Interrupt::none(),
+        extra_headers,
     )?;
     publish_received(
         dest,
@@ -564,7 +664,12 @@ fn fetch_pack_http_v2(
     tracking: &[(RefName, RefTarget)],
     ref_mutations: &[FactMutation],
 ) -> Result<(), GitError> {
-    let FetchSource::HttpV2 { base, caps } = source else {
+    let FetchSource::HttpV2 {
+        base,
+        caps,
+        extra_headers,
+    } = source
+    else {
         return Err(GitError::Invalid {
             detail: "smart-http v2 fetch needs an HTTP v2 source".to_owned(),
         });
@@ -576,6 +681,7 @@ fn fetch_pack_http_v2(
         request,
         IngestLimits::default(),
         &Interrupt::none(),
+        extra_headers,
     )?;
     publish_received(
         dest,
@@ -596,18 +702,24 @@ fn fetch_pack_http_v2(
 /// Oracle: `git/builtin/fetch.c`, `git/remote-curl.c` (dumb fallback).
 fn fetch_pack_dumb(
     dest: &Store,
-    base: &str,
+    source: &FetchSource,
     remote_label: &str,
     request: &FetchWireRequest,
     tracking: &[(RefName, RefTarget)],
     ref_mutations: &[FactMutation],
 ) -> Result<(), GitError> {
+    let FetchSource::DumbHttp { base, extra_headers } = source else {
+        return Err(GitError::Invalid {
+            detail: "dumb-http fetch needs a dumb-http source".to_owned(),
+        });
+    };
     let received = ruk_git::transport::dumb_http::fetch_pack(
         base,
         dest,
         request,
         IngestLimits::default(),
         &Interrupt::none(),
+        extra_headers,
     )?;
     publish_received(
         dest,
@@ -1222,19 +1334,22 @@ fn push_net(
     let http_adv = match endpoint {
         Endpoint::Http { url, .. } => {
             let base = ruk_git::transport::smart_http::normalize_base(url)?;
+            let extra_headers = http_extra_headers(ctx, &base);
             Some((
                 base.clone(),
                 ruk_git::transport::smart_http::discover(
                     &base,
                     ruk_git::transport::smart_http::SmartService::ReceivePack,
                     kind,
+                    &extra_headers,
                 )?,
+                extra_headers,
             ))
         }
         _ => None,
     };
     let advertised = match &http_adv {
-        Some((_, adv)) => net::to_local_refs(adv.refs.clone())?,
+        Some((_, adv, _)) => net::to_local_refs(adv.refs.clone())?,
         None => net::to_local_refs(net::discover_endpoint(
             endpoint,
             Service::ReceivePack,
@@ -1269,14 +1384,17 @@ fn push_net(
         updates,
     );
     match &http_adv {
-        Some((base, adv)) => push_outcomes(ruk_git::transport::smart_http::push_pack(
-            base,
-            adv,
-            &store,
-            &mut plan,
-            &request,
-            &Interrupt::none(),
-        )?),
+        Some((base, adv, extra_headers)) => {
+            push_outcomes(ruk_git::transport::smart_http::push_pack(
+                base,
+                adv,
+                &store,
+                &mut plan,
+                &request,
+                &Interrupt::none(),
+                extra_headers,
+            )?)
+        }
         None => {
             let stream = net::open_stream(endpoint, Service::ReceivePack)?;
             push_outcomes(ruk_git::transport::push::push_over(
@@ -1757,10 +1875,12 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
                 }
                 Endpoint::Http { url, .. } => {
                     let base = ruk_git::transport::smart_http::normalize_base(&url)?;
+                    let extra_headers = http_extra_headers(ctx, &base);
                     let out = ruk_git::transport::smart_http::fetch_archive(
                         &base,
                         &ruk_git::transport::smart_http::ArchiveWireRequest { rev },
                         &Interrupt::none(),
+                        &extra_headers,
                     )?;
                     out.tar
                 }
@@ -3397,10 +3517,12 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             let refs = match &endpoint {
                 Endpoint::Http { url, .. } => {
                     let base = ruk_git::transport::smart_http::normalize_base(url)?;
+                    let extra_headers = http_extra_headers(ctx, &base);
                     match ruk_git::transport::smart_http::discover_versioned(
                         &base,
                         ruk_git::transport::smart_http::SmartService::UploadPack,
                         ctx.kind()?,
+                        &extra_headers,
                     )? {
                         ruk_git::transport::smart_http::VersionedDiscovery::V2(caps) => {
                             ruk_git::transport::smart_http::ls_refs_v2(
@@ -3409,6 +3531,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                                 ctx.kind()?,
                                 &[],
                                 &Interrupt::none(),
+                                &extra_headers,
                             )?
                         }
                         ruk_git::transport::smart_http::VersionedDiscovery::V0(adv) => adv.refs,
