@@ -1933,6 +1933,37 @@ fn push_over_smart_http_reports_status() {
 }
 
 #[test]
+fn ls_remote_over_dumb_http_reads_info_refs() {
+    const TIP: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+    let dumb = format!("{TIP}\trefs/heads/main\n");
+    let (base, log) = smart_http_server(vec![
+        (b"not a smart advertisement".to_vec(), "text/plain"),
+        (dumb.into_bytes(), "text/plain"),
+    ]);
+    let (root, env) = seeded_repo("httpdumb", "l.txt", b"l\n");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_transport::ls_remote, &mut ctx, &[&base]).expect("dumb ls-remote");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains(TIP), "{text}");
+    assert!(text.contains("refs/heads/main"), "{text}");
+    let requests = log
+        .recv_timeout(Duration::from_secs(30))
+        .expect("server saw both GETs");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0].0.contains("service=git-upload-pack"),
+        "{:?}",
+        requests[0].0
+    );
+    assert!(
+        requests[1].0.contains("GET /a.git/info/refs "),
+        "{:?}",
+        requests[1].0
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn ls_remote_over_smart_http_lists_refs() {
     const TIP: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
     let mut adv = pkt_frame(b"# service=git-upload-pack\n");

@@ -4159,7 +4159,10 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
         }
         Target::Net(endpoint) => {
             // Over v2, ls-remote is ls-refs: one `Git-Protocol` GET
-            // parses caps or the v0 refs, with no second round trip.
+            // parses caps or the v0 refs, with no second round trip. A
+            // server answering `info/refs` without the smart advertisement
+            // falls back to the dumb text file, the same fallback
+            // `run_fetch` makes.
             let refs = match &endpoint {
                 Endpoint::Http { url, .. } => {
                     let base = ruk_git::transport::smart_http::normalize_base(url)?;
@@ -4169,8 +4172,8 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                         ruk_git::transport::smart_http::SmartService::UploadPack,
                         ctx.kind()?,
                         &extra_headers,
-                    )? {
-                        ruk_git::transport::smart_http::VersionedDiscovery::V2(caps) => {
+                    ) {
+                        Ok(ruk_git::transport::smart_http::VersionedDiscovery::V2(caps)) => {
                             ruk_git::transport::smart_http::ls_refs_v2(
                                 &base,
                                 &caps,
@@ -4180,7 +4183,18 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                                 &extra_headers,
                             )?
                         }
-                        ruk_git::transport::smart_http::VersionedDiscovery::V0(adv) => adv.refs,
+                        Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => adv.refs,
+                        Err(err)
+                            if ruk_git::transport::dumb_http::is_dumb_gap(&err) =>
+                        {
+                            ruk_git::transport::dumb_http::discover(
+                                &base,
+                                ctx.kind()?,
+                                &extra_headers,
+                            )?
+                            .refs
+                        }
+                        Err(err) => return Err(err),
                     }
                 }
                 _ => net::discover_endpoint(&endpoint, Service::UploadPack, ctx.kind()?)?,
