@@ -1735,6 +1735,112 @@ fn archive_local_streams_tar() {
 }
 
 #[test]
+fn archive_zip_roundtrip_reads_back() {
+    let (root, env) = seeded_repo("uarchive-zip", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    // The tar path stays byte-identical to the default (no --format) flow.
+    let tar = run(verbs_transport::archive, &mut ctx, &["--format=tar", "HEAD"])
+        .expect("explicit tar");
+    let default = run(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("default tar");
+    assert_eq!(tar, default);
+    let zip = run(verbs_transport::archive, &mut ctx, &["--format=zip", "HEAD"])
+        .expect("zip archive");
+    assert!(
+        zip.starts_with(b"PK"),
+        "zip magic, got {:?}",
+        &zip[..4.min(zip.len())]
+    );
+    // Read back through the writer crate: the central directory parses and
+    // the payload verifies against its CRC.
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
+    let names: Vec<String> = archive
+        .file_names()
+        .map(|name| name.expect("entry name").into_owned())
+        .collect();
+    assert!(names.contains(&"a.txt".to_owned()), "{names:?}");
+    let mut file = archive.by_name("a.txt").expect("entry");
+    assert_eq!(file.compression(), zip::CompressionMethod::Deflated);
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut body).expect("payload");
+    assert_eq!(body, b"a\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_zip_prefix_and_path_limits() {
+    let (root, env) = seeded_repo("uarchive-zip-pre", "a.txt", b"a\n");
+    std::fs::create_dir_all(root.join("sub")).expect("subdir");
+    std::fs::write(root.join("sub").join("b.txt"), b"b\n").expect("seed b");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_stage::add, &mut ctx, &["sub/b.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit");
+    let zip = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=zip", "--prefix=pre/", "HEAD", "sub"],
+    )
+    .expect("zip with prefix and limit");
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
+    let names: Vec<String> = archive
+        .file_names()
+        .map(|name| name.expect("entry name").into_owned())
+        .collect();
+    assert!(!names.is_empty(), "path limit kept the subtree");
+    for name in &names {
+        assert!(name.starts_with("pre/"), "prefix applies: {name:?}");
+        assert!(
+            !name.starts_with("pre/a.txt"),
+            "path limit drops a.txt: {names:?}"
+        );
+    }
+    assert!(
+        names.iter().any(|name| name == "pre/sub/b.txt"),
+        "{names:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn archive_zip_output_file_matches_stdout() {
+    let (root, env) = seeded_repo("uarchive-zip-out", "a.txt", b"a\n");
+    let mut ctx = repo_ctx(&root, env);
+    let stdout = run(verbs_transport::archive, &mut ctx, &["--format=zip", "HEAD"])
+        .expect("stdout zip");
+    assert!(stdout.starts_with(b"PK"));
+    let dest = root
+        .parent()
+        .expect("parent")
+        .join("out.zip")
+        .to_str()
+        .expect("utf8")
+        .to_owned();
+    let out = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=zip", "-o", dest.as_str(), "HEAD"],
+    )
+    .expect("file zip");
+    assert!(out.is_empty(), "file output returns no stdout bytes");
+    let filed = std::fs::read(
+        root.parent()
+            .expect("parent")
+            .join("out.zip"),
+    )
+    .expect("written zip");
+    assert_eq!(filed, stdout, "-o writes the streamed bytes");
+    // Only tar and zip are spoken.
+    let err = run(verbs_transport::archive, &mut ctx, &["--format=rar", "HEAD"])
+        .expect_err("unknown format must fail");
+    assert!(
+        matches!(err, ruk_git::GitError::Unsupported { .. }),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn archive_refusals_pin_exit_codes() {
     // An unreachable SSH remote fails at dial time, not as a named gap:
     // the ssh/git-daemon duplex session is served.
@@ -1906,24 +2012,6 @@ fn archive_paths_limit_members() {
         .map(|(name, _, _)| name.clone())
         .collect();
     assert_eq!(file_names, vec![b"a.txt".to_vec()], "{file_names:?}");
-    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
-}
-
-#[test]
-fn archive_format_zip_names_its_gap() {
-    let (root, env) = seeded_repo("uarchive-zip", "a.txt", b"a\n");
-    let mut ctx = repo_ctx(&root, env);
-    let err = run(
-        verbs_transport::archive,
-        &mut ctx,
-        &["--format=zip", "HEAD"],
-    )
-    .expect_err("zip must fail");
-    assert!(
-        matches!(err, ruk_git::GitError::Unsupported { .. }),
-        "{err}"
-    );
-    assert!(err.to_string().contains("zip"), "{err}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
