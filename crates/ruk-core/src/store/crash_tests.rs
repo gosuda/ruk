@@ -878,6 +878,14 @@ fn open_assert_spec(store: &Store, kind: HashKind, spec: &str) -> Result<bool, i
                 has_b.then_some(oid_b.as_bytes()),
             )
         }
+        "xor_ab_or_ab" => match open_assert_spec(store, kind, "ab") {
+            Ok(true) => Ok(true),
+            // `ab` reports a missing object as EXIT_ASSERT: that is the
+            // separate-commit outcome, checked by `xor_ab`. Any other code is
+            // a store failure and stays fatal.
+            Ok(false) | Err(EXIT_ASSERT) => open_assert_spec(store, kind, "xor_ab"),
+            Err(code) => Err(code),
+        },
         "none" => {
             if present(store, oid_a)? || present(store, oid_b)? {
                 return Ok(false);
@@ -1812,10 +1820,11 @@ fn concurrent_preparation_and_serial_publications_roundtrip() {
 }
 
 /// Two publications race through the serialized writer while the process is
-/// killed: at the first metadata commit exactly one publication survives
-/// whole (and neither was acknowledged); during the first append neither
-/// survives. Every publication is all-or-nothing under concurrent crash,
-/// and the recovered store keeps serving and publishing.
+/// killed: at the first metadata commit either one publication survives
+/// whole, or both do when the writer grouped them into one commit, and
+/// neither was acknowledged; during the first append neither survives.
+/// Every publication is all-or-nothing under concurrent crash, and the
+/// recovered store keeps serving and publishing.
 #[test]
 fn concurrent_publications_are_atomic_under_crash() {
     let first_commit_root = fresh_root("sha1-racing-first-commit");
@@ -1831,8 +1840,8 @@ fn concurrent_publications_are_atomic_under_crash() {
     assert_child_state(
         &first_commit_root,
         "sha1",
-        "xor_ab",
-        "exactly one racing publication survives a first-commit kill",
+        "xor_ab_or_ab",
+        "one racing publication, or both grouped into one commit, survives a first-commit kill",
     );
     let first_append_root = fresh_root("sha1-racing-first-append");
     let first_append_arg = first_append_root.to_string_lossy().into_owned();
