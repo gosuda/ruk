@@ -9,7 +9,7 @@
 //! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
-//! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC | tar only; ssh/git-daemon remotes, prefixes, outputs and path limits are named gaps |
+//! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex session | tar only (`--format=zip` names its missing writer); `--prefix`, `-o` and path limits rewrite the stream client-side |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
 //! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
@@ -1627,14 +1627,14 @@ fn first_hop(head: &ruk_core::workspace::HeadRef) -> Option<Vec<u8>> {
 
 /// Streams a tar archive of one revision: local trees through the
 /// `upload-archive` serve half over a loopback, `--remote` trees over the
-/// smart-http `git-upload-archive` RPC.
+/// smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex
+/// `upload-archive` session.
 ///
 /// Oracle: `git/builtin/archive.c` (`run_remote_archiver` client grammar
-/// for the `--remote` arm). Only `tar` is spoken (the server default);
-/// `--prefix`, `--output` and path limiting are named gaps the server
-/// half also refuses, and SSH/git-daemon remotes stay a named gap (no
-/// `upload-archive` duplex client exists there): use a local path,
-/// `file://` or `http(s)://`.
+/// for the `--remote` arm). Only `tar` is spoken (the server default;
+/// `--format=zip` names its missing writer); `--prefix` and path limiting
+/// rewrite the streamed tar client-side, so every transport answers whole
+/// trees and the verb narrows them.
 pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -1657,47 +1657,63 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
             short: Some('o'),
             takes_value: true,
         },
-        FlagSpec {
-            long: "verbose",
-            short: Some('v'),
-            takes_value: false,
-        },
     ];
     let opts = collect(args, &specs)?;
-    if opts.is_set("prefix") {
-        return Err(GitError::Unsupported {
-            command: "archive --prefix is a named gap; the server half archives whole trees only"
-                .to_owned(),
-        });
-    }
-    if opts.is_set("output") {
-        return Err(GitError::Unsupported {
-            command: "archive --output is a named gap; redirect stdout instead".to_owned(),
-        });
-    }
     if let Some(format) = opts.single("format")? {
         if format != "tar" {
             return Err(GitError::Unsupported {
-                command: format!("archive format {format:?} (only tar is spoken)"),
+                command: format!("archive format {format:?}: no zip writer in this slice (only tar is spoken)"),
             });
         }
     }
+    let prefix = match opts.single("prefix")? {
+        None => None,
+        Some(raw) => {
+            if raw.bytes().any(|byte| byte == 0) {
+                return Err(GitError::Invalid {
+                    detail: "archive --prefix must not contain NUL".to_owned(),
+                });
+            }
+            if raw.starts_with('/') {
+                return Err(GitError::Invalid {
+                    detail: "archive --prefix must be relative".to_owned(),
+                });
+            }
+            let mut owned = raw.into_bytes();
+            if !owned.is_empty() && !owned.ends_with(b"/") {
+                owned.push(b'/');
+            }
+            if owned.is_empty() { None } else { Some(owned) }
+        }
+    };
     if opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: archive [--remote=<repo>] [--format=tar] <tree-ish>".to_owned(),
-        });
-    }
-    if opts.positionals.len() > 1 {
-        return Err(GitError::Unsupported {
-            command: "archive paths are a named gap; the server half archives whole trees only"
-                .to_owned(),
+            detail: "usage: archive [--remote=<repo>] [--format=tar] [--prefix=<p>/] [-o <file>] <tree-ish> [<path>...]".to_owned(),
         });
     }
     let rev = opts.positionals[0].clone();
-    match opts.single("remote")? {
+    let mut paths: Vec<String> = Vec::new();
+    for raw in &opts.positionals[1..] {
+        if raw.is_empty() || raw.bytes().any(|byte| byte == 0) {
+            return Err(GitError::Invalid {
+                detail: "archive paths must be non-empty NUL-free names".to_owned(),
+            });
+        }
+        if raw.starts_with('/') {
+            return Err(GitError::Invalid {
+                detail: format!("archive path {raw:?} must be relative"),
+            });
+        }
+        let trimmed = raw.strip_suffix('/').unwrap_or(raw);
+        if trimmed.is_empty() || trimmed == "." {
+            continue;
+        }
+        paths.push(trimmed.to_owned());
+    }
+    let tar = match opts.single("remote")? {
         None => {
             let store = ctx.store()?;
-            archive_local(store, store.hash_kind(), &rev)
+            archive_local(store, store.hash_kind(), &rev)?
         }
         Some(raw) => {
             let url = ctx
@@ -1712,7 +1728,7 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
                     };
                     let store = open_store_at(&base).or_else(|_| open_local_store(&base))?;
                     let kind = store.hash_kind();
-                    archive_local(&store, kind, &rev)
+                    archive_local(&store, kind, &rev)?
                 }
                 Endpoint::Http { url, .. } => {
                     let base = ruk_git::transport::smart_http::normalize_base(&url)?;
@@ -1721,16 +1737,509 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
                         &ruk_git::transport::smart_http::ArchiveWireRequest { rev },
                         &Interrupt::none(),
                     )?;
-                    Ok(out.tar)
+                    out.tar
                 }
-                Endpoint::Ssh { .. } | Endpoint::Git { .. } => Err(GitError::Unsupported {
-                    command: format!(
-                        "archive over {url:?} (ssh/git-daemon transports are a named gap; use a local path, file:// or http(s)://)"
-                    ),
-                }),
+                endpoint @ (Endpoint::Ssh { .. } | Endpoint::Git { .. }) => {
+                    let stream = net::open_archive_stream(&endpoint)?;
+                    net::fetch_archive_stream(stream, &rev)?
+                }
             }
         }
+    };
+    let tar = if prefix.is_some() || !paths.is_empty() {
+        rewrap_archive_tar(tar, prefix.as_deref(), &paths)?
+    } else {
+        tar
+    };
+    match opts.single("output")? {
+        None => Ok(tar),
+        Some(dest) => {
+            let path = if PathBuf::from(&dest).is_absolute() {
+                PathBuf::from(dest)
+            } else {
+                ctx.env.cwd.join(dest)
+            };
+            std::fs::write(&path, &tar).map_err(|err| GitError::Io {
+                detail: format!("cannot write archive to {}: {err}", path.display()),
+            })?;
+            Ok(Vec::new())
+        }
     }
+}
+
+/// One tar member: its 512-byte header plus the payload without padding.
+/// `x` pax headers stay separate members paired with the entry behind
+/// them; `g` global headers pass through untouched.
+struct TarMember {
+    header: [u8; 512],
+    data: Vec<u8>,
+}
+
+/// Splits a member path across the ustar prefix/name fields at the last
+/// slash within the first 155 bytes, mirroring the server half. Returns
+/// `None` when no split fits and the caller must carry the name in a pax
+/// `path` record instead.
+fn split_tar_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    if path.len() <= 100 {
+        return Some((&[][..], path));
+    }
+    let mut i = path.len();
+    if i > 1 && path[i - 1] == b'/' {
+        i -= 1;
+    }
+    if i > 155 {
+        i = 155;
+    }
+    loop {
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+        if path[i] == b'/' {
+            break;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    let (prefix, rest) = (&path[..i], &path[i + 1..]);
+    if rest.len() <= 100 {
+        Some((prefix, rest))
+    } else {
+        None
+    }
+}
+
+/// Parses a NUL/space-terminated octal header field.
+fn parse_octal(field: &[u8], what: &str) -> Result<u64, GitError> {
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0 || *byte == b' ')
+        .unwrap_or(field.len());
+    let text = std::str::from_utf8(&field[..end]).map_err(|_| GitError::Corrupt {
+        detail: format!("archive header {what} is not ASCII"),
+    })?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(0);
+    }
+    if !text.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        return Err(GitError::Corrupt {
+            detail: format!("archive header {what} is not octal: {text:?}"),
+        });
+    }
+    u64::from_str_radix(text, 8).map_err(|_| GitError::Corrupt {
+        detail: format!("archive header {what} overflows: {text:?}"),
+    })
+}
+
+/// Recomputes a member header's checksum over spaces, mirroring the
+/// server half's `%07o` shape.
+fn checksum_header(header: &mut [u8; 512]) {
+    let digits = 7;
+    let mut sum: u32 = 0;
+    for (index, byte) in header.iter().enumerate() {
+        sum += if (148..156).contains(&index) {
+            u32::from(b' ')
+        } else {
+            u32::from(*byte)
+        };
+    }
+    let text = format!("{sum:0digits$o}");
+    let bytes = text.as_bytes();
+    let n = bytes.len().min(7);
+    header[148..148 + n].copy_from_slice(&bytes[..n]);
+    header[155] = b' ';
+}
+
+/// The logical path of a member: the pax `path` record when an `x` header
+/// carries one, else the ustar prefix/name fields joined with `/`.
+fn member_path(header: &[u8; 512], data: &[u8], typeflag: u8) -> Option<Vec<u8>> {
+    if typeflag == b'x' {
+        return pax_path_record(data);
+    }
+    let prefix_end = header[345..500].iter().position(|byte| *byte == 0).unwrap_or(155);
+    let name_end = header[..100].iter().position(|byte| *byte == 0).unwrap_or(100);
+    let (prefix, name) = (&header[345..345 + prefix_end], &header[..name_end]);
+    if prefix.is_empty() {
+        Some(name.to_vec())
+    } else {
+        let mut out = prefix.to_vec();
+        out.push(b'/');
+        out.extend_from_slice(name);
+        Some(out)
+    }
+}
+
+/// The ustar prefix/name fields joined with `/`, without consulting any
+/// `x` record beside the member.
+fn header_name(header: &[u8; 512]) -> Vec<u8> {
+    let prefix_end = header[345..500].iter().position(|byte| *byte == 0).unwrap_or(155);
+    let name_end = header[..100].iter().position(|byte| *byte == 0).unwrap_or(100);
+    let (prefix, name) = (&header[345..345 + prefix_end], &header[..name_end]);
+    if prefix.is_empty() {
+        name.to_vec()
+    } else {
+        let mut out = prefix.to_vec();
+        out.push(b'/');
+        out.extend_from_slice(name);
+        out
+    }
+}
+
+/// Reads the `path` record out of pax extended-header data, if present.
+/// Reads the `path` record out of pax extended-header data, if present.
+fn pax_path_record(data: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = data;
+    while !rest.is_empty() {
+        let space = rest.iter().position(|byte| *byte == b' ')?;
+        let len: usize = std::str::from_utf8(&rest[..space]).ok()?.parse().ok()?;
+        if len == 0 || len > rest.len() {
+            return None;
+        }
+        let record = &rest[..len];
+        rest = &rest[len..];
+        if !record.ends_with(b"\n") {
+            continue;
+        }
+        let body = &record[space + 1..record.len() - 1];
+        if let Some(value) = body.strip_prefix(b"path=") {
+            return Some(value.to_vec());
+        }
+    }
+    None
+}
+
+/// Ensures pax extended-header data carries a `path` record for `path`:
+/// an existing record is rewritten, else one is appended. Record lengths
+/// count themselves, so every rewrite recomputes the width.
+fn set_pax_path(data: &[u8], path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + path.len() + 16);
+    let mut rest = data;
+    let mut replaced = false;
+    while !rest.is_empty() {
+        let Some(space) = rest.iter().position(|byte| *byte == b' ') else {
+            out.extend_from_slice(rest);
+            break;
+        };
+        let len: usize = match std::str::from_utf8(&rest[..space]).ok().and_then(|text| text.parse().ok()) {
+            Some(len) => len,
+            None => {
+                out.extend_from_slice(rest);
+                break;
+            }
+        };
+        if len == 0 || len > rest.len() {
+            out.extend_from_slice(rest);
+            break;
+        }
+        let record = &rest[..len];
+        rest = &rest[len..];
+        if !record.ends_with(b"\n") {
+            out.extend_from_slice(record);
+            continue;
+        }
+        let body = &record[space + 1..record.len() - 1];
+        if body.strip_prefix(b"path=").is_none() {
+            out.extend_from_slice(record);
+            continue;
+        }
+        out.extend_from_slice(&ext_record_bytes("path", path));
+        replaced = true;
+    }
+    if !replaced {
+        out.extend_from_slice(&ext_record_bytes("path", path));
+    }
+    out
+}
+
+/// Whether a member path survives path limiting: an exact hit or anything
+/// beneath a named directory (trailing slashes already trimmed).
+fn path_kept(name: &[u8], paths: &[String]) -> bool {
+    let name = name.strip_suffix(b"/").unwrap_or(name);
+    paths.is_empty()
+        || paths.iter().any(|wanted| {
+            let wanted = wanted.as_bytes();
+            name == wanted
+                || (name.len() > wanted.len()
+                    && name.starts_with(wanted)
+                    && name[wanted.len()] == b'/')
+        })
+}
+
+/// Rewrites a streamed tar client-side: `prefix` (with its trailing slash)
+/// is prepended to every member name, and `paths` drops every member
+/// outside the named files and directories. The `g` global header is not
+/// a member and passes through verbatim; `x` pax headers follow the entry
+/// they describe and their `path` records track the rename.
+fn rewrap_archive_tar(
+    tar: Vec<u8>,
+    prefix: Option<&[u8]>,
+    paths: &[String],
+) -> Result<Vec<u8>, GitError> {
+    let corrupt = |detail: String| GitError::Corrupt { detail };
+    let mut members: Vec<(TarMember, u8)> = Vec::new();
+    let mut pos = 0;
+    while pos + 512 <= tar.len() {
+        let mut header = [0u8; 512];
+        header.copy_from_slice(&tar[pos..pos + 512]);
+        pos += 512;
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        if header[257..263] != *b"ustar\0" {
+            return Err(corrupt("archive member is not a ustar header".to_owned()));
+        }
+        let size = usize::try_from(parse_octal(&header[124..136], "size")?)
+            .map_err(|_| corrupt("archive member size overflows".to_owned()))?;
+        let padded = size.div_ceil(512) * 512;
+        if pos + padded > tar.len() {
+            return Err(corrupt("archive member runs past the stream".to_owned()));
+        }
+        let data = tar[pos..pos + size].to_vec();
+        pos += padded;
+        let typeflag = header[156];
+        members.push((TarMember { header, data }, typeflag));
+    }
+    // `names` holds every described member's logical path (`None` for the
+    // `x` headers, which name no member): the `path` record beside a
+    // member wins over its (possibly truncated) header fields per POSIX.
+    // The keep passes below read only these plus the flags.
+    let mut names: Vec<Option<Vec<u8>>> = Vec::with_capacity(members.len());
+    let mut held_path: Option<Vec<u8>> = None;
+    for (member, typeflag) in &members {
+        if *typeflag == b'x' {
+            if let Some(path) = pax_path_record(&member.data) {
+                held_path = Some(path);
+            }
+            names.push(None);
+            continue;
+        }
+        if *typeflag == b'g' {
+            names.push(Some(header_name(&member.header)));
+            continue;
+        }
+        let path = match held_path.take() {
+            Some(path) => path,
+            None => header_name(&member.header),
+        };
+        names.push(Some(path));
+    }
+    let is_dir = |index: usize| members[index].1 == b'5';
+    let under = |dir: &[u8], peer: &[u8]| {
+        peer.len() > dir.len() && peer.starts_with(dir) && peer[dir.len()] == b'/'
+    };
+    // Files (and symlinks, gitlinks-as-dirs aside) pass on a direct hit;
+    // directories pass on a hit or when they parent a passing file.
+    let mut file_kept = vec![false; members.len()];
+    for index in 0..members.len() {
+        if members[index].1 == b'g' || members[index].1 == b'x' {
+            continue;
+        }
+        let Some(name) = &names[index] else {
+            return Err(corrupt("archive member has no name".to_owned()));
+        };
+        if !is_dir(index) && path_kept(name, paths) {
+            file_kept[index] = true;
+        }
+    }
+    let mut keep = vec![false; members.len()];
+    for index in 0..members.len() {
+        let typeflag = members[index].1;
+        if typeflag == b'g' {
+            keep[index] = true;
+            continue;
+        }
+        if typeflag == b'x' {
+            continue;
+        }
+        let Some(name) = &names[index] else {
+            return Err(corrupt("archive member has no name".to_owned()));
+        };
+        if path_kept(name, paths) {
+            keep[index] = true;
+            continue;
+        }
+        if !is_dir(index) {
+            continue;
+        }
+        let dir = name.strip_suffix(b"/").unwrap_or(name);
+        keep[index] = file_kept
+            .iter()
+            .enumerate()
+            .filter(|(_, kept)| **kept)
+            .any(|(other, _)| {
+                names[other].as_ref().is_some_and(|peer| {
+                    let peer = peer.strip_suffix(b"/").unwrap_or(peer);
+                    under(dir, peer)
+                })
+            });
+    }
+    // An `x` header passes with the entry it describes (the next non-`x`
+    // member); consecutive headers merge onto the same entry.
+    for index in 0..members.len() {
+        if members[index].1 != b'x' {
+            continue;
+        }
+        keep[index] = members
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find(|(_, (_, flag))| *flag != b'x')
+            .is_some_and(|(next, _)| keep[next]);
+    }
+    // Pax headers buffer in memory until their entry arrives, so a
+    // synthesized header for an unsplittable rename emits the same way.
+    let mut out = Vec::with_capacity(tar.len() + 512);
+    let mut pending: Option<TarMember> = None;
+    for (index, (mut member, _)) in members.into_iter().enumerate() {
+        if member.header[156] == b'x' {
+            if keep[index] {
+                match pending.as_mut() {
+                    Some(first) => first.data.extend_from_slice(&member.data),
+                    None => pending = Some(member),
+                }
+            }
+            continue;
+        }
+        // The global header is not a member: it passes through verbatim,
+        // never renamed or filtered.
+        if member.header[156] == b'g' {
+            emit_member(&mut out, &member);
+            continue;
+        }
+        if !keep[index] {
+            pending = None;
+            continue;
+        }
+        let synth = match prefix {
+            Some(prefix) => rename_member(&mut member, &mut pending, prefix),
+            None => None,
+        };
+        if let Some(synth) = synth {
+            emit_member(&mut out, &synth);
+        }
+        if let Some(header) = pending.take() {
+            emit_member(&mut out, &header);
+        }
+        emit_member(&mut out, &member);
+    }
+    out.extend_from_slice(&[0u8; 1024]);
+    Ok(out)
+}
+
+/// Appends one member with its padding.
+fn emit_member(out: &mut Vec<u8>, member: &TarMember) {
+    out.extend_from_slice(&member.header);
+    out.extend_from_slice(&member.data);
+    let pad = member.data.len().div_ceil(512) * 512 - member.data.len();
+    out.extend_from_slice(&vec![0u8; pad]);
+}
+
+/// Prepends `prefix` to a member's name and returns a synthesized pax
+/// header when the longer name no longer splits across the ustar fields.
+/// A buffered header describing the member gains (or rewrites) its `path`
+/// record and the visible header keeps a truncated placeholder the record
+/// overrides per POSIX; without one the header fields move when the name
+/// splits, else the synthesized header carries it.
+fn rename_member(
+    member: &mut TarMember,
+    pending: &mut Option<TarMember>,
+    prefix: &[u8],
+) -> Option<TarMember> {
+    let logical = pending
+        .as_ref()
+        .and_then(|describer| pax_path_record(&describer.data))
+        .unwrap_or_else(|| header_name(&member.header));
+    let trailing_slash = logical.ends_with(b"/");
+    let stem = logical.strip_suffix(b"/").unwrap_or(&logical);
+    let mut renamed = prefix.to_vec();
+    renamed.extend_from_slice(stem);
+    if trailing_slash {
+        renamed.push(b'/');
+    }
+    if let Some(describer) = pending {
+        describer.data = set_pax_path(&describer.data, &renamed);
+        octal_into(
+            &mut describer.header[124..136],
+            describer.data.len() as u64,
+        );
+        checksum_header(&mut describer.header);
+        truncate_header(&mut member.header, &renamed);
+        checksum_header(&mut member.header);
+        return None;
+    }
+    if let Some((name_prefix, name)) = split_tar_name(&renamed) {
+        write_split_name(&mut member.header, name_prefix, name);
+        checksum_header(&mut member.header);
+        return None;
+    }
+    let record = ext_record_bytes("path", &renamed);
+    truncate_header(&mut member.header, &renamed);
+    checksum_header(&mut member.header);
+    Some(TarMember {
+        header: pax_header_bytes(&record),
+        data: record,
+    })
+}
+
+/// Writes ustar name/prefix fields, zeroing the previous contents first.
+fn write_split_name(header: &mut [u8; 512], name_prefix: &[u8], name: &[u8]) {
+    header[..100].fill(0);
+    header[345..500].fill(0);
+    header[..name.len()].copy_from_slice(name);
+    header[345..345 + name_prefix.len()].copy_from_slice(name_prefix);
+}
+
+/// Truncates a header's visible name to what fits; a pax `path` record
+/// beside it stays authoritative per POSIX.
+fn truncate_header(header: &mut [u8; 512], renamed: &[u8]) {
+    header[..100].fill(0);
+    header[345..500].fill(0);
+    let shown = &renamed[..renamed.len().min(100)];
+    header[..shown.len()].copy_from_slice(shown);
+}
+
+/// Builds one `%u %s=%s\n` pax record with its self-counting length: the
+/// width iterates to its fixed point (at most two rounds, since the width
+/// only grows into wider digit counts).
+fn ext_record_bytes(keyword: &str, value: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(value);
+    let mut record = format!("0 {keyword}={text}\n");
+    loop {
+        let width = record.len();
+        let next = format!("{width} {keyword}={text}\n");
+        if next.len() == width {
+            return next.into_bytes();
+        }
+        record = next;
+    }
+}
+
+/// Builds a 512-byte `x` pax header for `record` bytes of data.
+fn pax_header_bytes(record: &[u8]) -> [u8; 512] {
+    let mut header = [0u8; 512];
+    let name = b"paxheader";
+    header[..name.len()].copy_from_slice(name);
+    octal_into(&mut header[100..108], 0o100666);
+    octal_into(&mut header[124..136], record.len() as u64);
+    header[156] = b'x';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header[265..269].copy_from_slice(b"root");
+    header[297..301].copy_from_slice(b"root");
+    checksum_header(&mut header);
+    header
+}
+
+/// Writes a zero-padded octal field with its NUL terminator, mirroring
+/// the server half.
+fn octal_into(field: &mut [u8], value: u64) {
+    let digits = field.len() - 1;
+    let text = format!("{value:0digits$o}");
+    let bytes = text.as_bytes();
+    let n = bytes.len().min(digits);
+    field[..n].copy_from_slice(&bytes[..n]);
 }
 
 /// Archives one revision of a local store through the `upload-archive`
@@ -2604,6 +3113,7 @@ fn render_ls_remote(
     line(out)
 }
 
+
 #[cfg(test)]
 mod archive_rewrap_tests {
     use super::*;
@@ -2620,14 +3130,26 @@ mod archive_rewrap_tests {
         header[263..265].copy_from_slice(b"00");
         checksum_header(&mut header);
         let mut out = header.to_vec();
-        emit_member(
-            &mut out,
-            &TarMember {
-                header: [0u8; 512],
-                data: data.to_vec(),
-            },
-        );
-        out[..512].copy_from_slice(&header);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&vec![0u8; data.len().div_ceil(512) * 512 - data.len()]);
+        out
+    }
+
+    /// Builds a member with literal header name bytes, the way the server
+    /// shapes unsplittable names (truncated visible name, the `x` record
+    /// authoritative).
+    fn raw_member(name_field: &[u8], typeflag: u8, data: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        header[..name_field.len()].copy_from_slice(name_field);
+        octal_into(&mut header[100..108], 0o644);
+        octal_into(&mut header[124..136], data.len() as u64);
+        header[156] = typeflag;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        checksum_header(&mut header);
+        let mut out = header.to_vec();
+        out.extend_from_slice(data);
+        out.extend_from_slice(&vec![0u8; data.len().div_ceil(512) * 512 - data.len()]);
         out
     }
 
@@ -2682,7 +3204,14 @@ mod archive_rewrap_tests {
         assert_eq!(members[0].0, b'g');
         assert_eq!(members[0].1, b"pax_global_header");
         let named: Vec<Vec<u8>> = members[1..].iter().map(|(_, path, _)| path.clone()).collect();
-        assert_eq!(named, vec![b"lead/a.txt", b"lead/sub/", b"lead/sub/b.txt"]);
+        assert_eq!(
+            named,
+            vec![
+                b"lead/a.txt".to_vec(),
+                b"lead/sub/".to_vec(),
+                b"lead/sub/b.txt".to_vec()
+            ]
+        );
         assert_eq!(members[1].2, b"a\n");
     }
 
@@ -2703,12 +3232,11 @@ mod archive_rewrap_tests {
 
     #[test]
     fn rewrap_prefix_tracks_pax_records() {
-        let long: Vec<u8> = core::iter::repeat(b'n').take(120).collect();
-        let mut sub_path = b"sub/".to_vec();
-        sub_path.extend_from_slice(&long);
+        // No slash: unsplittable, so the `x` path record carries the name.
+        let sub_path: Vec<u8> = core::iter::repeat(b'n').take(120).collect();
         let record = ext_record_bytes("path", &sub_path);
         let mut tar = member_bytes(b"h.paxheader", b'x', &record);
-        tar.extend_from_slice(&member_bytes(&sub_path, b'0', b"data\n"));
+        tar.extend_from_slice(&raw_member(&sub_path[..100], b'0', b"data\n"));
         tar.extend_from_slice(&[0u8; 1024]);
         let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
         let members = logical(&out);
