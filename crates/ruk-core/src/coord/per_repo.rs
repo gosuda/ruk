@@ -27,8 +27,8 @@
 //! served; anything else is refused at the handshake.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -225,7 +225,8 @@ pub async fn recv_frame(stream: &mut Outgoing, deadline: Instant) -> Result<Vec<
 /// # Errors
 /// `E_INVALID` when the value cannot be encoded.
 pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
-    sonic_rs::to_vec(value).map_err(|err| CoreError::new(ErrorCode::EInvalid, format!("frame encode: {err}")))
+    sonic_rs::to_vec(value)
+        .map_err(|err| CoreError::new(ErrorCode::EInvalid, format!("frame encode: {err}")))
 }
 
 /// Decodes one JSON frame body.
@@ -344,10 +345,11 @@ impl Server {
     }
 
     fn live_burst(&self) -> Option<(Arc<HostedCoordinator>, SessionId)> {
-        self.burst
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|burst| (Arc::clone(&burst.coord), burst.session)))
+        self.burst.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|burst| (Arc::clone(&burst.coord), burst.session))
+        })
     }
 
     /// Opens (or resumes) the persistent CLI session for one burst.
@@ -398,7 +400,7 @@ impl Server {
             self.owner.clone(),
             self.store_dir.clone(),
         )?);
-                let runner = coord.spawn_on(&tokio::runtime::Handle::current())?;
+        let runner = coord.spawn_on(&tokio::runtime::Handle::current())?;
         let session = self.ensure_session(&coord).await?;
         self.note_burst();
         // One atomic install: whoever finds a live burst keeps it and
@@ -423,7 +425,10 @@ impl Server {
                 }
             }
             Err(_) => {
-                return Err(CoreError::new(ErrorCode::EIo, "coordinator burst lock poisoned"));
+                return Err(CoreError::new(
+                    ErrorCode::EIo,
+                    "coordinator burst lock poisoned",
+                ));
             }
         };
         if raced {
@@ -432,7 +437,10 @@ impl Server {
                 let _ = mine.runner.await;
             }
             return self.live_burst().ok_or_else(|| {
-                CoreError::new(ErrorCode::EIo, "coordinator burst vanished under contention")
+                CoreError::new(
+                    ErrorCode::EIo,
+                    "coordinator burst vanished under contention",
+                )
             });
         }
         Ok((coord, session))
@@ -441,7 +449,11 @@ impl Server {
     /// Drains and retires the live burst, releasing the store lock, and
     /// folds its durability barriers into the run totals.
     async fn retire_burst(&self) {
-        let burst = self.burst.lock().map(|mut guard| guard.take()).unwrap_or(None);
+        let burst = self
+            .burst
+            .lock()
+            .map(|mut guard| guard.take())
+            .unwrap_or(None);
         if let Some(burst) = burst {
             burst.coord.shutdown();
             let _ = burst.runner.await;
@@ -533,7 +545,9 @@ impl Server {
         let reply = match coord.prepare_for_dispatch(session, call.body.clone(), &allow)? {
             DispatchReady::Replay(reply) => reply,
             DispatchReady::Prepared(prepared) => {
-                coord.submit_prepared(&self.owner, prepared, &self.cancel).await?
+                coord
+                    .submit_prepared(&self.owner, prepared, &self.cancel)
+                    .await?
             }
         };
         Ok(ok_answer(&id, reply))
@@ -621,7 +635,10 @@ pub async fn cli_serve(
             }
             let _ = std::fs::remove_file(&sock);
             tokio::net::UnixListener::bind(&sock).map_err(|err| {
-                CoreError::new(ErrorCode::EIo, format!("coordinator bind {}: {err}", sock.display()))
+                CoreError::new(
+                    ErrorCode::EIo,
+                    format!("coordinator bind {}: {err}", sock.display()),
+                )
             })?
         }
     };
@@ -697,7 +714,11 @@ pub async fn cli_serve(
             }
         }
     }
-    let stats = server.stats.lock().map(|stats| stats.clone()).unwrap_or_default();
+    let stats = server
+        .stats
+        .lock()
+        .map(|stats| stats.clone())
+        .unwrap_or_default();
     let _ = write_stats_sidecar(&store_dir, &stats);
     // Unlink before releasing the lock: the next owner must find a free
     // path the moment this lock goes free, never a stale file to probe.
@@ -738,7 +759,6 @@ pub async fn cli_serve(
 
 fn write_stats_sidecar(store_dir: &Path, stats: &ServeStats) -> Result<(), CoreError> {
     let bytes = encode_frame(stats)?;
-    std::fs::write(store_dir.join("coordinator.stats"), bytes).map_err(|err| {
-        CoreError::new(ErrorCode::EIo, format!("coordinator stats: {err}"))
-    })
+    std::fs::write(store_dir.join("coordinator.stats"), bytes)
+        .map_err(|err| CoreError::new(ErrorCode::EIo, format!("coordinator stats: {err}")))
 }

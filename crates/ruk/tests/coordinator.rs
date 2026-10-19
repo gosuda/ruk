@@ -22,9 +22,15 @@ fn ruk_bin() -> PathBuf {
 fn base_env() -> Vec<(String, String)> {
     vec![
         ("GIT_AUTHOR_NAME".to_owned(), "Coord Test".to_owned()),
-        ("GIT_AUTHOR_EMAIL".to_owned(), "coord@test.invalid".to_owned()),
+        (
+            "GIT_AUTHOR_EMAIL".to_owned(),
+            "coord@test.invalid".to_owned(),
+        ),
         ("GIT_COMMITTER_NAME".to_owned(), "Coord Test".to_owned()),
-        ("GIT_COMMITTER_EMAIL".to_owned(), "coord@test.invalid".to_owned()),
+        (
+            "GIT_COMMITTER_EMAIL".to_owned(),
+            "coord@test.invalid".to_owned(),
+        ),
         // Widen the store group-commit window so racing publications share
         // one durability transaction deterministically.
         ("RUK_COMMIT_LINGER_MS".to_owned(), "50".to_owned()),
@@ -33,7 +39,8 @@ fn base_env() -> Vec<(String, String)> {
 
 fn run(repo: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(ruk_bin());
-    cmd.arg("--git-dir")
+    cmd.arg("git")
+        .arg("--git-dir")
         .arg(repo.join(".ruk"))
         .args(args)
         .current_dir(repo)
@@ -56,12 +63,7 @@ fn run(repo: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, Stri
 
 fn fresh_repo(tag: &str) -> PathBuf {
     let id = REPO_SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "ruk-coord-{}-{}-{}",
-        tag,
-        std::process::id(),
-        id
-    ));
+    let dir = std::env::temp_dir().join(format!("ruk-coord-{}-{}-{}", tag, std::process::id(), id));
     if dir.exists() {
         std::fs::remove_dir_all(&dir).expect("clear stale repo");
     }
@@ -87,7 +89,9 @@ fn stat_field(repo: &Path, field: &str) -> u64 {
         .expect("coordinator stats proof file");
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let marker = format!("\"{field}\":");
-    let start = text.find(&marker).unwrap_or_else(|| panic!("{field} in {text}"));
+    let start = text
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{field} in {text}"));
     text[start + marker.len()..]
         .trim_start()
         .split(|ch: char| !ch.is_ascii_digit())

@@ -22,12 +22,12 @@
 //! `git/builtin/show-ref.c`, `git/builtin/for-each-ref.c`,
 //! `git/builtin/tag.c`, `git/builtin/stash.c`.
 
+use ruk_core::change::RequestId;
 use ruk_core::commit::CommitRecord;
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
-use ruk_core::change::RequestId;
 use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::refs::{ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog};

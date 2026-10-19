@@ -119,14 +119,13 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
-    GitCommitArgs,
     ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
-    EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, LandPrepareArgs,
-    LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply, RebaseArgs,
-    RebaseScope, ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs, SquashArgs,
-    TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply,
-    Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs,
-    WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
+    EditReply, EffectiveIdentity, GitCommitArgs, HeadRewrite, IdentityClaim, IdentitySource,
+    LandPrepareArgs, LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply,
+    RebaseArgs, RebaseScope, ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs,
+    SquashArgs, TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs,
+    UnpinReply, Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply,
+    WsNewArgs, WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
     Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
@@ -136,7 +135,9 @@ use crate::records::Records;
 use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::head_key;
 use crate::records::types::{ChangeEntry, ChangeState};
-use crate::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate};
+use crate::refdata::{
+    RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
+};
 use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked};
 use crate::store::ObjectKind;
 use crate::store::Store;
@@ -3717,12 +3718,12 @@ mod tests {
         AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
         BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
         ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs,
-        GitCommitArgs, GitCommitRefUpdate,
-        IdentityClaim, LandExecuteArgs, LandPrepareArgs, MergeSelection, Mutation as WireMutation,
-        NewArgs, OpLogArgs, PathSelection, PinArgs, PushArgs, PushAtomicity, PushReconcileArgs,
-        PushSource, PushUpdate, RebaseArgs, RebaseScope, RemoteName, RemoteSpec, Resolution,
-        ResolveArgs, RevertArgs, SessionAuthority, SplitArgs, SplitPlacement, SquashArgs,
-        TagAnnotation, UnpinArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
+        GitCommitArgs, GitCommitRefUpdate, IdentityClaim, LandExecuteArgs, LandPrepareArgs,
+        MergeSelection, Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection, PinArgs,
+        PushArgs, PushAtomicity, PushReconcileArgs, PushSource, PushUpdate, RebaseArgs,
+        RebaseScope, RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
+        SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding,
+        WorkspaceInit, WsNewArgs,
     };
     use crate::records::codec::encode_change_entry;
     use crate::records::keys::change_key;

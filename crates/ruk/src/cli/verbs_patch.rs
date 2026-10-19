@@ -23,13 +23,13 @@
 
 use std::collections::BTreeMap;
 
+use ruk_core::change::RequestId;
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage, StatData};
-use ruk_core::change::RequestId;
 use ruk_core::ops::NewRequest;
 use ruk_git::GitError;
 

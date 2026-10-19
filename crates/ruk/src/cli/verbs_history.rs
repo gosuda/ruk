@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use regex::bytes::Regex;
+use ruk_core::change::RequestId;
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::error::CoreError;
@@ -35,7 +36,6 @@ use ruk_core::merge::composed::host::ComposedRequest;
 use ruk_core::merge::composed::route::{MergeOutcome, merge_file};
 use ruk_core::merge::syntax::grammar::{Cancel, GrammarRegistry, dispatch};
 use ruk_core::merge::syntax::registry_providers;
-use ruk_core::change::RequestId;
 use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::ObjectKind as MergeLaneObjectKind;
@@ -2854,7 +2854,12 @@ fn merge_content(
         let theirs_tree = commit_tree_oid(&commit_record(store, tip)?)?;
         let staged = take_tree_state(ctx, ours_tree, theirs_tree)?;
         let tree = build_index_tree(store, kind, &staged)?;
-        let new_oid = lane_commit(ctx, tree, vec![current, tip], message.unwrap_or(default_message))?;
+        let new_oid = lane_commit(
+            ctx,
+            tree,
+            vec![current, tip],
+            message.unwrap_or(default_message),
+        )?;
         let store = ctx.store()?;
         pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
         pseudo_delete(store, "abort-index/merge")?;
@@ -2882,7 +2887,12 @@ fn merge_content(
         return Err(merge_conflict_error(&plan));
     }
     let tree = build_index_tree(store, kind, &staged)?;
-    let new_oid = lane_commit(ctx, tree, vec![current, tip], message.unwrap_or(default_message))?;
+    let new_oid = lane_commit(
+        ctx,
+        tree,
+        vec![current, tip],
+        message.unwrap_or(default_message),
+    )?;
     let store = ctx.store()?;
     pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
     pseudo_delete(store, "abort-index/merge")?;
