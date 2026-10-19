@@ -24,18 +24,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ruk_core::change::RequestId;
-use ruk_core::coord::per_repo::{self, CommitAnswer, CommitCall, ServeOutcome, socket_path};
+use ruk_core::coord::per_repo::{self, CommitAnswer, CommitCall, ServeOutcome};
+#[cfg(all(unix, not(test)))]
+use ruk_core::coord::per_repo::socket_path;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::ops::{EditRequest, NewRequest, NewResult, edit as ops_edit, new as ops_new, prepare_new};
+use ruk_core::ops::{
+    EditRequest, NewRequest, NewResult, edit as ops_edit, new as ops_new, prepare_new,
+};
 use ruk_core::protocol::{GitCommitArgs, GitCommitRefUpdate, Mutation, NewReply, Reply, Request};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::{PreparationBudget, Store};
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
-use super::state;
 use super::Ctx;
+use super::state;
 
 /// Coordinator selection for this invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,11 +266,12 @@ pub(crate) fn commit_stash(
             Remote::Direct => return direct_stash(ctx, request),
             Remote::Uncertain => {
                 if let Some(landed) = landed_output(ctx, &request, &args)? {
-                    return landed.oid.or_else(|| landed.head.as_git().copied()).ok_or_else(
-                        || GitError::Invalid {
+                    return landed
+                        .oid
+                        .or_else(|| landed.head.as_git().copied())
+                        .ok_or_else(|| GitError::Invalid {
                             detail: "stash commit has no git identity".to_owned(),
-                        },
-                    );
+                        });
                 }
                 return direct_stash(ctx, request);
             }
@@ -330,7 +335,11 @@ fn commit_via_coordinator(
 }
 
 /// Publishes without the lane, preserving the caller's operation shape.
-fn publish_direct(ctx: &mut Ctx, request: NewRequest, direct: Direct) -> Result<NewResult, GitError> {
+fn publish_direct(
+    ctx: &mut Ctx,
+    request: NewRequest,
+    direct: Direct,
+) -> Result<NewResult, GitError> {
     match direct {
         Direct::New { expected } => direct_commit(ctx, request, expected),
         Direct::Amend {
@@ -535,7 +544,11 @@ enum Remote {
 /// Submits through the sidecar, restoring the caller's store first on every
 /// path. The store is dropped across the round trip so the server can
 /// burst-open it without waiting on this process's lock.
-fn try_remote(ctx: &mut Ctx, args: &GitCommitArgs, request_id: RequestId) -> Result<Remote, GitError> {
+fn try_remote(
+    ctx: &mut Ctx,
+    args: &GitCommitArgs,
+    request_id: RequestId,
+) -> Result<Remote, GitError> {
     let root = ctx.root.clone();
     let store_dir = root.join(".ruk");
     ctx.store.take();
@@ -582,24 +595,22 @@ fn remote_round(
 }
 
 /// Maps a lane answer onto the caller's next step.
+///
+/// Only success and the lost-race retry settle here. Every other refusal
+/// resolves as uncertain: a failed burst open or an ambiguous store failure
+/// may still have committed, so the landed check runs before any direct
+/// publish (or any required-mode failure).
 fn settle(answer: CommitAnswer) -> Result<Remote, GitError> {
     if answer.ok {
         return match answer.body {
             Some(Reply::GitCommit(boxed)) => Ok(Remote::Done(*boxed)),
-            Some(_) => Err(GitError::Io {
-                detail: "coordinator answered another method's reply".to_owned(),
-            }),
-            None => Err(GitError::Io {
-                detail: "coordinator answered ok without a body".to_owned(),
-            }),
+            Some(_) => Ok(Remote::Uncertain),
+            None => Ok(Remote::Uncertain),
         };
     }
-    let detail = answer.message.unwrap_or_else(|| "coordinator refused".to_owned());
     match answer.code.as_deref() {
         Some("EStale") => Ok(Remote::Stale),
-        Some("ENotFound") => Err(GitError::NotFound { detail }),
-        Some("EInvalid") => Err(GitError::Invalid { detail }),
-        _ => Err(GitError::Io { detail }),
+        _ => Ok(Remote::Uncertain),
     }
 }
 
@@ -640,8 +651,11 @@ async fn round(
         request_id,
         args: args.clone(),
     }));
-    let bytes = per_repo::encode_frame(&CommitCall { v: 1, body: request })
-        .map_err(|_| Phase::Pre)?;
+    let bytes = per_repo::encode_frame(&CommitCall {
+        v: 1,
+        body: request,
+    })
+    .map_err(|_| Phase::Pre)?;
     // A send error may still have reached the server, so a retry replays
     // the same id instead of publishing directly.
     per_repo::send_frame(&mut stream, &bytes, far)
@@ -657,6 +671,11 @@ async fn round(
 
 /// Starts a detached server for the repository; the socket file is the
 /// rendezvous, so callers poll it instead of supervising the child.
+///
+/// Unit tests never spawn: the test binary is not a coordinator, so an
+/// in-process commit would wait out the full rendezvous before falling
+/// back. Integration tests drive the real binary and spawn normally.
+#[cfg(not(test))]
 fn spawn_server(store_dir: &Path) {
     let root = store_dir.parent().map(Path::to_path_buf);
     let exe = std::env::var("RUK_COORDINATOR_BIN")
@@ -667,6 +686,7 @@ fn spawn_server(store_dir: &Path) {
         return;
     };
     let _ = std::process::Command::new(exe)
+        .arg("git")
         .arg("coordinator")
         .arg(root)
         .stdin(std::process::Stdio::null())
@@ -676,9 +696,13 @@ fn spawn_server(store_dir: &Path) {
     wait_socket(store_dir);
 }
 
+#[cfg(test)]
+fn spawn_server(_store_dir: &Path) {}
+
 /// Polls for a connectable socket after a spawn. Unix only: elsewhere the
 /// coordinator cannot serve, so spawns simply fall back to direct publish.
-#[cfg(unix)]
+/// Never compiled into unit tests, where spawning is stubbed out.
+#[cfg(all(unix, not(test)))]
 fn wait_socket(store_dir: &Path) {
     let sock = socket_path(store_dir);
     let end = std::time::Instant::now() + SPAWN_WAIT;
@@ -696,9 +720,12 @@ fn wait_socket(_store_dir: &Path) {}
 /// Serves this repository's coordinator sidecar until its idle TTL lapses.
 /// Hidden: `ruk coordinator <repo>`.
 pub(crate) fn serve(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let repo = args.iter().find(|arg| !arg.starts_with('-')).ok_or_else(|| GitError::Invalid {
-        detail: "usage: ruk coordinator <repo>".to_owned(),
-    })?;
+    let repo = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .ok_or_else(|| GitError::Invalid {
+            detail: "usage: ruk coordinator <repo>".to_owned(),
+        })?;
     let repo = PathBuf::from(repo);
     let store_dir = if repo.join(".ruk").is_dir() {
         repo.join(".ruk")
@@ -717,7 +744,10 @@ pub(crate) fn serve(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         .map_err(|err| GitError::Io {
             detail: format!("coordinator runtime: {err}"),
         })?;
-    match runtime.block_on(per_repo::cli_serve(store_dir, Duration::from_millis(idle_ms))) {
+    match runtime.block_on(per_repo::cli_serve(
+        store_dir,
+        Duration::from_millis(idle_ms),
+    )) {
         Ok((ServeOutcome::Idle, _)) | Ok((ServeOutcome::AlreadyRunning, _)) => Ok(Vec::new()),
         Err(err) => Err(GitError::from(err)),
     }
