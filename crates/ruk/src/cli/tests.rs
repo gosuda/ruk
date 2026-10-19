@@ -7399,6 +7399,6 @@ fn wave_j_status_verbose_column_renames() {
     let out = run(verbs_stage::status, &mut ctx, &["-vv"]).expect("grouped vv");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(text.contains("Changes to be committed:\n"), "vv header: {text}");
-    assert!(text.contains("diff --git a/g.txt b/g.txt\n"), "vv diff: {text}");
+    assert!(text.contains("diff --git a/f.txt b/g.txt\n"), "vv diff: {text}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
