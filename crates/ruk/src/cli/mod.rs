@@ -27,6 +27,7 @@ pub(crate) mod dispatch;
 pub(crate) mod state;
 pub(crate) mod tree;
 pub(crate) mod verbs_branch;
+pub(crate) mod verbs_bundle;
 pub(crate) mod verbs_grep;
 pub(crate) mod verbs_history;
 pub(crate) mod verbs_meta;

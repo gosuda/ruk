@@ -174,6 +174,16 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     let src = opts.positionals.first().ok_or_else(|| GitError::Invalid {
         detail: "clone needs a source repository".to_owned(),
     })?;
+    // Bundle files clone through the bundle lane, not the local-store
+    // lane: the source is a pack plus header, not a repository.
+    let candidate = if std::path::Path::new(src.as_str()).is_absolute() {
+        std::path::PathBuf::from(src.as_str())
+    } else {
+        ctx.env.cwd.join(src.as_str())
+    };
+    if super::verbs_bundle::is_bundle_file(&candidate) {
+        return super::verbs_bundle::clone_bundle(ctx, candidate, &opts);
+    }
     let origin = opts
         .single("origin")?
         .unwrap_or_else(|| "origin".to_owned());

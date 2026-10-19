@@ -8,6 +8,7 @@
 use ruk_git::GitError;
 
 use super::verbs_branch;
+use super::verbs_bundle;
 use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_meta;
@@ -59,7 +60,7 @@ pub(crate) static VERBS: &[Verb] = &[
         oracle: "git/builtin/bundle.c",
         needs_repo: true,
         summary: "Move objects and refs by archive",
-        run: verbs_transport::bundle,
+        run: verbs_bundle::bundle,
     },
     Verb {
         name: "cat-file",
