@@ -1,6 +1,6 @@
 # CLI verb status
 
-90 verbs, one row each. Statuses: **implemented** (real native-store
+94 verbs, one row each. Statuses: **implemented** (real native-store
 transitions), **partial** (resolves and validates, then completes only the
 cases its backing covers), **unsupported** (typed `Unsupported` with the
 reason; exit code 1 through `GitError::exit_code`).
@@ -66,6 +66,8 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | credential | implemented | `fill`/`approve`/`reject` over stdin `key=value` descriptions through the configured helpers (`get`/`store`/`erase`); needs no repository |
 | describe | implemented | nearest tag by parent depth; `--tags`/`--exact-match`/`--long`/`--abbrev`/`--always` |
 | diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; `-M`/`--find-renames` pairs renames by similarity, merge lane tracks rename-plus-edit |
+| fast-export | implemented | `commit`/`blob`/`tag`/`reset` stream with `:mark` ids in topo order; ref args (default `HEAD` branch), `--all`, `--import-marks`/`--export-marks`; un-emitted tips ride as `reset` lines; trailing `done` |
+| fast-import | implemented | `blob`/`commit` (`M`/`D`/`R`/`C`/`deleteall`, `from`/`merge`, explicit idents or env fallback)/lightweight and annotated `tag`/`reset`; `data <n>` and `data <<eof`; `feature`/`option`/`checkpoint`/`progress` ignored; `ls`/`cat-blob`/`get-mark`/`alias` and `N` file ops are `Unsupported`; `--import-marks`/`--export-marks`; refs always overwritten, worktree untouched |
 | fetch | implemented | refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; local, `ssh://`, `git://`, smart-http v2→v0, dumb-http fetch fallback; `--lfs` pulls payloads for fetched tips under `LfsMode::Full` (mirror parity) |
 | fmt-merge-msg | implemented | subject from the `FETCH_HEAD` pseudo record; `-m`, `--log[=n]`/`--no-log`, `--stdin`/file |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
@@ -95,6 +97,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | pack-objects | implemented | self-contained pack v2 to `<base>.pack` or `--stdout`; stdin-only input (exact oids, or rev-list args with `--revs`, plus `--all`); `--thin` needs `--stdout` and stays full without receiver haves; `--no-thin`, `--delta-base-offset`/`--no-delta-base-offset` inert |
 | pull | implemented | local paths only; fetch plus fast-forward merge |
 | push | implemented | local, `ssh://`, `git://`, and smart/dumb-http; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
+| range-diff | implemented | pairs `A..B` against `C..D` by first-parent content fingerprint then subject (`=`/`!`/`<`/`>`); mapping lines only, no patch-of-patch hunks; `...` ranges refused |
 | read-tree | implemented | one-tree replace, `--empty`, `-m` two/three-tree (stages 1/2/3, no content merge), `--reset`, `-u` scoped checkout; one-tree `-m` only fast-forwards; `--prefix`, `--index-output`, `--trivial`, `--aggressive`, `--dry-run` are `Unsupported` |
 | rebase | implemented | `<upstream>` and `--onto <new> <upstream>` replay over the merge lane; `--continue`/`--skip`/`--abort`; drops merge commits; no branch switching |
 | receive-pack | implemented | serves pushes over stdin/stdout via `ruk receive-pack <dir>` and the `git-receive-pack` argv0 name; v0 wire |
@@ -102,6 +105,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | remote | implemented | backed by `remote.<name>.*` config records |
 | rerere | implemented | bare run replays recorded resolutions (staging stage zero) and records preimages/postimages under `cli/rerere/`; `status`/`diff`/`remaining`/`forget`/`clear`/`gc` (15d preimage / 60d resolved); ids hash conflict hunks, labels excluded; no `rerere.enabled` config |
 | replace | implemented | create (`-f`), `-l [<pattern>]`, `-d`; `refs/replace/*` redirects commit reads and history walks plus tip redirection in `log`/`blame`/`diff`/`checkout`; no graft/edit, no transfer over fetch/push/clone, `--no-replace-objects` stays inert |
+| request-pull | implemented | mail template with base, end subject, source url, oldest-first shortlog, and range diffstat; `-p` is `Unsupported` |
 | reset | implemented | `--soft`, `--mixed` (default), `--hard` with worktree sync, path form |
 | restore | implemented | `--staged`/`--worktree` (default worktree), `--source` |
 | rev-list | implemented | `--count`, `-n`/`--max-count` |

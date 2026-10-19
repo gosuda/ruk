@@ -1,4 +1,4 @@
-//! Verb table: the 90 advertised names and their handlers.
+//! Verb table: the 94 advertised names and their handlers.
 //!
 //! The shape mirrors `git.c:commands[]`: one row per verb with its oracle
 //! anchor, whether it needs a repository, a one-line summary, and the entry
@@ -11,6 +11,7 @@ use super::verbs_bisect;
 use super::verbs_blame;
 use super::verbs_branch;
 use super::verbs_bundle;
+use super::verbs_fastio;
 use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_merge_plumbing;
@@ -41,7 +42,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 90 advertised verbs in alphabetical order.
+/// The 94 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -224,6 +225,20 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Show changes between commits, commit and working tree, etc",
         run: verbs_history::diff,
+    },
+    Verb {
+        name: "fast-export",
+        oracle: "git/builtin/fast-export.c",
+        needs_repo: true,
+        summary: "Dump history as a fast-import stream",
+        run: verbs_fastio::fast_export,
+    },
+    Verb {
+        name: "fast-import",
+        oracle: "git/builtin/fast-import.c",
+        needs_repo: true,
+        summary: "Read a fast-import stream into the repository",
+        run: verbs_fastio::fast_import,
     },
     Verb {
         name: "fetch",
@@ -429,6 +444,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_transport::push,
     },
     Verb {
+        name: "range-diff",
+        oracle: "git/builtin/range-diff.c",
+        needs_repo: true,
+        summary: "Compare two commit ranges commit by commit",
+        run: verbs_fastio::range_diff,
+    },
+    Verb {
         name: "read-tree",
         oracle: "git/builtin/read-tree.c",
         needs_repo: true,
@@ -469,6 +491,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Create, list, and delete object replacements",
         run: verbs_notes::replace,
+    },
+    Verb {
+        name: "request-pull",
+        oracle: "git/builtin/request-pull.c",
+        needs_repo: true,
+        summary: "Print a pull-request mail template for a range",
+        run: verbs_fastio::request_pull,
     },
     Verb {
         name: "rerere",

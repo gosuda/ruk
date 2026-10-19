@@ -5509,3 +5509,196 @@ fn replace_list_force_delete() {
     assert!(err.to_string().contains("does not exist"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn fastio_import_creates_branch_history() {
+    let base = temp_base("fastio-import");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    let mut ctx = repo_ctx(&root, env);
+    ctx.env.stdin = Some(
+        b"blob\nmark :1\ndata 5\nhello\ncommit refs/heads/main\nmark :2\nauthor Ada <ada@example.invalid> 1700000000 +0000\ncommitter Ada <ada@example.invalid> 1700000000 +0000\ndata 12\nfirst import\nM 100644 :1 hello.txt\ndone\n"
+            .to_vec(),
+    );
+    run(verbs_fastio::fast_import, &mut ctx, &[]).expect("fast-import");
+    let head = String::from_utf8(
+        run(verbs_history::rev_parse, &mut ctx, &["refs/heads/main"]).expect("rev-parse"),
+    )
+    .expect("utf8");
+    let head = head.trim();
+    assert!(
+        head.len() == 40 || head.len() == 64,
+        "unexpected head {head:?}"
+    );
+    assert!(head.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let log = String::from_utf8(run(verbs_history::log, &mut ctx, &["--oneline"]).expect("log"))
+        .expect("utf8");
+    assert!(log.contains("first import"), "got {log:?}");
+    let body = String::from_utf8(
+        run(verbs_objects::cat_file, &mut ctx, &["-p", head]).expect("cat-file"),
+    )
+    .expect("utf8");
+    assert!(body.contains("first import"), "got {body:?}");
+    // The importer never touches the worktree: a checkout materializes it.
+    assert!(!root.join("hello.txt").exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn fastio_export_import_roundtrip() {
+    let (root, env) = seeded_repo("fastio-roundtrip", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"one\ntwo\n", "change two");
+    run(verbs_branch::tag, &mut ctx, &["v1"]).expect("tag");
+    let stream = run(verbs_fastio::fast_export, &mut ctx, &["--all"]).expect("export");
+    let text = String::from_utf8(stream.clone()).expect("utf8");
+    assert!(text.contains("commit refs/heads/main\nmark :"), "got {text:?}");
+    assert!(text.contains("\nblob\nmark :"), "got {text:?}");
+    assert!(text.contains("from :"), "got {text:?}");
+    assert!(text.contains("reset refs/tags/v1\n"), "got {text:?}");
+    assert!(text.ends_with("done\n"), "got {text:?}");
+    let before_log = run(verbs_history::log, &mut ctx, &["--oneline"]).expect("log");
+    let before_refs = run(verbs_branch::show_ref, &mut ctx, &[]).expect("show-ref");
+    let dest_base = temp_base("fastio-roundtrip-dest");
+    let dest_env = test_env(&dest_base);
+    let mut dest_ctx = Ctx {
+        store: None,
+        root: dest_base.clone(),
+        file_base: dest_base.clone(),
+        kind: None,
+        env: dest_env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut dest_ctx, &["repo".to_owned()]).expect("init");
+    let dest_root = dest_base.join("repo");
+    let mut dest_ctx = repo_ctx(&dest_root, dest_env);
+    dest_ctx.env.stdin = Some(stream);
+    run(verbs_fastio::fast_import, &mut dest_ctx, &[]).expect("import");
+    let after_log = run(verbs_history::log, &mut dest_ctx, &["--oneline"]).expect("log");
+    let after_refs = run(verbs_branch::show_ref, &mut dest_ctx, &[]).expect("show-ref");
+    assert_eq!(before_log, after_log);
+    assert_eq!(before_refs, after_refs);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(&dest_base);
+}
+
+#[test]
+fn fastio_export_marks_skip_known_objects() {
+    let (root, env) = seeded_repo("fastio-marks", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_fastio::fast_export, &mut ctx, &["--export-marks=marks.out"]).expect("export");
+    let marks = std::fs::read(root.join("marks.out")).expect("marks file");
+    let marks_text = String::from_utf8(marks).expect("utf8");
+    assert!(!marks_text.contains("refs/heads/main"), "marks hold oids, got {marks_text:?}");
+    assert!(marks_text.lines().all(|line| line.starts_with(':')), "got {marks_text:?}");
+    let again = run(
+        verbs_fastio::fast_export,
+        &mut ctx,
+        &["--import-marks=marks.out"],
+    )
+    .expect("re-export");
+    let text = String::from_utf8(again).expect("utf8");
+    // Every object is already known, so the tip rides a reset line and no
+    // commit or blob block is re-emitted.
+    assert!(text.contains("reset refs/heads/main\n"), "got {text:?}");
+    assert!(!text.contains("commit refs/heads/main\n"), "got {text:?}");
+    assert!(!text.contains("\nblob\n"), "got {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn fastio_range_diff_pairs_patches() {
+    let (root, env) = seeded_repo("fastio-range-diff", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"one\ntwo\n", "change two");
+    let base = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("base"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    let main = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("main"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side", &base]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "f.txt", b"one\ntwo\n", "change two");
+    let side = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("side"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    let same = String::from_utf8(
+        run(
+            verbs_fastio::range_diff,
+            &mut ctx,
+            &[&format!("{base}..{main}"), &format!("{base}..{side}")],
+        )
+        .expect("range-diff"),
+    )
+    .expect("utf8");
+    assert!(same.contains(" = "), "got {same:?}");
+    assert!(same.contains("change two"), "got {same:?}");
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side2", &base]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "f.txt", b"one\nTHREE\n", "change two");
+    let moved = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("moved"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    let changed = String::from_utf8(
+        run(
+            verbs_fastio::range_diff,
+            &mut ctx,
+            &[&format!("{base}..{main}"), &format!("{base}..{moved}")],
+        )
+        .expect("range-diff"),
+    )
+    .expect("utf8");
+    // Same subject but a different patch pairs with `!`.
+    assert!(changed.contains(" ! "), "got {changed:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn fastio_request_pull_template() {
+    let (root, env) = seeded_repo("fastio-request-pull", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"one\ntwo\n", "change two");
+    let start =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("start"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
+    let out = String::from_utf8(
+        run(
+            verbs_fastio::request_pull,
+            &mut ctx,
+            &[&start, "https://example.invalid/repo"],
+        )
+        .expect("request-pull"),
+    )
+    .expect("utf8");
+    assert!(out.contains(&format!("The following changes since commit {start}:")), "got {out:?}");
+    assert!(out.contains("are available in the Git repository at:"), "got {out:?}");
+    assert!(out.contains("https://example.invalid/repo"), "got {out:?}");
+    assert!(out.contains("change two"), "got {out:?}");
+    assert!(out.contains("f.txt"), "got {out:?}");
+    let err = run(
+        verbs_fastio::request_pull,
+        &mut ctx,
+        &["-p", &start, "https://example.invalid/repo"],
+    )
+    .expect_err("request-pull -p");
+    assert!(err.to_string().contains("request-pull -p"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
