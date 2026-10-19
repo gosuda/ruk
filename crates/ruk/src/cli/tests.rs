@@ -7051,14 +7051,26 @@ fn wave_j_commit_file_signoff_cleanup_template() {
     run(verbs_history::commit, &mut ctx, &[&"-F", &msg_arg, &"-s"]).expect("commit -F -s");
     assert_eq!(
         wave_j_head_message(&mut ctx),
-        "real subject\n\nbody text\n\nSigned-off-by: Ada <ada@example.invalid>\n"
+        "# comment\nreal subject\n\nbody text\n\nSigned-off-by: Ada <ada@example.invalid>\n"
     );
-    // A `#` subject strips to empty under the default cleanup ...
+    // Without an editor the default cleanup keeps `#` comments ...
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
-    let err = run(verbs_history::commit, &mut ctx, &["-m", "# gone"]).expect_err("stripped");
-    assert!(err.to_string().contains("empty commit message"), "{err}");
+    run(verbs_history::commit, &mut ctx, &["-m", "# gone"]).expect("kept comment");
+    assert_eq!(wave_j_head_message(&mut ctx), "# gone\n");
+    // ... while an explicit `--cleanup=strip` drops them ...
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "# stripped", "-m", "real", "--cleanup=strip"],
+    )
+    .expect("strip");
+    assert_eq!(wave_j_head_message(&mut ctx), "real\n");
     // ... but verbatim keeps it, and templates seed the message as-is.
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\nfive\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     run(
         verbs_history::commit,
         &mut ctx,
@@ -7066,7 +7078,7 @@ fn wave_j_commit_file_signoff_cleanup_template() {
     )
     .expect("verbatim");
     assert_eq!(wave_j_head_message(&mut ctx), "# keep me\n");
-    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\n").expect("modify");
+    std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\nfive\nsix\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     let tpl = root.join("tpl.txt");
     std::fs::write(&tpl, b"templated\n").expect("template");
@@ -7253,6 +7265,13 @@ fn wave_j_status_untracked_ignored() {
         String::from_utf8_lossy(&out).contains("!! debug.log\n"),
         "ignored shown"
     );
+    // A bare `-u` carries the oracle `all` default, not the absent-flag
+    // `normal` collapse.
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "-u"]).expect("bare u");
+    assert!(
+        String::from_utf8_lossy(&out).contains("?? sub/a.txt\n"),
+        "bare -u lists"
+    );
     let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "-uall"]).expect("all");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(text.contains("?? sub/a.txt\n"), "all lists: {text}");
@@ -7362,5 +7381,14 @@ fn wave_j_status_verbose_column_renames() {
         "unpaired: {}",
         String::from_utf8_lossy(&out)
     );
+    // Under `-z` the rename is `XY new\0old\0`, never `old -> new` text.
+    let out = run(verbs_stage::status, &mut ctx, &["--porcelain", "-z"]).expect("null rename");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("R  g.txt\0f.txt\0"), "nul rename: {text:?}");
+    // `-vv` heads the staged diff; the grouped spelling parses as two hits.
+    let out = run(verbs_stage::status, &mut ctx, &["-vv"]).expect("grouped vv");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("Changes to be committed:\n"), "vv header: {text}");
+    assert!(text.contains("diff --git a/g.txt b/g.txt\n"), "vv diff: {text}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
