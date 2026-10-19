@@ -3791,4 +3791,61 @@ mod archive_rewrap_tests {
         wanted.extend_from_slice(&name);
         assert_eq!(members[0].1, wanted);
     }
+
+    /// Builds a member with full control over mode and link target, the
+    /// fields `member_bytes` fixes for rewrap-only shapes. The mtime is the
+    /// fixed stamp the assertions below decode.
+    fn zip_member(name: &[u8], flag: u8, mode: u32, link: &[u8], data: &[u8]) -> Vec<u8> {
+        // 1_700_000_000 is Tue 2023-11-14 22:13:20 UTC, inside the DOS range.
+        let mtime = 1_700_000_000;
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name);
+        octal_into(&mut header[100..108], u64::from(mode));
+        let size = u64::try_from(data.len()).expect("test payload fits");
+        octal_into(&mut header[124..136], size);
+        octal_into(&mut header[136..148], mtime);
+        header[156] = flag;
+        header[157..157 + link.len()].copy_from_slice(link);
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        checksum_header(&mut header);
+        let mut out = header.to_vec();
+        out.extend_from_slice(data);
+        let pad = data.len().div_ceil(512) * 512 - data.len();
+        out.extend_from_slice(&vec![0u8; pad]);
+        out
+    }
+
+    #[test]
+    fn zip_transcode_keeps_kinds_modes_and_mtimes() {
+        use std::io::Read as _;
+
+        let mut tar = zip_member(b"f.txt", b'0', 0o100644, b"", b"hello\n");
+        tar.extend_from_slice(&zip_member(b"d/", b'5', 0o040775, b"", b""));
+        tar.extend_from_slice(&zip_member(b"l", b'2', 0o120777, b"f.txt", b""));
+        tar.extend_from_slice(&[0u8; 1024]);
+        let zip = tar_to_zip(&tar).expect("transcode");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("read back");
+        let mut file = archive.by_name("f.txt").expect("file");
+        assert_eq!(file.compression(), zip::CompressionMethod::Deflated);
+        assert_eq!(file.unix_mode().unwrap_or(0), 0o100644);
+        let mtime = file.last_modified().expect("mtime present");
+        assert_eq!(
+            (mtime.year(), mtime.month(), mtime.day(), mtime.hour(), mtime.minute(), mtime.second()),
+            (2023, 11, 14, 22, 13, 20)
+        );
+        let mut body = Vec::new();
+        file.read_to_end(&mut body).expect("payload");
+        assert_eq!(body, b"hello\n");
+        drop(file);
+        let dir = archive.by_name("d/").expect("dir");
+        assert!(dir.is_dir());
+        assert_eq!(dir.unix_mode().unwrap_or(0), 0o040775);
+        drop(dir);
+        let mut link = archive.by_name("l").expect("link");
+        assert_eq!(link.unix_mode().unwrap_or(0) & 0o170000, 0o120000);
+        let mut target = Vec::new();
+        link.read_to_end(&mut target).expect("target");
+        assert_eq!(target, b"f.txt");
+    }
 }
