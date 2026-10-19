@@ -182,7 +182,7 @@ impl PrivateClosure {
             }
             let found = match read_object(store, oid, EXPAND_OBJECT_BYTES) {
                 Ok((kind, bytes)) => Some((kind, bytes)),
-                Err(err) if matches!(err, GitError::NotFound { .. }) => None,
+                Err(GitError::NotFound { .. }) => None,
                 Err(err) => return Err(err),
             };
             let Some((kind, bytes)) = found else {

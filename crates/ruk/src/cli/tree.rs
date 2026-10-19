@@ -7,7 +7,6 @@
 //! tag headers the store's Git import path already accepts.
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
 
 use ruk_core::conflict::Signature;
 use ruk_core::ids::{HashKind, Oid};
@@ -182,6 +181,10 @@ pub(crate) fn encode_tree(entries: &[TreeEntry]) -> Vec<u8> {
     out
 }
 
+/// Per-directory file rows behind one staged tree build: directory bytes to
+/// `(file name, mode, id)` rows.
+type DirEntries = BTreeMap<Vec<u8>, Vec<(Vec<u8>, FileMode, Oid)>>;
+
 /// Builds and publishes the tree for stage-zero `rows`, bottom-up.
 ///
 /// `rows` holds `(full path bytes, entry)` pairs; intermediate subtrees are
@@ -192,7 +195,7 @@ pub(crate) fn build_index_tree(
     kind: HashKind,
     rows: &[(Vec<u8>, IndexEntry)],
 ) -> Result<Oid, GitError> {
-    let mut by_dir: BTreeMap<Vec<u8>, Vec<(Vec<u8>, FileMode, Oid)>> = BTreeMap::new();
+    let mut by_dir: DirEntries = BTreeMap::new();
     for (path, entry) in rows {
         entry
             .validate(kind)
@@ -212,8 +215,8 @@ pub(crate) fn build_index_tree(
 /// Builds one directory level, recursing into subdirectories first.
 fn build_dir(
     store: &Store,
-    kind: HashKind,
-    by_dir: &BTreeMap<Vec<u8>, Vec<(Vec<u8>, FileMode, Oid)>>,
+    _kind: HashKind,
+    by_dir: &DirEntries,
     dir: &[u8],
     published: &mut Vec<ruk_core::store::PreparedObject>,
 ) -> Result<Oid, GitError> {
@@ -246,7 +249,7 @@ fn build_dir(
             full.push(b'/');
         }
         full.extend_from_slice(child);
-        let oid = build_dir(store, kind, by_dir, &full, published)?;
+        let oid = build_dir(store, _kind, by_dir, &full, published)?;
         entries.push(TreeEntry {
             mode: TreeMode::Tree,
             name: child.clone(),

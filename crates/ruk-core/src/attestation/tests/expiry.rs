@@ -75,7 +75,7 @@ fn a_statement_signed_after_the_bound_is_expired_not_missing() {
         &lab.temp.store,
         &lab.subject,
         &[lab.bounded(BOUND_BEFORE_SIGNING)],
-        &[lab.signer.clone()],
+        std::slice::from_ref(&lab.signer),
         &open,
     )
     .expect("expiry evaluates");
@@ -107,7 +107,7 @@ fn a_statement_signed_before_the_bound_satisfies() {
         &lab.temp.store,
         &lab.subject,
         &[lab.bounded(BOUND_AFTER_SIGNING)],
-        &[lab.signer.clone()],
+        std::slice::from_ref(&lab.signer),
         &open,
     )
     .expect("in-bound evaluates");
@@ -133,7 +133,7 @@ fn legacy_evaluation_ignores_validity_bounds() {
         &lab.temp.store,
         &lab.subject,
         &required,
-        &[lab.signer.clone()],
+        std::slice::from_ref(&lab.signer),
         &open,
     )
     .expect("unbounded evaluates");

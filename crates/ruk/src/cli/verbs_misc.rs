@@ -403,7 +403,7 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     }
     if opts.is_set("dir") {
         // Deepest first so newly-emptied parents cascade.
-        emptied.sort_by(|left, right| right.components().count().cmp(&left.components().count()));
+        emptied.sort_by_key(|left| std::cmp::Reverse(left.components().count()));
         emptied.dedup();
         for dir in emptied {
             if dir == ctx.file_base {
@@ -562,8 +562,8 @@ pub(crate) fn describe(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             continue;
         }
         for parent in parents_of(store, oid)? {
-            if !depth_of.contains_key(&parent) {
-                depth_of.insert(parent, depth + 1);
+            if let std::collections::hash_map::Entry::Vacant(e) = depth_of.entry(parent) {
+                e.insert(depth + 1);
                 queue.push_back(parent);
             }
         }
@@ -620,10 +620,10 @@ fn reflog_name(store: &Store, spelling: &str) -> Result<RefName, GitError> {
             }),
         };
     }
-    if let Ok(name) = RefName::new(spelling.to_owned()) {
-        if super::state::read_ref(store, &name)?.is_some() || has_reflogs(store, &name)? {
-            return Ok(name);
-        }
+    if let Ok(name) = RefName::new(spelling.to_owned())
+        && (super::state::read_ref(store, &name)?.is_some() || has_reflogs(store, &name)?)
+    {
+        return Ok(name);
     }
     let full = format!("refs/heads/{spelling}");
     RefName::new(full.clone()).map_err(|err| GitError::Invalid {
@@ -690,7 +690,7 @@ pub(crate) fn reflog(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 detail: format!("unknown reflog subcommand {word:?}: want show|list|expire|delete"),
             });
         }
-        _ => ("show", &args[..]),
+        _ => ("show", args),
     };
     match sub {
         "show" => reflog_show(ctx, rest),
@@ -981,10 +981,10 @@ pub(crate) fn shortlog(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
     let (mut tips, exclude) = parse_log_revs(store, kind, &opts.positionals, default_tip)?;
     if opts.is_set("all") {
         for (_, target) in list_refs(store)? {
-            if let Some(oid) = peel_target_commit(store, Some(target))? {
-                if commit_record(store, oid).is_ok() {
-                    tips.push(oid);
-                }
+            if let Some(oid) = peel_target_commit(store, Some(target))?
+                && commit_record(store, oid).is_ok()
+            {
+                tips.push(oid);
             }
         }
     }
@@ -1175,20 +1175,19 @@ impl Mailmap {
             .iter()
             .find(|(key, _)| *key == email.to_lowercase())
             .map(|(_, entry)| entry)?;
-        if !entry.names.is_empty() {
-            if let Some((_, new_name, new_email)) = entry
+        if !entry.names.is_empty()
+            && let Some((_, new_name, new_email)) = entry
                 .names
                 .iter()
                 .find(|(old, _, _)| *old == name.to_lowercase())
-            {
-                if new_name.is_none() && new_email.is_none() {
-                    return None;
-                }
-                return Some((
-                    new_name.clone().unwrap_or_else(|| name.to_owned()),
-                    new_email.clone().unwrap_or_else(|| email.to_owned()),
-                ));
+        {
+            if new_name.is_none() && new_email.is_none() {
+                return None;
             }
+            return Some((
+                new_name.clone().unwrap_or_else(|| name.to_owned()),
+                new_email.clone().unwrap_or_else(|| email.to_owned()),
+            ));
         }
         if entry.name.is_none() && entry.email.is_none() {
             return None;
@@ -1565,7 +1564,7 @@ pub(crate) fn name_rev(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         if opts.is_set("tags") && !text.starts_with("refs/tags/") {
             continue;
         }
-        if !patterns.is_empty() && !patterns.iter().any(|p| glob_match(p, &text)) {
+        if !patterns.is_empty() && !patterns.iter().any(|p| glob_match(p, text)) {
             continue;
         }
         if let Some(commit) = peel_target_commit(store, Some(target))? {
@@ -1589,8 +1588,8 @@ pub(crate) fn name_rev(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
     while let Some(oid) = queue.pop_front() {
         let (name, depth) = found[&oid].clone();
         for parent in parents_of(store, oid)? {
-            if !found.contains_key(&parent) {
-                found.insert(parent, (name.clone(), depth + 1));
+            if let std::collections::hash_map::Entry::Vacant(e) = found.entry(parent) {
+                e.insert((name.clone(), depth + 1));
                 queue.push_back(parent);
             }
         }
@@ -2437,7 +2436,7 @@ fn scan_tar_comment(raw: &[u8]) -> Result<Option<String>, GitError> {
                 return Ok(Some(hex));
             }
         }
-        offset = offset.saturating_add(((size + 511) / 512) * 512);
+        offset = offset.saturating_add(size.div_ceil(512) * 512);
     }
     Ok(None)
 }
@@ -3405,10 +3404,11 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
                 result = Err(err);
             }
         }
-        if let Some(store) = sub.store.take() {
-            if restore_target && ctx.store.is_none() {
-                ctx.store = Some(store);
-            }
+        if let Some(store) = sub.store.take()
+            && restore_target
+            && ctx.store.is_none()
+        {
+            ctx.store = Some(store);
         }
     }
     result.map(|()| out)
@@ -3623,7 +3623,7 @@ pub(crate) fn remote_fd(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, Git
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3650,7 +3650,7 @@ mod tests {
         base
     }
 
-    fn test_env(cwd: &PathBuf) -> CliEnv {
+    fn test_env(cwd: &Path) -> CliEnv {
         let vars = [
             ("GIT_AUTHOR_NAME", "Ada"),
             ("GIT_AUTHOR_EMAIL", "ada@example.invalid"),
@@ -3662,12 +3662,12 @@ mod tests {
         .collect::<HashMap<String, String>>();
         CliEnv {
             vars,
-            cwd: cwd.clone(),
+            cwd: cwd.to_path_buf(),
             stdin: None,
         }
     }
 
-    fn open_store(root: &PathBuf) -> Store {
+    fn open_store(root: &Path) -> Store {
         Store::open(
             &root.join(".ruk"),
             Arc::new(PreparationBudget::reference_defaults()),
@@ -3675,13 +3675,13 @@ mod tests {
         .expect("open store")
     }
 
-    fn mkctx(root: &PathBuf, env: CliEnv) -> Ctx {
+    fn mkctx(root: &Path, env: CliEnv) -> Ctx {
         let store = open_store(root);
         let kind = store.hash_kind();
         Ctx {
             store: Some(store),
-            root: root.clone(),
-            file_base: root.clone(),
+            root: root.to_path_buf(),
+            file_base: root.to_path_buf(),
             kind: Some(kind),
             env,
             bare: false,
@@ -3720,7 +3720,7 @@ mod tests {
         )
     }
 
-    fn commit_file(ctx: &mut Ctx, root: &PathBuf, file: &str, body: &[u8], message: &str) {
+    fn commit_file(ctx: &mut Ctx, root: &Path, file: &str, body: &[u8], message: &str) {
         std::fs::write(root.join(file), body).expect("write file");
         call(verbs_stage::add, ctx, &[file]).expect("add");
         call(verbs_history::commit, ctx, &["-m", message]).expect("commit");
@@ -4029,9 +4029,9 @@ mod tests {
         commit_file(&mut ctx, &root, "b.txt", b"b\n", "side work");
         let tip = head_hex(&ctx);
         call(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
-        let store = ctx.store().expect("store").clone();
+        let store = ctx.store().expect("store");
         pseudo_write(
-            &store,
+            store,
             "FETCH_HEAD",
             format!("{tip}\trefs/heads/feature\n").into_bytes(),
         )

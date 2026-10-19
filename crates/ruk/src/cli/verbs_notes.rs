@@ -626,7 +626,7 @@ fn notes_prune(ctx: &Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>, 
     let verbose = opts.is_set("verbose");
     let mut out = Vec::new();
     let mut dead = Vec::new();
-    for (hex, _) in &head.entries {
+    for hex in head.entries.keys() {
         let Ok(target) = Oid::from_hex(hex) else {
             continue;
         };
@@ -806,10 +806,11 @@ fn replace_list(ctx: &Ctx, patterns: &[String]) -> Result<Vec<u8>, GitError> {
         let Some(hex) = text.strip_prefix(PREFIX) else {
             continue;
         };
-        if let Some(pattern) = patterns.first() {
-            if !replace_glob(pattern, hex) && !replace_glob(pattern, &text) {
-                continue;
-            }
+        if let Some(pattern) = patterns.first()
+            && !replace_glob(pattern, hex)
+            && !replace_glob(pattern, &text)
+        {
+            continue;
         }
         out.extend_from_slice(format!("{hex}\n").as_bytes());
     }

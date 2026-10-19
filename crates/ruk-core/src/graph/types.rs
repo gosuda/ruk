@@ -18,22 +18,67 @@ use crate::heads::Head;
 
 /// Maximum valid commit position in the graph ($2^{31} - 1$).
 /// Total capacity is $2^{31}$ positions (`0` through `0x7FFF_FFFF`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub const MAX_GRAPH_POSITIONS: u32 = 0x8000_0000;
 
 /// Maximum number of indexed commits across composite graph segments ($2^{31}$).
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub const MAX_INDEXED_COMMITS: u64 = 0x8000_0000;
 
 /// Flag indicating that a parent or change entry points to the segment's
 /// overflow table rather than an inlined local/global position.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub const OVERFLOW_FLAG: u32 = 0x8000_0000;
 
 /// Value indicating no parent in an entry slot (e.g. root commit or single parent).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub const NO_PARENT: u32 = 0xFFFF_FFFF;
 
 /// Format version for v1 graph segments.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub const GRAPH_SEGMENT_V1_FORMAT: u32 = 1;
 
 /// Magic bytes identifying a Ruk graph segment file (`b"RUKGRAPH"`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub const GRAPH_SEGMENT_MAGIC: [u8; 8] = *b"RUKGRAPH";
 
 /// Global commit position across all segments in a composite index chain.
@@ -41,13 +86,29 @@ pub const GRAPH_SEGMENT_MAGIC: [u8; 8] = *b"RUKGRAPH";
 /// Invariant: position must be strictly less than `MAX_GRAPH_POSITIONS` ($2^{31}$).
 /// Exceeding this boundary fails with [`ErrorCode::ECapacity`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub struct GlobalPosition(u32);
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 impl GlobalPosition {
     /// Validates and constructs a global position.
     ///
     /// # Errors
     /// Returns [`ErrorCode::ECapacity`] if `pos >= 2^31`.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     pub fn new(pos: u32) -> Result<Self, CoreError> {
         if pos >= MAX_GRAPH_POSITIONS {
             return Err(CoreError::new(
@@ -65,12 +126,20 @@ impl GlobalPosition {
     }
 
     /// Returns the raw position index.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
     }
 
     /// Converts to usize for array indexing.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     #[must_use]
     pub const fn as_usize(self) -> usize {
         self.0 as usize
@@ -93,13 +162,26 @@ impl fmt::Display for GlobalPosition {
 ///
 /// Invariant: position must be strictly less than `MAX_GRAPH_POSITIONS` ($2^{31}$).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub struct LocalPosition(u32);
 
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl LocalPosition {
     /// Validates and constructs a local position.
     ///
     /// # Errors
     /// Returns [`ErrorCode::ECapacity`] if `pos >= 2^31`.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     pub fn new(pos: u32) -> Result<Self, CoreError> {
         if pos >= MAX_GRAPH_POSITIONS {
             return Err(CoreError::new(
@@ -117,12 +199,20 @@ impl LocalPosition {
     }
 
     /// Returns the raw local position index.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
     }
 
     /// Converts to usize for array indexing.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     #[must_use]
     pub const fn as_usize(self) -> usize {
         self.0 as usize
@@ -148,16 +238,33 @@ impl fmt::Display for LocalPosition {
 /// Invariant: for every parent $p$ of $c$, $G(p) < G(c)$.
 /// Early pruning: $p$ cannot be an ancestor of $c$ if $G(p) \ge G(c)$.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub struct Generation(u32);
 
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl Generation {
     /// Root commit generation ($1$).
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     pub const ROOT: Self = Self(1);
 
     /// Constructs a generation number from a checked non-zero integer.
     ///
     /// # Errors
     /// Returns [`ErrorCode::EInvalid`] if `gen == 0`.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     pub fn new(generation: u32) -> Result<Self, CoreError> {
         if generation == 0 {
             return Err(CoreError::new(
@@ -175,6 +282,10 @@ impl Generation {
     }
 
     /// Computes child generation from ordered parents.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     #[must_use]
     pub fn from_parents(parents: &[Generation]) -> Self {
         let max_parent = parents.iter().map(|g| g.0).max().unwrap_or(0);
@@ -182,6 +293,10 @@ impl Generation {
     }
 
     /// Returns the raw generation value.
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
@@ -205,6 +320,11 @@ impl fmt::Display for Generation {
 /// Supports 0, 1, 2 parents inlined, or an ordered octopus merge (> 2 parents)
 /// referencing a range in the segment's overflow table.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub enum ParentPositions {
     /// Root commit with no parents.
     Zero,
@@ -218,6 +338,11 @@ pub enum ParentPositions {
 
 impl ParentPositions {
     /// Extracts all parent positions in exact order.
+    #[expect(dead_code, reason = "never used; goes live when revset is wired")]
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     pub fn collect_parents(&self, overflow: &[GlobalPosition]) -> SmallVec<[GlobalPosition; 2]> {
         match self {
             Self::Zero => SmallVec::new(),
@@ -249,6 +374,14 @@ impl ParentPositions {
 ///
 /// Missing shallow evidence must never be coerced into a false negative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub enum ShallowAncestry {
     /// Ancestor is proven to be an ancestor of descendant without crossing
     /// shallow boundaries.
@@ -263,6 +396,14 @@ pub enum ShallowAncestry {
 
 /// Result of evaluating a changed-path Bloom filter for a commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub enum BloomMatch {
     /// Bloom filter indicates the path might be changed (or filter is
     /// missing/truncated). Must be verified against tree diff.
@@ -274,6 +415,18 @@ pub enum BloomMatch {
 
 /// Three-way prefix resolution outcome for commit IDs and change IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "revset matches on NoMatch/SingleMatch/AmbiguousMatch; renaming touches another subtree"
+)]
 pub enum PrefixResolution<T> {
     /// No matching identity found.
     NoMatch,
@@ -285,6 +438,14 @@ pub enum PrefixResolution<T> {
 
 impl<T: PartialEq> PrefixResolution<T> {
     /// Combines two prefix search results across index segments.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used only in test builds; dead in lib build")
+    )]
+    #[expect(
+        unreachable_pub,
+        reason = "graph is a private mod; surface not yet re-exported"
+    )]
     #[must_use]
     pub fn combine(self, other: Self) -> Self {
         match (self, other) {
@@ -303,6 +464,11 @@ impl<T: PartialEq> PrefixResolution<T> {
 
 /// Verifies whether a commit actually changed a path after Bloom filter
 /// candidate match.
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
+#[expect(
+    unreachable_pub,
+    reason = "graph is a private mod; surface not yet re-exported"
+)]
 pub trait ExactPathVerifier: Send + Sync {
     /// Returns true if `head` actually modified `path`.
     fn verify_path(&self, head: &Head, path: &[u8]) -> Result<bool, CoreError>;
@@ -318,6 +484,7 @@ where
 }
 
 /// Helper to format unexpected EOF errors into [`CoreError`].
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 pub(crate) fn unexpected_eof(what: &str) -> CoreError {
     CoreError::new(
         ErrorCode::ECorrupt,
@@ -326,6 +493,7 @@ pub(crate) fn unexpected_eof(what: &str) -> CoreError {
 }
 
 /// Helper to validate table count without overflowing `usize`.
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 pub(crate) fn validate_count(
     count: u32,
     max_allowed: usize,

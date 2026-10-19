@@ -25,6 +25,13 @@ pub(crate) struct Times {
 
 impl Times {
     /// Creates a new `Times` sample from explicit wall and monotonic instants.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) const fn new(wall: jiff::Timestamp, mono: Instant) -> Self {
         Self { wall, mono }

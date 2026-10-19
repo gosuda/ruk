@@ -22,7 +22,7 @@ use crate::budget::ByteBudget;
 use crate::change::ChangeId;
 use crate::error::{CoreError, ErrorCode};
 use crate::graph::folding::{fold_segments, select_folding_chain};
-use crate::graph::segment::{ChangeIdPage, GraphSegment, GraphSegmentWriter, StagedCommit};
+use crate::graph::segment::{GraphSegment, GraphSegmentWriter, StagedCommit};
 use crate::graph::traversal::GraphAccess;
 use crate::graph::types::{
     Generation, GlobalPosition, LocalPosition, MAX_GRAPH_POSITIONS, PrefixResolution,
@@ -31,6 +31,10 @@ use crate::heads::Head;
 use crate::ids::HashKind;
 
 /// Resumable cursor for multi-segment divergent change queries.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) struct ChangeIdCursor {
     pub(crate) segment_idx: usize,
@@ -38,8 +42,9 @@ pub(crate) struct ChangeIdCursor {
 }
 
 /// One bounded page of a composite divergence query. Unlike the per-segment
-/// [`ChangeIdPage`], the continuation is a [`ChangeIdCursor`] spanning
+/// [`crate::graph::segment::ChangeIdPage`], the continuation is a [`ChangeIdCursor`] spanning
 /// segments rather than an overflow offset inside one.
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 #[derive(Clone, Debug)]
 pub(crate) struct DivergentPage<T> {
     pub(crate) items: SmallVec<[T; 8]>,
@@ -48,12 +53,17 @@ pub(crate) struct DivergentPage<T> {
 }
 
 /// Composite graph index spanning chained immutable v1 segments.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 #[derive(Clone)]
 pub(crate) struct GraphIndex {
     segments_oldest_first: Vec<Arc<GraphSegment>>,
     hash_kind: HashKind,
 }
 
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl GraphIndex {
     /// Constructs a composite index from a chain of segments ordered oldest first.
     pub(crate) fn new(
@@ -393,12 +403,20 @@ impl GraphAccess for GraphIndex {
 }
 
 /// Incremental builder that adds commits on top of an existing index.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 pub(crate) struct GraphIndexBuilder {
     base_index: GraphIndex,
     staged: Vec<StagedCommit>,
     staged_heads: std::collections::HashMap<Head, GlobalPosition>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 impl GraphIndexBuilder {
     #[must_use]
     pub(crate) fn new(base_index: GraphIndex) -> Self {

@@ -39,6 +39,9 @@ use ruk_core::store::{PreparedObject, Store};
 use super::{Interrupt, stage_object};
 use crate::GitError;
 
+/// One staged pack entry: index order, kind, and decompressed bytes.
+type StagedPackEntry = Result<(usize, ObjectKind, Vec<u8>), GitError>;
+
 /// Bounds for one ingested pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IngestLimits {
@@ -522,55 +525,54 @@ fn pre_resolve_independent(
         return Ok(());
     }
     let width = pack_threads();
-    let staged: Vec<Result<(usize, ObjectKind, Vec<u8>), GitError>> =
-        if width <= 1 || independent.len() < 32 {
-            independent
-                .iter()
-                .map(|(index, kind)| {
-                    interrupt.check("resolving pack deltas")?;
-                    inflate(
-                        &resolver.raw[*index].compressed,
-                        resolver.raw[*index].declared,
-                        resolver.limits.max_object_bytes,
-                    )
-                    .map(|bytes| (*index, *kind, bytes))
-                })
-                .collect()
-        } else {
-            let piece = independent.len().div_ceil(width);
-            let raw = &resolver.raw;
-            let max_object_bytes = resolver.limits.max_object_bytes;
-            std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                for part in independent.chunks(piece) {
-                    handles.push(scope.spawn(move || {
-                        part.iter()
-                            .map(|(index, kind)| {
-                                if interrupt.check("resolving pack deltas").is_err() {
-                                    return Err(GitError::Cancelled {
-                                        detail: "resolving pack deltas was cancelled".to_owned(),
-                                    });
-                                }
-                                inflate(
-                                    &raw[*index].compressed,
-                                    raw[*index].declared,
-                                    max_object_bytes,
-                                )
-                                .map(|bytes| (*index, *kind, bytes))
-                            })
-                            .collect::<Vec<_>>()
-                    }));
-                }
-                let mut staged = Vec::with_capacity(independent.len());
-                for handle in handles {
-                    match handle.join() {
-                        Ok(part) => staged.extend(part),
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    }
-                }
-                staged
+    let staged: Vec<StagedPackEntry> = if width <= 1 || independent.len() < 32 {
+        independent
+            .iter()
+            .map(|(index, kind)| {
+                interrupt.check("resolving pack deltas")?;
+                inflate(
+                    &resolver.raw[*index].compressed,
+                    resolver.raw[*index].declared,
+                    resolver.limits.max_object_bytes,
+                )
+                .map(|bytes| (*index, *kind, bytes))
             })
-        };
+            .collect()
+    } else {
+        let piece = independent.len().div_ceil(width);
+        let raw = &resolver.raw;
+        let max_object_bytes = resolver.limits.max_object_bytes;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for part in independent.chunks(piece) {
+                handles.push(scope.spawn(move || {
+                    part.iter()
+                        .map(|(index, kind)| {
+                            if interrupt.check("resolving pack deltas").is_err() {
+                                return Err(GitError::Cancelled {
+                                    detail: "resolving pack deltas was cancelled".to_owned(),
+                                });
+                            }
+                            inflate(
+                                &raw[*index].compressed,
+                                raw[*index].declared,
+                                max_object_bytes,
+                            )
+                            .map(|bytes| (*index, *kind, bytes))
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut staged = Vec::with_capacity(independent.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(part) => staged.extend(part),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            staged
+        })
+    };
     for entry in staged {
         let (index, kind, bytes) = entry?;
         resolver.finish(index, kind, bytes)?;
@@ -671,9 +673,9 @@ impl Resolver<'_> {
     }
 
     fn resolve_inner(&mut self, index: usize, depth: u32) -> Result<Resolution, GitError> {
-        // The header is cloned so delta recursion can borrow `self`
+        // The header is copied so delta recursion can borrow `self`
         // mutably; offsets below are plain copies for the same reason.
-        let header = self.raw[index].header.clone();
+        let header = self.raw[index].header;
         let pack_offset = self.raw[index].pack_offset;
         let declared = self.raw[index].declared;
         if let Some(kind) = pack_kind(&header) {
@@ -705,7 +707,7 @@ impl Resolver<'_> {
                 if base_oid.kind() != self.kind {
                     return Err(corrupt("ref-delta base has the wrong width"));
                 }
-                if self.oid_index.get(&base_oid).is_none() {
+                if !self.oid_index.contains_key(&base_oid) {
                     match self.store.read(base_oid) {
                         Ok(_) => {}
                         Err(err) if err.code() == ruk_core::error::ErrorCode::ENotFound => {

@@ -27,6 +27,10 @@ pub(crate) enum RenameMode {
 impl RenameMode {
     /// Whether any pairing runs at all.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn pairs(self) -> bool {
         !matches!(self, Self::Disabled)
     }
@@ -114,11 +118,11 @@ pub(crate) fn similarity(old: &[u8], new: &[u8]) -> u8 {
     }
     let mut common: u64 = 0;
     for line in new_lines {
-        if let Some(left) = counts.get_mut(line) {
-            if *left > 0 {
-                *left -= 1;
-                common += 1;
-            }
+        if let Some(left) = counts.get_mut(line)
+            && *left > 0
+        {
+            *left -= 1;
+            common += 1;
         }
     }
     let total_lines = line_count(old) + line_count(new);
@@ -210,7 +214,7 @@ pub(crate) fn pair_renames(
             order.push((oi, ni, same_basename(&del.path, &add.path)));
         }
     }
-    order.sort_by(|left, right| right.2.cmp(&left.2));
+    order.sort_by_key(|left| std::cmp::Reverse(left.2));
     order.truncate(MAX_EVALS);
     let mut scored: Vec<(u8, usize, usize)> = Vec::new();
     for (oi, ni, _) in order {
@@ -259,7 +263,7 @@ fn same_basename(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -279,7 +283,7 @@ mod tests {
         base
     }
 
-    fn test_env(cwd: &PathBuf) -> CliEnv {
+    fn test_env(cwd: &Path) -> CliEnv {
         let vars = [
             ("GIT_AUTHOR_NAME", "Ada"),
             ("GIT_AUTHOR_EMAIL", "ada@example.invalid"),
@@ -291,13 +295,13 @@ mod tests {
         .collect::<HashMap<String, String>>();
         CliEnv {
             vars,
-            cwd: cwd.clone(),
+            cwd: cwd.to_path_buf(),
             stdin: None,
         }
     }
 
-    fn repo_ctx(root: &PathBuf, mut env: CliEnv) -> Ctx {
-        env.cwd = root.clone();
+    fn repo_ctx(root: &Path, mut env: CliEnv) -> Ctx {
+        env.cwd = root.to_path_buf();
         let store = Store::open(
             &root.join(".ruk"),
             Arc::new(PreparationBudget::reference_defaults()),
@@ -306,8 +310,8 @@ mod tests {
         let kind = store.hash_kind();
         Ctx {
             store: Some(store),
-            root: root.clone(),
-            file_base: root.clone(),
+            root: root.to_path_buf(),
+            file_base: root.to_path_buf(),
             kind: Some(kind),
             env,
             bare: false,
@@ -352,7 +356,7 @@ mod tests {
         verb(ctx, &owned).expect("verb")
     }
 
-    fn ctx_for(root: &PathBuf, env: &CliEnv) -> Ctx {
+    fn ctx_for(root: &Path, env: &CliEnv) -> Ctx {
         repo_ctx(root, env.clone())
     }
 

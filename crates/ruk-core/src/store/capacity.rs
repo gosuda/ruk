@@ -132,7 +132,7 @@ impl CapacityLimits {
 /// bytes they charged are covered by committed manifests and locators.
 /// `Released` rows are dead charges freed by recovery reconciliation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ReservationState {
+pub(crate) enum ReservationState {
     Pending,
     Committed,
     Released,
@@ -140,7 +140,7 @@ pub enum ReservationState {
 
 /// One segment range reserved and observed during a publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SegmentCharge {
+pub(crate) struct SegmentCharge {
     /// Segment file id the range was reserved in.
     pub segment: u64,
     /// Start offset of the reserved range.
@@ -156,7 +156,7 @@ pub struct SegmentCharge {
 
 /// The durable pending-reservation record of one publication.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PendingReservation {
+pub(crate) struct PendingReservation {
     /// Locator generation the publication advanced (or would advance) to.
     pub generation: u64,
     /// Per-generation sequence distinguishing crash retries.
@@ -176,7 +176,7 @@ impl PendingReservation {
     /// Key bytes: big-endian generation followed by big-endian sequence.
     /// Fixed width, so raw-byte order matches numeric order.
     #[must_use]
-    pub fn key(generation: u64, seq: u32) -> Vec<u8> {
+    pub(crate) fn key(generation: u64, seq: u32) -> Vec<u8> {
         let mut key = Vec::with_capacity(12);
         key.extend_from_slice(&generation.to_be_bytes());
         key.extend_from_slice(&seq.to_be_bytes());
@@ -184,7 +184,7 @@ impl PendingReservation {
     }
 
     /// Splits key bytes back into `(generation, seq)`.
-    pub fn split_key(key: &[u8]) -> Result<(u64, u32), StoreError> {
+    pub(crate) fn split_key(key: &[u8]) -> Result<(u64, u32), StoreError> {
         if key.len() != 12 {
             return Err(StoreError::Corrupt(format!(
                 "pending reservation key has {} bytes, expected 12",
@@ -198,6 +198,10 @@ impl PendingReservation {
 }
 
 /// Checked sum of record lengths for the incoming publication.
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) fn estimate_bytes(lens: impl Iterator<Item = u64>) -> Result<u64, StoreError> {
     let mut total = 0u64;
     for len in lens {

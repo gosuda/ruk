@@ -28,16 +28,15 @@ mod safety;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use apply::{
-    ApplyOutcome, ApplySession, FinishBatch, MaterializePlan, WorkspaceFence, begin_apply,
-    materialize,
-};
+// Re-exports are consumed only by the `#[cfg(test)]` suite in `tests.rs`
+// (`use super::*;`); nothing in the non-test crate links this subtree yet.
+#[cfg(test)]
+pub(crate) use apply::{FinishBatch, MaterializePlan, WorkspaceFence, begin_apply, materialize};
+#[cfg(test)]
 pub(crate) use blocks::{JournalReader, current_journal, is_applying};
+#[cfg(test)]
 pub(crate) use capture::{ManifestEntry, PlanEntry};
-pub(crate) use journal::{
-    ApplyJournal, ApplyState, ApplyStep, JournalEntry, Preimage, StepCursor, TargetEntry,
-    Transition,
-};
-pub(crate) use recover::{
-    PathReport, RecoveryAction, RecoveryReport, inspect, open_journals, recover,
-};
+#[cfg(test)]
+pub(crate) use journal::{ApplyState, StepCursor, Transition};
+#[cfg(test)]
+pub(crate) use recover::{RecoveryAction, inspect, open_journals, recover};

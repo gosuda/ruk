@@ -576,7 +576,7 @@ fn object_links_cover_all_kinds() {
 
     let blob = HashKind::Sha1.hash_git_object("blob", b"f").expect("blob");
     let tree_hex = blob.to_hex();
-    let mut tree = format!("100644 f\0").into_bytes();
+    let mut tree = "100644 f\0".to_string().into_bytes();
     tree.extend_from_slice(blob.as_bytes());
     let mut with_link = tree.clone();
     let foreign = Oid::from_bytes(&[9u8; 20]).expect("oid");
@@ -613,7 +613,7 @@ fn object_links_cover_all_kinds() {
 
     // Unsorted entries are tolerated the way Git reads them: both objects
     // still join the closure.
-    let mut unsorted = format!("100644 b\0").into_bytes();
+    let mut unsorted = "100644 b\0".to_string().into_bytes();
     unsorted.extend_from_slice(blob.as_bytes());
     unsorted.extend_from_slice(b"100644 a\0");
     unsorted.extend_from_slice(blob.as_bytes());

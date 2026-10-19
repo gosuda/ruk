@@ -76,9 +76,16 @@ pub(crate) enum WriteOutcome {
     /// The named paths already match the base tree; `cache` refreshes
     /// their stat rows and records no operation.
     NoChange {
+        #[cfg_attr(
+            test,
+            expect(
+                dead_code,
+                reason = "no write test observes an unchanged write; retained for later changeset rows"
+            )
+        )]
         cache: Vec<FactMutation>,
     },
-    Changed(PreparedWrite),
+    Changed(Box<PreparedWrite>),
 }
 
 /// Hashes the named paths and rebuilds the tree.
@@ -142,7 +149,7 @@ pub(crate) fn write(store: &Store, input: &WriteInput<'_>) -> Result<WriteOutcom
         });
     }
     computed.facts.push(guard);
-    Ok(WriteOutcome::Changed(PreparedWrite {
+    Ok(WriteOutcome::Changed(Box::new(PreparedWrite {
         objects: computed.objects,
         facts: computed.facts.into_vec(),
         descriptor: WriteDescriptor {
@@ -156,7 +163,7 @@ pub(crate) fn write(store: &Store, input: &WriteInput<'_>) -> Result<WriteOutcom
             removed: computed.removed,
             conflict_edits: computed.conflict_edits,
         },
-    }))
+    })))
 }
 
 fn validate_paths(input: &WriteInput<'_>, scope: &Scope) -> Result<(), CoreError> {

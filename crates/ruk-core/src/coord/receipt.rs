@@ -9,7 +9,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::change::{RequestId, SessionId};
-use crate::coord::rows::{ReceiptRow, decode_receipt, receipt_key};
+use crate::coord::rows::{decode_receipt, receipt_key};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Reply, Request, RequestDigest};
 use crate::store::Store;
@@ -119,6 +119,13 @@ pub(crate) fn replay_if_committed(
 /// # Errors
 /// - [`ErrorCode::ERequestReused`] if the request id was used with a different digest.
 /// - `err` if no receipt exists.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) fn settle_rejection(
     store: &Store,
     session: SessionId,
@@ -146,7 +153,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::change::{ChangeId, OperationId, WorkspaceId};
-    use crate::coord::rows::encode;
+    use crate::coord::rows::{ReceiptRow, encode};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{

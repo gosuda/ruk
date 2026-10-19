@@ -425,14 +425,14 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Loaded grep sources: `(rev label, [(path, bytes)])`.
+type GrepSources = (Option<String>, Vec<(Vec<u8>, Vec<u8>)>);
+
 /// Loads `(rev label, [(path, bytes)])` for the worktree or one tree.
 ///
 /// Tree entries that are not blobs (gitlinks, submodules) are skipped, as
 /// the oracle skips what it cannot read as text.
-fn load_sources(
-    ctx: &mut Ctx,
-    rev_arg: Option<&str>,
-) -> Result<(Option<String>, Vec<(Vec<u8>, Vec<u8>)>), GitError> {
+fn load_sources(ctx: &mut Ctx, rev_arg: Option<&str>) -> Result<GrepSources, GitError> {
     match rev_arg {
         None => load_worktree(ctx),
         Some(rev_text) => load_tree(ctx, rev_text),
@@ -443,7 +443,7 @@ fn load_sources(
 ///
 /// Symlinks are skipped: following them could read outside the worktree,
 /// and the oracle never reports link bytes as matches.
-fn load_worktree(ctx: &Ctx) -> Result<(Option<String>, Vec<(Vec<u8>, Vec<u8>)>), GitError> {
+fn load_worktree(ctx: &Ctx) -> Result<GrepSources, GitError> {
     ctx.require_worktree()?;
     let mut files = Vec::new();
     for entry in walk_worktree(&ctx.file_base)? {
@@ -457,10 +457,7 @@ fn load_worktree(ctx: &Ctx) -> Result<(Option<String>, Vec<(Vec<u8>, Vec<u8>)>),
 }
 
 /// Reads every blob under the tree one revision names.
-fn load_tree(
-    ctx: &Ctx,
-    rev_text: &str,
-) -> Result<(Option<String>, Vec<(Vec<u8>, Vec<u8>)>), GitError> {
+fn load_tree(ctx: &Ctx, rev_text: &str) -> Result<GrepSources, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let oid = resolve_rev(store, kind, rev_text).map_err(|err| GitError::Usage {

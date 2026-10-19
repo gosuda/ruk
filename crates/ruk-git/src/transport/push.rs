@@ -577,7 +577,7 @@ pub(crate) fn check_report_covers_live(
     }
     let mut seen: HashMap<&[u8], usize> = HashMap::with_capacity(server.len());
     for outcome in server {
-        if wanted.get(outcome.name.as_slice()).is_none() {
+        if !wanted.contains_key(outcome.name.as_slice()) {
             return Err(GitError::Corrupt {
                 detail: "push report names a ref the client did not send".to_owned(),
             });
@@ -833,7 +833,7 @@ pub(crate) fn push_closure_filtered(
         let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
             Ok((ObjectKind::Commit, bytes)) => bytes,
             Ok(_) => continue,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+            Err(GitError::NotFound { .. }) => continue,
             Err(err) => return Err(err),
         };
         for parent in &object_links(ObjectKind::Commit, &bytes, kind)?.parents {
@@ -860,7 +860,7 @@ pub(crate) fn push_closure_filtered(
         }
         let (kind, bytes) = match read_object(store, oid, WALK_OBJECT_BYTES) {
             Ok(found) => found,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => {
+            Err(GitError::NotFound { .. }) => {
                 return Err(GitError::NotFound {
                     detail: format!("push needs local object {oid} which is absent"),
                 });
@@ -883,7 +883,7 @@ pub(crate) fn push_closure_filtered(
             base: None,
         });
     }
-    entries.sort_by(|a, b| a.oid.cmp(&b.oid));
+    entries.sort_by_key(|a| a.oid);
     Ok(entries)
 }
 
@@ -957,7 +957,7 @@ fn commit_tree(store: &Store, oid: Oid) -> Result<Option<Oid>, GitError> {
     let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
         Ok((ObjectKind::Commit, bytes)) => bytes,
         Ok(_) => return Ok(None),
-        Err(err) if matches!(err, GitError::NotFound { .. }) => return Ok(None),
+        Err(GitError::NotFound { .. }) => return Ok(None),
         Err(err) => return Err(err),
     };
     Ok(object_links(ObjectKind::Commit, &bytes, store.hash_kind())?.tree)

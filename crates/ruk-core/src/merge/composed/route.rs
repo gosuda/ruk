@@ -5,7 +5,6 @@
 //! decline. It is the single place that decides which engine a path reaches,
 //! so a language added to the catalogue cannot be silently unrouted.
 
-use crate::bytes::ByteString;
 use crate::merge::composed::host::{ComposedOutcome, ComposedRequest, merge_host};
 use crate::merge::composed::markdown::merge_markdown;
 use crate::merge::composed::mdx::merge_mdx;
@@ -221,6 +220,7 @@ fn git_mode_decline(request: &ComposedRequest<'_>) -> MergeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytes::ByteString;
 
     #[test]
     fn every_catalogued_language_has_one_engine() {

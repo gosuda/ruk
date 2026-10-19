@@ -167,7 +167,7 @@ pub(crate) fn prepare_open(
         )
     })?;
 
-    let secret_hash: [u8; 32] = Sha256::digest(&secret_bytes).into();
+    let secret_hash: [u8; 32] = Sha256::digest(secret_bytes).into();
     let idle_expires_at = wall.checked_add(idle).map_err(|err| {
         CoreError::new(
             ErrorCode::EInvalid,
@@ -294,6 +294,10 @@ impl SessionLive {
 
     /// Returns the monotonic deadline for the session.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn deadline(&self) -> Instant {
         let inner = self.inner.lock().expect("session live lock");
         inner.deadline
@@ -317,6 +321,13 @@ impl SessionLive {
 
     /// Convenience check whether the session is currently [`Authority::Active`].
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn is_active(&self, times: &Times) -> bool {
         self.current_authority(times) == Authority::Active
     }
@@ -375,6 +386,13 @@ pub(crate) struct OpenReservation {
 impl OpenReservation {
     /// The session identifier reserved.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn session_id(&self) -> SessionId {
         self.session_id
     }
@@ -409,11 +427,11 @@ impl OpenReservation {
 
 impl Drop for OpenReservation {
     fn drop(&mut self) {
-        if !self.committed {
-            if let Some(table) = self.table.upgrade() {
-                let mut entries = table.entries.lock().expect("session table lock");
-                entries.remove(&self.session_id);
-            }
+        if !self.committed
+            && let Some(table) = self.table.upgrade()
+        {
+            let mut entries = table.entries.lock().expect("session table lock");
+            entries.remove(&self.session_id);
         }
     }
 }
@@ -431,12 +449,26 @@ pub(crate) struct BoundSession {
 impl BoundSession {
     /// The shared live session.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn session(&self) -> &Arc<SessionLive> {
         &self.session
     }
 
     /// The session identifier.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn id(&self) -> SessionId {
         self.session.id
     }
@@ -449,6 +481,13 @@ impl BoundSession {
 
     /// Evaluates current authority.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn current_authority(&self, times: &Times) -> Authority {
         self.session.current_authority(times)
     }
@@ -487,15 +526,13 @@ impl Drop for BoundSession {
 
             inner.bindings == 0 && inner.in_flight == 0 && !inner.reserved
         };
-        if should_reclaim {
-            if let Some(table) = self.table.upgrade() {
-                let mut entries = table.entries.lock().expect("session table lock");
-                if let Some(entry) = entries.get(&self.session.id) {
-                    let inner = entry.inner.lock().expect("session live lock");
-                    if inner.bindings == 0 && inner.in_flight == 0 && !inner.reserved {
-                        drop(inner);
-                        entries.remove(&self.session.id);
-                    }
+        if should_reclaim && let Some(table) = self.table.upgrade() {
+            let mut entries = table.entries.lock().expect("session table lock");
+            if let Some(entry) = entries.get(&self.session.id) {
+                let inner = entry.inner.lock().expect("session live lock");
+                if inner.bindings == 0 && inner.in_flight == 0 && !inner.reserved {
+                    drop(inner);
+                    entries.remove(&self.session.id);
                 }
             }
         }
@@ -515,6 +552,13 @@ pub(crate) struct InFlightGuard {
 impl InFlightGuard {
     /// The session identifier for this in-flight request.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn session_id(&self) -> SessionId {
         self.session.id
     }
@@ -527,15 +571,13 @@ impl Drop for InFlightGuard {
             inner.in_flight = inner.in_flight.saturating_sub(1);
             inner.bindings == 0 && inner.in_flight == 0 && !inner.reserved
         };
-        if should_reclaim {
-            if let Some(table) = self.table.upgrade() {
-                let mut entries = table.entries.lock().expect("session table lock");
-                if let Some(entry) = entries.get(&self.session.id) {
-                    let inner = entry.inner.lock().expect("session live lock");
-                    if inner.bindings == 0 && inner.in_flight == 0 && !inner.reserved {
-                        drop(inner);
-                        entries.remove(&self.session.id);
-                    }
+        if should_reclaim && let Some(table) = self.table.upgrade() {
+            let mut entries = table.entries.lock().expect("session table lock");
+            if let Some(entry) = entries.get(&self.session.id) {
+                let inner = entry.inner.lock().expect("session live lock");
+                if inner.bindings == 0 && inner.in_flight == 0 && !inner.reserved {
+                    drop(inner);
+                    entries.remove(&self.session.id);
                 }
             }
         }
@@ -552,6 +594,10 @@ pub(crate) enum ResumeOutcome {
     /// without a durable latch. The lane must persist `latched_row` before replying.
     NeedsLatch {
         session_id: SessionId,
+        #[expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )]
         current_row: Arc<SessionRow>,
         latched_row: SessionRow,
         receipts_until: Timestamp,
@@ -559,6 +605,13 @@ pub(crate) enum ResumeOutcome {
 }
 
 struct SessionTableInner {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     clock: Clock,
     entries: Mutex<HashMap<SessionId, Arc<SessionLive>>>,
 }
@@ -583,12 +636,26 @@ impl SessionTable {
 
     /// The process-lifetime clock.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn clock(&self) -> &Clock {
         &self.inner.clock
     }
 
     /// Returns the number of currently registered live sessions.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn live_count(&self) -> usize {
         let entries = self.inner.entries.lock().expect("session table lock");
         entries.len()
@@ -844,7 +911,7 @@ impl SessionTable {
         idle: SignedDuration,
         times: Times,
     ) {
-        let mut entries = self.inner.entries.lock().expect("session table lock");
+        let entries = self.inner.entries.lock().expect("session table lock");
         if let Some(live) = entries.get(&id) {
             let mut inner = live.inner.lock().expect("session live lock");
             match row {
@@ -1301,7 +1368,7 @@ mod tests {
         let mut conn_binding: Option<BoundSession> = Some(bound_a);
 
         // Connection replaces binding A with B
-        conn_binding = Some(bound_b);
+        conn_binding.replace(bound_b);
 
         // Trigger reclamation
         let dummy = prepare_open(

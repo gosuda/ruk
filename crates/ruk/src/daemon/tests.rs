@@ -1,4 +1,4 @@
-//! Command-stream serving tests driving the exact Go wire.
+//! Command-stream serving tests driving the daemon wire.
 //!
 //! The tests speak the Forgejo backend's field names over a socket pair
 //! (`protocol_major` without `protocol_minor`, `argv`/`dir`/`env` opens,
@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -42,7 +42,7 @@ static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
 /// Mints one stored commit directly in the repository store and closes the
 /// handle before the daemon opens it, so dispatch-time reads see committed
 /// state with only one live handle at a time.
-fn seed_commit(repo_dir: &PathBuf) -> Oid {
+fn seed_commit(repo_dir: &Path) -> Oid {
     let budget = Arc::new(PreparationBudget::reference_defaults());
     let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
     let tree = store
@@ -332,8 +332,8 @@ async fn handshake(driver: &mut Driver) {
 }
 
 /// Spawns `serve_connection` on a socket pair, returning the driver end.
-fn spawn_pair(root: &PathBuf) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
-    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry"));
+fn spawn_pair(root: &Path) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
+    let registry = Arc::new(Registry::new(vec![root.to_path_buf()]).expect("registry"));
     registry.set_runtime(tokio::runtime::Handle::current());
     let refs = ConnectionRefs {
         registry,

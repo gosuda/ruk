@@ -379,8 +379,7 @@ pub(crate) fn plan_refs(
     }
 
     if !updates.is_empty() {
-        let transaction =
-            RefTransaction::new(store.hash_kind(), updates).map_err(|err| ref_error(err))?;
+        let transaction = RefTransaction::new(store.hash_kind(), updates).map_err(ref_error)?;
         transaction.check(&reader).map_err(ref_error)?;
         let prepared = prepare_checked_transaction(store, &transaction).map_err(GitError::from)?;
         facts.extend(prepared.into_mutations());

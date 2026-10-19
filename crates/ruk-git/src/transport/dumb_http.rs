@@ -680,7 +680,7 @@ mod tests {
                     .expect("timeout");
                 let path = read_get_path(&socket);
                 let (status, content_type, body) = route(&server, &refs_body, &path);
-                write_response(socket, status, &content_type, &body);
+                write_response(socket, status, content_type, &body);
             }
         });
         (base, handle)

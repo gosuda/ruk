@@ -14,6 +14,10 @@ use super::lock::{Acquisition, LockSnapshot, StoreLock};
 use crate::store::{StoreFormat, read_format};
 use crate::{CoreError, ErrorCode};
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) enum Attachment {
     Owner {
         lock: StoreLock,
@@ -26,6 +30,10 @@ pub(crate) enum Attachment {
 ///
 /// The caller registers the repository with admission before this call.
 /// This path never opens redb. A held lock never permits a second writer.
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) async fn attach(
     root: &Path,
     admission: &Arc<Admission>,
@@ -47,6 +55,10 @@ pub(crate) async fn attach(
     })?
 }
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 async fn attach_until(
     root: &Path,
     admission: &Arc<Admission>,
@@ -98,6 +110,10 @@ async fn attach_until(
     }
 }
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 fn probe_owner(root: &Path) -> Result<(StoreFormat, Acquisition), CoreError> {
     endpoint::ensure_local_storage(root)?;
     let (format, file) = read_format(root)?;

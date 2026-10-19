@@ -218,7 +218,7 @@ fn test_git_native_eligibility() {
 #[test]
 fn test_sha1_native_key_fixed32_identity() {
     let fixture = TestFixture::new("fixed32-sha1", HashKind::Sha1);
-    let records = Records::new(fixture.store());
+    let _records = Records::new(fixture.store());
 
     // Native CommitKey with fixed 32 bytes
     let raw_32_bytes = [
@@ -451,8 +451,7 @@ fn test_wrong_expected_head_and_cas_failure() {
 
     let err = records
         .prepare_native_commit(input)
-        .err()
-        .expect("should fail with E_NOT_FOUND or E_STALE");
+        .expect_err("should fail with E_NOT_FOUND or E_STALE");
     assert!(
         err.code == ErrorCode::ENotFound || err.code == ErrorCode::EStale,
         "expected ENotFound or EStale, got {err:?}"

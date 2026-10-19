@@ -367,6 +367,10 @@ const STDERR_GRACE: Duration = Duration::from_secs(5);
 /// channel under [`STDERR_GRACE`]; a reader that never delivers is
 /// abandoned (it exits on its own once every inheritor finally exits) and
 /// the push proceeds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the hook spawn shape: paths, quarantine, args, input, options, and timeout"
+)]
 fn execute(
     path: &Path,
     repo_dir: &Path,

@@ -95,11 +95,11 @@ fn c_declarator_name(tree: &ParsedTree, source: &[u8], node: u32) -> Vec<u8> {
 /// match in order when `disc_all`).
 fn unit_discriminator(tree: &ParsedTree, source: &[u8], node: u32, rules: &CodeRules) -> Vec<u8> {
     let mut discriminator = Vec::new();
-    if let Some(field) = rules.disc_field {
-        if let Some(edge) = tree.child_with_field(node, field) {
-            discriminator.extend_from_slice(tree.text_of(edge, source));
-            discriminator.push(0);
-        }
+    if let Some(field) = rules.disc_field
+        && let Some(edge) = tree.child_with_field(node, field)
+    {
+        discriminator.extend_from_slice(tree.text_of(edge, source));
+        discriminator.push(0);
     }
     if rules.disc_all {
         for child in tree.named_children(node) {
@@ -141,6 +141,15 @@ fn c_signature(tree: &ParsedTree, source: &[u8], node: u32) -> Vec<u8> {
     Vec::new()
 }
 
+/// Shared read-only context for one code-adapter collection pass.
+#[derive(Clone, Copy)]
+struct CodeCollectCtx<'a> {
+    tree: &'a ParsedTree,
+    source: &'a [u8],
+    rules: &'a CodeRules,
+    language: Language,
+}
+
 /// Extracts units under `node`, threading lexical-parent names. Descent
 /// stops at [`MAX_WALK_DEPTH`](super::MAX_WALK_DEPTH); deeper subtrees stay
 /// gaps. Members are reached through containers and their transparent body
@@ -148,15 +157,18 @@ fn c_signature(tree: &ParsedTree, source: &[u8], node: u32) -> Vec<u8> {
 /// (units return before descent, and their body kinds are never listed as
 /// wrappers) never leak nested declarations as member units.
 fn collect(
-    tree: &ParsedTree,
-    source: &[u8],
+    ctx: CodeCollectCtx<'_>,
     node: u32,
-    rules: &CodeRules,
-    language: Language,
     parents: &mut Vec<Vec<u8>>,
     out: &mut Vec<SourceUnit>,
     depth: usize,
 ) {
+    let CodeCollectCtx {
+        tree,
+        source,
+        rules,
+        language,
+    } = ctx;
     if depth > super::MAX_WALK_DEPTH {
         return;
     }
@@ -217,16 +229,7 @@ fn collect(
         return;
     }
     for child in tree.named_children(node) {
-        collect(
-            tree,
-            source,
-            child,
-            rules,
-            language,
-            parents,
-            out,
-            depth + 1,
-        );
+        collect(ctx, child, parents, out, depth + 1);
     }
     if pushed {
         parents.pop();
@@ -245,7 +248,13 @@ fn extract(
         return out;
     }
     let mut parents = Vec::new();
-    collect(tree, source, 0, rules, language, &mut parents, &mut out, 0);
+    let ctx = CodeCollectCtx {
+        tree,
+        source,
+        rules,
+        language,
+    };
+    collect(ctx, 0, &mut parents, &mut out, 0);
     out.sort_by_key(|unit| (unit.start, unit.end));
     out
 }

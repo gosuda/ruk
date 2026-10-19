@@ -46,7 +46,7 @@ struct RegistryInner {
 }
 
 /// The hosted repository registry of one daemon process.
-pub struct Registry {
+pub(crate) struct Registry {
     /// Canonicalized repository roots; every open must land beneath one.
     roots: Vec<PathBuf>,
     /// Handle and path bindings.
@@ -80,7 +80,7 @@ impl Registry {
     /// # Errors
     /// `E_INVALID` for an empty root set, `E_IO` when a root is missing or
     /// inaccessible.
-    pub fn new(roots: Vec<PathBuf>) -> Result<Self, CoreError> {
+    pub(crate) fn new(roots: Vec<PathBuf>) -> Result<Self, CoreError> {
         if roots.is_empty() {
             return Err(CoreError::new(
                 ErrorCode::EInvalid,
@@ -114,7 +114,7 @@ impl Registry {
     ///
     /// `serve` calls this once before accepting; [`Registry::open`] refuses
     /// with `E_HOSTED` until it runs.
-    pub fn set_runtime(&self, handle: tokio::runtime::Handle) {
+    pub(crate) fn set_runtime(&self, handle: tokio::runtime::Handle) {
         if let Ok(mut runtime) = self.runtime.lock() {
             *runtime = Some(handle);
         }
@@ -122,7 +122,7 @@ impl Registry {
 
     /// Returns the canonicalized repository roots.
     #[must_use]
-    pub fn roots(&self) -> Vec<PathBuf> {
+    pub(crate) fn roots(&self) -> Vec<PathBuf> {
         self.roots.clone()
     }
 
@@ -132,7 +132,7 @@ impl Registry {
     /// each coordinator opened afterwards sweeps on this period. Zero disables
     /// the per-coordinator tasks. The atomic read in `coordinator_for` keeps
     /// opens lock-free with respect to this setting.
-    pub fn set_retention_interval(&self, interval: Duration) {
+    pub(crate) fn set_retention_interval(&self, interval: Duration) {
         self.retention_interval_ms.store(
             u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -144,7 +144,7 @@ impl Registry {
     /// # Errors
     /// `E_NOT_FOUND` for a missing path, `E_IO` when the path is
     /// inaccessible, `E_FORBIDDEN` outside the configured roots.
-    pub fn resolve(&self, requested: &Path) -> Result<PathBuf, CoreError> {
+    pub(crate) fn resolve(&self, requested: &Path) -> Result<PathBuf, CoreError> {
         let canonical = match std::fs::canonicalize(requested) {
             Ok(path) => path,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -184,7 +184,7 @@ impl Registry {
     /// As for [`Registry::resolve`] for paths, `E_NOT_FOUND` for unknown
     /// handles, `E_FORBIDDEN` outside the configured roots, `E_HOSTED` when
     /// the daemon runtime is not bound yet.
-    pub fn open(
+    pub(crate) fn open(
         &self,
         repo_ref: &str,
     ) -> Result<(String, PathBuf, Arc<HostedCoordinator>), CoreError> {
@@ -296,7 +296,14 @@ impl Registry {
     ///
     /// # Errors
     /// As for [`Registry::resolve`].
-    pub fn open_by_path(&self, requested: &Path) -> Result<String, CoreError> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    pub(crate) fn open_by_path(&self, requested: &Path) -> Result<String, CoreError> {
         let canonical = self.resolve(requested)?;
         self.handle_for_path(&canonical)
     }
@@ -306,7 +313,7 @@ impl Registry {
     /// # Errors
     /// `E_NOT_FOUND` for an unknown handle, `E_FORBIDDEN` when the bound
     /// path no longer sits beneath a configured root.
-    pub fn open_by_handle(&self, handle: &str) -> Result<PathBuf, CoreError> {
+    pub(crate) fn open_by_handle(&self, handle: &str) -> Result<PathBuf, CoreError> {
         let mut inner = self
             .inner
             .lock()
@@ -362,7 +369,14 @@ impl Registry {
     ///
     /// # Errors
     /// `E_IO` when the registry lock is poisoned.
-    pub fn evict_idle(&self, max_idle: Duration) -> Result<usize, CoreError> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    pub(crate) fn evict_idle(&self, max_idle: Duration) -> Result<usize, CoreError> {
         let mut inner = self
             .inner
             .lock()
@@ -397,7 +411,14 @@ impl Registry {
     ///
     /// # Errors
     /// `E_IO` when the registry lock is poisoned.
-    pub fn len(&self) -> Result<usize, CoreError> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    pub(crate) fn len(&self) -> Result<usize, CoreError> {
         self.inner
             .lock()
             .map(|inner| inner.entries.len())
@@ -408,7 +429,14 @@ impl Registry {
     ///
     /// # Errors
     /// `E_IO` when the registry lock is poisoned.
-    pub fn is_empty(&self) -> Result<bool, CoreError> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    pub(crate) fn is_empty(&self) -> Result<bool, CoreError> {
         self.len().map(|len| len == 0)
     }
 }
@@ -455,7 +483,7 @@ impl Registry {
     /// closes to new submissions, in-flight and queued work drains, and
     /// each store handle flushes. Idempotent: shutting down twice retires
     /// nothing the second time beyond repeating the idempotent calls.
-    pub fn shutdown_all(&self) {
+    pub(crate) fn shutdown_all(&self) {
         let retired: Vec<Arc<HostedCoordinator>> = self
             .inner
             .lock()
@@ -482,7 +510,7 @@ impl Registry {
     /// tearing down around the wait) report nowhere new. Evicted entries
     /// keep no handle: their runners drain detached while the runtime
     /// lives, exactly as before.
-    pub async fn shutdown_and_drain(&self) {
+    pub(crate) async fn shutdown_and_drain(&self) {
         self.shutdown_all();
         let runners: Vec<tokio::task::JoinHandle<Result<(), CoreError>>> = self
             .inner

@@ -71,9 +71,9 @@ pub use capacity::CapacityLimits;
 pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
 pub use compact::{CompactionBacklog, CompactionStats, PruneStats};
 pub use error::StoreError;
-pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
+pub(crate) use guards::GenerationRegistry;
 pub use metadata::{FactPage, FactPageBudget, FactRow};
-pub(crate) use metadata::{MAX_FACT_ROW_BYTES, decode, encode};
+pub(crate) use metadata::{decode, encode};
 pub use spool::{BudgetLimits, PreparationBudget, Spool};
 pub use stream::{ChunkDecision, StreamMeta};
 pub use types::{
@@ -558,6 +558,13 @@ impl Store {
     ///
     /// No filesystem I/O is performed under this registry mutex.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn is_segment_retired_ready_for_unlink(&self, retired_generation: u64) -> bool {
         self.guards
             .is_segment_retired_ready_for_unlink(retired_generation)
@@ -565,6 +572,13 @@ impl Store {
 
     /// Accessor for the store's generation registry.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn generation_registry(&self) -> &Arc<GenerationRegistry> {
         &self.guards
     }

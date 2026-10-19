@@ -537,8 +537,7 @@ fn claim_list_authorization_denies_and_grants() {
     }
     assert_eq!(
         authorize_claim_listing(&bare, viewer, &ClaimListing::Mine(holder(2)))
-            .err()
-            .expect("another holder without intent")
+            .expect_err("another holder without intent")
             .code,
         ErrorCode::EForbidden
     );
@@ -551,8 +550,7 @@ fn provenance_read_authorization_denies_and_grants() {
     authorize_provenance_read(&bare, viewer, viewer).expect("own provenance");
     assert_eq!(
         authorize_provenance_read(&bare, viewer, holder(2))
-            .err()
-            .expect("other without intent")
+            .expect_err("other without intent")
             .code,
         ErrorCode::EForbidden
     );
@@ -653,8 +651,7 @@ fn mutation_seal_covers_declared_write_paths() {
             &write_request(&["src/lib.rs"]),
             None,
         )
-        .err()
-        .expect("blocked write")
+        .expect_err("blocked write")
         .code,
         ErrorCode::EClaimed
     );

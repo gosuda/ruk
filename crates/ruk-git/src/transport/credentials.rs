@@ -99,10 +99,10 @@ fn parse_fill_output(out: &[u8]) -> Option<(String, String)> {
             if username.is_none() {
                 username = Some(value.to_owned());
             }
-        } else if let Some(value) = line.strip_prefix("password=") {
-            if password.is_empty() {
-                password = value.to_owned();
-            }
+        } else if let Some(value) = line.strip_prefix("password=")
+            && password.is_empty()
+        {
+            password = value.to_owned();
         }
     }
     username
@@ -318,15 +318,15 @@ fn helper_commands_for(url: &str, entries: &[CredentialHelperRow]) -> Vec<(Strin
             out.clear();
             continue;
         }
-        if let Some(scope) = entry.scope.as_ref() {
-            if !scope_matches(scope, url) {
-                continue;
-            }
+        if let Some(scope) = entry.scope.as_ref()
+            && !scope_matches(scope, url)
+        {
+            continue;
         }
-        if let Some(command) = classify_helper(&entry.value) {
-            if out.len() < MAX_HELPERS {
-                out.push(command);
-            }
+        if let Some(command) = classify_helper(&entry.value)
+            && out.len() < MAX_HELPERS
+        {
+            out.push(command);
         }
     }
     out
@@ -592,10 +592,10 @@ fn credential_field<'a>(desc: &'a [(String, String)], key: &str) -> Option<&'a s
 /// unscoped helpers.
 #[must_use]
 pub fn credential_scope_url(desc: &[(String, String)]) -> Option<String> {
-    if let Some(url) = credential_field(desc, "url") {
-        if !url.is_empty() {
-            return Some(url.to_owned());
-        }
+    if let Some(url) = credential_field(desc, "url")
+        && !url.is_empty()
+    {
+        return Some(url.to_owned());
     }
     let protocol = credential_field(desc, "protocol")?;
     let host = credential_field(desc, "host")?;

@@ -499,19 +499,59 @@ fn build_context(
     ctx
 }
 
+/// Shared read-only context for the recursive host-tree walk.
+#[derive(Clone, Copy)]
+struct HostWalk<'a> {
+    tree: &'a ParsedTree,
+    source: &'a [u8],
+    host_lang: Language,
+    path: &'a ByteString,
+    input_which: NoticeInput,
+}
+
+/// The three region-key sets compared when checking insertions and deletions.
+struct RegionKeySets<'a> {
+    base_keys: &'a HashMap<&'a RegionKey, usize>,
+    ours_keys: &'a HashMap<&'a RegionKey, usize>,
+    theirs_keys: &'a HashMap<&'a RegionKey, usize>,
+}
+
+/// The four inputs merged when both sides change one embedded region.
+/// Two lifetimes: `r_base` outlives the returned edit while the contents
+/// only need to live through the call (they borrow the request sides).
+#[derive(Clone, Copy)]
+struct CompetingInputs<'b, 'c> {
+    r_base: &'b EmbeddedRegion,
+    base_content: &'c [u8],
+    ours_content: &'c [u8],
+    theirs_content: &'c [u8],
+}
+
+/// Shared request context for final host verification.
+struct HostVerify<'a> {
+    host_grammar: &'a dyn Grammar,
+    registry: &'a GrammarRegistry<'a>,
+    cancel: &'a Cancel,
+    req_lang: Language,
+    path: &'a ByteString,
+}
+
 /// Processes an embedded element node and extracts its region descriptor.
 fn process_embedded_node(
-    tree: &ParsedTree,
-    source: &[u8],
+    ctx: HostWalk<'_>,
     node: u32,
-    host_lang: Language,
-    path: &ByteString,
-    input_which: NoticeInput,
     ancestors: &[Vec<u8>],
     container_depth: usize,
     regions: &mut Vec<EmbeddedRegion>,
     collector: &mut NoticeCollector,
 ) -> Result<(), DeclineReason> {
+    let HostWalk {
+        tree,
+        source,
+        host_lang,
+        path,
+        input_which,
+    } = ctx;
     if container_depth > MAX_INJECTION_DEPTH {
         let msg = format!("exceeded maximum injection depth {MAX_INJECTION_DEPTH}");
         add_notice(
@@ -623,17 +663,14 @@ fn process_embedded_node(
 
 /// Recursively processes container nodes and traverses children.
 fn process_container_node(
-    tree: &ParsedTree,
-    source: &[u8],
+    ctx: HostWalk<'_>,
     node: u32,
-    host_lang: Language,
-    path: &ByteString,
-    input_which: NoticeInput,
     ancestors: &mut Vec<Vec<u8>>,
     container_depth: usize,
     regions: &mut Vec<EmbeddedRegion>,
     collector: &mut NoticeCollector,
 ) -> Result<(), DeclineReason> {
+    let HostWalk { tree, source, .. } = ctx;
     let tag = get_tag_name(tree, source, node);
     let is_elem = !tag.is_empty();
     if is_elem {
@@ -645,18 +682,7 @@ fn process_container_node(
         container_depth
     };
     for child in tree.named_children(node) {
-        walk_tree(
-            tree,
-            source,
-            child,
-            host_lang,
-            path,
-            input_which,
-            ancestors,
-            next_depth,
-            regions,
-            collector,
-        )?;
+        walk_tree(ctx, child, ancestors, next_depth, regions, collector)?;
     }
     if is_elem {
         ancestors.pop();
@@ -666,44 +692,24 @@ fn process_container_node(
 
 /// Walks the parsed host tree to discover embedded regions.
 fn walk_tree(
-    tree: &ParsedTree,
-    source: &[u8],
+    ctx: HostWalk<'_>,
     node: u32,
-    host_lang: Language,
-    path: &ByteString,
-    input_which: NoticeInput,
     ancestors: &mut Vec<Vec<u8>>,
     container_depth: usize,
     regions: &mut Vec<EmbeddedRegion>,
     collector: &mut NoticeCollector,
 ) -> Result<(), DeclineReason> {
-    let kind = tree.kind_of(node);
-    if is_host_embedded(kind, tree, source, node, host_lang) {
-        return process_embedded_node(
-            tree,
-            source,
-            node,
-            host_lang,
-            path,
-            input_which,
-            ancestors,
-            container_depth,
-            regions,
-            collector,
-        );
-    }
-    process_container_node(
+    let HostWalk {
         tree,
         source,
-        node,
         host_lang,
-        path,
-        input_which,
-        ancestors,
-        container_depth,
-        regions,
-        collector,
-    )
+        ..
+    } = ctx;
+    let kind = tree.kind_of(node);
+    if is_host_embedded(kind, tree, source, node, host_lang) {
+        return process_embedded_node(ctx, node, ancestors, container_depth, regions, collector);
+    }
+    process_container_node(ctx, node, ancestors, container_depth, regions, collector)
 }
 
 /// Extracts all embedded regions from a parsed host input.
@@ -720,18 +726,14 @@ fn extract_regions(
         return Ok(regions);
     }
     let mut ancestors = Vec::new();
-    walk_tree(
+    let ctx = HostWalk {
         tree,
         source,
-        0,
         host_lang,
         path,
         input_which,
-        &mut ancestors,
-        0,
-        &mut regions,
-        collector,
-    )?;
+    };
+    walk_tree(ctx, 0, &mut ancestors, 0, &mut regions, collector)?;
     Ok(regions)
 }
 
@@ -885,15 +887,18 @@ fn check_key_uniqueness(
 
 /// Verifies that no embedded regions were added or removed on one side.
 fn check_insertions_and_deletions(
-    base_keys: &HashMap<&RegionKey, usize>,
-    ours_keys: &HashMap<&RegionKey, usize>,
-    theirs_keys: &HashMap<&RegionKey, usize>,
+    keys: RegionKeySets<'_>,
     ours_regions: &[EmbeddedRegion],
     theirs_regions: &[EmbeddedRegion],
     base_regions: &[EmbeddedRegion],
     request: &ComposedRequest<'_>,
     collector: &mut NoticeCollector,
 ) -> Result<(), DeclineReason> {
+    let RegionKeySets {
+        base_keys,
+        ours_keys,
+        theirs_keys,
+    } = keys;
     for r_ours in ours_regions {
         if base_keys.contains_key(&r_ours.key) {
             continue;
@@ -1043,10 +1048,13 @@ fn validate_matching<'a>(
     check_key_uniqueness(&ours_keys, "ours", request, collector)?;
     check_key_uniqueness(&theirs_keys, "theirs", request, collector)?;
 
+    let keys = RegionKeySets {
+        base_keys: &base_keys,
+        ours_keys: &ours_keys,
+        theirs_keys: &theirs_keys,
+    };
     check_insertions_and_deletions(
-        &base_keys,
-        &ours_keys,
-        &theirs_keys,
+        keys,
         ours_regions,
         theirs_regions,
         base_regions,
@@ -1087,16 +1095,19 @@ fn validate_matching<'a>(
 }
 
 /// Merges a region changed on both sides using plain syntax adapter.
-fn merge_competing_region<'a>(
-    r_base: &'a EmbeddedRegion,
-    base_content: &[u8],
-    ours_content: &[u8],
-    theirs_content: &[u8],
+fn merge_competing_region<'a, 'c>(
+    inputs: CompetingInputs<'a, 'c>,
     request: &ComposedRequest<'_>,
     registry: &GrammarRegistry<'_>,
     cancel: &Cancel,
     collector: &mut NoticeCollector,
 ) -> Result<Result<Option<RegionEdit<'a>>, DeclineReason>, SyntaxError> {
+    let CompetingInputs {
+        r_base,
+        base_content,
+        ours_content,
+        theirs_content,
+    } = inputs;
     let Some(child_lang) = r_base.declared_language else {
         let msg = format!(
             "both sides changed unsupported preprocessor region {}",
@@ -1214,16 +1225,13 @@ fn merge_single_region<'a>(
         })));
     }
 
-    merge_competing_region(
+    let inputs = CompetingInputs {
         r_base,
         base_content,
         ours_content,
         theirs_content,
-        request,
-        registry,
-        cancel,
-        collector,
-    )
+    };
+    merge_competing_region(inputs, request, registry, cancel, collector)
 }
 
 /// Performs a single-pass streaming splice of sorted, non-overlapping replacements.
@@ -1343,15 +1351,18 @@ fn verify_child_syntax(
 
 /// Verifies that the re-parsed host and child regions match expected boundaries.
 fn verify_final(
-    host_grammar: &dyn Grammar,
-    registry: &GrammarRegistry<'_>,
-    cancel: &Cancel,
+    ctx: HostVerify<'_>,
     merged_bytes: &[u8],
     edits: &[RegionEdit<'_>],
-    req_lang: Language,
-    path: &ByteString,
     collector: &mut NoticeCollector,
 ) -> Result<Result<(), DeclineReason>, SyntaxError> {
+    let HostVerify {
+        host_grammar,
+        registry,
+        cancel,
+        req_lang,
+        path,
+    } = ctx;
     cancel.check()?;
     let final_tree = match parse_host(
         host_grammar,
@@ -1664,16 +1675,14 @@ pub fn merge_host(
         }
     };
 
-    if let Err(reason) = verify_final(
+    let ctx = HostVerify {
         host_grammar,
         registry,
         cancel,
-        &merged_bytes,
-        &edits,
-        request.language,
-        &request.path,
-        &mut collector,
-    )? {
+        req_lang: request.language,
+        path: &request.path,
+    };
+    if let Err(reason) = verify_final(ctx, &merged_bytes, &edits, &mut collector)? {
         return Ok(ComposedOutcome::Declined {
             reason,
             notices: collector.finish(),

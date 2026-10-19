@@ -69,7 +69,6 @@ impl GenerationRegistry {
     ///
     /// Must be called BEFORE opening the redb read transaction for locator lookup.
     /// The reader is assigned epoch `u128::from(published_generation) + 1`.
-    #[must_use]
     pub(crate) fn register(self: &Arc<Self>) -> GenerationGuard {
         let mut inner = self
             .inner
@@ -114,6 +113,13 @@ impl GenerationRegistry {
     }
 
     /// The oldest active reader epoch, or `None` if no readers are active.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn oldest_active_reader_epoch(&self) -> Option<u128> {
         let inner = self
@@ -143,6 +149,13 @@ impl GenerationRegistry {
     }
 
     /// Total number of active registered readers.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn active_reader_count(&self) -> usize {
         let inner = self
@@ -153,6 +166,13 @@ impl GenerationRegistry {
     }
 
     /// The current published generation recorded in the registry.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn published_generation(&self) -> u64 {
         let inner = self
@@ -165,6 +185,13 @@ impl GenerationRegistry {
 
 impl GenerationGuard {
     /// The reader epoch assigned at registration.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn epoch(&self) -> u128 {
         self.epoch
@@ -197,6 +224,10 @@ pub(crate) struct ObjectSnapshot {
 }
 
 impl ObjectSnapshot {
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn target_oid(&self) -> Oid {
         self.target_oid
     }
@@ -640,7 +671,7 @@ mod tests {
 
         let delta_data = b"delta payload";
         let delta_blob = prep_delta(&store, base_oid, delta_data);
-        let delta_oid = delta_blob.oid();
+        let _delta_oid = delta_blob.oid();
         store.publish(vec![delta_blob], &[]).expect("publish delta");
 
         let meta_path = dir.meta_path();

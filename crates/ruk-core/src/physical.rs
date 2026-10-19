@@ -75,6 +75,10 @@ pub(crate) enum AllocationError {
     /// Ordinary I/O failure, including out-of-space.
     Io(std::io::Error),
     /// No strict reservation primitive exists on this platform.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     Unsupported,
     /// The handle does not name a regular file.
     NotRegularFile,
@@ -111,6 +115,13 @@ impl std::error::Error for AllocationError {}
 /// caller-visible floor (`f_bavail`-class, so per-user quotas and the
 /// privileged reserve are reflected); `total` is the volume size.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct VolumeFloor {
     /// Bytes reported free to the calling user.
     pub(crate) available: u64,
@@ -168,6 +179,13 @@ impl PhysicalReservation {
 }
 
 /// Advisory volume sample for admission diagnostics. See [`VolumeFloor`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
     platform::volume_free_floor(path)
 }
@@ -250,6 +268,13 @@ mod platform {
         })
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(super) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
         let dir = File::open(path).map_err(AllocationError::Io)?;
         let v = fstatvfs(&dir).map_err(|e| AllocationError::Io(e.into()))?;

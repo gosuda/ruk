@@ -426,7 +426,7 @@ impl<'p, R: Read> SidebandReader<'p, R> {
                 });
             }
             match demux(payload)? {
-                Band::Data(data) if data.is_empty() => {}
+                Band::Data([]) => {}
                 Band::Data(data) => {
                     self.pending.clear();
                     self.pending.extend_from_slice(data);

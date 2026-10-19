@@ -1134,10 +1134,10 @@ impl<'a> Eval<'a> {
         let mut out = BTreeSet::new();
         for raw in 0..self.ctx.graph.num_total_commits() {
             let pos = GlobalPosition::from_raw_checked(raw);
-            if let Head::Git { oid } = self.ctx.graph.pos_to_head(pos)? {
-                if query(self.ctx.store, &oid, &kind, &result)? {
-                    out.insert(pos);
-                }
+            if let Head::Git { oid } = self.ctx.graph.pos_to_head(pos)?
+                && query(self.ctx.store, &oid, &kind, &result)?
+            {
+                out.insert(pos);
             }
         }
         Ok(out)

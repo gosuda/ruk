@@ -64,14 +64,14 @@ use crate::store::types::{FactExpectation, FactMutation, FactTable};
 use crate::store::{Store, decode, encode};
 
 /// How long a land plan stays executable after creation.
-pub const LAND_PLAN_TTL: SignedDuration = SignedDuration::from_hours(1);
+pub(super) const LAND_PLAN_TTL: SignedDuration = SignedDuration::from_hours(1);
 
 /// Most candidate commits one land plan freezes.
-pub const MAX_LAND_CANDIDATES: usize = 1024;
+pub(super) const MAX_LAND_CANDIDATES: usize = 1024;
 
 /// The frozen inputs [`land_prepare`] turns into a [`LandPlan`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LandPrepareRequest {
+pub(super) struct LandPrepareRequest {
     /// The change under land, with its selected head.
     pub change: ChangeRef,
     /// The target ref to land onto, e.g. `refs/heads/main`.
@@ -94,7 +94,7 @@ pub struct LandPrepareRequest {
 ///
 /// All durable row formats declared here are v1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LandPlan {
+pub(super) struct LandPlan {
     /// The durable identity of this plan.
     pub plan: PlanId,
     /// The change under land, with its selected head.
@@ -128,7 +128,7 @@ impl LandPlan {
     /// carries at least one member. An empty set decodes only from a
     /// hand-built row and reports as absent here.
     #[must_use]
-    pub fn candidate(&self) -> Option<Oid> {
+    pub(super) fn candidate(&self) -> Option<Oid> {
         self.candidates.first().copied()
     }
 
@@ -136,14 +136,16 @@ impl LandPlan {
     ///
     /// The plan stays valid at exactly `expires_at` and refuses after it.
     #[must_use]
-    pub fn is_expired(&self, now: Timestamp) -> bool {
+    #[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+    pub(super) fn is_expired(&self, now: Timestamp) -> bool {
         now.instant() > self.expires_at.instant()
     }
 }
 
 /// The local publish leg of one executed land plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LandOutcome {
+#[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+pub(super) struct LandOutcome {
     /// The executed plan.
     pub plan: PlanId,
     /// The target ref that moved.
@@ -160,7 +162,7 @@ pub struct LandOutcome {
 
 /// Returns the [`FactTable::LandPlans`](crate::store::types::FactTable::LandPlans) key for `plan`.
 #[must_use]
-pub fn plan_key(plan: PlanId) -> [u8; 16] {
+pub(super) fn plan_key(plan: PlanId) -> [u8; 16] {
     *plan.as_bytes()
 }
 
@@ -170,7 +172,8 @@ pub fn plan_key(plan: PlanId) -> [u8; 16] {
 ///
 /// # Errors
 /// `E_CORRUPT` for a stored row that fails decoding; I/O failures propagate.
-pub fn load_plan(store: &Store, plan: PlanId) -> Result<Option<LandPlan>, CoreError> {
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
+pub(super) fn load_plan(store: &Store, plan: PlanId) -> Result<Option<LandPlan>, CoreError> {
     let raw = store.fact(FactTable::LandPlans, &plan_key(plan))?;
     let Some(bytes) = raw else {
         return Ok(None);
@@ -190,7 +193,7 @@ pub fn load_plan(store: &Store, plan: PlanId) -> Result<Option<LandPlan>, CoreEr
 ///
 /// # Errors
 /// Same as [`land_prepare`], without publishing.
-pub fn prepare_land_plan(
+pub(super) fn prepare_land_plan(
     store: &Store,
     request: LandPrepareRequest,
     checkpoint: &Checkpoint<'_>,
@@ -320,7 +323,8 @@ pub fn prepare_land_plan(
 /// of the wrong hash width; `E_NOT_FOUND` for a candidate with no stored
 /// object; `E_POLICY` for requirements with no trusted signer; `E_STALE`
 /// for a plan identity collision; `E_CORRUPT` or `E_IO` from the store.
-pub fn land_prepare(
+#[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+pub(super) fn land_prepare(
     store: &Store,
     request: LandPrepareRequest,
     checkpoint: &Checkpoint<'_>,
@@ -343,7 +347,8 @@ pub fn land_prepare(
 /// stored plan that differs from `plan`, a moved target tip, or a lost
 /// commit race; `E_POLICY` for a candidate that misses a requirement;
 /// `E_CORRUPT` or `E_IO` from the store.
-pub fn land_execute(
+#[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+pub(super) fn land_execute(
     store: &Store,
     plan: &LandPlan,
     now: Timestamp,
@@ -417,7 +422,7 @@ pub fn land_execute(
         }],
     )
     .map_err(CoreError::from)?;
-    let prepared = prepare_checked_transaction(store, &transaction).map_err(CoreError::from)?;
+    let prepared = prepare_checked_transaction(store, &transaction)?;
     let mut mutations = prepared.into_mutations();
     mutations.push(FactMutation {
         table: FactTable::LandPlans,

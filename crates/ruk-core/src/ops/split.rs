@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::bytes::ByteString;
 use crate::change::ChangeId;
 use crate::commit::{NativeCommitInput, Provenance};
-use crate::conflict::{ExtraHeader, Signature};
+use crate::conflict::ExtraHeader;
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
@@ -90,13 +90,13 @@ pub fn prepare_split(
             "first commit message contains a NUL byte",
         ));
     }
-    if let Some(msg) = &request.second_message {
-        if msg.as_bytes().contains(&0) {
-            return Err(CoreError::new(
-                ErrorCode::EInvalid,
-                "second commit message contains a NUL byte",
-            ));
-        }
+    if let Some(msg) = &request.second_message
+        && msg.as_bytes().contains(&0)
+    {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "second commit message contains a NUL byte",
+        ));
     }
 
     let records = Records::new(store);
@@ -210,7 +210,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::conflict::TzOffset;
+    use crate::conflict::{Signature, TzOffset};
     use crate::ids::HashKind;
     use crate::ops::{NewRequest, new};
     use crate::store::PreparationBudget;

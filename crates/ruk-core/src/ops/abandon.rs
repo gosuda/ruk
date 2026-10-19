@@ -5,7 +5,7 @@
 //! it from its current heads. When a change has no heads left, its state
 //! transitions to abandoned.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use serde::{Deserialize, Serialize};
 
@@ -85,9 +85,9 @@ pub fn prepare_abandon(
         })?;
         let change_id = record.change_id();
 
-        if !pending.contains_key(&change_id) {
+        if let Entry::Vacant(slot) = pending.entry(change_id) {
             let update = load_change_update(store, &change_id)?;
-            pending.insert(change_id, update);
+            slot.insert(update);
             order.push(change_id);
         }
 

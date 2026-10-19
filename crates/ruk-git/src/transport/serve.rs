@@ -424,6 +424,10 @@ fn alternate_line(alternate: &AlternateRef, old: Oid, new: Oid) -> String {
 /// Accepted review refs accumulate in `alternates` as `(command index,
 /// review ref)` pairs so `post-receive` observes the hook-supplied
 /// refname and OIDs, mirroring the oracle's use of the hook's `ref_name`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "hook-phase context threaded through; grouping it would ripple to the serve entry points"
+)]
 fn run_proc_receive_phase(
     live: &[(usize, PushUpdate)],
     results: &mut [Option<Result<(), String>>],
@@ -551,6 +555,10 @@ pub fn serve_receive_pack<R: Read, W: Write>(
 /// [`GitError::Corrupt`] for grammar violations, [`GitError::ObjectFormat`]
 /// for store/kind mismatch or foreign OIDs, plus ingest, verification,
 /// store and transport failures.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "public serve entry mirroring serve_receive_pack plus hooks and policy; grouping would ripple to callers"
+)]
 pub fn serve_receive_pack_with<R: Read, W: Write>(
     reader: R,
     mut writer: W,
@@ -751,13 +759,13 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     // This runs even when every ref was refused: the oracle migrates the
     // quarantine directory regardless of per-ref outcomes, and unreferenced
     // objects simply stay unreachable.
-    if let Some(pack) = staged {
-        if let Err(err) = store.publish(pack.into_objects(), &facts) {
-            let err = GitError::from(err);
-            let reason = sanitize(&err.to_string());
-            send_report(&mut writer, Some(&reason), &all_ng(&commands, &reason))?;
-            return Err(err);
-        }
+    if let Some(pack) = staged
+        && let Err(err) = store.publish(pack.into_objects(), &facts)
+    {
+        let err = GitError::from(err);
+        let reason = sanitize(&err.to_string());
+        send_report(&mut writer, Some(&reason), &all_ng(&commands, &reason))?;
+        return Err(err);
     }
     // AGit diversion runs only outside `atomic`: consulting the hook could
     // create a review the client is then told failed, and atomicity across
@@ -840,8 +848,9 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             hook_line(cmd)
         })
         .collect();
-    if !landed.is_empty() && interrupt.check("running post-receive hook").is_ok() {
-        if let Some(reason) = run_hook(
+    if !landed.is_empty()
+        && interrupt.check("running post-receive hook").is_ok()
+        && let Some(reason) = run_hook(
             hooks,
             quarantine.as_ref(),
             "post-receive",
@@ -849,9 +858,9 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             Some(landed.as_bytes()),
             &push_options,
             client_push_options,
-        ) {
-            tracing::warn!("post-receive hook failed: {reason}");
-        }
+        )
+    {
+        tracing::warn!("post-receive hook failed: {reason}");
     }
     send_report(&mut writer, None, &report_rows(&commands, &results))?;
     Ok(())
@@ -873,6 +882,41 @@ fn report_rows(
             )
         })
         .collect()
+}
+
+/// Routes one server-side command to its serve half (protocol v0).
+///
+/// `name` is the bare command (`upload-pack`, `receive-pack`,
+/// `upload-archive`); the per-command grammars stay with their owners.
+/// The `upload-archive` arm serves `git archive --remote` through
+/// [`super::archive::serve_upload_archive`].
+///
+/// # Errors
+/// [`GitError::Unsupported`] for an unknown command, plus each half's own
+/// failures.
+pub fn serve_command<R: Read, W: Write>(
+    name: &str,
+    reader: R,
+    writer: W,
+    store: &Store,
+    kind: HashKind,
+    head: &HeadAdvertisement,
+    interrupt: &Interrupt,
+) -> Result<(), GitError> {
+    match name {
+        "upload-pack" => serve_upload_pack(reader, writer, store, kind, head, interrupt),
+        // No repository directory travels with a bare command dispatch, so
+        // no policy file is readable: fail closed to pointer refusal.
+        "receive-pack" => {
+            serve_receive_pack(reader, writer, store, kind, head, interrupt, LfsMode::Deny)
+        }
+        "upload-archive" => {
+            super::archive::serve_upload_archive(reader, writer, store, kind, head, interrupt)
+        }
+        other => Err(GitError::Unsupported {
+            command: format!("unknown serve command {other:?}"),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -927,7 +971,7 @@ mod tests {
     /// Skips the advertisement and NAK lines of a serve transcript,
     /// returning the pack bytes that follow.
     fn pack_of(out: &[u8], kind: HashKind) -> Vec<u8> {
-        let mut pkt = PktReader::new(&out[..], Interrupt::none());
+        let mut pkt = PktReader::new(out, Interrupt::none());
         match read_initial(&mut pkt, kind).expect("advertisement parses") {
             Initial::Refs(_) => {}
             Initial::V2(_) => panic!("unexpected v2 advertisement"),
@@ -1295,7 +1339,7 @@ mod tests {
             .prepare(
                 ObjectKind::Blob,
                 POINTER_BLOB.len() as u64,
-                &POINTER_BLOB[..],
+                POINTER_BLOB,
                 None,
             )
             .expect("pointer blob");
@@ -2081,40 +2125,5 @@ printf '0000'
             vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
         );
         assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
-    }
-}
-
-/// Routes one server-side command to its serve half (protocol v0).
-///
-/// `name` is the bare command (`upload-pack`, `receive-pack`,
-/// `upload-archive`); the per-command grammars stay with their owners.
-/// The `upload-archive` arm serves `git archive --remote` through
-/// [`super::archive::serve_upload_archive`].
-///
-/// # Errors
-/// [`GitError::Unsupported`] for an unknown command, plus each half's own
-/// failures.
-pub fn serve_command<R: Read, W: Write>(
-    name: &str,
-    reader: R,
-    writer: W,
-    store: &Store,
-    kind: HashKind,
-    head: &HeadAdvertisement,
-    interrupt: &Interrupt,
-) -> Result<(), GitError> {
-    match name {
-        "upload-pack" => serve_upload_pack(reader, writer, store, kind, head, interrupt),
-        // No repository directory travels with a bare command dispatch, so
-        // no policy file is readable: fail closed to pointer refusal.
-        "receive-pack" => {
-            serve_receive_pack(reader, writer, store, kind, head, interrupt, LfsMode::Deny)
-        }
-        "upload-archive" => {
-            super::archive::serve_upload_archive(reader, writer, store, kind, head, interrupt)
-        }
-        other => Err(GitError::Unsupported {
-            command: format!("unknown serve command {other:?}"),
-        }),
     }
 }

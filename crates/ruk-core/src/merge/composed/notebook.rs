@@ -1187,33 +1187,29 @@ fn align_by_anchors<'a>(
         return Err(conflict_outcome());
     }
 
-    let m = candidate_anchors.len();
     let mut candidates = Vec::new();
     let mut prev_b = 0;
     let mut prev_o = 0;
     let mut prev_t = 0;
 
-    for interval in 0..=m {
-        let (end_b, end_o, end_t) = if interval < m {
-            candidate_anchors[interval]
-        } else {
-            (base.cells.len(), ours.cells.len(), theirs.cells.len())
-        };
-
-        let b_slice = &base.cells[prev_b..end_b];
-        let o_slice = &ours.cells[prev_o..end_o];
-        let t_slice = &theirs.cells[prev_t..end_t];
+    for &(b_idx, o_idx, t_idx) in &candidate_anchors {
+        let b_slice = &base.cells[prev_b..b_idx];
+        let o_slice = &ours.cells[prev_o..o_idx];
+        let t_slice = &theirs.cells[prev_t..t_idx];
 
         process_anchor_interval(b_slice, o_slice, t_slice, request, &mut candidates)?;
 
-        if interval < m {
-            let (b_idx, o_idx, t_idx) = candidate_anchors[interval];
-            candidates.push(matched_anchor(base, ours, theirs, b_idx, o_idx, t_idx));
-            prev_b = b_idx + 1;
-            prev_o = o_idx + 1;
-            prev_t = t_idx + 1;
-        }
+        candidates.push(matched_anchor(base, ours, theirs, b_idx, o_idx, t_idx));
+        prev_b = b_idx + 1;
+        prev_o = o_idx + 1;
+        prev_t = t_idx + 1;
     }
+
+    let b_slice = &base.cells[prev_b..];
+    let o_slice = &ours.cells[prev_o..];
+    let t_slice = &theirs.cells[prev_t..];
+
+    process_anchor_interval(b_slice, o_slice, t_slice, request, &mut candidates)?;
 
     Ok(candidates)
 }
@@ -1374,7 +1370,14 @@ fn is_strictly_increasing(slice: &[usize]) -> bool {
 }
 
 enum CellMergeOutcome {
-    Merged { bytes: Vec<u8>, cleared: bool },
+    Merged {
+        bytes: Vec<u8>,
+        #[expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )]
+        cleared: bool,
+    },
     Conflict,
 }
 
@@ -1419,9 +1422,16 @@ fn merge_candidate_cell(
             collector,
             NoticeInput::Ours,
         )),
-        AlignedCandidate::Matched { base, ours, theirs } => merge_matched_cell(
-            base, ours, theirs, position, code_lang, request, registry, cancel, collector,
-        ),
+        AlignedCandidate::Matched { base, ours, theirs } => {
+            let cells = MatchedCells { base, ours, theirs };
+            let ctx = CellMergeCtx {
+                request,
+                registry,
+                cancel,
+                collector,
+            };
+            merge_matched_cell(&cells, position, code_lang, ctx)
+        }
     }
 }
 
@@ -1448,24 +1458,41 @@ fn merge_inserted_cell(
     }
 }
 
+/// The three sides of one matched notebook cell.
+#[derive(Clone, Copy)]
+struct MatchedCells<'c> {
+    base: &'c ParsedCell,
+    ours: &'c ParsedCell,
+    theirs: &'c ParsedCell,
+}
+
+/// Shared driver context for one matched-cell merge.
+struct CellMergeCtx<'a> {
+    request: &'a ComposedRequest<'a>,
+    registry: &'a GrammarRegistry<'a>,
+    cancel: &'a Cancel,
+    collector: &'a mut NoticeCollector,
+}
+
 fn merge_matched_cell(
-    base: &ParsedCell,
-    ours: &ParsedCell,
-    theirs: &ParsedCell,
+    cells: &MatchedCells<'_>,
     position: usize,
     code_lang: Option<Language>,
-    request: &ComposedRequest<'_>,
-    registry: &GrammarRegistry<'_>,
-    cancel: &Cancel,
-    collector: &mut NoticeCollector,
+    ctx: CellMergeCtx<'_>,
 ) -> Result<CellMergeOutcome, SyntaxError> {
+    let MatchedCells { base, ours, theirs } = *cells;
+    let CellMergeCtx {
+        request,
+        registry,
+        cancel,
+        collector,
+    } = ctx;
     let Some(cell_type) = resolve_cell_type(base, ours, theirs) else {
         return Ok(CellMergeOutcome::Conflict);
     };
 
-    let Some(merged_source_text) = resolve_cell_source_text(
-        base, ours, theirs, &cell_type, code_lang, request, registry, cancel,
-    )?
+    let Some(merged_source_text) =
+        resolve_cell_source_text(cells, &cell_type, code_lang, request, registry, cancel)?
     else {
         return Ok(CellMergeOutcome::Conflict);
     };
@@ -1607,15 +1634,14 @@ fn select_donor_cell<'a>(
 }
 
 fn resolve_cell_source_text(
-    base: &ParsedCell,
-    ours: &ParsedCell,
-    theirs: &ParsedCell,
+    cells: &MatchedCells<'_>,
     cell_type: &str,
     code_lang: Option<Language>,
     request: &ComposedRequest<'_>,
     registry: &GrammarRegistry<'_>,
     cancel: &Cancel,
 ) -> Result<Option<String>, SyntaxError> {
+    let MatchedCells { base, ours, theirs } = *cells;
     if ours.source.text == base.source.text && theirs.source.text == base.source.text {
         return Ok(Some(base.source.text.clone()));
     }
@@ -1783,16 +1809,17 @@ fn emit_patched_cell(
     }
     out.extend_from_slice(&donor_source[cursor..cell.byte_range.1]);
 
-    if policy == OutputPolicy::Clear && cell.outputs_val_range.is_none() {
-        if let Some(closing_brace) = out.iter().rposition(|&b| b == b'}') {
-            let mut inserted = Vec::new();
-            inserted.extend_from_slice(&out[..closing_brace]);
-            inserted.extend_from_slice(
-                b",\n      \"outputs\": [],\n      \"execution_count\": null\n    }",
-            );
-            inserted.extend_from_slice(&out[closing_brace + 1..]);
-            out = inserted;
-        }
+    if policy == OutputPolicy::Clear
+        && cell.outputs_val_range.is_none()
+        && let Some(closing_brace) = out.iter().rposition(|&b| b == b'}')
+    {
+        let mut inserted = Vec::new();
+        inserted.extend_from_slice(&out[..closing_brace]);
+        inserted.extend_from_slice(
+            b",\n      \"outputs\": [],\n      \"execution_count\": null\n    }",
+        );
+        inserted.extend_from_slice(&out[closing_brace + 1..]);
+        out = inserted;
     }
 
     out
@@ -2247,7 +2274,6 @@ fn merge_object_entry(
 mod tests {
     use super::*;
     use crate::merge::syntax::treesitter::registry_providers;
-    use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _};
 
     struct TestEnv {
         providers: Vec<Result<crate::merge::syntax::TsGrammar, SyntaxError>>,

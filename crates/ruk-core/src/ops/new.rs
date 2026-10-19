@@ -129,14 +129,14 @@ pub fn prepare_new(store: &Store, request: NewRequest) -> Result<PreparedOp<NewR
         change_id: prepared.record.change_id(),
         oid,
     };
-    if let Some(existing) = records.get_commit(&head)? {
-        if existing == prepared.record {
-            return Ok(PreparedOp {
-                objects: Vec::new(),
-                facts: Vec::new(),
-                output,
-            });
-        }
+    if let Some(existing) = records.get_commit(&head)?
+        && existing == prepared.record
+    {
+        return Ok(PreparedOp {
+            objects: Vec::new(),
+            facts: Vec::new(),
+            output,
+        });
     }
     Ok(PreparedOp {
         objects: vec![prepared.prepared_object],

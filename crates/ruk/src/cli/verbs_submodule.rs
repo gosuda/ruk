@@ -199,10 +199,8 @@ fn parse_gitmodules(bytes: &[u8]) -> Vec<SubmoduleEntry> {
             match key.trim() {
                 "path" => entry.path = value,
                 "url" => entry.url = value,
-                "branch" => {
-                    if !value.is_empty() {
-                        entry.branch = Some(value);
-                    }
+                "branch" if !value.is_empty() => {
+                    entry.branch = Some(value);
                 }
                 _ => {}
             }
@@ -268,11 +266,11 @@ fn load_modules(ctx: &Ctx, store: &Store, kind: HashKind) -> Result<Vec<Submodul
             return Ok(parse_gitmodules(&body));
         }
     }
-    if let Ok(tree) = head_tree_map(store, kind) {
-        if let Some((_, oid)) = tree.get(b".rukmodules".as_slice()) {
-            let (_, body) = read_object_bytes(store, *oid)?;
-            return Ok(parse_gitmodules(&body));
-        }
+    if let Ok(tree) = head_tree_map(store, kind)
+        && let Some((_, oid)) = tree.get(b".rukmodules".as_slice())
+    {
+        let (_, body) = read_object_bytes(store, *oid)?;
+        return Ok(parse_gitmodules(&body));
     }
     Ok(Vec::new())
 }

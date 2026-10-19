@@ -912,11 +912,11 @@ impl Porcelain<'_> {
             format!("committer-time {committer_time}\ncommitter-tz {committer_tz}\n").as_bytes(),
         );
         Self::field(self.out, "summary", &summary);
-        if let Some(parent_hex) = previous {
-            if self.previous_holds(*oid)? {
-                self.out
-                    .extend_from_slice(format!("previous {parent_hex} {path_text}\n").as_bytes());
-            }
+        if let Some(parent_hex) = previous
+            && self.previous_holds(*oid)?
+        {
+            self.out
+                .extend_from_slice(format!("previous {parent_hex} {path_text}\n").as_bytes());
         }
         if boundary {
             self.out.extend_from_slice(b"boundary\n");

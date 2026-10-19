@@ -386,6 +386,13 @@ impl<W: Write + Seek> SegmentWriter<W> {
     /// Whether a record of `record_len` bytes still fits under
     /// [`SEGMENT_TARGET_BYTES`]. The owner seals and rolls over when it does
     /// not and the segment is non-empty.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn fits_target(&self, record_len: u64) -> bool {
         self.fits_sized(record_len, SEGMENT_TARGET_BYTES)
     }
@@ -1260,13 +1267,13 @@ pub(crate) fn validate_segment_file_concurrent(
         None
     };
     let records_crc = scan_records_sharded(file, records_end)?;
-    if let Some(footer) = footer {
-        if records_crc != footer.records_crc {
-            return Err(corrupt(format!(
-                "seal footer records checksum {:#010x} does not match the recomputed {records_crc:#010x}",
-                footer.records_crc
-            )));
-        }
+    if let Some(footer) = footer
+        && records_crc != footer.records_crc
+    {
+        return Err(corrupt(format!(
+            "seal footer records checksum {:#010x} does not match the recomputed {records_crc:#010x}",
+            footer.records_crc
+        )));
     }
     Ok(VerifiedSegment {
         records_crc,

@@ -586,7 +586,7 @@ pub fn collect_haves_filtered(
         let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
             Ok((ObjectKind::Commit, bytes)) => bytes,
             Ok(_) => continue,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+            Err(GitError::NotFound { .. }) => continue,
             Err(err) => return Err(err),
         };
         haves.push(oid);
@@ -769,12 +769,10 @@ pub fn commit_record_facts(
         if let Some((ObjectKind::Commit, payload)) = staged.payload(*oid) {
             batch
                 .observe_git_payload(payload.to_vec(), None)
-                .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+                .map_err(GitError::from)?;
         }
     }
-    batch
-        .into_mutations()
-        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))
+    batch.into_mutations().map_err(GitError::from)
 }
 
 #[cfg(test)]

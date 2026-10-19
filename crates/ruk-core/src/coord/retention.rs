@@ -297,6 +297,13 @@ pub(crate) struct SweepPage {
     /// Number of rows examined in this page.
     pub(crate) examined_rows: usize,
     /// Total bytes (keys + values) examined across all rows in this page.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) examined_bytes: u64,
 }
 

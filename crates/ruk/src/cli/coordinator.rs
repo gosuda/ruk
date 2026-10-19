@@ -66,6 +66,7 @@ impl Mode {
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Bounds spawn plus first contact with a fresh server.
+#[cfg(all(unix, not(test)))]
 const SPAWN_WAIT: Duration = Duration::from_millis(500);
 
 /// Bounds one submission exchange.
@@ -333,7 +334,7 @@ fn commit_via_coordinator(
     let runtime = client_runtime()?;
     for _ in 0..MAX_STALE_RETRIES {
         match try_remote(ctx, &runtime, &args, request_id)? {
-            Remote::Done(reply) => return Ok(finish(reply)),
+            Remote::Done(reply) => return Ok(finish(*reply)),
             // No coordinator answered: publish the caller's commit
             // directly with identical arguments. A Stale refusal proves a
             // racing writer landed first; only then rebuild against its
@@ -646,7 +647,7 @@ fn advance_head_to(
 /// What one remote round settled as.
 enum Remote {
     /// The lane answered; the commit is durable.
-    Done(NewReply),
+    Done(Box<NewReply>),
     /// No coordinator answered before any byte could commit; publish direct.
     Direct,
     /// The lane refused a lost branch race; retry with a fresh tip.
@@ -726,7 +727,7 @@ fn remote_round(
 fn settle(answer: CommitAnswer) -> Result<Remote, GitError> {
     if answer.ok {
         return match answer.body {
-            Some(Reply::GitCommit(boxed)) => Ok(Remote::Done(*boxed)),
+            Some(Reply::GitCommit(boxed)) => Ok(Remote::Done(boxed)),
             Some(_) => Ok(Remote::Uncertain),
             None => Ok(Remote::Uncertain),
         };

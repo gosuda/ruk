@@ -177,7 +177,7 @@ impl Store {
         // The cached read-only handle: positional reads keep the shared
         // cursor untouched, so concurrent streams stay independent.
         let file = committed.open_committed(location.segment)?;
-        let mut payload = RecordPayload::open(
+        let payload = RecordPayload::open(
             BufReader::with_capacity(IO_CHUNK, PreadReader::new(&file)),
             location.offset,
             manifest.records_end,
@@ -334,11 +334,7 @@ fn sink_pump(sink: &mut ChunkSink<'_>, err: StoreError) -> Result<Pump, StoreErr
     Err(err)
 }
 
-fn sink_step<'a>(
-    sink: &mut ChunkSink<'_>,
-    target: &StreamTarget,
-    err: StoreError,
-) -> Result<Step<'a>, StoreError> {
+fn sink_step<'a>(sink: &mut ChunkSink<'_>, err: StoreError) -> Result<Step<'a>, StoreError> {
     if let Some(failure) = sink.failure.take() {
         return Err(failure);
     }
@@ -578,7 +574,7 @@ fn pump_delta<'p>(
             let source = frame.finish()?;
             Ok(Step::Complete(source.inner, source.consumed))
         }
-        Err(err) => sink_step(sink, target, err),
+        Err(err) => sink_step(sink, err),
     }
 }
 

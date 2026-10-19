@@ -295,7 +295,7 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     })?;
     if StoreRefs::new(&dst_store)
         .get(&head_name)
-        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?
+        .map_err(GitError::from)?
         .is_none()
     {
         return Err(GitError::NotFound {
@@ -884,7 +884,7 @@ pub(crate) fn remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                     detail: format!("remote {name:?} already exists"),
                 });
             }
-            config_write(store, &format!("remote.{name}.url"), &url)?;
+            config_write(store, &format!("remote.{name}.url"), url)?;
             config_write(
                 store,
                 &format!("remote.{name}.fetch"),
@@ -1018,12 +1018,11 @@ fn list_remote_urls(store: &Store) -> Result<Vec<u8>, GitError> {
 fn all_remote_names(store: &Store) -> Result<Vec<String>, GitError> {
     let mut names = Vec::new();
     for (key, _) in config_list(store)? {
-        if let Some(rest) = key.strip_prefix("remote.") {
-            if let Some((name, _)) = rest.split_once('.') {
-                if !names.contains(&name.to_owned()) {
-                    names.push(name.to_owned());
-                }
-            }
+        if let Some(rest) = key.strip_prefix("remote.")
+            && let Some((name, _)) = rest.split_once('.')
+            && !names.contains(&name.to_owned())
+        {
+            names.push(name.to_owned());
         }
     }
     Ok(names)

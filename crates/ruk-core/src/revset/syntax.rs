@@ -566,7 +566,7 @@ fn unescape_double_quoted(raw: &str, span: Span) -> Result<String, RevsetParseEr
                     chars.next(); // consume '{'
                     let mut hex_str = String::new();
                     let mut closed = false;
-                    while let Some((_, h)) = chars.next() {
+                    for (_, h) in chars.by_ref() {
                         if h == '}' {
                             closed = true;
                             break;
@@ -821,11 +821,7 @@ impl<'a> Parser<'a> {
             }
         };
 
-        loop {
-            let Some(peek_tok) = self.peek() else {
-                break;
-            };
-
+        while let Some(peek_tok) = self.peek() {
             match peek_tok {
                 RawToken::ColonColon => {
                     // Binary Infix DAG range: x::y

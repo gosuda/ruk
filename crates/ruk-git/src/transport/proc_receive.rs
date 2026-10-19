@@ -532,8 +532,7 @@ fn report_line(
 fn report_option(line: &str, pending: &mut [Pending], kind: HashKind) -> Result<(), GitError> {
     let state = pending
         .iter_mut()
-        .filter(|state| state.returned && state.accepted)
-        .next_back()
+        .rfind(|state| state.returned && state.accepted)
         .ok_or_else(|| broken("proc-receive sent 'option' without a matching 'ok'"))?;
     let (key, value) = match line.split_once(' ') {
         Some((key, value)) => (key, Some(value)),
@@ -684,7 +683,7 @@ mod tests {
 
     /// Reads every frame the server wrote during a drive.
     fn written_frames(written: &[u8]) -> Vec<Vec<u8>> {
-        let mut pkt = PktReader::new(&written[..], Interrupt::none());
+        let mut pkt = PktReader::new(written, Interrupt::none());
         let mut frames = Vec::new();
         loop {
             match pkt.read_packet().expect("frame") {

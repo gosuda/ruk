@@ -120,7 +120,7 @@ fn bundle_create(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     if opts.is_set("all") {
         for (name, _) in list_refs(store)? {
             let text = String::from_utf8_lossy(name.as_bytes()).into_owned();
-            if !positives.iter().any(|rev| *rev == text) {
+            if !positives.contains(&text) {
                 positives.push(text);
             }
         }

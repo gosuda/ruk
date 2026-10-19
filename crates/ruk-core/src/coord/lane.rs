@@ -28,11 +28,9 @@ mod commit;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use batch::{
-    BatchAccumulator, BatchItem, MAX_BATCH_BYTES, MAX_BATCH_LINGER, MAX_BATCH_REQUESTS,
-};
+pub(crate) use batch::{BatchAccumulator, BatchItem, MAX_BATCH_LINGER};
 pub(crate) use candidate::{InternalCandidate, InternalPayload, MutationCandidate, WorkspaceFence};
-pub(crate) use commit::{StoreFailureKind, classify_store_error, commit_batch};
+pub(crate) use commit::commit_batch;
 
 /// Queue bound for pending submissions to the publication lane.
 ///

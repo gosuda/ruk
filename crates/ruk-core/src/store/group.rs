@@ -198,7 +198,7 @@ impl StoreError {
             Self::Corrupt(detail) => Self::Corrupt(detail.clone()),
             Self::NotFound(detail) => Self::NotFound(detail.clone()),
             Self::StaleFact { table, key } => Self::StaleFact {
-                table: *table,
+                table,
                 key: key.clone(),
             },
             Self::WriterClosed(reason) => Self::WriterClosed(reason.clone()),

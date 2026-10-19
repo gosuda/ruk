@@ -28,9 +28,13 @@ use crate::coord::rows::{OpHeader, fact_table_from_name};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Method, Request, UndoSummary};
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
+
 use crate::refs::StoreRefs;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
+
+/// Net undo change per key: the value before the first delta and after the last.
+type NetChanges = BTreeMap<(String, Vec<u8>), (Option<Vec<u8>>, Option<Vec<u8>>)>;
 
 /// The inverse of one operation, ready to lane as a mutation.
 #[derive(Debug)]
@@ -75,7 +79,7 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
     let mut reader = OpDeltaReader::new(store, operation, header);
     // Keyed by table name and key, each entry keeps the value before the first
     // delta and the value after the last: the net change to that key.
-    let mut net: BTreeMap<(String, Vec<u8>), (Option<Vec<u8>>, Option<Vec<u8>>)> = BTreeMap::new();
+    let mut net: NetChanges = BTreeMap::new();
     while let Some(delta) = reader.next_delta()? {
         let slot = net
             .entry((delta.table, delta.key))

@@ -228,6 +228,10 @@ impl AdmissionLimits {
         }
     }
 
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     fn blocking_threads(&self) -> usize {
         self.control_blocking.saturating_add(self.ordinary_blocking)
     }
@@ -239,6 +243,10 @@ impl AdmissionLimits {
 /// # Errors
 /// Invalid limits are reported as `InvalidInput`; runtime construction
 /// failures are reported as they occur.
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) fn build_runtime(limits: &AdmissionLimits) -> io::Result<Runtime> {
     limits
         .validate()
@@ -299,6 +307,13 @@ impl Admission {
 
     /// Stops new admission and wakes queued callers with `E_CANCELLED`.
     /// Granted permits keep running until they drop.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn close(&self) {
         self.shared.close();
     }
@@ -594,7 +609,7 @@ mod tests {
         );
 
         drop(waiters.pop());
-        admission
+        let _ = admission
             .shared
             .enqueue(
                 repo.key,
@@ -623,7 +638,7 @@ mod tests {
                 .expect("blocking work completes");
             assert_eq!(value, 7);
             drop(admitted);
-            admission
+            let _ = admission
                 .admit(&repo, request(RequestClass::Interactive, 0), &cancel)
                 .await
                 .expect("the permit returns when the admitted value drops");
@@ -659,7 +674,7 @@ mod tests {
             assert_eq!(refused.unwrap_err().code, ErrorCode::ELimit);
 
             release_tx.send(()).expect("release the closure");
-            admission
+            let _ = admission
                 .admit(&repo, request(RequestClass::Interactive, 0), &cancel)
                 .await
                 .expect("the permit returns when the closure finishes");

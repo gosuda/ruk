@@ -18,7 +18,7 @@ use redb::{
 use std::sync::Arc;
 
 use super::error::StoreError;
-use super::metadata::{FactPage, FactPageBudget, FactRow, Metadata, PublicationTxn};
+use super::metadata::{FactPageBudget, Metadata, PublicationTxn};
 use super::types::{
     FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, SegmentManifest,
 };

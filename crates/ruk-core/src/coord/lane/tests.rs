@@ -13,15 +13,15 @@
 //! 10. Cancellation before publication and receiver drop after commit
 //! 11. Fail-closed ambiguous storage error handling
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jiff::SignedDuration;
 use tokio::sync::oneshot;
 
+use super::commit::{StoreFailureKind, classify_store_error};
 use super::*;
 use crate::bytes::ByteString;
 use crate::change::{ClaimId, RequestId, SessionId, WorkspaceId};
@@ -29,14 +29,13 @@ use crate::coord::cancel::cancellation;
 use crate::coord::clock::Clock;
 use crate::coord::oplog;
 use crate::coord::policy::{Policy, PolicySource, Principal};
-use crate::coord::receipt;
-use crate::coord::rows::{self, SessionRow, WorkspaceRow};
+use crate::coord::rows::{self, WorkspaceRow};
 use crate::coord::session::{SessionLive, SessionTable, prepare_open};
 use crate::error::ErrorCode;
 use crate::ids::HashKind;
 use crate::index::RepoPath;
 use crate::protocol::{
-    ClaimAcquireArgs, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimTtl, Method, Mutation,
+    ClaimAcquireArgs, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimTtl, Mutation,
     MutationOutcome, ReceiptRef, Reply, Request, RequestDigest, SessionOpenArgs, Timestamp,
     WorkspaceInit, WsNewArgs, WsNewReply,
 };

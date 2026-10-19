@@ -1481,10 +1481,10 @@ fn read_data(cursor: &mut Cursor<'_>, arg: &[u8]) -> Result<Vec<u8>, GitError> {
 /// Parses a fast-import file mode: full octal spellings plus the `644`
 /// and `755` shorthands.
 fn parse_file_mode(arg: &[u8]) -> Result<TreeMode, GitError> {
-    if let Some(mode) = TreeMode::parse(arg) {
-        if mode != TreeMode::Tree {
-            return Ok(mode);
-        }
+    if let Some(mode) = TreeMode::parse(arg)
+        && mode != TreeMode::Tree
+    {
+        return Ok(mode);
     }
     match arg {
         b"644" => Ok(TreeMode::Regular),

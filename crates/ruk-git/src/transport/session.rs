@@ -249,6 +249,10 @@ pub struct FetchReport {
 /// # Errors
 /// Closure, ingest, verification and store failures; nothing is published
 /// on failure.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the local-fetch call shape: stores, request, tracking, mutations, limits, and interrupt"
+)]
 pub fn local_fetch(
     dest: &Store,
     src: &Store,
@@ -518,7 +522,7 @@ fn local_closure_scoped(
             let links = match read {
                 Ok((ObjectKind::Commit, _, links)) => links,
                 Ok(_) => continue,
-                Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+                Err(GitError::NotFound { .. }) => continue,
                 Err(err) => return Err(err),
             };
             frontier.extend(links.parents.iter().copied());
@@ -596,7 +600,7 @@ fn local_closure_scoped(
             .unwrap_or(0.0);
     }
     let sort_start = profile.then(std::time::Instant::now);
-    objects.sort_by(|a, b| a.0.cmp(&b.0));
+    objects.sort_by_key(|a| a.0);
     let sort_ms = sort_start
         .map(|start| start.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);

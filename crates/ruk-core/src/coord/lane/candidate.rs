@@ -120,6 +120,10 @@ impl MutationCandidate {
     /// - `E_INVALID` if the request method is not a mutation, the reply method does not
     ///   match the request, the reply has no mutable outcome, or any fact uses `FactExpectation::Any`.
     /// - `E_LIMIT` if any fact row exceeds `ROW_MAX_BYTES`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor takes 12 validated fields; production caller is hosted.rs, tests in lane/tests.rs"
+    )]
     pub(crate) fn new(
         session: Arc<SessionLive>,
         principal: Principal,

@@ -10,12 +10,20 @@ use super::lock::EndpointNonce;
 use super::policy::{PolicySource, Principal};
 use crate::{CoreError, ErrorCode, StoreId};
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) struct Authentication {
     pub(crate) store: StoreId,
     pub(crate) nonce: EndpointNonce,
     pub(crate) policy: Arc<PolicySource>,
 }
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) struct Authenticated {
     pub(crate) stream: Incoming,
     pub(crate) principal: Principal,
@@ -27,6 +35,10 @@ impl Authentication {
     /// The caller reserves a connection slot before this call. It supplies a
     /// control admission permit and a deadline set at accept, at most one
     /// second later. No session payload may be read before this call succeeds.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) async fn accept(
         &self,
         mut stream: Incoming,
@@ -63,6 +75,10 @@ impl Authentication {
     }
 }
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 fn authorize_peer(
     stream: &Incoming,
     policy: &PolicySource,

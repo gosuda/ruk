@@ -115,7 +115,7 @@ pub(crate) enum SnapshotOutcome {
     NoChange {
         cache: Vec<FactMutation>,
     },
-    Changed(PreparedSnapshot),
+    Changed(Box<PreparedSnapshot>),
 }
 
 /// A read-only status report.
@@ -167,7 +167,7 @@ pub(crate) fn snapshot(
         });
     }
     facts.push(guard);
-    Ok(SnapshotOutcome::Changed(PreparedSnapshot {
+    Ok(SnapshotOutcome::Changed(Box::new(PreparedSnapshot {
         objects,
         facts: facts.into_vec(),
         descriptor: SnapshotDescriptor {
@@ -182,7 +182,7 @@ pub(crate) fn snapshot(
             conflict_edits,
             source,
         },
-    }))
+    })))
 }
 
 /// Reports how the worktree differs from the base tree without writing.

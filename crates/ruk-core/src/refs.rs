@@ -17,6 +17,7 @@ use crate::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Sto
 #[cfg(test)]
 mod tests;
 
+#[derive(Debug)]
 pub struct StoreRefs<'a> {
     store: &'a Store,
 }
@@ -272,11 +273,9 @@ fn decode_stored_conflict(
 ) -> Result<Merge<Option<Oid>>, CoreError> {
     let res: Result<Merge<Option<Oid>>, StoreError> = (|| {
         let conflict: Merge<Option<Oid>> = crate::store::decode("ref conflict", bytes)?;
-        for term in conflict.adds().chain(conflict.removes()) {
-            if let Some(oid) = term {
-                reject_null_oid(*oid, "ref conflict")?;
-                oid.expect_kind(store.hash_kind(), "ref conflict")?;
-            }
+        for oid in conflict.adds().chain(conflict.removes()).flatten() {
+            reject_null_oid(*oid, "ref conflict")?;
+            oid.expect_kind(store.hash_kind(), "ref conflict")?;
         }
         if conflict.is_resolved() {
             return Err(StoreError::Corrupt(format!(
@@ -304,11 +303,9 @@ pub fn prepare_set_ref_conflict(
     name: &RefName,
     conflict: &Merge<Option<Oid>>,
 ) -> Result<FactMutation, CoreError> {
-    for term in conflict.adds().chain(conflict.removes()) {
-        if let Some(oid) = term {
-            reject_null_oid(*oid, "ref conflict")?;
-            oid.expect_kind(store.hash_kind(), "ref conflict")?;
-        }
+    for oid in conflict.adds().chain(conflict.removes()).flatten() {
+        reject_null_oid(*oid, "ref conflict")?;
+        oid.expect_kind(store.hash_kind(), "ref conflict")?;
     }
     if conflict.is_resolved() {
         return Err(CoreModelError::Invalid {

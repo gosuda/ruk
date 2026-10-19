@@ -25,6 +25,13 @@ pub(crate) const BULK_TOTAL: Duration = Duration::from_secs(2 * 60 * 60);
 /// frame bound ([`crate::MAX_CONTROL_FRAME_BYTES`]), not a fresh profile knob.
 /// The `as` cast widens `usize` to `u64`: it cannot narrow on any supported
 /// target (`u64` is at least as wide as `usize`), so no value change is possible.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) const GRAY_ALLOWANCE_BYTES: u64 = crate::MAX_CONTROL_FRAME_BYTES as u64;
 
 /// Authority state of one lease at a sampled instant.
@@ -93,6 +100,13 @@ pub(crate) fn bulk_authority(created: Instant, progress: Instant, now: Instant) 
 }
 /// Whether a bulk owner that last reported admitted progress at `progress`
 /// has been silent long enough to cancel at `now`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 #[must_use]
 pub(crate) fn bulk_progress_lapsed(progress: Instant, now: Instant) -> bool {
     match progress.checked_add(BULK_NO_PROGRESS) {

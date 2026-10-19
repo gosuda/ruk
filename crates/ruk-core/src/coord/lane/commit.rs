@@ -20,7 +20,7 @@ use crate::coord::oplog::{self, OpMeta};
 use crate::coord::policy::{Policy, PolicySource};
 use crate::coord::receipt::{self, Lookup};
 use crate::coord::retention;
-use crate::coord::rows::{self, CoordinatorHead, RECEIPT_HORIZON, ReceiptRow, SessionRow};
+use crate::coord::rows::{self, CoordinatorHead, RECEIPT_HORIZON, SessionRow};
 use crate::coord::session::Authority;
 use crate::coord::session::SessionTable;
 use crate::coord::undo::undone_operation;
@@ -30,8 +30,12 @@ use crate::protocol::{
     MAX_PAGE_SIZE, ReceiptRef, Reply, Request, RequestDigest, SessionAuthority, Timestamp,
 };
 use crate::refs::StoreRefs;
-use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
+use crate::store::types::{FactExpectation, FactMutation, FactTable};
 use crate::store::{Store, StoreError};
+
+/// Coalesced duplicate reply channels keyed by `(session, request)`.
+type CoalescedDuplicates =
+    HashMap<(SessionId, RequestId), Vec<oneshot::Sender<Result<Reply, CoreError>>>>;
 
 /// Classification of a `StoreError` during lane publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,10 +131,7 @@ pub(crate) fn commit_batch(
     // 2. Separate mutations and internal items; resolve idempotency replays and in-batch duplicates.
     let mut candidate_mutations: Vec<ActiveMutation> = Vec::new();
     let mut active_internals: Vec<ActiveInternal> = Vec::new();
-    let mut coalesced_duplicates: HashMap<
-        (SessionId, RequestId),
-        Vec<oneshot::Sender<Result<Reply, CoreError>>>,
-    > = HashMap::new();
+    let mut coalesced_duplicates: CoalescedDuplicates = HashMap::new();
     let mut seen_batch_mutations: HashMap<(SessionId, RequestId), RequestDigest> = HashMap::new();
 
     for item in pending_items {
@@ -428,15 +429,11 @@ pub(crate) fn commit_batch(
         let new_expires_ts = Timestamp::new(new_expires_instant);
 
         let modified = match row.authority {
-            SessionAuthority::Active { idle_expires_at } => {
-                if new_expires_ts >= idle_expires_at {
-                    row.authority = SessionAuthority::Active {
-                        idle_expires_at: new_expires_ts,
-                    };
-                    true
-                } else {
-                    false
-                }
+            SessionAuthority::Active { idle_expires_at } if new_expires_ts >= idle_expires_at => {
+                row.authority = SessionAuthority::Active {
+                    idle_expires_at: new_expires_ts,
+                };
+                true
             }
             _ => false,
         };

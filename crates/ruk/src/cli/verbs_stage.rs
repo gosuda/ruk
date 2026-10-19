@@ -30,6 +30,13 @@ use super::tree::{
 };
 use super::{Ctx, FlagSpec, collect, line};
 
+/// `(path, staged code, index/head identity)` in path order.
+type StagedEntry = (Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>);
+/// `(old path, new path, score)` staged rename.
+type StagedRename = (Vec<u8>, Vec<u8>, u8);
+/// Split status-only spellings: kept args, formats, untracked modes.
+type StatusArgsSplit = (Vec<String>, Vec<StatusFormat>, Vec<UntrackedMode>);
+
 /// How `add` fills new rows. A named type, never a flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AddFill {
@@ -791,9 +798,7 @@ fn check_ignore_submodules(arg: &str) -> Result<(), GitError> {
 /// command-line order so the last format wins), `-u<mode>` and
 /// `--untracked-files[=<mode>]` (bare means `normal`), and
 /// `--ignore-submodules[=<when>]` (validated, inert).
-fn split_status_args(
-    args: &[String],
-) -> Result<(Vec<String>, Vec<StatusFormat>, Vec<UntrackedMode>), GitError> {
+fn split_status_args(args: &[String]) -> Result<StatusArgsSplit, GitError> {
     let mut kept = Vec::with_capacity(args.len());
     let mut formats = Vec::new();
     let mut untracked = Vec::new();
@@ -985,27 +990,27 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             // appends the bare staged diff. Prefixes stay the diff lane's
             // `a/`/`b/` (the oracle uses `c/`/`i/`/`w/` here).
             if verbose >= 2 {
-                if let Some(diff) = staged_diff {
-                    if !diff.is_empty() {
-                        out.extend_from_slice(b"Changes to be committed:\n");
-                        out.extend_from_slice(&diff);
-                    }
-                }
-                if let Some(diff) = unstaged_diff {
-                    if !diff.is_empty() {
-                        out.extend_from_slice(
-                            b"--------------------------------------------------\nChanges not staged for commit:\n",
-                        );
-                        out.extend_from_slice(&diff);
-                    }
-                }
-            } else if let Some(diff) = staged_diff {
-                if !diff.is_empty() {
-                    if out.last() != Some(&b'\n') {
-                        out.push(b'\n');
-                    }
+                if let Some(diff) = staged_diff
+                    && !diff.is_empty()
+                {
+                    out.extend_from_slice(b"Changes to be committed:\n");
                     out.extend_from_slice(&diff);
                 }
+                if let Some(diff) = unstaged_diff
+                    && !diff.is_empty()
+                {
+                    out.extend_from_slice(
+                            b"--------------------------------------------------\nChanges not staged for commit:\n",
+                        );
+                    out.extend_from_slice(&diff);
+                }
+            } else if let Some(diff) = staged_diff
+                && !diff.is_empty()
+            {
+                if out.last() != Some(&b'\n') {
+                    out.push(b'\n');
+                }
+                out.extend_from_slice(&diff);
             }
             Ok(out)
         }
@@ -1017,7 +1022,7 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
 pub(crate) struct StatusPlan {
     /// `(path, staged code, index/head identity)` in path order. The
     /// identity backs exact-rename pairing; `None` for modified/unmerged.
-    pub(crate) staged: Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
+    pub(crate) staged: Vec<StagedEntry>,
     /// `(old path, new path, score)` staged renames; exact pairs score 100.
     pub(crate) renames: Vec<(Vec<u8>, Vec<u8>, u8)>,
     /// `(old path, new path, score)` worktree deletions paired with
@@ -1077,7 +1082,7 @@ pub(crate) fn status_plan_with_mode(
     let unmerged = unmerged_paths(&rows);
     let mut staged = Vec::new();
     let mut known: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
-    for (path, _) in unmerged.iter() {
+    for path in unmerged.keys() {
         staged.push((path.clone(), 'U', None));
         known.insert(path.clone(), true);
     }
@@ -1237,9 +1242,9 @@ fn collapse_untracked(paths: Vec<Vec<u8>>, tracked: &HashSet<Vec<u8>>) -> Vec<Ve
 fn pair_staged_renames(
     ctx: &Ctx,
     store: &Store,
-    staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
+    staged: &mut Vec<StagedEntry>,
     mode: super::rename::RenameMode,
-) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
+) -> Result<Vec<StagedRename>, GitError> {
     if mode == super::rename::RenameMode::Disabled {
         return Ok(Vec::new());
     }
@@ -1256,18 +1261,16 @@ fn pair_staged_renames(
 /// `(old, new, 100)` renames, removing both sides from `staged`. The
 /// oracle reports similarity-100% moves as `R  old -> new`; content-exact
 /// pairing reproduces that without a similarity engine.
-fn pair_exact_renames(
-    staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
-) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
+fn pair_exact_renames(staged: &mut Vec<StagedEntry>) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
     let mut renames = Vec::new();
     let mut kept = Vec::new();
     let mut unmatched_adds: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
     for (path, code, identity) in staged.drain(..) {
-        if code == 'A' {
-            if let Some((mode, oid)) = identity {
-                unmatched_adds.push((path, mode, oid));
-                continue;
-            }
+        if code == 'A'
+            && let Some((mode, oid)) = identity
+        {
+            unmatched_adds.push((path, mode, oid));
+            continue;
         }
         kept.push((path, code, identity));
     }
@@ -1278,7 +1281,7 @@ fn pair_exact_renames(
             restaged.push((path, code, identity));
             continue;
         }
-        let (Some((mode, oid))) = identity else {
+        let Some((mode, oid)) = identity else {
             restaged.push((path, code, identity));
             continue;
         };
@@ -1314,12 +1317,12 @@ fn pair_exact_renames(
 fn pair_similar_staged(
     _ctx: &Ctx,
     store: &Store,
-    staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
+    staged: &mut Vec<StagedEntry>,
     threshold: u8,
-) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
+) -> Result<Vec<StagedRename>, GitError> {
     use super::rename::{RenameSide, pair_renames, similarity};
     let mut renames = Vec::new();
-    let mut keep: Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)> = Vec::new();
+    let mut keep: Vec<StagedEntry> = Vec::new();
     let mut dels: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
     let mut adds: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
     for (path, code, identity) in staged.drain(..) {
@@ -1433,7 +1436,7 @@ fn pair_unstaged_renames(
     unstaged: &mut Vec<(Vec<u8>, char)>,
     untracked: &mut Vec<Vec<u8>>,
     threshold: u8,
-) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
+) -> Result<Vec<StagedRename>, GitError> {
     use super::rename::{RenameSide, pair_renames, similarity};
     let mut dels: Vec<(Vec<u8>, ruk_core::ids::Oid)> = Vec::new();
     let mut keep: Vec<(Vec<u8>, char)> = Vec::new();
@@ -1749,11 +1752,11 @@ fn v2_branch_headers(
             &format!("# branch.upstream {}", upstream.display),
             input.eol,
         );
-        if input.ahead_behind == AheadBehind::Full {
-            if let Ok(head) = head_oid(store) {
-                let (ahead, behind) = ahead_behind_counts(store, head, target)?;
-                push_v2_line(out, &format!("# branch.ab +{ahead} -{behind}"), input.eol);
-            }
+        if input.ahead_behind == AheadBehind::Full
+            && let Ok(head) = head_oid(store)
+        {
+            let (ahead, behind) = ahead_behind_counts(store, head, target)?;
+            push_v2_line(out, &format!("# branch.ab +{ahead} -{behind}"), input.eol);
         }
     }
     Ok(())
@@ -2075,16 +2078,16 @@ fn porcelain_v1_branch(
         match upstream.oid {
             None => line.push_str(" [gone]"),
             Some(target) => {
-                if ahead_behind == AheadBehind::Full {
-                    if let Ok(head) = head_oid(store) {
-                        let (ahead, behind) = ahead_behind_counts(store, head, target)?;
-                        match (ahead, behind) {
-                            (0, 0) => {}
-                            (ahead, 0) => line.push_str(&format!(" [ahead {ahead}]")),
-                            (0, behind) => line.push_str(&format!(" [behind {behind}]")),
-                            (ahead, behind) => {
-                                line.push_str(&format!(" [ahead {ahead}, behind {behind}]"))
-                            }
+                if ahead_behind == AheadBehind::Full
+                    && let Ok(head) = head_oid(store)
+                {
+                    let (ahead, behind) = ahead_behind_counts(store, head, target)?;
+                    match (ahead, behind) {
+                        (0, 0) => {}
+                        (ahead, 0) => line.push_str(&format!(" [ahead {ahead}]")),
+                        (0, behind) => line.push_str(&format!(" [behind {behind}]")),
+                        (ahead, behind) => {
+                            line.push_str(&format!(" [ahead {ahead}, behind {behind}]"))
                         }
                     }
                 }

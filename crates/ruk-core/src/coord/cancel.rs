@@ -36,7 +36,6 @@ pub struct Cancel {
 }
 
 /// Creates a new cancellation pair starting in the uncancelled state.
-#[must_use]
 pub fn cancellation() -> (CancelHandle, Cancel) {
     let (sender, receiver) = watch::channel(false);
     (CancelHandle { sender }, Cancel { receiver })

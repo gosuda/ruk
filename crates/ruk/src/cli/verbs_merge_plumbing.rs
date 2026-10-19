@@ -287,11 +287,11 @@ fn text_merge(request: &TextMerge<'_>) -> Option<(Vec<u8>, bool)> {
     bounds.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(bounds.len());
     for bound in bounds {
-        if let Some(last) = merged.last_mut() {
-            if bound.0 <= last.1 {
-                last.1 = last.1.max(bound.1);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && bound.0 <= last.1
+        {
+            last.1 = last.1.max(bound.1);
+            continue;
         }
         merged.push(bound);
     }
@@ -741,15 +741,18 @@ fn lane_blob(
     Ok(body)
 }
 
+/// One union path's three tree sides: base, ours, theirs.
+type MergeSides = (
+    Option<(TreeMode, Oid)>,
+    Option<(TreeMode, Oid)>,
+    Option<(TreeMode, Oid)>,
+);
+
 /// Merges one union path at tree level (no syntax lane: plumbing).
 fn merge_tree_path(
     store: &Store,
     blobs: &mut HashMap<Oid, Vec<u8>>,
-    sides: (
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-    ),
+    sides: MergeSides,
 ) -> Result<TreePathOutcome, GitError> {
     let (base, ours, theirs) = sides;
     // Directory/file clashes cannot happen here: tree paths never prefix
@@ -1155,12 +1158,7 @@ fn read_merge_resolution(
         )
         .map_err(core_err)
     };
-    let stages = |sides: (
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-    )|
-     -> Result<Vec<(Stage, IndexEntry)>, GitError> {
+    let stages = |sides: MergeSides| -> Result<Vec<(Stage, IndexEntry)>, GitError> {
         let mut out = Vec::new();
         for (side, stage) in [
             (sides.0, Stage::Base),
@@ -1480,12 +1478,12 @@ pub(crate) fn checkout_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, 
             detail: "checkout-index -z needs --stdin".to_owned(),
         });
     }
-    if let Some(stage) = opts.single("stage")? {
-        if !["1", "2", "3"].contains(&stage.as_str()) {
-            return Err(GitError::Unsupported {
-                command: "checkout-index --stage=all".to_owned(),
-            });
-        }
+    if let Some(stage) = opts.single("stage")?
+        && !["1", "2", "3"].contains(&stage.as_str())
+    {
+        return Err(GitError::Unsupported {
+            command: "checkout-index --stage=all".to_owned(),
+        });
     }
     ctx.require_worktree()?;
     let store = ctx.store()?;

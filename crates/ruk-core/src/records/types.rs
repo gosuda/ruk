@@ -193,6 +193,7 @@ pub struct HistoryPage {
 }
 
 /// Outcome of preparing a single native commit creation or trusted local rewrite.
+#[derive(Debug)]
 pub struct PreparedNativeCommit {
     pub head: Head,
     pub record: CommitRecord,
@@ -201,6 +202,7 @@ pub struct PreparedNativeCommit {
 }
 
 /// Outcome of preparing an imported Git commit payload.
+#[derive(Debug)]
 pub struct PreparedImport {
     pub head: Head,
     pub change_id: ChangeId,
@@ -211,6 +213,7 @@ pub struct PreparedImport {
 }
 
 /// Prepared artifacts for a multi-record batch publication.
+#[derive(Debug)]
 pub struct PreparedRecordBatch {
     pub prepared_objects: Vec<PreparedObject>,
     pub mutations: Vec<FactMutation>,

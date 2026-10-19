@@ -574,7 +574,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    pub fn sync_dir_makes_namespace_changes_durable_api() {
+    fn sync_dir_makes_namespace_changes_durable_api() {
         let root = temp_root("syncdir");
         let gone = root.join("missing.bin");
         let file = File::create(&gone).expect("create file");

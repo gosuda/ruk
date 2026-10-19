@@ -35,8 +35,7 @@ use crate::commit::ProvenanceClaims;
 use crate::coord::policy::Principal;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
-    IdentityClaim, MutationOutcome, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp,
-    Validate,
+    IdentityClaim, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp, Validate,
 };
 use crate::store::types::FactTable;
 use crate::store::{Store, StoreError};
@@ -272,14 +271,14 @@ pub(crate) fn decode_session(
     b: &[u8],
 ) -> Result<SessionRow, CoreError> {
     let row: SessionRow = decode(store, "session row", b)?;
-    if let Some(identity) = &row.identity {
-        if let Err(err) = identity.validate() {
-            return corrupt(
-                store,
-                "session row",
-                format!("invalid identity claim: {err}"),
-            );
-        }
+    if let Some(identity) = &row.identity
+        && let Err(err) = identity.validate()
+    {
+        return corrupt(
+            store,
+            "session row",
+            format!("invalid identity claim: {err}"),
+        );
     }
     Ok(row)
 }
@@ -353,6 +352,10 @@ impl ReceiptRow {
     }
 
     /// Read-only access to the wrapped reply.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn reply(&self) -> &Reply {
         &self.0
@@ -703,11 +706,11 @@ mod tests {
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{
-        BoundedList, Method, RequestDigest, ResultingStamp, SchemaArgs, SchemaReply, SchemaVersion,
-        WsTakeArgs, WsTakeReply,
+        BoundedList, Method, MutationOutcome, RequestDigest, SchemaArgs, SchemaReply,
+        SchemaVersion, WsTakeReply,
     };
     use crate::store::PreparationBudget;
-    use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp};
+    use crate::workspace::{NativeWorkspace, Scope};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 

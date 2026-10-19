@@ -309,6 +309,13 @@ impl Metadata {
     /// file, a mistyped census table, or a missing generation row;
     /// [`StoreError::Version`] for an unknown table or a file format
     /// that needs an offline upgrade.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
         Self::open_with_timeout(path, open_wait_timeout())
     }
@@ -719,7 +726,7 @@ impl Metadata {
         let fact_table = txn
             .open_table(fact_definition(table))
             .map_err(table_error)?;
-        let lower: Bound<&[u8]> = after.map_or(Bound::Unbounded, |key| Bound::Excluded(key));
+        let lower: Bound<&[u8]> = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut iter = fact_table
             .range::<&[u8]>((lower, Bound::Unbounded))
             .map_err(storage)?;

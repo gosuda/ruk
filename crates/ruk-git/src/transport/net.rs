@@ -233,7 +233,7 @@ fn ssh_invocation(
                 line.push_str(&format!(" -p {port}"));
             }
             line.push(' ');
-            line.push_str(&shell_quote(&login));
+            line.push_str(&shell_quote(login));
             line.push(' ');
             line.push_str(&shell_quote(&remote));
             SshInvocation::Shell(line)
@@ -274,13 +274,11 @@ const SSH_EXIT_GRACE: Duration = Duration::from_secs(30);
 /// deadlocks a child blocked on input, and killing first cuts the remote's
 /// hooks), and taking `stdout` lets a drain thread sink any trailing remote
 /// output to EOF so a chatty hook cannot block on a full pipe.
+#[derive(Debug)]
 pub struct SshStream {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
-    #[expect(
-        dead_code,
-        reason = "owns the spawned ssh so Drop can kill-and-reap it after taking the pipes"
-    )]
+    /// Owns the spawned ssh so Drop can kill-and-reap it after taking the pipes.
     child: Child,
 }
 
@@ -501,6 +499,7 @@ pub fn git_connect(
 }
 
 /// One duplex network stream: SSH child pipes or a daemon socket.
+#[derive(Debug)]
 pub enum Stream {
     /// SSH child pipes (reaped on drop).
     Ssh(SshStream),
@@ -738,7 +737,6 @@ mod tests {
         // The fake server speaks `upload-archive` on stdin/stdout: it
         // checks the spawned remote command, consumes the argument
         // framing, and answers ACK plus a sideband tar.
-        use std::io::Write as _;
         let rev = "HEAD";
         let request_len = super::super::smart_http::archive_request_body(rev)
             .expect("request")

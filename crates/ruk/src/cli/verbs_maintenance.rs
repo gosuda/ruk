@@ -1007,12 +1007,11 @@ fn maintenance_prefetch(ctx: &mut Ctx, quiet: bool) -> Result<Vec<u8>, GitError>
         let store = ctx.store()?;
         let mut names = Vec::new();
         for (key, _) in super::state::config_list(store)? {
-            if let Some(rest) = key.strip_prefix("remote.") {
-                if let Some((name, _)) = rest.split_once('.') {
-                    if !names.iter().any(|known| known == name) {
-                        names.push(name.to_owned());
-                    }
-                }
+            if let Some(rest) = key.strip_prefix("remote.")
+                && let Some((name, _)) = rest.split_once('.')
+                && !names.iter().any(|known| known == name)
+            {
+                names.push(name.to_owned());
             }
         }
         names
@@ -1026,7 +1025,10 @@ fn maintenance_prefetch(ctx: &mut Ctx, quiet: bool) -> Result<Vec<u8>, GitError>
     }
     let mut out = Vec::new();
     for name in &names {
-        out.extend_from_slice(&super::verbs_transport::fetch(ctx, &[name.clone()])?);
+        out.extend_from_slice(&super::verbs_transport::fetch(
+            ctx,
+            std::slice::from_ref(name),
+        )?);
     }
     Ok(out)
 }

@@ -9,9 +9,9 @@
 //! Windows named-pipe transport is out of scope for this build: [`serve`]
 //! reports it as [`Error::Unsupported`] instead of binding.
 
-pub mod executor;
-pub mod ipc;
-pub mod registry;
+pub(crate) mod executor;
+pub(crate) mod ipc;
+pub(crate) mod registry;
 
 #[cfg(test)]
 mod tests;
@@ -24,40 +24,34 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub use executor::BoundedExecutor;
-pub use registry::Registry;
+pub(crate) use executor::BoundedExecutor;
+pub(crate) use registry::Registry;
 use ruk_core::change::{RequestId, SessionId};
 use ruk_core::coord::{Cancel, HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::protocol::{
-    AbandonArgs, AttestAddArgs, AttestListArgs, BlameArgs, BookmarkDeleteArgs, BookmarkResolveArgs,
-    BookmarkSetArgs, ClaimAcquireArgs, ClaimListArgs, ClaimReleaseArgs, DescribeArgs, DiffArgs,
-    EditArgs, FetchArgs, FileArgs, LandExecuteArgs, LandPrepareArgs, LogArgs, Method, Mutation,
-    NewArgs, OpLogArgs, OpPruneArgs, PinArgs, PushArgs, PushReconcileArgs, QueryArgs, RebaseArgs,
-    ReconnectSecret, Reply, ReplyEnvelope, Request, ResolveArgs, RevertArgs, SessionOpenArgs,
-    SessionResumeArgs, ShowArgs, SnapshotArgs, SplitArgs, SquashArgs, StatusArgs, TagDeleteArgs,
-    TagSetArgs, UndoArgs, UnpinArgs, WriteArgs, WsDropArgs, WsNewArgs, WsRecoverArgs, WsScopeArgs,
-    WsTakeArgs, decode_json,
+    Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request, SessionOpenArgs,
+    SessionResumeArgs, decode_json,
 };
 
 /// Default concurrent connections of one daemon process.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
 /// Default blocking permits of the shared executor.
-pub const DEFAULT_BLOCKING_POOL_SIZE: usize = 16;
+pub(crate) const DEFAULT_BLOCKING_POOL_SIZE: usize = 16;
 
 /// Default handshake deadline in milliseconds.
-pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 
 /// Default per-frame deadline in milliseconds.
-pub const DEFAULT_FRAME_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const DEFAULT_FRAME_TIMEOUT_MS: u64 = 60_000;
 
 /// Default interval between periodic retention sweeps in milliseconds.
-pub const DEFAULT_RETENTION_INTERVAL_MS: u64 = 60_000;
+pub(crate) const DEFAULT_RETENTION_INTERVAL_MS: u64 = 60_000;
 
 /// Configuration of one `ruk forgejo serve` process.
 #[derive(Clone, Debug)]
-pub struct DaemonConfig {
+pub(crate) struct DaemonConfig {
     /// Filesystem path of the Unix socket to bind.
     socket_path: PathBuf,
     /// Repository roots; every open must land beneath one.
@@ -81,7 +75,7 @@ pub struct DaemonConfig {
 
 impl DaemonConfig {
     /// Builds one configuration binding `socket_path` over `repo_roots`.
-    pub fn new(socket_path: PathBuf, repo_roots: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(socket_path: PathBuf, repo_roots: Vec<PathBuf>) -> Self {
         Self {
             socket_path,
             repo_roots,
@@ -97,42 +91,42 @@ impl DaemonConfig {
 
     /// Restricts Unix-socket peers to `uids`.
     #[must_use]
-    pub fn with_allowed_uids(mut self, uids: Vec<u32>) -> Self {
+    pub(crate) fn with_allowed_uids(mut self, uids: Vec<u32>) -> Self {
         self.allowed_uids = uids;
         self
     }
 
     /// Sets the concurrent connection bound.
     #[must_use]
-    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+    pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }
 
     /// Sets the blocking permits of the shared executor.
     #[must_use]
-    pub fn with_blocking_pool_size(mut self, pool_size: usize) -> Self {
+    pub(crate) fn with_blocking_pool_size(mut self, pool_size: usize) -> Self {
         self.blocking_pool_size = pool_size;
         self
     }
 
     /// Sets the stream-zero handshake deadline.
     #[must_use]
-    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+    pub(crate) fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
     }
 
     /// Sets the per-frame deadline after the handshake.
     #[must_use]
-    pub fn with_frame_timeout(mut self, timeout: Duration) -> Self {
+    pub(crate) fn with_frame_timeout(mut self, timeout: Duration) -> Self {
         self.frame_timeout = timeout;
         self
     }
 
     /// Sets the starting credit window of each stream direction.
     #[must_use]
-    pub fn with_stream_window_bytes(mut self, bytes: u64) -> Self {
+    pub(crate) fn with_stream_window_bytes(mut self, bytes: u64) -> Self {
         self.stream_window_bytes = bytes;
         self
     }
@@ -140,26 +134,41 @@ impl DaemonConfig {
     /// Sets the interval between periodic retention sweeps of every opened
     /// coordinator. Zero disables them.
     #[must_use]
-    pub fn with_retention_interval(mut self, interval: Duration) -> Self {
+    pub(crate) fn with_retention_interval(mut self, interval: Duration) -> Self {
         self.retention_interval = interval;
         self
     }
 
     /// Returns the socket path.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
-    pub fn socket_path(&self) -> &std::path::Path {
+    pub(crate) fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
     }
 
     /// Returns the configured repository roots.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
-    pub fn repo_roots(&self) -> &[PathBuf] {
+    pub(crate) fn repo_roots(&self) -> &[PathBuf] {
         &self.repo_roots
     }
 
     /// Returns the interval between periodic retention sweeps; zero disables them.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
-    pub fn retention_interval(&self) -> Duration {
+    pub(crate) fn retention_interval(&self) -> Duration {
         self.retention_interval
     }
 
@@ -173,7 +182,7 @@ impl DaemonConfig {
     /// # Errors
     /// `Error::Config` on malformed TOML, missing required keys, or bounds
     /// outside `validate`.
-    pub fn from_toml(doc: &[u8]) -> Result<Self, Error> {
+    pub(crate) fn from_toml(doc: &[u8]) -> Result<Self, Error> {
         #[derive(Deserialize)]
         struct Doc {
             socket_path: PathBuf,
@@ -220,7 +229,7 @@ impl DaemonConfig {
     /// # Errors
     /// `Config` for an empty socket path, root set, connection bound,
     /// blocking pool, deadline, or window.
-    pub fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.socket_path.as_os_str().is_empty() {
             return Err(Error::Config(String::from("socket path must not be empty")));
         }
@@ -256,7 +265,7 @@ impl DaemonConfig {
 
 /// Failure of the hosted daemon process.
 #[derive(Debug)]
-pub enum Error {
+pub(crate) enum Error {
     /// The configuration is unusable.
     Config(String),
     /// Transport or runtime setup failed.
@@ -264,6 +273,10 @@ pub enum Error {
     /// A typed core failure ended the daemon or one handshake.
     Core(CoreError),
     /// The platform lacks the required transport.
+    #[expect(
+        dead_code,
+        reason = "no constructor at this commit; retained for later changeset rows"
+    )]
     Unsupported(String),
 }
 
@@ -302,7 +315,7 @@ impl From<std::io::Error> for Error {
 
 /// The `Open` payload: one invocation against one repository.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvocationOpen {
+pub(crate) struct InvocationOpen {
     /// Absolute repository path or opaque handle from a previous open.
     pub repo: String,
     /// The protocol method name, such as `status`.
@@ -321,7 +334,7 @@ pub struct InvocationOpen {
 
 /// The `Accepted` payload answering one `Open`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvocationAccepted {
+pub(crate) struct InvocationAccepted {
     /// The accepted stream identifier.
     pub stream_id: u64,
     /// The dispatched method name.
@@ -338,7 +351,7 @@ pub struct InvocationAccepted {
 /// the inbound window and `stdout`/`stderr` grants to the outbound
 /// window of the named stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WindowCredit {
+pub(crate) struct WindowCredit {
     /// The credit bytes granted to the frame's stream.
     #[serde(alias = "bytes")]
     pub credit_bytes: u64,
@@ -349,7 +362,7 @@ pub struct WindowCredit {
 
 /// The `Exit` payload ending one invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExitReport {
+pub(crate) struct ExitReport {
     /// The process-style exit status: zero on success.
     pub status: i32,
     /// `OK` on success, else the closed error-code spelling of the failure.
@@ -362,7 +375,7 @@ pub struct ExitReport {
 
 /// The `Error` payload reporting one invocation failure.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorReport {
+pub(crate) struct ErrorReport {
     /// The closed error-code spelling, never message text.
     pub code: String,
     /// The human diagnostic accompanying the code.
@@ -387,7 +400,7 @@ const OUTCOME_CANCELLED: &str = "CancelledBeforeCommit";
 /// (for example `["rev-parse", "--git-dir"]`); the daemon prepends its own
 /// program name before running the interpreter.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandOpen {
+pub(crate) struct CommandOpen {
     /// The Forgejo service session; accepted and ignored, reserved for the
     /// day the service session becomes a coordinator session.
     pub session_id: String,
@@ -415,7 +428,7 @@ pub struct CommandOpen {
 /// backend's `RukAcceptedReply`. `stdin_credit` carries the inbound window
 /// granted; it is always positive.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandAccepted {
+pub(crate) struct CommandAccepted {
     /// The accepted stream identifier.
     pub stream_id: u64,
     /// The stdin credit bytes granted to the client.
@@ -427,7 +440,7 @@ pub struct CommandAccepted {
 /// The `Exit` payload ending one command stream, mirroring the Go
 /// backend's `RukExitReport`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandExitReport {
+pub(crate) struct CommandExitReport {
     /// The native process exit status: zero on success.
     pub exit_code: i32,
     /// The terminating signal name; empty for a normal exit.
@@ -476,7 +489,7 @@ impl CommandExitReport {
 /// One stream-zero typed control query, mirroring the Go backend's
 /// `RukControlRequest`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ControlRequest {
+pub(crate) struct ControlRequest {
     /// The query type; the daemon answers `outcome-lookup`.
     #[serde(rename = "type")]
     pub type_: String,
@@ -488,7 +501,7 @@ pub struct ControlRequest {
 /// `RukControlReply`. It travels on an `Accepted` frame with no terminal
 /// `Exit`: the connection stays open for further streams.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ControlReply {
+pub(crate) struct ControlReply {
     /// The query type echoed back.
     #[serde(rename = "type")]
     pub type_: String,
@@ -596,7 +609,7 @@ impl OutcomeLedger {
 /// the daemon cannot read, so the daemon omits them instead of guessing.
 /// `session.resume` reports the negotiated capabilities and authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionOpened {
+pub(crate) struct SessionOpened {
     /// The opened session identity.
     pub session: SessionId,
     /// The secret resuming the session.
@@ -614,7 +627,7 @@ pub struct SessionOpened {
 /// implementation), and covered mutations run through the
 /// per-method preparation layer plus `submit_prepared`.
 #[must_use]
-pub fn coord_call_site(method: Method) -> &'static str {
+pub(crate) fn coord_call_site(method: Method) -> &'static str {
     match method.kind() {
         ruk_core::protocol::MethodKind::Anonymous => "none: answer from ruk-core protocol data",
         ruk_core::protocol::MethodKind::Bootstrap => {
@@ -631,7 +644,7 @@ pub fn coord_call_site(method: Method) -> &'static str {
 
 /// Builds the `E_HOSTED` refusal for one session-bound method.
 #[must_use]
-pub fn method_error(method: Method, reason: &str) -> CoreError {
+pub(crate) fn method_error(method: Method, reason: &str) -> CoreError {
     CoreError::new(
         ErrorCode::EHosted,
         format!(
@@ -648,7 +661,7 @@ pub fn method_error(method: Method, reason: &str) -> CoreError {
 /// # Errors
 /// `Config` for an unusable configuration, `Io` when the socket cannot
 /// bind or accept persistently fails, `Unsupported` off Unix.
-pub fn serve(config: DaemonConfig) -> Result<(), Error> {
+pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
     config.validate()?;
     #[cfg(not(unix))]
     return Err(Error::Unsupported(String::from(
@@ -709,10 +722,10 @@ async fn serve_async(
     registry: Arc<Registry>,
     executor: BoundedExecutor,
 ) -> Result<(), Error> {
-    if let Err(err) = std::fs::remove_file(&config.socket_path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            return Err(Error::Io(err));
-        }
+    if let Err(err) = std::fs::remove_file(&config.socket_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::Io(err));
     }
     let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
     let refs = ConnectionRefs {
@@ -2106,7 +2119,7 @@ async fn open_inner(
 /// `E_INVALID` for an unknown shape or a session-bound method without a
 /// session, `E_HOSTED` where no read or preparation path exists, plus the
 /// coordinator's own typed failures.
-pub async fn dispatch_method(
+pub(crate) async fn dispatch_method(
     coordinator: &Arc<HostedCoordinator>,
     principal: &Principal,
     method: Method,

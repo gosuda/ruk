@@ -947,7 +947,7 @@ pub(crate) fn list_refs(store: &Store) -> Result<Vec<(RefName, RefTarget)>, GitE
     let mut out = Vec::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
-        let page = page_refs(store, after.as_deref(), 1000).map_err(|err| GitError::from(err))?;
+        let page = page_refs(store, after.as_deref(), 1000).map_err(GitError::from)?;
         for entry in &page.entries {
             out.push((entry.name.clone(), entry.target.clone()));
         }
@@ -1154,7 +1154,7 @@ fn resolve_base(store: &Store, kind: HashKind, base: &str) -> Result<Oid, GitErr
         return head_oid(store);
     }
     if let Ok(oid) = ruk_git::parse_oid(base) {
-        return ruk_git::require_kind(oid, kind).map_err(GitError::from);
+        return ruk_git::require_kind(oid, kind);
     }
     for candidate in [
         base.to_owned(),

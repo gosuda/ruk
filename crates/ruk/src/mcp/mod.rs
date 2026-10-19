@@ -39,8 +39,7 @@
 //! No manifest change is needed: the adapter uses only the `ruk` crate's
 //! existing dependencies (`ruk-core`, `serde`, `sonic-rs`).
 
-pub mod server;
-pub mod tools;
+pub(crate) mod server;
+pub(crate) mod tools;
 
-pub use server::{Server, serve};
-pub use tools::{TOOL_TABLE, Tool, ToolInfo};
+pub(crate) use server::serve;

@@ -155,6 +155,12 @@ pub struct HostedCoordinator {
     page_guards: Mutex<HashMap<LeaseId, (OwnerGuard, StdInstant)>>,
 }
 
+impl core::fmt::Debug for HostedCoordinator {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostedCoordinator").finish_non_exhaustive()
+    }
+}
+
 impl HostedCoordinator {
     /// Opens one repository coordinator over `store`.
     ///
@@ -1005,6 +1011,14 @@ fn decode_oplog_position(bytes: &[u8]) -> Result<OperationId, CoreError> {
     Ok(OperationId(u64::from_be_bytes(raw)))
 }
 
+/// One bounded newest-first `op.log` page: entries, resume id, oldest retained id, and end flag.
+type OplogPage = (
+    Vec<crate::protocol::OperationEntry>,
+    Option<OperationId>,
+    Option<OperationId>,
+    bool,
+);
+
 /// Walks one bounded `op.log` page from `start` newest-first.
 ///
 /// Collects at most `limit` matching entries while visiting at most
@@ -1017,15 +1031,7 @@ fn walk_oplog_page(
     start: Option<OperationId>,
     filter: Option<SessionId>,
     limit: usize,
-) -> Result<
-    (
-        Vec<crate::protocol::OperationEntry>,
-        Option<OperationId>,
-        Option<OperationId>,
-        bool,
-    ),
-    CoreError,
-> {
+) -> Result<OplogPage, CoreError> {
     let mut entries = Vec::new();
     let mut cursor = start;
     let mut oldest = None;
@@ -1402,8 +1408,7 @@ mod tests {
         AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement, BoundedList,
         ClaimHolderFilter, ClaimListArgs, ClaimMode, ClaimTtl, GitCommitArgs, Method,
         Mutation as WireMutation, MutationOutcome, OpLogArgs, PageCursor, PageLimit, PageRequest,
-        PinArgs, QueryDigest, ReceiptRef, StatusArgs, TagSetArgs, Timestamp, UndoArgs, UndoReply,
-        UndoSummary,
+        PinArgs, QueryDigest, ReceiptRef, TagSetArgs, Timestamp, UndoArgs, UndoReply, UndoSummary,
     };
     use crate::refdata::{RefExpect, RefName};
     use crate::store::PreparationBudget;
@@ -1553,12 +1558,7 @@ mod tests {
             .expect("open session");
 
         let reply = coord
-            .read(
-                &owner,
-                session,
-                Request::OpLog(Box::new(OpLogArgs::default())),
-                &cancel,
-            )
+            .read(&owner, session, Request::OpLog(Box::default()), &cancel)
             .await
             .expect("op.log reads");
         let Reply::OpLog(page) = reply else {
@@ -1570,7 +1570,7 @@ mod tests {
             .read(
                 &owner,
                 SessionId::generate(),
-                Request::OpLog(Box::new(OpLogArgs::default())),
+                Request::OpLog(Box::default()),
                 &cancel,
             )
             .await
@@ -1581,7 +1581,7 @@ mod tests {
             .read(
                 &stranger(),
                 session,
-                Request::OpLog(Box::new(OpLogArgs::default())),
+                Request::OpLog(Box::default()),
                 &cancel,
             )
             .await
@@ -1604,12 +1604,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::EForbidden);
 
         let reply = coord
-            .read(
-                &owner,
-                session,
-                Request::ClaimList(Box::new(ClaimListArgs::default())),
-                &cancel,
-            )
+            .read(&owner, session, Request::ClaimList(Box::default()), &cancel)
             .await
             .expect("claim.list serves its first page");
         let Reply::ClaimList(list) = reply else {
@@ -1623,7 +1618,7 @@ mod tests {
             .read(
                 &owner,
                 session,
-                Request::AttestList(Box::new(AttestListArgs::default())),
+                Request::AttestList(Box::default()),
                 &cancel,
             )
             .await
@@ -1717,12 +1712,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::ELeaseLost);
 
         let err = coord
-            .read(
-                &owner,
-                session,
-                Request::Status(Box::new(StatusArgs::default())),
-                &cancel,
-            )
+            .read(&owner, session, Request::Status(Box::default()), &cancel)
             .await
             .expect_err("status names its missing implementation");
         assert_eq!(err.code, ErrorCode::EHosted);
@@ -1733,7 +1723,7 @@ mod tests {
         );
 
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -1843,7 +1833,7 @@ mod tests {
         );
 
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -1982,12 +1972,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::EForbidden);
 
         let reply = coord
-            .read(
-                &owner,
-                session,
-                Request::OpLog(Box::new(OpLogArgs::default())),
-                &cancel,
-            )
+            .read(&owner, session, Request::OpLog(Box::default()), &cancel)
             .await
             .expect("op.log reads after mutation");
         let Reply::OpLog(page) = reply else {
@@ -1998,7 +1983,7 @@ mod tests {
         assert_eq!(page.oldest_retained, Some(page.entries.items[0].id));
 
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     fn seed_claims(coord: &HostedCoordinator, holder: SessionId, specs: &[(u8, &str)]) {
@@ -2185,7 +2170,7 @@ mod tests {
         assert_ne!(third.claims.items, first.claims.items);
         assert_ne!(third.claims.items, second.claims.items);
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -2246,7 +2231,7 @@ mod tests {
         subjects.dedup();
         assert_eq!(subjects.len(), 3);
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -2301,7 +2286,7 @@ mod tests {
         assert!(second.oldest_retained.is_some());
         assert_ne!(second.entries.items[0].id, first.entries.items[0].id);
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -2430,7 +2415,7 @@ mod tests {
             .expect_err("foreign session lease is forbidden");
         assert_eq!(err.code, ErrorCode::EForbidden);
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -2556,7 +2541,7 @@ mod tests {
             .expect_err("stale op.log view is forbidden");
         assert_eq!(err.code, ErrorCode::EForbidden);
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -2628,7 +2613,7 @@ mod tests {
             .expect_err("expired lease is lost");
         assert_eq!(err.code, ErrorCode::ELeaseLost);
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     #[tokio::test]
@@ -2715,7 +2700,7 @@ mod tests {
             .expect_err("unknown session with valid shape stays forbidden");
         assert_eq!(err.code, ErrorCode::EForbidden);
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     fn signature() -> Signature {
@@ -2873,7 +2858,7 @@ mod tests {
         );
 
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 
     /// Concurrent lane commits on distinct branches share batches: the
@@ -2894,9 +2879,8 @@ mod tests {
         use std::time::Duration;
 
         use crate::change::ChangeId;
-        use crate::conflict::{Signature, TzOffset};
-        use crate::protocol::{GitCommitArgs, GitCommitRefUpdate, Reply, Request, SessionOpenArgs};
-        use crate::refdata::{RefTarget, resolve};
+        use crate::protocol::{GitCommitArgs, GitCommitRefUpdate, SessionOpenArgs};
+        use crate::refdata::resolve;
         use crate::refs::StoreRefs;
 
         const BRANCHES: usize = 4;
@@ -2981,7 +2965,7 @@ mod tests {
                     &cancel,
                     GitCommitArgs {
                         tree: tree_oid,
-                        parents: vec![seed_head.clone()],
+                        parents: vec![seed_head],
                         author: signature(),
                         committer: signature(),
                         message: ByteString::from(format!("lane commit {branch_no}")),
@@ -3038,6 +3022,6 @@ mod tests {
         );
 
         coord.shutdown();
-        let _ = runner.abort();
+        runner.abort();
     }
 }

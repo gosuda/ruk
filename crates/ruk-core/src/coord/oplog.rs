@@ -384,30 +384,53 @@ impl<'a> OpDeltaReader<'a> {
     }
 
     /// The validated header of this operation.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn header(&self) -> &OpHeader {
         &self.header
     }
 
     /// Number of deltas successfully read so far.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn deltas_read(&self) -> u64 {
         self.deltas_read
     }
 
     /// Number of raw stream bytes consumed so far.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn stream_bytes_read(&self) -> u64 {
         self.stream_bytes_read
     }
 
     /// Current part number being read.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn current_part(&self) -> u64 {
         self.current_part
     }
 
     /// Returns `true` when all deltas in the operation have been successfully read.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn is_finished(&self) -> bool {
         self.done
@@ -416,10 +439,10 @@ impl<'a> OpDeltaReader<'a> {
     }
 
     fn ensure_fragment_loaded(&mut self) -> Result<(), CoreError> {
-        if let Some(f) = &self.current_fragment {
-            if self.fragment_offset < f.len() {
-                return Ok(());
-            }
+        if let Some(f) = &self.current_fragment
+            && self.fragment_offset < f.len()
+        {
+            return Ok(());
         }
 
         if self.current_part > self.header.parts {
@@ -570,14 +593,14 @@ impl<'a> OpDeltaReader<'a> {
                 );
             }
 
-            if let Some(frag) = &self.current_fragment {
-                if self.fragment_offset < frag.len() {
-                    return corrupt(
-                        self.store,
-                        "op stream",
-                        "unconsumed trailing bytes in terminal fragment",
-                    );
-                }
+            if let Some(frag) = &self.current_fragment
+                && self.fragment_offset < frag.len()
+            {
+                return corrupt(
+                    self.store,
+                    "op stream",
+                    "unconsumed trailing bytes in terminal fragment",
+                );
             }
 
             let extra_key = op_key(self.id, self.header.parts + 1);
@@ -667,17 +690,17 @@ impl<'a> OpDeltaReader<'a> {
             );
         }
 
-        if let (Some(b), Some(a)) = (&delta.before, &delta.after) {
-            if b == a {
-                return corrupt(
-                    self.store,
-                    "op delta",
-                    format!(
-                        "delta for table `{}` has identical before and after content",
-                        delta.table
-                    ),
-                );
-            }
+        if let (Some(b), Some(a)) = (&delta.before, &delta.after)
+            && b == a
+        {
+            return corrupt(
+                self.store,
+                "op delta",
+                format!(
+                    "delta for table `{}` has identical before and after content",
+                    delta.table
+                ),
+            );
         }
 
         let key_len = u64::try_from(delta.key.len())

@@ -25,45 +25,45 @@ use ruk_core::ops::{
 };
 
 /// The wire name of the `describe_change` tool.
-pub const TOOL_DESCRIBE_CHANGE: &str = "describe_change";
+pub(crate) const TOOL_DESCRIBE_CHANGE: &str = "describe_change";
 
 /// The wire name of the `new_commit` tool.
-pub const TOOL_NEW_COMMIT: &str = "new_commit";
+pub(crate) const TOOL_NEW_COMMIT: &str = "new_commit";
 
 /// The wire name of the `edit` tool.
-pub const TOOL_EDIT: &str = "edit";
+pub(crate) const TOOL_EDIT: &str = "edit";
 
 /// The wire name of the `split` tool.
-pub const TOOL_SPLIT: &str = "split";
+pub(crate) const TOOL_SPLIT: &str = "split";
 
 /// The wire name of the `squash` tool.
-pub const TOOL_SQUASH: &str = "squash";
+pub(crate) const TOOL_SQUASH: &str = "squash";
 
 /// The wire name of the `rebase` tool.
-pub const TOOL_REBASE: &str = "rebase";
+pub(crate) const TOOL_REBASE: &str = "rebase";
 
 /// The wire name of the `abandon` tool.
-pub const TOOL_ABANDON: &str = "abandon";
+pub(crate) const TOOL_ABANDON: &str = "abandon";
 
 /// The wire name of the `resolve` tool.
-pub const TOOL_RESOLVE: &str = "resolve";
+pub(crate) const TOOL_RESOLVE: &str = "resolve";
 
 /// The wire name of the `revert` tool.
-pub const TOOL_REVERT: &str = "revert";
+pub(crate) const TOOL_REVERT: &str = "revert";
 
 /// The wire name of the `revset_eval` tool.
-pub const TOOL_REVSET_EVAL: &str = "revset_eval";
+pub(crate) const TOOL_REVSET_EVAL: &str = "revset_eval";
 
 /// The wire name of the `refs_list` tool.
-pub const TOOL_REFS_LIST: &str = "refs_list";
+pub(crate) const TOOL_REFS_LIST: &str = "refs_list";
 
 /// The wire name of the `attestation_query` tool.
-pub const TOOL_ATTESTATION_QUERY: &str = "attestation_query";
+pub(crate) const TOOL_ATTESTATION_QUERY: &str = "attestation_query";
 
 /// One exposed tool: its wire name, what it does, and the existing Rust
 /// request type its arguments decode as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ToolInfo {
+pub(crate) struct ToolInfo {
     /// The wire name accepted by `tools/call`.
     pub name: &'static str,
     /// What the tool does, including any degraded local semantics.
@@ -74,7 +74,7 @@ pub struct ToolInfo {
 
 /// The full tool table in wire order: nine change operations, then the three
 /// degraded reads.
-pub const TOOL_TABLE: &[ToolInfo] = &[
+pub(crate) const TOOL_TABLE: &[ToolInfo] = &[
     ToolInfo {
         name: TOOL_DESCRIBE_CHANGE,
         description: "Describe one commit or one change in typed form; never publishes.",
@@ -139,7 +139,7 @@ pub const TOOL_TABLE: &[ToolInfo] = &[
 
 /// Typed identity of one tool in [`TOOL_TABLE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Tool {
+pub(crate) enum Tool {
     /// Reads one commit or change via `ops::describe`.
     DescribeChange,
     /// Publishes one commit via `ops::new`.
@@ -171,7 +171,7 @@ impl Tool {
     ///
     /// # Errors
     /// `E_NOT_FOUND` naming the unknown tool.
-    pub fn from_name(name: &str) -> Result<Self, CoreError> {
+    pub(crate) fn from_name(name: &str) -> Result<Self, CoreError> {
         match name {
             TOOL_DESCRIBE_CHANGE => Ok(Self::DescribeChange),
             TOOL_NEW_COMMIT => Ok(Self::NewCommit),
@@ -193,8 +193,15 @@ impl Tool {
     }
 
     /// The wire name accepted by `tools/call`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::DescribeChange => TOOL_DESCRIBE_CHANGE,
             Self::NewCommit => TOOL_NEW_COMMIT,
@@ -224,7 +231,11 @@ impl Tool {
 /// The [`CoreError`] from argument decoding, the operation itself, or result
 /// rendering. `revset_eval` always fails `E_INVALID` carrying
 /// `E_UNSUPPORTED_OPERATION`.
-pub fn call_on_store(store: &Store, tool: Tool, args_json: &[u8]) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn call_on_store(
+    store: &Store,
+    tool: Tool,
+    args_json: &[u8],
+) -> Result<Vec<u8>, CoreError> {
     match tool {
         Tool::DescribeChange => {
             let request: DescribeRequest = decode_args(args_json)?;

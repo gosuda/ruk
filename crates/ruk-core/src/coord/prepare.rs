@@ -167,8 +167,10 @@ pub(crate) struct PrepareContext<'a> {
     /// Wall clock for signature timestamps; absent on the legacy path.
     pub(crate) clock: Option<&'a Clock>,
     /// Monotonic claim clock for claim sealing; absent on the legacy path.
+    #[expect(dead_code, reason = "wired in CS-R42 (claim sealing)")]
     pub(crate) claim_clock: Option<&'a ClaimClock>,
     /// Admission policy for land preparation; absent on the legacy path.
+    #[expect(dead_code, reason = "wired in CS-R38/40/44 (land preparation)")]
     pub(crate) policy: Option<&'a Policy>,
     /// Progress gate for attestation verification; absent on the legacy path.
     pub(crate) checkpoint: Option<&'a Checkpoint<'a>>,
@@ -950,17 +952,17 @@ fn mint_empty_commit(
         change_id: staged.record.change_id(),
         oid: head.as_git().copied(),
     };
-    if let Some(existing) = records.get_commit(&head)? {
-        if existing == staged.record {
-            return Ok((
-                PreparedOp {
-                    objects: staged_prefix,
-                    facts: Vec::new(),
-                    output,
-                },
-                identity,
-            ));
-        }
+    if let Some(existing) = records.get_commit(&head)?
+        && existing == staged.record
+    {
+        return Ok((
+            PreparedOp {
+                objects: staged_prefix,
+                facts: Vec::new(),
+                output,
+            },
+            identity,
+        ));
     }
     let mut objects = staged_prefix;
     objects.push(staged.prepared_object);
@@ -3715,15 +3717,14 @@ mod tests {
     use crate::index::RepoPath;
     use crate::ops::{NewRequest, prepare_new};
     use crate::protocol::{
-        AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
-        BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
-        ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs,
-        GitCommitArgs, GitCommitRefUpdate, IdentityClaim, LandExecuteArgs, LandPrepareArgs,
-        MergeSelection, Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection, PinArgs,
-        PushArgs, PushAtomicity, PushReconcileArgs, PushSource, PushUpdate, RebaseArgs,
-        RebaseScope, RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
-        SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding,
-        WorkspaceInit, WsNewArgs,
+        AbandonArgs, AttestAddArgs, AttestSignature, AttestStatement, BookmarkDeleteArgs,
+        ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs,
+        FetchArgs, FetchFilter, FetchRefs, GitCommitArgs, GitCommitRefUpdate, IdentityClaim,
+        LandExecuteArgs, LandPrepareArgs, MergeSelection, Mutation as WireMutation, NewArgs,
+        PathSelection, PinArgs, PushArgs, PushAtomicity, PushReconcileArgs, PushSource, PushUpdate,
+        RebaseArgs, RebaseScope, RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs,
+        SessionAuthority, SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs,
+        WorkspaceBinding, WorkspaceInit, WsNewArgs,
     };
     use crate::records::codec::encode_change_entry;
     use crate::records::keys::change_key;
@@ -4857,7 +4858,7 @@ mod tests {
             session,
             Request::GitCommit(Box::new(WireMutation {
                 request_id: request_id(),
-                args: git_commit_args(&store, parent.clone(), branch.clone(), RefExpect::Absent),
+                args: git_commit_args(&store, parent, branch.clone(), RefExpect::Absent),
             })),
         )
         .expect("first git.commit prepares");
@@ -7252,9 +7253,9 @@ mod tests {
     fn reads_have_no_preparation() {
         let (_temp, store, session) = fixture();
         for request in [
-            Request::ClaimList(Box::new(ClaimListArgs::default())),
-            Request::AttestList(Box::new(AttestListArgs::default())),
-            Request::OpLog(Box::new(OpLogArgs::default())),
+            Request::ClaimList(Box::default()),
+            Request::AttestList(Box::default()),
+            Request::OpLog(Box::default()),
         ] {
             let err = prepare_mutation(&store, session, request).expect_err("reads never prepare");
             assert_eq!(err.code, ErrorCode::EInvalid);

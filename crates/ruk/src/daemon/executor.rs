@@ -13,10 +13,14 @@ use ruk_core::error::{CoreError, ErrorCode};
 
 /// The shared bounded blocking pool of one daemon process.
 #[derive(Clone, Debug)]
-pub struct BoundedExecutor {
+pub(crate) struct BoundedExecutor {
     /// Bulkhead permits for blocking work.
     semaphore: Arc<Semaphore>,
     /// The permit count, retained for introspection.
+    #[expect(
+        dead_code,
+        reason = "no reader at this commit; retained for later changeset rows"
+    )]
     pool_size: usize,
 }
 
@@ -25,7 +29,7 @@ impl BoundedExecutor {
     ///
     /// # Errors
     /// `E_INVALID` for a zero pool.
-    pub fn new(pool_size: usize) -> Result<Self, CoreError> {
+    pub(crate) fn new(pool_size: usize) -> Result<Self, CoreError> {
         if pool_size == 0 {
             return Err(CoreError::new(
                 ErrorCode::EInvalid,
@@ -39,8 +43,12 @@ impl BoundedExecutor {
     }
 
     /// Returns the blocking permit count.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
-    pub const fn permits(&self) -> usize {
+    pub(crate) const fn permits(&self) -> usize {
         self.pool_size
     }
 
@@ -52,7 +60,7 @@ impl BoundedExecutor {
     /// # Errors
     /// `E_CANCELLED` when the queue sheds the request or the worker is
     /// cancelled, `E_IO` when the worker fails to report.
-    pub async fn run<F, T>(&self, work: F) -> Result<T, CoreError>
+    pub(crate) async fn run<F, T>(&self, work: F) -> Result<T, CoreError>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,

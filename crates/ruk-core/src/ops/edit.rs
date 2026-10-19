@@ -107,13 +107,13 @@ pub fn prepare_edit(
         tree.expect_kind(kind, "tree")?;
         require_tree(store, tree)?;
     }
-    if let Some(msg) = &request.message {
-        if msg.as_bytes().contains(&0) {
-            return Err(CoreError::new(
-                ErrorCode::EInvalid,
-                "commit message contains a NUL byte",
-            ));
-        }
+    if let Some(msg) = &request.message
+        && msg.as_bytes().contains(&0)
+    {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "commit message contains a NUL byte",
+        ));
     }
 
     let records = Records::new(store);
