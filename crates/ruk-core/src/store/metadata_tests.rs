@@ -191,8 +191,7 @@ const LOCK_HOLD_ENTRY: &str = "store::metadata_tests::lock_hold_child";
 #[test]
 #[ignore = "child of open_releases_the_lock_when_the_holder_is_killed; the parent test spawns it"]
 fn lock_hold_child() {
-    let path =
-        std::env::var(LOCK_HOLD_PATH_ENV).expect("the parent test sets the metadata path");
+    let path = std::env::var(LOCK_HOLD_PATH_ENV).expect("the parent test sets the metadata path");
     let ready = std::env::var(LOCK_HOLD_READY_ENV).expect("the parent test sets the marker path");
     let _holder = Metadata::open(Path::new(&path)).expect("child holds the metadata lock");
     std::fs::write(ready, b"held").expect("signal the parent the lock is held");
@@ -209,7 +208,9 @@ fn open_waits_for_a_live_holder_instead_of_refusing() {
         let meta = Metadata::open_with_timeout(&path, Duration::from_secs(10))
             .expect("the waiter opens after the holder drops");
         assert_eq!(meta.generation().expect("waiter reads generation"), 0);
-        done_tx.send(Instant::now()).expect("report the waiter completion");
+        done_tx
+            .send(Instant::now())
+            .expect("report the waiter completion");
     });
     // Backoff starts near 1 ms, so 300 ms is many busy retries: the waiter
     // must still be queued behind the live holder here.

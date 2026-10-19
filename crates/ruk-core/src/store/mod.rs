@@ -1715,7 +1715,9 @@ mod tests {
             let store = Store::open_with_timeout(&root, budget(), Duration::from_secs(30))
                 .expect("the second open waits for the live store");
             assert_eq!(store.hash_kind(), HashKind::Sha1);
-            done_tx.send(Instant::now()).expect("report the waiter completion");
+            done_tx
+                .send(Instant::now())
+                .expect("report the waiter completion");
         });
         // The waiter must still be queued behind the live store here: it
         // neither refuses with already-open nor slips through early.
