@@ -147,8 +147,7 @@ pub(crate) fn blame(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
                     origins: blamed.origins,
                 }
             } else {
-                let (lines, origins) =
-                    overlay_worktree(&blamed.lines, &blamed.origins, &bytes)?;
+                let (lines, origins) = overlay_worktree(&blamed.lines, &blamed.origins, &bytes)?;
                 BlamedFile { lines, origins }
             }
         }
@@ -704,8 +703,11 @@ fn render_default(
             }
             None => {
                 out.extend_from_slice(
-                    format!("00000000 (Not Committed Yet {} {lineno}) ", blame_date(now, "+0000")?,)
-                        .as_bytes(),
+                    format!(
+                        "00000000 (Not Committed Yet {} {lineno}) ",
+                        blame_date(now, "+0000")?,
+                    )
+                    .as_bytes(),
                 );
                 out.extend_from_slice(line);
                 out.push(b'\n');
@@ -872,9 +874,8 @@ impl Porcelain<'_> {
         Self::field(self.out, "summary", &summary);
         if let Some(parent_hex) = previous {
             if self.previous_holds(*oid)? {
-                self.out.extend_from_slice(
-                    format!("previous {parent_hex} {path_text}\n").as_bytes(),
-                );
+                self.out
+                    .extend_from_slice(format!("previous {parent_hex} {path_text}\n").as_bytes());
             }
         }
         if boundary {
@@ -901,11 +902,9 @@ impl Porcelain<'_> {
         self.out.extend_from_slice(b"committer Not Committed Yet\n");
         self.out
             .extend_from_slice(b"committer-mail <not.committed.yet>\n");
-        self.out.extend_from_slice(
-            format!("committer-time {now}\ncommitter-tz +0000\n").as_bytes(),
-        );
         self.out
-            .extend_from_slice(b"summary Not Committed Yet\n");
+            .extend_from_slice(format!("committer-time {now}\ncommitter-tz +0000\n").as_bytes());
+        self.out.extend_from_slice(b"summary Not Committed Yet\n");
         self.out
             .extend_from_slice(format!("filename {path_text}\n").as_bytes());
         Ok(())
@@ -918,10 +917,7 @@ impl Porcelain<'_> {
         if let Some(hit) = self.previous_cache.get(&commit) {
             return Ok(*hit);
         }
-        let parent = self
-            .facts
-            .get(&commit)
-            .and_then(|row| row.previous.clone());
+        let parent = self.facts.get(&commit).and_then(|row| row.previous.clone());
         let holds = match parent {
             None => false,
             Some(hex) => {
@@ -1010,9 +1006,5 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         .expect("day-of-year fits in u32");
     let prime = u32::try_from(month_prime).expect("month-prime fits in u32");
     let month = if prime < 10 { prime + 3 } else { prime - 9 };
-    (
-        if month <= 2 { year + 1 } else { year },
-        month,
-        day,
-    )
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }

@@ -588,7 +588,10 @@ mod tests {
             Some("refs/heads/main".to_owned())
         );
         // Detached HEAD, garbage, and empty bodies carry no symref.
-        assert_eq!(parse_head_symref(b"705446959e9d34f504c3c368dbf61264e603fa2d\n"), None);
+        assert_eq!(
+            parse_head_symref(b"705446959e9d34f504c3c368dbf61264e603fa2d\n"),
+            None
+        );
         assert_eq!(parse_head_symref(b"not a ref\n"), None);
         assert_eq!(parse_head_symref(b""), None);
         assert_eq!(parse_head_symref(b"ref: \n"), None);

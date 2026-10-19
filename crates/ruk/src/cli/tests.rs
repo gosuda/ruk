@@ -3922,10 +3922,9 @@ fn rebase_replays_side_onto_main() {
 /// Commits `body` as `file` under one author name for blame tests.
 fn blame_commit(ctx: &mut Ctx, root: &PathBuf, file: &str, body: &[u8], name: &str, message: &str) {
     for role in ["AUTHOR", "COMMITTER"] {
-        ctx.env.vars.insert(
-            format!("GIT_{role}_NAME"),
-            name.to_owned(),
-        );
+        ctx.env
+            .vars
+            .insert(format!("GIT_{role}_NAME"), name.to_owned());
         ctx.env.vars.insert(
             format!("GIT_{role}_EMAIL"),
             format!("{}@example.invalid", name.to_lowercase()),
@@ -3960,7 +3959,11 @@ fn parse_blame_line(line: &str) -> (String, String, usize, String) {
     let (head, content) = line.split_once(") ").expect("close paren");
     let (id, rest) = head.split_once(" (").expect("open paren");
     let parts: Vec<&str> = rest.split_whitespace().collect();
-    let lineno: usize = parts.last().expect("lineno").parse().expect("lineno number");
+    let lineno: usize = parts
+        .last()
+        .expect("lineno")
+        .parse()
+        .expect("lineno number");
     (
         id.to_owned(),
         parts.first().expect("author").to_string(),
@@ -3985,7 +3988,14 @@ fn blame_attributes_three_commit_interleaved_history() {
     // zulu, appends delta; c3 edits alpha, appends echo. The blamed lines
     // interleave origins c3/c2/c1/c2/c3, and the deleted zulu exercises
     // the walk's parent-only slots.
-    blame_commit(&mut ctx, &root, "poem.txt", b"alpha\nbravo\ncharlie\nzulu\n", "Ada", "first");
+    blame_commit(
+        &mut ctx,
+        &root,
+        "poem.txt",
+        b"alpha\nbravo\ncharlie\nzulu\n",
+        "Ada",
+        "first",
+    );
     blame_commit(
         &mut ctx,
         &root,
@@ -4008,8 +4018,7 @@ fn blame_attributes_three_commit_interleaved_history() {
 
     let out = run(verbs_blame::blame, &mut ctx, &["HEAD", "--", "poem.txt"]).expect("blame");
     let text = String::from_utf8(out).expect("utf8");
-    let rows: Vec<(String, String, usize, String)> =
-        text.lines().map(parse_blame_line).collect();
+    let rows: Vec<(String, String, usize, String)> = text.lines().map(parse_blame_line).collect();
     assert_eq!(rows.len(), 5, "got {text:?}");
     // (expected short id, author, lineno, content) per final line.
     let want = [
@@ -4033,8 +4042,12 @@ fn blame_attributes_three_commit_interleaved_history() {
     }
 
     // `-L` slices the same attribution with real line numbers.
-    let out = run(verbs_blame::blame, &mut ctx, &["-L", "2,4", "HEAD", "--", "poem.txt"])
-        .expect("blame -L");
+    let out = run(
+        verbs_blame::blame,
+        &mut ctx,
+        &["-L", "2,4", "HEAD", "--", "poem.txt"],
+    )
+    .expect("blame -L");
     let ranged: Vec<(String, String, usize, String)> = String::from_utf8(out)
         .expect("utf8")
         .lines()
@@ -4048,8 +4061,12 @@ fn blame_attributes_three_commit_interleaved_history() {
 
     // Porcelain groups carry author facts, summaries, and boundary/previous
     // markers: c1 is the root (boundary, no previous), c2/c3 name parents.
-    let out = run(verbs_blame::blame, &mut ctx, &["-p", "HEAD", "--", "poem.txt"])
-        .expect("blame -p");
+    let out = run(
+        verbs_blame::blame,
+        &mut ctx,
+        &["-p", "HEAD", "--", "poem.txt"],
+    )
+    .expect("blame -p");
     let porcelain = String::from_utf8(out).expect("utf8");
     assert!(
         porcelain.contains(&format!("{third} 1 1 1\n")),
@@ -4079,7 +4096,10 @@ fn blame_attributes_three_commit_interleaved_history() {
         porcelain.contains(&format!("previous {first} poem.txt\n")),
         "c2 previous: {porcelain:?}"
     );
-    assert!(porcelain.contains("boundary\n"), "c1 boundary: {porcelain:?}");
+    assert!(
+        porcelain.contains("boundary\n"),
+        "c1 boundary: {porcelain:?}"
+    );
     assert!(
         porcelain.contains("filename poem.txt\n\tALPHA\n"),
         "content lines: {porcelain:?}"
@@ -4117,8 +4137,7 @@ fn blame_worktree_overlay_reports_uncommitted_lines() {
     std::fs::write(root.join("note.txt"), b"one\nTWO\nthree\n").expect("dirty");
     let out = run(verbs_blame::blame, &mut ctx, &["note.txt"]).expect("blame worktree");
     let text = String::from_utf8(out).expect("utf8");
-    let rows: Vec<(String, String, usize, String)> =
-        text.lines().map(parse_blame_line).collect();
+    let rows: Vec<(String, String, usize, String)> = text.lines().map(parse_blame_line).collect();
     assert_eq!(rows.len(), 3, "got {text:?}");
     assert_eq!(rows[0].3, "one");
     assert_eq!(rows[0].1, "Ada");
@@ -4149,8 +4168,12 @@ fn blame_worktree_overlay_reports_uncommitted_lines() {
     );
     // Unknown paths fail instead of blaming nothing.
     run(verbs_blame::blame, &mut ctx, &["missing.txt"]).expect_err("unknown path");
-    run(verbs_blame::blame, &mut ctx, &["-L", "99", "HEAD", "--", "note.txt"])
-        .expect_err("line range past end");
+    run(
+        verbs_blame::blame,
+        &mut ctx,
+        &["-L", "99", "HEAD", "--", "note.txt"],
+    )
+    .expect_err("line range past end");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -4258,10 +4281,11 @@ fn bisect_contradictory_marks_rejected() {
     let mut ctx = repo_ctx(&root, env);
     lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second");
     let tip = bisect_head(&mut ctx);
-    let first = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("first"))
-        .expect("utf8")
-        .trim()
-        .to_owned();
+    let first =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("first"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     run(
         verbs_bisect::bisect,
         &mut ctx,
@@ -4283,10 +4307,11 @@ fn bisect_terms_aliases_and_log() {
     lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second");
     lane_commit(&mut ctx, &root, "f.txt", b"v3\n", "third");
     let tip = bisect_head(&mut ctx);
-    let first = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~2"]).expect("first"))
-        .expect("utf8")
-        .trim()
-        .to_owned();
+    let first =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~2"]).expect("first"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     run(
         verbs_bisect::bisect,
         &mut ctx,
@@ -4362,10 +4387,11 @@ fn bisect_run_finds_first_bad() {
     let planted = bisect_head(&mut ctx);
     lane_commit(&mut ctx, &root, "f.txt", b"BAD\n", "still bad");
     let tip = bisect_head(&mut ctx);
-    let first = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~3"]).expect("first"))
-        .expect("utf8")
-        .trim()
-        .to_owned();
+    let first =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~3"]).expect("first"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     run(
         verbs_bisect::bisect,
         &mut ctx,
@@ -4399,7 +4425,12 @@ fn patch_round_trip_format_patch_am() {
     std::fs::write(root.join("new.txt"), b"fresh\n").expect("write new");
     run(verbs_stage::add, &mut ctx, &["f.txt", "new.txt"]).expect("add");
     run(verbs_stage::rm, &mut ctx, &["gone.txt"]).expect("rm");
-    run(verbs_history::commit, &mut ctx, &["-m", "swap gone for new"]).expect("commit");
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "swap gone for new"],
+    )
+    .expect("commit");
     let tip = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("tip"))
         .expect("utf8")
         .trim()
@@ -4493,10 +4524,9 @@ fn apply_check_stat_reverse_index() {
         stat.contains("f.txt") && stat.contains("created.txt") && stat.contains("old.txt"),
         "got {stat:?}"
     );
-    let numstat = String::from_utf8(
-        run(verbs_patch::apply, &mut ctx, &["--numstat"]).expect("numstat"),
-    )
-    .expect("utf8");
+    let numstat =
+        String::from_utf8(run(verbs_patch::apply, &mut ctx, &["--numstat"]).expect("numstat"))
+            .expect("utf8");
     assert!(numstat.contains("1\t1\tf.txt"), "got {numstat:?}");
     run(verbs_patch::apply, &mut ctx, &[]).expect("apply");
     assert_eq!(
@@ -4510,15 +4540,14 @@ fn apply_check_stat_reverse_index() {
     assert!(!root.join("old.txt").exists());
     // A worktree-only apply leaves the index on the old blobs.
     assert!(index_stages(&mut ctx, "created.txt").is_empty());
-    let rows =
-        super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
-            .expect("scan");
+    let rows = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+        .expect("scan");
     let (_, _, entry) = rows
         .iter()
         .find(|(path, stage, _)| path.as_bytes() == b"f.txt" && stage.as_u8() == 0)
         .expect("index f");
-    let (_, body) = super::tree::read_object_bytes(ctx.store().expect("store"), entry.oid())
-        .expect("blob");
+    let (_, body) =
+        super::tree::read_object_bytes(ctx.store().expect("store"), entry.oid()).expect("blob");
     assert_eq!(body, b"line1\nline2\nline3\nline4\nline5\nline6\n");
     run(verbs_patch::apply, &mut ctx, &["--reverse"]).expect("reverse");
     assert_eq!(
@@ -4526,10 +4555,7 @@ fn apply_check_stat_reverse_index() {
         b"line1\nline2\nline3\nline4\nline5\nline6\n"
     );
     assert!(!root.join("created.txt").exists());
-    assert_eq!(
-        std::fs::read(root.join("old.txt")).expect("read"),
-        b"bye\n"
-    );
+    assert_eq!(std::fs::read(root.join("old.txt")).expect("read"), b"bye\n");
     run(verbs_patch::apply, &mut ctx, &["--index"]).expect("index");
     assert_eq!(
         std::fs::read(root.join("created.txt")).expect("read"),
@@ -4556,10 +4582,7 @@ fn am_abort_restores_session() {
         .replace(" one\n", " oneX\n");
     ctx.env.stdin = Some(bad_text.into_bytes());
     let err = run(verbs_patch::am, &mut ctx, &[]).expect_err("am fails");
-    assert!(
-        err.to_string().contains("am --abort"),
-        "got {err:?}"
-    );
+    assert!(err.to_string().contains("am --abort"), "got {err:?}");
     // The failure leaves HEAD, the worktree, and the session behind.
     let head = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("head"))
         .expect("utf8")
@@ -4590,7 +4613,9 @@ fn am_abort_restores_session() {
     ctx.env.stdin = Some(mbox);
     let out = run(verbs_patch::am, &mut ctx, &[]).expect("am");
     assert!(
-        String::from_utf8(out).expect("utf8").contains("Applying: change two")
+        String::from_utf8(out)
+            .expect("utf8")
+            .contains("Applying: change two")
     );
     assert_eq!(
         std::fs::read(root.join("f.txt")).expect("read"),

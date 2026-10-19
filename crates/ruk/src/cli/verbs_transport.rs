@@ -4184,9 +4184,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             )?
                         }
                         Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => adv.refs,
-                        Err(err)
-                            if ruk_git::transport::dumb_http::is_dumb_gap(&err) =>
-                        {
+                        Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
                             let adv = ruk_git::transport::dumb_http::discover(
                                 &base,
                                 ctx.kind()?,

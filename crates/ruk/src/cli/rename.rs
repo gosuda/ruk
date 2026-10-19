@@ -435,7 +435,7 @@ mod tests {
             &mut ctx,
             &["--cached", "-M", "--name-status"],
         );
-                assert_eq!(
+        assert_eq!(
             String::from_utf8(out).expect("utf8"),
             "R090\ta.txt\tb.txt\n"
         );

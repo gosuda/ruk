@@ -44,8 +44,8 @@ use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
 use super::state::{
-    IdentityRole, commit_record, head_oid, identity, list_refs,     load_or_default, merge_base as state_merge_base, now_seconds, pseudo_read, read_ref,
-    resolve_rev, scan_index,
+    IdentityRole, commit_record, head_oid, identity, list_refs, load_or_default,
+    merge_base as state_merge_base, now_seconds, pseudo_read, read_ref, resolve_rev, scan_index,
 };
 use super::tree::{TreeMode, commit_tree_oid, flatten_tree, read_object_bytes, walk_worktree};
 use super::verbs_history::{parse_log_revs, walk_history_excluding};
@@ -347,9 +347,7 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     let mut out = Vec::new();
     let mut emptied: Vec<PathBuf> = Vec::new();
     for path in &candidates {
-        let full = ctx
-            .file_base
-            .join(String::from_utf8_lossy(path).as_ref());
+        let full = ctx.file_base.join(String::from_utf8_lossy(path).as_ref());
         match std::fs::remove_file(&full) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -370,12 +368,7 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     }
     if opts.is_set("dir") {
         // Deepest first so newly-emptied parents cascade.
-        emptied.sort_by(|left, right| {
-            right
-                .components()
-                .count()
-                .cmp(&left.components().count())
-        });
+        emptied.sort_by(|left, right| right.components().count().cmp(&left.components().count()));
         emptied.dedup();
         for dir in emptied {
             if dir == ctx.file_base {
@@ -393,8 +386,7 @@ fn under_limits(path: &[u8], limits: &[Vec<u8>]) -> bool {
     limits.is_empty()
         || limits.iter().any(|limit| {
             path == limit.as_slice()
-                || (path.starts_with(limit.as_slice())
-                    && path.get(limit.len()) == Some(&b'/'))
+                || (path.starts_with(limit.as_slice()) && path.get(limit.len()) == Some(&b'/'))
         })
 }
 
@@ -478,7 +470,9 @@ pub(crate) fn describe(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         let Some(short) = text.strip_prefix("refs/tags/") else {
             continue;
         };
-        let RefTarget::Direct(oid) = target else { continue };
+        let RefTarget::Direct(oid) = target else {
+            continue;
+        };
         let (object_kind, _) = read_object_bytes(store, oid)?;
         if object_kind == ObjectKind::Tag {
             if let Ok(commit) = peel_to_commit(store, oid) {
@@ -514,8 +508,7 @@ pub(crate) fn describe(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             break;
         }
         if let Some(tips) = by_commit.get(&oid) {
-            let mut names: Vec<String> =
-                tips.iter().map(|tag| tag.name.clone()).collect();
+            let mut names: Vec<String> = tips.iter().map(|tag| tag.name.clone()).collect();
             names.sort();
             names.dedup();
             match &mut found {
@@ -570,7 +563,9 @@ pub(crate) fn describe(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             if depth == 0 && !opts.is_set("long") {
                 return Ok(line(name.into_bytes()));
             }
-            Ok(line(format!("{name}-{depth}-g{}", short_of(&tip)).into_bytes()))
+            Ok(line(
+                format!("{name}-{depth}-g{}", short_of(&tip)).into_bytes(),
+            ))
         }
     }
 }
@@ -615,8 +610,7 @@ fn read_reflog_all(
     let mut out = Vec::new();
     let mut after: Option<ReflogKey> = None;
     loop {
-        let page =
-            page_reflogs(store, name, after.as_ref(), 256).map_err(GitError::from)?;
+        let page = page_reflogs(store, name, after.as_ref(), 256).map_err(GitError::from)?;
         let more = page.more;
         out.extend(page.entries);
         if !more {
@@ -681,7 +675,11 @@ fn reflog_show(ctx: &Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }];
     let opts = collect(&rewrite_dash_number(args), &specs)?;
     let store = ctx.store()?;
-    let spelling = opts.positionals.first().map(String::as_str).unwrap_or("HEAD");
+    let spelling = opts
+        .positionals
+        .first()
+        .map(String::as_str)
+        .unwrap_or("HEAD");
     if opts.positionals.len() > 1 {
         return Err(GitError::Invalid {
             detail: "usage: reflog show [-n <n>] [<ref>]".to_owned(),
@@ -718,9 +716,7 @@ fn reflog_show(ctx: &Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             new_hex.chars().take(7).collect()
         };
         let message = String::from_utf8_lossy(entry.record.message.as_bytes());
-        out.extend_from_slice(
-            format!("{short} {shown}@{{{index}}}: {message}\n").as_bytes(),
-        );
+        out.extend_from_slice(format!("{short} {shown}@{{{index}}}: {message}\n").as_bytes());
     }
     Ok(out)
 }
@@ -830,7 +826,11 @@ fn reflog_expire(ctx: &Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             after = page.rows.last().map(|row| row.key.clone());
         }
     } else {
-        let spelling = opts.positionals.first().map(String::as_str).unwrap_or("HEAD");
+        let spelling = opts
+            .positionals
+            .first()
+            .map(String::as_str)
+            .unwrap_or("HEAD");
         if opts.positionals.len() > 1 {
             return Err(GitError::Invalid {
                 detail: "usage: reflog expire [--expire=<when>] [--all | <ref>]".to_owned(),
@@ -878,12 +878,15 @@ fn reflog_delete(ctx: &Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         });
     }
     let store = ctx.store()?;
-    let (spelling, index) = args[0].rsplit_once("@{").and_then(|(name, tail)| {
-        tail.strip_suffix('}')
-            .and_then(|digits| digits.parse::<usize>().ok().map(|n| (name, n)))
-    }).ok_or_else(|| GitError::Invalid {
-        detail: format!("bad selector {:?}: want <ref>@{{<n>}}", args[0]),
-    })?;
+    let (spelling, index) = args[0]
+        .rsplit_once("@{")
+        .and_then(|(name, tail)| {
+            tail.strip_suffix('}')
+                .and_then(|digits| digits.parse::<usize>().ok().map(|n| (name, n)))
+        })
+        .ok_or_else(|| GitError::Invalid {
+            detail: format!("bad selector {:?}: want <ref>@{{<n>}}", args[0]),
+        })?;
     let name = reflog_name(store, spelling)?;
     let mut entries = read_reflog_all(store, &name)?;
     entries.reverse();
@@ -1008,10 +1011,7 @@ pub(crate) fn shortlog(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
 }
 
 /// Follows one optional ref target to its commit, peeling tag objects.
-fn peel_target_commit(
-    store: &Store,
-    target: Option<RefTarget>,
-) -> Result<Option<Oid>, GitError> {
+fn peel_target_commit(store: &Store, target: Option<RefTarget>) -> Result<Option<Oid>, GitError> {
     let mut current = target;
     for _ in 0..16 {
         match current {
@@ -1027,8 +1027,8 @@ fn peel_target_commit(
                 _ => return Ok(None),
             },
             Some(RefTarget::Symbolic(name)) => {
-                let resolved = ruk_core::refdata::resolve(&StoreRefs::new(store), &name)
-                    .map_err(|err| {
+                let resolved =
+                    ruk_core::refdata::resolve(&StoreRefs::new(store), &name).map_err(|err| {
                         GitError::Invalid {
                             detail: format!("bad ref chain: {err}"),
                         }
@@ -1067,10 +1067,14 @@ fn patch_id(store: &Store, kind: HashKind, record: &CommitRecord) -> Result<Stri
         .next()
     {
         None => BTreeMap::new(),
-        Some(parent) => flatten_tree(store, kind, commit_tree_oid(&commit_record(store, parent)?)?)?
-            .into_iter()
-            .map(|(path, mode, oid)| (path, (mode, oid)))
-            .collect(),
+        Some(parent) => flatten_tree(
+            store,
+            kind,
+            commit_tree_oid(&commit_record(store, parent)?)?,
+        )?
+        .into_iter()
+        .map(|(path, mode, oid)| (path, (mode, oid)))
+        .collect(),
     };
     let mut keys: Vec<&Vec<u8>> = new_map.keys().chain(old_map.keys()).collect();
     keys.sort();
@@ -1126,13 +1130,11 @@ pub(crate) fn cherry(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             rewritten.push(arg.clone());
         }
     }
-    let specs = [
-        FlagSpec {
-            long: "verbose",
-            short: Some('v'),
-            takes_value: false,
-        },
-    ];
+    let specs = [FlagSpec {
+        long: "verbose",
+        short: Some('v'),
+        takes_value: false,
+    }];
     let opts = collect(&rewritten, &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -1507,7 +1509,9 @@ fn load_attr_rules(base: &Path) -> Result<Vec<AttrRule>, GitError> {
             continue;
         }
         let mut words = text_line.split_whitespace();
-        let Some(pattern) = words.next() else { continue };
+        let Some(pattern) = words.next() else {
+            continue;
+        };
         let mut assigns = Vec::new();
         for word in words {
             let (name, value) = if let Some(bare) = word.strip_prefix('-') {
@@ -1680,12 +1684,7 @@ pub(crate) fn stripspace(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
         {
             text_line.pop();
         }
-        if strip_comments
-            && text_line
-                .iter()
-                .find(|b| **b != b' ' && **b != b'\t')
-                == Some(&b'#')
-        {
+        if strip_comments && text_line.iter().find(|b| **b != b' ' && **b != b'\t') == Some(&b'#') {
             continue;
         }
         kept.push(text_line);
@@ -1751,10 +1750,7 @@ fn split_trailers(text: &str) -> (Vec<String>, Vec<Trailer>) {
     let mut start = end;
     while start > 0 {
         let text_line = lines[start - 1];
-        if text_line.starts_with(' ')
-            || text_line.starts_with('\t')
-            || is_trailer_line(text_line)
-        {
+        if text_line.starts_with(' ') || text_line.starts_with('\t') || is_trailer_line(text_line) {
             start -= 1;
         } else {
             break;
@@ -1779,9 +1775,7 @@ fn split_trailers(text: &str) -> (Vec<String>, Vec<Trailer>) {
         let token = text_line[..colon].trim().to_owned();
         let mut value = text_line[colon + 1..].trim().to_owned();
         index += 1;
-        while index < end
-            && (lines[index].starts_with(' ') || lines[index].starts_with('\t'))
-        {
+        while index < end && (lines[index].starts_with(' ') || lines[index].starts_with('\t')) {
             value.push(' ');
             value.push_str(lines[index].trim());
             index += 1;
@@ -1865,8 +1859,9 @@ pub(crate) fn interpret_trailers(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u
     let opts = collect(args, &specs)?;
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: interpret-trailers [--only-trailers] [--trailer=<key[=: ]value>] < input"
-                .to_owned(),
+            detail:
+                "usage: interpret-trailers [--only-trailers] [--trailer=<key[=: ]value>] < input"
+                    .to_owned(),
         });
     }
     if opts.is_set("only-trailers") && opts.is_set("only-input") {
@@ -2010,8 +2005,20 @@ fn var_value(ctx: &Ctx, name: &str) -> Result<Vec<u8>, GitError> {
             .config_get("init.defaultBranch")
             .unwrap_or_else(|| "main".to_owned())
             .into_bytes()),
-        "GIT_EDITOR" => Ok(var_chain(ctx, "GIT_EDITOR", "core.editor", &["VISUAL", "EDITOR"], "vi")),
-        "GIT_PAGER" => Ok(var_chain(ctx, "GIT_PAGER", "core.pager", &["PAGER"], "less")),
+        "GIT_EDITOR" => Ok(var_chain(
+            ctx,
+            "GIT_EDITOR",
+            "core.editor",
+            &["VISUAL", "EDITOR"],
+            "vi",
+        )),
+        "GIT_PAGER" => Ok(var_chain(
+            ctx,
+            "GIT_PAGER",
+            "core.pager",
+            &["PAGER"],
+            "less",
+        )),
         _ => Err(GitError::Invalid {
             detail: format!("unknown variable {name:?}"),
         }),
@@ -2384,9 +2391,10 @@ pub(crate) fn verify_tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
     }
     let store = ctx.store()?;
     for name in &opts.positionals {
-        let refname = RefName::new(format!("refs/tags/{name}")).map_err(|err| GitError::Invalid {
-            detail: format!("bad tag name: {err}"),
-        })?;
+        let refname =
+            RefName::new(format!("refs/tags/{name}")).map_err(|err| GitError::Invalid {
+                detail: format!("bad tag name: {err}"),
+            })?;
         let target = read_ref(store, &refname)?.ok_or_else(|| GitError::NotFound {
             detail: format!("tag {name:?} does not exist"),
         })?;
@@ -2445,7 +2453,9 @@ mod tests {
     use ruk_git::GitError;
 
     use super::super::state::{head_oid, pseudo_write};
-    use super::super::{CliEnv, Ctx, verbs_branch, verbs_history, verbs_repo, verbs_stage, verbs_transport};
+    use super::super::{
+        CliEnv, Ctx, verbs_branch, verbs_history, verbs_repo, verbs_stage, verbs_transport,
+    };
     use super::{
         check_attr, check_ignore, cherry, clean, describe, fmt_merge_msg, get_tar_commit_id,
         interpret_trailers, name_rev, reflog, shortlog, stripspace, var, verify_commit, verify_tag,
@@ -2539,7 +2549,9 @@ mod tests {
     }
 
     fn head_hex(ctx: &Ctx) -> String {
-        head_oid(ctx.store().expect("store")).expect("head").to_hex()
+        head_oid(ctx.store().expect("store"))
+            .expect("head")
+            .to_hex()
     }
 
     fn stdin_of(ctx: &mut Ctx, input: &[u8]) {
@@ -2553,14 +2565,20 @@ mod tests {
         std::fs::write(root.join("untracked.txt"), b"u\n").expect("write");
         std::fs::create_dir_all(root.join("sub/dir")).expect("mkdir");
         std::fs::write(root.join("sub/dir/u.txt"), b"u\n").expect("write");
-        let preview = String::from_utf8(call(clean, &mut ctx, &["-n"]).expect("dry run"))
-            .expect("utf8");
-        assert!(preview.contains("Would remove untracked.txt"), "got {preview:?}");
+        let preview =
+            String::from_utf8(call(clean, &mut ctx, &["-n"]).expect("dry run")).expect("utf8");
+        assert!(
+            preview.contains("Would remove untracked.txt"),
+            "got {preview:?}"
+        );
         assert!(!preview.contains("sub/dir/u.txt"), "got {preview:?}");
         assert!(root.join("untracked.txt").exists());
         call(clean, &mut ctx, &["-f"]).expect("clean");
         assert!(!root.join("untracked.txt").exists());
-        assert!(root.join("sub/dir/u.txt").exists(), "no -d keeps nested files");
+        assert!(
+            root.join("sub/dir/u.txt").exists(),
+            "no -d keeps nested files"
+        );
         call(clean, &mut ctx, &["-f", "-d"]).expect("clean -d");
         assert!(!root.join("sub/dir/u.txt").exists());
         assert!(call(clean, &mut ctx, &[]).is_err(), "clean needs -f");
@@ -2575,8 +2593,8 @@ mod tests {
         commit_file(&mut ctx, &root, "b.txt", b"2\n", "two");
         commit_file(&mut ctx, &root, "c.txt", b"3\n", "three");
         let head = head_hex(&ctx);
-        let out = String::from_utf8(call(describe, &mut ctx, &[]).expect("describe"))
-            .expect("utf8");
+        let out =
+            String::from_utf8(call(describe, &mut ctx, &[]).expect("describe")).expect("utf8");
         assert_eq!(out.trim(), format!("v1-2-g{}", &head[..7]));
         let exact = String::from_utf8(
             call(describe, &mut ctx, &["--exact-match", "HEAD~2"]).expect("exact"),
@@ -2584,10 +2602,9 @@ mod tests {
         .expect("utf8");
         assert_eq!(exact.trim(), "v1");
         assert!(call(describe, &mut ctx, &["--exact-match"]).is_err());
-        let long = String::from_utf8(
-            call(describe, &mut ctx, &["--long", "HEAD~2"]).expect("long"),
-        )
-        .expect("utf8");
+        let long =
+            String::from_utf8(call(describe, &mut ctx, &["--long", "HEAD~2"]).expect("long"))
+                .expect("utf8");
         assert!(long.trim().starts_with("v1-0-g"), "got {long:?}");
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }
@@ -2616,8 +2633,8 @@ mod tests {
         assert!(lines[0].contains("main@{0}: second"), "got {out:?}");
         assert!(lines[1].contains("main@{1}: first"), "got {out:?}");
         call(reflog, &mut ctx, &["delete", "main@{1}"]).expect("delete");
-        let out = String::from_utf8(call(reflog, &mut ctx, &[]).expect("default show"))
-            .expect("utf8");
+        let out =
+            String::from_utf8(call(reflog, &mut ctx, &[]).expect("default show")).expect("utf8");
         assert_eq!(out.lines().count(), 1, "got {out:?}");
         call(reflog, &mut ctx, &["expire", "--expire=now", "main"]).expect("expire");
         assert!(call(reflog, &mut ctx, &["show", "main"]).is_err());
@@ -2629,15 +2646,26 @@ mod tests {
         let (root, mut ctx) = fresh("shortlog");
         commit_file(&mut ctx, &root, "a.txt", b"a\n", "seed it");
         commit_file(&mut ctx, &root, "b.txt", b"b\n", "second it");
-        ctx.env.vars.insert("GIT_AUTHOR_NAME".to_owned(), "Bo".to_owned());
-        ctx.env.vars.insert("GIT_AUTHOR_EMAIL".to_owned(), "bo@example.invalid".to_owned());
+        ctx.env
+            .vars
+            .insert("GIT_AUTHOR_NAME".to_owned(), "Bo".to_owned());
+        ctx.env.vars.insert(
+            "GIT_AUTHOR_EMAIL".to_owned(),
+            "bo@example.invalid".to_owned(),
+        );
         commit_file(&mut ctx, &root, "c.txt", b"c\n", "third it");
         let summary =
             String::from_utf8(call(shortlog, &mut ctx, &["-s"]).expect("summary")).expect("utf8");
         let lines: Vec<&str> = summary.lines().collect();
         assert_eq!(lines.len(), 2, "got {summary:?}");
-        assert!(lines[0].ends_with("\tAda") && lines[0].contains('2'), "got {summary:?}");
-        assert!(lines[1].ends_with("\tBo") && lines[1].contains('1'), "got {summary:?}");
+        assert!(
+            lines[0].ends_with("\tAda") && lines[0].contains('2'),
+            "got {summary:?}"
+        );
+        assert!(
+            lines[1].ends_with("\tBo") && lines[1].contains('1'),
+            "got {summary:?}"
+        );
         let full = String::from_utf8(call(shortlog, &mut ctx, &[]).expect("full")).expect("utf8");
         assert!(full.contains("Ada (2):"), "got {full:?}");
         assert!(full.contains("seed it"), "got {full:?}");
@@ -2654,16 +2682,18 @@ mod tests {
         commit_file(&mut ctx, &root, "a.txt", b"2\n", "change a again");
         call(verbs_branch::checkout, &mut ctx, &["side"]).expect("checkout side");
         commit_file(&mut ctx, &root, "b.txt", b"x\n", "extra");
-        let out = String::from_utf8(call(cherry, &mut ctx, &["main"]).expect("cherry"))
-            .expect("utf8");
+        let out =
+            String::from_utf8(call(cherry, &mut ctx, &["main"]).expect("cherry")).expect("utf8");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2, "got {out:?}");
         assert!(lines[0].starts_with("- "), "got {out:?}");
         assert!(lines[1].starts_with("+ "), "got {out:?}");
-        let verbose =
-            String::from_utf8(call(cherry, &mut ctx, &["-v", "main"]).expect("verbose"))
-                .expect("utf8");
-        assert!(verbose.contains("change a") && verbose.contains("extra"), "got {verbose:?}");
+        let verbose = String::from_utf8(call(cherry, &mut ctx, &["-v", "main"]).expect("verbose"))
+            .expect("utf8");
+        assert!(
+            verbose.contains("change a") && verbose.contains("extra"),
+            "got {verbose:?}"
+        );
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }
 
@@ -2677,21 +2707,19 @@ mod tests {
         let second = head_hex(&ctx);
         commit_file(&mut ctx, &root, "c.txt", b"3\n", "three");
         let head = head_hex(&ctx);
-        let out = String::from_utf8(call(name_rev, &mut ctx, &["HEAD"]).expect("head"))
-            .expect("utf8");
+        let out =
+            String::from_utf8(call(name_rev, &mut ctx, &["HEAD"]).expect("head")).expect("utf8");
         assert_eq!(out.trim(), format!("{head} main"));
         // The tagged commit names exactly; the untagged middle commit
         // names by distance back from the branch tip.
-        let out = String::from_utf8(call(name_rev, &mut ctx, &[&first]).expect("first"))
-            .expect("utf8");
+        let out =
+            String::from_utf8(call(name_rev, &mut ctx, &[&first]).expect("first")).expect("utf8");
         assert_eq!(out.trim(), format!("{first} tags/v1"));
-        let out = String::from_utf8(call(name_rev, &mut ctx, &[&second]).expect("second"))
-            .expect("utf8");
+        let out =
+            String::from_utf8(call(name_rev, &mut ctx, &[&second]).expect("second")).expect("utf8");
         assert_eq!(out.trim(), format!("{second} main~1"));
-        let out = String::from_utf8(
-            call(name_rev, &mut ctx, &["--tags", &first]).expect("tags"),
-        )
-        .expect("utf8");
+        let out = String::from_utf8(call(name_rev, &mut ctx, &["--tags", &first]).expect("tags"))
+            .expect("utf8");
         assert_eq!(out.trim(), format!("{first} tags/v1"));
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }
@@ -2717,15 +2745,13 @@ mod tests {
     fn check_attr_values() {
         let (root, mut ctx) = fresh("check-attr");
         std::fs::write(root.join(".rukattributes"), b"*.txt text\n*.bin -text\n").expect("write");
-        let out = String::from_utf8(
-            call(check_attr, &mut ctx, &["text", "--", "f.txt"]).expect("set"),
-        )
-        .expect("utf8");
+        let out =
+            String::from_utf8(call(check_attr, &mut ctx, &["text", "--", "f.txt"]).expect("set"))
+                .expect("utf8");
         assert_eq!(out, "f.txt: text: set\n");
-        let out = String::from_utf8(
-            call(check_attr, &mut ctx, &["text", "--", "f.bin"]).expect("unset"),
-        )
-        .expect("utf8");
+        let out =
+            String::from_utf8(call(check_attr, &mut ctx, &["text", "--", "f.bin"]).expect("unset"))
+                .expect("utf8");
         assert_eq!(out, "f.bin: text: unset\n");
         let out = String::from_utf8(
             call(check_attr, &mut ctx, &["binary", "--", "f.txt"]).expect("unspecified"),
@@ -2785,10 +2811,8 @@ mod tests {
         let tar = call(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("archive");
         assert!(!tar.is_empty());
         stdin_of(&mut ctx, &tar);
-        let out = String::from_utf8(
-            call(get_tar_commit_id, &mut ctx, &[]).expect("commit id"),
-        )
-        .expect("utf8");
+        let out = String::from_utf8(call(get_tar_commit_id, &mut ctx, &[]).expect("commit id"))
+            .expect("utf8");
         assert_eq!(out.trim(), head);
         stdin_of(&mut ctx, b"nope");
         assert!(call(get_tar_commit_id, &mut ctx, &[]).is_err());
@@ -2813,10 +2837,8 @@ mod tests {
         let out =
             String::from_utf8(call(fmt_merge_msg, &mut ctx, &[]).expect("message")).expect("utf8");
         assert_eq!(out, "Merge branch 'feature'\n");
-        let out = String::from_utf8(
-            call(fmt_merge_msg, &mut ctx, &["--log"]).expect("log"),
-        )
-        .expect("utf8");
+        let out = String::from_utf8(call(fmt_merge_msg, &mut ctx, &["--log"]).expect("log"))
+            .expect("utf8");
         assert!(out.contains("side work"), "got {out:?}");
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }

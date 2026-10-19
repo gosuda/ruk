@@ -71,9 +71,7 @@ pub(crate) fn bisect(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             command: format!("bisect {sub} is not supported"),
         }),
         _ => Err(GitError::Invalid {
-            detail: format!(
-                "usage: bisect start|bad|good|skip|reset|log|terms|run (got {sub:?})"
-            ),
+            detail: format!("usage: bisect start|bad|good|skip|reset|log|terms|run (got {sub:?})"),
         }),
     }
 }
@@ -407,12 +405,8 @@ fn terms(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         });
     }
     let store = ctx.store()?;
-    let bad = opts
-        .single("term-bad")?
-        .or(opts.single("term-old")?);
-    let good = opts
-        .single("term-good")?
-        .or(opts.single("term-new")?);
+    let bad = opts.single("term-bad")?.or(opts.single("term-old")?);
+    let good = opts.single("term-good")?.or(opts.single("term-new")?);
     if bad.is_none() && good.is_none() {
         let (bad_term, good_term) = read_terms(store)?;
         return Ok(line(
@@ -477,9 +471,7 @@ fn run_cmd(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             return Ok(out);
         }
         if interesting_count(ctx)? >= before {
-            out.extend_from_slice(
-                b"test verdict did not narrow the range; stopping\n",
-            );
+            out.extend_from_slice(b"test verdict did not narrow the range; stopping\n");
             return Ok(out);
         }
     }
@@ -554,7 +546,10 @@ fn advance(ctx: &mut Ctx) -> Result<Vec<u8>, GitError> {
         let store = ctx.store()?;
         pseudo_write(store, "BISECT_EXPECTED_REV", first.to_hex().into_bytes())?;
         pseudo_write(store, "BISECT_HEAD", first.to_hex().into_bytes())?;
-        append_log(store, &format!("# first bad commit: {}\n", log_ref(store, first)?))?;
+        append_log(
+            store,
+            &format!("# first bad commit: {}\n", log_ref(store, first)?),
+        )?;
         return Ok(line(first_bad_line(first)));
     }
     let candidate = pick_midpoint(ctx.store()?, &range)?;
@@ -733,11 +728,7 @@ fn bisect_steps(n: usize) -> usize {
 }
 
 /// Refuses a bad revision that a good revision already clears.
-fn check_compatible(
-    store: &Store,
-    bad: Option<Oid>,
-    goods: &[Oid],
-) -> Result<(), GitError> {
+fn check_compatible(store: &Store, bad: Option<Oid>, goods: &[Oid]) -> Result<(), GitError> {
     let Some(bad_oid) = bad else {
         return Ok(());
     };
@@ -875,7 +866,11 @@ fn read_terms(store: &Store) -> Result<(String, String), GitError> {
 
 /// Writes the session terms: bad term first, good term second.
 fn write_terms(store: &Store, bad: &str, good: &str) -> Result<(), GitError> {
-    pseudo_write(store, "BISECT_TERMS", format!("{bad}\n{good}\n").into_bytes())
+    pseudo_write(
+        store,
+        "BISECT_TERMS",
+        format!("{bad}\n{good}\n").into_bytes(),
+    )
 }
 
 /// Reads marked-good revisions in mark order.

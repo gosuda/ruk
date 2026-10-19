@@ -219,8 +219,16 @@ fn emit_patch_hunks(out: &mut Vec<u8>, old: &[TextLine], new: &[TextLine], radiu
             }
         }
         // An empty side numbers at the line before the hunk, as git does.
-        let old_start = if old_count == 0 { old_seen } else { old_seen + 1 };
-        let new_start = if new_count == 0 { new_seen } else { new_seen + 1 };
+        let old_start = if old_count == 0 {
+            old_seen
+        } else {
+            old_seen + 1
+        };
+        let new_start = if new_count == 0 {
+            new_seen
+        } else {
+            new_seen + 1
+        };
         out.extend_from_slice(
             format!(
                 "@@ -{} +{} @@\n",
@@ -278,10 +286,8 @@ fn emit_context_no_newline(
     new: &[TextLine],
     ni: usize,
 ) {
-    let old_missing =
-        oi + 1 == old.len() && old.get(oi).is_some_and(|line| !line.newline);
-    let new_missing =
-        ni + 1 == new.len() && new.get(ni).is_some_and(|line| !line.newline);
+    let old_missing = oi + 1 == old.len() && old.get(oi).is_some_and(|line| !line.newline);
+    let new_missing = ni + 1 == new.len() && new.get(ni).is_some_and(|line| !line.newline);
     if old_missing || new_missing {
         out.extend_from_slice(b"\\ No newline at end of file\n");
     }
@@ -451,9 +457,7 @@ fn parse_mbox_date(text: &str) -> Result<(i64, TzOffset), GitError> {
                 .bytes()
                 .enumerate()
                 .all(|(i, b)| b.is_ascii_digit() || (i == 0 && b == b'-'));
-        if numeric
-            && let Ok(stamp) = first.parse::<i64>()
-        {
+        if numeric && let Ok(stamp) = first.parse::<i64>() {
             let offset = match second {
                 None => TzOffset::UTC,
                 Some(tz) => parse_tz_token(tz).ok_or_else(bad)?,
@@ -480,8 +484,13 @@ fn parse_mbox_date(text: &str) -> Result<(i64, TzOffset), GitError> {
         return Err(bad());
     };
     let month = month.map_err(|_| bad())?;
-    let year: i64 = fields.get(2).and_then(|text| text.parse().ok()).ok_or_else(bad)?;
-    let clock: Vec<&str> = fields.get(3).map_or_else(Vec::new, |text| text.split(':').collect());
+    let year: i64 = fields
+        .get(2)
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(bad)?;
+    let clock: Vec<&str> = fields
+        .get(3)
+        .map_or_else(Vec::new, |text| text.split(':').collect());
     if clock.len() != 3 {
         return Err(bad());
     }
@@ -525,7 +534,9 @@ fn parse_tz_token(token: &str) -> Option<TzOffset> {
     if digits.len() != 4 || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let hhmm = digits.iter().fold(0_u16, |acc, d| acc * 10 + u16::from(d - b'0'));
+    let hhmm = digits
+        .iter()
+        .fold(0_u16, |acc, d| acc * 10 + u16::from(d - b'0'));
     match sign {
         b'+' => TzOffset::new(false, hhmm).ok(),
         b'-' => TzOffset::new(true, hhmm).ok(),
@@ -775,14 +786,16 @@ fn render_patch_diff(
                 out.extend_from_slice(format!("new file mode {:o}\n", mode.octal()).as_bytes());
             }
             (Some(mode), None) => {
-                out.extend_from_slice(
-                    format!("deleted file mode {:o}\n", mode.octal()).as_bytes(),
-                );
+                out.extend_from_slice(format!("deleted file mode {:o}\n", mode.octal()).as_bytes());
             }
             (Some(before), Some(after)) if before != after => {
                 out.extend_from_slice(
-                    format!("old mode {:o}\nnew mode {:o}\n", before.octal(), after.octal())
-                        .as_bytes(),
+                    format!(
+                        "old mode {:o}\nnew mode {:o}\n",
+                        before.octal(),
+                        after.octal()
+                    )
+                    .as_bytes(),
                 );
             }
             _ => {}
@@ -818,12 +831,8 @@ fn render_patch_diff(
         }
         let old_body = old_oid.and_then(|oid| read_object_bytes(store, oid).ok());
         let new_body = new_oid.and_then(|oid| read_object_bytes(store, oid).ok());
-        if old_body
-            .as_ref()
-            .is_some_and(|(_, body)| body.contains(&0))
-            || new_body
-                .as_ref()
-                .is_some_and(|(_, body)| body.contains(&0))
+        if old_body.as_ref().is_some_and(|(_, body)| body.contains(&0))
+            || new_body.as_ref().is_some_and(|(_, body)| body.contains(&0))
         {
             let old_side = if change.old.is_some() {
                 format!("a/{old_display}")
@@ -959,7 +968,10 @@ fn parse_patch(bytes: &[u8]) -> Result<Vec<PatchFile>, GitError> {
             index = parse_plain_file(&lines, index, &mut files)?;
         } else {
             return Err(GitError::Invalid {
-                detail: format!("expected 'diff --git' or '---' but found {:?}", preview(line)),
+                detail: format!(
+                    "expected 'diff --git' or '---' but found {:?}",
+                    preview(line)
+                ),
             });
         }
     }
@@ -1305,7 +1317,10 @@ fn split_git_name(rest: &[u8]) -> Result<(&[u8], &[u8]), GitError> {
         });
     }
     match rest.iter().position(|byte| *byte == b' ') {
-        Some(at) => Ok((rest.get(..at).unwrap_or_default(), rest.get(at..).unwrap_or_default())),
+        Some(at) => Ok((
+            rest.get(..at).unwrap_or_default(),
+            rest.get(at..).unwrap_or_default(),
+        )),
         None => Err(GitError::Invalid {
             detail: "malformed 'diff --git' header".to_owned(),
         }),
@@ -1376,8 +1391,7 @@ fn strip_path(path: &[u8], depth: usize) -> Result<Vec<u8>, GitError> {
 
 /// Old-side bodies of one hunk: context plus deletions, in order.
 fn hunk_old_seq(hunk: &PatchHunk) -> Vec<&[u8]> {
-    hunk
-        .lines
+    hunk.lines
         .iter()
         .filter(|line| line.kind != b'+')
         .map(|line| line.body.as_slice())
@@ -1859,11 +1873,7 @@ fn wrap_path(path: &[u8], err: GitError) -> GitError {
 
 /// Writes validated plans to the index and/or worktree. Index rows publish
 /// in one transaction with a single generation bump; worktree files follow.
-fn execute_apply(
-    ctx: &Ctx,
-    plans: &[ApplyPlan],
-    target: ApplyTarget,
-) -> Result<(), GitError> {
+fn execute_apply(ctx: &Ctx, plans: &[ApplyPlan], target: ApplyTarget) -> Result<(), GitError> {
     if target != ApplyTarget::Worktree {
         let store = ctx.store()?;
         let kind = ctx.kind()?;
@@ -1873,7 +1883,9 @@ fn execute_apply(
         for plan in plans {
             stage_plan_result(store, kind, plan, &mut objects, &mut mutations)?;
         }
-        let next = workspace.mutate_index(workspace.stamp).map_err(to_core_invalid)?;
+        let next = workspace
+            .mutate_index(workspace.stamp)
+            .map_err(to_core_invalid)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         store.publish(objects, &mutations).map_err(GitError::from)?;
     }
@@ -2382,7 +2394,10 @@ fn am_apply_message(
     for file in &message.patches {
         if file.binary {
             return Err(GitError::Invalid {
-                detail: format!("binary patch for {} is not supported", preview(&file.new_path)),
+                detail: format!(
+                    "binary patch for {} is not supported",
+                    preview(&file.new_path)
+                ),
             });
         }
     }
@@ -2425,14 +2440,16 @@ fn am_apply_message(
             };
             (*mode, body.clone())
         };
-        let result_mode = patch_result_mode(file, tree_mode_of(base.0)).map_err(|err| match err {
-            GitError::Invalid { detail } => wrap(detail),
-            other => other,
-        })?;
-        let applied = apply_hunks_to(&split_text(&base.1), &file.hunks).map_err(|err| match err {
-            GitError::Invalid { detail } => wrap(detail),
-            other => other,
-        })?;
+        let result_mode =
+            patch_result_mode(file, tree_mode_of(base.0)).map_err(|err| match err {
+                GitError::Invalid { detail } => wrap(detail),
+                other => other,
+            })?;
+        let applied =
+            apply_hunks_to(&split_text(&base.1), &file.hunks).map_err(|err| match err {
+                GitError::Invalid { detail } => wrap(detail),
+                other => other,
+            })?;
         results.push((
             old_path,
             new_path,
@@ -2483,7 +2500,9 @@ fn am_apply_message(
             &[(Stage::Zero, entry)],
         )?);
     }
-    let next = workspace.mutate_index(workspace.stamp).map_err(to_core_invalid)?;
+    let next = workspace
+        .mutate_index(workspace.stamp)
+        .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
@@ -2562,10 +2581,7 @@ fn guard_worktree_untouched(
     }
     if !full.is_symlink() && !full.is_file() {
         return Err(GitError::Invalid {
-            detail: format!(
-                "worktree {} is missing",
-                String::from_utf8_lossy(old_path)
-            ),
+            detail: format!("worktree {} is missing", String::from_utf8_lossy(old_path)),
         });
     }
     let base = map
@@ -2717,7 +2733,9 @@ fn am_continue(
             }
         }
     }
-    let next = workspace.mutate_index(workspace.stamp).map_err(to_core_invalid)?;
+    let next = workspace
+        .mutate_index(workspace.stamp)
+        .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(workspace_raw.as_deref(), &next)?);
     store.publish(objects, &mutations).map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
@@ -2807,13 +2825,13 @@ fn decode_am_state(raw: &[u8]) -> Result<(String, Vec<Vec<u8>>), GitError> {
     let corrupt = || GitError::Corrupt {
         detail: "am state does not decode".to_owned(),
     };
-    let header_end = raw.iter().position(|byte| *byte == b'\n').ok_or_else(corrupt)?;
-    let header = std::str::from_utf8(raw.get(..header_end).unwrap_or_default())
-        .map_err(|_| corrupt())?;
-    let abort = header
-        .strip_prefix("AMv1 ")
-        .ok_or_else(corrupt)?
-        .to_owned();
+    let header_end = raw
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(corrupt)?;
+    let header =
+        std::str::from_utf8(raw.get(..header_end).unwrap_or_default()).map_err(|_| corrupt())?;
+    let abort = header.strip_prefix("AMv1 ").ok_or_else(corrupt)?.to_owned();
     let mut pending = Vec::new();
     let mut cursor = header_end + 1;
     while cursor < raw.len() {
@@ -2821,10 +2839,8 @@ fn decode_am_state(raw: &[u8]) -> Result<(String, Vec<Vec<u8>>), GitError> {
             .iter()
             .position(|byte| *byte == b'\n')
             .ok_or_else(corrupt)?;
-        let frame = std::str::from_utf8(
-            raw.get(cursor..cursor + end).ok_or_else(corrupt)?,
-        )
-        .map_err(|_| corrupt())?;
+        let frame = std::str::from_utf8(raw.get(cursor..cursor + end).ok_or_else(corrupt)?)
+            .map_err(|_| corrupt())?;
         let len: usize = frame
             .strip_prefix("### ")
             .ok_or_else(corrupt)?
@@ -2900,12 +2916,11 @@ fn parse_message_impl(raw: &[u8], keep_subject: bool) -> Result<AmMessage, GitEr
         None => (now_seconds()?, TzOffset::UTC),
         Some(date) => parse_mbox_date(&date)?,
     };
-    let author = Signature::parse(
-        format!("{author_name} <{author_email}> {stamp} {offset}").as_bytes(),
-    )
-    .map_err(|_| GitError::Invalid {
-        detail: format!("bad mbox From: header {from:?}"),
-    })?;
+    let author =
+        Signature::parse(format!("{author_name} <{author_email}> {stamp} {offset}").as_bytes())
+            .map_err(|_| GitError::Invalid {
+                detail: format!("bad mbox From: header {from:?}"),
+            })?;
     let payload = lines.get(index..).unwrap_or_default();
     let diff_at = payload
         .iter()
@@ -2974,8 +2989,13 @@ fn parse_from_header(from: &str) -> Result<(String, String), GitError> {
         detail: format!("bad mbox From: header {from:?}"),
     };
     let open = from.rfind('<').ok_or_else(bad)?;
-    let close = from.get(open..).and_then(|rest| rest.find('>')).ok_or_else(bad)?;
-    let name = from.get(..open).map_or_else(String::new, |text| text.trim().to_owned());
+    let close = from
+        .get(open..)
+        .and_then(|rest| rest.find('>'))
+        .ok_or_else(bad)?;
+    let name = from
+        .get(..open)
+        .map_or_else(String::new, |text| text.trim().to_owned());
     let email = from
         .get(open + 1..open + close)
         .map_or_else(String::new, |text| text.trim().to_owned());
