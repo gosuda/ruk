@@ -35,7 +35,8 @@ use ruk_core::merge::composed::host::ComposedRequest;
 use ruk_core::merge::composed::route::{MergeOutcome, merge_file};
 use ruk_core::merge::syntax::grammar::{Cancel, GrammarRegistry, dispatch};
 use ruk_core::merge::syntax::registry_providers;
-use ruk_core::ops::{EditRequest, NewRequest, edit as ops_edit, new as ops_new};
+use ruk_core::change::RequestId;
+use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::ObjectKind as MergeLaneObjectKind;
 use ruk_core::store::Store as MergeLaneStore;
@@ -378,14 +379,13 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         predecessor: None,
         provenance: None,
     };
-    let result = ops_new(store, request).map_err(GitError::from)?;
+    let result = super::coordinator::commit_new(ctx, request, RequestId::generate())?;
     let new_oid = result
         .oid
         .or_else(|| result.head.as_git().copied())
         .ok_or_else(|| GitError::Invalid {
             detail: "new commit has no git identity".to_owned(),
         })?;
-    advance_head_to(ctx, new_oid)?;
     super::verbs_hooks::run_post_commit(ctx)?;
     let label = branch_label_of(ctx)?;
     let subject = message.lines().next().unwrap_or_default().to_owned();
@@ -940,17 +940,36 @@ fn commit_amend(
         let subject = message.lines().next().unwrap_or_default().to_owned();
         return commit_summary(ctx, Some(old_tree), tree, &tip, &label, &subject);
     }
-    let result = ops_edit(
-        store,
-        EditRequest {
-            head: Head::Git { oid: tip },
-            tree: Some(tree),
-            message: Some(ruk_core::ByteString::from(message.as_str())),
-            author: replace_author.then_some(author),
-            committer: Some(committer),
-        },
-    )
-    .map_err(GitError::from)?;
+    let old_change = ruk_core::records::Records::new(store)
+        .get_commit(&Head::Git { oid: tip })
+        .map_err(GitError::from)?
+        .ok_or_else(|| GitError::Corrupt {
+            detail: "HEAD names no stored commit".to_owned(),
+        })?
+        .change_id();
+    let author = if replace_author {
+        author
+    } else {
+        incumbent_author
+    };
+    let request = NewRequest {
+        tree,
+        parents: old.parents().to_vec(),
+        author: author.clone(),
+        committer: committer.clone(),
+        message: ruk_core::ByteString::from(message.as_str()),
+        change_id: Some(old_change),
+        predecessor: Some(Head::Git { oid: tip }),
+        provenance: None,
+    };
+    let author_override = replace_author.then_some(author);
+    let result = super::coordinator::commit_amend(
+        ctx,
+        request,
+        RequestId::generate(),
+        tip,
+        author_override,
+    )?;
     let new_oid = result
         .head
         .as_git()
@@ -958,7 +977,6 @@ fn commit_amend(
         .ok_or_else(|| GitError::Invalid {
             detail: "rewritten commit has no git identity".to_owned(),
         })?;
-    advance_head_to(ctx, new_oid)?;
     // The no-op path above reuses the tip without a new commit, so only
     // this path runs `post-commit`.
     super::verbs_hooks::run_post_commit(ctx)?;
@@ -2812,7 +2830,7 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
 /// Merges one tip through the three-way lane: plans, guards, applies, and
 /// either commits the merge or leaves conflict state behind.
 fn merge_content(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     rev: &str,
     current: Oid,
     tip: Oid,
@@ -2835,12 +2853,9 @@ fn merge_content(
         let ours_tree = commit_tree_oid(&commit_record(store, current)?)?;
         let theirs_tree = commit_tree_oid(&commit_record(store, tip)?)?;
         let staged = take_tree_state(ctx, ours_tree, theirs_tree)?;
-        let new_oid = lane_commit(
-            ctx,
-            build_index_tree(store, kind, &staged)?,
-            vec![current, tip],
-            message.unwrap_or(default_message),
-        )?;
+        let tree = build_index_tree(store, kind, &staged)?;
+        let new_oid = lane_commit(ctx, tree, vec![current, tip], message.unwrap_or(default_message))?;
+        let store = ctx.store()?;
         pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
         pseudo_delete(store, "abort-index/merge")?;
         let subject = message_subject(ctx, &new_oid)?;
@@ -2866,12 +2881,9 @@ fn merge_content(
         write_merge_state(ctx, &current, &tip, &text)?;
         return Err(merge_conflict_error(&plan));
     }
-    let new_oid = lane_commit(
-        ctx,
-        build_index_tree(store, kind, &staged)?,
-        vec![current, tip],
-        message.unwrap_or(default_message),
-    )?;
+    let tree = build_index_tree(store, kind, &staged)?;
+    let new_oid = lane_commit(ctx, tree, vec![current, tip], message.unwrap_or(default_message))?;
+    let store = ctx.store()?;
     pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
     pseudo_delete(store, "abort-index/merge")?;
     let mut out = b"Merge made by the 'ort' strategy.\n".to_vec();
@@ -3021,6 +3033,7 @@ fn finish_merge_commit(ctx: &mut Ctx, text: String) -> Result<Vec<u8>, GitError>
     let new_oid = lane_commit(ctx, tree, vec![head, merge_head], text)?;
     // The merge concludes with the ref update above: sequencer state goes
     // first so a failing `post-commit` never replays a finished merge.
+    let store = ctx.store()?;
     sequencer_delete(store, "merge")?;
     pseudo_delete(store, "MERGE_HEAD")?;
     pseudo_delete(store, "MERGE_MSG")?;
@@ -3530,12 +3543,8 @@ fn apply_pick_todos(
         let staged = apply_merge_plan(ctx, &plan)?;
         if plan.conflicted.is_empty() {
             if !no_commit {
-                let new_oid = lane_commit(
-                    ctx,
-                    build_index_tree(store, kind, &staged)?,
-                    vec![head],
-                    todo.message.clone(),
-                )?;
+                let tree = build_index_tree(store, kind, &staged)?;
+                let new_oid = lane_commit(ctx, tree, vec![head], todo.message.clone())?;
                 out.extend_from_slice(&pick_summary(ctx, head_tree, new_oid)?);
             }
             remaining.remove(0);
@@ -5097,8 +5106,12 @@ fn guard_lane_worktree(
 
 /// Records one commit on the current branch (or detached `HEAD`) and moves
 /// it forward, returning the new tip.
-fn lane_commit(ctx: &Ctx, tree: Oid, parents: Vec<Oid>, message: String) -> Result<Oid, GitError> {
-    let store = ctx.store()?;
+fn lane_commit(
+    ctx: &mut Ctx,
+    tree: Oid,
+    parents: Vec<Oid>,
+    message: String,
+) -> Result<Oid, GitError> {
     let author = identity(ctx, IdentityRole::Author)?;
     let committer = identity(ctx, IdentityRole::Committer)?;
     let request = NewRequest {
@@ -5111,15 +5124,13 @@ fn lane_commit(ctx: &Ctx, tree: Oid, parents: Vec<Oid>, message: String) -> Resu
         predecessor: None,
         provenance: None,
     };
-    let result = ops_new(store, request).map_err(GitError::from)?;
-    let new_oid = result
+    let result = super::coordinator::commit_new(ctx, request, RequestId::generate())?;
+    result
         .oid
         .or_else(|| result.head.as_git().copied())
         .ok_or_else(|| GitError::Invalid {
             detail: "new commit has no git identity".to_owned(),
-        })?;
-    advance_head_to(ctx, new_oid)?;
-    Ok(new_oid)
+        })
 }
 
 /// Snapshots the merged index rows for a future `--abort` restore.

@@ -29,15 +29,14 @@ use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage, StatData};
-use ruk_core::ops::{NewRequest, new as ops_new};
-use ruk_core::refdata::{RefChange, RefExpect, RefTarget, RefUpdate};
-use ruk_core::workspace::HeadRef;
+use ruk_core::change::RequestId;
+use ruk_core::ops::NewRequest;
 use ruk_git::GitError;
 
 use super::state::{
-    IdentityRole, apply_refs, commit_record, head_oid, identity, load_or_default, merged_rows,
-    now_seconds, path_row_mutations, pseudo_delete, pseudo_read, pseudo_write, read_path_rows,
-    read_ref, scan_index, workspace_mutation,
+    IdentityRole, commit_record, head_oid, identity, load_or_default, merged_rows, now_seconds,
+    path_row_mutations, pseudo_delete, pseudo_read, pseudo_write, read_path_rows, scan_index,
+    workspace_mutation,
 };
 use super::tree::{
     TreeMode, build_index_tree, commit_tree_oid, flatten_tree, join_base, read_object_bytes,
@@ -2367,6 +2366,7 @@ fn am_resume(
         let message = match parsed {
             Ok(message) => message,
             Err(err) => {
+                let store = ctx.store()?;
                 save_am_state(store, abort, &pending)?;
                 return Err(with_am_hint(err));
             }
@@ -2377,11 +2377,13 @@ fn am_resume(
                 pending.remove(0);
             }
             Err(err) => {
+                let store = ctx.store()?;
                 save_am_state(store, abort, &pending)?;
                 return Err(with_am_hint(err));
             }
         }
     }
+    let store = ctx.store()?;
     pseudo_delete(store, AM_STATE)?;
     Ok(out)
 }
@@ -2427,7 +2429,7 @@ fn seed_file_map(
 /// Applies one message: in-memory hunk validation, worktree guards,
 /// worktree plus index writes, then the commit.
 fn am_apply_message(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     message: &AmMessage,
     map: &mut BTreeMap<Vec<u8>, (TreeMode, Option<Vec<u8>>)>,
     opts: &super::Collected,
@@ -2565,14 +2567,14 @@ fn am_apply_message(
         predecessor: None,
         provenance: None,
     };
-    let applied = ops_new(store, request).map_err(GitError::from)?;
+    let applied = super::coordinator::commit_new(ctx, request, RequestId::generate())?;
     let new_oid = applied
         .oid
         .or_else(|| applied.head.as_git().copied())
         .ok_or_else(|| GitError::Invalid {
             detail: "new commit has no git identity".to_owned(),
         })?;
-    advance_head_to(ctx, new_oid)?;
+    let store = ctx.store()?;
     for (old_path, new_path, result, result_mode, is_delete) in &results {
         if *is_delete {
             let full = join_base(&ctx.file_base, new_path)?;
@@ -2810,14 +2812,13 @@ fn am_continue(
         predecessor: None,
         provenance: None,
     };
-    let applied = ops_new(store, request).map_err(GitError::from)?;
+    let applied = super::coordinator::commit_new(ctx, request, RequestId::generate())?;
     let new_oid = applied
         .oid
         .or_else(|| applied.head.as_git().copied())
         .ok_or_else(|| GitError::Invalid {
             detail: "new commit has no git identity".to_owned(),
         })?;
-    advance_head_to(ctx, new_oid)?;
     let summary = format!("Applying: {}\n", message.subject);
     let rest = pending.into_iter().skip(1).collect::<Vec<_>>();
     am_resume(ctx, abort, rest, opts, Some(summary))
@@ -2829,38 +2830,6 @@ fn am_abort(ctx: &mut Ctx, abort: &str) -> Result<Vec<u8>, GitError> {
     reset(ctx, &["--hard".to_owned(), abort.to_owned()])?;
     pseudo_delete(ctx.store()?, AM_STATE)?;
     Ok(Vec::new())
-}
-
-/// Moves the current branch tip, or a detached `HEAD`, to a new commit:
-/// the `commit` verb's head advance, reused for `am` commits.
-fn advance_head_to(ctx: &Ctx, new_oid: Oid) -> Result<(), GitError> {
-    let store = ctx.store()?;
-    let kind = ctx.kind()?;
-    let (workspace, raw) = load_or_default(store)?;
-    match &workspace.head {
-        HeadRef::Symbolic(name) => {
-            let before = read_ref(store, name)?;
-            let expected = before.map(RefExpect::Present).unwrap_or(RefExpect::Absent);
-            apply_refs(
-                store,
-                kind,
-                vec![RefUpdate {
-                    name: name.clone(),
-                    expected,
-                    change: RefChange::Set(RefTarget::Direct(new_oid)),
-                }],
-            )?;
-            Ok(())
-        }
-        HeadRef::Detached(_) => {
-            let next = workspace.move_head(workspace.stamp, HeadRef::Detached(new_oid))?;
-            let mutation = workspace_mutation(raw.as_deref(), &next)?;
-            store
-                .publish(Vec::new(), &[mutation])
-                .map_err(GitError::from)?;
-            Ok(())
-        }
-    }
 }
 
 /// Encodes the `am` session: the abort head plus framed message raws.

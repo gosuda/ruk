@@ -27,7 +27,8 @@ use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
-use ruk_core::ops::{NewRequest, prepare_new as ops_prepare_new};
+use ruk_core::change::RequestId;
+use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::refs::{ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog};
 use ruk_core::store::{FactMutation, Store};
@@ -5830,7 +5831,7 @@ fn unique_short_oid(store: &Store, oid: Oid) -> Result<String, GitError> {
 /// (`tree` = worktree state, parents = [`HEAD`, index commit], subject
 /// `On <branch>: <msg>` or `WIP on ...`). `refs/stash` points at the
 /// worktree commit, whose oid the later `Dropped` line names.
-fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+fn stash_push(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let rows = scan_index(store, kind)?;
@@ -5873,8 +5874,8 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     // Commit payloads carry the message verbatim. The oracle ends its index
     // message with a newline but leaves the worktree subject bare; the slot
     // subject matches the latter for `list` and the `Saved` line.
-    let index_oid = mint_stash_commit(
-        store,
+    let index_oid = super::coordinator::commit_stash(
+        ctx,
         NewRequest {
             tree: index_tree,
             parents: base_heads.clone(),
@@ -5885,11 +5886,13 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
             predecessor: None,
             provenance: None,
         },
+        RequestId::generate(),
     )?;
+    let store = ctx.store()?;
     let mut wip_parents = base_heads;
     wip_parents.push(Head::Git { oid: index_oid });
-    let commit_oid = mint_stash_commit(
-        store,
+    let commit_oid = super::coordinator::commit_stash(
+        ctx,
         NewRequest {
             tree: worktree_tree,
             parents: wip_parents,
@@ -5900,7 +5903,9 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
             predecessor: None,
             provenance: None,
         },
+        RequestId::generate(),
     )?;
+    let store = ctx.store()?;
     let slot = stash_alloc(store)?;
     let slot_rows: Vec<(Vec<u8>, Stage, IndexEntry)> = rows
         .iter()
@@ -5939,34 +5944,6 @@ fn stash_push(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
         checkout_tree_files(ctx, store, kind, head_tree, &indexed)?;
     }
     Ok(format!("Saved working directory and index state {message}\n").into_bytes())
-}
-
-/// Mints one stash commit through the shared exportable path (no
-/// `change-id` header, so oids match the oracle byte-for-byte) and returns
-/// its object id. A byte-identical commit (same tree, parents, message,
-/// and identity, as a repeated push of unchanged state produces) already
-/// lives in the store, so only a missing commit is published — the oracle
-/// likewise deduplicates by oid.
-fn mint_stash_commit(store: &Store, request: NewRequest) -> Result<Oid, GitError> {
-    let prepared = ops_prepare_new(store, request).map_err(GitError::from)?;
-    let oid = prepared
-        .output
-        .oid
-        .or_else(|| prepared.output.head.as_git().copied())
-        .ok_or_else(|| GitError::Invalid {
-            detail: "stash commit has no git identity".to_owned(),
-        })?;
-    let missing = match super::state::commit_record(store, oid) {
-        Ok(_) => false,
-        Err(GitError::NotFound { .. }) => true,
-        Err(err) => return Err(err),
-    };
-    if missing {
-        store
-            .publish(prepared.objects, &prepared.facts)
-            .map_err(GitError::from)?;
-    }
-    Ok(oid)
 }
 
 /// Builds `(path, entry)` rows for the stash worktree tree: the tracked

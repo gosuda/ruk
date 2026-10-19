@@ -2294,6 +2294,7 @@ fn decode_request_args(
         Method::Snapshot => mutation_request(id, decode_args(text)?, Request::Snapshot),
         Method::Write => mutation_request(id, decode_args(text)?, Request::Write),
         Method::New => mutation_request(id, decode_args(text)?, Request::New),
+        Method::GitCommit => mutation_request(id, decode_args(text)?, Request::GitCommit),
         Method::Describe => mutation_request(id, decode_args(text)?, Request::Describe),
         Method::Edit => mutation_request(id, decode_args(text)?, Request::Edit),
         Method::Split => mutation_request(id, decode_args(text)?, Request::Split),
