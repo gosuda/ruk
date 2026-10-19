@@ -47,6 +47,8 @@ pub(crate) fn split_rename_args(args: &[String]) -> Result<(Vec<String>, RenameM
         }
         if arg == "--no-renames" {
             mode = RenameMode::Disabled;
+        } else if arg == "--renames" {
+            mode = RenameMode::ExactOnly;
         } else if arg == "--find-renames" || arg == "-M" {
             mode = RenameMode::Similar(50);
         } else if let Some(spec) = arg.strip_prefix("--find-renames=") {

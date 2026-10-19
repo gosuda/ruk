@@ -1310,7 +1310,7 @@ pub(crate) fn name_rev(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
 // ---------------------------------------------------------------------------
 
 /// One parsed ignore line, with its file line number for `-v` output.
-struct IgnoreRule {
+pub(crate) struct IgnoreRule {
     lineno: usize,
     pattern: String,
     dir_only: bool,
@@ -1319,7 +1319,7 @@ struct IgnoreRule {
 
 /// Loads `.rukignore` lines: blanks and `#` comments drop, `!` negates, a
 /// trailing `/` pins a directory. Absent file means no rules.
-fn load_ignore_rules(base: &Path) -> Result<Vec<IgnoreRule>, GitError> {
+pub(crate) fn load_ignore_rules(base: &Path) -> Result<Vec<IgnoreRule>, GitError> {
     let path = base.join(".rukignore");
     let body = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -1369,7 +1369,7 @@ fn ignore_rule_hits(rule: &IgnoreRule, path: &str) -> bool {
 }
 
 /// The last matching rule decides: ignored unless it negates.
-fn path_is_ignored(rules: &[IgnoreRule], path: &str) -> Option<usize> {
+pub(crate) fn path_is_ignored(rules: &[IgnoreRule], path: &str) -> Option<usize> {
     let mut hit = None;
     for (index, rule) in rules.iter().enumerate() {
         if ignore_rule_hits(rule, path) {

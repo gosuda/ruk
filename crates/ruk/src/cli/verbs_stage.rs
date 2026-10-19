@@ -7,13 +7,13 @@
 //! | `rm` | row delete + file delete (`--cached` keeps the file) | implemented |
 //! | `update-index` | row add/remove/flag edits | implemented (`--cacheinfo`, `--stdin`, `--add`, `--remove`, `--assume-unchanged`, `--skip-worktree`, `--refresh`) |
 //! | `ls-files` | row scan | implemented (`-s`, `-u`, `--others`) |
-//! | `status` | `HEAD` tree vs index vs worktree | implemented (`--porcelain`, `--short`, long) |
+//! | `status` | `HEAD` tree vs index vs worktree | implemented (`--porcelain=v1`/`v2`, `--short`, `--long`, `--branch`, `--null`, `-u` modes, `--ignored`, `--show-stash`, `--ahead-behind`/`--no-ahead-behind`, `--renames`/`-M`/`--find-renames`/`--no-renames`, `-v` staged + `-vv` unstaged diffs, `--no-column`/`--ignore-submodules` no-op, `--column` unsupported) |
 //!
 //! Oracle anchors: `git/builtin/add.c`, `git/builtin/mv.c`,
 //! `git/builtin/rm.c`, `git/builtin/update-index.c`,
 //! `git/builtin/ls-files.c`, `git/builtin/commit.c` (`cmd_status`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ruk_core::ids::HashKind;
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
@@ -21,8 +21,9 @@ use ruk_core::store::Store;
 use ruk_git::GitError;
 
 use super::state::{
-    MAX_OBJECT_BYTES, load_or_default, path_row_mutations, read_path_rows, scan_index,
-    unmerged_paths, workspace_mutation,
+    MAX_OBJECT_BYTES, head_oid, load_or_default, path_row_mutations, read_path_rows, read_ref,
+    scan_index, stash_high_water, stash_read, unmerged_paths, walk_history,
+    workspace_mutation,
 };
 use super::tree::{
     TreeMode, WorktreeEntry, WorktreeType, commit_tree_oid, flatten_tree, join_base,
@@ -713,42 +714,271 @@ pub(crate) fn ls_files(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
     Ok(out)
 }
 
+/// Untracked-file display for `-u`/`--untracked-files`: hidden, collapsed
+/// to `dir/`, or listed file by file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UntrackedMode {
+    /// `-uno`: hide untracked files entirely.
+    No,
+    /// Default: collapse untracked directories holding no tracked file.
+    Normal,
+    /// `-uall`: list every untracked file.
+    All,
+}
+
+/// Porcelain machine formats: v1 (`XY <path>`) or v2 (`1`/`2`/`u`/`?`/`!`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PorcelainVersion {
+    V1,
+    V2,
+}
+
+/// Output shape: the last of `--porcelain`/`--short`/`--long` wins, the
+/// way the oracle's single `status_format` variable resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusFormat {
+    Long,
+    Short,
+    Porcelain(PorcelainVersion),
+}
+
+/// Ahead/behind detail: exact counts by default and `--ahead-behind`,
+/// suppressed by `--no-ahead-behind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AheadBehind {
+    Full,
+    Off,
+}
+
+/// Parses one `-u<mode>`/`--untracked-files[=<mode>]` value: `no`,
+/// `normal` (also the bare form), or `all`.
+fn parse_untracked_mode(value: Option<&str>) -> Result<UntrackedMode, GitError> {
+    match value {
+        None | Some("normal") => Ok(UntrackedMode::Normal),
+        Some("all") => Ok(UntrackedMode::All),
+        Some("no") => Ok(UntrackedMode::No),
+        Some(other) => Err(GitError::Invalid {
+            detail: format!("bad --untracked-files={other:?}: want no|normal|all"),
+        }),
+    }
+}
+
+/// Validates `--ignore-submodules[=<when>]`: accepted so scripts pass
+/// through, inert because no submodule summary engine exists to tune.
+fn check_ignore_submodules(arg: &str) -> Result<(), GitError> {
+    let value = arg.strip_prefix("--ignore-submodules=").unwrap_or("all");
+    match value {
+        "all" | "untracked" | "dirty" | "none" => Ok(()),
+        _ => Err(GitError::Invalid {
+            detail: format!(
+                "bad {arg:?}: want --ignore-submodules[=all|untracked|dirty|none]"
+            ),
+        }),
+    }
+}
+
+/// Splits status-only spellings `collect` cannot express, stopping at `--`
+/// so paths survive: `--porcelain[=v1|v2]`, `--short`, `--long` (kept in
+/// command-line order so the last format wins), `-u<mode>` and
+/// `--untracked-files[=<mode>]` (bare means `normal`), and
+/// `--ignore-submodules[=<when>]` (validated, inert).
+fn split_status_args(
+    args: &[String],
+) -> Result<(Vec<String>, Vec<StatusFormat>, Vec<UntrackedMode>), GitError> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut formats = Vec::new();
+    let mut untracked = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            kept.extend(args[index..].iter().cloned());
+            break;
+        }
+        if arg == "--porcelain" {
+            formats.push(StatusFormat::Porcelain(PorcelainVersion::V1));
+        } else if let Some(value) = arg.strip_prefix("--porcelain=") {
+            match value {
+                "v1" | "1" => formats.push(StatusFormat::Porcelain(PorcelainVersion::V1)),
+                "v2" | "2" => formats.push(StatusFormat::Porcelain(PorcelainVersion::V2)),
+                _ => {
+                    return Err(GitError::Invalid {
+                        detail: format!("bad --porcelain={value:?}: want v1|v2"),
+                    });
+                }
+            }
+        } else if arg == "--short" || arg == "-s" {
+            formats.push(StatusFormat::Short);
+        } else if arg == "--long" {
+            formats.push(StatusFormat::Long);
+        } else if arg == "--untracked-files" || arg == "-u" {
+            untracked.push(UntrackedMode::Normal);
+        } else if let Some(value) = arg.strip_prefix("--untracked-files=") {
+            untracked.push(parse_untracked_mode(Some(value))?);
+        } else if let Some(rest) = arg.strip_prefix("-u") {
+            untracked.push(parse_untracked_mode(Some(rest))?);
+        } else if arg == "--ignore-submodules" || arg.starts_with("--ignore-submodules=") {
+            check_ignore_submodules(arg)?;
+        } else {
+            kept.push(arg.clone());
+        }
+        index += 1;
+    }
+    Ok((kept, formats, untracked))
+}
+
 /// Shows the working tree status against the index and `HEAD`.
 ///
 /// Oracle: `git/builtin/commit.c` (`cmd_status`).
 pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
-            long: "porcelain",
-            short: None,
-            takes_value: false,
-        },
-        FlagSpec {
-            long: "short",
-            short: Some('s'),
-            takes_value: false,
-        },
-        FlagSpec {
             long: "branch",
             short: Some('b'),
             takes_value: false,
         },
+        // NUL-terminate entries; implies porcelain v1 with no format flag.
+        FlagSpec {
+            long: "null",
+            short: Some('z'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "show-stash",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ahead-behind",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-ahead-behind",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignored",
+            short: None,
+            takes_value: false,
+        },
+        // The machine never paginates a column layout: `--no-column` (the
+        // default) parses while `--column` names its TTY reason.
+        FlagSpec {
+            long: "no-column",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "column",
+            short: None,
+            takes_value: false,
+        },
+        // Appends the staged diff to a long report (`-vv` adds the
+        // unstaged diff too), rendered by the diff lane itself.
+        FlagSpec {
+            long: "verbose",
+            short: Some('v'),
+            takes_value: false,
+        },
     ];
-    let (args, rename_mode) = super::rename::split_rename_args(args)?;
+    let (args, formats, untracked_opts) = split_status_args(args)?;
+    let (args, rename_mode) = super::rename::split_rename_args(&args)?;
     let opts = collect(&args, &specs)?;
+    if opts.is_set("column") {
+        return Err(GitError::Unsupported {
+            command: "status --column needs a terminal column layout".to_owned(),
+        });
+    }
     ctx.require_worktree()?;
+    let mut format = StatusFormat::Long;
+    for next in formats {
+        format = next;
+    }
+    // Verbose diffs render before the store is borrowed: the diff lane
+    // needs `&mut Ctx`. Porcelain formats ignore `-v` like the oracle.
+    let verbose = opts.count("verbose");
+    let staged_diff = (verbose >= 1 && format == StatusFormat::Long)
+        .then(|| super::verbs_history::diff(ctx, &["--cached".to_owned()]))
+        .transpose()?;
+    let unstaged_diff = (verbose >= 2 && format == StatusFormat::Long)
+        .then(|| super::verbs_history::diff(ctx, &[]))
+        .transpose()?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let plan = status_plan_with_mode(ctx, store, kind, rename_mode)?;
-    if opts.is_set("porcelain") || opts.is_set("short") {
-        let branch = opts
-            .is_set("branch")
-            .then(|| porcelain_branch(store))
-            .transpose()?;
-        return Ok(render_porcelain(&plan, branch.as_deref()));
+    let null = opts.is_set("null");
+    if null && format == StatusFormat::Long {
+        format = StatusFormat::Porcelain(PorcelainVersion::V1);
     }
-    let branch = long_branch_label(store)?;
-    Ok(render_long(store, &branch, &plan))
+    let untracked_mode = untracked_opts.last().copied().unwrap_or(UntrackedMode::Normal);
+    let ahead_behind = if opts.is_set("no-ahead-behind") {
+        AheadBehind::Off
+    } else {
+        AheadBehind::Full
+    };
+    let show_stash = opts.is_set("show-stash");
+    let eol = if null { b'\0' } else { b'\n' };
+    let plan = status_plan_with_mode(ctx, store, kind, rename_mode, untracked_mode)?;
+    match format {
+        StatusFormat::Porcelain(PorcelainVersion::V2) => {
+            let ignored = shown_ignored(&plan, &opts);
+            let input = V2Input {
+                plan: &plan,
+                show_branch: opts.is_set("branch"),
+                ignored: ignored.as_deref(),
+                ahead_behind,
+                show_stash,
+                eol,
+            };
+            render_porcelain_v2(ctx, store, kind, &input)
+        }
+        StatusFormat::Short | StatusFormat::Porcelain(PorcelainVersion::V1) => {
+            let branch = opts
+                .is_set("branch")
+                .then(|| porcelain_v1_branch(ctx, store, ahead_behind))
+                .transpose()?;
+            let ignored = shown_ignored(&plan, &opts);
+            Ok(render_porcelain(
+                &plan,
+                branch.as_deref(),
+                ignored.as_deref(),
+                eol,
+            ))
+        }
+        StatusFormat::Long => {
+            let tracking = match current_short_branch(store)? {
+                Some(name) if ahead_behind == AheadBehind::Full => {
+                    tracking_sentence(ctx, store, &name)?
+                }
+                _ => None,
+            };
+            let stash = if show_stash {
+                stash_count(store)?
+            } else {
+                0
+            };
+            let ignored = shown_ignored(&plan, &opts);
+            let branch = long_branch_label(store)?;
+            let mut out =
+                render_long_full(store, &branch, &plan, tracking, stash, ignored.as_deref());
+            for diff in [staged_diff, unstaged_diff].into_iter().flatten() {
+                if !diff.is_empty() {
+                    if out.last() != Some(&b'\n') {
+                        out.push(b'\n');
+                    }
+                    out.extend_from_slice(&diff);
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Borrows the computed ignored list when `--ignored` was given, so the
+/// flag stays at the call site instead of forking a helper.
+fn shown_ignored(plan: &StatusPlan, opts: &super::Collected) -> Option<Vec<Vec<u8>>> {
+    opts.is_set("ignored").then(|| plan.ignored.clone())
 }
 
 /// One computed status: staged, unstaged, unmerged, and untracked paths.
@@ -756,39 +986,50 @@ pub(crate) struct StatusPlan {
     /// `(path, staged code, index/head identity)` in path order. The
     /// identity backs exact-rename pairing; `None` for modified/unmerged.
     pub(crate) staged: Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
-    /// `(old path, new path)` additions/deletions of identical blobs.
-    pub(crate) renames: Vec<(Vec<u8>, Vec<u8>)>,
-    /// `(old path, new path)` worktree deletions paired with untracked
-    /// files (`-M` only; the oracle never reports these, so the default
-    /// plan leaves them as delete plus untracked).
-    pub(crate) renames_unstaged: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `(old path, new path, score)` staged renames; exact pairs score 100.
+    pub(crate) renames: Vec<(Vec<u8>, Vec<u8>, u8)>,
+    /// `(old path, new path, score)` worktree deletions paired with
+    /// untracked files (`-M` only; the oracle never reports these, so the
+    /// default plan leaves them as delete plus untracked).
+    pub(crate) renames_unstaged: Vec<(Vec<u8>, Vec<u8>, u8)>,
     /// `(path, worktree code)` in path order.
     pub(crate) unstaged: Vec<(Vec<u8>, char)>,
     /// Unmerged paths in path order.
     pub(crate) unmerged: Vec<Vec<u8>>,
-    /// Untracked paths in path order.
+    /// Untracked paths in path order, shaped by the untracked mode.
     pub(crate) untracked: Vec<Vec<u8>>,
+    /// Ignored paths (collapsed to `dir/`), shown only with `--ignored`.
+    pub(crate) ignored: Vec<Vec<u8>>,
 }
 
 /// Compares `HEAD` tree, index rows, and worktree files with the default
-/// exact-only rename pairing.
+/// exact-only rename pairing and uncollapsed untracked files.
 pub(crate) fn status_plan(
     ctx: &Ctx,
     store: &Store,
     kind: HashKind,
 ) -> Result<StatusPlan, GitError> {
-    status_plan_with_mode(ctx, store, kind, super::rename::RenameMode::ExactOnly)
+    status_plan_with_mode(
+        ctx,
+        store,
+        kind,
+        super::rename::RenameMode::ExactOnly,
+        UntrackedMode::All,
+    )
 }
 
 /// Compares `HEAD` tree, index rows, and worktree files, pairing renames
 /// per `mode`: staged additions/deletions always pair when identical
 /// (unless disabled), and `-M` additionally pairs by similarity both
-/// staged and worktree (deleted tracked plus untracked).
+/// staged and worktree (deleted tracked plus untracked). Ignored files
+/// split out of the untracked list per `.rukignore` (tracked files never
+/// count as ignored); the remainder collapses per `untracked_mode`.
 pub(crate) fn status_plan_with_mode(
     ctx: &Ctx,
     store: &Store,
     kind: HashKind,
     mode: super::rename::RenameMode,
+    untracked_mode: UntrackedMode,
 ) -> Result<StatusPlan, GitError> {
     let head_tree = head_tree_map(ctx, store)?;
     let rows = scan_index(store, kind)?;
@@ -869,6 +1110,30 @@ pub(crate) fn status_plan_with_mode(
         )?,
         super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => Vec::new(),
     };
+    let mut tracked: HashSet<Vec<u8>> = HashSet::new();
+    for path in index_merged.keys().chain(head_tree.keys()) {
+        tracked.insert(path.clone());
+    }
+    // Ignored files hide from the untracked list (tracked files never do);
+    // the survivors collapse per the untracked mode while ignored sides
+    // always collapse to `dir/`.
+    let ignore_rules = super::verbs_misc::load_ignore_rules(&ctx.file_base)?;
+    let mut shown = Vec::new();
+    let mut ignored_files = Vec::new();
+    for path in untracked {
+        let text = String::from_utf8_lossy(&path);
+        if super::verbs_misc::path_is_ignored(&ignore_rules, &text).is_some() {
+            ignored_files.push(path);
+        } else {
+            shown.push(path);
+        }
+    }
+    let ignored = collapse_untracked(ignored_files, &tracked);
+    let untracked = match untracked_mode {
+        UntrackedMode::No => Vec::new(),
+        UntrackedMode::Normal => collapse_untracked(shown, &tracked),
+        UntrackedMode::All => shown,
+    };
     let mut unmerged_paths_sorted: Vec<Vec<u8>> = unmerged.into_keys().collect();
     unmerged_paths_sorted.sort();
     Ok(StatusPlan {
@@ -878,7 +1143,44 @@ pub(crate) fn status_plan_with_mode(
         unstaged,
         unmerged: unmerged_paths_sorted,
         untracked,
+        ignored,
     })
+}
+
+/// Collapses paths under directories holding no tracked file to `dir/`,
+/// the oracle's `normal` display: the shortest clean ancestor wins, so
+/// `a/b/c` under a clean `a/` reports `a/`.
+fn collapse_untracked(paths: Vec<Vec<u8>>, tracked: &HashSet<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut live: HashSet<Vec<u8>> = HashSet::new();
+    for path in tracked {
+        let mut rest = path.as_slice();
+        while let Some(pos) = rest.iter().rposition(|byte| *byte == b'/') {
+            live.insert(rest[..pos].to_vec());
+            rest = &rest[..pos];
+        }
+    }
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        let mut collapsed: Option<Vec<u8>> = None;
+        let mut start = 0;
+        while let Some(rel) = path[start..].iter().position(|byte| *byte == b'/') {
+            let dir = &path[..start + rel];
+            if !live.contains(dir) {
+                let mut entry = dir.to_vec();
+                entry.push(b'/');
+                collapsed = Some(entry);
+                break;
+            }
+            start += rel + 1;
+        }
+        let entry = collapsed.unwrap_or(path);
+        if seen.insert(entry.clone()) {
+            out.push(entry);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Pairs staged additions with staged deletions per `mode`, removing both
@@ -890,7 +1192,7 @@ fn pair_staged_renames(
     store: &Store,
     staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
     mode: super::rename::RenameMode,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, GitError> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
     if mode == super::rename::RenameMode::Disabled {
         return Ok(Vec::new());
     }
@@ -904,12 +1206,12 @@ fn pair_staged_renames(
 }
 
 /// Pairs staged additions with staged deletions of identical blobs into
-/// `(old, new)` renames, removing both sides from `staged`. The oracle
-/// reports similarity-100% moves as `R  old -> new`; content-exact
+/// `(old, new, 100)` renames, removing both sides from `staged`. The
+/// oracle reports similarity-100% moves as `R  old -> new`; content-exact
 /// pairing reproduces that without a similarity engine.
 fn pair_exact_renames(
     staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
     let mut renames = Vec::new();
     let mut kept = Vec::new();
     let mut unmatched_adds: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
@@ -943,7 +1245,7 @@ fn pair_exact_renames(
         match paired {
             Some((index, new_path)) => {
                 taken[index] = true;
-                renames.push((path, new_path));
+                renames.push((path, new_path, 100));
             }
             None => restaged.push((path, code, Some((mode, oid)))),
         }
@@ -967,7 +1269,7 @@ fn pair_similar_staged(
     store: &Store,
     staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
     threshold: u8,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, GitError> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
     use super::rename::{RenameSide, pair_renames, similarity};
     let mut renames = Vec::new();
     let mut keep: Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)> = Vec::new();
@@ -988,7 +1290,7 @@ fn pair_similar_staged(
         for (index, (new_path, _, new_oid)) in adds.iter().enumerate() {
             if !taken[index] && *new_oid == old_oid {
                 paired = Some(index);
-                renames.push((old_path.clone(), new_path.clone()));
+                renames.push((old_path.clone(), new_path.clone(), 100));
                 break;
             }
         }
@@ -1049,7 +1351,11 @@ fn pair_similar_staged(
         }
         used_del[win.old] = true;
         used_add[win.new] = true;
-        renames.push((live_dels[win.old].0.clone(), live_adds[win.new].0.clone()));
+        renames.push((
+            live_dels[win.old].0.clone(),
+            live_adds[win.new].0.clone(),
+            win.score,
+        ));
     }
     // Rebuild: survivors are the kept rows plus unpaired leftovers.
     let mut restaged = keep;
@@ -1080,7 +1386,7 @@ fn pair_unstaged_renames(
     unstaged: &mut Vec<(Vec<u8>, char)>,
     untracked: &mut Vec<Vec<u8>>,
     threshold: u8,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, GitError> {
+) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
     use super::rename::{RenameSide, pair_renames, similarity};
     let mut dels: Vec<(Vec<u8>, ruk_core::ids::Oid)> = Vec::new();
     let mut keep: Vec<(Vec<u8>, char)> = Vec::new();
@@ -1133,7 +1439,11 @@ fn pair_unstaged_renames(
         }
     }) {
         used_untracked[win.new] = true;
-        renames.push((dels[win.old].0.clone(), add_side[win.new].path.clone()));
+        renames.push((
+            dels[win.old].0.clone(),
+            add_side[win.new].path.clone(),
+            win.score,
+        ));
     }
     let mut used_del = vec![false; dels.len()];
     for win in renames.iter() {
@@ -1205,12 +1515,19 @@ fn read_entry_bytes(ctx: &Ctx, entry: &WorktreeEntry) -> Result<Vec<u8>, GitErro
     }
 }
 
-/// Renders porcelain v1 lines (`XY <path>`, `R  <old> -> <new>`,
-/// `?? <path>`).
-fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
+/// Renders porcelain v1 lines (`## <branch>`, `XY <path>`,
+/// `R  <old> -> <new>`, `?? <path>`, `!! <path>`), terminated by `eol`
+/// (`--null` uses NUL).
+fn render_porcelain(
+    plan: &StatusPlan,
+    branch: Option<&str>,
+    ignored: Option<&[Vec<u8>]>,
+    eol: u8,
+) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some(branch) = branch {
-        out.extend_from_slice(format!("## {branch}\n").as_bytes());
+        out.extend_from_slice(format!("## {branch}").as_bytes());
+        out.push(eol);
     }
     let mut staged_map: BTreeMap<&Vec<u8>, char> = BTreeMap::new();
     for (path, code, _) in &plan.staged {
@@ -1221,13 +1538,16 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
         unstaged_map.insert(path, *code);
     }
     let mut rename_new: BTreeMap<&Vec<u8>, &Vec<u8>> = BTreeMap::new();
-    for (old, new) in &plan.renames {
+    for (old, new, _) in &plan.renames {
         rename_new.insert(new, old);
     }
     let mut lines: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     for path in staged_map.keys().chain(unstaged_map.keys()) {
-        if plan.renames.iter().any(|(old, _)| old == *path)
-            || plan.renames_unstaged.iter().any(|(old, _)| old == *path)
+        if plan.renames.iter().any(|(old, _, _)| old == *path)
+            || plan
+                .renames_unstaged
+                .iter()
+                .any(|(old, _, _)| old == *path)
         {
             continue;
         }
@@ -1239,7 +1559,7 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
         match rename_new.get(path) {
             Some(old) => {
                 let line = format!(
-                    "R{unstaged_code} {} -> {}\n",
+                    "R{unstaged_code} {} -> {}",
                     String::from_utf8_lossy(old),
                     String::from_utf8_lossy(path)
                 );
@@ -1247,7 +1567,7 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
             }
             None => {
                 let line = format!(
-                    "{staged_code}{unstaged_code} {}\n",
+                    "{staged_code}{unstaged_code} {}",
                     String::from_utf8_lossy(path)
                 );
                 lines.insert((*path).clone(), line.into_bytes());
@@ -1259,15 +1579,15 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
             continue;
         }
         let line = format!(
-            "R  {} -> {}\n",
+            "R  {} -> {}",
             String::from_utf8_lossy(old),
             String::from_utf8_lossy(new)
         );
         lines.insert((*new).clone(), line.into_bytes());
     }
-    for (old, new) in &plan.renames_unstaged {
+    for (old, new, _) in &plan.renames_unstaged {
         let line = format!(
-            " R {} -> {}\n",
+            " R {} -> {}",
             String::from_utf8_lossy(old),
             String::from_utf8_lossy(new)
         );
@@ -1275,29 +1595,435 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
     }
     for line in lines.into_values() {
         out.extend_from_slice(&line);
+        out.push(eol);
     }
     for path in &plan.unmerged {
         if !staged_map.contains_key(&path) {
             out.extend_from_slice(b"UU ");
             out.extend_from_slice(path);
-            out.push(b'\n');
+            out.push(eol);
         }
     }
     for path in &plan.untracked {
         out.extend_from_slice(b"?? ");
         out.extend_from_slice(path);
-        out.push(b'\n');
+        out.push(eol);
+    }
+    if let Some(ignored) = ignored {
+        for path in ignored {
+            out.extend_from_slice(b"!! ");
+            out.extend_from_slice(path);
+            out.push(eol);
+        }
     }
     out
 }
 
-/// Names the checked-out branch shortened (`main`, not `refs/heads/main`),
-/// for porcelain's `##` header (`HEAD (no branch)` when detached).
-fn porcelain_branch(store: &Store) -> Result<String, GitError> {
-    match current_short_branch(store)? {
-        Some(name) => Ok(name),
-        None => Ok("HEAD (no branch)".to_owned()),
+/// Pushes one `eol`-terminated header line.
+fn push_v2_line(out: &mut Vec<u8>, text: &str, eol: u8) {
+    out.extend_from_slice(text.as_bytes());
+    out.push(eol);
+}
+
+/// Porcelain v2 selections that travel together: the plan, display flags,
+/// and the line terminator.
+struct V2Input<'a> {
+    plan: &'a StatusPlan,
+    show_branch: bool,
+    ignored: Option<&'a [Vec<u8>]>,
+    ahead_behind: AheadBehind,
+    show_stash: bool,
+    eol: u8,
+}
+
+/// Writes the `# branch.*` (plus `# stash`) headers for porcelain v2;
+/// nothing without `--branch`, tracking only with a live upstream.
+fn v2_branch_headers(
+    ctx: &Ctx,
+    store: &Store,
+    input: &V2Input<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), GitError> {
+    if !input.show_branch {
+        return Ok(());
     }
+    match head_oid(store) {
+        Ok(tip) => push_v2_line(out, &format!("# branch.oid {}", tip.to_hex()), input.eol),
+        Err(_) => push_v2_line(out, "# branch.oid (initial)", input.eol),
+    }
+    let Some(name) = current_short_branch(store)? else {
+        push_v2_line(out, "# branch.head (detached)", input.eol);
+        return Ok(());
+    };
+    push_v2_line(out, &format!("# branch.head {name}"), input.eol);
+    if let Some(upstream) = branch_upstream(ctx, store, &name) {
+        let Some(target) = upstream.oid else {
+            return Ok(());
+        };
+        push_v2_line(
+            out,
+            &format!("# branch.upstream {}", upstream.display),
+            input.eol,
+        );
+        if input.ahead_behind == AheadBehind::Full {
+            if let Ok(head) = head_oid(store) {
+                let (ahead, behind) = ahead_behind_counts(store, head, target)?;
+                push_v2_line(out, &format!("# branch.ab +{ahead} -{behind}"), input.eol);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes the `# stash N` line for porcelain v2; unlike the branch
+/// headers this needs only `--show-stash`, never `--branch`.
+fn v2_stash_line(store: &Store, eol: u8, out: &mut Vec<u8>) -> Result<(), GitError> {
+    let entries = stash_count(store)?;
+    if entries > 0 {
+        push_v2_line(out, &format!("# stash {entries}"), eol);
+    }
+    Ok(())
+}
+
+/// Renders porcelain v2: `# branch.*` headers (with `--branch`), `1`
+/// changed lines with head/index/worktree modes and oids, `2` rename
+/// lines with scores, `u` unmerged lines with stage modes and oids, `?`
+/// untracked, `!` ignored. The lane is stat-less, so the worktree mode
+/// column reuses the indexed mode; missing sides print `000000` and the
+/// zero oid. Submodules report `N...`: no submodule state is tracked.
+fn render_porcelain_v2(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    input: &V2Input<'_>,
+) -> Result<Vec<u8>, GitError> {
+    let mut out = Vec::new();
+    v2_branch_headers(ctx, store, input, &mut out)?;
+    if input.show_stash {
+        v2_stash_line(store, input.eol, &mut out)?;
+    }
+    let plan = input.plan;
+    let eol = input.eol;
+    let head_tree = head_tree_map(ctx, store)?;
+    let rows = scan_index(store, kind)?;
+    let mut index: BTreeMap<Vec<u8>, (TreeMode, ruk_core::ids::Oid)> = BTreeMap::new();
+    let mut stages: BTreeMap<Vec<u8>, Vec<(u8, TreeMode, ruk_core::ids::Oid)>> = BTreeMap::new();
+    for (path, stage, entry) in &rows {
+        let key = path.as_bytes().to_vec();
+        let value = (TreeMode::from(entry.mode()), entry.oid());
+        if *stage == Stage::Zero {
+            index.insert(key, value);
+        } else {
+            stages
+                .entry(key)
+                .or_default()
+                .push((stage.as_u8(), value.0, value.1));
+        }
+    }
+    let zero = "0".repeat(kind.hex_len());
+    let head_side = |path: &[u8]| -> (u32, String) {
+        match head_tree.get(path) {
+            Some((mode, oid)) => (mode.octal(), oid.to_hex()),
+            None => (0, zero.clone()),
+        }
+    };
+    let index_side = |path: &[u8]| -> (u32, String) {
+        match index.get(path) {
+            Some((mode, oid)) => (mode.octal(), oid.to_hex()),
+            None => (0, zero.clone()),
+        }
+    };
+    let mut staged_map: BTreeMap<&Vec<u8>, char> = BTreeMap::new();
+    for (path, code, _) in &plan.staged {
+        staged_map.insert(path, *code);
+    }
+    let mut unstaged_map: BTreeMap<&Vec<u8>, char> = BTreeMap::new();
+    for (path, code) in &plan.unstaged {
+        unstaged_map.insert(path, *code);
+    }
+    let mut rename_new: BTreeMap<&Vec<u8>, (&Vec<u8>, u8)> = BTreeMap::new();
+    for (old, new, score) in plan.renames.iter().chain(plan.renames_unstaged.iter()) {
+        rename_new.insert(new, (old, *score));
+    }
+    let mut paths: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for (path, _, _) in &plan.staged {
+        paths.insert(path.clone());
+    }
+    for (path, _) in &plan.unstaged {
+        paths.insert(path.clone());
+    }
+    for (old, new, _) in plan.renames.iter().chain(plan.renames_unstaged.iter()) {
+        paths.remove(old);
+        paths.insert(new.clone());
+    }
+    let unmerged: HashSet<&Vec<u8>> = plan.unmerged.iter().collect();
+    // `-z` separates rename sides with NUL instead of TAB, like the oracle.
+    let sep = if eol == b'\0' { b'\0' } else { b'\t' };
+    for path in &paths {
+        if unmerged.contains(&path) {
+            continue;
+        }
+        let worktree = unstaged_map.get(&path).copied().unwrap_or('.');
+        if let Some((old, score)) = rename_new.get(&path) {
+            let (mode_head, oid_head) = head_side(old);
+            let (mode_index, oid_index) = index_side(path);
+            let mode_worktree = if worktree == 'D' {
+                0
+            } else if mode_index != 0 {
+                mode_index
+            } else {
+                index_side(old).0
+            };
+            let mut line = format!(
+                "2 R{worktree} N... {mode_head:06o} {mode_index:06o} {mode_worktree:06o} {oid_head} {oid_index} R{score} ",
+            )
+            .into_bytes();
+            line.extend_from_slice(path);
+            line.push(sep);
+            line.extend_from_slice(old);
+            line.push(eol);
+            out.extend_from_slice(&line);
+            continue;
+        }
+        let staged = staged_map.get(&path).copied().unwrap_or('.');
+        let (mode_head, oid_head) = head_side(path);
+        let (mode_index, oid_index) = index_side(path);
+        let mode_worktree = if worktree == 'D' {
+            0
+        } else if mode_index != 0 {
+            mode_index
+        } else {
+            mode_head
+        };
+        let mut line = format!(
+            "1 {staged}{worktree} N... {mode_head:06o} {mode_index:06o} {mode_worktree:06o} {oid_head} {oid_index} ",
+        )
+        .into_bytes();
+        line.extend_from_slice(path);
+        line.push(eol);
+        out.extend_from_slice(&line);
+    }
+    for path in &plan.unmerged {
+        let mut mode = [0u32; 3];
+        let mut oid = [zero.clone(), zero.clone(), zero.clone()];
+        let mut mask = 0u8;
+        if let Some(entries) = stages.get(path) {
+            for (stage, entry_mode, entry_oid) in entries {
+                if (1..=3).contains(stage) {
+                    let slot = usize::from(*stage - 1);
+                    mode[slot] = entry_mode.octal();
+                    oid[slot] = entry_oid.to_hex();
+                    mask |= 1 << (*stage - 1);
+                }
+            }
+        }
+        let key = match mask {
+            1 => "DD",
+            2 => "AU",
+            3 => "UD",
+            4 => "UA",
+            5 => "DU",
+            6 => "AA",
+            _ => "UU",
+        };
+        let mut line = format!(
+            "u {key} N... {:06o} {:06o} {:06o} {:06o} {} {} {} ",
+            mode[0], mode[1], mode[2], mode[1], oid[0], oid[1], oid[2],
+        )
+        .into_bytes();
+        line.extend_from_slice(path);
+        line.push(eol);
+        out.extend_from_slice(&line);
+    }
+    for path in &plan.untracked {
+        out.extend_from_slice(b"? ");
+        out.extend_from_slice(path);
+        out.push(eol);
+    }
+    if let Some(ignored) = input.ignored {
+        for path in ignored {
+            out.extend_from_slice(b"! ");
+            out.extend_from_slice(path);
+            out.push(eol);
+        }
+    }
+    Ok(out)
+}
+
+/// One configured upstream: the display short name plus the ref target
+/// (`None` when the upstream is gone).
+struct Upstream {
+    display: String,
+    oid: Option<ruk_core::ids::Oid>,
+}
+
+/// Resolves the upstream of one local branch from
+/// `branch.<name>.remote`/`.merge` (the pair `branch -u` records): remote
+/// `.` means the merge ref itself, otherwise the remote-tracking ref under
+/// `refs/remotes/<remote>/`. `None` means no upstream is configured.
+fn branch_upstream(ctx: &Ctx, store: &Store, branch: &str) -> Option<Upstream> {
+    let remote = ctx.config_get(&format!("branch.{branch}.remote"))?;
+    let merge = ctx.config_get(&format!("branch.{branch}.merge"))?;
+    let full = if remote == "." {
+        merge.clone()
+    } else {
+        let leaf = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+        format!("refs/remotes/{remote}/{leaf}")
+    };
+    let display = full
+        .strip_prefix("refs/remotes/")
+        .or_else(|| full.strip_prefix("refs/heads/"))
+        .unwrap_or(&full)
+        .to_owned();
+    let name = ruk_core::refdata::RefName::new(full).ok()?;
+    // A configured upstream with no ref is gone, not unconfigured: report
+    // it so the `[gone]` and gone sentences stay reachable.
+    let gone = || {
+        Some(Upstream {
+            display: display.clone(),
+            oid: None,
+        })
+    };
+    let mut target = match read_ref(store, &name).ok()? {
+        Some(target) => target,
+        None => return gone(),
+    };
+    for _ in 0..16 {
+        match target {
+            ruk_core::refdata::RefTarget::Direct(oid) => {
+                return Some(Upstream {
+                    display,
+                    oid: Some(oid),
+                });
+            }
+            ruk_core::refdata::RefTarget::Symbolic(next) => {
+                target = match read_ref(store, &next).ok()? {
+                    Some(target) => target,
+                    None => return gone(),
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Counts commits reachable from `head` but not `upstream` (ahead) and
+/// vice versa (behind) by ancestry-set difference.
+fn ahead_behind_counts(
+    store: &Store,
+    head: ruk_core::ids::Oid,
+    upstream: ruk_core::ids::Oid,
+) -> Result<(usize, usize), GitError> {
+    if head == upstream {
+        return Ok((0, 0));
+    }
+    let head_set: HashSet<ruk_core::ids::Oid> = walk_history(store, &[head], None)?
+        .into_iter()
+        .map(|(oid, _)| oid)
+        .collect();
+    let upstream_set: HashSet<ruk_core::ids::Oid> = walk_history(store, &[upstream], None)?
+        .into_iter()
+        .map(|(oid, _)| oid)
+        .collect();
+    Ok((
+        head_set.difference(&upstream_set).count(),
+        upstream_set.difference(&head_set).count(),
+    ))
+}
+
+/// Renders the oracle's long-format tracking sentence for one branch, or
+/// `None` without a configured upstream (or before the first commit).
+fn tracking_sentence(
+    ctx: &Ctx,
+    store: &Store,
+    branch: &str,
+) -> Result<Option<String>, GitError> {
+    let Some(upstream) = branch_upstream(ctx, store, branch) else {
+        return Ok(None);
+    };
+    let Some(target) = upstream.oid else {
+        return Ok(Some(format!(
+            "Your branch is based on '{}', but the upstream is gone.",
+            upstream.display
+        )));
+    };
+    let Ok(head) = head_oid(store) else {
+        return Ok(None);
+    };
+    let (ahead, behind) = ahead_behind_counts(store, head, target)?;
+    let noun = |count: usize| {
+        if count == 1 {
+            "commit".to_owned()
+        } else {
+            "commits".to_owned()
+        }
+    };
+    Ok(Some(match (ahead, behind) {
+        (0, 0) => format!("Your branch is up to date with '{}'.", upstream.display),
+        (ahead, 0) => format!(
+            "Your branch is ahead of '{}' by {ahead} {}.",
+            upstream.display,
+            noun(ahead)
+        ),
+        (0, behind) => format!(
+            "Your branch is behind '{}' by {behind} {}.",
+            upstream.display,
+            noun(behind)
+        ),
+        (ahead, behind) => format!(
+            "Your branch and '{}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.",
+            upstream.display
+        ),
+    }))
+}
+
+/// Renders the porcelain v1 `##` header: the short branch (or
+/// `HEAD (no branch)` detached) with `...<upstream> [ahead N, behind M]`
+/// tracking, or `[gone]` when the upstream ref is missing.
+fn porcelain_v1_branch(
+    ctx: &Ctx,
+    store: &Store,
+    ahead_behind: AheadBehind,
+) -> Result<String, GitError> {
+    let Some(name) = current_short_branch(store)? else {
+        return Ok("HEAD (no branch)".to_owned());
+    };
+    let mut line = name.clone();
+    if let Some(upstream) = branch_upstream(ctx, store, &name) {
+        line.push_str("...");
+        line.push_str(&upstream.display);
+        match upstream.oid {
+            None => line.push_str(" [gone]"),
+            Some(target) => {
+                if ahead_behind == AheadBehind::Full {
+                    if let Ok(head) = head_oid(store) {
+                        let (ahead, behind) = ahead_behind_counts(store, head, target)?;
+                        match (ahead, behind) {
+                            (0, 0) => {}
+                            (ahead, 0) => line.push_str(&format!(" [ahead {ahead}]")),
+                            (0, behind) => line.push_str(&format!(" [behind {behind}]")),
+                            (ahead, behind) => line.push_str(
+                                &format!(" [ahead {ahead}, behind {behind}]"),
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(line)
+}
+
+/// Counts live stash entries across numbering gaps left by drops.
+fn stash_count(store: &Store) -> Result<usize, GitError> {
+    let high = stash_high_water(store)?;
+    let mut entries = 0;
+    for slot in 0..high {
+        if stash_read(store, slot)?.is_some() {
+            entries += 1;
+        }
+    }
+    Ok(entries)
 }
 
 /// Names the checked-out branch for long status, shortened like the
@@ -1341,20 +2067,41 @@ fn head_unborn(store: &Store) -> Result<bool, GitError> {
     })
 }
 
-/// Renders the default long status from one plan, matching the oracle's
-/// section order, hint text, blank lines, and footers exactly.
+/// Renders the default long status from one plan with no tracking, stash,
+/// or ignored extras: the historical three-argument entry point.
 pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec<u8> {
+    render_long_full(store, branch, plan, None, 0, None)
+}
+
+/// Renders the default long status from one plan, matching the oracle's
+/// section order, hint text, blank lines, and footers exactly. `tracking`
+/// is the upstream sentence (or `None`), `stash` the stash entry count
+/// (`--show-stash`, 0 hides), and `ignored` the `--ignored` list.
+pub(crate) fn render_long_full(
+    store: &Store,
+    branch: &str,
+    plan: &StatusPlan,
+    tracking: Option<String>,
+    stash: usize,
+    ignored: Option<&[Vec<u8>]>,
+) -> Vec<u8> {
     let unborn = head_unborn(store).unwrap_or(false);
     let mut out = Vec::new();
     out.extend_from_slice(format!("On branch {branch}\n").as_bytes());
+    if let Some(sentence) = tracking {
+        out.extend_from_slice(sentence.as_bytes());
+        out.push(b'\n');
+    }
     if unborn {
         out.extend_from_slice(b"\nNo commits yet\n");
     }
+    let ignored = ignored.unwrap_or(&[]);
     if plan.staged.is_empty()
         && plan.renames.is_empty()
         && plan.renames_unstaged.is_empty()
         && plan.unstaged.is_empty()
         && plan.untracked.is_empty()
+        && ignored.is_empty()
     {
         if unborn {
             out.extend_from_slice(
@@ -1363,6 +2110,7 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
         } else {
             out.extend_from_slice(b"nothing to commit, working tree clean\n");
         }
+        out.extend_from_slice(&stash_summary(stash));
         return line(out);
     }
     let mut sections: Vec<Vec<u8>> = Vec::new();
@@ -1397,9 +2145,10 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
             let word = if *code == 'D' { "deleted" } else { "modified" };
             section.extend_from_slice(&status_entry(word, path));
         }
-        let mut renamed: Vec<&(Vec<u8>, Vec<u8>)> = plan.renames_unstaged.iter().collect();
+        let mut renamed: Vec<&(Vec<u8>, Vec<u8>, u8)> =
+            plan.renames_unstaged.iter().collect();
         renamed.sort_by(|left, right| left.1.cmp(&right.1));
-        for (old, new) in renamed {
+        for (old, new, _) in renamed {
             let display = format!(
                 "{} -> {}",
                 String::from_utf8_lossy(old),
@@ -1419,12 +2168,24 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
         }
         sections.push(section);
     }
+    if !ignored.is_empty() {
+        let mut section = Vec::from(b"Ignored files:\n".as_slice());
+        section.extend_from_slice(
+            b"  (use \"git add -f <file>...\" to include in what will be committed)\n",
+        );
+        for path in ignored {
+            section.extend_from_slice(format!("\t{}\n", String::from_utf8_lossy(path)).as_bytes());
+        }
+        sections.push(section);
+    }
     let footer: &[u8] = if !plan.staged.is_empty() || !plan.renames.is_empty() {
         b""
     } else if !plan.unstaged.is_empty() || !plan.renames_unstaged.is_empty() {
         b"\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n"
-    } else {
+    } else if !plan.untracked.is_empty() {
         b"\nnothing added to commit but untracked files present (use \"git add\" to track)\n"
+    } else {
+        b""
     };
     if unborn {
         out.push(b'\n');
@@ -1440,7 +2201,17 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
     } else {
         out.extend_from_slice(footer);
     }
+    out.extend_from_slice(&stash_summary(stash));
     line(out)
+}
+/// Renders `Your stash currently has N entr(y|ies)` for `--show-stash`,
+/// empty when no entries are stashed.
+fn stash_summary(entries: usize) -> Vec<u8> {
+    if entries == 0 {
+        return Vec::new();
+    }
+    let noun = if entries == 1 { "entry" } else { "entries" };
+    format!("Your stash currently has {entries} {noun}\n").into_bytes()
 }
 
 /// Renders staged entries plus exact renames as aligned `\t<word>:  <path>`
@@ -1456,7 +2227,7 @@ fn staged_status_lines(plan: &StatusPlan) -> Vec<Vec<u8>> {
         };
         rows.push((path.clone(), status_entry(word, path)));
     }
-    for (old, new) in &plan.renames {
+    for (old, new, _) in &plan.renames {
         let display = format!(
             "{} -> {}",
             String::from_utf8_lossy(old),
