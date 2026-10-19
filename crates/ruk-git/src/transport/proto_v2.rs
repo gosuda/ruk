@@ -311,12 +311,28 @@ pub struct FetchSections {
     pub progress: RemoteMessages,
 }
 
+/// How one response section ended: another section follows, or the
+/// response itself ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SectionEnd {
+    /// A delimiter: more sections follow.
+    More,
+    /// A flush or response-end: the response is over.
+    Done,
+}
+
 /// Reads one `fetch` response after the request flush: the `shallow-info`
 /// boundaries plus the sideband-multiplexed `packfile` section. The
 /// packfile section always demultiplexes: live servers multiplex it
 /// whether or not `sideband-all` was negotiated (verified against git
 /// 2.53.0), so a raw pack here is corrupt. The packfile section closes
 /// the response; negotiation sections always precede it.
+///
+/// A section closed by a flush or response-end (rather than a delimiter)
+/// ends the response itself: without a packfile section that is
+/// [`GitError::Corrupt`], and the reader never reads past it — required
+/// on connection-reuse transports, where reading on would block on a
+/// connection the server holds open in silence.
 ///
 /// # Errors
 /// Grammar failures are [`GitError::Corrupt`]; see [`ingest_pack`] for
@@ -340,13 +356,13 @@ pub fn read_fetch_response<R: Read>(
             Packet::Delimiter => {}
             Packet::Data(_) => {
                 let section = pkt.last_line().unwrap_or_default().to_vec();
-                match section.as_slice() {
+                let ended = match section.as_slice() {
                     b"acknowledgment" | b"acknowledgments" => {
-                        read_section_lines(pkt, &mut Vec::new())?;
+                        read_section_lines(pkt, &mut Vec::new())?
                     }
                     b"shallow-info" => {
                         let mut lines = Vec::new();
-                        read_section_lines(pkt, &mut lines)?;
+                        let ended = read_section_lines(pkt, &mut lines)?;
                         for line in lines {
                             if let Some(rest) = line.strip_prefix(b"shallow ") {
                                 shallow.push(parse_server_oid(rest, kind)?);
@@ -354,6 +370,7 @@ pub fn read_fetch_response<R: Read>(
                                 unshallow.push(parse_server_oid(rest, kind)?);
                             }
                         }
+                        ended
                     }
                     b"wanted-refs" => read_section_lines(pkt, &mut Vec::new())?,
                     b"packfile" => {
@@ -369,6 +386,9 @@ pub fn read_fetch_response<R: Read>(
                         break;
                     }
                     _ => read_section_lines(pkt, &mut Vec::new())?,
+                };
+                if ended == SectionEnd::Done {
+                    break;
                 }
             }
         }
@@ -386,16 +406,17 @@ pub fn read_fetch_response<R: Read>(
     })
 }
 
-/// Reads one response section up to its terminator (flush, response-end,
-/// or delimiter).
+/// Reads one response section up to its terminator, reporting whether the
+/// terminator ends the section alone (delimiter) or the whole response
+/// (flush, response-end).
 fn read_section_lines<R: Read>(
     pkt: &mut PktReader<R>,
     lines: &mut Vec<Vec<u8>>,
-) -> Result<(), GitError> {
+) -> Result<SectionEnd, GitError> {
     loop {
         match pkt.read_packet()? {
-            Packet::Flush | Packet::ResponseEnd => return Ok(()),
-            Packet::Delimiter => return Ok(()),
+            Packet::Flush | Packet::ResponseEnd => return Ok(SectionEnd::Done),
+            Packet::Delimiter => return Ok(SectionEnd::More),
             Packet::Data(_) => lines.push(pkt.last_line().unwrap_or_default().to_vec()),
         }
     }
@@ -660,23 +681,30 @@ mod tests {
 
     #[test]
     fn fetch_sections_without_packfile_is_corrupt() {
-        let mut script = frame(b"shallow-info\n");
-        script.extend(frame(format!("shallow {A}\n").as_bytes()));
-        // One flush ends the section, a second ends the response with no
-        // packfile section: that is corrupt, not a hangup.
-        script.extend(b"0000");
-        script.extend(b"0000");
-        let store = test_store(HashKind::Sha1);
-        let mut pkt = PktReader::new(&script[..], Interrupt::none());
-        assert!(matches!(
-            read_fetch_response(
-                &mut pkt,
-                HashKind::Sha1,
-                &store,
-                IngestLimits::default(),
-                &Interrupt::none(),
-            ),
-            Err(GitError::Corrupt { .. })
-        ));
+        // A section closed by a flush ends the response itself: with no
+        // packfile section that is corrupt, and the reader must stop
+        // there instead of reading past the response end.
+        for tail in [&b"0000"[..], &b"0001"[..]] {
+            let mut script = frame(b"shallow-info\n");
+            script.extend(frame(format!("shallow {A}\n").as_bytes()));
+            script.extend(tail);
+            // A delimiter opens another section, which here ends the
+            // response the same way.
+            if tail == b"0001" {
+                script.extend(b"0000");
+            }
+            let store = test_store(HashKind::Sha1);
+            let mut pkt = PktReader::new(&script[..], Interrupt::none());
+            assert!(matches!(
+                read_fetch_response(
+                    &mut pkt,
+                    HashKind::Sha1,
+                    &store,
+                    IngestLimits::default(),
+                    &Interrupt::none(),
+                ),
+                Err(GitError::Corrupt { .. })
+            ));
+        }
     }
 }
