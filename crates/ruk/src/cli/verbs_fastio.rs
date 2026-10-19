@@ -548,7 +548,7 @@ impl Exporter {
                     };
                     let quoted = quote_path(path);
                     out.extend_from_slice(b"M ");
-                    out.extend_from_slice(format!("{mode} {reference} ").as_bytes());
+                    out.extend_from_slice(format!("{mode:o} {reference} ").as_bytes());
                     out.extend_from_slice(&quoted);
                     out.push(b'\n');
                 }
@@ -657,7 +657,7 @@ fn first_parent_tree(store: &Store, parents: &[Oid]) -> Result<Option<Oid>, GitE
 /// One export file operation: a modify or a delete.
 #[derive(Clone, Debug)]
 enum FileOp {
-    /// `M <mode> <blob> <path>` with the numeric mode spelling.
+    /// `M <mode> <blob> <path>` with the octal mode spelling.
     Modify {
         /// Octal mode (`100644`, `100755`, `120000`, `160000`).
         mode: u32,
