@@ -116,7 +116,10 @@ pub(crate) fn blame(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     // on `HEAD`, the way the oracle blames the working tree by default.
     let (tip, worktree) = match rev_text {
         Some(rev) => {
-            let oid = replace_redirect(store, super::verbs_history::resolve_local(store, kind, &rev)?);
+            let oid = replace_redirect(
+                store,
+                super::verbs_history::resolve_local(store, kind, &rev)?,
+            );
             commit_record(store, oid)?;
             (oid, None)
         }

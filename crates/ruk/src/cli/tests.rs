@@ -4702,7 +4702,12 @@ fn submodule_case(case: &str) -> (PathBuf, CliEnv, PathBuf, String) {
     let env = test_env(&root);
     let mut ctx = repo_ctx(&root, env.clone());
     let url = child_root.to_string_lossy().into_owned();
-    run(verbs_submodule::submodule, &mut ctx, &["add", &url, "vendor/lib"]).expect("add");
+    run(
+        verbs_submodule::submodule,
+        &mut ctx,
+        &["add", &url, "vendor/lib"],
+    )
+    .expect("add");
     (root, env, child_root, child_head)
 }
 
@@ -4719,10 +4724,8 @@ fn submodule_add_records_gitlink_and_modules() {
         .expect("gitlink row");
     assert_eq!(link.2.mode(), ruk_core::index::FileMode::Gitlink);
     assert_eq!(link.2.oid().to_hex(), child_head);
-    let text = String::from_utf8(
-        std::fs::read(root.join(".rukmodules")).expect("modules file"),
-    )
-    .expect("utf8");
+    let text = String::from_utf8(std::fs::read(root.join(".rukmodules")).expect("modules file"))
+        .expect("utf8");
     assert!(text.contains("vendor/lib"), "got {text:?}");
     assert!(
         text.contains(&child_root.to_string_lossy().into_owned()),
@@ -4740,7 +4743,12 @@ fn submodule_add_records_gitlink_and_modules() {
 fn submodule_update_init_materializes_checkout() {
     let (root, env, child_root, child_head) = submodule_case("submodule-update");
     let mut ctx = repo_ctx(&root, env);
-    run(verbs_submodule::submodule, &mut ctx, &["deinit", "vendor/lib"]).expect("deinit");
+    run(
+        verbs_submodule::submodule,
+        &mut ctx,
+        &["deinit", "vendor/lib"],
+    )
+    .expect("deinit");
     assert!(!root.join("vendor/lib").exists());
     let out = run(verbs_submodule::submodule, &mut ctx, &["status"]).expect("status");
     let text = String::from_utf8(out).expect("utf8");
@@ -4748,10 +4756,11 @@ fn submodule_update_init_materializes_checkout() {
         text.starts_with('-') && text.contains("vendor/lib"),
         "got {text:?}"
     );
-    let out = run(verbs_submodule::submodule, &mut ctx, &["update", "--init"])
-        .expect("update");
+    let out = run(verbs_submodule::submodule, &mut ctx, &["update", "--init"]).expect("update");
     assert!(
-        String::from_utf8(out).expect("utf8").contains("checked out"),
+        String::from_utf8(out)
+            .expect("utf8")
+            .contains("checked out"),
         "update reports the checkout"
     );
     assert_eq!(
@@ -4793,11 +4802,7 @@ fn submodule_status_summary_foreach_and_gap() {
     );
     run(verbs_history::commit, &mut ctx, &["-m", "add lib"]).expect("commit");
     let out = run(verbs_submodule::submodule, &mut ctx, &["summary"]).expect("summary");
-    assert!(
-        out.is_empty(),
-        "in sync: {}",
-        String::from_utf8_lossy(&out)
-    );
+    assert!(out.is_empty(), "in sync: {}", String::from_utf8_lossy(&out));
     let err = run(verbs_submodule::submodule, &mut ctx, &["absorbgitdirs"]).expect_err("gap");
     assert!(err.to_string().contains("absorbgitdirs"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -4809,8 +4814,12 @@ fn submodule_deinit_refuses_dirty_without_force() {
     let (root, env, child_root, _) = submodule_case("submodule-deinit");
     let mut ctx = repo_ctx(&root, env);
     std::fs::write(root.join("vendor/lib/lib.txt"), b"dirty\n").expect("dirty file");
-    let err = run(verbs_submodule::submodule, &mut ctx, &["deinit", "vendor/lib"])
-        .expect_err("refuses");
+    let err = run(
+        verbs_submodule::submodule,
+        &mut ctx,
+        &["deinit", "vendor/lib"],
+    )
+    .expect_err("refuses");
     assert!(err.to_string().contains("--force"), "got {err:?}");
     assert!(root.join("vendor/lib/lib.txt").exists());
     run(
@@ -5021,10 +5030,7 @@ fn merge_tree_merges_disjoint_sides() {
     assert!(raw.contains("f.txt"), "got {raw:?}");
     assert!(raw.contains("g.txt"), "got {raw:?}");
     // The index and worktree still hold the theirs tip untouched.
-    assert_eq!(
-        std::fs::read(root.join("f.txt")).expect("read"),
-        b"base\n"
-    );
+    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"base\n");
     assert_eq!(
         std::fs::read(root.join("g.txt")).expect("read"),
         b"theirs\n"
@@ -5076,10 +5082,7 @@ fn read_tree_single_empty_and_checkout() {
     // `-u` restores the worktree from the reseated index.
     std::fs::remove_file(root.join("s.txt")).expect("remove");
     run(verbs_merge_plumbing::read_tree, &mut ctx, &["HEAD", "-u"]).expect("read -u");
-    assert_eq!(
-        std::fs::read(root.join("s.txt")).expect("read"),
-        b"one\n"
-    );
+    assert_eq!(std::fs::read(root.join("s.txt")).expect("read"), b"one\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -5107,14 +5110,15 @@ fn read_tree_merge_stages_conflicts() {
     let text = String::from_utf8(out).expect("utf8");
     assert!(text.contains("f.txt"), "got {text:?}");
     // The worktree keeps the pre-merge bytes; no markers are written.
-    assert_eq!(
-        std::fs::read(root.join("f.txt")).expect("read"),
-        b"c\n"
-    );
+    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"c\n");
     // A clean three-way collapses back to stage zero (clear the stopped
     // stages first: `-m` refuses an unmerged index).
-    run(verbs_merge_plumbing::read_tree, &mut ctx, &["--reset", base.as_str()])
-        .expect("reset clears");
+    run(
+        verbs_merge_plumbing::read_tree,
+        &mut ctx,
+        &["--reset", base.as_str()],
+    )
+    .expect("reset clears");
     run(
         verbs_merge_plumbing::read_tree,
         &mut ctx,
@@ -5141,19 +5145,18 @@ fn checkout_index_round_trip() {
     std::fs::remove_file(root.join("f.txt")).expect("remove");
     let out = run(verbs_merge_plumbing::checkout_index, &mut ctx, &["f.txt"]).expect("checkout");
     assert_eq!(String::from_utf8(out).expect("utf8"), "f.txt\n");
-    assert_eq!(
-        std::fs::read(root.join("f.txt")).expect("read"),
-        b"data\n"
-    );
+    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"data\n");
     // A dirty file refuses without `--force`.
     std::fs::write(root.join("f.txt"), b"dirty\n").expect("dirty");
     let err = run(verbs_merge_plumbing::checkout_index, &mut ctx, &["f.txt"]).expect_err("refuse");
     assert!(err.to_string().contains("no checkout"), "got {err:?}");
-    run(verbs_merge_plumbing::checkout_index, &mut ctx, &["-f", "f.txt"]).expect("force");
-    assert_eq!(
-        std::fs::read(root.join("f.txt")).expect("read"),
-        b"data\n"
-    );
+    run(
+        verbs_merge_plumbing::checkout_index,
+        &mut ctx,
+        &["-f", "f.txt"],
+    )
+    .expect("force");
+    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"data\n");
     // `--prefix` roots the materialization elsewhere.
     run(
         verbs_merge_plumbing::checkout_index,
@@ -5165,8 +5168,12 @@ fn checkout_index_round_trip() {
         std::fs::read(root.join("out/f.txt")).expect("read"),
         b"data\n"
     );
-    let err = run(verbs_merge_plumbing::checkout_index, &mut ctx, &["nope.txt"])
-        .expect_err("missing");
+    let err = run(
+        verbs_merge_plumbing::checkout_index,
+        &mut ctx,
+        &["nope.txt"],
+    )
+    .expect_err("missing");
     assert!(err.to_string().contains("not in the index"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -5175,7 +5182,11 @@ fn checkout_index_round_trip() {
 fn sparse_checkout_set_filters_worktree() {
     let (root, env) = plumbing_repo(
         "sparse",
-        &[("top.txt", b"top\n"), ("sub/a.txt", b"a\n"), ("sub/b.txt", b"b\n")],
+        &[
+            ("top.txt", b"top\n"),
+            ("sub/a.txt", b"a\n"),
+            ("sub/b.txt", b"b\n"),
+        ],
     );
     let mut ctx = repo_ctx(&root, env);
     run(
@@ -5203,22 +5214,16 @@ fn sparse_checkout_set_filters_worktree() {
     assert!(text.contains("sub/"), "got {text:?}");
     // A dirty in-cone file blocks reapply.
     std::fs::write(root.join("sub/a.txt"), b"dirty\n").expect("dirty");
-    let err = run(verbs_sparse::sparse_checkout, &mut ctx, &["set", "sub/"])
-        .expect_err("dirty refuses");
+    let err =
+        run(verbs_sparse::sparse_checkout, &mut ctx, &["set", "sub/"]).expect_err("dirty refuses");
     assert!(
         err.to_string().contains("would be overwritten"),
         "got {err:?}"
     );
     std::fs::write(root.join("sub/a.txt"), b"a\n").expect("restore");
     run(verbs_sparse::sparse_checkout, &mut ctx, &["disable"]).expect("disable");
-    assert_eq!(
-        std::fs::read(root.join("top.txt")).expect("read"),
-        b"top\n"
-    );
-    assert_eq!(
-        std::fs::read(root.join("sub/b.txt")).expect("read"),
-        b"b\n"
-    );
+    assert_eq!(std::fs::read(root.join("top.txt")).expect("read"), b"top\n");
+    assert_eq!(std::fs::read(root.join("sub/b.txt")).expect("read"), b"b\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -5237,7 +5242,10 @@ fn rerere_records_and_replays_resolution() {
     let err = run(verbs_history::merge, &mut ctx, &["side"]).expect_err("conflict");
     assert!(err.to_string().contains("Merge conflict"), "got {err:?}");
     let body = std::fs::read(root.join("f.txt")).expect("read");
-    assert!(String::from_utf8_lossy(&body).contains("<<<<<<<"), "markers");
+    assert!(
+        String::from_utf8_lossy(&body).contains("<<<<<<<"),
+        "markers"
+    );
     // First run records the preimage; nothing is resolved yet.
     let out = run(verbs_merge_plumbing::rerere, &mut ctx, &[]).expect("record");
     assert!(out.is_empty());
@@ -5306,7 +5314,12 @@ fn notes_add_show_list_round_trip() {
     let (root, env) = seeded_repo("notes-round-trip", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
     let head = notes_tip(&mut ctx);
-    run(verbs_notes::notes, &mut ctx, &["add", "-m", "first note", head.as_str()]).expect("add");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["add", "-m", "first note", head.as_str()],
+    )
+    .expect("add");
     let shown = run(verbs_notes::notes, &mut ctx, &["show", head.as_str()]).expect("show");
     assert_eq!(shown, b"first note");
     let listed = String::from_utf8(run(verbs_notes::notes, &mut ctx, &["list"]).expect("list"))
@@ -5315,10 +5328,9 @@ fn notes_add_show_list_round_trip() {
     assert_eq!(line.split_whitespace().count(), 2, "got {listed:?}");
     assert!(line.ends_with(head.as_str()), "got {listed:?}");
     // The notes ref always points at a commit, never a blob or tree.
-    let refname = String::from_utf8(
-        run(verbs_notes::notes, &mut ctx, &["get-ref"]).expect("get-ref"),
-    )
-    .expect("utf8");
+    let refname =
+        String::from_utf8(run(verbs_notes::notes, &mut ctx, &["get-ref"]).expect("get-ref"))
+            .expect("utf8");
     assert_eq!(refname.trim(), "refs/notes/commits");
     let tip = String::from_utf8(
         run(verbs_history::rev_parse, &mut ctx, &["refs/notes/commits"]).expect("notes tip"),
@@ -5336,19 +5348,48 @@ fn notes_append_copy_remove() {
     let first = notes_tip(&mut ctx);
     lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second change");
     let second = notes_tip(&mut ctx);
-    run(verbs_notes::notes, &mut ctx, &["add", "-m", "base", first.as_str()]).expect("add");
-    let err = run(verbs_notes::notes, &mut ctx, &["add", "-m", "again", first.as_str()])
-        .expect_err("clobber refused");
-    assert!(err.to_string().contains("already has a note"), "got {err:?}");
-    run(verbs_notes::notes, &mut ctx, &["append", "-m", "more", first.as_str()]).expect("append");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["add", "-m", "base", first.as_str()],
+    )
+    .expect("add");
+    let err = run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["add", "-m", "again", first.as_str()],
+    )
+    .expect_err("clobber refused");
+    assert!(
+        err.to_string().contains("already has a note"),
+        "got {err:?}"
+    );
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["append", "-m", "more", first.as_str()],
+    )
+    .expect("append");
     let shown = run(verbs_notes::notes, &mut ctx, &["show", first.as_str()]).expect("show");
     assert_eq!(shown, b"base\nmore");
-    run(verbs_notes::notes, &mut ctx, &["copy", first.as_str(), second.as_str()]).expect("copy");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["copy", first.as_str(), second.as_str()],
+    )
+    .expect("copy");
     let shown = run(verbs_notes::notes, &mut ctx, &["show", second.as_str()]).expect("show copy");
     assert_eq!(shown, b"base\nmore");
-    let err = run(verbs_notes::notes, &mut ctx, &["copy", first.as_str(), second.as_str()])
-        .expect_err("copy clobber refused");
-    assert!(err.to_string().contains("already has a note"), "got {err:?}");
+    let err = run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["copy", first.as_str(), second.as_str()],
+    )
+    .expect_err("copy clobber refused");
+    assert!(
+        err.to_string().contains("already has a note"),
+        "got {err:?}"
+    );
     run(
         verbs_notes::notes,
         &mut ctx,
@@ -5359,7 +5400,12 @@ fn notes_append_copy_remove() {
     assert_eq!(shown, b"new");
     let shown = run(verbs_notes::notes, &mut ctx, &["show", second.as_str()]).expect("copy kept");
     assert_eq!(shown, b"base\nmore");
-    run(verbs_notes::notes, &mut ctx, &["remove", first.as_str(), second.as_str()]).expect("remove");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["remove", first.as_str(), second.as_str()],
+    )
+    .expect("remove");
     let listed = run(verbs_notes::notes, &mut ctx, &["list"]).expect("list");
     assert!(listed.is_empty(), "got {listed:?}");
     let err = run(verbs_notes::notes, &mut ctx, &["show", first.as_str()]).expect_err("gone");
@@ -5374,9 +5420,16 @@ fn notes_refs_merge_and_prune() {
     let (root, env) = seeded_repo("notes-merge-prune", "f.txt", b"v1\n");
     let mut ctx = repo_ctx(&root, env);
     let head = notes_tip(&mut ctx);
-    let out = run(verbs_notes::notes, &mut ctx, &["get-ref", "--ref", "my-notes"])
-        .expect("get-ref");
-    assert_eq!(String::from_utf8(out).expect("utf8").trim(), "refs/notes/my-notes");
+    let out = run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["get-ref", "--ref", "my-notes"],
+    )
+    .expect("get-ref");
+    assert_eq!(
+        String::from_utf8(out).expect("utf8").trim(),
+        "refs/notes/my-notes"
+    );
     run(
         verbs_notes::notes,
         &mut ctx,
@@ -5391,16 +5444,32 @@ fn notes_refs_merge_and_prune() {
     run(
         verbs_notes::notes,
         &mut ctx,
-        &["--ref", "my-notes", "add", "-f", "-m", "diverged", head.as_str()],
+        &[
+            "--ref",
+            "my-notes",
+            "add",
+            "-f",
+            "-m",
+            "diverged",
+            head.as_str(),
+        ],
     )
     .expect("diverge");
-    let err = run(verbs_notes::notes, &mut ctx, &["merge", "my-notes"])
-        .expect_err("conflict refused");
-    assert!(err.to_string().contains("differs on both sides"), "got {err:?}");
+    let err =
+        run(verbs_notes::notes, &mut ctx, &["merge", "my-notes"]).expect_err("conflict refused");
+    assert!(
+        err.to_string().contains("differs on both sides"),
+        "got {err:?}"
+    );
     // A note for a missing object prunes away; live notes stay.
     let mut ghost = head.clone();
     ghost.replace_range(0..1, if &head[0..1] == "a" { "b" } else { "a" });
-    run(verbs_notes::notes, &mut ctx, &["add", "-m", "ghost", ghost.as_str()]).expect("ghost");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["add", "-m", "ghost", ghost.as_str()],
+    )
+    .expect("ghost");
     let dry = String::from_utf8(run(verbs_notes::notes, &mut ctx, &["prune", "-n"]).expect("dry"))
         .expect("utf8");
     assert!(dry.contains(&format!("would prune {ghost}")), "got {dry:?}");
@@ -5410,7 +5479,10 @@ fn notes_refs_merge_and_prune() {
     let pruned =
         String::from_utf8(run(verbs_notes::notes, &mut ctx, &["prune", "-v"]).expect("prune"))
             .expect("utf8");
-    assert!(pruned.contains(&format!("pruned {ghost}")), "got {pruned:?}");
+    assert!(
+        pruned.contains(&format!("pruned {ghost}")),
+        "got {pruned:?}"
+    );
     let shown = run(verbs_notes::notes, &mut ctx, &["show", head.as_str()]).expect("live kept");
     assert_eq!(shown, b"custom");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -5425,7 +5497,12 @@ fn replace_redirects_history_verbs() {
     let second = notes_tip(&mut ctx);
     let before = run(verbs_history::diff, &mut ctx, &[first.as_str()]).expect("diff before");
     assert!(!before.is_empty(), "baseline diff is empty");
-    run(verbs_notes::replace, &mut ctx, &[first.as_str(), second.as_str()]).expect("create");
+    run(
+        verbs_notes::replace,
+        &mut ctx,
+        &[first.as_str(), second.as_str()],
+    )
+    .expect("create");
     // Raw resolution still spells the stored oid.
     assert_eq!(notes_tip_of(&mut ctx, first.as_str()), first);
     // Log walks the replacement: only the second subject renders.
@@ -5436,10 +5513,9 @@ fn replace_redirects_history_verbs() {
     assert!(logged.contains("second change"), "got {logged:?}");
     assert!(!logged.contains("seed"), "got {logged:?}");
     // Show renders the replacement commit.
-    let shown = String::from_utf8(
-        run(verbs_history::show, &mut ctx, &[first.as_str()]).expect("show"),
-    )
-    .expect("utf8");
+    let shown =
+        String::from_utf8(run(verbs_history::show, &mut ctx, &[first.as_str()]).expect("show"))
+            .expect("utf8");
     assert!(shown.contains("second change"), "got {shown:?}");
     // Diff against the worktree (which holds v2) goes quiet.
     let after = run(verbs_history::diff, &mut ctx, &[first.as_str()]).expect("diff after");
@@ -5451,7 +5527,12 @@ fn replace_redirects_history_verbs() {
     .expect("utf8");
     assert!(blamed.contains(&second[..7]), "got {blamed:?}");
     // Checkout materializes the replacement tree.
-    run(verbs_branch::checkout, &mut ctx, &["--detach", first.as_str()]).expect("detach");
+    run(
+        verbs_branch::checkout,
+        &mut ctx,
+        &["--detach", first.as_str()],
+    )
+    .expect("detach");
     assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"v2\n");
     // Deleting the replacement restores the original history.
     run(verbs_notes::replace, &mut ctx, &["-d", first.as_str()]).expect("delete");
@@ -5472,23 +5553,38 @@ fn replace_list_force_delete() {
     let second = notes_tip(&mut ctx);
     lane_commit(&mut ctx, &root, "f.txt", b"v3\n", "third change");
     let third = notes_tip(&mut ctx);
-    run(verbs_notes::replace, &mut ctx, &[first.as_str(), second.as_str()]).expect("create");
-    let err = run(verbs_notes::replace, &mut ctx, &[first.as_str(), third.as_str()])
-        .expect_err("clobber refused");
+    run(
+        verbs_notes::replace,
+        &mut ctx,
+        &[first.as_str(), second.as_str()],
+    )
+    .expect("create");
+    let err = run(
+        verbs_notes::replace,
+        &mut ctx,
+        &[first.as_str(), third.as_str()],
+    )
+    .expect_err("clobber refused");
     assert!(err.to_string().contains("already exists"), "got {err:?}");
     let listed = String::from_utf8(run(verbs_notes::replace, &mut ctx, &["-l"]).expect("list"))
         .expect("utf8");
     assert_eq!(listed.trim(), first.as_str());
     let pattern = format!("{}*", &first[..12]);
-    let filtered =
-        String::from_utf8(run(verbs_notes::replace, &mut ctx, &["-l", pattern.as_str()]).expect("glob"))
-            .expect("utf8");
+    let filtered = String::from_utf8(
+        run(verbs_notes::replace, &mut ctx, &["-l", pattern.as_str()]).expect("glob"),
+    )
+    .expect("utf8");
     assert_eq!(filtered.trim(), first.as_str());
     let missed =
         String::from_utf8(run(verbs_notes::replace, &mut ctx, &["-l", "no-such-*"]).expect("miss"))
             .expect("utf8");
     assert!(missed.is_empty(), "got {missed:?}");
-    run(verbs_notes::replace, &mut ctx, &["-f", first.as_str(), third.as_str()]).expect("force");
+    run(
+        verbs_notes::replace,
+        &mut ctx,
+        &["-f", first.as_str(), third.as_str()],
+    )
+    .expect("force");
     let shown = String::from_utf8(
         run(verbs_history::show, &mut ctx, &[first.as_str()]).expect("show third"),
     )
@@ -5497,16 +5593,24 @@ fn replace_list_force_delete() {
     run(verbs_notes::replace, &mut ctx, &["-d", first.as_str()]).expect("delete");
     let listed = run(verbs_notes::replace, &mut ctx, &["-l"]).expect("empty");
     assert!(listed.is_empty(), "got {listed:?}");
-    let err = run(verbs_notes::replace, &mut ctx, &["-d", first.as_str()])
-        .expect_err("double delete");
+    let err =
+        run(verbs_notes::replace, &mut ctx, &["-d", first.as_str()]).expect_err("double delete");
     assert!(err.to_string().contains("no replacement"), "got {err:?}");
-    let err = run(verbs_notes::replace, &mut ctx, &[second.as_str(), second.as_str()])
-        .expect_err("self refused");
+    let err = run(
+        verbs_notes::replace,
+        &mut ctx,
+        &[second.as_str(), second.as_str()],
+    )
+    .expect_err("self refused");
     assert!(err.to_string().contains("itself"), "got {err:?}");
     let mut ghost = second.clone();
     ghost.replace_range(0..1, if &second[0..1] == "a" { "b" } else { "a" });
-    let err = run(verbs_notes::replace, &mut ctx, &[ghost.as_str(), third.as_str()])
-        .expect_err("missing orig");
+    let err = run(
+        verbs_notes::replace,
+        &mut ctx,
+        &[ghost.as_str(), third.as_str()],
+    )
+    .expect_err("missing orig");
     assert!(err.to_string().contains("does not exist"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -5546,10 +5650,9 @@ fn fastio_import_creates_branch_history() {
     let log = String::from_utf8(run(verbs_history::log, &mut ctx, &["--oneline"]).expect("log"))
         .expect("utf8");
     assert!(log.contains("first import"), "got {log:?}");
-    let body = String::from_utf8(
-        run(verbs_objects::cat_file, &mut ctx, &["-p", head]).expect("cat-file"),
-    )
-    .expect("utf8");
+    let body =
+        String::from_utf8(run(verbs_objects::cat_file, &mut ctx, &["-p", head]).expect("cat-file"))
+            .expect("utf8");
     assert!(body.contains("first import"), "got {body:?}");
     // The importer never touches the worktree: a checkout materializes it.
     assert!(!root.join("hello.txt").exists());
@@ -5564,7 +5667,10 @@ fn fastio_export_import_roundtrip() {
     run(verbs_branch::tag, &mut ctx, &["v1"]).expect("tag");
     let stream = run(verbs_fastio::fast_export, &mut ctx, &["--all"]).expect("export");
     let text = String::from_utf8(stream.clone()).expect("utf8");
-    assert!(text.contains("commit refs/heads/main\nmark :"), "got {text:?}");
+    assert!(
+        text.contains("commit refs/heads/main\nmark :"),
+        "got {text:?}"
+    );
     assert!(text.contains("\nblob\nmark :"), "got {text:?}");
     assert!(text.contains("from :"), "got {text:?}");
     assert!(text.contains("reset refs/tags/v1\n"), "got {text:?}");
@@ -5600,11 +5706,22 @@ fn fastio_export_import_roundtrip() {
 fn fastio_export_marks_skip_known_objects() {
     let (root, env) = seeded_repo("fastio-marks", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
-    run(verbs_fastio::fast_export, &mut ctx, &["--export-marks=marks.out"]).expect("export");
+    run(
+        verbs_fastio::fast_export,
+        &mut ctx,
+        &["--export-marks=marks.out"],
+    )
+    .expect("export");
     let marks = std::fs::read(root.join("marks.out")).expect("marks file");
     let marks_text = String::from_utf8(marks).expect("utf8");
-    assert!(!marks_text.contains("refs/heads/main"), "marks hold oids, got {marks_text:?}");
-    assert!(marks_text.lines().all(|line| line.starts_with(':')), "got {marks_text:?}");
+    assert!(
+        !marks_text.contains("refs/heads/main"),
+        "marks hold oids, got {marks_text:?}"
+    );
+    assert!(
+        marks_text.lines().all(|line| line.starts_with(':')),
+        "got {marks_text:?}"
+    );
     let again = run(
         verbs_fastio::fast_export,
         &mut ctx,
@@ -5625,10 +5742,11 @@ fn fastio_range_diff_pairs_patches() {
     let (root, env) = seeded_repo("fastio-range-diff", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
     lane_commit(&mut ctx, &root, "f.txt", b"one\ntwo\n", "change two");
-    let base = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("base"))
-        .expect("utf8")
-        .trim()
-        .to_owned();
+    let base =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("base"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     let main = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("main"))
         .expect("utf8")
         .trim()
@@ -5652,10 +5770,11 @@ fn fastio_range_diff_pairs_patches() {
     assert!(same.contains("change two"), "got {same:?}");
     run(verbs_branch::checkout, &mut ctx, &["-b", "side2", &base]).expect("checkout -b");
     lane_commit(&mut ctx, &root, "f.txt", b"one\nTHREE\n", "change two");
-    let moved = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("moved"))
-        .expect("utf8")
-        .trim()
-        .to_owned();
+    let moved =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("moved"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     let changed = String::from_utf8(
         run(
             verbs_fastio::range_diff,
@@ -5689,8 +5808,14 @@ fn fastio_request_pull_template() {
         .expect("request-pull"),
     )
     .expect("utf8");
-    assert!(out.contains(&format!("The following changes since commit {start}:")), "got {out:?}");
-    assert!(out.contains("are available in the Git repository at:"), "got {out:?}");
+    assert!(
+        out.contains(&format!("The following changes since commit {start}:")),
+        "got {out:?}"
+    );
+    assert!(
+        out.contains("are available in the Git repository at:"),
+        "got {out:?}"
+    );
     assert!(out.contains("https://example.invalid/repo"), "got {out:?}");
     assert!(out.contains("change two"), "got {out:?}");
     assert!(out.contains("f.txt"), "got {out:?}");

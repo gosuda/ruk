@@ -186,7 +186,11 @@ struct ExportPlan {
 }
 
 /// Resolves export arguments to named refs, anonymous tips, and exclusions.
-fn export_plan(store: &Store, kind: HashKind, opts: &super::Collected) -> Result<ExportPlan, GitError> {
+fn export_plan(
+    store: &Store,
+    kind: HashKind,
+    opts: &super::Collected,
+) -> Result<ExportPlan, GitError> {
     let mut plan = ExportPlan::default();
     let mut seen: HashSet<String> = HashSet::new();
     if opts.positionals.is_empty() && !opts.is_set("all") {
@@ -909,7 +913,8 @@ impl Importer {
 
     /// Writes every assigned mark ordered by mark number.
     fn save_marks(&self, path: &Path) -> Result<(), GitError> {
-        let mut rows: Vec<(u64, Oid)> = self.marks.iter().map(|(mark, oid)| (*mark, *oid)).collect();
+        let mut rows: Vec<(u64, Oid)> =
+            self.marks.iter().map(|(mark, oid)| (*mark, *oid)).collect();
         rows.sort();
         write_marks_file(path, &rows)
     }
@@ -953,7 +958,11 @@ impl Importer {
     }
 
     /// Reads a `blob` command: an optional mark plus one data block.
-    fn read_blob(&mut self, context: &ImportCx<'_>, cursor: &mut Cursor<'_>) -> Result<(), GitError> {
+    fn read_blob(
+        &mut self,
+        context: &ImportCx<'_>,
+        cursor: &mut Cursor<'_>,
+    ) -> Result<(), GitError> {
         let mut mark = None;
         let mut body = None;
         while let Some(line) = cursor.read_line()? {
@@ -1110,9 +1119,12 @@ impl Importer {
             }
             "R" | "C" => {
                 let (source, dest) = split_quoted_pair(arg)?;
-                let entry = tree.get(&source).copied().ok_or_else(|| GitError::Invalid {
-                    detail: format!("{word} reads missing path {source:?}"),
-                })?;
+                let entry = tree
+                    .get(&source)
+                    .copied()
+                    .ok_or_else(|| GitError::Invalid {
+                        detail: format!("{word} reads missing path {source:?}"),
+                    })?;
                 if word == "R" {
                     tree.remove(&source);
                 }
@@ -1158,9 +1170,12 @@ impl Importer {
         let number: u64 = digits.parse().map_err(|_| GitError::Invalid {
             detail: format!("bad mark {text:?}"),
         })?;
-        self.marks.get(&number).copied().ok_or_else(|| GitError::Invalid {
-            detail: format!("mark :{number} is not defined"),
-        })
+        self.marks
+            .get(&number)
+            .copied()
+            .ok_or_else(|| GitError::Invalid {
+                detail: format!("mark :{number} is not defined"),
+            })
     }
 
     /// Resolves an `M` data reference: a defined mark or a stored object.
@@ -1242,8 +1257,13 @@ impl Importer {
                     }
                 };
                 let short = full.trim_start_matches("refs/tags/");
-                let payload =
-                    tag_payload(&target.to_hex(), type_name, short, tagger.as_ref(), &message);
+                let payload = tag_payload(
+                    &target.to_hex(),
+                    type_name,
+                    short,
+                    tagger.as_ref(),
+                    &message,
+                );
                 store_object(context.store, ObjectKind::Tag, payload)?
             }
             (Some(target), None) => target,
@@ -1560,7 +1580,10 @@ fn find_quoted_end(arg: &[u8]) -> Result<usize, GitError> {
 }
 
 /// Flattens one commit's tree into a path map for file-operation editing.
-fn tree_of(context: &ImportCx<'_>, oid: Oid) -> Result<BTreeMap<Vec<u8>, (TreeMode, Oid)>, GitError> {
+fn tree_of(
+    context: &ImportCx<'_>,
+    oid: Oid,
+) -> Result<BTreeMap<Vec<u8>, (TreeMode, Oid)>, GitError> {
     let tree = commit_tree_oid(&commit_record(context.store, oid)?)?;
     let mut map = BTreeMap::new();
     for (path, mode, entry) in flatten_tree(context.store, context.kind, tree)? {
@@ -1682,8 +1705,12 @@ pub(crate) fn range_diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
             }
             None => {
                 out.extend_from_slice(
-                    format!("{left_num}:  {} < -:  -------- {}\n", short_hex(oid), left_prints[left_index].1)
-                        .as_bytes(),
+                    format!(
+                        "{left_num}:  {} < -:  -------- {}\n",
+                        short_hex(oid),
+                        left_prints[left_index].1
+                    )
+                    .as_bytes(),
                 );
             }
         }
@@ -1736,7 +1763,10 @@ fn match_ranges(
     let mut subject_waiting: HashMap<&str, VecDeque<usize>> = HashMap::new();
     for (index, (_, subject)) in right_prints.iter().enumerate() {
         if !taken[index] {
-            subject_waiting.entry(subject.as_str()).or_default().push_back(index);
+            subject_waiting
+                .entry(subject.as_str())
+                .or_default()
+                .push_back(index);
         }
     }
     for (left_index, (_, subject)) in left_prints.iter().enumerate() {
@@ -1800,7 +1830,13 @@ fn fingerprint(
 ) -> Result<String, GitError> {
     let new_tree = commit_tree_oid(record)?;
     let new_map = flat_records(store, kind, Some(new_tree))?;
-    let old_map = match record.parents().iter().filter_map(Head::as_git).copied().next() {
+    let old_map = match record
+        .parents()
+        .iter()
+        .filter_map(Head::as_git)
+        .copied()
+        .next()
+    {
         None => BTreeMap::new(),
         Some(parent) => {
             let tree = commit_tree_oid(&commit_record(store, parent)?)?;

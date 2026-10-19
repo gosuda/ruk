@@ -42,8 +42,7 @@ use super::state::{
     IdentityRole, apply_refs, commit_record, identity, list_refs, read_ref, resolve_rev_raw,
 };
 use super::tree::{
-    TreeEntry, TreeMode, commit_payload, encode_tree, flatten_tree, read_object_bytes,
-    store_object,
+    TreeEntry, TreeMode, commit_payload, encode_tree, flatten_tree, read_object_bytes, store_object,
 };
 use super::{Collected, Ctx, FlagSpec, collect};
 
@@ -183,7 +182,10 @@ fn store_notes(ctx: &Ctx, name: &RefName, head: &NotesHead, message: &str) -> Re
     let tree_oid = store_object(store, ObjectKind::Tree, encode_tree(&tree_entries))?;
     let author = identity(ctx, IdentityRole::Author)?;
     let committer = identity(ctx, IdentityRole::Committer)?;
-    let parents = head.commit.map(|oid| vec![oid.to_hex()]).unwrap_or_default();
+    let parents = head
+        .commit
+        .map(|oid| vec![oid.to_hex()])
+        .unwrap_or_default();
     let payload = commit_payload(
         &tree_oid.to_hex(),
         &parents,
@@ -421,7 +423,12 @@ fn notes_upsert(
     let body = note_message(ctx, opts)?;
     let blob = store_object(store, ObjectKind::Blob, body)?;
     head.entries.insert(oid.to_hex(), blob);
-    store_notes(ctx, &name, &head, &format!("notes: note for {}", oid.to_hex()))?;
+    store_notes(
+        ctx,
+        &name,
+        &head,
+        &format!("notes: note for {}", oid.to_hex()),
+    )?;
     Ok(Vec::new())
 }
 
@@ -457,7 +464,12 @@ fn notes_append(ctx: &Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>,
     combined.extend_from_slice(&addition);
     let blob = store_object(store, ObjectKind::Blob, combined)?;
     head.entries.insert(oid.to_hex(), blob);
-    store_notes(ctx, &name, &head, &format!("notes: append for {}", oid.to_hex()))?;
+    store_notes(
+        ctx,
+        &name,
+        &head,
+        &format!("notes: append for {}", oid.to_hex()),
+    )?;
     Ok(Vec::new())
 }
 

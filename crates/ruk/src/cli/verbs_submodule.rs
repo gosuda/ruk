@@ -137,10 +137,14 @@ pub(crate) fn submodule(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
         },
     ];
     let opts = collect(args, &specs)?;
-    let (cmd, rest) = opts.positionals.split_first().ok_or_else(|| GitError::Invalid {
-        detail: "usage: submodule <add|status|init|deinit|update|summary|foreach|absorbgitdirs>"
-            .to_owned(),
-    })?;
+    let (cmd, rest) = opts
+        .positionals
+        .split_first()
+        .ok_or_else(|| GitError::Invalid {
+            detail:
+                "usage: submodule <add|status|init|deinit|update|summary|foreach|absorbgitdirs>"
+                    .to_owned(),
+        })?;
     match cmd.as_str() {
         "add" => cmd_add(ctx, &opts, rest),
         "status" => cmd_status(ctx, &opts, rest),
@@ -279,11 +283,7 @@ fn cli_path(ctx: &Ctx, raw: &str) -> Result<RepoPath, GitError> {
 }
 
 /// Reads the gitlink oid staged at `path`, if the row is a gitlink.
-fn index_gitlink(
-    store: &Store,
-    kind: HashKind,
-    path: &RepoPath,
-) -> Result<Option<Oid>, GitError> {
+fn index_gitlink(store: &Store, kind: HashKind, path: &RepoPath) -> Result<Option<Oid>, GitError> {
     for (stage, entry, _) in read_path_rows(store, kind, path)? {
         if stage == Stage::Zero {
             return Ok(if entry.mode() == FileMode::Gitlink {
@@ -419,9 +419,7 @@ fn cmd_add(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>, 
         });
     }
     let repo_path = cli_path(ctx, path_text)?;
-    let name = opts
-        .single("name")?
-        .unwrap_or_else(|| path_text.to_owned());
+    let name = opts.single("name")?.unwrap_or_else(|| path_text.to_owned());
     if name.is_empty() || name.contains('"') || name.contains('\n') {
         return Err(GitError::Invalid {
             detail: format!("bad submodule name {name:?}"),
@@ -435,9 +433,7 @@ fn cmd_add(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>, 
             .any(|entry| entry.path == path_text || entry.name == name)
     {
         return Err(GitError::Invalid {
-            detail: format!(
-                "{path_text:?} is already a submodule; use --force to replace it"
-            ),
+            detail: format!("{path_text:?} is already a submodule; use --force to replace it"),
         });
     }
     let child_root = ctx.root.join(path_text);
@@ -587,11 +583,12 @@ fn clone_local_into(
                 .strip_prefix("refs/heads/")
                 .unwrap_or("")
                 .to_owned();
-            let remote_name = RefName::new(format!("refs/remotes/origin/{short}")).map_err(|err| {
-                GitError::Invalid {
-                    detail: format!("remote-tracking ref refused: {err}"),
-                }
-            })?;
+            let remote_name =
+                RefName::new(format!("refs/remotes/origin/{short}")).map_err(|err| {
+                    GitError::Invalid {
+                        detail: format!("remote-tracking ref refused: {err}"),
+                    }
+                })?;
             updates.push(RefUpdate {
                 name: remote_name,
                 expected: RefExpect::Absent,
@@ -788,7 +785,9 @@ fn write_flat_index(
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-    child.publish(Vec::new(), &mutations).map_err(GitError::from)?;
+    child
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
     Ok(())
 }
 
@@ -862,9 +861,12 @@ fn status_into(
             _ => None,
         };
         if unmerged.contains_key(entry.path.as_bytes()) {
-            let oid = index_oid.copied().or(head_oid_opt).ok_or_else(|| GitError::NotFound {
-                detail: format!("no gitlink recorded for {:?}", entry.path),
-            })?;
+            let oid = index_oid
+                .copied()
+                .or(head_oid_opt)
+                .ok_or_else(|| GitError::NotFound {
+                    detail: format!("no gitlink recorded for {:?}", entry.path),
+                })?;
             out.extend_from_slice(
                 format!("U{} {display} (missing gitlink)\n", oid.to_hex()).as_bytes(),
             );
@@ -1029,7 +1031,11 @@ fn describe_child(child: Option<&Store>) -> Result<String, GitError> {
 }
 
 /// Loads module bindings rooted at `root` (worktree file, else the store).
-fn load_modules_at(root: &Path, store: &Store, kind: HashKind) -> Result<Vec<SubmoduleEntry>, GitError> {
+fn load_modules_at(
+    root: &Path,
+    store: &Store,
+    kind: HashKind,
+) -> Result<Vec<SubmoduleEntry>, GitError> {
     let file = root.join(".rukmodules");
     if let Ok(bytes) = std::fs::read(&file) {
         return Ok(parse_gitmodules(&bytes));
@@ -1226,8 +1232,9 @@ fn cmd_update(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8
     ctx.require_worktree()?;
     if opts.is_set("merge") || opts.is_set("rebase") {
         return Err(GitError::Unsupported {
-            command: "submodule update --merge/--rebase: only the checkout update mode is implemented"
-                .to_owned(),
+            command:
+                "submodule update --merge/--rebase: only the checkout update mode is implemented"
+                    .to_owned(),
         });
     }
     let depth = match opts.single("depth")? {
@@ -1352,7 +1359,10 @@ fn fetch_remote_tip(
         // Urls recorded by `add` are used verbatim; only absolute local
         // paths resolve for `--remote` fetches.
         return Err(GitError::Offline {
-            detail: format!("cannot fetch remote tip for {:?}: {url:?} is not local", entry.path),
+            detail: format!(
+                "cannot fetch remote tip for {:?}: {url:?} is not local",
+                entry.path
+            ),
         });
     };
     let src_store = open_store(&src_root.join(".ruk"))?;
@@ -1384,11 +1394,10 @@ fn fetch_remote_tip(
         ruk_git::transport::pack::IngestLimits::default(),
         &ruk_git::transport::Interrupt::none(),
     )?;
-    let name = RefName::new(format!("refs/remotes/origin/{branch}")).map_err(|err| {
-        GitError::Invalid {
+    let name =
+        RefName::new(format!("refs/remotes/origin/{branch}")).map_err(|err| GitError::Invalid {
             detail: format!("remote-tracking ref refused: {err}"),
-        }
-    })?;
+        })?;
     apply_refs(
         child,
         kind,
@@ -1567,7 +1576,9 @@ fn foreach_into(
             continue;
         };
         let display = format!("{prefix}{}", entry.path);
-        let sha1 = head_oid(&child_store).map(|oid| oid.to_hex()).unwrap_or_default();
+        let sha1 = head_oid(&child_store)
+            .map(|oid| oid.to_hex())
+            .unwrap_or_default();
         out.extend_from_slice(format!("Entering '{display}'\n").as_bytes());
         let output = std::process::Command::new("sh")
             .arg("-c")

@@ -40,7 +40,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use ruk_core::ids::Oid;
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
-use ruk_core::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store};
+use ruk_core::store::{
+    FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store,
+};
 use ruk_git::GitError;
 use serde::{Deserialize, Serialize};
 
@@ -693,9 +695,7 @@ pub(crate) fn merge_tree(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
         out.extend_from_slice(format!("CONFLICT (content): Merge conflict in {path}\n").as_bytes());
     }
     if !conflicted.is_empty() && !opts.is_set("quiet") {
-        ctx.emit_stderr(
-            format!("merge-tree: {} conflict(s)\n", conflicted.len()).as_bytes(),
-        );
+        ctx.emit_stderr(format!("merge-tree: {} conflict(s)\n", conflicted.len()).as_bytes());
     }
     Ok(line(out))
 }
@@ -737,7 +737,11 @@ fn lane_index_entry(
 }
 
 /// Reads one blob body through a small oid-keyed cache.
-fn lane_blob(store: &Store, cache: &mut HashMap<Oid, Vec<u8>>, oid: Oid) -> Result<Vec<u8>, GitError> {
+fn lane_blob(
+    store: &Store,
+    cache: &mut HashMap<Oid, Vec<u8>>,
+    oid: Oid,
+) -> Result<Vec<u8>, GitError> {
     if let Some(hit) = cache.get(&oid) {
         return Ok(hit.clone());
     }
@@ -798,7 +802,10 @@ fn merge_tree_path(
         }
         (Some(base_side), Some(ours_side), Some(theirs_side)) => {
             if ours_side == base_side {
-                return Ok(TreePathOutcome::Take(index_side(theirs_side)?, theirs_side.1));
+                return Ok(TreePathOutcome::Take(
+                    index_side(theirs_side)?,
+                    theirs_side.1,
+                ));
             }
             if theirs_side == base_side {
                 return Ok(TreePathOutcome::Take(index_side(ours_side)?, ours_side.1));
@@ -831,9 +838,7 @@ fn tree_content_merge(
     // lane; add/add with equal modes takes either.
     let mode = match base {
         Some((base_tree_mode, _)) => {
-            let base_file = base_tree_mode
-                .as_index_mode()
-                .unwrap_or(FileMode::Regular);
+            let base_file = base_tree_mode.as_index_mode().unwrap_or(FileMode::Regular);
             if ours_mode != base_file {
                 ours_mode
             } else {
@@ -885,7 +890,14 @@ fn tree_content_merge(
         Some((bytes, true)) => Ok(TreePathOutcome::Conflict(FileMode::Regular, bytes)),
         None => Ok(TreePathOutcome::Conflict(
             FileMode::Regular,
-            whole_file_conflict(&ours_bytes, &theirs_bytes, labels, MarkerStyle::Normal, b"<<<<<<<", &base_bytes),
+            whole_file_conflict(
+                &ours_bytes,
+                &theirs_bytes,
+                labels,
+                MarkerStyle::Normal,
+                b"<<<<<<<",
+                &base_bytes,
+            ),
         )),
     }
 }
@@ -1022,9 +1034,7 @@ fn read_tree_empty(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
         mutations.extend(path_row_mutations(path, &seen, &[])?);
     }
     let (workspace, raw) = load_or_default(store)?;
-    let next = workspace
-        .mutate_index(workspace.stamp)
-        .map_err(core_err)?;
+    let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
         .publish(Vec::new(), &mutations)
@@ -1109,9 +1119,7 @@ fn read_tree_merge(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
         )?);
     }
     let (workspace, raw) = load_or_default(store)?;
-    let next = workspace
-        .mutate_index(workspace.stamp)
-        .map_err(core_err)?;
+    let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
         .publish(Vec::new(), &mutations)
@@ -1131,12 +1139,26 @@ fn read_merge_resolution(
     theirs: Option<(TreeMode, Oid)>,
 ) -> Result<Vec<(Stage, IndexEntry)>, GitError> {
     let entry = |side: (TreeMode, Oid)| -> Result<IndexEntry, GitError> {
-        IndexEntry::new(side.1, side.0.as_index_mode().map_err(core_err)?, None, IndexFlags::default())
-            .map_err(core_err)
+        IndexEntry::new(
+            side.1,
+            side.0.as_index_mode().map_err(core_err)?,
+            None,
+            IndexFlags::default(),
+        )
+        .map_err(core_err)
     };
-    let stages = |sides: (Option<(TreeMode, Oid)>, Option<(TreeMode, Oid)>, Option<(TreeMode, Oid)>)| -> Result<Vec<(Stage, IndexEntry)>, GitError> {
+    let stages = |sides: (
+        Option<(TreeMode, Oid)>,
+        Option<(TreeMode, Oid)>,
+        Option<(TreeMode, Oid)>,
+    )|
+     -> Result<Vec<(Stage, IndexEntry)>, GitError> {
         let mut out = Vec::new();
-        for (side, stage) in [(sides.0, Stage::Base), (sides.1, Stage::Ours), (sides.2, Stage::Theirs)] {
+        for (side, stage) in [
+            (sides.0, Stage::Base),
+            (sides.1, Stage::Ours),
+            (sides.2, Stage::Theirs),
+        ] {
             if let Some(present) = side {
                 out.push((stage, entry(present)?));
             }
@@ -1145,7 +1167,9 @@ fn read_merge_resolution(
     };
     match (base, ours, theirs) {
         (None, None, None) => Ok(Vec::new()),
-        (None, Some(side), None) | (None, None, Some(side)) => Ok(vec![(Stage::Zero, entry(side)?)]),
+        (None, Some(side), None) | (None, None, Some(side)) => {
+            Ok(vec![(Stage::Zero, entry(side)?)])
+        }
         (None, Some(one), Some(other)) => {
             if one == other {
                 return Ok(vec![(Stage::Zero, entry(one)?)]);
@@ -1236,15 +1260,27 @@ fn checkout_touched(
                     (Some(current), Some(wanted)) if current != wanted => {
                         // Overwrite only when the worktree still shows the
                         // old index bytes (or nothing does).
-                        let old_bytes = old
-                            .and_then(|(_, oid)| lane_blob(store, &mut cache, *oid).ok());
+                        let old_bytes =
+                            old.and_then(|(_, oid)| lane_blob(store, &mut cache, *oid).ok());
                         if Some(current) != old_bytes {
                             blocked.push(String::from_utf8_lossy(path).into_owned());
                             continue;
                         }
-                        writes.push((path.clone(), TouchedWrite::Blob { mode: *mode, oid: *oid }));
+                        writes.push((
+                            path.clone(),
+                            TouchedWrite::Blob {
+                                mode: *mode,
+                                oid: *oid,
+                            },
+                        ));
                     }
-                    _ => writes.push((path.clone(), TouchedWrite::Blob { mode: *mode, oid: *oid })),
+                    _ => writes.push((
+                        path.clone(),
+                        TouchedWrite::Blob {
+                            mode: *mode,
+                            oid: *oid,
+                        },
+                    )),
                 }
             }
             (Some(_), None) => {
@@ -1254,8 +1290,7 @@ fn checkout_touched(
                 if !full.is_symlink() && !full.is_file() {
                     continue;
                 }
-                let old_bytes = old
-                    .and_then(|(_, oid)| lane_blob(store, &mut cache, *oid).ok());
+                let old_bytes = old.and_then(|(_, oid)| lane_blob(store, &mut cache, *oid).ok());
                 let current = std::fs::read(&full).ok();
                 if current != old_bytes {
                     blocked.push(String::from_utf8_lossy(path).into_owned());
@@ -1451,7 +1486,11 @@ pub(crate) fn checkout_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, 
     if opts.is_set("stdin") {
         let text = read_stdin_text(&ctx.env)?;
         if opts.is_set("z") {
-            wanted.extend(text.split('\0').filter(|part| !part.is_empty()).map(str::to_owned));
+            wanted.extend(
+                text.split('\0')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned),
+            );
         } else {
             wanted.extend(
                 text.lines()
@@ -1509,7 +1548,10 @@ pub(crate) fn checkout_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, 
     for path in targets {
         let Some(stages) = by_path.get(&path) else {
             return Err(GitError::NotFound {
-                detail: format!("path is not in the index: {:?}", String::from_utf8_lossy(&path)),
+                detail: format!(
+                    "path is not in the index: {:?}",
+                    String::from_utf8_lossy(&path)
+                ),
             });
         };
         let entry = match stage {
@@ -1621,13 +1663,11 @@ struct RerereRecord {
 /// matching preimages onto current conflicts (staging stage zero) and
 /// records fresh preimages; newly resolved paths graduate to postimages.
 pub(crate) fn rerere(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [
-        FlagSpec {
-            long: "rerere-autoupdate",
-            short: None,
-            takes_value: false,
-        },
-    ];
+    let specs = [FlagSpec {
+        long: "rerere-autoupdate",
+        short: None,
+        takes_value: false,
+    }];
     let opts = collect(args, &specs)?;
     match opts.positionals.first().map(String::as_str) {
         None => rerere_replay(ctx),
@@ -1704,15 +1744,16 @@ fn rerere_replay(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         let entry = IndexEntry::for_blob(kind, mode, &postimage, None).map_err(core_err)?;
         let mutations = path_row_mutations(&repo_path, &before, &[(Stage::Zero, entry)])?;
         let (workspace, raw) = load_or_default(store)?;
-        let next = workspace
-            .mutate_index(workspace.stamp)
-            .map_err(core_err)?;
+        let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
         let mut all = mutations;
         all.push(workspace_mutation(raw.as_deref(), &next)?);
         store.publish(Vec::new(), &all).map_err(GitError::from)?;
         out.extend_from_slice(
-            format!("Resolved '{}' using previous resolution.\n", String::from_utf8_lossy(path))
-                .as_bytes(),
+            format!(
+                "Resolved '{}' using previous resolution.\n",
+                String::from_utf8_lossy(path)
+            )
+            .as_bytes(),
         );
     }
     // Graduate newly resolved paths: an active preimage whose path no
@@ -1747,7 +1788,11 @@ fn rerere_replay(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         rerere_write(ctx, &id, &record)?;
         rerere_unmark_active(ctx, &path)?;
         out.extend_from_slice(
-            format!("Recorded resolution for '{}'.\n", String::from_utf8_lossy(&path)).as_bytes(),
+            format!(
+                "Recorded resolution for '{}'.\n",
+                String::from_utf8_lossy(&path)
+            )
+            .as_bytes(),
         );
     }
     Ok(out)
@@ -1961,7 +2006,9 @@ fn rerere_gc(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
             .publish(Vec::new(), &mutations)
             .map_err(GitError::from)?;
     }
-    Ok(line(format!("pruned {pruned} rerere record(s)").into_bytes()))
+    Ok(line(
+        format!("pruned {pruned} rerere record(s)").into_bytes(),
+    ))
 }
 
 /// Extracts conflict-hunk content (marker lines excluded) from worktree
@@ -1981,7 +2028,10 @@ fn conflict_hunks(body: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
         if in_conflict {
-            if text_line.starts_with(b"||||||| ") || text_line == b"=======\n" || text_line == b"=======" {
+            if text_line.starts_with(b"||||||| ")
+                || text_line == b"=======\n"
+                || text_line == b"======="
+            {
                 continue;
             }
             hunks.extend_from_slice(text_line);
@@ -1992,8 +2042,7 @@ fn conflict_hunks(body: &[u8]) -> Option<Vec<u8>> {
 
 /// Hashes conflict hunks to the record id.
 fn rerere_id(kind: ruk_core::ids::HashKind, hunks: &[u8]) -> Result<String, GitError> {
-    kind
-        .hash_git_object("blob", hunks)
+    kind.hash_git_object("blob", hunks)
         .map(|oid| oid.to_hex())
         .map_err(core_err)
 }
@@ -2002,9 +2051,7 @@ fn rerere_id(kind: ruk_core::ids::HashKind, hunks: &[u8]) -> Result<String, GitE
 fn rerere_read(store: &Store, id: &str) -> Result<Option<RerereRecord>, GitError> {
     let mut key = RERERE_PREFIX.to_vec();
     key.extend_from_slice(id.as_bytes());
-    let raw = store
-        .fact(FactTable::Pins, &key)
-        .map_err(GitError::from)?;
+    let raw = store.fact(FactTable::Pins, &key).map_err(GitError::from)?;
     raw.map(|bytes| {
         sonic_rs::from_slice(&bytes).map_err(|err| GitError::Corrupt {
             detail: format!("rerere record {id} does not decode: {err}"),
@@ -2048,12 +2095,7 @@ fn rerere_scan(store: &Store) -> Result<Vec<(String, RerereRecord)>, GitError> {
 }
 
 /// Stores a fresh preimage and marks the path active.
-fn rerere_store_preimage(
-    ctx: &Ctx,
-    path: &[u8],
-    hunks: &[u8],
-    id: &str,
-) -> Result<(), GitError> {
+fn rerere_store_preimage(ctx: &Ctx, path: &[u8], hunks: &[u8], id: &str) -> Result<(), GitError> {
     let store = ctx.store()?;
     if rerere_read(store, id)?.is_some() {
         rerere_mark_active(ctx, path, id)?;

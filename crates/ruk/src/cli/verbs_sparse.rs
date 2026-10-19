@@ -361,7 +361,9 @@ fn plan_materialize(
         let target = std::fs::read_link(&full)
             .ok()
             .map(|link| link.as_os_str().as_encoded_bytes().to_vec());
-        let wanted = read_object_bytes(store, entry.oid()).ok().map(|(_, body)| body);
+        let wanted = read_object_bytes(store, entry.oid())
+            .ok()
+            .map(|(_, body)| body);
         if target == wanted {
             return;
         }
@@ -423,7 +425,9 @@ fn plan_removal(
         let target = std::fs::read_link(&full)
             .ok()
             .map(|link| link.as_os_str().as_encoded_bytes().to_vec());
-        let wanted = read_object_bytes(store, entry.oid()).ok().map(|(_, body)| body);
+        let wanted = read_object_bytes(store, entry.oid())
+            .ok()
+            .map(|(_, body)| body);
         if target != wanted {
             blocked.push(String::from_utf8_lossy(path).into_owned());
             return;
@@ -461,10 +465,9 @@ fn sync_sparse_worktree(ctx: &Ctx, writes: &[(Vec<u8>, SparseWrite)]) -> Result<
             SparseWrite::Blob { mode, oid } => {
                 if *mode == FileMode::Symlink {
                     let (_, body) = read_object_bytes(store, *oid)?;
-                    let text =
-                        std::str::from_utf8(&body).map_err(|_| GitError::Invalid {
-                            detail: "symlink target is not valid UTF-8".to_owned(),
-                        })?;
+                    let text = std::str::from_utf8(&body).map_err(|_| GitError::Invalid {
+                        detail: "symlink target is not valid UTF-8".to_owned(),
+                    })?;
                     if full.is_symlink() || full.exists() {
                         std::fs::remove_file(&full).map_err(|err| GitError::Io {
                             detail: format!("removing {}: {err}", full.display()),
@@ -596,7 +599,9 @@ fn rule_matches(rule: &SparseRule, path: &str) -> bool {
 
 /// Reports whether a pattern carries glob metacharacters.
 fn has_glob(pattern: &str) -> bool {
-    pattern.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'))
+    pattern
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\'))
 }
 
 /// Shell-ish glob where `*` crosses `/`, plus `?`/`[...]` and escapes.
