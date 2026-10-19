@@ -4149,3 +4149,235 @@ fn blame_worktree_overlay_reports_uncommitted_lines() {
         .expect_err("line range past end");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+// ---------------------------------------------------------------------------
+// bisect: midpoint state machine over cli/pseudo/ session state
+// ---------------------------------------------------------------------------
+
+/// Reads `HEAD` as hex for bisect step assertions.
+fn bisect_head(ctx: &mut Ctx) -> String {
+    String::from_utf8(run(verbs_history::rev_parse, ctx, &["HEAD"]).expect("head"))
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+/// Commits `extra - 1` more revisions on `f.txt`, returning every `HEAD`
+/// oid oldest-first (the seed commit starts the chain).
+fn bisect_chain(ctx: &mut Ctx, root: &PathBuf, extra: usize) -> Vec<String> {
+    let mut oids = vec![bisect_head(ctx)];
+    for index in 2..=extra {
+        lane_commit(
+            ctx,
+            root,
+            "f.txt",
+            format!("v{index}\n").as_bytes(),
+            &format!("commit {index}"),
+        );
+        oids.push(bisect_head(ctx));
+    }
+    oids
+}
+
+#[test]
+fn bisect_linear_halves_to_first_bad() {
+    let (root, env) = seeded_repo("bisect-linear", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    let oids = bisect_chain(&mut ctx, &root, 8);
+    assert_eq!(oids.len(), 8);
+    // Commits 1..=5 are good; commit 6 (index 5) is the planted first bad.
+    let planted = 5;
+    let out = run(
+        verbs_bisect::bisect,
+        &mut ctx,
+        &["start", oids[7].as_str(), oids[0].as_str()],
+    )
+    .expect("start");
+    assert!(
+        String::from_utf8_lossy(&out).contains("Bisecting"),
+        "got {out:?}"
+    );
+    // The first checkout is the midpoint (commit 5), not a linear scan.
+    assert_eq!(bisect_head(&mut ctx), oids[4]);
+    let mut marks = 0;
+    for _ in 0..10 {
+        let head = bisect_head(&mut ctx);
+        let index = oids
+            .iter()
+            .position(|oid| *oid == head)
+            .expect("checked-out commit is known");
+        let out = if index < planted {
+            run(verbs_bisect::bisect, &mut ctx, &["good"]).expect("good")
+        } else {
+            run(verbs_bisect::bisect, &mut ctx, &["bad"]).expect("bad")
+        };
+        marks += 1;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        if text.contains("first bad commit") {
+            assert!(text.contains(&oids[planted]), "got {text:?}");
+            break;
+        }
+    }
+    assert_eq!(bisect_head(&mut ctx), oids[planted]);
+    assert!(marks <= 4, "bisection took {marks} marks");
+    run(verbs_bisect::bisect, &mut ctx, &["reset"]).expect("reset");
+    assert_eq!(bisect_head(&mut ctx), oids[7]);
+    run(verbs_bisect::bisect, &mut ctx, &["log"]).expect_err("session is gone");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn bisect_start_without_revs_waits_then_resets() {
+    let (root, env) = seeded_repo("bisect-wait", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second");
+    let tip = bisect_head(&mut ctx);
+    let out = run(verbs_bisect::bisect, &mut ctx, &["start"]).expect("start");
+    assert!(
+        String::from_utf8_lossy(&out).contains("waiting"),
+        "got {out:?}"
+    );
+    let empty: &[&str] = &[];
+    let status = run(verbs_bisect::bisect, &mut ctx, empty).expect("status");
+    assert!(
+        String::from_utf8_lossy(&status).contains("waiting"),
+        "got {status:?}"
+    );
+    run(verbs_bisect::bisect, &mut ctx, &["reset"]).expect("reset");
+    assert_eq!(bisect_head(&mut ctx), tip);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn bisect_contradictory_marks_rejected() {
+    let (root, env) = seeded_repo("bisect-clash", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second");
+    let tip = bisect_head(&mut ctx);
+    let first = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("first"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    run(
+        verbs_bisect::bisect,
+        &mut ctx,
+        &["start", tip.as_str(), first.as_str()],
+    )
+    .expect("start");
+    // The good root cannot go bad: it is an ancestor of itself as good.
+    run(verbs_bisect::bisect, &mut ctx, &["bad", first.as_str()]).expect_err("clash");
+    // The bad tip cannot go good: the range would empty.
+    run(verbs_bisect::bisect, &mut ctx, &["good", tip.as_str()]).expect_err("empty");
+    run(verbs_bisect::bisect, &mut ctx, &["reset"]).expect("reset");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn bisect_terms_aliases_and_log() {
+    let (root, env) = seeded_repo("bisect-terms", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second");
+    lane_commit(&mut ctx, &root, "f.txt", b"v3\n", "third");
+    let tip = bisect_head(&mut ctx);
+    let first = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~2"]).expect("first"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    run(
+        verbs_bisect::bisect,
+        &mut ctx,
+        &[
+            "start",
+            "--term-bad",
+            "old",
+            "--term-new",
+            "new",
+            tip.as_str(),
+            first.as_str(),
+        ],
+    )
+    .expect("start");
+    let shown = run(verbs_bisect::bisect, &mut ctx, &["terms"]).expect("terms");
+    assert!(
+        String::from_utf8_lossy(&shown).contains("new and old"),
+        "got {shown:?}"
+    );
+    // The custom good alias marks the checked-out midpoint.
+    let marked = run(verbs_bisect::bisect, &mut ctx, &["new"]).expect("alias good");
+    assert!(
+        String::from_utf8_lossy(&marked).contains("Bisecting"),
+        "got {marked:?}"
+    );
+    let log = run(verbs_bisect::bisect, &mut ctx, &["log"]).expect("log");
+    let text = String::from_utf8_lossy(&log).into_owned();
+    assert!(text.contains("git bisect start"), "got {text:?}");
+    assert!(text.contains("# bad:"), "got {text:?}");
+    assert!(text.contains("# good:"), "got {text:?}");
+    run(verbs_bisect::bisect, &mut ctx, &["reset"]).expect("reset");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn bisect_first_parent_ignores_side_branch() {
+    let (root, env) = seeded_repo("bisect-fp", "base.txt", b"base\n");
+    let mut ctx = repo_ctx(&root, env);
+    let first = bisect_head(&mut ctx);
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
+    lane_commit(&mut ctx, &root, "side.txt", b"side\n", "side work");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    lane_commit(&mut ctx, &root, "main.txt", b"main\n", "main work");
+    let second = bisect_head(&mut ctx);
+    run(verbs_history::merge, &mut ctx, &["side"]).expect("merge");
+    let tip = bisect_head(&mut ctx);
+    let out = run(
+        verbs_bisect::bisect,
+        &mut ctx,
+        &["start", "--first-parent", tip.as_str(), first.as_str()],
+    )
+    .expect("start");
+    assert!(
+        String::from_utf8_lossy(&out).contains("Bisecting"),
+        "got {out:?}"
+    );
+    // First-parent order walks the merge tip then the main line only.
+    assert_eq!(bisect_head(&mut ctx), second);
+    let verdict = run(verbs_bisect::bisect, &mut ctx, &["bad"]).expect("bad");
+    let text = String::from_utf8_lossy(&verdict).into_owned();
+    assert!(text.contains("first bad commit"), "got {text:?}");
+    assert!(text.contains(&second), "got {text:?}");
+    run(verbs_bisect::bisect, &mut ctx, &["reset"]).expect("reset");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn bisect_run_finds_first_bad() {
+    let (root, env) = seeded_repo("bisect-run", "f.txt", b"GOOD\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"GOOD\n", "still good");
+    lane_commit(&mut ctx, &root, "f.txt", b"BAD\n", "turns bad");
+    let planted = bisect_head(&mut ctx);
+    lane_commit(&mut ctx, &root, "f.txt", b"BAD\n", "still bad");
+    let tip = bisect_head(&mut ctx);
+    let first = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~3"]).expect("first"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    run(
+        verbs_bisect::bisect,
+        &mut ctx,
+        &["start", tip.as_str(), first.as_str()],
+    )
+    .expect("start");
+    let out = run(
+        verbs_bisect::bisect,
+        &mut ctx,
+        &["run", "sh", "-c", "grep -q GOOD f.txt"],
+    )
+    .expect("run");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("first bad commit"), "got {text:?}");
+    assert!(text.contains(&planted), "got {text:?}");
+    assert_eq!(bisect_head(&mut ctx), planted);
+    run(verbs_bisect::bisect, &mut ctx, &["reset"]).expect("reset");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
