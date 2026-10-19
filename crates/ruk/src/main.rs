@@ -321,6 +321,12 @@ fn main() -> ExitCode {
     }
     // Git-compatibility dispatch: invoked as `git`, or `ruk git <verb>`.
     let argv: Vec<String> = std::env::args().collect();
+    // Remote-helper entry: stock git spawns this binary as
+    // `git-remote-ruk <remote> <url>` for `ruk::` URLs (a `PATH` symlink
+    // to `ruk` suffices); the helper owns stdio as its protocol demands.
+    if let Some((remote, url)) = cli::verbs_remote_helper::remote_helper_argv0(&argv) {
+        return cli::verbs_remote_helper::run_remote_helper(remote, url);
+    }
     // Server-side entry: `git-upload-pack '<dir>'` as argv[0] (what ssh
     // spawns for a remote clone/fetch), or `ruk upload-pack <dir>`.
     if let Some(rest) = cli::serve_argv(&argv) {
