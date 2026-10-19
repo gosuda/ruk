@@ -1705,11 +1705,9 @@ fn archive_local(store: &Store, kind: HashKind, rev: &str) -> Result<Vec<u8>, Gi
         ruk_git::transport::pktline::LARGE_PACKET_MAX,
     );
     let mut tar = Vec::new();
-    sideband
-        .read_to_end(&mut tar)
-        .map_err(|err| GitError::Io {
-            detail: format!("cannot read the archive stream: {err}"),
-        })?;
+    sideband.read_to_end(&mut tar).map_err(|err| GitError::Io {
+        detail: format!("cannot read the archive stream: {err}"),
+    })?;
     Ok(tar)
 }
 

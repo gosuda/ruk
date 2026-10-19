@@ -672,8 +672,9 @@ fn fetch_advances_tracking_ref_through_new_commits_but_refuses_rewind() {
         run(verbs_stage::add, &mut src_ctx, &["side.txt"]).expect("add side");
         run(verbs_history::commit, &mut src_ctx, &["-m", "side work"]).expect("commit side");
         let store = src_ctx.store().expect("store");
-        let side = super::state::resolve_rev(store, src_ctx.kind().expect("kind"), "refs/heads/side")
-            .expect("side tip");
+        let side =
+            super::state::resolve_rev(store, src_ctx.kind().expect("kind"), "refs/heads/side")
+                .expect("side tip");
         run(verbs_branch::checkout, &mut src_ctx, &["main"]).expect("checkout main");
         std::fs::write(src.join("h.txt"), b"h\n").expect("new file");
         run(verbs_stage::add, &mut src_ctx, &["h.txt"]).expect("add");
@@ -717,7 +718,8 @@ fn fetch_advances_tracking_ref_through_new_commits_but_refuses_rewind() {
         .expect("tracking tip after refusal");
         assert_eq!(tip2, kept);
         assert!(
-            ruk_git::transport::has_object(dst_ctx.store().expect("store"), side).expect("has side"),
+            ruk_git::transport::has_object(dst_ctx.store().expect("store"), side)
+                .expect("has side"),
             "refused tip's objects stay"
         );
     }
@@ -1681,10 +1683,7 @@ fn archive_over_smart_http_streams_tar() {
     frame.extend_from_slice(&tar);
     body.extend_from_slice(&frame);
     body.extend_from_slice(b"0000");
-    let (base, log) = smart_http_server(vec![(
-        body,
-        "application/x-git-upload-archive-result",
-    )]);
+    let (base, log) = smart_http_server(vec![(body, "application/x-git-upload-archive-result")]);
     let (root, env) = seeded_repo("uarchive-http", "a.txt", b"a\n");
     let mut ctx = repo_ctx(&root, env);
     let remote = format!("--remote={base}");
@@ -1719,7 +1718,11 @@ fn archive_local_streams_tar() {
     let (root, env) = seeded_repo("uarchive-local", "a.txt", b"a\n");
     let mut ctx = repo_ctx(&root, env);
     let out = run(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("local archive");
-    assert!(out.len() >= 1024, "tar ends with two zero blocks: {}", out.len());
+    assert!(
+        out.len() >= 1024,
+        "tar ends with two zero blocks: {}",
+        out.len()
+    );
     assert!(
         out[out.len() - 1024..].iter().all(|byte| *byte == 0),
         "missing tar trailer"
