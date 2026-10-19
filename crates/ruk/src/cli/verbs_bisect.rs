@@ -249,7 +249,7 @@ fn mark_bad(ctx: &mut Ctx, bad: Oid) -> Result<Vec<u8>, GitError> {
     advance(ctx)
 }
 
-/// Records working revisions; an empty range after applying is rolled back.
+/// Records working revisions, refusing marks that would empty the range.
 fn mark_goods(ctx: &mut Ctx, goods: &[Oid]) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let bad = pseudo_read_oid(store, "BISECT_BAD")?;
