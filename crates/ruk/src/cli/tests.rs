@@ -129,11 +129,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 127);
+    assert_eq!(VERBS.len(), 128);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 127);
+    assert_eq!(names.len(), 128);
     for name in [
         "add",
         "am",
