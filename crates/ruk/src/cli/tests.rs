@@ -118,11 +118,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 59);
+    assert_eq!(VERBS.len(), 60);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 59);
+    assert_eq!(names.len(), 60);
     for name in [
         "add",
         "archive",
@@ -137,6 +137,7 @@ fn verb_table_covers_advertised_names() {
         "commit-tree",
         "config",
         "count-objects",
+        "credential",
         "diff",
         "fetch",
         "for-each-ref",
@@ -1951,6 +1952,82 @@ fn ls_remote_over_smart_http_lists_refs() {
     log.recv_timeout(Duration::from_secs(30))
         .expect("server finished discovery");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn credential_rejects_usage_before_reading_stdin() {
+    let (root, env) = seeded_repo("cred-usage", "c.txt", b"c\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_transport::credential, &mut ctx, &[]).expect_err("no operation");
+    run(verbs_transport::credential, &mut ctx, &["bogus"]).expect_err("bad operation");
+    run(verbs_transport::credential, &mut ctx, &["fill", "extra"]).expect_err("two positionals");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn credential_fill_approve_reject_round_trip() {
+    let base = temp_base("credential-live");
+    let log = base.join("cred-ops.log");
+    let script = base.join("cred-helper.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "op=\"$1\"\ncat > /dev/null\nprintf '%s\\n' \"$op\" >> \"{}\"\n\
+             if [ \"$op\" = \"get\" ]; then printf 'username=alice\\npassword=s3cret\\n'; fi\n",
+            log.display()
+        ),
+    )
+    .expect("helper script");
+    let config = base.join("gitconfig");
+    std::fs::write(
+        &config,
+        format!(
+            "[credential \"https://cred-test.invalid\"]\n\thelper = !/bin/sh {}\n",
+            script.display()
+        ),
+    )
+    .expect("helper config");
+    let (root, env) = seeded_repo("cred-live", "c.txt", b"c\n");
+    let mut ctx = repo_ctx(&root, env);
+    // Helper config files resolve against the captured environment only:
+    // pointing the chain at the temp config touches no process state, so
+    // parallel tests stay isolated.
+    ctx.env.vars.insert(
+        "GIT_CONFIG_NOSYSTEM".to_owned(),
+        "1".to_owned(),
+    );
+    ctx.env
+        .vars
+        .insert("GIT_CONFIG_GLOBAL".to_owned(), config.to_string_lossy().into_owned());
+    let desc =
+        b"url=https://cred-test.invalid/x\nprotocol=https\nhost=cred-test.invalid\n\n".to_vec();
+    ctx.env.stdin = Some(desc.clone());
+    let out = run(verbs_transport::credential, &mut ctx, &["fill"]).expect("fill");
+    assert_eq!(
+        out,
+        b"url=https://cred-test.invalid/x\nprotocol=https\nhost=cred-test.invalid\n\
+          username=alice\npassword=s3cret\n"
+    );
+    ctx.env.stdin = Some(desc.clone());
+    assert_eq!(
+        run(verbs_transport::credential, &mut ctx, &["approve"]).expect("approve"),
+        Vec::<u8>::new()
+    );
+    ctx.env.stdin = Some(desc);
+    assert_eq!(
+        run(verbs_transport::credential, &mut ctx, &["reject"]).expect("reject"),
+        Vec::<u8>::new()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("helper log"),
+        "get\nstore\nerase\n"
+    );
+    // A description outside the scoped helper's URL matches nothing, so
+    // `fill` reports no username instead of answering.
+    ctx.env.stdin = Some(b"protocol=https\nhost=elsewhere.invalid\n\n".to_vec());
+    run(verbs_transport::credential, &mut ctx, &["fill"]).expect_err("unmatched fill");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

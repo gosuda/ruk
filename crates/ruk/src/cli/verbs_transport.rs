@@ -13,13 +13,14 @@
 //! | `bundle` | git bundle v2/v3 headers plus pack v2, see `verbs_bundle` | `create`/`verify`/`list-heads`/`unbundle` over the native store |
 //! | `gc` | ref closure plus workspace pins through `Store::prune_unreachable`, then `Store::compact` | `--aggressive` repeats compaction; `--auto` exits quietly with no work; `--dry-run` reports; `--prune=now` (default) prunes, `--prune=never` compacts only, other dates are `Unsupported` (no object ages) |
 //! | `fsck` | ref walk + object existence, census-minus-reachable sweep | implemented; `--dangling`/`--unreachable` list `dangling <kind> <oid>` rows |
-//! | `ls-remote` | local `session::advertise` or one `net::discover` round trip; HTTP remotes probe protocol v2 first (`ls-refs`) | SSH/git and smart-http remotes served; dumb-http is the remaining HTTP gap |
+//! | `ls-remote` | local `session::advertise` or one `net::discover` round trip; HTTP remotes probe protocol v2 first (`ls-refs`), then the dumb-http text file | SSH/git and smart/dumb-http remotes served |
+//! | `credential` | stdin `key=value` description through the configured helpers with the `get`/`store`/`erase` operation | `fill` echoes the description with the found fields; `approve`/`reject` are silent; needs no repository |
 //!
 //! Oracle anchors: `git/builtin/fetch.c`, `git/builtin/pull.c`,
 //! `git/builtin/push.c`, `git/builtin/receive-pack.c`,
 //! `git/builtin/upload-pack.c`, `git/builtin/archive.c`,
 //! `git/builtin/gc.c`, `git/builtin/fsck.c`,
-//! `git/builtin/ls-remote.c`.
+//! `git/builtin/ls-remote.c`, `git/builtin/credential.c`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -4228,6 +4229,63 @@ fn render_ls_remote(
         }
     }
     line(out)
+}
+
+/// Bare `git credential` helper protocol: `fill` looks one description up
+/// through the configured helpers and prints the filled description,
+/// `approve` stores it, `reject` erases it.
+///
+/// Oracle: `git/builtin/credential.c`. The description arrives on stdin as
+/// `key=value` lines to the first blank line; helpers run with the
+/// `get`/`store`/`erase` operation on their command line, the same runner
+/// the transport fill uses. A `fill` no helper answers is an error, the
+/// way the oracle's interactive prompt fails with no terminal. Needs no
+/// repository.
+pub(crate) fn credential(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    const USAGE: &str = "usage: credential <fill|approve|reject>";
+    let [op] = args else {
+        return Err(GitError::Invalid {
+            detail: USAGE.to_owned(),
+        });
+    };
+    if op != "fill" && op != "approve" && op != "reject" {
+        return Err(GitError::Invalid {
+            detail: USAGE.to_owned(),
+        });
+    }
+    let stdin = super::read_stdin_bytes(&ctx.env)?;
+    if stdin.len() > ruk_git::transport::credentials::MAX_CREDENTIAL_INPUT {
+        return Err(GitError::Limit {
+            detail: "credential description exceeds the input bound".to_owned(),
+        });
+    }
+    let desc = ruk_git::transport::credentials::parse_credential_input(&stdin);
+    // Helper config files resolve against the captured environment, never
+    // the live process one, so the verb stays hermetic under test.
+    match op.as_str() {
+        "fill" => {
+            let Some(filled) =
+                ruk_git::transport::credentials::credential_fill_desc(&desc, &ctx.env.vars)
+            else {
+                return Err(GitError::Invalid {
+                    detail: "credential fill found no username".to_owned(),
+                });
+            };
+            let mut out = Vec::new();
+            for (key, value) in &filled {
+                out.extend_from_slice(format!("{key}={value}\n").as_bytes());
+            }
+            Ok(line(out))
+        }
+        "approve" => {
+            ruk_git::transport::credentials::credential_approve_desc(&desc, &ctx.env.vars);
+            Ok(Vec::new())
+        }
+        _ => {
+            ruk_git::transport::credentials::credential_reject_desc(&desc, &ctx.env.vars);
+            Ok(Vec::new())
+        }
+    }
 }
 
 #[cfg(test)]

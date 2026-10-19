@@ -1,4 +1,4 @@
-//! Verb table: the 59 advertised names and their handlers.
+//! Verb table: the 60 advertised names and their handlers.
 //!
 //! The shape mirrors `git.c:commands[]`: one row per verb with its oracle
 //! anchor, whether it needs a repository, a one-line summary, and the entry
@@ -33,7 +33,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 59 advertised verbs in alphabetical order.
+/// The 60 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -125,6 +125,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Count unpacked objects and display their disk consumption",
         run: verbs_objects::count_objects,
+    },
+    Verb {
+        name: "credential",
+        oracle: "git/builtin/credential.c",
+        needs_repo: false,
+        summary: "Fill and approve credentials",
+        run: verbs_transport::credential,
     },
     Verb {
         name: "diff",
