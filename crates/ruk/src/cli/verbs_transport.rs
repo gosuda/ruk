@@ -3642,6 +3642,29 @@ fn render_ls_remote(
 }
 
 #[cfg(test)]
+mod extra_header_scope_tests {
+    use super::*;
+
+    #[test]
+    fn splits_unscoped_scoped_and_rejects() {
+        assert_eq!(extra_header_scope("http.extraHeader"), Some(None));
+        assert_eq!(
+            extra_header_scope("http.https://host.x/a.extraHeader"),
+            Some(Some("https://host.x/a".to_owned()))
+        );
+        // Section and key match case-insensitively; the scope keeps case.
+        assert_eq!(
+            extra_header_scope("HTTP.https://Host.X/A.EXTRAHEADER"),
+            Some(Some("https://Host.X/A".to_owned()))
+        );
+        assert_eq!(extra_header_scope("http.extraheaderx"), None);
+        assert_eq!(extra_header_scope("http..extraHeader"), None);
+        assert_eq!(extra_header_scope("http.extraHeader.more"), None);
+        assert_eq!(extra_header_scope("remote.origin.url"), None);
+    }
+}
+
+#[cfg(test)]
 mod archive_rewrap_tests {
     use super::*;
 
