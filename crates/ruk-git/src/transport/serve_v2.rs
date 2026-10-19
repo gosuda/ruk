@@ -452,7 +452,9 @@ fn peel_tag(store: &Store, oid: Oid, kind: HashKind) -> Result<Option<Oid>, GitE
         }
         current_bytes = next_bytes;
     }
-    Err(corrupt(format!("tag {oid} nests deeper than {MAX_TAG_DEPTH}")))
+    Err(corrupt(format!(
+        "tag {oid} nests deeper than {MAX_TAG_DEPTH}"
+    )))
 }
 
 /// The OID a tag object points at: the hex after its `object ` header line.
@@ -880,12 +882,7 @@ mod tests {
             format!("object {FOUR}\ntype commit\ntag v1\ntagger test <t@t> 0 +0000\n\nv1\n");
         let tag_len = u64::try_from(tag_bytes.len()).expect("tag fits in memory");
         let prepared = store
-            .prepare(
-                ObjectKind::Tag,
-                tag_len,
-                &tag_bytes.as_bytes()[..],
-                None,
-            )
+            .prepare(ObjectKind::Tag, tag_len, &tag_bytes.as_bytes()[..], None)
             .expect("prepare tag");
         let tag_oid = prepared.oid();
         store.publish(vec![prepared], &[]).expect("publish tag");

@@ -35,9 +35,9 @@ use ruk_core::merge::composed::route::{MergeOutcome, merge_file};
 use ruk_core::merge::syntax::grammar::{Cancel, GrammarRegistry, dispatch};
 use ruk_core::merge::syntax::registry_providers;
 use ruk_core::ops::{EditRequest, NewRequest, edit as ops_edit, new as ops_new};
+use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::ObjectKind as MergeLaneObjectKind;
 use ruk_core::store::Store as MergeLaneStore;
-use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::Store;
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
@@ -1555,7 +1555,11 @@ fn merge_content(
     pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
     pseudo_delete(store, "abort-index/merge")?;
     let mut out = b"Merge made by the 'ort' strategy.\n".to_vec();
-    let changes = tree_file_changes(ctx, Some(ours_tree), commit_tree_oid(&commit_record(store, new_oid)?)?)?;
+    let changes = tree_file_changes(
+        ctx,
+        Some(ours_tree),
+        commit_tree_oid(&commit_record(store, new_oid)?)?,
+    )?;
     out.extend_from_slice(&render_file_stat(&changes));
     Ok(out)
 }
@@ -1598,12 +1602,7 @@ fn take_tree_state(
 }
 
 /// Writes `ORIG_HEAD`, `MERGE_HEAD`, `MERGE_MSG`, and the sequencer record.
-fn write_merge_state(
-    ctx: &Ctx,
-    current: &Oid,
-    tip: &Oid,
-    message: &str,
-) -> Result<(), GitError> {
+fn write_merge_state(ctx: &Ctx, current: &Oid, tip: &Oid, message: &str) -> Result<(), GitError> {
     let store = ctx.store()?;
     pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
     pseudo_write(store, "MERGE_HEAD", tip.to_hex().into_bytes())?;
@@ -1651,7 +1650,13 @@ fn conclude_merge(ctx: &mut Ctx, message: Option<String>) -> Result<Vec<u8>, Git
         Some(text) => text,
         None => pseudo_read(store, "MERGE_MSG")?
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_else(|| format!("Merge {} into {}", merge_head.to_hex(), branch_label_of(ctx).unwrap_or_default())),
+            .unwrap_or_else(|| {
+                format!(
+                    "Merge {} into {}",
+                    merge_head.to_hex(),
+                    branch_label_of(ctx).unwrap_or_default()
+                )
+            }),
     };
     let head = head_oid(store)?;
     let old_tree = commit_tree_oid(&commit_record(store, head)?)?;
@@ -1671,7 +1676,11 @@ fn message_subject(ctx: &Ctx, oid: &Oid) -> Result<String, GitError> {
     let store = ctx.store()?;
     let record = commit_record(store, *oid)?;
     let message = record.message();
-    Ok(String::from_utf8_lossy(&message).lines().next().unwrap_or_default().to_owned())
+    Ok(String::from_utf8_lossy(&message)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned())
 }
 
 /// Resumes a conflicted merge from the resolved index.
@@ -1893,13 +1902,21 @@ pub(crate) fn rebase(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     }
     if is_ancestor(store, current, onto)? {
         super::verbs_branch::move_branch_to(ctx, onto)?;
-        take_tree_state(ctx, current_tree, commit_tree_oid(&commit_record(store, onto)?)?)?;
+        take_tree_state(
+            ctx,
+            current_tree,
+            commit_tree_oid(&commit_record(store, onto)?)?,
+        )?;
         return Ok(format!("Successfully rebased and updated {label}.\n").into_bytes());
     }
     snapshot_abort_index(ctx, "rebase")?;
     pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
     super::verbs_branch::move_branch_to(ctx, onto)?;
-    take_tree_state(ctx, current_tree, commit_tree_oid(&commit_record(store, onto)?)?)?;
+    take_tree_state(
+        ctx,
+        current_tree,
+        commit_tree_oid(&commit_record(store, onto)?)?,
+    )?;
     let mut todos = Vec::with_capacity(range.len());
     for oid in &range {
         let parents = commit_parents(store, *oid)?;
@@ -1909,7 +1926,9 @@ pub(crate) fn rebase(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         let record = commit_record(store, *oid)?;
         todos.push(PickTodo {
             oid: oid.to_hex(),
-            base: parents.first().map_or_else(String::new, |parent| parent.to_hex()),
+            base: parents
+                .first()
+                .map_or_else(String::new, |parent| parent.to_hex()),
             theirs: oid.to_hex(),
             message: String::from_utf8_lossy(record.message()).into_owned(),
             label: short_hex(oid),
@@ -2014,8 +2033,7 @@ fn cherry_pick_todos(
             },
         };
         let record = commit_record(store, *oid)?;
-        let mut message =
-            String::from_utf8_lossy(record.message()).into_owned();
+        let mut message = String::from_utf8_lossy(record.message()).into_owned();
         if with_reference {
             message = format!(
                 "{}\n(cherry picked from commit {})",
@@ -2075,7 +2093,10 @@ fn revert_todos(
             oid: oid.to_hex(),
             base: oid.to_hex(),
             theirs: parent.to_hex(),
-            message: format!("Revert \"{subject}\"\n\nThis reverts commit {}.\n", oid.to_hex()),
+            message: format!(
+                "Revert \"{subject}\"\n\nThis reverts commit {}.\n",
+                oid.to_hex()
+            ),
             label: format!("revert of {}", short_hex(oid)),
         });
     }
@@ -2129,7 +2150,15 @@ fn apply_pick_todos(
             }
             remaining.remove(0);
         } else {
-            write_lane_state(ctx, verb, head_key, orig_hex, &todo.oid, &todo.message, &remaining)?;
+            write_lane_state(
+                ctx,
+                verb,
+                head_key,
+                orig_hex,
+                &todo.oid,
+                &todo.message,
+                &remaining,
+            )?;
             return Err(pick_conflict_error(verb, &todo, &plan));
         }
     }
@@ -2167,11 +2196,7 @@ fn pick_conflict_error(verb: &str, todo: &PickTodo, plan: &MergePlan) -> GitErro
 }
 
 /// Resumes a stopped pick sequence from the resolved index.
-fn pick_continue(
-    ctx: &mut Ctx,
-    verb: &str,
-    head_key: Option<&str>,
-) -> Result<Vec<u8>, GitError> {
+fn pick_continue(ctx: &mut Ctx, verb: &str, head_key: Option<&str>) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let Some(seq) = sequencer_read(store, verb)? else {
         return no_sequencer(verb, "continue");
@@ -2201,25 +2226,39 @@ fn pick_continue(
         clear_lane_state(ctx, verb, head_key)?;
         return Ok(out);
     }
-    out.extend_from_slice(&apply_pick_todos(ctx, verb, head_key, &seq.head_hex, rest, false)?);
+    out.extend_from_slice(&apply_pick_todos(
+        ctx,
+        verb,
+        head_key,
+        &seq.head_hex,
+        rest,
+        false,
+    )?);
     Ok(out)
 }
 
-/// Skips the stopped pick, resets its conflict rows to `HEAD`, and applies
-/// the rest of the sequence.
+/// Skips the stopped pick, resets the whole index and worktree to `HEAD`
+/// (the skipped pick's clean-resolved paths must not leak into the next
+/// pick's commit, which is built from the index), and applies the rest.
 fn pick_skip(ctx: &mut Ctx, verb: &str, head_key: Option<&str>) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
+    let kind = ctx.kind()?;
     let Some(seq) = sequencer_read(store, verb)? else {
         return no_sequencer(verb, "skip");
     };
     let todos = read_lane_todos(store, verb)?.ok_or_else(|| GitError::Corrupt {
         detail: format!("sequencer todo for {verb} does not decode"),
     })?;
+    let head = head_oid(store)?;
+    let head_tree = commit_tree_oid(&commit_record(store, head)?)?;
+    let head_map = lane_tree_map(store, kind, head_tree)?;
+    // No dirty guard here: in-progress user resolutions are exactly what a
+    // skip discards. Untracked files stay untouched by construction.
+    apply_merge_plan(ctx, &plan_take_tree(&head_map, &head_map)?)?;
     if todos.len() <= 1 {
         clear_lane_state(ctx, verb, head_key)?;
         return Ok(Vec::new());
     }
-    reset_unmerged_to_head(ctx)?;
     let rest = todos[1..].to_vec();
     apply_pick_todos(ctx, verb, head_key, &seq.head_hex, rest, false)
 }
@@ -2264,7 +2303,9 @@ fn reset_unmerged_to_head(ctx: &Ctx) -> Result<(), GitError> {
                 Vec::new()
             }
         };
-        mutations.extend(super::state::path_row_mutations(&repo_path, &before, &after)?);
+        mutations.extend(super::state::path_row_mutations(
+            &repo_path, &before, &after,
+        )?);
     }
     let (workspace, raw) = load_or_default(store)?;
     let next = workspace
@@ -2633,10 +2674,7 @@ fn myers_hunks(a: &[&[u8]], b: &[&[u8]]) -> Option<Vec<Hunk>> {
     let n = i32::try_from(a.len()).ok()?;
     let m = i32::try_from(b.len()).ok()?;
     let max = i32::try_from(total).ok()?;
-    let width = usize::try_from(max)
-        .ok()?
-        .checked_mul(2)?
-        .checked_add(1)?;
+    let width = usize::try_from(max).ok()?.checked_mul(2)?.checked_add(1)?;
     let off = i64::from(max);
     let cell = |v: &[i32], k: i64| -> Option<i32> {
         let idx = usize::try_from(off + k).ok()?;
@@ -2651,9 +2689,17 @@ fn myers_hunks(a: &[&[u8]], b: &[&[u8]]) -> Option<Vec<Hunk>> {
         for k in (-dd..=dd).step_by(2) {
             let down = k == -dd
                 || (k != dd && cell(&v, k - 1).unwrap_or(0) < cell(&v, k + 1).unwrap_or(0));
-            let mut x = if down { cell(&v, k + 1)? } else { cell(&v, k - 1)? + 1 };
+            let mut x = if down {
+                cell(&v, k + 1)?
+            } else {
+                cell(&v, k - 1)? + 1
+            };
             let mut y = x - i32::try_from(k).ok()?;
-            while x < n && y >= 0 && y < m && a[usize::try_from(x).ok()?] == b[usize::try_from(y).ok()?] {
+            while x < n
+                && y >= 0
+                && y < m
+                && a[usize::try_from(x).ok()?] == b[usize::try_from(y).ok()?]
+            {
                 x += 1;
                 y += 1;
             }
@@ -2687,8 +2733,8 @@ fn myers_hunks(a: &[&[u8]], b: &[&[u8]]) -> Option<Vec<Hunk>> {
         let prev = trace.get(dd - 1)?;
         let k = x - y;
         let di = i64::try_from(dd).ok()?;
-        let go_down =
-            k == -di || (k != di && cell(prev, k - 1).unwrap_or(0) < cell(prev, k + 1).unwrap_or(0));
+        let go_down = k == -di
+            || (k != di && cell(prev, k - 1).unwrap_or(0) < cell(prev, k + 1).unwrap_or(0));
         let k_prev = if go_down { k + 1 } else { k - 1 };
         let x_prev = i64::from(cell(prev, k_prev)?);
         let y_prev = x_prev - k_prev;
@@ -2850,7 +2896,13 @@ fn diff3_merge(
                     push_lines(&mut out, &ours_lines);
                 } else {
                     conflicted = true;
-                    push_conflict(&mut out, ours_label, &ours_lines, theirs_label, &theirs_lines);
+                    push_conflict(
+                        &mut out,
+                        ours_label,
+                        &ours_lines,
+                        theirs_label,
+                        &theirs_lines,
+                    );
                 }
             }
             (true, false) => {
@@ -3208,10 +3260,7 @@ enum LaneWrite {
 /// Applies one plan: publishes new blobs, swaps index rows per touched path,
 /// and syncs exactly those worktree paths. Returns the merged stage-zero
 /// rows for tree building.
-fn apply_merge_plan(
-    ctx: &Ctx,
-    plan: &MergePlan,
-) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
+fn apply_merge_plan(ctx: &Ctx, plan: &MergePlan) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let mut prepared = Vec::new();
@@ -3219,8 +3268,8 @@ fn apply_merge_plan(
     let mut mutations = Vec::new();
     let mut writes: Vec<(Vec<u8>, LaneWrite)> = Vec::new();
     for (path, resolution) in &plan.resolutions {
-        let repo_path = RepoPath::new(path.clone())
-            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        let repo_path =
+            RepoPath::new(path.clone()).map_err(|err| GitError::from(CoreError::from(err)))?;
         let before = read_path_rows(store, kind, &repo_path)?;
         let after: Vec<(Stage, IndexEntry)> = match resolution {
             PathResolution::Take { mode, oid } => {
@@ -3273,9 +3322,7 @@ fn apply_merge_plan(
             }
         };
         mutations.extend(super::state::path_row_mutations(
-            &repo_path,
-            &before,
-            &after,
+            &repo_path, &before, &after,
         )?);
     }
     let (workspace, raw) = load_or_default(store)?;
@@ -3371,7 +3418,11 @@ fn prune_empty_parents(full: &std::path::Path, base: &std::path::Path) {
 }
 
 /// Materializes one symlink worktree path from its target blob.
-fn write_lane_link(store: &MergeLaneStore, oid: Oid, full: &std::path::Path) -> Result<(), GitError> {
+fn write_lane_link(
+    store: &MergeLaneStore,
+    oid: Oid,
+    full: &std::path::Path,
+) -> Result<(), GitError> {
     let (_, body) = read_object_bytes(store, oid)?;
     #[cfg(unix)]
     {
@@ -3442,9 +3493,11 @@ fn guard_lane_worktree(
     let mut blocked: Vec<String> = Vec::new();
     for (path, resolution) in &plan.resolutions {
         let touched = match resolution {
-            PathResolution::Take { mode, oid } => ours_map.get(path).is_none_or(|(head_mode, head_oid)| {
-                head_mode.as_index_mode().ok() != Some(*mode) || head_oid != oid
-            }),
+            PathResolution::Take { mode, oid } => {
+                ours_map.get(path).is_none_or(|(head_mode, head_oid)| {
+                    head_mode.as_index_mode().ok() != Some(*mode) || head_oid != oid
+                })
+            }
             PathResolution::NewBlob { mode, bytes } => match ours_map.get(path) {
                 None => true,
                 Some((head_mode, head_oid)) => {
@@ -3465,9 +3518,9 @@ fn guard_lane_worktree(
             Some(entry) => {
                 let full = super::tree::join_base(&ctx.file_base, path)?;
                 if entry.mode() == FileMode::Symlink {
-                    let target = std::fs::read_link(&full).ok().map(|link| {
-                        link.as_os_str().as_encoded_bytes().to_vec()
-                    });
+                    let target = std::fs::read_link(&full)
+                        .ok()
+                        .map(|link| link.as_os_str().as_encoded_bytes().to_vec());
                     let wanted = lane_blob(store, &mut cache, entry.oid()).ok();
                     target != wanted
                 } else {
@@ -3560,11 +3613,11 @@ fn restore_abort_index(ctx: &Ctx, verb: &str) -> Result<(), GitError> {
         })?;
     let mut wanted: BTreeMap<Vec<u8>, Vec<(Stage, IndexEntry)>> = BTreeMap::new();
     for (path, stage_num, bytes) in &serial {
-        let stage = Stage::from_u8(*stage_num).map_err(|err| GitError::from(CoreError::from(err)))?;
-        let entry: IndexEntry =
-            sonic_rs::from_slice(bytes).map_err(|_| GitError::Corrupt {
-                detail: format!("abort snapshot for {verb} does not decode"),
-            })?;
+        let stage =
+            Stage::from_u8(*stage_num).map_err(|err| GitError::from(CoreError::from(err)))?;
+        let entry: IndexEntry = sonic_rs::from_slice(bytes).map_err(|_| GitError::Corrupt {
+            detail: format!("abort snapshot for {verb} does not decode"),
+        })?;
         entry
             .validate(kind)
             .map_err(|err| GitError::from(CoreError::from(err)))?;
@@ -3579,14 +3632,12 @@ fn restore_abort_index(ctx: &Ctx, verb: &str) -> Result<(), GitError> {
     let mut keys: std::collections::BTreeSet<Vec<u8>> = wanted.keys().cloned().collect();
     keys.extend(present.iter().cloned());
     for path in keys {
-        let repo_path = RepoPath::new(path.clone())
-            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        let repo_path =
+            RepoPath::new(path.clone()).map_err(|err| GitError::from(CoreError::from(err)))?;
         let before = read_path_rows(store, kind, &repo_path)?;
         let after = wanted.get(&path).cloned().unwrap_or_default();
         mutations.extend(super::state::path_row_mutations(
-            &repo_path,
-            &before,
-            &after,
+            &repo_path, &before, &after,
         )?);
         if let Some(rows) = wanted.get(&path) {
             if let Some((_, entry)) = rows.iter().find(|(stage, _)| *stage == Stage::Zero) {

@@ -995,13 +995,17 @@ fn pack_objects_revs_round_trip_through_index_pack() {
     .expect("pack-objects");
     assert!(pack.starts_with(b"PACK"), "not a pack stream");
     let (_dst, _env, mut dst) = indexed_repo("packobj-rt-dst", pack);
-    let count = String::from_utf8_lossy(
-        &run(verbs_objects::count_objects, &mut dst, &[]).expect("count"),
-    )
-    .into_owned();
+    let count =
+        String::from_utf8_lossy(&run(verbs_objects::count_objects, &mut dst, &[]).expect("count"))
+            .into_owned();
     assert!(count.starts_with("6 objects,"), "{count}");
     let walked = String::from_utf8_lossy(
-        &run(verbs_history::rev_list, &mut dst, &[tip.as_str(), "--count"]).expect("rev-list"),
+        &run(
+            verbs_history::rev_list,
+            &mut dst,
+            &[tip.as_str(), "--count"],
+        )
+        .expect("rev-list"),
     )
     .into_owned();
     assert_eq!(walked, "2\n", "{walked}");
@@ -1020,14 +1024,19 @@ fn pack_objects_exact_mode_packs_named_objects_only() {
         )
     };
     ctx.env.stdin = Some(
-        format!("{}\n-{}\n{}\n", blob.to_hex(), blob.to_hex(), commit.to_hex()).into_bytes(),
+        format!(
+            "{}\n-{}\n{}\n",
+            blob.to_hex(),
+            blob.to_hex(),
+            commit.to_hex()
+        )
+        .into_bytes(),
     );
     let pack = run(verbs_objects::pack_objects, &mut ctx, &["--stdout"]).expect("pack-objects");
     let (_dst, _env, mut dst) = indexed_repo("packobj-exact-dst", pack);
-    let count = String::from_utf8_lossy(
-        &run(verbs_objects::count_objects, &mut dst, &[]).expect("count"),
-    )
-    .into_owned();
+    let count =
+        String::from_utf8_lossy(&run(verbs_objects::count_objects, &mut dst, &[]).expect("count"))
+            .into_owned();
     assert!(count.starts_with("2 objects,"), "{count}");
     let hex = commit.to_hex();
     let present = run(verbs_objects::cat_file, &mut dst, &["-e", hex.as_str()]);
@@ -1039,16 +1048,14 @@ fn pack_objects_file_mode_writes_base_pack() {
     let (root, env) = seeded_repo("packobj-file", "a.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
     ctx.env.stdin = Some(b"HEAD\n".to_vec());
-    let out = run(verbs_objects::pack_objects, &mut ctx, &["--revs", "out"])
-        .expect("pack-objects");
+    let out = run(verbs_objects::pack_objects, &mut ctx, &["--revs", "out"]).expect("pack-objects");
     assert!(out.is_empty(), "file mode stays silent");
     let pack = std::fs::read(root.join("out.pack")).expect("pack file");
     assert!(pack.starts_with(b"PACK"), "not a pack stream");
     let (_dst, _env, mut dst) = indexed_repo("packobj-file-dst", pack);
-    let count = String::from_utf8_lossy(
-        &run(verbs_objects::count_objects, &mut dst, &[]).expect("count"),
-    )
-    .into_owned();
+    let count =
+        String::from_utf8_lossy(&run(verbs_objects::count_objects, &mut dst, &[]).expect("count"))
+            .into_owned();
     assert!(count.starts_with("3 objects,"), "{count}");
 }
 
@@ -1056,22 +1063,24 @@ fn pack_objects_file_mode_writes_base_pack() {
 fn pack_plumbing_rejects_thin_file_garbage_and_usage() {
     let (root, env) = seeded_repo("packobj-err", "a.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
-    let err = run(verbs_objects::pack_objects, &mut ctx, &["--thin", "out"])
-        .expect_err("thin file pack");
+    let err =
+        run(verbs_objects::pack_objects, &mut ctx, &["--thin", "out"]).expect_err("thin file pack");
     assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
-    let err = run(verbs_objects::pack_objects, &mut ctx, &["--stdout", "extra"])
-        .expect_err("trailing argv");
+    let err = run(
+        verbs_objects::pack_objects,
+        &mut ctx,
+        &["--stdout", "extra"],
+    )
+    .expect_err("trailing argv");
     assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
     ctx.env.stdin = Some(b"not-an-oid\n".to_vec());
-    let err = run(verbs_objects::pack_objects, &mut ctx, &["--stdout"])
-        .expect_err("garbage oid");
+    let err = run(verbs_objects::pack_objects, &mut ctx, &["--stdout"]).expect_err("garbage oid");
     assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
     ctx.env.stdin = None;
     let err = run(verbs_objects::index_pack, &mut ctx, &[]).expect_err("no source");
     assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
     ctx.env.stdin = Some(b"garbage".to_vec());
-    let err = run(verbs_objects::index_pack, &mut ctx, &["--stdin"])
-        .expect_err("garbage pack");
+    let err = run(verbs_objects::index_pack, &mut ctx, &["--stdin"]).expect_err("garbage pack");
     assert!(matches!(err, ruk_git::GitError::Corrupt { .. }), "{err}");
 }
 
@@ -3221,7 +3230,10 @@ fn merge_three_way_clean_makes_two_parent_commit() {
     std::fs::write(root.join("untracked.txt"), b"keep me\n").expect("untracked");
     let out = run(verbs_history::merge, &mut ctx, &["feature"]).expect("merge");
     assert!(String::from_utf8_lossy(&out).contains("ort"), "got {out:?}");
-    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"A\nb\nC\n");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"A\nb\nC\n"
+    );
     assert_eq!(
         std::fs::read(root.join("untracked.txt")).expect("read"),
         b"keep me\n"
@@ -3237,12 +3249,11 @@ fn merge_conflict_leaves_stages_and_merge_head() {
     let mut ctx = repo_ctx(&root, env);
     run(verbs_branch::checkout, &mut ctx, &["-b", "feature"]).expect("checkout -b");
     lane_commit(&mut ctx, &root, "f.txt", b"a\nX\nc\n", "feature side");
-    let tip = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["feature"]).expect("tip"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let tip =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["feature"]).expect("tip"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "f.txt", b"a\nY\nc\n", "main side");
     let err = run(verbs_history::merge, &mut ctx, &["feature"]).expect_err("conflict");
@@ -3279,7 +3290,10 @@ fn merge_continue_concludes_after_resolve() {
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     let out = run(verbs_history::merge, &mut ctx, &["--continue"]).expect("continue");
     assert!(!out.is_empty());
-    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"a\nZ\nc\n");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"a\nZ\nc\n"
+    );
     assert_eq!(head_parent_count(&mut ctx), 2);
     let store = ctx.store().expect("store");
     assert!(
@@ -3306,7 +3320,10 @@ fn merge_abort_restores_pre_merge_state() {
     run(verbs_history::merge, &mut ctx, &["feature"]).expect_err("conflict");
     let out = run(verbs_history::merge, &mut ctx, &["--abort"]).expect("abort");
     assert!(out.is_empty());
-    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"a\nY\nc\n");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"a\nY\nc\n"
+    );
     assert_eq!(index_stages(&mut ctx, "f.txt"), vec![0]);
     assert_eq!(head_parent_count(&mut ctx), 1);
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -3367,12 +3384,11 @@ fn cherry_pick_middle_commit_applies_content_and_message() {
     lane_commit(&mut ctx, &root, "b.txt", b"b\n", "pick B");
     lane_commit(&mut ctx, &root, "c.txt", b"c\n", "pick C");
     lane_commit(&mut ctx, &root, "d.txt", b"d\n", "pick D");
-    let middle = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["side~1"]).expect("middle"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let middle =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["side~1"]).expect("middle"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     run(verbs_history::cherry_pick, &mut ctx, &[middle.as_str()]).expect("pick");
     assert_eq!(std::fs::read(root.join("c.txt")).expect("read"), b"c\n");
@@ -3381,9 +3397,12 @@ fn cherry_pick_middle_commit_applies_content_and_message() {
     assert_eq!(head_parent_count(&mut ctx), 1);
     let store = ctx.store().expect("store");
     let head = super::state::head_oid(store).expect("head");
-    let message =
-        String::from_utf8_lossy(super::state::commit_record(store, head).expect("record").message())
-            .into_owned();
+    let message = String::from_utf8_lossy(
+        super::state::commit_record(store, head)
+            .expect("record")
+            .message(),
+    )
+    .into_owned();
     assert_eq!(message, "pick C\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -3397,10 +3416,16 @@ fn revert_removes_picked_change() {
     assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"one\n");
     let store = ctx.store().expect("store");
     let head = super::state::head_oid(store).expect("head");
-    let message =
-        String::from_utf8_lossy(super::state::commit_record(store, head).expect("record").message())
-            .into_owned();
-    assert!(message.starts_with("Revert \"add line\""), "got {message:?}");
+    let message = String::from_utf8_lossy(
+        super::state::commit_record(store, head)
+            .expect("record")
+            .message(),
+    )
+    .into_owned();
+    assert!(
+        message.starts_with("Revert \"add line\""),
+        "got {message:?}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -3418,8 +3443,14 @@ fn rebase_replays_side_onto_main() {
         String::from_utf8_lossy(&out).contains("Successfully rebased"),
         "got {out:?}"
     );
-    assert_eq!(std::fs::read(root.join("base.txt")).expect("read"), b"side\n");
-    assert_eq!(std::fs::read(root.join("other.txt")).expect("read"), b"other\n");
+    assert_eq!(
+        std::fs::read(root.join("base.txt")).expect("read"),
+        b"side\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("other.txt")).expect("read"),
+        b"other\n"
+    );
     let count = String::from_utf8(
         run(verbs_history::rev_list, &mut ctx, &["--count", "HEAD"]).expect("count"),
     )

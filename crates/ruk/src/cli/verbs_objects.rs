@@ -737,10 +737,7 @@ pub(crate) fn index_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
             })?;
             (path, bytes)
         }
-        None => (
-            "stdin".to_owned(),
-            super::read_stdin_bytes(&ctx.env)?,
-        ),
+        None => ("stdin".to_owned(), super::read_stdin_bytes(&ctx.env)?),
     };
     let staged = ruk_git::transport::pack::ingest_pack(
         &bytes[..],
@@ -754,7 +751,12 @@ pub(crate) fn index_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
     if opts.is_set("verbose") {
         for object in staged.objects() {
             out.extend_from_slice(
-                format!("{} {}\n", object.oid().to_hex(), kind_name_of(object.kind())).as_bytes(),
+                format!(
+                    "{} {}\n",
+                    object.oid().to_hex(),
+                    kind_name_of(object.kind())
+                )
+                .as_bytes(),
             );
         }
     }
@@ -794,7 +796,8 @@ pub(crate) fn index_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
 /// `--include-tag`, `--stdin-packs`, `--cruft`, `--keep-pack`,
 /// `--local`, `--incremental`.
 pub(crate) fn pack_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    const USAGE: &str = "usage: pack-objects [--stdout | <base>] [--revs] [--all] [--thin] < <list>";
+    const USAGE: &str =
+        "usage: pack-objects [--stdout | <base>] [--revs] [--all] [--thin] < <list>";
     let specs = [
         FlagSpec {
             long: "stdout",
@@ -857,12 +860,14 @@ pub(crate) fn pack_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     };
     let entries: Vec<ruk_git::transport::pack::PackEntry<'_>> = payloads
         .iter()
-        .map(|(oid, object_kind, bytes)| ruk_git::transport::pack::PackEntry {
-            oid: *oid,
-            kind: *object_kind,
-            bytes,
-            base: None,
-        })
+        .map(
+            |(oid, object_kind, bytes)| ruk_git::transport::pack::PackEntry {
+                oid: *oid,
+                kind: *object_kind,
+                bytes,
+                base: None,
+            },
+        )
         .collect();
     let mut pack = Vec::new();
     ruk_git::transport::pack::write_pack(
@@ -945,8 +950,7 @@ fn pack_rev_closure(
         }
         rev_args.push(line_text.to_owned());
     }
-    let (tips, exclude) =
-        super::verbs_history::parse_log_revs(store, kind, &rev_args, None)?;
+    let (tips, exclude) = super::verbs_history::parse_log_revs(store, kind, &rev_args, None)?;
     let mut all_tips = tips;
     if opts.is_set("all") {
         all_tips.extend(pack_all_tips(store, kind)?);
@@ -1073,7 +1077,10 @@ fn pack_tag_target(
     oid: ruk_core::ids::Oid,
     bytes: &[u8],
 ) -> Result<ruk_core::ids::Oid, GitError> {
-    let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let first = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
     let hex = first
         .strip_prefix(b"object ")
         .ok_or_else(|| GitError::Corrupt {

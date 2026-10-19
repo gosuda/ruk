@@ -395,7 +395,11 @@ pub(crate) fn sequencer_read(
 }
 
 /// Writes one sequencer record, replacing any record the verb left behind.
-pub(crate) fn sequencer_write(store: &Store, verb: &str, state: &SequencerState) -> Result<(), GitError> {
+pub(crate) fn sequencer_write(
+    store: &Store,
+    verb: &str,
+    state: &SequencerState,
+) -> Result<(), GitError> {
     let mut key = SEQUENCER_PREFIX.to_vec();
     key.extend_from_slice(verb.as_bytes());
     let value = sonic_rs::to_vec(state).map_err(|err| GitError::Io {
@@ -444,7 +448,9 @@ fn pseudo_key(name: &str) -> Vec<u8> {
 
 /// Reads one pseudo-head record as raw bytes.
 pub(crate) fn pseudo_read(store: &Store, name: &str) -> Result<Option<Vec<u8>>, GitError> {
-    store.fact(FactTable::Pins, &pseudo_key(name)).map_err(GitError::from)
+    store
+        .fact(FactTable::Pins, &pseudo_key(name))
+        .map_err(GitError::from)
 }
 
 /// Writes one pseudo-head record, replacing any previous value.
