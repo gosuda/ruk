@@ -5405,7 +5405,7 @@ fn notes_add_show_list_round_trip() {
     )
     .expect("utf8");
     let kind = run(verbs_objects::cat_file, &mut ctx, &["-t", tip.trim()]).expect("type");
-    assert_eq!(kind, b"commit");
+    assert_eq!(String::from_utf8_lossy(&kind).trim_end(), "commit");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
