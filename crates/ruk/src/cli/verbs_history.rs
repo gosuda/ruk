@@ -5036,7 +5036,8 @@ pub(crate) fn tree_file_changes(
             (None, None) => {}
             (Some(old), Some(new)) if old == new => {}
             (Some((old_mode, old_oid)), Some((new_mode, new_oid))) => {
-                let (old_body, new_body) = stored_pair(store, old_oid, new_oid)?;
+                let (old_body, new_body) =
+                    stored_pair(store, (old_mode, old_oid), (new_mode, new_oid))?;
                 let (added, removed, binary) = count_diff(&old_body, &new_body);
                 changes.push(FileChange {
                     old: Some((path.clone(), old_mode, old_oid)),
@@ -5065,7 +5066,7 @@ pub(crate) fn tree_file_changes(
         match paired {
             Some((index, new_path, new_mode, new_oid)) => {
                 taken_new[index] = true;
-                let (_, body) = read_object_bytes(store, old_oid)?;
+                let body = stat_body(store, old_mode, old_oid)?;
                 changes.push(FileChange {
                     old: Some((old_path, old_mode, old_oid)),
                     new: Some((new_path, new_mode, new_oid)),
@@ -5079,7 +5080,7 @@ pub(crate) fn tree_file_changes(
         }
     }
     for (path, mode, oid) in orphans {
-        let (_, body) = read_object_bytes(store, oid)?;
+        let body = stat_body(store, mode, oid)?;
         changes.push(FileChange {
             old: Some((path, mode, oid)),
             new: None,
@@ -5093,7 +5094,7 @@ pub(crate) fn tree_file_changes(
         if taken_new[index] {
             continue;
         }
-        let (_, body) = read_object_bytes(store, oid)?;
+        let body = stat_body(store, mode, oid)?;
         changes.push(FileChange {
             old: None,
             new: Some((path, mode, oid)),
@@ -5108,10 +5109,27 @@ pub(crate) fn tree_file_changes(
 }
 
 /// Reads both blobs behind one stored pair.
-fn stored_pair(store: &Store, old: Oid, new: Oid) -> Result<(Vec<u8>, Vec<u8>), GitError> {
-    let (_, old_body) = read_object_bytes(store, old)?;
-    let (_, new_body) = read_object_bytes(store, new)?;
-    Ok((old_body, new_body))
+fn stored_pair(
+    store: &Store,
+    old: (TreeMode, Oid),
+    new: (TreeMode, Oid),
+) -> Result<(Vec<u8>, Vec<u8>), GitError> {
+    Ok((
+        stat_body(store, old.0, old.1)?,
+        stat_body(store, new.0, new.1)?,
+    ))
+}
+
+/// Reads one blob for stat line counts.
+///
+/// A gitlink row names a commit in the child store, never a blob here, so
+/// its side reads as empty: the change still counts as a file, with no
+/// lines, and the mode line keeps the `160000` spelling.
+fn stat_body(store: &Store, mode: TreeMode, oid: Oid) -> Result<Vec<u8>, GitError> {
+    if mode == TreeMode::Gitlink {
+        return Ok(Vec::new());
+    }
+    read_object_bytes(store, oid).map(|(_, body)| body)
 }
 
 /// Counts added/removed lines between two bodies with the shared LCS
