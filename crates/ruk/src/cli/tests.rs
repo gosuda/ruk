@@ -6457,10 +6457,18 @@ fn log_topo_order_cherry_pick_smoke() {
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "m.txt", b"main\n", "main work");
     for flag in ["--topo-order", "--date-order"] {
-        let out = run(verbs_history::log, &mut ctx, &["--oneline", flag]).expect(flag);
+        let out = run(
+            verbs_history::log,
+            &mut ctx,
+            &["--oneline", "--all", flag],
+        )
+        .expect(flag);
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("side work"), "{flag} got {text}");
         assert!(text.contains("add b"), "{flag} got {text}");
+        let head_only = run(verbs_history::log, &mut ctx, &["--oneline", flag]).expect(flag);
+        let head_text = String::from_utf8_lossy(&head_only).into_owned();
+        assert!(!head_text.contains("side work"), "{flag} got {head_text}");
     }
     let out = run(
         verbs_history::log,
@@ -7589,5 +7597,20 @@ fn wave_j_switch_merge_guard() {
     assert!(err.to_string().contains("overwritten"), "got {err:?}");
     run(verbs_branch::reset, &mut ctx, &["--hard", "HEAD"]).expect("clean");
     run(verbs_branch::switch, &mut ctx, &["-m", "side"]).expect("merge clean");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_reset_intent_full_tree() {
+    let (root, env) = seeded_repo("wavej-intentfull", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("new.txt"), b"new\n").expect("new file");
+    run(verbs_stage::add, &mut ctx, &["new.txt"]).expect("add");
+    run(verbs_branch::reset, &mut ctx, &["-N", "HEAD"]).expect("intent reset");
+    let out = String::from_utf8(
+        run(verbs_stage::ls_files, &mut ctx, &["-s"]).expect("ls-files"),
+    )
+    .expect("utf8");
+    assert!(out.contains("new.txt"), "intent row kept: {out:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

@@ -2786,6 +2786,7 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
     }
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
+    let mut needs_empty = false;
     for wanted in paths {
         let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
         let before = read_path_rows(store, kind, &path)?;
@@ -2799,10 +2800,15 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
             None => {
                 let entry = IndexEntry::intent_to_add(kind, FileMode::Regular, None)
                     .map_err(|err| GitError::from(CoreError::from(err)))?;
+                needs_empty = true;
                 vec![(Stage::Zero, entry)]
             }
         };
         mutations.extend(path_row_mutations(&path, &before, &after)?);
+    }
+    // Intent rows name the empty blob: store it so later reads resolve.
+    if needs_empty {
+        store_object(store, ruk_core::store::ObjectKind::Blob, Vec::new())?;
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
@@ -2941,6 +2947,7 @@ fn reset_tree_intent(ctx: &Ctx, tree: Oid) -> Result<(), GitError> {
     }
     let (workspace, raw) = load_or_default(store)?;
     let mut mutations = Vec::new();
+    let mut needs_empty = false;
     for path in union {
         let before = read_path_rows(store, kind, &path)?;
         let after = match target.get(path.as_bytes()) {
@@ -2957,10 +2964,15 @@ fn reset_tree_intent(ctx: &Ctx, tree: Oid) -> Result<(), GitError> {
             None => {
                 let entry = IndexEntry::intent_to_add(kind, FileMode::Regular, None)
                     .map_err(|err| GitError::from(CoreError::from(err)))?;
+                needs_empty = true;
                 vec![(Stage::Zero, entry)]
             }
         };
         mutations.extend(path_row_mutations(&path, &before, &after)?);
+    }
+    // Intent rows name the empty blob: store it so later reads resolve.
+    if needs_empty {
+        store_object(store, ruk_core::store::ObjectKind::Blob, Vec::new())?;
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
