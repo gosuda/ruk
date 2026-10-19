@@ -3210,12 +3210,104 @@ fn plan_merge_trees(
             }
         }
     }
+    // Rename tracking: a rename on one side plus content edits on the other
+    // merges the edit into the renamed path instead of conflicting as
+    // delete plus add. Detection runs at the oracle's 50% threshold.
+    let theirs_ren = detect_lane_renames(ctx, &mut scope.blobs, &base_map, &theirs_map)?;
+    let ours_ren = detect_lane_renames(ctx, &mut scope.blobs, &base_map, &ours_map)?;
+    // `old -> (new, theirs_renamed)` for consumed rename sources, and the
+    // reverse for redirect targets.
+    let mut redirect_old: HashMap<Vec<u8>, (Vec<u8>, bool)> = HashMap::new();
+    let mut redirect_new: HashMap<Vec<u8>, (Vec<u8>, bool)> = HashMap::new();
+    for (old, new, _) in &theirs_ren {
+        if ours_ren.iter().any(|(other, _, _)| other == old)
+            || dir_prefixes.contains(new)
+        {
+            continue;
+        }
+        match (
+            base_map.get(old),
+            ours_map.get(old),
+            ours_map.get(new),
+        ) {
+            (Some(base_side), Some(ours_side), None) if ours_side != base_side => {
+                redirect_old.insert(old.clone(), (new.clone(), true));
+                redirect_new.insert(new.clone(), (old.clone(), true));
+            }
+            _ => {}
+        }
+    }
+    for (old, new, _) in &ours_ren {
+        if theirs_ren.iter().any(|(other, _, _)| other == old)
+            || redirect_old.contains_key(old)
+            || dir_prefixes.contains(new)
+        {
+            continue;
+        }
+        match (
+            base_map.get(old),
+            theirs_map.get(old),
+            theirs_map.get(new),
+        ) {
+            (Some(base_side), Some(theirs_side), None) if theirs_side != base_side => {
+                redirect_old.insert(old.clone(), (new.clone(), false));
+                redirect_new.insert(new.clone(), (old.clone(), false));
+            }
+            _ => {}
+        }
+    }
     let mut plan = MergePlan {
         resolutions: Vec::new(),
         auto_merged: Vec::new(),
         conflicted: Vec::new(),
     };
     for path in keys {
+        // A consumed rename source simply deletes: its content merged at
+        // the redirect target below.
+        if redirect_old.contains_key(&path) {
+            plan.resolutions.push((path, PathResolution::Deleted));
+            continue;
+        }
+        if let Some((old_path, theirs_side)) = redirect_new.get(&path) {
+            let shown = String::from_utf8_lossy(&path).into_owned();
+            let synthetic = PathSides {
+                base: base_map.get(old_path).copied(),
+                ours: if *theirs_side {
+                    ours_map.get(old_path).copied()
+                } else {
+                    ours_map.get(&path).copied()
+                },
+                theirs: if *theirs_side {
+                    theirs_map.get(&path).copied()
+                } else {
+                    theirs_map.get(old_path).copied()
+                },
+            };
+            let resolution = match (synthetic.base, synthetic.ours, synthetic.theirs) {
+                (Some(_), Some(_), Some(_)) => {
+                    plan.auto_merged.push(shown);
+                    resolve_content(ctx, &mut scope, &path, &synthetic)?
+                }
+                _ => {
+                    let input = PathInput {
+                        path: &path,
+                        dir_clash: dir_prefixes.contains(&path),
+                        sides: PathSides {
+                            base: base_map.get(&path).copied(),
+                            ours: ours_map.get(&path).copied(),
+                            theirs: theirs_map.get(&path).copied(),
+                        },
+                    };
+                    resolve_path(ctx, &mut scope, &input, &mut plan.auto_merged)?
+                }
+            };
+            if matches!(resolution, PathResolution::Conflict { .. }) {
+                plan.conflicted
+                    .push(String::from_utf8_lossy(&path).into_owned());
+            }
+            plan.resolutions.push((path, resolution));
+            continue;
+        }
         let input = PathInput {
             path: &path,
             dir_clash: dir_prefixes.contains(&path),
@@ -3233,6 +3325,104 @@ fn plan_merge_trees(
         plan.resolutions.push((path, resolution));
     }
     Ok(plan)
+}
+
+/// Detects base-to-side renames: deleted base paths paired with added side
+/// paths by blob identity, then by 50% content similarity. Blob bodies come
+/// through the lane cache; gitlink sides only pair when identical.
+fn detect_lane_renames(
+    ctx: &Ctx,
+    cache: &mut HashMap<Oid, Vec<u8>>,
+    base: &BTreeMap<Vec<u8>, (TreeMode, Oid)>,
+    side: &BTreeMap<Vec<u8>, (TreeMode, Oid)>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
+    use super::rename::{RenameSide, pair_renames, similarity};
+    let store = ctx.store()?;
+    let mut dels: Vec<(Vec<u8>, TreeMode, Oid)> = Vec::new();
+    let mut adds: Vec<(Vec<u8>, TreeMode, Oid)> = Vec::new();
+    for (path, (mode, oid)) in base {
+        if !side.contains_key(path) {
+            dels.push((path.clone(), *mode, *oid));
+        }
+    }
+    for (path, (mode, oid)) in side {
+        if !base.contains_key(path) {
+            adds.push((path.clone(), *mode, *oid));
+        }
+    }
+    let mut taken = vec![false; adds.len()];
+    let mut out: Vec<(Vec<u8>, Vec<u8>, u8)> = Vec::new();
+    let mut rest: Vec<(Vec<u8>, TreeMode, Oid)> = Vec::new();
+    for (old_path, old_mode, old_oid) in dels {
+        let mut hit = None;
+        for (index, (new_path, _, new_oid)) in adds.iter().enumerate() {
+            if !taken[index] && *new_oid == old_oid {
+                hit = Some(index);
+                out.push((old_path.clone(), new_path.clone(), 100));
+                break;
+            }
+        }
+        match hit {
+            Some(index) => taken[index] = true,
+            None => rest.push((old_path, old_mode, old_oid)),
+        }
+    }
+    let live_adds: Vec<(Vec<u8>, TreeMode, Oid)> = adds
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !taken[*index])
+        .map(|(_, triple)| triple)
+        .collect();
+    const MAX_SCORE_BYTES: usize = 1 << 20;
+    let mut lane_body = |mode: TreeMode, oid: Oid| -> Result<Option<Vec<u8>>, GitError> {
+        if mode == TreeMode::Gitlink {
+            return Ok(None);
+        }
+        let body = lane_blob(store, cache, oid)?;
+        if body.len() > MAX_SCORE_BYTES {
+            return Ok(None);
+        }
+        Ok(Some(body))
+    };
+    let mut del_side = Vec::with_capacity(rest.len());
+    let mut del_body = Vec::with_capacity(rest.len());
+    for (path, mode, oid) in &rest {
+        let body = lane_body(*mode, *oid)?;
+        del_side.push(RenameSide {
+            path: path.clone(),
+            size: body.as_ref().map_or(0, Vec::len),
+        });
+        del_body.push(body);
+    }
+    let mut add_side = Vec::with_capacity(live_adds.len());
+    let mut add_body = Vec::with_capacity(live_adds.len());
+    for (path, mode, oid) in &live_adds {
+        let body = lane_body(*mode, *oid)?;
+        add_side.push(RenameSide {
+            path: path.clone(),
+            size: body.as_ref().map_or(0, Vec::len),
+        });
+        add_body.push(body);
+    }
+    let rest_oid: Vec<Oid> = rest.iter().map(|(_, _, oid)| *oid).collect();
+    let live_oid: Vec<Oid> = live_adds.iter().map(|(_, _, oid)| *oid).collect();
+    for win in pair_renames(&del_side, &add_side, 50, |oi, ni| {
+        if rest_oid[oi] == live_oid[ni] {
+            return 100;
+        }
+        match (&del_body[oi], &add_body[ni]) {
+            (Some(old), Some(new)) => similarity(old, new),
+            _ => 0,
+        }
+    }) {
+        out.push((
+            del_side[win.old].path.clone(),
+            add_side[win.new].path.clone(),
+            win.score,
+        ));
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// One scoped worktree write: only merge-touched paths are ever addressed.
@@ -3845,6 +4035,7 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     ];
     let (rev_args, path_args) = split_double_dash(args);
     let (rev_args, decorate_mode) = extract_decorate_arg(&rev_args)?;
+    let (rev_args, rename_mode) = super::rename::split_rename_args(&rev_args)?;
     let opts = collect_expanded(&rewrite_dash_number(&rev_args), &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -3907,7 +4098,14 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         let decoration = decoration_text(&decorations, oid, full_names);
         let mut block = render_commit_line(&line, oid, record, &decoration)?;
         if show_diffs {
-            block.extend_from_slice(&log_commit_diff(ctx, store, oid, record, &opts)?);
+            block.extend_from_slice(&log_commit_diff(
+                ctx,
+                store,
+                oid,
+                record,
+                &opts,
+                rename_mode,
+            )?);
         }
         if graph {
             block = graph_block(&block);
@@ -4006,13 +4204,15 @@ fn log_commit_diff(
     oid: &Oid,
     record: &CommitRecord,
     opts: &super::Collected,
+    rename_mode: super::rename::RenameMode,
 ) -> Result<Vec<u8>, GitError> {
     let tree = commit_tree_oid(record)?;
     let mut parent_tree = None;
     if let Some(parent) = commit_parents(store, *oid)?.first() {
         parent_tree = Some(commit_tree_oid(&commit_record(store, *parent)?)?);
     }
-    let pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
+    let mut pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
+    apply_pair_renames(ctx, &mut pairs, rename_mode)?;
     render_pairs(ctx, &pairs, opts)
 }
 
@@ -4100,6 +4300,7 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         },
     ];
     let (args, decorate_mode) = extract_decorate_arg(args)?;
+    let (args, rename_mode) = super::rename::split_rename_args(&args)?;
     let opts = collect_expanded(&args, &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -4129,7 +4330,8 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     if let Some(parent) = commit_parents(store, oid)?.first() {
         parent_tree = Some(commit_tree_oid(&commit_record(store, *parent)?)?);
     }
-    let pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
+    let mut pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
+    apply_pair_renames(ctx, &mut pairs, rename_mode)?;
     out.extend_from_slice(&render_pairs(ctx, &pairs, &opts)?);
     Ok(out)
 }
@@ -4189,6 +4391,7 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         },
     ];
     let (rev_args, dash_paths) = split_double_dash(args);
+    let (rev_args, rename_mode) = super::rename::split_rename_args(&rev_args)?;
     let opts = collect_expanded(&rev_args, &specs)?;
     ctx.require_worktree()?;
     let store = ctx.store()?;
@@ -4241,6 +4444,9 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         .map(|text| super::verbs_stage::repo_path_of(ctx, text.as_bytes()))
         .collect::<Result<_, _>>()?;
     let staged = opts.is_set("cached") || opts.is_set("staged");
+    // Only tree/tree and tree/index pairs rename-pair: worktree additions
+    // include untracked files, which the oracle never pairs.
+    let track_renames = rev_b.is_some() || staged;
     let pairs = match (rev, rev_b) {
         (Some(one), Some(two)) => {
             let old_tree = peel_to_tree(store, kind, resolve_local(store, kind, &one)?)?;
@@ -4255,13 +4461,21 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         },
         (None, Some(_)) => unreachable!("a second rev never outlives a missing first"),
     };
+    let mut pairs = pairs;
+    if track_renames {
+        apply_pair_renames(ctx, &mut pairs, rename_mode)?;
+    }
     let pairs: Vec<TreePair> = pairs
         .into_iter()
         .filter(|pair| {
             paths.is_empty()
-                || paths
-                    .iter()
-                    .any(|want| want.as_bytes() == pair.path.as_slice())
+                || paths.iter().any(|want| {
+                    want.as_bytes() == pair.path.as_slice()
+                        || pair
+                            .old_path
+                            .as_ref()
+                            .is_some_and(|old| want.as_bytes() == old.as_slice())
+                })
         })
         .collect();
     render_pairs(ctx, &pairs, &opts)
@@ -4269,8 +4483,10 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
 
 /// One compared path: the old and new side, either absent.
 struct TreePair {
-    /// Full path bytes.
+    /// Full path bytes (the new path for renames).
     path: Vec<u8>,
+    /// Old path for renames, set by the pairing pass.
+    old_path: Option<Vec<u8>>,
     /// Old mode and oid, when present before.
     old: Option<(TreeMode, Oid)>,
     /// New mode and oid, when present after.
@@ -4278,6 +4494,8 @@ struct TreePair {
     /// New-side bytes when the content has no stored object (worktree
     /// edits). Overrides the object read keyed by `new`'s oid.
     new_bytes: Option<Vec<u8>>,
+    /// Rename similarity score, set by the pairing pass.
+    similarity: Option<u8>,
 }
 
 /// Pairs two optional trees path by path.
@@ -4312,9 +4530,11 @@ fn tree_pairs(ctx: &Ctx, old: Option<Oid>, new: Option<Oid>) -> Result<Vec<TreeP
         }
         pairs.push(TreePair {
             path,
+            old_path: None,
             old: old_entry,
             new: new_entry,
             new_bytes: None,
+            similarity: None,
         });
     }
     Ok(pairs)
@@ -4348,9 +4568,11 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                 let mode = TreeMode::from(entry_mode_of(&entry));
                 pairs.push(TreePair {
                     path: entry.path,
+                    old_path: None,
                     old: None,
                     new: Some((mode, oid)),
                     new_bytes: Some(bytes),
+                    similarity: None,
                 });
             }
             Some((mode, oid)) => {
@@ -4361,9 +4583,11 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                         .map_err(|err| GitError::from(CoreError::from(err)))?;
                     pairs.push(TreePair {
                         path: entry.path,
+                        old_path: None,
                         old: Some((mode, oid)),
                         new: Some((mode, fresh)),
                         new_bytes: Some(bytes),
+                        similarity: None,
                     });
                 }
             }
@@ -4372,9 +4596,11 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
     for (path, (mode, oid)) in index_map {
         pairs.push(TreePair {
             path,
+            old_path: None,
             old: Some((mode, oid)),
             new: None,
             new_bytes: None,
+            similarity: None,
         });
     }
     pairs.sort_by(|left, right| left.path.cmp(&right.path));
@@ -4445,9 +4671,11 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                 let mode = TreeMode::from(entry_mode_of(&entry));
                 pairs.push(TreePair {
                     path: entry.path,
+                    old_path: None,
                     old: None,
                     new: Some((mode, fresh)),
                     new_bytes: Some(bytes),
+                    similarity: None,
                 });
             }
             Some((mode, oid)) => {
@@ -4458,9 +4686,11 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                         .map_err(|err| GitError::from(CoreError::from(err)))?;
                     pairs.push(TreePair {
                         path: entry.path,
+                        old_path: None,
                         old: Some((mode, oid)),
                         new: Some((mode, fresh)),
                         new_bytes: Some(bytes),
+                        similarity: None,
                     });
                 }
             }
@@ -4469,9 +4699,11 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
     for (path, (mode, oid)) in tree_map {
         pairs.push(TreePair {
             path,
+            old_path: None,
             old: Some((mode, oid)),
             new: None,
             new_bytes: None,
+            similarity: None,
         });
     }
     pairs.sort_by(|left, right| left.path.cmp(&right.path));
@@ -4526,18 +4758,161 @@ fn tree_pairs_index(
         }
         pairs.push(TreePair {
             path,
+            old_path: None,
             old: old_entry,
             new: new_entry,
             new_bytes: None,
+            similarity: None,
         });
     }
     Ok(pairs)
 }
 
+/// Pairs deletions with additions into renames when `mode` enables
+/// similarity (`-M`). Worktree pairs never reach this pass: their additions
+/// include untracked files, which the oracle never rename-pairs, so the
+/// callers only invoke it for tree/tree and tree/index pairs.
+fn apply_pair_renames(
+    ctx: &Ctx,
+    pairs: &mut Vec<TreePair>,
+    mode: super::rename::RenameMode,
+) -> Result<(), GitError> {
+    use super::rename::{RenameSide, pair_renames, similarity};
+    let threshold = match mode {
+        super::rename::RenameMode::Similar(value) => value,
+        super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => {
+            return Ok(());
+        }
+    };
+    let store = ctx.store()?;
+    // Index positions of pure deletions and pure additions.
+    let mut dels: Vec<usize> = Vec::new();
+    let mut adds: Vec<usize> = Vec::new();
+    for (index, pair) in pairs.iter().enumerate() {
+        match (&pair.old, &pair.new) {
+            (Some(_), None) => dels.push(index),
+            (None, Some(_)) => adds.push(index),
+            _ => {}
+        }
+    }
+    if dels.is_empty() || adds.is_empty() {
+        return Ok(());
+    }
+    const MAX_SCORE_BYTES: usize = 1 << 20;
+    // Blob bodies on each side, read once; oversized sides only pair when
+    // their oids already match.
+    let mut del_body: Vec<Option<Vec<u8>>> = Vec::with_capacity(dels.len());
+    let mut del_side: Vec<RenameSide> = Vec::with_capacity(dels.len());
+    for index in &dels {
+        let pair = &pairs[*index];
+        let (mode, oid) = pair.old.expect("deletion has an old side");
+        let (_, body) = read_object_bytes(store, oid)?;
+        del_side.push(RenameSide {
+            path: pair.path.clone(),
+            size: body.len(),
+        });
+        del_body.push(if body.len() > MAX_SCORE_BYTES {
+            None
+        } else {
+            Some(body)
+        });
+    }
+    let mut add_body: Vec<Option<Vec<u8>>> = Vec::with_capacity(adds.len());
+    let mut add_side: Vec<RenameSide> = Vec::with_capacity(adds.len());
+    for index in &adds {
+        let pair = &pairs[*index];
+        let (_, oid) = pair.new.expect("addition has a new side");
+        let body = match &pair.new_bytes {
+            Some(bytes) => bytes.clone(),
+            None => read_object_bytes(store, oid)?.1,
+        };
+        add_side.push(RenameSide {
+            path: pair.path.clone(),
+            size: body.len(),
+        });
+        add_body.push(if body.len() > MAX_SCORE_BYTES {
+            None
+        } else {
+            Some(body)
+        });
+    }
+    let del_oid: Vec<Oid> = dels
+        .iter()
+        .map(|index| pairs[*index].old.expect("deletion old").1)
+        .collect();
+    let add_oid: Vec<Oid> = adds
+        .iter()
+        .map(|index| pairs[*index].new.expect("addition new").1)
+        .collect();
+    let del_link: Vec<bool> = dels
+        .iter()
+        .map(|index| {
+            matches!(
+                pairs[*index].old.expect("deletion old").0,
+                TreeMode::Gitlink
+            )
+        })
+        .collect();
+    let add_link: Vec<bool> = adds
+        .iter()
+        .map(|index| {
+            matches!(
+                pairs[*index].new.expect("addition new").0,
+                TreeMode::Gitlink
+            )
+        })
+        .collect();
+    let winners = pair_renames(&del_side, &add_side, threshold, |oi, ni| {
+        if del_oid[oi] == add_oid[ni] {
+            return 100;
+        }
+        if del_link[oi] || add_link[ni] {
+            return 0;
+        }
+        match (&del_body[oi], &add_body[ni]) {
+            (Some(old), Some(new)) => similarity(old, new),
+            _ => 0,
+        }
+    });
+    if winners.is_empty() {
+        return Ok(());
+    }
+    let mut dead = vec![false; pairs.len()];
+    let mut merged: Vec<(usize, Vec<u8>, (TreeMode, Oid), u8)> = Vec::new();
+    for win in &winners {
+        let del_index = dels[win.old];
+        let add_index = adds[win.new];
+        dead[del_index] = true;
+        merged.push((
+            add_index,
+            pairs[del_index].path.clone(),
+            pairs[del_index].old.expect("deletion old"),
+            win.score,
+        ));
+    }
+    for (add_index, old_path, old_entry, score) in merged {
+        let pair = &mut pairs[add_index];
+        pair.old = Some(old_entry);
+        pair.old_path = Some(old_path);
+        pair.similarity = Some(score);
+    }
+    let mut kept = Vec::with_capacity(pairs.len());
+    for (index, pair) in pairs.drain(..).enumerate() {
+        if !dead[index] {
+            kept.push(pair);
+        }
+    }
+    kept.sort_by(|left, right| left.path.cmp(&right.path));
+    *pairs = kept;
+    Ok(())
+}
+
 /// One rendered pair with its line counts for `--stat`.
 struct CountedHunk {
-    /// Full path bytes.
+    /// Full path bytes (the new path for renames).
     path: Vec<u8>,
+    /// Old path for renames.
+    old_path: Option<Vec<u8>>,
     /// Unified text for the patch form.
     text: Vec<u8>,
     /// Added lines.
@@ -4565,6 +4940,17 @@ fn render_pairs(
     if opts.is_set("name-status") {
         let mut out = Vec::new();
         for pair in pairs {
+            if let (Some(old_path), Some(score)) = (&pair.old_path, pair.similarity) {
+                out.extend_from_slice(
+                    format!(
+                        "R{score}\t{}\t{}\n",
+                        String::from_utf8_lossy(old_path),
+                        String::from_utf8_lossy(&pair.path)
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            }
             let status = match (&pair.old, &pair.new) {
                 (None, Some(_)) => 'A',
                 (Some(_), None) => 'D',
@@ -4584,6 +4970,7 @@ fn render_pairs(
             unified_pair(pair, old_body.as_deref(), new_body.as_deref(), context)?;
         hunks.push(CountedHunk {
             path: pair.path.clone(),
+            old_path: pair.old_path.clone(),
             text,
             added,
             removed,
@@ -4925,10 +5312,17 @@ fn render_stat(hunks: &[CountedHunk]) -> Vec<u8> {
     for hunk in hunks {
         added_total += hunk.added;
         removed_total += hunk.removed;
+        let name = match &hunk.old_path {
+            Some(old) => format!(
+                "{} => {}",
+                String::from_utf8_lossy(old),
+                String::from_utf8_lossy(&hunk.path)
+            ),
+            None => String::from_utf8_lossy(&hunk.path).into_owned(),
+        };
         out.extend_from_slice(
             format!(
-                " {} | {} {}{}\n",
-                String::from_utf8_lossy(&hunk.path),
+                " {name} | {} {}{}\n",
                 hunk.added + hunk.removed,
                 "+".repeat(hunk.added),
                 "-".repeat(hunk.removed)
@@ -4978,8 +5372,12 @@ fn unified_pair(
     new: Option<&[u8]>,
     context: Option<usize>,
 ) -> Result<(Vec<u8>, usize, usize), GitError> {
-    let name = String::from_utf8_lossy(&pair.path);
-    let mut out = format!("diff --git a/{name} b/{name}\n").into_bytes();
+    let new_name = String::from_utf8_lossy(&pair.path);
+    let old_name = pair.old_path.as_ref().map_or_else(
+        || new_name.clone(),
+        |old| String::from_utf8_lossy(old),
+    );
+    let mut out = format!("diff --git a/{old_name} b/{new_name}\n").into_bytes();
     let old_mode = pair.old.map(|(mode, _)| mode);
     let new_mode = pair.new.map(|(mode, _)| mode);
     match (old_mode, new_mode) {
@@ -5001,9 +5399,18 @@ fn unified_pair(
         }
         _ => {}
     }
+    if let Some(score) = pair.similarity {
+        out.extend_from_slice(
+            format!("similarity index {score}%\nrename from {old_name}\nrename to {new_name}\n")
+                .as_bytes(),
+        );
+    }
     let old_oid = pair.old.map(|(_, oid)| oid);
     let new_oid = pair.new.map(|(_, oid)| oid);
     let content_changed = old_oid != new_oid;
+    if pair.old_path.is_some() && !content_changed {
+        return Ok((out, 0, 0));
+    }
     if content_changed {
         let old_short = old_oid.map_or_else(|| "0000000".to_owned(), |oid| short_hex(&oid));
         let new_short = new_oid.map_or_else(|| "0000000".to_owned(), |oid| short_hex(&oid));
@@ -5025,10 +5432,10 @@ fn unified_pair(
     {
         let old_side = pair
             .old
-            .map_or_else(|| "/dev/null".to_owned(), |_| format!("a/{name}"));
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("a/{old_name}"));
         let new_side = pair
             .new
-            .map_or_else(|| "/dev/null".to_owned(), |_| format!("b/{name}"));
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("b/{new_name}"));
         out.extend_from_slice(
             format!("Binary files {old_side} and {new_side} differ\n").as_bytes(),
         );
@@ -5037,12 +5444,12 @@ fn unified_pair(
     if pair.old.is_none() {
         out.extend_from_slice(b"--- /dev/null\n");
     } else {
-        out.extend_from_slice(format!("--- a/{name}\n").as_bytes());
+        out.extend_from_slice(format!("--- a/{old_name}\n").as_bytes());
     }
     if pair.new.is_none() {
         out.extend_from_slice(b"+++ /dev/null\n");
     } else {
-        out.extend_from_slice(format!("+++ b/{name}\n").as_bytes());
+        out.extend_from_slice(format!("+++ b/{new_name}\n").as_bytes());
     }
     if !content_changed {
         return Ok((out, 0, 0));
