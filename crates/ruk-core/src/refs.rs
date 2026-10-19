@@ -655,3 +655,34 @@ pub fn page_reflogs(
 
     Ok(ReflogPage { entries, more })
 }
+
+/// Every object id named by any reflog record in the store, old and new.
+///
+/// Collection roots pin these: a store object referenced by an op record
+/// must not be pruned. Key or body damage fails as corruption, the same
+/// way [`page_reflogs`] fails it.
+pub fn all_reflog_oids(store: &Store) -> Result<Vec<Oid>, CoreError> {
+    let mut out = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = store.fact_page(
+            FactTable::Reflogs,
+            after.as_deref(),
+            FactPageBudget::new(1024, MAX_CONTROL_FRAME_BYTES),
+        )?;
+        if page.rows.is_empty() {
+            return Ok(out);
+        }
+        for row in &page.rows {
+            let key = ReflogKey::decode(&row.key)
+                .map_err(|err| corrupt_store(store, format!("reflog key corrupt: {err}")))?;
+            let record = decode_stored_reflog(store, &key, &row.value)?;
+            out.extend(record.old_oid);
+            out.extend(record.new_oid);
+        }
+        if !page.more {
+            return Ok(out);
+        }
+        after = page.rows.last().map(|row| row.key.clone());
+    }
+}

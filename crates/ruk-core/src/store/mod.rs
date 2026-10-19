@@ -68,7 +68,7 @@ use std::time::Duration;
 
 pub use capacity::CapacityLimits;
 pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
-pub use compact::CompactionStats;
+pub use compact::{CompactionBacklog, CompactionStats, PruneStats};
 pub use error::StoreError;
 pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
 pub use metadata::{FactPage, FactPageBudget, FactRow};

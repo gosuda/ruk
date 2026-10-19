@@ -896,6 +896,23 @@ impl PublicationTxn {
         Ok(())
     }
 
+    /// Deletes a committed locator. A missing key is not an error: the
+    /// caller pages the census first and a concurrent pass never deletes
+    /// (compaction only replaces), so absence means the row was already
+    /// pruned and the set simply converges. Segment bytes are untouched;
+    /// the next compaction rewrites the surviving locators and retires the
+    /// sources holding the dead bytes.
+    ///
+    /// # Errors
+    /// Redb failures.
+    pub(crate) fn remove_object(&self, oid: &Oid) -> Result<bool, StoreError> {
+        let mut table = self.txn.open_table(OBJECTS).map_err(table_error)?;
+        Ok(table
+            .remove(oid.as_bytes())
+            .map_err(storage)?
+            .is_some())
+    }
+
     /// Replaces a `Pending` ledger row with its post-append state, normally
     /// `Committed` carrying the per-segment charges and their observed
     /// receipts. The key must already exist in `Pending` state: that row is

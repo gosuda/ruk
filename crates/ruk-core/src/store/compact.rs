@@ -59,6 +59,44 @@ impl CompactionStats {
     }
 }
 
+/// What one [`Store::prune_unreachable`] pass did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Census objects examined.
+    pub objects_examined: usize,
+    /// Census objects kept (in the reachable set or a delta base of one).
+    pub objects_kept: usize,
+    /// Locator rows deleted.
+    pub objects_pruned: usize,
+}
+
+impl PruneStats {
+    /// True when the pass deleted at least one locator row.
+    #[must_use]
+    pub fn did_work(&self) -> bool {
+        self.objects_pruned > 0
+    }
+}
+
+/// Segments a [`Store::compact`] pass could act on (see
+/// [`Store::compaction_backlog`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompactionBacklog {
+    /// Sealed segments available to merge, excluding the session-open one.
+    /// A merge pass needs at least two.
+    pub mergeable: usize,
+    /// Retired segments whose files still exist, pending reclaim.
+    pub reclaimable: usize,
+}
+
+impl CompactionBacklog {
+    /// True when a compaction pass could merge or unlink anything.
+    #[must_use]
+    pub fn has_work(&self) -> bool {
+        self.mergeable >= 2 || self.reclaimable > 0
+    }
+}
+
 /// One fresh segment being filled.
 struct FreshSegment {
     id: u64,
@@ -106,6 +144,116 @@ impl Store {
         // file this pass copies from can vanish under it. Live external
         // readers still defer each unlink through the generation registry.
         self.compact_guarded()
+    }
+
+    /// Deletes the locator rows of census objects outside `reachable`.
+    ///
+    /// The caller owns reachability (ref closure plus whatever pins live
+    /// objects beyond refs); this pass closes the set over delta bases —
+    /// a kept delta keeps its whole base chain — and deletes every other
+    /// locator in one transaction that also advances the generation. The
+    /// generation advance invalidates the `verified_generation` cache, so
+    /// the next open re-verifies the changed state; the cache row itself
+    /// is recovery-owned and never written here. Segment bytes are
+    /// untouched: dead records become garbage the next [`Store::compact`]
+    /// rewrites away, and a resurrected duplicate (re-published before
+    /// any compaction) points at still-valid bytes. `Pending` reservation
+    /// rows name quota generations, never objects, and in-flight objects
+    /// are uncommitted (outside the census), so reservations are neither
+    /// read nor disturbed. Whole passes serialize on the compaction lock,
+    /// keeping two prunes — or a prune and a compaction — from racing
+    /// each other's census snapshot.
+    ///
+    /// An empty prune set commits nothing and advances nothing, keeping
+    /// the verification cache valid.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for committed damage (which latches
+    /// quarantine, like any committed read); quarantine refuses.
+    pub fn prune_unreachable(
+        &self,
+        reachable: &HashSet<Oid>,
+    ) -> Result<PruneStats, StoreError> {
+        self.refuse_if_quarantined()?;
+        let _serial = self.compaction_lock.lock().map_err(|_| {
+            StoreError::WriterClosed("compaction lock poisoned by a panic".to_owned())
+        })?;
+        let census = self.page_all_objects()?;
+        let (kept, doomed) = plan_doomed(&census, reachable);
+        let mut stats = PruneStats {
+            objects_examined: census.len(),
+            objects_kept: kept,
+            objects_pruned: 0,
+        };
+        if doomed.is_empty() {
+            return Ok(stats);
+        }
+        let new_generation = self
+            .observe(self.meta.generation())?
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Capacity("locator generation exhausted".to_owned()))?;
+        let txn = self.observe(self.meta.begin_publication(&[]))?;
+        for oid in &doomed {
+            txn.remove_object(oid)?;
+        }
+        txn.set_generation(new_generation)?;
+        self.observe(txn.commit())?;
+        self.guards.advance_published_generation(new_generation);
+        stats.objects_pruned = doomed.len();
+        Ok(stats)
+    }
+
+    /// Census oids outside `reachable`, closed over delta bases: exactly
+    /// the set [`Store::prune_unreachable`] would delete. Powers dry runs
+    /// without mutating.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for committed damage (which latches
+    /// quarantine, like any committed read); quarantine refuses.
+    pub fn unreachable_oids(
+        &self,
+        reachable: &HashSet<Oid>,
+    ) -> Result<Vec<Oid>, StoreError> {
+        self.refuse_if_quarantined()?;
+        let census = self.page_all_objects()?;
+        Ok(plan_doomed(&census, reachable).1)
+    }
+
+    /// Segments a [`Store::compact`] pass could act on: sealed segments
+    /// available to merge (excluding the session-open segment) and retired
+    /// segments whose files still exist (pending reclaim). Powers
+    /// maintenance threshold checks without running a pass.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for committed damage (which latches
+    /// quarantine, like any committed read); quarantine refuses.
+    pub fn compaction_backlog(&self) -> Result<CompactionBacklog, StoreError> {
+        self.refuse_if_quarantined()?;
+        let open = {
+            let writer = self.lock_writer()?;
+            if let Some(reason) = writer.closed.as_ref() {
+                return Err(StoreError::WriterClosed(reason.clone()));
+            }
+            let mut open = HashSet::new();
+            open.extend(writer.active.as_ref().map(|active| active.id));
+            open.extend(writer.resume.as_ref().map(|resume| resume.id));
+            open
+        };
+        let mut backlog = CompactionBacklog::default();
+        for manifest in self.observe(self.meta.all_manifests())? {
+            if manifest.retired {
+                let path = self
+                    .root
+                    .join(SEGMENTS_DIR)
+                    .join(segment::segment_file_name(manifest.id));
+                if std::fs::metadata(&path).is_ok() {
+                    backlog.reclaimable += 1;
+                }
+            } else if manifest.sealed && !open.contains(&manifest.id) {
+                backlog.mergeable += 1;
+            }
+        }
+        Ok(backlog)
     }
 
     fn compact_guarded(&self) -> Result<CompactionStats, StoreError> {
@@ -558,6 +706,42 @@ impl Store {
         }
         Ok(stats)
     }
+}
+
+/// Splits `census` into `(kept, doomed)`: `doomed` holds every census oid
+/// outside `reachable`, except delta bases of kept objects — a kept delta
+/// keeps its whole base chain, so pruning can never strand a survivor on
+/// a deleted base. Oids in `reachable` but absent from the census are not
+/// objects and change nothing.
+fn plan_doomed(
+    census: &[(Oid, ObjectLocation)],
+    reachable: &HashSet<Oid>,
+) -> (usize, Vec<Oid>) {
+    let mut live: HashSet<Oid> = reachable.clone();
+    let mut bases: HashMap<Oid, Oid> = HashMap::new();
+    for (oid, location) in census {
+        if let Some(base) = location.base {
+            bases.insert(*oid, base);
+        }
+    }
+    let mut stack: Vec<Oid> = live.iter().copied().collect();
+    while let Some(oid) = stack.pop() {
+        if let Some(base) = bases.get(&oid)
+            && live.insert(*base)
+        {
+            stack.push(*base);
+        }
+    }
+    let mut kept = 0;
+    let mut doomed = Vec::new();
+    for (oid, _) in census {
+        if live.contains(oid) {
+            kept += 1;
+        } else {
+            doomed.push(*oid);
+        }
+    }
+    (kept, doomed)
 }
 
 fn stats_add(total: &mut u64, amount: u64) -> Result<(), StoreError> {
