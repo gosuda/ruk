@@ -543,6 +543,109 @@ fn stash_pop_index_flag_restores_staged_state() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+/// Seeds a repo with two committed files for stash overlap tests.
+fn two_file_repo(case: &str) -> (PathBuf, CliEnv) {
+    let (root, env) = seeded_repo(case, "s.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("t.txt"), b"two\n").expect("seed t");
+    run(verbs_stage::add, &mut ctx, &["t.txt"]).expect("stage t");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit t");
+    let env = ctx.env.clone();
+    (root, env)
+}
+
+#[test]
+fn stash_apply_keeps_unrelated_staged_changes() {
+    // Git refuses only overlapping changes: a staged edit on a path the
+    // stash never names restores cleanly (measured against git 2.53, where
+    // staged non-overlap plus plain apply exits 0).
+    let (root, env) = two_file_repo("stash-relax");
+    let mut ctx = repo_ctx(&root, env);
+    let porcelain = |ctx: &mut Ctx| {
+        String::from_utf8(run(verbs_stage::status, ctx, &["--porcelain"]).expect("status"))
+            .expect("status utf8")
+    };
+    std::fs::write(root.join("t.txt"), b"two\nwip\n").expect("modify t");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    std::fs::write(root.join("s.txt"), b"one\nstaged\n").expect("modify s");
+    run(verbs_stage::add, &mut ctx, &["s.txt"]).expect("stage s");
+    run(verbs_branch::stash, &mut ctx, &["apply"]).expect("apply");
+    assert_eq!(
+        std::fs::read(root.join("t.txt")).expect("read t"),
+        b"two\nwip\n"
+    );
+    assert_eq!(porcelain(&mut ctx), "M  s.txt\n M t.txt\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn stash_apply_refuses_overlapping_index_and_worktree_changes() {
+    // Measured against git 2.53: staged overlap merge-conflicts and
+    // unstaged overlap refuses outright; this lane refuses both instead
+    // of merging, keeping the safety either way.
+    let (root, env) = two_file_repo("stash-overlap");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("t.txt"), b"two\nwip\n").expect("modify t");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    std::fs::write(root.join("t.txt"), b"two\noverlap\n").expect("overlap t");
+    run(verbs_stage::add, &mut ctx, &["t.txt"]).expect("stage overlap");
+    let err = run(verbs_branch::stash, &mut ctx, &["apply"]).expect_err("overlapping apply");
+    assert!(err.to_string().contains("clean index on: t.txt"), "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+
+    let (root, env) = two_file_repo("stash-overlap-wt");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("t.txt"), b"two\nwip\n").expect("modify t");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    std::fs::write(root.join("t.txt"), b"two\ndirty\n").expect("dirty t");
+    let err = run(verbs_branch::stash, &mut ctx, &["apply"]).expect_err("dirty apply");
+    assert!(err.to_string().contains("clean worktree: t.txt"), "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn stash_apply_index_flag_keeps_unrelated_staged_changes() {
+    // With `--index` the stashed index rows come back alongside unrelated
+    // staged changes instead of demanding a fully clean index.
+    let (root, env) = two_file_repo("stash-index-relax");
+    let mut ctx = repo_ctx(&root, env);
+    let porcelain = |ctx: &mut Ctx| {
+        String::from_utf8(run(verbs_stage::status, ctx, &["--porcelain"]).expect("status"))
+            .expect("status utf8")
+    };
+    std::fs::write(root.join("t.txt"), b"two\nwip\n").expect("modify t");
+    run(verbs_stage::add, &mut ctx, &["t.txt"]).expect("stage t");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    std::fs::write(root.join("s.txt"), b"one\nstaged\n").expect("modify s");
+    run(verbs_stage::add, &mut ctx, &["s.txt"]).expect("stage s");
+    run(verbs_branch::stash, &mut ctx, &["apply", "--index"]).expect("apply --index");
+    assert_eq!(
+        std::fs::read(root.join("t.txt")).expect("read t"),
+        b"two\nwip\n"
+    );
+    assert_eq!(porcelain(&mut ctx), "M  s.txt\nM  t.txt\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn stash_apply_restores_deletion_without_touching_neighbors() {
+    let (root, env) = two_file_repo("stash-delete");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::remove_file(root.join("t.txt")).expect("delete t");
+    run(verbs_branch::stash, &mut ctx, &["push", "-m", "wip"]).expect("stash");
+    // The push resets the worktree to HEAD; the apply must delete t.txt
+    // again while an unrelated unstaged edit to s.txt stays.
+    assert!(root.join("t.txt").is_file());
+    std::fs::write(root.join("s.txt"), b"one\nneighbor\n").expect("modify s");
+    run(verbs_branch::stash, &mut ctx, &["apply"]).expect("apply");
+    assert!(!root.join("t.txt").exists());
+    assert_eq!(
+        std::fs::read(root.join("s.txt")).expect("read s"),
+        b"one\nneighbor\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
 #[test]
 fn stash_push_uses_paragraph_subject_and_short_abbrev() {
     // HEAD's message has a two-line first paragraph: the oracle joins it

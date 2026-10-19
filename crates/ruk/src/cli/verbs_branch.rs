@@ -3390,12 +3390,45 @@ fn worktree_overlay_rows(
     Ok((out, objects))
 }
 
+/// Names every path the stash changes: entries whose `(mode, oid)` differ
+/// between the `WIP` tree and the base tree, including additions and
+/// deletions. The restore guards and rewrites only these paths; anything
+/// else keeps its worktree and index state, the way the oracle's merge
+/// only touches stash-changed paths.
+fn stash_touched_paths(
+    wip: &[(Vec<u8>, TreeMode, Oid)],
+    base: &[(Vec<u8>, TreeMode, Oid)],
+) -> Vec<Vec<u8>> {
+    let mut wip_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in wip {
+        wip_map.insert(path.clone(), (*mode, *oid));
+    }
+    let mut base_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in base {
+        base_map.insert(path.clone(), (*mode, *oid));
+    }
+    let mut touched = Vec::new();
+    for (path, entry) in &wip_map {
+        if base_map.get(path) != Some(entry) {
+            touched.push(path.clone());
+        }
+    }
+    for path in base_map.keys() {
+        if !wip_map.contains_key(path.as_slice()) {
+            touched.push(path.clone());
+        }
+    }
+    touched.sort();
+    touched
+}
+
 /// Refuses a restore whose `WIP` tree would overwrite unsaved worktree
-/// edits. A path passes when it is missing on disk, already holds the
-/// `WIP` bytes (re-apply), or still holds the base bytes (clean restore);
-/// anything else — including an untracked file where the stash adds one —
-/// errors instead of clobbering, the way the oracle refuses an overwriting
-/// merge.
+/// edits on stash-touched paths. A touched path passes when it is missing
+/// on disk, already holds the `WIP` bytes (re-apply), or still holds the
+/// base bytes (clean restore); anything else — including an untracked file
+/// where the stash adds one — errors instead of clobbering, the way the
+/// oracle refuses an overwriting merge. Untouched paths are never read:
+/// unrelated worktree edits stay.
 fn refuse_worktree_overwrite(
     ctx: &Ctx,
     store: &Store,
@@ -3403,13 +3436,15 @@ fn refuse_worktree_overwrite(
     tree: Oid,
     base_paths: &[(Vec<u8>, TreeMode, Oid)],
 ) -> Result<(), GitError> {
-    let mut wip: std::collections::BTreeMap<Vec<u8>, Oid> = std::collections::BTreeMap::new();
-    for (path, _, oid) in flatten_tree(store, kind, tree)? {
-        wip.insert(path, oid);
+    let mut wip: std::collections::BTreeMap<Vec<u8>, (TreeMode, Oid)> =
+        std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, tree)? {
+        wip.insert(path, (mode, oid));
     }
-    let mut base: std::collections::BTreeMap<Vec<u8>, Oid> = std::collections::BTreeMap::new();
-    for (path, _, oid) in base_paths {
-        base.insert(path.clone(), *oid);
+    let mut base: std::collections::BTreeMap<Vec<u8>, (TreeMode, Oid)> =
+        std::collections::BTreeMap::new();
+    for (path, mode, oid) in base_paths {
+        base.insert(path.clone(), (*mode, *oid));
     }
     let mut union: Vec<&Vec<u8>> = wip.keys().collect();
     for path in base.keys() {
@@ -3419,6 +3454,14 @@ fn refuse_worktree_overwrite(
     }
     let mut blocked = Vec::new();
     for path in union {
+        // Only stash-touched paths can collide with the restore: an
+        // untouched path keeps its worktree bytes whatever they are, so
+        // unrelated edits never block. The `(mode, oid)` comparison keeps
+        // this in step with `stash_touched_paths`, so even a pure mode
+        // change is checked (its bytes match either side and pass).
+        if wip.get(path) == base.get(path) {
+            continue;
+        }
         let full = join_base(&ctx.file_base, path)?;
         let disk = match std::fs::symlink_metadata(&full) {
             Ok(meta) if meta.file_type().is_dir() => None,
@@ -3437,8 +3480,8 @@ fn refuse_worktree_overwrite(
             }
             continue;
         };
-        let matches = |oid: Option<&Oid>| {
-            oid.is_some_and(|want| {
+        let matches = |entry: Option<&(TreeMode, Oid)>| {
+            entry.is_some_and(|(_, want)| {
                 read_object_bytes(store, *want)
                     .ok()
                     .is_some_and(|(_, body)| body == disk)
@@ -3657,16 +3700,204 @@ fn stash_pop_scoped(ctx: &Ctx, slot: u64, opts: &super::Collected) -> Result<Vec
     }
 }
 
-/// Restores one slot's worktree files, requiring `HEAD` and a clean index
-/// on the stashed base.
+/// Restores one slot's worktree files, requiring `HEAD` and refusing only
+/// staged changes on paths the stash touches.
 fn stash_apply(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     stash_restore(ctx, slot, IndexRestore::Worktree)
 }
 
 /// Restores one slot's worktree files and its index rows, requiring `HEAD`
-/// and a clean index on the stashed base.
+/// and refusing only staged changes on paths the stash touches.
 fn stash_apply_with_index(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     stash_restore(ctx, slot, IndexRestore::WorktreeAndIndex)
+}
+
+/// Refuses a restore whose index holds staged changes on stash-touched
+/// paths: unmerged stages always, and stage-zero rows matching neither the
+/// base nor the `WIP` entry. Anything else — including staged changes on
+/// paths the stash never names — restores cleanly, the way the oracle only
+/// refuses overlapping local changes. A row already holding the base entry
+/// is an unstaged-only change governed by the worktree guard; a row
+/// already holding the `WIP` entry is consistent with the restore.
+fn refuse_index_overlap(
+    current: &[(RepoPath, Stage, IndexEntry)],
+    wip: &[(Vec<u8>, TreeMode, Oid)],
+    base: &[(Vec<u8>, TreeMode, Oid)],
+    touched: &[Vec<u8>],
+) -> Result<(), GitError> {
+    let entry_matches = |rows: &[(Vec<u8>, TreeMode, Oid)], path: &[u8], row: &IndexEntry| {
+        rows.iter().any(|(known, mode, oid)| {
+            known.as_slice() == path
+                && mode.as_index_mode().is_ok_and(|index_mode| index_mode == row.mode())
+                && *oid == row.oid()
+        })
+    };
+    let mut blocked = Vec::new();
+    for (path, stage, row) in current {
+        if *stage != Stage::Zero {
+            blocked.push(format!(
+                "{} (unmerged)",
+                String::from_utf8_lossy(path.as_bytes())
+            ));
+            continue;
+        }
+        let raw = path.as_bytes();
+        if !touched.iter().any(|known| known.as_slice() == raw) {
+            continue;
+        }
+        if !entry_matches(base, raw, row) && !entry_matches(wip, raw, row) {
+            blocked.push(String::from_utf8_lossy(raw).into_owned());
+        }
+    }
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    blocked.sort();
+    Err(GitError::Invalid {
+        detail: format!(
+            "index has changes; stash apply needs a clean index on: {}",
+            blocked.join(", ")
+        ),
+    })
+}
+
+/// Whether validated index rows for one path match the base tree entry:
+/// the stash staged nothing there (or the path never existed), so an
+/// `--index` restore must leave the current rows alone instead of
+/// restoring over them.
+fn stash_recorded_is_base(stashed: &[(Stage, IndexEntry)], base: Option<(TreeMode, Oid)>) -> bool {
+    match (stashed, base) {
+        ([], None) => true,
+        ([(Stage::Zero, row)], Some((mode, oid))) => {
+            mode.as_index_mode().is_ok_and(|index_mode| index_mode == row.mode())
+                && oid == row.oid()
+        }
+        _ => false,
+    }
+}
+
+/// Refuses `--index` when the current index holds staged changes the
+/// recorded rows cannot absorb. On paths where the stash staged something
+/// (recorded rows differ from the base entry) the current rows must match
+/// the recorded rows or the base entry; anything else would silently
+/// clobber staged work the oracle would merge-or-refuse instead. Paths
+/// where the stash staged nothing keep their current rows unconditionally,
+/// the way the oracle merges the stashed index state alongside unrelated
+/// staged changes.
+fn refuse_index_restore_conflict(
+    current: &[(RepoPath, Stage, IndexEntry)],
+    entry: &StashSlot,
+    base: &[(Vec<u8>, TreeMode, Oid)],
+    kind: HashKind,
+) -> Result<(), GitError> {
+    let mut base_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in base {
+        base_map.insert(path.as_slice(), (*mode, *oid));
+    }
+    let mut recorded: std::collections::BTreeMap<&[u8], Vec<(Stage, IndexEntry)>> =
+        std::collections::BTreeMap::new();
+    for (raw, stage, row) in &entry.rows {
+        if row.validate(kind).is_err() {
+            continue;
+        }
+        recorded
+            .entry(raw.as_slice())
+            .or_default()
+            .push((*stage, row.clone()));
+    }
+    let mut union: std::collections::BTreeSet<&[u8]> = recorded.keys().copied().collect();
+    for (path, _, _) in current {
+        union.insert(path.as_bytes());
+    }
+    let mut blocked = Vec::new();
+    for raw in union {
+        let base_entry = base_map.get(raw).copied();
+        let rec: &[(Stage, IndexEntry)] = recorded.get(raw).map_or(&[], Vec::as_slice);
+        if stash_recorded_is_base(rec, base_entry) {
+            continue;
+        }
+        let cur: Vec<(Stage, IndexEntry)> = current
+            .iter()
+            .filter(|(path, _, _)| path.as_bytes() == raw)
+            .map(|(_, stage, row)| (*stage, row.clone()))
+            .collect();
+        if cur.as_slice() == rec || stash_recorded_is_base(&cur, base_entry) {
+            continue;
+        }
+        blocked.push(String::from_utf8_lossy(raw).into_owned());
+    }
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    blocked.sort();
+    Err(GitError::Invalid {
+        detail: format!(
+            "index has changes; stash apply --index cannot restore over: {}",
+            blocked.join(", ")
+        ),
+    })
+}
+
+/// Writes only the stash-touched paths of the `WIP` tree into the worktree
+/// and deletes the touched paths the stash drops. Untouched paths keep
+/// whatever the worktree holds — including unrelated staged or unstaged
+/// edits — because the restore never names them; anything else on disk
+/// (untracked files) stays.
+fn checkout_stash_files(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    wip: &[(Vec<u8>, TreeMode, Oid)],
+    touched: &[Vec<u8>],
+) -> Result<(), GitError> {
+    let mut wanted: std::collections::BTreeMap<Vec<u8>, (TreeMode, Oid)> =
+        std::collections::BTreeMap::new();
+    for (path, mode, oid) in wip {
+        if touched.iter().any(|known| known.as_slice() == path.as_slice()) {
+            wanted.insert(path.clone(), (*mode, *oid));
+        }
+    }
+    for (path, (mode, oid)) in &wanted {
+        let full = join_base(&ctx.file_base, path)?;
+        if *mode == TreeMode::Gitlink {
+            continue;
+        }
+        if *mode == TreeMode::Symlink {
+            create_worktree_link(store, *oid, &full)?;
+            continue;
+        }
+        let (_, body) = read_object_bytes(store, *oid)?;
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
+                detail: format!("creating {}: {err}", parent.display()),
+            })?;
+        }
+        std::fs::write(&full, body).map_err(|err| GitError::Io {
+            detail: format!("writing {}: {err}", full.display()),
+        })?;
+        #[cfg(unix)]
+        if *mode == TreeMode::Executable {
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&full, permissions).map_err(|err| GitError::Io {
+                detail: format!("chmod {}: {err}", full.display()),
+            })?;
+        }
+    }
+    for raw in touched {
+        if wanted.contains_key(raw) {
+            continue;
+        }
+        let Ok(full) = join_base(&ctx.file_base, raw) else {
+            continue;
+        };
+        if full.is_symlink() || full.is_file() {
+            std::fs::remove_file(&full).map_err(|err| GitError::Io {
+                detail: format!("removing {}: {err}", full.display()),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Restores one slot's worktree files from its `WIP` commit, and its index
@@ -3674,7 +3905,9 @@ fn stash_apply_with_index(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
 ///
 /// Oracle: `git/builtin/stash.c` (`do_apply_stash`). Without `--index` the
 /// oracle leaves the index on the base, so a stashed staged change comes
-/// back unstaged; `stash branch` always restores the index.
+/// back unstaged; `stash branch` always restores the index. Only
+/// stash-touched paths are guarded and rewritten: staged or worktree edits
+/// elsewhere restore cleanly instead of demanding a fully clean tree.
 fn stash_restore(ctx: &Ctx, slot: u64, scope: IndexRestore) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -3690,42 +3923,10 @@ fn stash_restore(ctx: &Ctx, slot: u64, scope: IndexRestore) -> Result<Vec<u8>, G
             command: "stash restore with a moved HEAD needs the merge lane".to_owned(),
         });
     }
-    let current = scan_index(store, kind)?;
-    if !current.is_empty() {
-        let base_tree = if entry.base_hex.is_empty() {
-            None
-        } else {
-            let base_oid = ruk_git::parse_oid_for(&entry.base_hex, kind)?;
-            let record = super::state::commit_record(store, base_oid)?;
-            Some(commit_tree_oid(&record)?)
-        };
-        let clean = match base_tree {
-            None => false,
-            Some(tree) => {
-                let mut target = std::collections::BTreeMap::new();
-                for (path, mode, oid) in flatten_tree(store, kind, tree)? {
-                    target.insert(path, (mode, oid));
-                }
-                current.len() == target.len()
-                    && current.iter().all(|(path, stage, row)| {
-                        *stage == Stage::Zero
-                            && target.get(path.as_bytes()).is_some_and(|(mode, oid)| {
-                                mode.as_index_mode()
-                                    .map_or(false, |index_mode| index_mode == row.mode())
-                                    && *oid == row.oid()
-                            })
-                    })
-            }
-        };
-        if !clean {
-            return Err(GitError::Invalid {
-                detail: "index has changes; stash apply needs a clean index".to_owned(),
-            });
-        }
-    }
     let commit_oid = ruk_git::parse_oid_for(&entry.commit_hex, kind)?;
     let record = super::state::commit_record(store, commit_oid)?;
     let tree = commit_tree_oid(&record)?;
+    let wip_paths = flatten_tree(store, kind, tree)?;
     let base_paths = if entry.base_hex.is_empty() {
         Vec::new()
     } else {
@@ -3733,45 +3934,40 @@ fn stash_restore(ctx: &Ctx, slot: u64, scope: IndexRestore) -> Result<Vec<u8>, G
         let base_record = super::state::commit_record(store, base_oid)?;
         flatten_tree(store, kind, commit_tree_oid(&base_record)?)?
     };
-    // Restore the worktree from the `WIP` tree. Paths the stash deletes come
-    // back out through the base-tree and current-index extras; anything else
-    // on disk (untracked files) stays.
-    let mut extra: Vec<Vec<u8>> = Vec::new();
-    for (path, _, _) in &base_paths {
-        if !extra
-            .iter()
-            .any(|known| known.as_slice() == path.as_slice())
-        {
-            extra.push(path.clone());
-        }
-    }
-    for (path, stage, _) in &current {
-        if *stage == Stage::Zero
-            && !extra
-                .iter()
-                .any(|known| known.as_slice() == path.as_bytes())
-        {
-            extra.push(path.as_bytes().to_vec());
-        }
+    let touched = stash_touched_paths(&wip_paths, &base_paths);
+    let current = scan_index(store, kind)?;
+    refuse_index_overlap(&current, &wip_paths, &base_paths, &touched)?;
+    if scope == IndexRestore::WorktreeAndIndex {
+        refuse_index_restore_conflict(&current, &entry, &base_paths, kind)?;
     }
     refuse_worktree_overwrite(ctx, store, kind, tree, &base_paths)?;
-    checkout_tree_files(ctx, store, kind, tree, &extra)?;
+    checkout_stash_files(ctx, store, kind, &wip_paths, &touched)?;
     if scope == IndexRestore::WorktreeAndIndex {
-        restore_stash_index(store, kind, &current, &entry)?;
+        restore_stash_index(store, kind, &current, &entry, &base_paths)?;
     }
     let plan = super::verbs_stage::status_plan(ctx, store, kind)?;
     let branch = super::verbs_stage::long_branch_label(store)?;
     Ok(super::verbs_stage::render_long(store, &branch, &plan))
 }
 
-/// Writes one slot's recorded index rows back into the index.
+/// Writes one slot's recorded index rows back into the index. Paths where
+/// the stash staged nothing keep their current rows, so `--index` restores
+/// alongside unrelated staged changes instead of deleting them; paths
+/// where it staged something take the recorded rows authoritatively, the
+/// way the oracle reinstates the stashed index. The conflict guard runs
+/// first, so a recorded path never overwrites divergent staged work here.
 fn restore_stash_index(
     store: &Store,
     kind: HashKind,
     current: &[(RepoPath, Stage, IndexEntry)],
     entry: &StashSlot,
+    base: &[(Vec<u8>, TreeMode, Oid)],
 ) -> Result<(), GitError> {
     let (workspace, raw) = load_or_default(store)?;
+    let mut base_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in base {
+        base_map.insert(path.as_slice(), (*mode, *oid));
+    }
     let mut mutations = Vec::new();
     let mut union: Vec<RepoPath> = current.iter().map(|(path, _, _)| path.clone()).collect();
     for (path_bytes, _, _) in &entry.rows {
@@ -3782,14 +3978,17 @@ fn restore_stash_index(
         }
     }
     for path in union {
-        let before = read_path_rows(store, kind, &path)?;
-        let after: Vec<(Stage, IndexEntry)> = entry
+        let stashed: Vec<(Stage, IndexEntry)> = entry
             .rows
             .iter()
             .filter(|(known, _, _)| *known == path.as_bytes())
             .filter_map(|(_, stage, row)| row.validate(kind).ok().map(|()| (*stage, row.clone())))
             .collect();
-        mutations.extend(path_row_mutations(&path, &before, &after)?);
+        if stash_recorded_is_base(&stashed, base_map.get(path.as_bytes()).copied()) {
+            continue;
+        }
+        let before = read_path_rows(store, kind, &path)?;
+        mutations.extend(path_row_mutations(&path, &before, &stashed)?);
     }
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
