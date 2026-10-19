@@ -7076,6 +7076,17 @@ fn wave_j_diff_raw_rename_old_first() {
     assert!(status.contains("R090\tf.txt\tr.txt\n"), "got {status:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+/// Pins author/committer dates for one test context. Rapid successive
+/// commits otherwise share a wall-clock second, and an amended commit
+/// identical in every byte to its tip trips the store's
+/// absent-expectation CAS flakily at second boundaries; distinct stamps
+/// keep each commit's bytes distinct by construction.
+fn wave_j_stamp(ctx: &mut Ctx, epoch: i64) {
+    let value = format!("{epoch} +0000");
+    ctx.env.vars.insert("GIT_AUTHOR_DATE".to_owned(), value.clone());
+    ctx.env.vars.insert("GIT_COMMITTER_DATE".to_owned(), value);
+}
+
 /// Reads the message of the current `HEAD` commit.
 fn wave_j_head_message(ctx: &mut Ctx) -> String {
     let store = ctx.store().expect("store");
@@ -7143,10 +7154,12 @@ fn wave_j_commit_squash_fixup_amend() {
         .to_owned();
     std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    wave_j_stamp(&mut ctx, 1700000001);
     run(verbs_history::commit, &mut ctx, &[&"--fixup", &base]).expect("fixup");
     assert_eq!(wave_j_head_message(&mut ctx), "fixup! seed\n");
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    wave_j_stamp(&mut ctx, 1700000002);
     run(
         verbs_history::commit,
         &mut ctx,
@@ -7159,11 +7172,13 @@ fn wave_j_commit_squash_fixup_amend() {
     );
     // A sourceless amend reuses the `HEAD` message like the oracle's editor
     // seed; `--reset-author` renews authorship on the same path.
+    wave_j_stamp(&mut ctx, 1700000003);
     run(verbs_history::commit, &mut ctx, &["--amend"]).expect("amend");
     assert_eq!(
         wave_j_head_message(&mut ctx),
         "squash! seed\n\nextra body\n"
     );
+    wave_j_stamp(&mut ctx, 1700000004);
     run(
         verbs_history::commit,
         &mut ctx,
@@ -7177,10 +7192,12 @@ fn wave_j_commit_squash_fixup_amend() {
     // Both `amend:` spellings lift the empty-tree refusal on a clean tree;
     // `reword:` shares the `amend!` subject line, never `reword!`.
     let amend_arg = format!("--fixup=amend:{base}");
+    wave_j_stamp(&mut ctx, 1700000005);
     run(verbs_history::commit, &mut ctx, &[amend_arg.as_str()]).expect("empty amend fixup");
     assert_eq!(wave_j_head_message(&mut ctx), "amend! seed\n\nseed\n");
     assert_eq!(head_parent_count(&mut ctx), 1);
     let reword_arg = format!("--fixup=reword:{base}");
+    wave_j_stamp(&mut ctx, 1700000006);
     run(verbs_history::commit, &mut ctx, &[reword_arg.as_str()]).expect("empty reword fixup");
     assert_eq!(wave_j_head_message(&mut ctx), "amend! seed\n\nseed\n");
     let err = run(verbs_history::commit, &mut ctx, &[reword_arg.as_str(), "-m", "x"])
