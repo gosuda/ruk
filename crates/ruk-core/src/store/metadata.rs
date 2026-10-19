@@ -54,6 +54,7 @@ use std::fmt;
 use std::io;
 use std::ops::Bound;
 use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use redb::{
     Builder, Database, DatabaseError, Durability, ReadableDatabase, ReadableTable, StorageError,
@@ -99,6 +100,97 @@ fn builder() -> Builder {
     let mut builder = Database::builder();
     builder.set_cache_size(CACHE_BYTES_PER_STORE);
     builder
+}
+
+/// Total budget for waiting on another process's metadata lock at open.
+///
+/// The redb open takes an OS-advisory whole-file byte-range lock
+/// (`fcntl` `F_OFD_SETLK` on Linux/macOS, `LockFileEx` on Windows) with a
+/// non-blocking `try_lock`: a second opener gets
+/// [`DatabaseError::DatabaseAlreadyOpen`] immediately instead of queueing.
+/// The lock lives on the holder's open file description, so a crashed
+/// holder releases it when the kernel closes its descriptors — there is no
+/// lockfile and no stale state to detect, and bounded retry is the correct
+/// wait. The default covers a long-running peer finishing its publication;
+/// [`RUK_OPEN_TIMEOUT_MS`] overrides it.
+const DEFAULT_OPEN_WAIT: Duration = Duration::from_secs(10);
+
+/// Environment override for the open lock-wait budget, in milliseconds.
+/// Unset or unparsable means [`DEFAULT_OPEN_WAIT`]; `0` means a single
+/// attempt with no wait.
+const OPEN_TIMEOUT_ENV: &str = "RUK_OPEN_TIMEOUT_MS";
+
+/// First backoff step between lock-busy retries; doubles to [`OPEN_RETRY_CAP`].
+const OPEN_RETRY_BASE: Duration = Duration::from_millis(1);
+/// Longest sleep between lock-busy retries: a peer publication is many
+/// milliseconds of segment and metadata I/O, so polling faster only burns CPU.
+const OPEN_RETRY_CAP: Duration = Duration::from_millis(50);
+
+/// The open lock-wait budget: [`OPEN_TIMEOUT_ENV`] in milliseconds, or
+/// [`DEFAULT_OPEN_WAIT`] when unset or unparsable.
+pub(crate) fn open_wait_timeout() -> Duration {
+    std::env::var(OPEN_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_OPEN_WAIT)
+}
+
+/// One backoff step with jitter uniform in `[delay/2, delay]`, from a
+/// xorshift over the wall clock, the attempt, and the pid: no extra
+/// dependency for a sleep interval, and distinct processes de-phase their
+/// retries instead of thundering together.
+fn backoff_with_jitter(attempt: u64) -> Duration {
+    let shift = attempt.min(6);
+    let delay = OPEN_RETRY_BASE
+        .checked_mul(1 << shift)
+        .unwrap_or(OPEN_RETRY_CAP)
+        .min(OPEN_RETRY_CAP);
+    // Saturate before narrowing: the cap is 50 ms so this never clamps in
+    // practice, and the `as` below is then exact rather than truncating.
+    let half_micros = delay.as_micros().max(2).min(u128::from(u64::MAX)) as u64 / 2;
+    // Truncation is the point here: the seed only de-phases retries.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let pid = u64::from(std::process::id());
+    let mut x = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(attempt.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        .wrapping_add(pid)
+        | 1;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    Duration::from_micros(half_micros + x % (half_micros + 1))
+}
+
+/// Opens the redb database, waiting only on the real busy signal.
+///
+/// Only [`DatabaseError::DatabaseAlreadyOpen`] retries, against the
+/// `timeout` budget: every other failure (missing, foreign, or damaged
+/// file, unknown format) maps through [`database_error`] on the first
+/// attempt, so corruption still refuses immediately and never burns the
+/// budget. A busy peer that never releases within budget surfaces the
+/// original already-open error unchanged.
+fn open_db_waiting(path: &Path, timeout: Duration) -> Result<Database, StoreError> {
+    let deadline = Instant::now() + timeout;
+    let mut attempt: u64 = 0;
+    loop {
+        match builder().open(path) {
+            Ok(db) => return Ok(db),
+            Err(DatabaseError::DatabaseAlreadyOpen) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(StoreError::Database(DatabaseError::DatabaseAlreadyOpen));
+                }
+                std::thread::sleep(backoff_with_jitter(attempt).min(deadline - now));
+                attempt = attempt.saturating_add(1);
+            }
+            Err(other) => return Err(database_error(other)),
+        }
+    }
 }
 
 type BytesTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
@@ -218,9 +310,17 @@ impl Metadata {
     /// [`StoreError::Version`] for an unknown table or a file format
     /// that needs an offline upgrade.
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_timeout(path, open_wait_timeout())
+    }
+
+    /// Opens an existing metadata database, waiting up to `timeout` for a
+    /// lock-busy peer; corruption still refuses on the first attempt.
+    /// `timeout` of zero means a single attempt. See [`open_db_waiting`]
+    /// for the busy signal and [`OPEN_TIMEOUT_ENV`] for the default.
+    pub(crate) fn open_with_timeout(path: &Path, timeout: Duration) -> Result<Self, StoreError> {
         let profiling = super::profile_enabled();
         let mut clock = super::ProfileClock::now(profiling);
-        let db = builder().open(path).map_err(database_error)?;
+        let db = open_db_waiting(path, timeout)?;
         let redb_ms = clock.elapsed_ms();
         clock = super::ProfileClock::now(profiling);
         ensure_census(&db)?;

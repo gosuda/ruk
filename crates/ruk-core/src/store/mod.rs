@@ -64,6 +64,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 pub use capacity::CapacityLimits;
 pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
@@ -348,7 +349,31 @@ impl Store {
     /// earlier two-line marker;
     /// [`StoreError::Corrupt`] for committed damage; I/O and database
     /// failures propagate, including a `root` that cannot be made absolute.
+    ///
+    /// Cross-process concurrency: redb opens in `ExclusiveWriter` mode, so
+    /// the whole-file lock is held for the `Database` lifetime — two
+    /// processes' open stores serialize against each other, reads included
+    /// (a read-only redb handle could share, but the store opens
+    /// read-write). The wait below only bounds the queue at open; once open,
+    /// a peer holds the lock until its store drops, which is what `git`
+    /// effectively does for writers while reads go lock-free. The lock is an
+    /// OS-advisory byte range released by the kernel when the holder's
+    /// descriptors close, so a killed peer never leaves a stale lock: the
+    /// waiter's retry then succeeds.
     pub fn open(root: &Path, budget: Arc<PreparationBudget>) -> Result<Self, StoreError> {
+        Self::open_with_timeout(root, budget, metadata::open_wait_timeout())
+    }
+
+    /// Opens the store, waiting up to `timeout` for a lock-busy peer at the
+    /// metadata open; corruption still refuses on the first attempt. A
+    /// `timeout` of zero means a single attempt. The budget defaults to
+    /// `RUK_OPEN_TIMEOUT_MS` milliseconds (10 s when unset or unparsable)
+    /// through [`Store::open`]; the CLI needs no extra flag.
+    pub fn open_with_timeout(
+        root: &Path,
+        budget: Arc<PreparationBudget>,
+        timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let profiling = profile_enabled();
         let total = ProfileClock::now(profiling);
         let mut clock = ProfileClock::now(profiling);
@@ -357,7 +382,7 @@ impl Store {
         let (format, format_file) = read_format(root)?;
         let format_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
-        let meta = Metadata::open(&root.join(META_FILE))?;
+        let meta = Metadata::open_with_timeout(&root.join(META_FILE), timeout)?;
         let meta_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
         durability::sync_file(&format_file)?;
@@ -1676,6 +1701,39 @@ mod tests {
 
     fn reopen(temp: &TempRoot) -> Store {
         Store::open(&temp.store_dir(), budget()).expect("open store")
+    }
+
+    #[test]
+    fn open_waits_for_a_live_store_instead_of_refusing() {
+        use std::time::{Duration, Instant};
+
+        let temp = TempRoot::new("open-lock-wait");
+        let holder = create(&temp, HashKind::Sha1);
+        let root = temp.store_dir();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let store = Store::open_with_timeout(&root, budget(), Duration::from_secs(30))
+                .expect("the second open waits for the live store");
+            assert_eq!(store.hash_kind(), HashKind::Sha1);
+            done_tx.send(Instant::now()).expect("report the waiter completion");
+        });
+        // The waiter must still be queued behind the live store here: it
+        // neither refuses with already-open nor slips through early.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the second Store::open must queue behind the live store"
+        );
+        let released = Instant::now();
+        drop(holder);
+        let completed = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the second open completes after the drop");
+        assert!(
+            completed >= released,
+            "the second open completes after the first store drops, not before"
+        );
+        waiter.join().expect("join the waiter");
     }
 
     fn len_of(bytes: &[u8]) -> u64 {
