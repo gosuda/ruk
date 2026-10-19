@@ -44,6 +44,12 @@ use crate::ids::{hex_byte, hex_val};
 /// Name of the ownership file inside an existing store directory.
 const LOCK_FILE_NAME: &str = "lock";
 
+/// Path of the ownership file inside an existing store directory.
+#[must_use]
+pub(crate) fn lock_path(root: &Path) -> PathBuf {
+    root.join(LOCK_FILE_NAME)
+}
+
 /// Exact first line of every body this build writes.
 const HEADER_V1: &str = "ruk-lock 1";
 
@@ -100,7 +106,7 @@ pub(crate) enum EndpointAddress {
 /// Published ownership body. Only the lock owner writes it, after its
 /// endpoint binds and passes its platform readiness check.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct LockBody {
+pub struct LockBody {
     pub(crate) pid: u32,
     pub(crate) address: EndpointAddress,
     pub(crate) nonce: EndpointNonce,

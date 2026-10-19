@@ -16,11 +16,11 @@ pub(crate) use windows::{WindowsEndpoint as Endpoint, connect};
 #[cfg(unix)]
 pub(crate) type Incoming = tokio::net::UnixStream;
 #[cfg(unix)]
-pub(crate) type Outgoing = tokio::net::UnixStream;
+pub type Outgoing = tokio::net::UnixStream;
 #[cfg(windows)]
 pub(crate) type Incoming = tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(windows)]
-pub(crate) type Outgoing = tokio::net::windows::named_pipe::NamedPipeClient;
+pub type Outgoing = tokio::net::windows::named_pipe::NamedPipeClient;
 
 pub(crate) fn owner() -> Result<Principal, CoreError> {
     #[cfg(unix)]

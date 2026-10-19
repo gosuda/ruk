@@ -17,6 +17,7 @@ mod lock;
 mod oplog;
 mod policy;
 pub(crate) use policy::lfs_mode_for_store;
+pub mod per_repo;
 mod prepare;
 pub use prepare::prepare_mutation;
 mod receipt;
