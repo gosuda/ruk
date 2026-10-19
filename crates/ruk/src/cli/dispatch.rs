@@ -222,6 +222,8 @@ pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "diff",
         oracle: "git/builtin/diff.c",
+        // Repository discovery stays mandatory (the open store backs every
+        // form but `--no-index`, which still runs from inside a repo).
         needs_repo: true,
         summary: "Show changes between commits, commit and working tree, etc",
         run: verbs_history::diff,

@@ -5666,6 +5666,26 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             takes_value: false,
         },
         FlagSpec {
+            long: "shortstat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "numstat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "summary",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "raw",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
             long: "name-only",
             short: None,
             takes_value: false,
@@ -5678,6 +5698,119 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         FlagSpec {
             long: "no-patch",
             short: Some('s'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-color",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted: the differ accepts `--minimal`/`--patience`/`--histogram`
+        // only to refuse them loudly in the shared renderer (a single LCS
+        // differ has no algorithm switch).
+        FlagSpec {
+            long: "minimal",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "patience",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "histogram",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "word-diff-regex",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "diff-filter",
+            short: None,
+            takes_value: true,
+        },
+        // Accepted only to refuse loudly: `GIT binary patch` literal
+        // output is a pack shape this renderer never emits.
+        FlagSpec {
+            long: "binary",
+            short: None,
+            takes_value: false,
+        },
+        // `--text` diffs NUL-holding blobs as text; `--no-text` is the
+        // default and only records the request.
+        FlagSpec {
+            long: "text",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-text",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-space-change",
+            short: Some('b'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-all-space",
+            short: Some('w'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-blank-lines",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-space-at-eol",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted only to refuse loudly: whole-function context needs
+        // per-language funcname patterns this renderer does not carry.
+        FlagSpec {
+            long: "function-context",
+            short: Some('W'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "inter-hunk-context",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "src-prefix",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "dst-prefix",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "line-prefix",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "output",
+            short: None,
+            takes_value: true,
+        },
+        // Accepted only to refuse loudly: the verb return carries stdout
+        // or failure, never both, so a differing diff with exit 1 needs
+        // plumbing owned outside this file (`--quiet` covers the no-output
+        // form with a real exit status today).
+        FlagSpec {
+            long: "exit-code",
+            short: None,
             takes_value: false,
         },
         FlagSpec {
@@ -5723,14 +5856,29 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     ];
     let (args, decorate_mode) = extract_decorate_arg(args)?;
     let (args, rename_mode) = super::rename::split_rename_args(&args)?;
-    let opts = collect_expanded(&args, &specs)?;
+    let (args, _) = strip_color_arg(&args)?;
+    let (args, color_moved) = extract_color_moved_arg(&args);
+    let (args, copies) = extract_copies_arg(&args)?;
+    let (args, word_mode, word_regex) = extract_word_arg(&args)?;
+    let (args, relative) = extract_relative_arg(&args)?;
+    let mut opts = collect_expanded(&args, &specs)?;
+    inject_diff_extras(
+        &mut opts,
+        DiffExtras {
+            copies,
+            word_mode,
+            word_regex,
+            relative,
+            color_moved,
+        },
+    );
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let rev = opts.positionals.first().map_or("HEAD", String::as_str);
     if rev.contains(':') {
         let oid = resolve_local(store, kind, rev)?;
         let (_, body) = read_object_bytes(store, oid)?;
-        return Ok(body);
+        return write_output_file(ctx, &opts, body);
     }
     let oid = resolve_local(store, kind, rev)?;
     let record = commit_record(store, oid)?;
@@ -5745,7 +5893,7 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     };
     let mut out = render_commit_line(&line, &oid, &record, &decoration)?;
     if opts.is_set("no-patch") || opts.is_set("quiet") {
-        return Ok(out);
+        return write_output_file(ctx, &opts, out);
     }
     let tree = commit_tree_oid(&record)?;
     let mut parent_tree = None;
@@ -5755,17 +5903,22 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     let mut pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
     apply_pair_renames(ctx, &mut pairs, rename_mode)?;
     out.extend_from_slice(&render_pairs(ctx, &pairs, &opts)?);
-    Ok(out)
+    write_output_file(ctx, &opts, out)
 }
 
 /// Shows worktree, index, and tree differences with hunks.
 ///
 /// Oracle: `git/builtin/diff.c`. `A..B` compares the two trees directly
 /// (the `diff A B` form); `A...B` diffs the merge base against `B`, showing
-/// `B` since it forked, as in git. `--no-color` is accepted because output
-/// is never colorized. `--exit-code` is deliberately absent: the verb
-/// return carries stdout or failure, never both, so a differing diff with
-/// exit 1 needs plumbing owned outside this file.
+/// `B` since it forked, as in git. `--color`/`--no-color` are accepted
+/// because output is never colorized. `--exit-code` is accepted only to
+/// refuse it loudly: the verb return carries stdout or failure, never
+/// both, so a differing diff with exit 1 needs plumbing owned outside this
+/// file (`--quiet` covers the no-output form with a real exit status).
+/// `--no-index` compares two filesystem paths directly (run from inside a
+/// repository: discovery stays mandatory); it exits 0 with the patch on
+/// stdout (the oracle's exit-1 default needs the same outside-this-file
+/// plumbing as `--exit-code`).
 pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -5780,6 +5933,26 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         },
         FlagSpec {
             long: "stat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "shortstat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "numstat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "summary",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "raw",
             short: None,
             takes_value: false,
         },
@@ -5800,6 +5973,19 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: Some('p'),
             takes_value: false,
         },
+        // Accepted: suppresses the patch, leaving any requested `--stat`
+        // style section (or nothing) behind.
+        FlagSpec {
+            long: "no-patch",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted: no output; differences fail with exit 1, clean exits 0.
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
         FlagSpec {
             long: "unified",
             short: Some('U'),
@@ -5811,10 +5997,147 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: None,
             takes_value: false,
         },
+        // Accepted: the differ accepts `--minimal`/`--patience`/`--histogram`
+        // only to refuse them loudly in the shared renderer (a single LCS
+        // differ has no algorithm switch).
+        FlagSpec {
+            long: "minimal",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "patience",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "histogram",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "word-diff-regex",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "diff-filter",
+            short: None,
+            takes_value: true,
+        },
+        // Accepted only to refuse loudly: `GIT binary patch` literal
+        // output is a pack shape this renderer never emits.
+        FlagSpec {
+            long: "binary",
+            short: None,
+            takes_value: false,
+        },
+        // `--text` diffs NUL-holding blobs as text; `--no-text` is the
+        // default and only records the request.
+        FlagSpec {
+            long: "text",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-text",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-space-change",
+            short: Some('b'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-all-space",
+            short: Some('w'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-blank-lines",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-space-at-eol",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted only to refuse loudly: whole-function context needs
+        // per-language funcname patterns this renderer does not carry.
+        FlagSpec {
+            long: "function-context",
+            short: Some('W'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "inter-hunk-context",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "src-prefix",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "dst-prefix",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "line-prefix",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "output",
+            short: None,
+            takes_value: true,
+        },
+        // Compares two filesystem paths with no repository involved.
+        FlagSpec {
+            long: "no-index",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted only to refuse loudly: see the `--exit-code` note on
+        // this verb's docs.
+        FlagSpec {
+            long: "exit-code",
+            short: None,
+            takes_value: false,
+        },
     ];
     let (rev_args, dash_paths) = split_double_dash(args);
     let (rev_args, rename_mode) = super::rename::split_rename_args(&rev_args)?;
-    let opts = collect_expanded(&rev_args, &specs)?;
+    let (rev_args, _) = strip_color_arg(&rev_args)?;
+    let (rev_args, color_moved) = extract_color_moved_arg(&rev_args);
+    let (rev_args, copies) = extract_copies_arg(&rev_args)?;
+    let (rev_args, word_mode, word_regex) = extract_word_arg(&rev_args)?;
+    let (rev_args, relative) = extract_relative_arg(&rev_args)?;
+    let mut opts = collect_expanded(&rev_args, &specs)?;
+    inject_diff_extras(
+        &mut opts,
+        DiffExtras {
+            copies,
+            word_mode,
+            word_regex,
+            relative,
+            color_moved,
+        },
+    );
+    if opts.is_set("no-index") {
+        if opts.is_set("cached") || opts.is_set("staged") {
+            return Err(GitError::Invalid {
+                detail: "--cached/--staged combine with revisions, not with --no-index".to_owned(),
+            });
+        }
+        let mut operands = opts.positionals.clone();
+        operands.extend(dash_paths);
+        return diff_no_index(ctx, &opts, &operands);
+    }
     ctx.require_worktree()?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -5898,10 +6221,11 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     if track_renames {
         apply_pair_renames(ctx, &mut pairs, rename_mode)?;
     }
-    render_pairs(ctx, &pairs, &opts)
+    write_output_file(ctx, &opts, render_pairs(ctx, &pairs, &opts)?)
 }
 
 /// One compared path: the old and new side, either absent.
+#[derive(Clone, Debug)]
 struct TreePair {
     /// Full path bytes (the new path for renames).
     path: Vec<u8>,
@@ -5914,8 +6238,14 @@ struct TreePair {
     /// New-side bytes when the content has no stored object (worktree
     /// edits). Overrides the object read keyed by `new`'s oid.
     new_bytes: Option<Vec<u8>>,
+    /// Old-side bytes when the content has no stored object (`--no-index`
+    /// file compares). Overrides the object read keyed by `old`'s oid.
+    old_bytes: Option<Vec<u8>>,
     /// Rename similarity score, set by the pairing pass.
     similarity: Option<u8>,
+    /// Copy flag, set by the `-C`/`--find-copies` pass next to `old_path`
+    /// and `similarity`. Unlike renames the source side stays in place.
+    is_copy: bool,
 }
 
 /// Pairs two optional trees path by path.
@@ -5955,6 +6285,8 @@ fn tree_pairs(ctx: &Ctx, old: Option<Oid>, new: Option<Oid>) -> Result<Vec<TreeP
             new: new_entry,
             new_bytes: None,
             similarity: None,
+            old_bytes: None,
+            is_copy: false,
         });
     }
     Ok(pairs)
@@ -5993,6 +6325,8 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                     new: Some((mode, oid)),
                     new_bytes: Some(bytes),
                     similarity: None,
+                    old_bytes: None,
+                    is_copy: false,
                 });
             }
             Some((mode, oid)) => {
@@ -6008,6 +6342,8 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                         new: Some((mode, fresh)),
                         new_bytes: Some(bytes),
                         similarity: None,
+                        old_bytes: None,
+                        is_copy: false,
                     });
                 }
             }
@@ -6021,6 +6357,8 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
             new: None,
             new_bytes: None,
             similarity: None,
+            old_bytes: None,
+            is_copy: false,
         });
     }
     pairs.sort_by(|left, right| left.path.cmp(&right.path));
@@ -6096,6 +6434,8 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                     new: Some((mode, fresh)),
                     new_bytes: Some(bytes),
                     similarity: None,
+                    old_bytes: None,
+                    is_copy: false,
                 });
             }
             Some((mode, oid)) => {
@@ -6111,6 +6451,8 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                         new: Some((mode, fresh)),
                         new_bytes: Some(bytes),
                         similarity: None,
+                        old_bytes: None,
+                        is_copy: false,
                     });
                 }
             }
@@ -6124,6 +6466,8 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
             new: None,
             new_bytes: None,
             similarity: None,
+            old_bytes: None,
+            is_copy: false,
         });
     }
     pairs.sort_by(|left, right| left.path.cmp(&right.path));
@@ -6183,6 +6527,8 @@ fn tree_pairs_index(
             new: new_entry,
             new_bytes: None,
             similarity: None,
+            old_bytes: None,
+            is_copy: false,
         });
     }
     Ok(pairs)
@@ -6331,27 +6677,456 @@ fn apply_pair_renames(
 struct CountedHunk {
     /// Full path bytes (the new path for renames).
     path: Vec<u8>,
-    /// Old path for renames.
-    old_path: Option<Vec<u8>>,
     /// Unified text for the patch form.
     text: Vec<u8>,
     /// Added lines.
     added: usize,
     /// Removed lines.
     removed: usize,
+    /// Either side holds NUL bytes (a binary pair, unless `--text`).
+    binary: bool,
+    /// Old and new blob sizes for `Bin` stat lines.
+    sizes: (usize, usize),
+    /// Old mode and oid, when present before.
+    old: Option<(TreeMode, Oid)>,
+    /// New mode and oid, when present after.
+    new: Option<(TreeMode, Oid)>,
+    /// Old path for renames and copies.
+    old_pair_path: Option<Vec<u8>>,
+    /// Rename/copy similarity score, when paired.
+    score: Option<u8>,
+    /// True for `-C` copy pairs (source stays in place).
+    is_copy: bool,
+}
+
+/// Whitespace folding for the line differ behind `-b`/`-w`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsFold {
+    /// Exact compare.
+    Exact,
+    /// `-b`/`--ignore-space-change`: collapse each `[ \t]+` run to one
+    /// space (edges kept; combine with `--ignore-space-at-eol` to also
+    /// trim trailing runs).
+    SpaceChange,
+    /// `-w`/`--ignore-all-space`: drop every `[ \t\r]`.
+    AllSpace,
+}
+
+/// Every diff-rendering knob parsed once from the collected flags.
+struct PairRender {
+    /// `-U<n>` context radius; `None` keeps the show-everything form.
+    context: Option<usize>,
+    /// `--inter-hunk-context=<n>` extra hunk-fusion distance (0 disables).
+    inter: usize,
+    /// `-b`/`-w` folding.
+    ws: WsFold,
+    /// `--ignore-space-at-eol`: trim trailing `[ \t\r]` before compare.
+    eol: bool,
+    /// `--ignore-blank-lines`: drop all-blank lines before compare.
+    blank: bool,
+    /// `--text`: diff NUL-holding blobs as text.
+    text: bool,
+    /// `--word-diff[=<mode>]` / `--color-words` rendering.
+    word: WordDiffMode,
+    /// Compiled `--word-diff-regex` / `--color-words=<regex>` tokenizer.
+    word_regex: Option<Regex>,
+    /// `--src-prefix` / `--dst-prefix` (`a/` / `b/` defaults).
+    src: Vec<u8>,
+    dst: Vec<u8>,
+}
+
+/// Parses the [`PairRender`] knobs from the collected flags.
+fn pair_render_of(opts: &super::Collected) -> Result<PairRender, GitError> {
+    let context = parse_unified_arg(opts)?;
+    let inter = opts
+        .single("inter-hunk-context")?
+        .map(|text| {
+            text.parse::<usize>().map_err(|_| GitError::Invalid {
+                detail: format!("bad --inter-hunk-context {text:?}: want context lines"),
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let ws = if opts.is_set("ignore-all-space") {
+        WsFold::AllSpace
+    } else if opts.is_set("ignore-space-change") {
+        WsFold::SpaceChange
+    } else {
+        WsFold::Exact
+    };
+    let word = match opts.single("diff-word")?.as_deref() {
+        None => WordDiffMode::Off,
+        Some("plain") => WordDiffMode::Plain,
+        Some("porcelain") => WordDiffMode::Porcelain,
+        Some(other) => {
+            return Err(GitError::Invalid {
+                detail: format!("bad --word-diff={other:?}: want plain|porcelain|none"),
+            });
+        }
+    };
+    // A regex without word rendering is inert, as in the oracle: only
+    // compile (and validate) what the render will tokenize with.
+    let word_regex = match opts.single("word-diff-regex")? {
+        None => None,
+        Some(_) if word == WordDiffMode::Off => None,
+        Some(pattern) => Some(Regex::new(&pattern).map_err(|_| GitError::Invalid {
+            detail: format!("bad --word-diff-regex {pattern:?}: invalid regex"),
+        })?),
+    };
+    Ok(PairRender {
+        context,
+        inter,
+        ws,
+        eol: opts.is_set("ignore-space-at-eol"),
+        blank: opts.is_set("ignore-blank-lines"),
+        text: opts.is_set("text"),
+        word,
+        word_regex,
+        src: opts
+            .single("src-prefix")?
+            .map(String::into_bytes)
+            .unwrap_or_else(|| b"a/".to_vec()),
+        dst: opts
+            .single("dst-prefix")?
+            .map(String::into_bytes)
+            .unwrap_or_else(|| b"b/".to_vec()),
+    })
+}
+
+/// One change class for `--diff-filter` / `--name-status` / `--raw`:
+/// additions, copies, deletions, modifications, renames, type changes.
+/// Pure permission-bit edits are `M` (as in the oracle); only a
+/// file/symlink/gitlink category switch is `T`.
+fn change_status(
+    old: Option<(TreeMode, Oid)>,
+    new: Option<(TreeMode, Oid)>,
+    old_path: &Option<Vec<u8>>,
+    is_copy: bool,
+) -> char {
+    match (old, new) {
+        (None, Some(_)) => 'A',
+        (Some(_), None) => 'D',
+        (Some((old_mode, _)), Some((new_mode, _))) => {
+            if is_copy {
+                'C'
+            } else if old_path.is_some() {
+                'R'
+            } else if mode_class(old_mode) != mode_class(new_mode) {
+                'T'
+            } else {
+                'M'
+            }
+        }
+        (None, None) => 'M',
+    }
+}
+
+/// Maps a tree mode to its `--diff-filter=T` category: plain and
+/// executable files share one class; symlinks and gitlinks are their own.
+fn mode_class(mode: TreeMode) -> u8 {
+    match mode {
+        TreeMode::Regular | TreeMode::Executable => 0,
+        TreeMode::Symlink => 1,
+        TreeMode::Gitlink => 2,
+        TreeMode::Tree => 3,
+    }
+}
+
+/// Reports one pair's change class for `--diff-filter`.
+fn pair_status(pair: &TreePair) -> char {
+    change_status(pair.old, pair.new, &pair.old_path, pair.is_copy)
+}
+
+/// Keeps only the `--diff-filter=[AMDRTCU]` classes: uppercase letters
+/// include, lowercase exclude; with only exclusions everything else stays.
+/// Unknown letters are usage errors, never silent no-ops.
+fn apply_diff_filter(pairs: &mut Vec<TreePair>, opts: &super::Collected) -> Result<(), GitError> {
+    let Some(filter) = opts.single("diff-filter")? else {
+        return Ok(());
+    };
+    if filter.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "bad --diff-filter \"\": want letters [ACDMRTUacdmrtu]".to_owned(),
+        });
+    }
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for letter in filter.chars() {
+        let upper = letter.to_ascii_uppercase();
+        if !"ACDMRTU".contains(upper) {
+            return Err(GitError::Invalid {
+                detail: format!(
+                    "bad --diff-filter {filter:?}: unknown letter {letter:?} (want [ACDMRTUacdmrtu])"
+                ),
+            });
+        }
+        if letter.is_ascii_uppercase() {
+            include.push(upper);
+        } else {
+            exclude.push(upper);
+        }
+    }
+    pairs.retain(|pair| {
+        let status = pair_status(pair);
+        if include.is_empty() {
+            !exclude.contains(&status)
+        } else {
+            include.contains(&status) && !exclude.contains(&status)
+        }
+    });
+    Ok(())
+}
+
+/// Limits pairs to `--relative[=<path>]` and strips the prefix from the
+/// display paths, the way the oracle relativizes names under the
+/// subdirectory. Bare `--relative` uses the repo-relative working
+/// directory; an empty result is a no-op.
+fn apply_relative(ctx: &Ctx, pairs: &mut Vec<TreePair>, opts: &super::Collected) {
+    let Ok(Some(raw)) = opts.single("diff-relative") else {
+        return;
+    };
+    let mut prefix: Vec<u8> = if raw.is_empty() {
+        match ctx.env.cwd.strip_prefix(&ctx.root) {
+            Ok(rel) => rel.as_os_str().as_encoded_bytes().to_vec(),
+            Err(_) => return,
+        }
+    } else {
+        raw.into_bytes()
+    };
+    while prefix.last() == Some(&b'/') {
+        prefix.pop();
+    }
+    if prefix.is_empty() {
+        return;
+    }
+    let mut slash = prefix.clone();
+    slash.push(b'/');
+    pairs.retain(|pair| pair.path == prefix || pair.path.starts_with(&slash));
+    for pair in pairs.iter_mut() {
+        if let Some(rest) = pair.path.strip_prefix(slash.as_slice()) {
+            pair.path = rest.to_vec();
+        } else if pair.path == prefix {
+            pair.path.clear();
+        }
+        if let Some(old) = pair.old_path.take() {
+            pair.old_path = if let Some(rest) = old.strip_prefix(slash.as_slice()) {
+                Some(rest.to_vec())
+            } else if old == prefix {
+                Some(Vec::new())
+            } else {
+                Some(old)
+            };
+        }
+    }
+}
+
+/// One `-C` copy source: the old side of a surviving pair with its
+/// size-gated body.
+struct CopySource {
+    /// Source path (the old path when the pair is itself a rename).
+    path: Vec<u8>,
+    /// Source blob, for the identical-content fast path.
+    oid: Oid,
+    /// Source is a gitlink (pairs by oid equality only, never by score).
+    link: bool,
+    /// Source body, `None` past the scoring size cap.
+    body: Option<Vec<u8>>,
+}
+
+/// Pairs leftover additions with modified/deleted sources into `-C`
+/// copies at or above `threshold`.
+///
+/// Oracle: `git/diffcore-rename.c`. Only files already in the change
+/// (old sides of surviving pairs) are sources — unchanged files need
+/// `--find-copies-harder`, which stays an unknown option. Identical blobs
+/// score 100 (binaries included); differing gitlinks never pair by score;
+/// text uses the shared line-Dice [`similarity`]. Renames win over copies:
+/// callers run [`apply_pair_renames`] first, so consumed deletions never
+/// resurface here.
+fn apply_pair_copies(
+    ctx: &Ctx,
+    pairs: &mut Vec<TreePair>,
+    threshold: u8,
+) -> Result<(), GitError> {
+    const MAX_SCORE_BYTES: usize = 1 << 20;
+    let store = ctx.store()?;
+    let mut sources: Vec<CopySource> = Vec::new();
+    for pair in pairs.iter() {
+        let Some((mode, oid)) = pair.old else {
+            continue;
+        };
+        let body = match &pair.old_bytes {
+            Some(bytes) => bytes.clone(),
+            None => read_object_bytes(store, oid)?.1,
+        };
+        sources.push(CopySource {
+            path: pair
+                .old_path
+                .clone()
+                .unwrap_or_else(|| pair.path.clone()),
+            oid,
+            link: matches!(mode, TreeMode::Gitlink),
+            body: if body.len() > MAX_SCORE_BYTES {
+                None
+            } else {
+                Some(body)
+            },
+        });
+    }
+    if sources.is_empty() {
+        return Ok(());
+    }
+    for pair in pairs.iter_mut() {
+        if pair.old.is_some() || pair.new.is_none() {
+            continue;
+        }
+        let Some((new_mode, new_oid)) = pair.new else {
+            continue;
+        };
+        let new_body = match &pair.new_bytes {
+            Some(bytes) => bytes.clone(),
+            None => read_object_bytes(store, new_oid)?.1,
+        };
+        let new_gated = if new_body.len() > MAX_SCORE_BYTES {
+            None
+        } else {
+            Some(new_body)
+        };
+        let new_link = matches!(new_mode, TreeMode::Gitlink);
+        let mut best: Option<(Vec<u8>, u8)> = None;
+        for source in sources.iter() {
+            let Some(score) = copy_score(source, new_oid, new_link, new_gated.as_deref(), threshold)
+            else {
+                continue;
+            };
+            let better = best.as_ref().map_or(true, |(_, prev)| score > *prev);
+            if better {
+                best = Some((source.path.clone(), score));
+            }
+        }
+        if let Some((path, score)) = best {
+            pair.old_path = Some(path);
+            pair.similarity = Some(score);
+            pair.is_copy = true;
+        }
+    }
+    Ok(())
+}
+
+/// Scores one copy candidate against an addition: identical blobs are 100
+/// (binaries included); differing gitlinks never pair by score; text uses
+/// the shared line-Dice [`similarity`]. Returns `None` when the score
+/// falls below `threshold` or either gated side is unreadable.
+fn copy_score(
+    source: &CopySource,
+    new_oid: Oid,
+    new_link: bool,
+    new_body: Option<&[u8]>,
+    threshold: u8,
+) -> Option<u8> {
+    use super::rename::similarity;
+    let score = if source.oid == new_oid {
+        100
+    } else if source.link || new_link {
+        return None;
+    } else {
+        match (&source.body, new_body) {
+            (Some(old), Some(new)) => similarity(old, new),
+            _ => return None,
+        }
+    };
+    (score >= threshold).then_some(score)
+}
+
+/// Prepends `--line-prefix=<prefix>` to every output line, as in git.
+fn apply_line_prefix(out: &mut Vec<u8>, prefix: &[u8]) {
+    if prefix.is_empty() || out.is_empty() {
+        return;
+    }
+    let mut prefixed = Vec::with_capacity(out.len() + prefix.len() * 8);
+    for line in out.split_inclusive(|byte| *byte == b'\n') {
+        prefixed.extend_from_slice(prefix);
+        prefixed.extend_from_slice(line);
+    }
+    *out = prefixed;
 }
 
 /// Renders pairs as patch, stat, or names per the parsed options. An
-/// explicit `-p`/`--patch` next to `--stat` prints stat-then-patch, as in
-/// git; without it `--stat` prints the stat alone.
+/// explicit `-p`/`--patch` next to a `--stat` style section prints
+/// section-then-patch, as in git; without it the section prints alone.
+/// `--shortstat`/`--numstat`/`--summary`/`--raw` behave like `--stat`.
+/// `--quiet` prints nothing: clean exits 0, differences fail (exit 1) with
+/// the signal as the message. (`show --quiet` never reaches here — it
+/// returns the commit line early — and `log --quiet` suppresses diffs
+/// before this renderer, so the failure is the `diff --quiet` contract.)
 fn render_pairs(
     ctx: &Ctx,
     pairs: &[TreePair],
     opts: &super::Collected,
 ) -> Result<Vec<u8>, GitError> {
+    // Named gaps: accepted by the flag tables only to fail loudly here,
+    // never to render a half-wrong diff.
+    if opts.is_set("minimal") {
+        return Err(GitError::Unsupported {
+            command: "diff --minimal is not supported: the differ is a single LCS pass with no algorithm switch".to_owned(),
+        });
+    }
+    if opts.is_set("patience") {
+        return Err(GitError::Unsupported {
+            command: "diff --patience is not supported: the differ is a single LCS pass with no algorithm switch".to_owned(),
+        });
+    }
+    if opts.is_set("histogram") {
+        return Err(GitError::Unsupported {
+            command: "diff --histogram is not supported: the differ is a single LCS pass with no algorithm switch".to_owned(),
+        });
+    }
+    if opts.is_set("function-context") {
+        return Err(GitError::Unsupported {
+            command: "diff -W/--function-context is not supported: whole-function context needs per-language funcname patterns".to_owned(),
+        });
+    }
+    if opts.is_set("binary") {
+        return Err(GitError::Unsupported {
+            command: "diff --binary is not supported: GIT binary patch literal output is never emitted".to_owned(),
+        });
+    }
+    if opts.is_set("exit-code") {
+        return Err(GitError::Unsupported {
+            command: "diff --exit-code is not supported: exit-status-with-output needs plumbing outside the diff renderer; use --quiet for the exit status alone".to_owned(),
+        });
+    }
+    if opts.is_set("diff-color-moved") {
+        return Err(GitError::Unsupported {
+            command: "diff --color-moved is not supported: moved-block coloring needs the color plumbing this renderer never emits".to_owned(),
+        });
+    }
+    let render = pair_render_of(opts)?;
+    let mut pairs: Vec<TreePair> = pairs.to_vec();
+    if let Some(threshold) = opts
+        .single("diff-copies")?
+        .map(|text| {
+            text.parse::<u8>().map_err(|_| GitError::Invalid {
+                detail: format!("bad copy threshold {text:?}"),
+            })
+        })
+        .transpose()?
+    {
+        apply_pair_copies(ctx, &mut pairs, threshold)?;
+    }
+    apply_diff_filter(&mut pairs, opts)?;
+    apply_relative(ctx, &mut pairs, opts);
+    if opts.is_set("quiet") {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(GitError::Invalid {
+            detail: "differences found (--quiet suppresses the patch)".to_owned(),
+        });
+    }
     if opts.is_set("name-only") {
         let mut out = Vec::new();
-        for pair in pairs {
+        for pair in &pairs {
             out.extend_from_slice(String::from_utf8_lossy(&pair.path).as_bytes());
             out.push(b'\n');
         }
@@ -6359,11 +7134,12 @@ fn render_pairs(
     }
     if opts.is_set("name-status") {
         let mut out = Vec::new();
-        for pair in pairs {
+        for pair in &pairs {
             if let (Some(old_path), Some(score)) = (&pair.old_path, pair.similarity) {
+                let letter = if pair.is_copy { 'C' } else { 'R' };
                 out.extend_from_slice(
                     format!(
-                        "R{score:03}\t{}\t{}\n",
+                        "{letter}{score:03}\t{}\t{}\n",
                         String::from_utf8_lossy(old_path),
                         String::from_utf8_lossy(&pair.path)
                     )
@@ -6371,45 +7147,65 @@ fn render_pairs(
                 );
                 continue;
             }
-            let status = match (&pair.old, &pair.new) {
-                (None, Some(_)) => 'A',
-                (Some(_), None) => 'D',
-                _ => 'M',
-            };
+            let status = pair_status(pair);
             out.extend_from_slice(
                 format!("{status}\t{}\n", String::from_utf8_lossy(&pair.path)).as_bytes(),
             );
         }
         return Ok(out);
     }
-    let context = parse_unified_arg(opts)?;
     let mut hunks: Vec<CountedHunk> = Vec::new();
-    for pair in pairs {
+    for pair in &pairs {
         let (old_body, new_body) = pair_bodies(ctx, pair)?;
-        let (text, added, removed) =
-            unified_pair(pair, old_body.as_deref(), new_body.as_deref(), context)?;
+        let (text, added, removed, binary, sizes) =
+            unified_pair(pair, old_body.as_deref(), new_body.as_deref(), &render)?;
         hunks.push(CountedHunk {
             path: pair.path.clone(),
-            old_path: pair.old_path.clone(),
             text,
             added,
             removed,
+            binary,
+            sizes,
+            old: pair.old,
+            new: pair.new,
+            old_pair_path: pair.old_path.clone(),
+            score: pair.similarity,
+            is_copy: pair.is_copy,
         });
     }
+    let sections = opts.is_set("stat")
+        || opts.is_set("numstat")
+        || opts.is_set("shortstat")
+        || opts.is_set("summary")
+        || opts.is_set("raw");
+    let mut out = Vec::new();
     if opts.is_set("stat") {
-        let stat = render_stat(&hunks);
-        if !opts.is_set("patch") {
-            return Ok(stat);
+        out.extend_from_slice(&render_stat(&hunks));
+    }
+    if opts.is_set("numstat") {
+        out.extend_from_slice(&render_pair_numstat(&hunks));
+    }
+    if opts.is_set("shortstat") {
+        let (mut added_total, mut removed_total) = (0, 0);
+        for hunk in &hunks {
+            added_total += hunk.added;
+            removed_total += hunk.removed;
         }
-        let mut out = stat;
+        out.extend_from_slice(&stat_summary(hunks.len(), added_total, removed_total));
+    }
+    if opts.is_set("summary") {
+        out.extend_from_slice(&render_pair_summary(&hunks));
+    }
+    if opts.is_set("raw") {
+        out.extend_from_slice(&render_raw(&hunks));
+    }
+    if (opts.is_set("patch") || !sections) && !opts.is_set("no-patch") {
         for hunk in &hunks {
             out.extend_from_slice(&hunk.text);
         }
-        return Ok(out);
     }
-    let mut out = Vec::new();
-    for hunk in &hunks {
-        out.extend_from_slice(&hunk.text);
+    if let Some(prefix) = opts.single("line-prefix")? {
+        apply_line_prefix(&mut out, prefix.as_bytes());
     }
     Ok(out)
 }
@@ -6742,7 +7538,25 @@ pub(crate) fn render_mode_lines(changes: &[FileChange]) -> Vec<u8> {
     out
 }
 
-/// Renders `--stat` from counted hunks.
+/// Reports one hunk's change class for `--raw`.
+fn hunk_status(hunk: &CountedHunk) -> char {
+    change_status(hunk.old, hunk.new, &hunk.old_pair_path, hunk.is_copy)
+}
+
+/// Names one hunk for the `--stat` family: `old => new` for renames.
+fn hunk_name(hunk: &CountedHunk) -> String {
+    match &hunk.old_pair_path {
+        Some(old) => format!(
+            "{} => {}",
+            String::from_utf8_lossy(old),
+            String::from_utf8_lossy(&hunk.path)
+        ),
+        None => String::from_utf8_lossy(&hunk.path).into_owned(),
+    }
+}
+
+/// Renders `--stat` from counted hunks. Binary pairs show the oracle's
+/// `Bin <old> -> <new> bytes` line instead of line counts.
 fn render_stat(hunks: &[CountedHunk]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut added_total = 0;
@@ -6750,14 +7564,13 @@ fn render_stat(hunks: &[CountedHunk]) -> Vec<u8> {
     for hunk in hunks {
         added_total += hunk.added;
         removed_total += hunk.removed;
-        let name = match &hunk.old_path {
-            Some(old) => format!(
-                "{} => {}",
-                String::from_utf8_lossy(old),
-                String::from_utf8_lossy(&hunk.path)
-            ),
-            None => String::from_utf8_lossy(&hunk.path).into_owned(),
-        };
+        let name = hunk_name(hunk);
+        if hunk.binary {
+            out.extend_from_slice(
+                format!(" {name} | Bin {} -> {} bytes\n", hunk.sizes.0, hunk.sizes.1).as_bytes(),
+            );
+            continue;
+        }
         out.extend_from_slice(
             format!(
                 " {name} | {} {}{}\n",
@@ -6772,19 +7585,142 @@ fn render_stat(hunks: &[CountedHunk]) -> Vec<u8> {
     out
 }
 
-/// Reads both blob bodies behind one pair for the differ.
+/// Renders `--numstat` from counted hunks: decimal added/deleted counts
+/// plus the path (`old => new` for renames), `- -` for binaries.
+fn render_pair_numstat(hunks: &[CountedHunk]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for hunk in hunks {
+        let name = hunk_name(hunk);
+        if hunk.binary {
+            out.extend_from_slice(format!("-\t-\t{name}\n").as_bytes());
+        } else {
+            out.extend_from_slice(
+                format!("{}\t{}\t{name}\n", hunk.added, hunk.removed).as_bytes(),
+            );
+        }
+    }
+    out
+}
+
+/// Renders `--raw` from counted hunks: the machine
+/// `:oldmode newmode oldsha newsha status` line per file, abbreviated
+/// like the `index` patch lines (zeros for absent sides). Worktree-backed
+/// new sides (unstaged edits) read as zeros, as in the oracle.
+fn render_raw(hunks: &[CountedHunk]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for hunk in hunks {
+        let old_mode = hunk
+            .old
+            .map(|(mode, _)| format!("{:06o}", mode.octal()))
+            .unwrap_or_else(|| "000000".to_owned());
+        let new_mode = hunk
+            .new
+            .map(|(mode, _)| format!("{:06o}", mode.octal()))
+            .unwrap_or_else(|| "000000".to_owned());
+        let old_sha = hunk
+            .old
+            .map(|(_, oid)| short_hex(&oid))
+            .unwrap_or_else(|| "0000000".to_owned());
+        let new_sha = hunk
+            .new
+            .map(|(_, oid)| short_hex(&oid))
+            .unwrap_or_else(|| "0000000".to_owned());
+        let status = hunk_status(hunk);
+        let status_text = match hunk.score {
+            Some(score) if status == 'R' || status == 'C' => format!("{status}{score}"),
+            _ => status.to_string(),
+        };
+        out.extend_from_slice(
+            format!(":{old_mode} {new_mode} {old_sha} {new_sha} {status_text}\t").as_bytes(),
+        );
+        out.extend_from_slice(String::from_utf8_lossy(&hunk.path).as_bytes());
+        if status == 'R' || status == 'C' {
+            if let Some(old) = &hunk.old_pair_path {
+                out.push(b'\t');
+                out.extend_from_slice(String::from_utf8_lossy(old).as_bytes());
+            }
+        }
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Renders `--summary` from counted hunks: `create mode` / `delete mode` /
+/// `rename` / `copy` / `mode change` lines in display-path order, the shape
+/// `commit` shares through [`render_mode_lines`].
+fn render_pair_summary(hunks: &[CountedHunk]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for hunk in hunks {
+        match (&hunk.old, &hunk.new) {
+            (None, Some((mode, _))) => {
+                out.extend_from_slice(
+                    format!(
+                        " create mode {:o} {}\n",
+                        mode.octal(),
+                        String::from_utf8_lossy(&hunk.path)
+                    )
+                    .as_bytes(),
+                );
+            }
+            (Some((mode, _)), None) => {
+                out.extend_from_slice(
+                    format!(
+                        " delete mode {:o} {}\n",
+                        mode.octal(),
+                        String::from_utf8_lossy(&hunk.path)
+                    )
+                    .as_bytes(),
+                );
+            }
+            (Some((old_mode, _)), Some((new_mode, _))) => {
+                if let Some(old) = &hunk.old_pair_path {
+                    let verb = if hunk.is_copy { "copy" } else { "rename" };
+                    let score = hunk.score.unwrap_or(100);
+                    out.extend_from_slice(
+                        format!(
+                            " {verb} {} => {} ({score}%)\n",
+                            String::from_utf8_lossy(old),
+                            String::from_utf8_lossy(&hunk.path)
+                        )
+                        .as_bytes(),
+                    );
+                }
+                if old_mode != new_mode {
+                    out.extend_from_slice(
+                        format!(
+                            " mode change {:o} => {:o} {}\n",
+                            old_mode.octal(),
+                            new_mode.octal(),
+                            String::from_utf8_lossy(&hunk.path)
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+/// Reads both blob bodies behind one pair for the differ. Inline sides
+/// (`new_bytes` worktree edits, `old_bytes`/`new_bytes` `--no-index`
+/// compares) override the object read, so repository-less compares never
+/// touch the store.
 fn pair_bodies(ctx: &Ctx, pair: &TreePair) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), GitError> {
-    let store = ctx.store()?;
-    let old_body = pair
-        .old
-        .map(|(_, oid)| read_object_bytes(store, oid).map(|(_, body)| body))
-        .transpose()?;
+    let old_body = match &pair.old_bytes {
+        Some(bytes) => Some(bytes.clone()),
+        None => match pair.old {
+            None => None,
+            Some((_, oid)) => Some(read_object_bytes(ctx.store()?, oid)?.1),
+        },
+    };
     let new_body = match &pair.new_bytes {
         Some(bytes) => Some(bytes.clone()),
-        None => pair
-            .new
-            .map(|(_, oid)| read_object_bytes(store, oid).map(|(_, body)| body))
-            .transpose()?,
+        None => match pair.new {
+            None => None,
+            Some((_, oid)) => Some(read_object_bytes(ctx.store()?, oid)?.1),
+        },
     };
     Ok((old_body, new_body))
 }
@@ -6803,19 +7739,27 @@ fn hunk_range(start: usize, count: usize) -> String {
 /// collapsing unchanged runs to `context` lines around each change when
 /// set. `None` keeps the historical show-everything form. The extended
 /// header (`new file mode`, `index <old>..<new>`, `/dev/null` sides)
-/// follows the oracle's `diff.c` layout exactly.
+/// follows the oracle's `diff.c` layout exactly; `--src-prefix` /
+/// `--dst-prefix` rewrite the `a/` / `b/` roots everywhere they appear.
+/// With whitespace folding, blank-line ignoring, or word rendering active,
+/// an index-based aligner drives the hunks (true line numbers preserved);
+/// otherwise the historical LCS script path runs byte-identically.
+/// Returns the text, added/removed line counts, the binary flag, and both
+/// blob sizes for the `--stat` family.
 fn unified_pair(
     pair: &TreePair,
     old: Option<&[u8]>,
     new: Option<&[u8]>,
-    context: Option<usize>,
-) -> Result<(Vec<u8>, usize, usize), GitError> {
+    render: &PairRender,
+) -> Result<(Vec<u8>, usize, usize, bool, (usize, usize)), GitError> {
     let new_name = String::from_utf8_lossy(&pair.path);
     let old_name = pair
         .old_path
         .as_ref()
         .map_or_else(|| new_name.clone(), |old| String::from_utf8_lossy(old));
-    let mut out = format!("diff --git a/{old_name} b/{new_name}\n").into_bytes();
+    let src = String::from_utf8_lossy(&render.src);
+    let dst = String::from_utf8_lossy(&render.dst);
+    let mut out = format!("diff --git {src}{old_name} {dst}{new_name}\n").into_bytes();
     let old_mode = pair.old.map(|(mode, _)| mode);
     let new_mode = pair.new.map(|(mode, _)| mode);
     match (old_mode, new_mode) {
@@ -6838,16 +7782,18 @@ fn unified_pair(
         _ => {}
     }
     if let Some(score) = pair.similarity {
+        let kind = if pair.is_copy { "copy" } else { "rename" };
         out.extend_from_slice(
-            format!("similarity index {score}%\nrename from {old_name}\nrename to {new_name}\n")
+            format!("similarity index {score}%\n{kind} from {old_name}\n{kind} to {new_name}\n")
                 .as_bytes(),
         );
     }
     let old_oid = pair.old.map(|(_, oid)| oid);
     let new_oid = pair.new.map(|(_, oid)| oid);
     let content_changed = old_oid != new_oid;
+    let sizes = (old.map_or(0, |body| body.len()), new.map_or(0, |body| body.len()));
     if pair.old_path.is_some() && !content_changed {
-        return Ok((out, 0, 0));
+        return Ok((out, 0, 0, false, sizes));
     }
     if content_changed {
         let old_short = old_oid.map_or_else(|| "0000000".to_owned(), |oid| short_hex(&oid));
@@ -6865,32 +7811,33 @@ fn unified_pair(
     }
     let old_lines = old.map(split_lines).unwrap_or_default();
     let new_lines = new.map(split_lines).unwrap_or_default();
-    if old_lines.iter().any(|line| line.contains(&b'\0'))
-        || new_lines.iter().any(|line| line.contains(&b'\0'))
-    {
+    let binary = !render.text
+        && (old.map_or(false, |body| body.contains(&0))
+            || new.map_or(false, |body| body.contains(&0)));
+    if binary {
         let old_side = pair
             .old
-            .map_or_else(|| "/dev/null".to_owned(), |_| format!("a/{old_name}"));
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("{src}{old_name}"));
         let new_side = pair
             .new
-            .map_or_else(|| "/dev/null".to_owned(), |_| format!("b/{new_name}"));
+            .map_or_else(|| "/dev/null".to_owned(), |_| format!("{dst}{new_name}"));
         out.extend_from_slice(
             format!("Binary files {old_side} and {new_side} differ\n").as_bytes(),
         );
-        return Ok((out, 0, 0));
+        return Ok((out, 0, 0, true, sizes));
     }
     if pair.old.is_none() {
         out.extend_from_slice(b"--- /dev/null\n");
     } else {
-        out.extend_from_slice(format!("--- a/{old_name}\n").as_bytes());
+        out.extend_from_slice(format!("--- {src}{old_name}\n").as_bytes());
     }
     if pair.new.is_none() {
         out.extend_from_slice(b"+++ /dev/null\n");
     } else {
-        out.extend_from_slice(format!("+++ b/{new_name}\n").as_bytes());
+        out.extend_from_slice(format!("+++ {dst}{new_name}\n").as_bytes());
     }
     if !content_changed {
-        return Ok((out, 0, 0));
+        return Ok((out, 0, 0, false, sizes));
     }
     let product = old_lines.len().saturating_mul(new_lines.len());
     if product > 4_000_000 {
@@ -6902,14 +7849,24 @@ fn unified_pair(
             )
             .as_bytes(),
         );
-        return Ok((out, new_lines.len(), old_lines.len()));
+        return Ok((out, new_lines.len(), old_lines.len(), false, sizes));
+    }
+    if render.ws != WsFold::Exact || render.blank || render.word != WordDiffMode::Off {
+        let (added, removed) = emit_aligned_hunks(&mut out, &old_lines, &new_lines, render)?;
+        if added == 0 && removed == 0 {
+            // Folding erased every difference (whitespace-only or
+            // blank-only edits): the oracle prints no block at all, not
+            // empty headers.
+            return Ok((Vec::new(), 0, 0, false, sizes));
+        }
+        return Ok((out, added, removed, false, sizes));
     }
     let script = lcs_script(&old_lines, &new_lines);
     let mut added = 0;
     let mut removed = 0;
-    if let Some(radius) = context {
-        let (added, removed) = emit_context_hunks(&mut out, &script, radius);
-        return Ok((out, added, removed));
+    if let Some(radius) = render.context {
+        let (added, removed) = emit_context_hunks(&mut out, &script, radius, render.inter);
+        return Ok((out, added, removed, false, sizes));
     }
     let mut hunk_start = 0;
     let mut old_line_number: usize = 1;
@@ -6972,13 +7929,512 @@ fn unified_pair(
         }
         hunk_start = hunk_end;
     }
-    Ok((out, added, removed))
+    Ok((out, added, removed, false, sizes))
+}
+
+/// Index operations aligning two key lists: positions into the kept-line
+/// arrays, resolved to true line numbers at emission.
+enum SeqOp {
+    /// Present on both sides, at kept positions `0` (old) and `1` (new).
+    Keep(usize, usize),
+    /// Present only before, at kept old position `0`.
+    Del(usize),
+    /// Present only after, at kept new position `0`.
+    Ins(usize),
+}
+
+/// Aligns two key lists with a classic LCS table, the way [`lcs_script`]
+/// aligns lines. Ties prefer deletion, matching the line differ.
+fn align_keys(old: &[Vec<u8>], new: &[Vec<u8>]) -> Vec<SeqOp> {
+    let rows = old.len() + 1;
+    let cols = new.len() + 1;
+    let mut table = vec![0u32; rows * cols];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            table[i * cols + j] = if old[i] == new[j] {
+                table[(i + 1) * cols + j + 1] + 1
+            } else {
+                table[(i + 1) * cols + j].max(table[i * cols + j + 1])
+            };
+        }
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        if old[i] == new[j] {
+            ops.push(SeqOp::Keep(i, j));
+            i += 1;
+            j += 1;
+        } else if table[(i + 1) * cols + j] >= table[i * cols + j + 1] {
+            ops.push(SeqOp::Del(i));
+            i += 1;
+        } else {
+            ops.push(SeqOp::Ins(j));
+            j += 1;
+        }
+    }
+    while i < old.len() {
+        ops.push(SeqOp::Del(i));
+        i += 1;
+    }
+    while j < new.len() {
+        ops.push(SeqOp::Ins(j));
+        j += 1;
+    }
+    ops
+}
+
+/// Folds one line (or word token) into its compare key under `-b`/`-w`
+/// plus `--ignore-space-at-eol`. `-b` collapses inner `[ \t]+` runs to one
+/// space and keeps edges; `-w` drops every `[ \t\r]` (so CRLF compares
+/// equal to LF); `--ignore-space-at-eol` trims trailing `[ \t\r]`.
+fn ws_key(line: &[u8], ws: WsFold, eol: bool) -> Vec<u8> {
+    if ws == WsFold::AllSpace {
+        return line
+            .iter()
+            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+            .copied()
+            .collect();
+    }
+    let mut end = line.len();
+    if eol {
+        while end > 0 && matches!(line[end - 1], b' ' | b'\t' | b'\r') {
+            end -= 1;
+        }
+    }
+    let line = &line[..end];
+    if ws == WsFold::Exact {
+        return line.to_vec();
+    }
+    let mut key = Vec::with_capacity(line.len());
+    let mut in_run = false;
+    for byte in line {
+        if matches!(byte, b' ' | b'\t') {
+            if !in_run {
+                key.push(b' ');
+                in_run = true;
+            }
+        } else {
+            key.push(*byte);
+            in_run = false;
+        }
+    }
+    key
+}
+
+/// Reports whether a line is blank for `--ignore-blank-lines`: empty or
+/// only `[ \t\r]`.
+fn is_blank_line(line: &[u8]) -> bool {
+    line.iter().all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+}
+
+/// Splits an op-change mask into windows with `radius` context lines,
+/// fusing windows whose hidden gap holds at most `inter` extra lines.
+/// `inter = 0` keeps the historical touch-only fusion, and the oracle's
+/// `--inter-hunk-context=<n>` fuses exactly when the unseen gap between
+/// two windows is `<= n`.
+fn diff_windows(is_change: &[bool], radius: usize, inter: usize) -> Vec<(usize, usize)> {
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for (index, change) in is_change.iter().enumerate() {
+        if !change {
+            continue;
+        }
+        let start = index.saturating_sub(radius);
+        let end = (index + 1 + radius).min(is_change.len());
+        match windows.last_mut() {
+            Some(last) if start <= last.1 + inter => last.1 = last.1.max(end),
+            _ => windows.push((start, end)),
+        }
+    }
+    windows
+}
+
+/// Advances true (1-based, blank-aware) line numbers past one op: each
+/// consumed kept position resolves to its full-file index plus one for the
+/// next line.
+fn advance_seq(
+    op: &SeqOp,
+    kept_old: &[usize],
+    kept_new: &[usize],
+    old_no: &mut usize,
+    new_no: &mut usize,
+) {
+    match *op {
+        SeqOp::Keep(oi, ni) => {
+            *old_no = kept_old[oi] + 2;
+            *new_no = kept_new[ni] + 2;
+        }
+        SeqOp::Del(oi) => {
+            *old_no = kept_old[oi] + 2;
+        }
+        SeqOp::Ins(ni) => {
+            *new_no = kept_new[ni] + 2;
+        }
+    }
+}
+
+/// Emits hunks for the folded/blank/word path: blank lines drop out of the
+/// compare but every number still counts in true file lines. Without an
+/// explicit `-U`, one window covers the whole change (the show-everything
+/// shape); with one, [`diff_windows`] fuses close hunks.
+fn emit_aligned_hunks(
+    out: &mut Vec<u8>,
+    old_lines: &[&[u8]],
+    new_lines: &[&[u8]],
+    render: &PairRender,
+) -> Result<(usize, usize), GitError> {
+    let kept_old: Vec<usize> = (0..old_lines.len())
+        .filter(|index| !render.blank || !is_blank_line(old_lines[*index]))
+        .collect();
+    let kept_new: Vec<usize> = (0..new_lines.len())
+        .filter(|index| !render.blank || !is_blank_line(new_lines[*index]))
+        .collect();
+    let old_keys: Vec<Vec<u8>> = kept_old
+        .iter()
+        .map(|index| ws_key(old_lines[*index], render.ws, render.eol))
+        .collect();
+    let new_keys: Vec<Vec<u8>> = kept_new
+        .iter()
+        .map(|index| ws_key(new_lines[*index], render.ws, render.eol))
+        .collect();
+    let ops = align_keys(&old_keys, &new_keys);
+    if ops.iter().all(|op| matches!(op, SeqOp::Keep(..))) {
+        // No change ops: (0, 0) tells the caller to drop the staged
+        // headers (any real change counts at least one line).
+        return Ok((0, 0));
+    }
+    let is_change: Vec<bool> = ops
+        .iter()
+        .map(|op| !matches!(op, SeqOp::Keep(..)))
+        .collect();
+    let windows = match render.context {
+        Some(radius) => diff_windows(&is_change, radius, render.inter),
+        None => vec![(0, ops.len())],
+    };
+    let mut added = 0;
+    let mut removed = 0;
+    let mut old_no: usize = 1;
+    let mut new_no: usize = 1;
+    let mut cursor = 0;
+    for (start, end) in windows {
+        for op in &ops[cursor..start] {
+            advance_seq(op, &kept_old, &kept_new, &mut old_no, &mut new_no);
+        }
+        let (mut old_count, mut new_count) = (0, 0);
+        for op in &ops[start..end] {
+            match op {
+                SeqOp::Keep(..) => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                SeqOp::Del(_) => old_count += 1,
+                SeqOp::Ins(_) => new_count += 1,
+            }
+        }
+        // Git numbers an empty side at the line before the hunk.
+        let old_start = if old_count == 0 {
+            old_no.saturating_sub(1)
+        } else {
+            old_no
+        };
+        let new_start = if new_count == 0 {
+            new_no.saturating_sub(1)
+        } else {
+            new_no
+        };
+        out.extend_from_slice(
+            format!(
+                "@@ -{} +{} @@\n",
+                hunk_range(old_start, old_count),
+                hunk_range(new_start, new_count)
+            )
+            .as_bytes(),
+        );
+        let view = WindowView {
+            old_lines,
+            new_lines,
+            kept_old: &kept_old,
+            kept_new: &kept_new,
+            ops: &ops[start..end],
+        };
+        if render.word == WordDiffMode::Off {
+            emit_index_window(out, &view, &mut added, &mut removed);
+        } else {
+            emit_word_window(out, &view, render, &mut added, &mut removed);
+        }
+        for op in &ops[start..end] {
+            advance_seq(op, &kept_old, &kept_new, &mut old_no, &mut new_no);
+        }
+        cursor = end;
+    }
+    Ok((added, removed))
+}
+
+/// One aligned window's inputs: the full line arrays plus the
+/// kept-position maps from the blank-line filter.
+struct WindowView<'a> {
+    /// All old lines (kept positions index into this).
+    old_lines: &'a [&'a [u8]],
+    /// All new lines.
+    new_lines: &'a [&'a [u8]],
+    /// Kept old positions in full-file order.
+    kept_old: &'a [usize],
+    /// Kept new positions in full-file order.
+    kept_new: &'a [usize],
+    /// Aligned ops over the kept positions.
+    ops: &'a [SeqOp],
+}
+
+/// Emits one aligned window in the line form (` `/`-`/`+`).
+fn emit_index_window(
+    out: &mut Vec<u8>,
+    view: &WindowView<'_>,
+    added: &mut usize,
+    removed: &mut usize,
+) {
+    for op in view.ops {
+        match *op {
+            SeqOp::Keep(oi, _) => {
+                out.push(b' ');
+                out.extend_from_slice(view.old_lines[view.kept_old[oi]]);
+                out.push(b'\n');
+            }
+            SeqOp::Del(oi) => {
+                *removed += 1;
+                out.push(b'-');
+                out.extend_from_slice(view.old_lines[view.kept_old[oi]]);
+                out.push(b'\n');
+            }
+            SeqOp::Ins(ni) => {
+                *added += 1;
+                out.push(b'+');
+                out.extend_from_slice(view.new_lines[view.kept_new[ni]]);
+                out.push(b'\n');
+            }
+        }
+    }
+}
+
+/// Emits one aligned window in the word form: unchanged lines print bare,
+/// and each maximal change run prints through [`render_word_run`].
+/// Counts stay line-based (run lengths), as in the oracle's `--stat`.
+fn emit_word_window(
+    out: &mut Vec<u8>,
+    view: &WindowView<'_>,
+    render: &PairRender,
+    added: &mut usize,
+    removed: &mut usize,
+) {
+    let mut index = 0;
+    while index < view.ops.len() {
+        match view.ops[index] {
+            SeqOp::Keep(oi, _) => {
+                out.extend_from_slice(view.old_lines[view.kept_old[oi]]);
+                out.push(b'\n');
+                index += 1;
+            }
+            _ => {
+                let mut old_run = Vec::new();
+                let mut new_run = Vec::new();
+                while index < view.ops.len() && !matches!(view.ops[index], SeqOp::Keep(..)) {
+                    match view.ops[index] {
+                        SeqOp::Del(oi) => old_run.push(view.old_lines[view.kept_old[oi]]),
+                        SeqOp::Ins(ni) => new_run.push(view.new_lines[view.kept_new[ni]]),
+                        SeqOp::Keep(..) => {}
+                    }
+                    index += 1;
+                }
+                *removed += old_run.len();
+                *added += new_run.len();
+                render_word_run(out, &old_run, &new_run, render);
+            }
+        }
+    }
+}
+
+/// Tokenizes one line into words for `--word-diff`: runs of
+/// non-whitespace stay whole while every whitespace byte is its own token
+/// (so newlines align as unchanged across changed runs). A
+/// `--word-diff-regex` match is a word and every gap byte its own token.
+fn word_tokens<'a>(line: &'a [u8], regex: Option<&Regex>) -> Vec<&'a [u8]> {
+    match regex {
+        None => {
+            let mut tokens = Vec::new();
+            let mut start = 0;
+            let mut index = 0;
+            while index < line.len() {
+                if line[index].is_ascii_whitespace() {
+                    if start < index {
+                        tokens.push(&line[start..index]);
+                    }
+                    tokens.push(&line[index..index + 1]);
+                    start = index + 1;
+                }
+                index += 1;
+            }
+            if start < line.len() {
+                tokens.push(&line[start..]);
+            }
+            tokens
+        }
+        Some(pattern) => {
+            let mut tokens = Vec::new();
+            let mut pos = 0;
+            for hit in pattern.find_iter(line) {
+                let (start, end) = (hit.start(), hit.end());
+                if start > pos {
+                    push_gap_bytes(&mut tokens, line, pos, start);
+                }
+                if start < end {
+                    tokens.push(&line[start..end]);
+                }
+                pos = pos.max(end);
+            }
+            push_gap_bytes(&mut tokens, line, pos, line.len());
+            tokens
+        }
+    }
+}
+
+/// Pushes `line[start..end]` one byte per token: gap bytes (whitespace and
+/// punctuation around regex words) align singly, so shared newlines still
+/// match across changed runs. Bounds come from [`Regex::find_iter`] and
+/// are always valid for `line`.
+fn push_gap_bytes<'a>(tokens: &mut Vec<&'a [u8]>, line: &'a [u8], start: usize, end: usize) {
+    for index in start..end {
+        tokens.push(&line[index..index + 1]);
+    }
+}
+
+/// Renders one maximal change run (old lines gone, new lines added) in the
+/// word form. Both runs tokenize (plus a `\n` token per line, so shared
+/// line breaks align as unchanged), align by token, and render per mode:
+/// `plain` wraps words inline (`[-gone-]{+new+}`) and re-splits physical
+/// lines; `porcelain` prints per-kind runs (` `/`-`/`+`) with newlines as
+/// bare `~` lines, as in the oracle.
+fn render_word_run(
+    out: &mut Vec<u8>,
+    old_run: &[&[u8]],
+    new_run: &[&[u8]],
+    render: &PairRender,
+) {
+    let mut old_toks: Vec<&[u8]> = Vec::new();
+    for line in old_run {
+        old_toks.extend(word_tokens(line, render.word_regex.as_ref()));
+        old_toks.push(b"\n");
+    }
+    let mut new_toks: Vec<&[u8]> = Vec::new();
+    for line in new_run {
+        new_toks.extend(word_tokens(line, render.word_regex.as_ref()));
+        new_toks.push(b"\n");
+    }
+    let old_keys: Vec<Vec<u8>> = old_toks
+        .iter()
+        .map(|token| ws_key(token, render.ws, render.eol))
+        .collect();
+    let new_keys: Vec<Vec<u8>> = new_toks
+        .iter()
+        .map(|token| ws_key(token, render.ws, render.eol))
+        .collect();
+    let ops = align_keys(&old_keys, &new_keys);
+    match render.word {
+        WordDiffMode::Off => {}
+        WordDiffMode::Plain => {
+            let mut merged = Vec::new();
+            for op in &ops {
+                match *op {
+                    SeqOp::Keep(oi, _) => merged.extend_from_slice(old_toks[oi]),
+                    SeqOp::Del(oi) => {
+                        merged.extend_from_slice(b"[-");
+                        merged.extend_from_slice(old_toks[oi]);
+                        merged.extend_from_slice(b"-]");
+                    }
+                    SeqOp::Ins(ni) => {
+                        merged.extend_from_slice(b"{+");
+                        merged.extend_from_slice(new_toks[ni]);
+                        merged.extend_from_slice(b"+}");
+                    }
+                }
+            }
+            let mut start = 0;
+            for (index, byte) in merged.iter().enumerate() {
+                if *byte == b'\n' {
+                    out.extend_from_slice(&merged[start..index]);
+                    out.push(b'\n');
+                    start = index + 1;
+                }
+            }
+            if start < merged.len() {
+                out.extend_from_slice(&merged[start..]);
+                out.push(b'\n');
+            }
+        }
+        WordDiffMode::Porcelain => {
+            let mut index = 0;
+            while index < ops.len() {
+                let prefix = match ops[index] {
+                    SeqOp::Keep(..) => b' ',
+                    SeqOp::Del(_) => b'-',
+                    SeqOp::Ins(_) => b'+',
+                };
+                let mut text = Vec::new();
+                while index < ops.len() && op_prefix(&ops[index]) == prefix {
+                    match ops[index] {
+                        SeqOp::Keep(oi, _) => text.extend_from_slice(old_toks[oi]),
+                        SeqOp::Del(oi) => text.extend_from_slice(old_toks[oi]),
+                        SeqOp::Ins(ni) => text.extend_from_slice(new_toks[ni]),
+                    }
+                    index += 1;
+                }
+                emit_porcelain_run(out, prefix, &text);
+            }
+        }
+    }
+}
+
+/// Reports one token op's porcelain run kind for run grouping.
+fn op_prefix(op: &SeqOp) -> u8 {
+    match *op {
+        SeqOp::Keep(..) => b' ',
+        SeqOp::Del(_) => b'-',
+        SeqOp::Ins(_) => b'+',
+    }
+}
+
+/// Emits one porcelain word run: non-empty pieces print with `prefix`,
+/// and every newline prints as a bare `~` line, as in the oracle.
+fn emit_porcelain_run(out: &mut Vec<u8>, prefix: u8, text: &[u8]) {
+    let mut piece: Vec<u8> = Vec::new();
+    for byte in text {
+        if *byte == b'\n' {
+            if !piece.is_empty() {
+                out.push(prefix);
+                out.extend_from_slice(&piece);
+                out.push(b'\n');
+                piece.clear();
+            }
+            out.extend_from_slice(b"~\n");
+        } else {
+            piece.push(*byte);
+        }
+    }
+    if !piece.is_empty() {
+        out.push(prefix);
+        out.extend_from_slice(&piece);
+        out.push(b'\n');
+    }
 }
 
 /// Emits one window per change run with `radius` context lines, merging
-/// windows whose gaps hold at most `2 * radius` unchanged lines, as git
-/// does. Returns added/removed counts for `--stat`.
-fn emit_context_hunks(out: &mut Vec<u8>, script: &[DiffOp<'_>], radius: usize) -> (usize, usize) {
+/// windows whose hidden gap holds at most `inter` extra lines
+/// (`--inter-hunk-context`; 0 keeps touch-only fusion), as git does.
+/// Returns added/removed counts for `--stat`.
+fn emit_context_hunks(
+    out: &mut Vec<u8>,
+    script: &[DiffOp<'_>],
+    radius: usize,
+    inter: usize,
+) -> (usize, usize) {
     let mut windows: Vec<(usize, usize)> = Vec::new();
     for (index, op) in script.iter().enumerate() {
         if matches!(op, DiffOp::Keep(_)) {
@@ -6987,7 +8443,7 @@ fn emit_context_hunks(out: &mut Vec<u8>, script: &[DiffOp<'_>], radius: usize) -
         let start = index.saturating_sub(radius);
         let end = (index + 1 + radius).min(script.len());
         match windows.last_mut() {
-            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            Some(last) if start <= last.1 + inter => last.1 = last.1.max(end),
             _ => windows.push((start, end)),
         }
     }
