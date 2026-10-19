@@ -9,7 +9,7 @@
 //! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
-//! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex session | tar only (`--format=zip` names its missing writer); `--prefix`, `-o` and path limits rewrite the stream client-side |
+//! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex session | tar and zip (`--format=zip` transcodes the tar client-side; every transport still answers tar); `--prefix`, `-o` and path limits rewrite the stream client-side |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
 //! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
@@ -1622,16 +1622,18 @@ fn first_hop(head: &ruk_core::workspace::HeadRef) -> Option<Vec<u8>> {
     }
 }
 
-/// Streams a tar archive of one revision: local trees through the
+/// Streams a tar or zip archive of one revision: local trees through the
 /// `upload-archive` serve half over a loopback, `--remote` trees over the
 /// smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex
 /// `upload-archive` session.
 ///
 /// Oracle: `git/builtin/archive.c` (`run_remote_archiver` client grammar
-/// for the `--remote` arm). Only `tar` is spoken (the server default;
-/// `--format=zip` names its missing writer); `--prefix` and path limiting
-/// rewrite the streamed tar client-side, so every transport answers whole
-/// trees and the verb narrows them.
+/// for the `--remote` arm). Every transport answers tar (the server
+/// default); `--format=zip` transcodes the narrowed tar client-side
+/// through the `zip` writer crate (files deflate, empty files store,
+/// directories and symlinks keep their kinds, modes, and mtimes).
+/// `--prefix` and path limiting rewrite the streamed tar client-side, so
+/// they apply to zip entries exactly as to tar members.
 pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -1656,15 +1658,16 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
         },
     ];
     let opts = collect(args, &specs)?;
-    if let Some(format) = opts.single("format")? {
-        if format != "tar" {
+    let format = opts.single("format")?.unwrap_or_else(|| "tar".to_owned());
+    let zipped = match format.as_str() {
+        "tar" => false,
+        "zip" => true,
+        other => {
             return Err(GitError::Unsupported {
-                command: format!(
-                    "archive format {format:?}: no zip writer in this slice (only tar is spoken)"
-                ),
+                command: format!("archive format {other:?}: only tar and zip are spoken"),
             });
         }
-    }
+    };
     let prefix = match opts.single("prefix")? {
         None => None,
         Some(raw) => {
@@ -1687,7 +1690,7 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
     };
     if opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: archive [--remote=<repo>] [--format=tar] [--prefix=<p>/] [-o <file>] <tree-ish> [<path>...]".to_owned(),
+            detail: "usage: archive [--remote=<repo>] [--format=tar|zip] [--prefix=<p>/] [-o <file>] <tree-ish> [<path>...]".to_owned(),
         });
     }
     let rev = opts.positionals[0].clone();
@@ -1750,15 +1753,18 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
     } else {
         tar
     };
+    // The tar flow above is untouched: zip transcodes the same rewrapped
+    // bytes, so the tar path stays byte-identical.
+    let stream = if zipped { tar_to_zip(&tar)? } else { tar };
     match opts.single("output")? {
-        None => Ok(tar),
+        None => Ok(stream),
         Some(dest) => {
             let path = if PathBuf::from(&dest).is_absolute() {
                 PathBuf::from(dest)
             } else {
                 ctx.env.cwd.join(dest)
             };
-            std::fs::write(&path, &tar).map_err(|err| GitError::Io {
+            std::fs::write(&path, &stream).map_err(|err| GitError::Io {
                 detail: format!("cannot write archive to {}: {err}", path.display()),
             })?;
             Ok(Vec::new())
@@ -2243,6 +2249,194 @@ fn octal_into(field: &mut [u8], value: u64) {
     let bytes = text.as_bytes();
     let n = bytes.len().min(digits);
     field[..n].copy_from_slice(&bytes[..n]);
+}
+
+/// One tar member staged for zip output: the logical path (the pax `path`
+/// record when one describes the member, else the ustar fields), its kind,
+/// the archived mode and mtime, and the payload (file bytes, or the link
+/// target for symlinks).
+struct ZipEntry {
+    name: Vec<u8>,
+    dir: bool,
+    symlink: bool,
+    mode: u32,
+    mtime: u64,
+    data: Vec<u8>,
+}
+
+/// Reads the link target out of a symlink member's ustar linkname field.
+fn header_linkname(header: &[u8; 512]) -> Vec<u8> {
+    let end = header[157..257]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(100);
+    header[157..157 + end].to_vec()
+}
+
+/// Splits a rewrapped tar into zip entries: the `g` global header carries
+/// no member, `x` pax headers only rename the entry they describe, `5`
+/// members become directories, `2` members symlinks (target from the
+/// linkname field), and `0` members files. Anything else is corrupt: the
+/// only producer is the `upload-archive` serve half, which emits exactly
+/// these kinds.
+fn parse_zip_entries(tar: &[u8]) -> Result<Vec<ZipEntry>, GitError> {
+    let corrupt = |detail: String| GitError::Corrupt { detail };
+    let mut entries = Vec::new();
+    let mut held_path: Option<Vec<u8>> = None;
+    let mut pos = 0;
+    while pos + 512 <= tar.len() {
+        let mut header = [0u8; 512];
+        header.copy_from_slice(&tar[pos..pos + 512]);
+        pos += 512;
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        if header[257..263] != *b"ustar\0" {
+            return Err(corrupt("archive member is not a ustar header".to_owned()));
+        }
+        let size = usize::try_from(parse_octal(&header[124..136], "size")?)
+            .map_err(|_| corrupt("archive member size overflows".to_owned()))?;
+        let padded = size.div_ceil(512) * 512;
+        if pos + padded > tar.len() {
+            return Err(corrupt("archive member runs past the stream".to_owned()));
+        }
+        let data = tar[pos..pos + size].to_vec();
+        pos += padded;
+        match header[156] {
+            b'x' => {
+                if let Some(path) = pax_path_record(&data) {
+                    held_path = Some(path);
+                }
+            }
+            b'g' => {}
+            flag @ (b'0' | b'5' | b'2') => {
+                let name = held_path.take().unwrap_or_else(|| header_name(&header));
+                let mode = u32::try_from(parse_octal(&header[100..108], "mode")?).map_err(|_| {
+                    corrupt("archive member mode overflows".to_owned())
+                })?;
+                let mtime = parse_octal(&header[136..148], "mtime")?;
+                let (dir, symlink, data) = match flag {
+                    b'5' => (true, false, Vec::new()),
+                    b'2' => (false, true, header_linkname(&header)),
+                    _ => (false, false, data),
+                };
+                entries.push(ZipEntry {
+                    name,
+                    dir,
+                    symlink,
+                    mode,
+                    mtime,
+                    data,
+                });
+            }
+            other => {
+                return Err(corrupt(format!(
+                    "archive member has unknown type {other}"
+                )));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Maps a zip writer failure onto the interpreter: I/O stays I/O, every
+/// other refusal (bad names, duplicate entries, a finished stream) is a
+/// corrupt archive, never a silent truncation.
+fn zip_failed(err: zip::result::ZipError) -> GitError {
+    match err {
+        zip::result::ZipError::Io(io) => GitError::Io {
+            detail: format!("cannot write the zip archive: {io}"),
+        },
+        other => GitError::Corrupt {
+            detail: format!("cannot write the zip archive: {other}"),
+        },
+    }
+}
+
+/// Converts a tar mtime into zip's DOS timestamp: out-of-range stamps
+/// (before 1980 or past 2107) fall back to the zip epoch instead of
+/// failing the archive.
+fn zip_mtime(stamp: u64) -> zip::DateTime {
+    const DAY: u64 = 86400;
+    let (days, clock) = (stamp / DAY, stamp % DAY);
+    // Days to civil date on the proleptic Gregorian calendar; the shifted
+    // era keeps every division exact for all representable stamps.
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    // Saturating conversions: any component outside the DOS range fails
+    // `from_date_and_time` below and lands on the zip epoch, exactly like
+    // a pre-1980 stamp.
+    let year = u16::try_from(year).unwrap_or(u16::MAX);
+    let month = u8::try_from(month).unwrap_or(u8::MAX);
+    let day = u8::try_from(day).unwrap_or(u8::MAX);
+    let hour = u8::try_from(clock / 3600).unwrap_or(u8::MAX);
+    let minute = u8::try_from((clock % 3600) / 60).unwrap_or(u8::MAX);
+    let second = u8::try_from(clock % 60).unwrap_or(u8::MAX);
+    zip::DateTime::from_date_and_time(year, month, day, hour, minute, second).unwrap_or_default()
+}
+
+/// Transcodes a rewrapped tar into a zip archive: non-empty files deflate,
+/// empty files store, directories and symlinks go through the writer's own
+/// constructors, and modes and mtimes carry over. Names must be UTF-8 (the
+/// writer stores them as text), so a non-UTF-8 tree name refuses here
+/// rather than landing mojibake in the archive.
+fn tar_to_zip(tar: &[u8]) -> Result<Vec<u8>, GitError> {
+    use std::io::Write as _;
+
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for entry in parse_zip_entries(tar)? {
+        let name = String::from_utf8(entry.name).map_err(|_| GitError::Corrupt {
+            detail: "archive member name is not UTF-8; zip stores names as text".to_owned(),
+        })?;
+        let mtime = zip_mtime(entry.mtime);
+        if entry.dir {
+            zip.add_directory(
+                name,
+                zip::write::SimpleFileOptions::default()
+                    .unix_permissions(entry.mode)
+                    .last_modified_time(mtime),
+            )
+            .map_err(zip_failed)?;
+        } else if entry.symlink {
+            let target = String::from_utf8(entry.data).map_err(|_| GitError::Corrupt {
+                detail: "symlink target is not UTF-8; zip stores it as text".to_owned(),
+            })?;
+            zip.add_symlink(
+                name,
+                target,
+                zip::write::SimpleFileOptions::default()
+                    .unix_permissions(entry.mode)
+                    .last_modified_time(mtime),
+            )
+            .map_err(zip_failed)?;
+        } else {
+            let method = if entry.data.is_empty() {
+                zip::CompressionMethod::Stored
+            } else {
+                zip::CompressionMethod::Deflated
+            };
+            zip.start_file(
+                name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(method)
+                    .unix_permissions(entry.mode)
+                    .last_modified_time(mtime),
+            )
+            .map_err(zip_failed)?;
+            zip.write_all(&entry.data).map_err(|err| GitError::Io {
+                detail: format!("cannot write the zip archive: {err}"),
+            })?;
+        }
+    }
+    Ok(zip.finish().map_err(zip_failed)?.into_inner())
 }
 
 /// Archives one revision of a local store through the `upload-archive`
