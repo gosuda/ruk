@@ -37,8 +37,6 @@ use std::path::{Path, PathBuf};
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::Signature;
 
-use ruk_core::commit::CommitRecord;
-use ruk_core::conflict::Signature;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
