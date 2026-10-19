@@ -24,11 +24,11 @@ use std::io::Read;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::Store;
 
+use super::Interrupt;
 use super::fetch::Filter;
 use super::pack::{IngestLimits, StagedPack, ingest_pack};
 use super::pktline::{self, Packet, PktReader, RemoteMessages, SidebandReader};
 use super::refadv::{self, Capabilities};
-use super::Interrupt;
 use crate::GitError;
 
 /// The HTTP header that asks a smart-http server to speak protocol v2
@@ -253,8 +253,8 @@ pub fn read_object_info<R: Read>(
             Some(at) => (&line[..at], Some(&line[at + 1..])),
             None => (line.as_slice(), None),
         };
-        let text =
-            std::str::from_utf8(oid).map_err(|_| corrupt(format!("non-ASCII object id {}", oid.escape_ascii())))?;
+        let text = std::str::from_utf8(oid)
+            .map_err(|_| corrupt(format!("non-ASCII object id {}", oid.escape_ascii())))?;
         let oid = crate::parse_oid_for(text, kind).map_err(|err| match err {
             GitError::ObjectFormat { detail } => GitError::ObjectFormat { detail },
             other => corrupt(other.to_string()),
@@ -374,8 +374,7 @@ pub fn read_fetch_response<R: Read>(
                     }
                     b"wanted-refs" => read_section_lines(pkt, &mut Vec::new())?,
                     b"packfile" => {
-                        let mut band =
-                            SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
+                        let mut band = SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
                         let pack = ingest_pack(&mut band, kind, store, limits, interrupt)?;
                         progress = band.drain_to_end()?;
                         staged = Some(pack);
@@ -607,7 +606,10 @@ mod tests {
         assert_eq!(attrs, vec!["size".to_owned(), "type".to_owned()]);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].oid, oid(A));
-        assert_eq!(entries[0].values, vec!["123".to_owned(), "commit".to_owned()]);
+        assert_eq!(
+            entries[0].values,
+            vec!["123".to_owned(), "commit".to_owned()]
+        );
         assert_eq!(entries[1].oid, oid(B));
         assert!(entries[1].values.is_empty());
     }

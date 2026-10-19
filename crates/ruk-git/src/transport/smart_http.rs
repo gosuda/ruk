@@ -59,9 +59,9 @@ use super::http;
 use super::net;
 use super::pack::IngestLimits;
 use super::pktline::{self, PktReader};
-use super::push::{self, PushPlanRecord, PushWireRequest, RefOutcome};
 use super::proto_v2;
-use super::refadv::{self, Advertisement, AdvertisedRef, Capabilities, Initial};
+use super::push::{self, PushPlanRecord, PushWireRequest, RefOutcome};
+use super::refadv::{self, AdvertisedRef, Advertisement, Capabilities, Initial};
 use crate::{GitError, parse_oid_for};
 
 /// Which smart service one RPC round trip speaks.
@@ -243,8 +243,9 @@ pub fn discover(
     match refadv::read_initial(&mut pkt, kind)? {
         Initial::Refs(adv) => Ok(adv),
         Initial::V2(_) => Err(GitError::Unsupported {
-            command: "protocol v2 without the Git-Protocol header: probe with discover_v2_caps first"
-                .to_owned(),
+            command:
+                "protocol v2 without the Git-Protocol header: probe with discover_v2_caps first"
+                    .to_owned(),
         }),
     }
 }
@@ -1332,11 +1333,8 @@ mod tests {
             format!("{FOUR} HEAD symref-target:refs/heads/main\n").as_bytes(),
         )
         .expect("frame");
-        pktline::encode_data(
-            &mut ls_body,
-            format!("{FOUR} refs/heads/main\n").as_bytes(),
-        )
-        .expect("frame");
+        pktline::encode_data(&mut ls_body, format!("{FOUR} refs/heads/main\n").as_bytes())
+            .expect("frame");
         pktline::encode_flush(&mut ls_body);
         let (base, server) = fake_smart_server(vec![
             (

@@ -1753,10 +1753,7 @@ fn archive_refusals_pin_exit_codes() {
     assert_eq!(err.exit_code(), 1, "{err}");
     // A NACK naming an unknown revision surfaces NotFound, not a corrupt stream.
     let body = pkt_frame(b"NACK unknown revision nope\n");
-    let (base, log) = smart_http_server(vec![(
-        body,
-        "application/x-git-upload-archive-result",
-    )]);
+    let (base, log) = smart_http_server(vec![(body, "application/x-git-upload-archive-result")]);
     let remote = format!("--remote={base}");
     let err = run(verbs_transport::archive, &mut ctx, &[&remote, "nope"])
         .expect_err("unknown revision must fail");
@@ -1777,8 +1774,14 @@ fn tar_members(tar: &[u8]) -> Vec<(Vec<u8>, u8, Vec<u8>)> {
         if header.iter().all(|byte| *byte == 0) {
             break;
         }
-        let name_end = header[..100].iter().position(|byte| *byte == 0).unwrap_or(100);
-        let prefix_end = header[345..500].iter().position(|byte| *byte == 0).unwrap_or(155);
+        let name_end = header[..100]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(100);
+        let prefix_end = header[345..500]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(155);
         let mut name = header[345..345 + prefix_end].to_vec();
         if !name.is_empty() {
             name.push(b'/');
@@ -1819,8 +1822,12 @@ fn archive_prefix_prepends_member_names() {
     let (root, env) = seeded_two_file_repo("uarchive-prefix");
     let mut ctx = repo_ctx(&root, env);
     let plain = run(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("plain");
-    let out = run(verbs_transport::archive, &mut ctx, &["--prefix=lead/", "HEAD"])
-        .expect("prefixed");
+    let out = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--prefix=lead/", "HEAD"],
+    )
+    .expect("prefixed");
     let plain_members = tar_members(&plain);
     let members = tar_members(&out);
     assert!(
@@ -1857,8 +1864,12 @@ fn archive_prefix_prepends_member_names() {
         .collect();
     assert_eq!(stripped, plain_names, "prefix only prepends");
     // A missing trailing slash normalizes to one.
-    let bare = run(verbs_transport::archive, &mut ctx, &["--prefix=lead", "HEAD"])
-        .expect("bare prefix");
+    let bare = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--prefix=lead", "HEAD"],
+    )
+    .expect("bare prefix");
     assert_eq!(bare, out, "prefix without a slash matches");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -1902,8 +1913,12 @@ fn archive_paths_limit_members() {
 fn archive_format_zip_names_its_gap() {
     let (root, env) = seeded_repo("uarchive-zip", "a.txt", b"a\n");
     let mut ctx = repo_ctx(&root, env);
-    let err = run(verbs_transport::archive, &mut ctx, &["--format=zip", "HEAD"])
-        .expect_err("zip must fail");
+    let err = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=zip", "HEAD"],
+    )
+    .expect_err("zip must fail");
     assert!(
         matches!(err, ruk_git::GitError::Unsupported { .. }),
         "{err}"
@@ -1925,8 +1940,8 @@ fn archive_over_git_daemon_streams_tar() {
             .expect("timeout");
         let mut prefix = [0u8; 4];
         socket.read_exact(&mut prefix).expect("length prefix");
-        let len = usize::from_str_radix(std::str::from_utf8(&prefix).expect("hex"), 16)
-            .expect("length");
+        let len =
+            usize::from_str_radix(std::str::from_utf8(&prefix).expect("hex"), 16).expect("length");
         let mut body = vec![0u8; len - 4];
         socket.read_exact(&mut body).expect("request body");
         assert!(

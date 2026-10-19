@@ -1659,7 +1659,9 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
     if let Some(format) = opts.single("format")? {
         if format != "tar" {
             return Err(GitError::Unsupported {
-                command: format!("archive format {format:?}: no zip writer in this slice (only tar is spoken)"),
+                command: format!(
+                    "archive format {format:?}: no zip writer in this slice (only tar is spoken)"
+                ),
             });
         }
     }
@@ -1852,8 +1854,14 @@ fn checksum_header(header: &mut [u8; 512]) {
 /// The ustar prefix/name fields joined with `/`, without consulting any
 /// `x` record beside the member.
 fn header_name(header: &[u8; 512]) -> Vec<u8> {
-    let prefix_end = header[345..500].iter().position(|byte| *byte == 0).unwrap_or(155);
-    let name_end = header[..100].iter().position(|byte| *byte == 0).unwrap_or(100);
+    let prefix_end = header[345..500]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(155);
+    let name_end = header[..100]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(100);
     let (prefix, name) = (&header[345..345 + prefix_end], &header[..name_end]);
     if prefix.is_empty() {
         name.to_vec()
@@ -1899,7 +1907,10 @@ fn set_pax_path(data: &[u8], path: &[u8]) -> Vec<u8> {
             out.extend_from_slice(rest);
             break;
         };
-        let len: usize = match std::str::from_utf8(&rest[..space]).ok().and_then(|text| text.parse().ok()) {
+        let len: usize = match std::str::from_utf8(&rest[..space])
+            .ok()
+            .and_then(|text| text.parse().ok())
+        {
             Some(len) => len,
             None => {
                 out.extend_from_slice(rest);
@@ -2149,10 +2160,7 @@ fn rename_member(
     }
     if let Some(describer) = pending {
         describer.data = set_pax_path(&describer.data, &renamed);
-        octal_into(
-            &mut describer.header[124..136],
-            describer.data.len() as u64,
-        );
+        octal_into(&mut describer.header[124..136], describer.data.len() as u64);
         checksum_header(&mut describer.header);
         truncate_header(&mut member.header, &renamed);
         checksum_header(&mut member.header);
@@ -3040,8 +3048,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             // parses caps or the v0 refs, with no second round trip.
             let refs = match &endpoint {
                 Endpoint::Http { url, .. } => {
-                    let base =
-                        ruk_git::transport::smart_http::normalize_base(url)?;
+                    let base = ruk_git::transport::smart_http::normalize_base(url)?;
                     match ruk_git::transport::smart_http::discover_versioned(
                         &base,
                         ruk_git::transport::smart_http::SmartService::UploadPack,
@@ -3106,7 +3113,6 @@ fn render_ls_remote(
     }
     line(out)
 }
-
 
 #[cfg(test)]
 mod archive_rewrap_tests {
@@ -3197,7 +3203,10 @@ mod archive_rewrap_tests {
         let members = logical(&out);
         assert_eq!(members[0].0, b'g');
         assert_eq!(members[0].1, b"pax_global_header");
-        let named: Vec<Vec<u8>> = members[1..].iter().map(|(_, path, _)| path.clone()).collect();
+        let named: Vec<Vec<u8>> = members[1..]
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect();
         assert_eq!(
             named,
             vec![
