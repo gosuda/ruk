@@ -5080,9 +5080,7 @@ fn clear_lane_state(ctx: &Ctx, verb: &str, head_key: Option<&str>) -> Result<(),
 /// `--first-parent`, `--left-right`/`--cherry-pick` (sides come from the
 /// first `A...B` range; without one every commit reads as right-side `>`),
 /// `--topo-order`, `--date-order` (the walk already pops newest
-/// committer-date first, so this is accepted as the default order; with
-/// no revisions either order walks every ref so the order reads across
-/// branches, while named revisions still walk just their tips),
+/// committer-date first, so this is accepted as the default order),
 /// `--date=<fmt>`/`--relative-date`, `--abbrev[=<n>]`, `--summary`,
 /// `--shortstat`, `--numstat`, `--dirstat`, `--show-notes[=<ref>]`/
 /// `--no-notes`, `--decorate=<short|full|auto|no>`, `--source`,
