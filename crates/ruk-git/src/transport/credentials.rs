@@ -230,10 +230,12 @@ fn parse_config_entries(text: &str) -> Vec<CredentialHelperRow> {
     entries
 }
 
-/// Whether a `[credential "<pattern>"]` subsection matches `url`: the
-/// pattern must be a prefix ending on a URL boundary (`/`, `?`, `#`, or the
-/// end), so `https://host` never matches `https://hostile`.
-fn scope_matches(pattern: &str, url: &str) -> bool {
+/// Whether a `[credential "<pattern>"]` (or `[http "<base>"]`) subsection
+/// matches `url`: the pattern must be a prefix ending on a URL boundary
+/// (`/`, `?`, `#`, or the end), so `https://host` never matches
+/// `https://hostile`. Shared with the `http.extraHeader` resolver, which
+/// documents its simplification against git's `urlmatch` normalization.
+pub(crate) fn scope_matches(pattern: &str, url: &str) -> bool {
     let pattern = pattern.trim_end_matches('/');
     if pattern.is_empty() {
         return false;
@@ -318,6 +320,66 @@ fn helper_commands_for(url: &str, entries: &[CredentialHelperRow]) -> Vec<(Strin
         }
     }
     out
+}
+
+/// Collects every `http.extraHeader` row in one config file, in file order:
+/// `(scope, value)` with `scope` from `[http "<base>"]` subsections (`None`
+/// is bare `http.extraHeader`). Multivalued by nature: every row is kept,
+/// including empty ones (an empty value resets the accumulated list when
+/// the rows resolve through [`http::extra_headers_for_url`]). Section and
+/// key compare case-insensitively like git's config; the scope keeps its
+/// case. Values share this module's minimal config grammar (no quoting): a
+/// ` #`/` ;` starts a comment, the same limitation helper paths accept.
+fn parse_http_extra_header_entries(text: &str) -> Vec<http::ExtraHeaderRow> {
+    let mut entries = Vec::new();
+    let mut section = String::new();
+    let mut subsection: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            let (name, sub) = parse_section_header(line);
+            section = name;
+            subsection = sub;
+            continue;
+        }
+        if section != "http" {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("extraheader") {
+            continue;
+        }
+        entries.push(http::ExtraHeaderRow {
+            scope: subsection.clone(),
+            value: strip_inline_comment(value.trim()).to_owned(),
+        });
+    }
+    entries
+}
+
+/// Reads every config file's `http.extraHeader` rows in file order.
+/// Unreadable files, oversized files and non-UTF-8 files are skipped.
+#[must_use]
+pub fn http_extra_header_rows() -> Vec<http::ExtraHeaderRow> {
+    let mut entries = Vec::new();
+    for path in config_paths() {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.len() > MAX_CONFIG_BYTES {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        entries.extend(parse_http_extra_header_entries(text));
+    }
+    entries
 }
 
 /// Reads every config file and resolves the runnable helper chain for `url`.
@@ -656,6 +718,44 @@ mod tests {
             });
             home.map(|program| (program, vec!["--flag".to_owned()]))
         });
+    }
+
+    #[test]
+    fn extra_header_rows_keep_file_order_scopes_and_resets() {
+        let rows = parse_http_extra_header_entries(
+            "[http]\n\textraHeader = X-One: 1\n[http \"https://host.x/sub\"]\n\textraHeader = X-Sub: 2\n\textraHeader =\n[credential]\n\thelper = /bin/top\n[http]\n\textraHeader = X-Two: 2\n",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                http::ExtraHeaderRow {
+                    scope: None,
+                    value: "X-One: 1".to_owned(),
+                },
+                http::ExtraHeaderRow {
+                    scope: Some("https://host.x/sub".to_owned()),
+                    value: "X-Sub: 2".to_owned(),
+                },
+                http::ExtraHeaderRow {
+                    scope: Some("https://host.x/sub".to_owned()),
+                    value: String::new(),
+                },
+                http::ExtraHeaderRow {
+                    scope: None,
+                    value: "X-Two: 2".to_owned(),
+                },
+            ]
+        );
+        // Section and key match case-insensitively; other sections and keys
+        // never leak in.
+        let rows = parse_http_extra_header_entries("[HTTP]\n\tEXTRAHEADER = X-Up: yes\n[http]\n\tsslVerify = false\n");
+        assert_eq!(
+            rows,
+            vec![http::ExtraHeaderRow {
+                scope: None,
+                value: "X-Up: yes".to_owned(),
+            }]
+        );
     }
 
     #[test]

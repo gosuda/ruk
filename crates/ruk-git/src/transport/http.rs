@@ -104,6 +104,88 @@ pub fn auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {
         })
 }
 
+/// One `http.extraHeader` config row: `scope` is the `[http "<base>"]`
+/// subsection when present (`None` is bare `http.extraHeader`), `value`
+/// the raw header line (`""` resets the accumulated list, per git).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtraHeaderRow {
+    /// URL-prefix scope from the config subsection, if any.
+    pub scope: Option<String>,
+    /// Raw `Name: value` header line, or `""` to reset the list.
+    pub value: String,
+}
+
+/// Parses one `http.extraHeader` line into its `(name, value)` header.
+/// The split is at the first colon; one leading blank on the value is
+/// stripped and the rest travels verbatim, the way curl takes `-H` lines.
+/// `None` for lines without a colon, with an empty name, or carrying a
+/// line break (curl would send those raw; this client refuses line breaks
+/// in [`send_head`], so one bad row must not fail the request).
+fn parse_extra_header(line: &str) -> Option<(String, String)> {
+    let (name, value) = line.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        return None;
+    }
+    let value = value.strip_prefix([' ', '\t']).unwrap_or(value);
+    if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        return None;
+    }
+    Some((name.to_owned(), value.to_owned()))
+}
+
+/// Resolves the `http.extraHeader` request headers for `url` from `rows`
+/// in precedence order (git-config files, then repo config, then `-c`
+/// overrides). The longest scope matching `url` (prefix ending on a URL
+/// boundary, see [`super::credentials::scope_matches`]) wins outright and
+/// only its rows apply; with no matching scope the unscoped rows apply.
+/// Rows apply in order: an empty value resets the list
+/// (`git/http.c` `http_options`), any other value joins verbatim.
+///
+/// Documented simplifications against git's `urlmatch` machinery: scopes
+/// compare as plain prefixes with no scheme/host case-folding, no
+/// percent-decoding, and no default-port folding; and unscoped rows never
+/// mix with scoped ones (git's mix is order-dependent, this wins cleanly).
+#[must_use]
+pub fn extra_headers_for_url(url: &str, rows: &[ExtraHeaderRow]) -> Vec<(String, String)> {
+    let mut winner: Option<&str> = None;
+    let mut winner_len = 0usize;
+    for row in rows {
+        let Some(scope) = row.scope.as_deref() else {
+            continue;
+        };
+        if !super::credentials::scope_matches(scope, url) {
+            continue;
+        }
+        let len = scope.trim_end_matches('/').len();
+        if winner.is_none() || len > winner_len {
+            winner = Some(scope);
+            winner_len = len;
+        }
+    }
+    let selected = |row: &ExtraHeaderRow| match (winner, row.scope.as_deref()) {
+        (Some(want), Some(have)) => {
+            have.trim_end_matches('/') == want.trim_end_matches('/')
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|row| selected(row)) {
+        if row.value.is_empty() {
+            out.clear();
+            continue;
+        }
+        if let Some(header) = parse_extra_header(&row.value) {
+            out.push(header);
+        }
+    }
+    out
+}
+
 /// An `Authorization` header from the git smart-http auth environment,
 /// when set.
 ///
@@ -111,9 +193,10 @@ pub fn auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {
 /// otherwise `GIT_AUTH_USER` plus `GIT_AUTH_PASSWORD` are sent as
 /// `Basic <base64(user:pass)>`. This is the environment half of auth: the
 /// helper half lives in [`super::credentials::auth_header_for_url`], which
-/// tries the configured helper first and falls back here. `http.<url>.extraHeader`
-/// stays a named gap (documented in [`super::smart_http`]): CI-style static
-/// tokens are what this adapter needs.
+/// tries the configured helper first and falls back here. Configured
+/// `http.<url>.extraHeader` lines join every request separately through
+/// [`extra_headers_for_url`]; when both carry `Authorization`, both are
+/// sent, the way curl sends custom headers alongside its own auth.
 #[must_use]
 pub fn git_auth_header(vars: &HashMap<String, String>) -> Option<(String, String)> {
     if let Some(token) = vars.get("GIT_AUTH_TOKEN").filter(|v| !v.is_empty()) {
@@ -124,6 +207,82 @@ pub fn git_auth_header(vars: &HashMap<String, String>) -> Option<(String, String
     let encoded = base64_encode(format!("{user}:{password}").as_bytes());
     Some(("authorization".to_owned(), format!("Basic {encoded}")))
 }
+#[cfg(test)]
+mod extra_header_tests {
+    use super::*;
+
+    fn row(scope: Option<&str>, value: &str) -> ExtraHeaderRow {
+        ExtraHeaderRow {
+            scope: scope.map(str::to_owned),
+            value: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn unscoped_rows_accumulate_verbatim() {
+        let headers = extra_headers_for_url(
+            "https://host.x/a.git",
+            &[
+                row(None, "X-One: 1"),
+                row(None, "Authorization: Bearer scoped-token"),
+            ],
+        );
+        assert_eq!(
+            headers,
+            vec![
+                ("X-One".to_owned(), "1".to_owned()),
+                (
+                    "Authorization".to_owned(),
+                    "Bearer scoped-token".to_owned()
+                ),
+            ]
+        );
+        assert!(extra_headers_for_url("https://host.x/a.git", &[]).is_empty());
+    }
+
+    #[test]
+    fn longest_matching_scope_wins_outright() {
+        let rows = vec![
+            row(None, "X-Global: g"),
+            row(Some("https://host.x"), "X-Host: h"),
+            row(Some("https://host.x/sub"), "X-Sub: s"),
+        ];
+        assert_eq!(
+            extra_headers_for_url("https://host.x/sub/a", &rows),
+            vec![("X-Sub".to_owned(), "s".to_owned())]
+        );
+        assert_eq!(
+            extra_headers_for_url("https://host.x/other", &rows),
+            vec![("X-Host".to_owned(), "h".to_owned())]
+        );
+        assert_eq!(
+            extra_headers_for_url("https://elsewhere.x/a", &rows),
+            vec![("X-Global".to_owned(), "g".to_owned())]
+        );
+        // Boundary, not substring: no match on a hostile hostname.
+        assert_eq!(
+            extra_headers_for_url("https://host.x.evil/a", &rows),
+            vec![("X-Global".to_owned(), "g".to_owned())]
+        );
+    }
+
+    #[test]
+    fn empty_value_resets_and_malformed_lines_drop() {
+        let headers = extra_headers_for_url(
+            "https://host.x/a",
+            &[
+                row(None, "X-One: 1"),
+                row(None, ""),
+                row(None, "X-Two: 2"),
+                row(None, "no-colon-here"),
+                row(None, ": empty-name"),
+                row(None, "X-Evil: a\rb"),
+            ],
+        );
+        assert_eq!(headers, vec![("X-Two".to_owned(), "2".to_owned())]);
+    }
+}
+
 /// Standard-alphabet base64 with padding, so Basic credentials need no new
 /// dependency for one short header value.
 fn base64_encode(bytes: &[u8]) -> String {
