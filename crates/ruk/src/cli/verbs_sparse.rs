@@ -14,14 +14,16 @@
 //! the root, and a trailing `/` matches the whole directory. Matching is the
 //! repo glob (`*` crosses `/`, plus `?`/`[...]`); a non-glob pattern also
 //! matches everything below that path, so `docs` keeps `docs/a.txt`. The
-//! last matching line wins. An enabled checkout with no patterns file
-//! matches everything, the way the oracle treats the missing file.
+//! last matching line wins. With no rules (missing or empty file) everything
+//! matches; with rules, unmatched paths are outside the cone.
 //!
 //! The index keeps every entry: paths outside the sparse set carry
 //! `CE_SKIP_WORKTREE` (`IndexFlags::skip_worktree`) on their stage-zero row,
-//! and the worktree holds only matching files. `set`/`reapply`/`disable`
-//! rewrite exactly the touched worktree paths and refuse when a rewrite
-//! would discard local changes; untracked files are never read or removed.
+//! and the worktree holds only matching files. With no rules (missing or
+//! empty patterns file) everything matches; otherwise only paths a rule
+//! names (last match wins, `!` excludes) are in the cone. `set`/`reapply`/
+//! `disable` rewrite exactly the touched worktree paths and refuse when a
+//! rewrite would discard local changes; untracked files are never removed.
 //!
 //! Oracle anchor: `git/builtin/sparse-checkout.c`.
 //!
@@ -563,17 +565,21 @@ fn parse_rules(body: &[u8]) -> Vec<SparseRule> {
     out
 }
 
-/// Reports whether `path` is in the sparse cone: the last matching rule wins,
-/// defaulting to included when no rule matches.
+/// Reports whether `path` is in the sparse cone: the last matching rule
+/// wins. With no rules at all nothing filters (everything matches); with
+/// rules, a path no rule names is outside the cone.
 fn rules_match(rules: &[SparseRule], path: &[u8]) -> bool {
+    if rules.is_empty() {
+        return true;
+    }
     let text = String::from_utf8_lossy(path);
-    let mut matched: Option<bool> = None;
+    let mut matched = false;
     for rule in rules {
         if rule_matches(rule, &text) {
-            matched = Some(!rule.negate);
+            matched = !rule.negate;
         }
     }
-    matched.unwrap_or(true)
+    matched
 }
 
 /// Matches one rule against a full path.
