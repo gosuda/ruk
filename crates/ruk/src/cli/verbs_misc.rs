@@ -3334,6 +3334,11 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
     // way the oracle's per-repository processes each own exactly one
     // handle. Anything else opens (and drops) its own handle per run.
     let here = std::fs::canonicalize(&ctx.root).ok();
+    // Only a store this call started with goes back: parking a listed
+    // repo's handle in a store-less context would make a repeated
+    // listing reopen against the parked handle and hit the store lock,
+    // so such handles just drop (releasing the lock) instead.
+    let restore_target = ctx.store.is_some();
     let mut out = Vec::new();
     let mut result = Ok(());
     for repo in &repos {
@@ -3404,7 +3409,7 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
             }
         }
         if let Some(store) = sub.store.take() {
-            if ctx.store.is_none() {
+            if restore_target && ctx.store.is_none() {
                 ctx.store = Some(store);
             }
         }
