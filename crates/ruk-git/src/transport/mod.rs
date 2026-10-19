@@ -56,6 +56,7 @@ pub mod net;
 pub mod pack;
 pub mod pktline;
 pub mod private;
+pub mod proto_v2;
 pub mod proc_receive;
 pub mod push;
 pub mod refadv;

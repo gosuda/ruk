@@ -36,7 +36,7 @@ use ruk_core::store::types::ObjectKind;
 use ruk_core::store::{FactMutation, Store};
 
 use super::pack::{IngestLimits, Links, StagedPack, ingest_pack, object_links};
-use super::pktline::{self, Packet, PktReader, RemoteMessages, SidebandReader, send};
+use super::pktline::{self, PktReader, RemoteMessages, SidebandReader, send};
 use super::private::PrivateFilter;
 use super::refadv::{self, Advertisement, Capabilities, Initial};
 use super::session::Duplex;
@@ -260,9 +260,9 @@ fn receive_v0<R: Read + Write>(
             });
         }
         if let Some(rest) = line.strip_prefix(b"shallow ") {
-            shallow.push(parse_server_oid(rest, kind)?);
+            shallow.push(super::proto_v2::parse_server_oid(rest, kind)?);
         } else if let Some(rest) = line.strip_prefix(b"unshallow ") {
-            unshallow.push(parse_server_oid(rest, kind)?);
+            unshallow.push(super::proto_v2::parse_server_oid(rest, kind)?);
         } else if is_nak(&line) {
             break;
         } else if line.starts_with(b"ACK ") {
@@ -320,18 +320,6 @@ fn is_nak(line: &[u8]) -> bool {
     line.len() == 3 && line.starts_with(b"NAK")
 }
 
-fn parse_server_oid(field: &[u8], kind: HashKind) -> Result<Oid, GitError> {
-    let text = std::str::from_utf8(field).map_err(|_| GitError::Corrupt {
-        detail: "server sent a non-ASCII object id".to_owned(),
-    })?;
-    crate::parse_oid_for(text, kind).map_err(|err| match err {
-        GitError::ObjectFormat { detail } => GitError::ObjectFormat { detail },
-        other => GitError::Corrupt {
-            detail: other.to_string(),
-        },
-    })
-}
-
 fn receive_v2<R: Read + Write>(
     pkt: &mut PktReader<R>,
     caps: Capabilities,
@@ -374,105 +362,27 @@ fn receive_v2<R: Read + Write>(
         }
         None => None,
     };
-    let sideband_all = caps.feature("fetch", "sideband-all");
-    let mut out = Vec::new();
-    refadv::write_command_header(&mut out, "fetch", &caps, kind)?;
-    for want in &req.wants {
-        pktline::encode_data(&mut out, format!("want {want}\n").as_bytes())?;
-    }
-    for oid in &req.shallow {
-        pktline::encode_data(&mut out, format!("shallow {oid}\n").as_bytes())?;
-    }
-    for have in &req.haves {
-        pktline::encode_data(&mut out, format!("have {have}\n").as_bytes())?;
-    }
-    if let Some(filter) = filter {
-        pktline::encode_data(&mut out, format!("filter {}\n", filter.spec()).as_bytes())?;
-    }
-    if let Some(depth) = depth {
-        pktline::encode_data(&mut out, format!("deepen {depth}\n").as_bytes())?;
-    }
-    if sideband_all {
-        pktline::encode_data(&mut out, b"sideband-all\n")?;
-    }
-    pktline::encode_data(&mut out, b"done\n")?;
-    pktline::encode_flush(&mut out);
-    send(pkt.get_mut(), &out)?;
-    let mut shallow = Vec::new();
-    let mut unshallow = Vec::new();
-    let mut staged = None;
-    let mut progress = RemoteMessages::default();
-    loop {
-        interrupt.check("reading the fetch response")?;
-        match pkt.read_packet()? {
-            Packet::Flush => break,
-            Packet::ResponseEnd => break,
-            Packet::Delimiter => {}
-            Packet::Data(_) => {
-                let section = pkt.last_line().unwrap_or_default().to_vec();
-                match section.as_slice() {
-                    b"acknowledgment" => read_section_lines(pkt, &mut Vec::new())?,
-                    b"shallow-info" => {
-                        let mut lines = Vec::new();
-                        read_section_lines(pkt, &mut lines)?;
-                        for line in lines {
-                            if let Some(rest) = line.strip_prefix(b"shallow ") {
-                                shallow.push(parse_server_oid(rest, kind)?);
-                            } else if let Some(rest) = line.strip_prefix(b"unshallow ") {
-                                unshallow.push(parse_server_oid(rest, kind)?);
-                            }
-                        }
-                    }
-                    b"wanted-refs" => read_section_lines(pkt, &mut Vec::new())?,
-                    b"packfile" => {
-                        // Protocol v2 multiplexes the packfile section on
-                        // sideband whether or not `sideband-all` was
-                        // negotiated: live servers send band-1 pack bytes
-                        // with band-2 progress either way (verified against
-                        // git 2.53.0), so this arm always demultiplexes. A
-                        // raw pack here is corrupt, not a legacy shape.
-                        let mut band = SidebandReader::new(pkt, super::pktline::LARGE_PACKET_MAX);
-                        let pack = ingest_pack(&mut band, kind, store, limits, interrupt)?;
-                        progress = band.drain_to_end()?;
-                        staged = Some(pack);
-                        // The packfile section closes the response: live
-                        // servers send one flush for section and response,
-                        // then hold the connection open in silence. Reading
-                        // on would block forever, so the loop ends here;
-                        // negotiation sections always precede the pack.
-                        break;
-                    }
-                    _ => read_section_lines(pkt, &mut Vec::new())?,
-                }
-            }
-        }
-    }
-    let Some(staged) = staged else {
-        return Err(GitError::Corrupt {
-            detail: "fetch response carries no packfile section".to_owned(),
-        });
+    let cmd = super::proto_v2::FetchCommand {
+        wants: &req.wants,
+        haves: &req.haves,
+        shallows: &req.shallow,
+        depth,
+        filter,
+        thin_pack: false,
+        ofs_delta: false,
+        sideband_all: caps.feature("fetch", "sideband-all"),
     };
+    let out = super::proto_v2::fetch_request(&caps, kind, &cmd)?;
+    send(pkt.get_mut(), &out)?;
+    let sections = super::proto_v2::read_fetch_response(pkt, kind, store, limits, interrupt)?;
     Ok(ReceivedPack {
-        staged,
-        shallow,
-        unshallow,
+        staged: sections.staged,
+        shallow: sections.shallow,
+        unshallow: sections.unshallow,
         warnings,
-        progress,
+        progress: sections.progress,
         refs,
     })
-}
-
-fn read_section_lines<R: Read>(
-    pkt: &mut PktReader<R>,
-    lines: &mut Vec<Vec<u8>>,
-) -> Result<(), GitError> {
-    loop {
-        match pkt.read_packet()? {
-            Packet::Flush | Packet::ResponseEnd => return Ok(()),
-            Packet::Delimiter => return Ok(()),
-            Packet::Data(_) => lines.push(pkt.last_line().unwrap_or_default().to_vec()),
-        }
-    }
 }
 
 /// Reads one pack after negotiation: side-band demultiplexed when the

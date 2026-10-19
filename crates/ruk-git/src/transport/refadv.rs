@@ -73,6 +73,25 @@ impl Capabilities {
             .filter_map(|(_, v)| v.as_deref())
     }
 
+    /// Renders every entry as one `name` or `name=value` line, in order:
+    /// the form [`super::proto_v2::encode_capability_advertisement`]
+    /// frames for fake servers.
+    #[must_use]
+    pub fn to_lines(&self) -> Vec<Vec<u8>> {
+        self.entries
+            .iter()
+            .map(|(name, value)| match value {
+                Some(value) => {
+                    let mut line = name.clone();
+                    line.push(b'=');
+                    line.extend_from_slice(value);
+                    line
+                }
+                None => name.clone(),
+            })
+            .collect()
+    }
+
     /// Whether the v2 capability `name` lists `feature` in its
     /// space-separated value (`fetch=shallow filter`).
     #[must_use]
@@ -324,21 +343,16 @@ pub fn ls_refs_request(
     kind: HashKind,
     prefixes: &[&[u8]],
 ) -> Result<Vec<u8>, GitError> {
-    let mut out = Vec::new();
-    write_command_header(&mut out, "ls-refs", caps, kind)?;
-    pktline::encode_data(&mut out, b"peel\n")?;
-    pktline::encode_data(&mut out, b"symrefs\n")?;
-    if caps.feature("ls-refs", "unborn") {
-        pktline::encode_data(&mut out, b"unborn\n")?;
-    }
-    for prefix in prefixes {
-        let mut line = b"ref-prefix ".to_vec();
-        line.extend_from_slice(prefix);
-        line.push(b'\n');
-        pktline::encode_data(&mut out, &line)?;
-    }
-    pktline::encode_flush(&mut out);
-    Ok(out)
+    super::proto_v2::ls_refs_request(
+        caps,
+        kind,
+        &super::proto_v2::LsRefsCommand {
+            prefixes: prefixes.iter().map(|prefix| prefix.to_vec()).collect(),
+            peel: true,
+            symrefs: true,
+            unborn: true,
+        },
+    )
 }
 
 /// Writes `command=<name>`, `agent`, `object-format` (when advertised) and
