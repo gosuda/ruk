@@ -1,6 +1,6 @@
 //! Transport and maintenance verbs: `fetch`, `pull`, `push`,
-//! `receive-pack`, `upload-pack`, `archive`, `bundle`, `gc`, `fsck`,
-//! `ls-remote`.
+//! `receive-pack`, `upload-pack`, `archive`, `gc`, `fsck`,
+//! `ls-remote` (`bundle` lives in `verbs_bundle`).
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
@@ -10,15 +10,15 @@
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
 //! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex session | tar and zip (`--format=zip` transcodes the tar client-side; every transport still answers tar); `--prefix`, `-o` and path limits rewrite the stream client-side |
-//! | `bundle` | no bundle format | unsupported |
-//! | `gc` | no repack/prune lane | unsupported |
+//! | `bundle` | git bundle v2/v3 headers plus pack v2, see `verbs_bundle` | `create`/`verify`/`list-heads`/`unbundle` over the native store |
+//! | `gc` | ref closure plus workspace pins through `Store::prune_unreachable`, then `Store::compact` | `--aggressive` repeats compaction; `--auto` exits quietly with no work; `--dry-run` reports; `--prune=now` (default) prunes, `--prune=never` compacts only, other dates are `Unsupported` (no object ages) |
 //! | `fsck` | ref walk + object existence, census-minus-reachable sweep | implemented; `--dangling`/`--unreachable` list `dangling <kind> <oid>` rows |
 //! | `ls-remote` | local `session::advertise` or one `net::discover` round trip; HTTP remotes probe protocol v2 first (`ls-refs`) | SSH/git and smart-http remotes served; dumb-http is the remaining HTTP gap |
 //!
 //! Oracle anchors: `git/builtin/fetch.c`, `git/builtin/pull.c`,
 //! `git/builtin/push.c`, `git/builtin/receive-pack.c`,
 //! `git/builtin/upload-pack.c`, `git/builtin/archive.c`,
-//! `git/builtin/bundle.c`, `git/builtin/gc.c`, `git/builtin/fsck.c`,
+//! `git/builtin/gc.c`, `git/builtin/fsck.c`,
 //! `git/builtin/ls-remote.c`.
 
 use std::collections::{HashMap, HashSet};
@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
-use ruk_core::refs::StoreRefs;
+use ruk_core::refs::{StoreRefs, all_reflog_oids};
 use ruk_core::store::{FactExpectation, FactMutation, FactTable, ObjectKind, Store};
 use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
@@ -2702,24 +2702,294 @@ fn archive_local(store: &Store, kind: HashKind, rev: &str) -> Result<Vec<u8>, Gi
     Ok(tar)
 }
 
-/// Handles bundles. Unsupported: no bundle format exists.
+/// Collects garbage: prunes objects no live root reaches, then compacts
+/// segments to fold the survivors and reclaim the dead bytes.
 ///
-/// Oracle: `git/builtin/bundle.c`.
-pub(crate) fn bundle(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "bundle: no bundle format in this slice".to_owned(),
-    })
-}
-
-/// Collects garbage. Unsupported: no repack or prune lane exists.
+/// Live means the ref closure (every ref tip peeled through tags, walked
+/// through history, closed over trees — the same walk [`fsck`] reports
+/// from) plus everything the workspace pins beyond refs: a detached
+/// `HEAD` oid, index entry blobs, stash commits with their captured index
+/// rows, `FETCH_HEAD` tips, in-progress sequencer tips, and every oid
+/// named by a reflog record. Census objects outside that set lose their
+/// locator rows in one [`Store::prune_unreachable`] transaction (delta
+/// bases of kept objects close over inside the store); a
+/// [`Store::compact`] pass then merges the sealed survivors and unlinks
+/// retired files whose readers drained.
+///
+/// Flags mirror the oracle (`git/builtin/gc.c`): `--aggressive` repeats
+/// compaction until a pass does no work, `--auto` exits quietly when
+/// neither unreachable objects nor a compaction backlog exist, `--dry-run`
+/// reports without mutating, `--quiet` mutes the report, and `--prune`
+/// (bare, like the oracle) or `--prune=now` (the default) prunes while
+/// `--prune=never` compacts only. Any other `--prune=<date>` is
+/// `Unsupported`: the store keeps no object ages to horizon against, so
+/// there is no grace period — an unreachable object prunes immediately.
 ///
 /// Oracle: `git/builtin/gc.c`.
-pub(crate) fn gc(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "gc: no repack or prune lane in this slice".to_owned(),
-    })
+pub(crate) fn gc(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let normalized: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            if arg == "--prune" {
+                "--prune=now".to_owned()
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    let specs = [
+        FlagSpec {
+            long: "aggressive",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "auto",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "dry-run",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "prune",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "quiet",
+            short: Some('q'),
+            takes_value: false,
+        },
+    ];
+    let opts = collect(&normalized, &specs)?;
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: gc [--aggressive] [--auto] [--dry-run] [--prune=now|never] [--quiet]"
+                .to_owned(),
+        });
+    }
+    let prune = match opts.single("prune")?.as_deref() {
+        None | Some("now") => true,
+        Some("never") => false,
+        Some(other) => {
+            return Err(GitError::Unsupported {
+                command: format!(
+                    "gc: --prune={other} needs object ages this store does not track (use --prune=now or --prune=never)"
+                ),
+            });
+        }
+    };
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let census = store.iter_objects().map_err(GitError::from)?.len();
+    let reachable = gc_reachable(store, kind)?;
+    let doomed = store.unreachable_oids(&reachable).map_err(GitError::from)?;
+    let backlog = store
+        .compaction_backlog()
+        .map_err(GitError::from)?;
+    if opts.is_set("auto") && doomed.is_empty() && !backlog.has_work() {
+        return Ok(Vec::new());
+    }
+    let quiet = opts.is_set("quiet");
+    let mut out = format!("Enumerating objects: {census}, done.\n").into_bytes();
+    if opts.is_set("dry-run") {
+        if doomed.is_empty() {
+            out.extend_from_slice(b"Nothing to prune.\n");
+        } else {
+            out.extend_from_slice(
+                format!("Would prune {} unreachable objects.\n", doomed.len()).as_bytes(),
+            );
+        }
+        if backlog.has_work() {
+            out.extend_from_slice(
+                format!(
+                    "Would compact {} segments ({} retired files pending reclaim).\n",
+                    backlog.mergeable, backlog.reclaimable
+                )
+                .as_bytes(),
+            );
+        } else {
+            out.extend_from_slice(b"Nothing to compact.\n");
+        }
+        return Ok(if quiet { Vec::new() } else { out });
+    }
+    if prune {
+        let stats = store
+            .prune_unreachable(&reachable)
+            .map_err(GitError::from)?;
+        debug_assert_eq!(stats.objects_pruned, doomed.len());
+        if stats.did_work() {
+            out.extend_from_slice(
+                format!("Unreachable objects: {} pruned.\n", stats.objects_pruned).as_bytes(),
+            );
+        } else {
+            out.extend_from_slice(b"Nothing to prune.\n");
+        }
+    }
+    let mut copied = 0usize;
+    let mut bytes_copied = 0u64;
+    let mut created = 0usize;
+    let mut retired = 0usize;
+    let mut unlinked = 0usize;
+    let mut bytes_freed = 0u64;
+    loop {
+        let stats = store.compact().map_err(GitError::from)?;
+        let worked = stats.did_work();
+        copied += stats.objects_copied;
+        bytes_copied += stats.bytes_copied;
+        created += stats.segments_created;
+        retired += stats.segments_retired;
+        unlinked += stats.segments_unlinked;
+        bytes_freed += stats.bytes_freed;
+        if !opts.is_set("aggressive") || !worked {
+            break;
+        }
+    }
+    if retired > 0 || unlinked > 0 {
+        out.extend_from_slice(
+            format!(
+                "Compacted {retired} segments into {created} ({copied} objects, {bytes_copied} bytes copied, {bytes_freed} bytes freed).\n"
+            )
+            .as_bytes(),
+        );
+    } else {
+        out.extend_from_slice(b"Nothing to compact.\n");
+    }
+    Ok(if quiet { Vec::new() } else { out })
+}
+
+/// Every object id a collection must keep: the ref closure plus workspace
+/// pins beyond refs.
+///
+/// Ref tips (plus a detached `HEAD`) peel through tags and walk history
+/// exactly like [`fsck`]; failures there propagate, since a broken ref
+/// walk is corruption either verb must report. Pins — index blobs, stash
+/// commits and their captured rows, `FETCH_HEAD` tips, sequencer tips, and
+/// reflog oids — are best effort: an unreadable pin keeps its own oid and
+/// continues, because collection is cleanup, not verification.
+fn gc_reachable(store: &Store, kind: HashKind) -> Result<HashSet<Oid>, GitError> {
+    let mut reachable = HashSet::new();
+    let mut commits = Vec::new();
+    let mut tips = Vec::new();
+    for (_, target) in super::state::list_refs(store)? {
+        match target {
+            RefTarget::Direct(oid) => tips.push(oid),
+            RefTarget::Symbolic(name) => {
+                let resolved = ruk_core::refdata::resolve(&StoreRefs::new(store), &name)
+                    .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+                if let Some(oid) = resolved.oid {
+                    tips.push(oid);
+                }
+            }
+        }
+    }
+    let (workspace, _) = super::state::load_or_default(store)?;
+    if let ruk_core::workspace::HeadRef::Detached(oid) = workspace.head {
+        tips.push(oid);
+    }
+    for tip in tips {
+        let (visited, commit) = peel_tip_chain(store, kind, tip)?;
+        reachable.extend(visited.iter().copied());
+        match commit {
+            Some(commit) => commits.push(commit),
+            None => {
+                if let Some(&terminal) = visited.last()
+                    && super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree
+                {
+                    mark_tree(store, kind, terminal, &mut reachable)?;
+                }
+            }
+        }
+    }
+    for (oid, record) in super::state::walk_history(store, &commits, None)? {
+        let tree = super::tree::commit_tree_oid(&record)?;
+        reachable.insert(oid);
+        mark_tree(store, kind, tree, &mut reachable)?;
+    }
+    let mut pin_tips = Vec::new();
+    for (_, _, entry) in super::state::scan_index(store, kind)? {
+        reachable.insert(entry.oid());
+    }
+    let high_water = super::state::stash_high_water(store)?;
+    for slot in 0..high_water {
+        if let Some(slot_entry) = super::state::stash_read(store, slot)? {
+            if let Ok(oid) = ruk_git::parse_oid_for(&slot_entry.commit_hex, kind) {
+                pin_tips.push(oid);
+            }
+            for (_, _, index_entry) in &slot_entry.rows {
+                reachable.insert(index_entry.oid());
+            }
+        }
+    }
+    if let Some(raw) = store
+        .fact(FactTable::Pins, b"cli/pseudo/FETCH_HEAD")
+        .map_err(GitError::from)?
+    {
+        for line in raw.split(|byte| *byte == b'\n') {
+            let field = line
+                .split(|byte| *byte == b'\t' || *byte == b' ')
+                .next()
+                .unwrap_or_default();
+            if field.is_empty() {
+                continue;
+            }
+            if let Ok(text) = std::str::from_utf8(field)
+                && let Ok(oid) = ruk_git::parse_oid_for(text, kind)
+            {
+                pin_tips.push(oid);
+            }
+        }
+    }
+    for verb in ["merge", "rebase", "cherry-pick", "revert"] {
+        if let Some(state) = super::state::sequencer_read(store, verb)? {
+            for hex in [&state.head_hex, &state.target_hex] {
+                if let Ok(oid) = ruk_git::parse_oid_for(hex, kind) {
+                    pin_tips.push(oid);
+                }
+            }
+        }
+    }
+    pin_tips.extend(all_reflog_oids(store).map_err(GitError::from)?);
+    // One pin at a time, so one unreadable pin cannot abort the rest.
+    for tip in pin_tips {
+        reachable.insert(tip);
+        let _ = gc_walk_pin_tip(store, kind, &mut reachable, tip);
+    }
+    Ok(reachable)
+}
+
+/// Walks one lenient pin tip into `reachable`: tags peel, commits walk
+/// history, trees walk their subtree. Any failure belongs to the caller
+/// to ignore — collection is cleanup, not verification.
+fn gc_walk_pin_tip(
+    store: &Store,
+    kind: HashKind,
+    reachable: &mut HashSet<Oid>,
+    tip: Oid,
+) -> Result<(), GitError> {
+    let (visited, commit) = peel_tip_chain(store, kind, tip)?;
+    reachable.extend(visited.iter().copied());
+    let Some(commit) = commit else {
+        if let Some(&terminal) = visited.last()
+            && super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree
+        {
+            mark_tree(store, kind, terminal, reachable)?;
+        }
+        return Ok(());
+    };
+    for (oid, record) in super::state::walk_history(store, &[commit], None)? {
+        reachable.insert(oid);
+        mark_tree(
+            store,
+            kind,
+            super::tree::commit_tree_oid(&record)?,
+            reachable,
+        )?;
+    }
+    Ok(())
 }
 
 /// Verifies reachable objects: every commit's tree must exist with every
