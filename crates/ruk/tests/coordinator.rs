@@ -211,6 +211,11 @@ fn cross_branch_commits_stay_isolated() {
         Duration::from_secs(15),
     );
     let stats = read_stats(&repo);
+    // All four committed through the lane: a direct fallback would land
+    // the commit without touching the server counters, so this excludes
+    // the fallback before the publication counts below pin no-sharing.
+    let committed = stat_field(&repo, "committed");
+    assert_eq!(committed, N as u64, "all four went through the lane");
     assert_eq!(stats.0, N as u64, "four publications: {stats:?}");
     assert_eq!(stats.1, N as u64, "one metadata commit each: {stats:?}");
     let _ = std::fs::remove_dir_all(&repo);
