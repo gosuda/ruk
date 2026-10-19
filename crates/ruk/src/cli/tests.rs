@@ -4382,10 +4382,10 @@ fn bisect_first_parent_ignores_side_branch() {
 fn bisect_run_finds_first_bad() {
     let (root, env) = seeded_repo("bisect-run", "f.txt", b"GOOD\n");
     let mut ctx = repo_ctx(&root, env);
-    lane_commit(&mut ctx, &root, "f.txt", b"GOOD\n", "still good");
+    lane_commit(&mut ctx, &root, "f.txt", b"GOOD still\n", "still good");
     lane_commit(&mut ctx, &root, "f.txt", b"BAD\n", "turns bad");
     let planted = bisect_head(&mut ctx);
-    lane_commit(&mut ctx, &root, "f.txt", b"BAD\n", "still bad");
+    lane_commit(&mut ctx, &root, "f.txt", b"BAD still\n", "still bad");
     let tip = bisect_head(&mut ctx);
     let first =
         String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~3"]).expect("first"))
