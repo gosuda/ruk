@@ -5896,6 +5896,457 @@ fn fastio_request_pull_template() {
     assert!(err.to_string().contains("request-pull -p"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+#[test]
+fn wave_j_diff_word_plain_marks_words() {
+    let (root, env) = seeded_repo("wavej-diff-word", "f.txt", b"alpha beta gamma\nline2\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"alpha beta DELTA\nline2\n").expect("modify");
+    let out = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--word-diff=plain"]).expect("word"),
+    )
+    .expect("utf8");
+    assert!(
+        out.contains("alpha beta [-gamma-]{+DELTA+}"),
+        "got {out:?}"
+    );
+    assert!(out.contains("line2"), "got {out:?}");
+    let plain = String::from_utf8(run(verbs_history::diff, &mut ctx, &[]).expect("plain"))
+        .expect("utf8");
+    assert!(!plain.contains("[-"), "got {plain:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_word_porcelain_runs() {
+    let (root, env) = seeded_repo("wavej-diff-porc", "f.txt", b"alpha beta gamma\nline2\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"alpha beta DELTA\nline2\n").expect("modify");
+    let out = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--word-diff=porcelain"]).expect("porcelain"),
+    )
+    .expect("utf8");
+    assert!(out.contains(" alpha beta \n"), "got {out:?}");
+    assert!(out.contains("-gamma\n+DELTA\n~\n"), "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_word_none_and_regex() {
+    let (root, env) = seeded_repo("wavej-diff-wordnone", "f.txt", b"alpha beta gamma\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"alpha beta DELTA\n").expect("modify");
+    let plain = run(verbs_history::diff, &mut ctx, &[]).expect("plain");
+    let none = run(verbs_history::diff, &mut ctx, &["--word-diff=none"]).expect("none");
+    assert_eq!(none, plain);
+    let custom = String::from_utf8(
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--word-diff", "--word-diff-regex=\\w+"],
+        )
+        .expect("regex"),
+    )
+    .expect("utf8");
+    assert!(custom.contains("[-gamma-]{+DELTA+}"), "got {custom:?}");
+    let err = run(verbs_history::diff, &mut ctx, &["--word-diff", "--word-diff-regex=([)"])
+        .expect_err("bad regex");
+    assert!(err.to_string().contains("bad --word-diff-regex"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_color_stays_uncolored() {
+    let (root, env) = seeded_repo("wavej-diff-color", "f.txt", b"alpha beta gamma\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"alpha beta DELTA\n").expect("modify");
+    let plain = run(verbs_history::diff, &mut ctx, &[]).expect("plain");
+    for flag in ["--color", "--color=auto", "--no-color"] {
+        let out = run(verbs_history::diff, &mut ctx, &[flag]).expect(flag);
+        assert_eq!(out, plain, "flag {flag}");
+        assert!(
+            !String::from_utf8_lossy(&out).contains('\x1b'),
+            "flag {flag}"
+        );
+    }
+    let words = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--color-words"]).expect("color-words"),
+    )
+    .expect("utf8");
+    assert!(words.contains("[-gamma-]{+DELTA+}"), "got {words:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_named_gaps_fail_loudly() {
+    let (root, env) = seeded_repo("wavej-diff-gaps", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    for flag in [
+        "--minimal",
+        "--patience",
+        "--histogram",
+        "-W",
+        "--function-context",
+        "--binary",
+        "--exit-code",
+        "--color-moved",
+    ] {
+        let err = run(verbs_history::diff, &mut ctx, &[flag]).expect_err(flag);
+        assert!(err.to_string().contains("not supported"), "flag {flag}: got {err:?}");
+    }
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_find_copies_pairs_additions() {
+    let (root, env) = seeded_repo(
+        "wavej-diff-copies",
+        "f.txt",
+        b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
+    );
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(
+        root.join("f.txt"),
+        b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\nseventh\n",
+    )
+    .expect("modify");
+    std::fs::write(
+        root.join("cp.txt"),
+        b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
+    )
+    .expect("copy");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add f");
+    run(verbs_stage::add, &mut ctx, &["cp.txt"]).expect("add cp");
+    let plain = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--cached", "--name-status"]).expect("plain"),
+    )
+    .expect("utf8");
+    assert!(plain.contains("A\tcp.txt"), "got {plain:?}");
+    let out = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--cached", "-C", "--name-status"])
+            .expect("copies"),
+    )
+    .expect("utf8");
+    assert!(out.contains("C100\tf.txt\tcp.txt"), "got {out:?}");
+    let patch = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--cached", "-C", "--", "cp.txt"])
+            .expect("patch"),
+    )
+    .expect("utf8");
+    assert!(patch.contains("copy from f.txt"), "got {patch:?}");
+    assert!(patch.contains("copy to cp.txt"), "got {patch:?}");
+    let off = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--cached", "-C0", "--name-status"])
+            .expect("c0"),
+    )
+    .expect("utf8");
+    assert!(off.contains("A\tcp.txt"), "got {off:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_filter_selects_classes() {
+    let (root, env) = seeded_repo("wavej-diff-filter", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    std::fs::write(root.join("n.txt"), b"new\n").expect("add file");
+    let added = String::from_utf8(
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--name-status", "--diff-filter=A"],
+        )
+        .expect("filter A"),
+    )
+    .expect("utf8");
+    assert!(added.contains("A\tn.txt"), "got {added:?}");
+    assert!(!added.contains("f.txt"), "got {added:?}");
+    let modified = String::from_utf8(
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--name-status", "--diff-filter=M"],
+        )
+        .expect("filter M"),
+    )
+    .expect("utf8");
+    assert!(modified.contains("M\tf.txt"), "got {modified:?}");
+    assert!(!modified.contains("n.txt"), "got {modified:?}");
+    let excluded = String::from_utf8(
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--name-status", "--diff-filter=a"],
+        )
+        .expect("filter a"),
+    )
+    .expect("utf8");
+    assert!(excluded.contains("M\tf.txt"), "got {excluded:?}");
+    assert!(!excluded.contains("n.txt"), "got {excluded:?}");
+    let err = run(verbs_history::diff, &mut ctx, &["--diff-filter=Z"]).expect_err("bad filter");
+    assert!(err.to_string().contains("unknown letter"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_text_diffs_binaries() {
+    let (root, env) = seeded_repo("wavej-diff-text", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("b.dat"), b"a\x00b\n").expect("binary");
+    let out = String::from_utf8(run(verbs_history::diff, &mut ctx, &["--", "b.dat"]).expect("diff"))
+        .expect("utf8");
+    assert!(out.contains("Binary files"), "got {out:?}");
+    let text = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--text", "--", "b.dat"]).expect("text"),
+    )
+    .expect("utf8");
+    assert!(text.contains("@@"), "got {text:?}");
+    assert!(!text.contains("Binary files"), "got {text:?}");
+    let no_text = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--no-text", "--", "b.dat"]).expect("no-text"),
+    )
+    .expect("utf8");
+    assert!(no_text.contains("Binary files"), "got {no_text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_ws_folds_silence_whitespace() {
+    let (root, env) = seeded_repo("wavej-diff-ws", "f.txt", b"one two\nthree\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"one  two\nthree\n").expect("spaces");
+    let plain = run(verbs_history::diff, &mut ctx, &[]).expect("plain");
+    assert!(!plain.is_empty(), "whitespace change must show by default");
+    for flag in ["-b", "--ignore-space-change", "-w", "--ignore-all-space"] {
+        let out = run(verbs_history::diff, &mut ctx, &[flag]).expect(flag);
+        assert!(out.is_empty(), "flag {flag}: got {out:?}");
+    }
+    std::fs::write(root.join("f.txt"), b"one two \nthree\n").expect("eol space");
+    let eol = run(verbs_history::diff, &mut ctx, &["--ignore-space-at-eol"]).expect("eol");
+    assert!(eol.is_empty(), "got {eol:?}");
+    std::fs::write(root.join("f.txt"), b"one two\n\nthree\n").expect("blank");
+    let blank = run(verbs_history::diff, &mut ctx, &["--ignore-blank-lines"]).expect("blank");
+    assert!(blank.is_empty(), "got {blank:?}");
+    std::fs::write(root.join("f.txt"), b"one  TWO\nthree\n").expect("real");
+    let kept = run(verbs_history::diff, &mut ctx, &["-b"]).expect("kept");
+    assert!(!kept.is_empty(), "real change must survive -b");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_inter_hunk_fuses_close_hunks() {
+    let mut body = Vec::new();
+    for i in 1..=30 {
+        body.extend_from_slice(format!("L{i:02}\n").as_bytes());
+    }
+    let (root, env) = seeded_repo("wavej-diff-inter", "h.txt", &body);
+    let mut ctx = repo_ctx(&root, env);
+    let mut modified = Vec::new();
+    for i in 1..=30 {
+        match i {
+            6 => modified.extend_from_slice(b"CHANGED06\n"),
+            13 => modified.extend_from_slice(b"CHANGED13\n"),
+            26 => modified.extend_from_slice(b"CHANGED26\n"),
+            _ => modified.extend_from_slice(format!("L{i:02}\n").as_bytes()),
+        }
+    }
+    std::fs::write(root.join("h.txt"), &modified).expect("modify");
+    let count = |out: &[u8]| {
+        String::from_utf8_lossy(out)
+            .lines()
+            .filter(|line| line.starts_with("@@"))
+            .count()
+    };
+    let split = run(verbs_history::diff, &mut ctx, &["-U1", "--", "h.txt"]).expect("split");
+    assert_eq!(count(&split), 3, "got {:?}", String::from_utf8_lossy(&split));
+    let fused = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["-U1", "--inter-hunk-context=20", "--", "h.txt"],
+    )
+    .expect("fused");
+    assert_eq!(count(&fused), 1, "got {:?}", String::from_utf8_lossy(&fused));
+    let err = run(verbs_history::diff, &mut ctx, &["--inter-hunk-context=bogus"])
+        .expect_err("bad inter");
+    assert!(err.to_string().contains("bad --inter-hunk-context"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_prefixes_rewrite_every_line() {
+    let (root, env) = seeded_repo("wavej-diff-prefix", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    let out = String::from_utf8(
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--src-prefix=SRC/", "--dst-prefix=DST/"],
+        )
+        .expect("prefix"),
+    )
+    .expect("utf8");
+    assert!(out.contains("diff --git SRC/f.txt DST/f.txt"), "got {out:?}");
+    assert!(out.contains("--- SRC/f.txt"), "got {out:?}");
+    assert!(out.contains("+++ DST/f.txt"), "got {out:?}");
+    let lined = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--line-prefix=>>"]).expect("line-prefix"),
+    )
+    .expect("utf8");
+    assert!(!lined.is_empty());
+    assert!(
+        lined.lines().all(|line| line.starts_with(">>")),
+        "got {lined:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_machine_sections() {
+    let (root, env) = seeded_repo("wavej-diff-machine", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    let raw = String::from_utf8(run(verbs_history::diff, &mut ctx, &["--raw"]).expect("raw"))
+        .expect("utf8");
+    assert!(raw.starts_with(":100644 100644 "), "got {raw:?}");
+    assert!(raw.contains("\tM\tf.txt\n"), "got {raw:?}");
+    let numstat = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--numstat"]).expect("numstat"),
+    )
+    .expect("utf8");
+    assert_eq!(numstat, "1\t1\tf.txt\n");
+    let short = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--shortstat"]).expect("shortstat"),
+    )
+    .expect("utf8");
+    assert!(
+        short.contains("1 file changed, 1 insertion(+), 1 deletion(-)"),
+        "got {short:?}"
+    );
+    std::fs::write(root.join("n2.txt"), b"new\n").expect("new file");
+    let summary = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--summary"]).expect("summary"),
+    )
+    .expect("utf8");
+    assert!(summary.contains(" create mode 100644 n2.txt"), "got {summary:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_output_writes_file() {
+    let (root, env) = seeded_repo("wavej-diff-output", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    let stdout = run(
+        verbs_history::diff,
+        &mut ctx,
+        &["--stat", "--output=rel.diff"],
+    )
+    .expect("output");
+    assert!(stdout.is_empty(), "got {stdout:?}");
+    let file = std::fs::read(root.join("rel.diff")).expect("read back");
+    assert!(
+        String::from_utf8_lossy(&file).contains("file changed"),
+        "got {file:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_relative_limits_to_prefix() {
+    let (root, env) = seeded_repo("wavej-diff-relative", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    std::fs::create_dir(root.join("sub")).expect("mkdir");
+    std::fs::write(root.join("sub/s.txt"), b"s\n").expect("sub file");
+    let out = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--relative=sub"]).expect("relative"),
+    )
+    .expect("utf8");
+    assert!(out.contains("s.txt"), "got {out:?}");
+    assert!(!out.contains("sub/s.txt"), "got {out:?}");
+    assert!(!out.contains("f.txt"), "got {out:?}");
+    let empty = run(verbs_history::diff, &mut ctx, &["--relative=nope"]).expect("nope");
+    assert!(empty.is_empty(), "got {empty:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_no_index_compares_files() {
+    let (root, env) = seeded_repo("wavej-diff-noindex", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("a.txt"), b"a1\na2\n").expect("a");
+    std::fs::write(root.join("b.txt"), b"a1\nb2\n").expect("b");
+    let out = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt", "b.txt"]).expect("no-index"),
+    )
+    .expect("utf8");
+    assert!(out.contains("diff --git a/a.txt b/b.txt"), "got {out:?}");
+    assert!(out.contains("-a2\n+b2"), "got {out:?}");
+    let same = run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt", "a.txt"])
+        .expect("identical");
+    assert!(same.is_empty(), "got {same:?}");
+    let err = run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt", "missing.txt"])
+        .expect_err("missing");
+    assert!(err.to_string().contains("missing.txt"), "got {err:?}");
+    let err = run(verbs_history::diff, &mut ctx, &["--no-index", "a.txt"]).expect_err("arity");
+    assert!(err.to_string().contains("usage"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_quiet_signals_through_status() {
+    let (root, env) = seeded_repo("wavej-diff-quiet", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    let err = run(verbs_history::diff, &mut ctx, &["--quiet"]).expect_err("dirty");
+    assert!(err.to_string().contains("differences found"), "got {err:?}");
+    lane_commit(&mut ctx, &root, "f.txt", b"two\n", "second");
+    let clean = run(verbs_history::diff, &mut ctx, &["--quiet"]).expect("clean");
+    assert!(clean.is_empty(), "got {clean:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_show_machine_sections_and_output() {
+    let (root, env) = seeded_repo("wavej-show-sections", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    lane_commit(&mut ctx, &root, "f.txt", b"alpha beta gamma\n", "second");
+    let raw = String::from_utf8(run(verbs_history::show, &mut ctx, &["HEAD", "--raw"]).expect("raw"))
+        .expect("utf8");
+    assert!(raw.contains("\tM\tf.txt\n"), "got {raw:?}");
+    assert!(raw.contains("second"), "got {raw:?}");
+    let stdout = run(verbs_history::show, &mut ctx, &["HEAD", "--output=sh.out"])
+        .expect("output");
+    assert!(stdout.is_empty(), "got {stdout:?}");
+    let file = std::fs::read(root.join("sh.out")).expect("read back");
+    assert!(
+        String::from_utf8_lossy(&file).contains("diff --git"),
+        "got {file:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_diff_no_patch_suppresses_patch() {
+    let (root, env) = seeded_repo("wavej-diff-nopatch", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    let stat = run(verbs_history::diff, &mut ctx, &["--stat"]).expect("stat");
+    let suppressed = run(verbs_history::diff, &mut ctx, &["--stat", "--no-patch"])
+        .expect("no-patch");
+    assert_eq!(suppressed, stat);
+    let empty = run(verbs_history::diff, &mut ctx, &["--no-patch"]).expect("empty");
+    assert!(empty.is_empty(), "got {empty:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+/// Reads the message of the current `HEAD` commit.
+fn wave_j_head_message(ctx: &mut Ctx) -> String {
+    let store = ctx.store().expect("store");
+    let tip = super::state::head_oid(store).expect("head");
+    let record = super::state::commit_record(store, tip).expect("record");
+    String::from_utf8_lossy(record.message()).into_owned()
+}
+
 // Wave J (LogFlags): `log` flag parity.
 // ---------------------------------------------------------------------------
 

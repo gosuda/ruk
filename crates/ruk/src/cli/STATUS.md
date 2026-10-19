@@ -65,7 +65,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | count-objects | implemented | `<n> objects, <bytes>` from the store census, no payload I/O |
 | credential | implemented | `fill`/`approve`/`reject` over stdin `key=value` descriptions through the configured helpers (`get`/`store`/`erase`); needs no repository |
 | describe | implemented | nearest tag by parent depth; `--tags`/`--exact-match`/`--long`/`--abbrev`/`--always` |
-| diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; `-M`/`--find-renames` pairs renames by similarity, merge lane tracks rename-plus-edit |
+| diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`/`--shortstat`/`--numstat`/`--summary`/`--raw`, `--name-only`, paths; `-M`/`--find-renames` pairs renames by similarity, `-C`/`--find-copies` pairs copies, merge lane tracks rename-plus-edit; `--word-diff[=plain\|porcelain\|none]`/`--color-words` (+`--word-diff-regex`), `--color`/`--no-color` (never colorized), `-b`/`-w`/`--ignore-blank-lines`/`--ignore-space-at-eol`, `--text`, `-U`/`--inter-hunk-context`, `--src/dst/line-prefix`, `--diff-filter`, `--relative`, `--output`, `--no-index` (in-repo), `--quiet` (exit 1 on diff), `--no-patch`; `--minimal`/`--patience`/`--histogram`, `-W`, `--binary`, `--exit-code`, `--color-moved` are `Unsupported` |
 | fast-export | implemented | `commit`/`blob`/`tag`/`reset` stream with `:mark` ids in topo order; ref args (default `HEAD` branch), `--all`, `--import-marks`/`--export-marks`; un-emitted tips ride as `reset` lines; trailing `done` |
 | fast-import | implemented | `blob`/`commit` (`M`/`D`/`R`/`C`/`deleteall`, `from`/`merge`, explicit idents or env fallback)/lightweight and annotated `tag`/`reset`; `data <n>` and `data <<eof`; `feature`/`option`/`checkpoint`/`progress` ignored; `ls`/`cat-blob`/`get-mark`/`alias` and `N` file ops are `Unsupported`; `--import-marks`/`--export-marks`; refs always overwritten, worktree untouched |
 | fetch | implemented | refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; local, `ssh://`, `git://`, smart-http v2→v0, dumb-http fetch fallback; `--lfs` pulls payloads for fetched tips under `LfsMode::Full` (mirror parity) |
@@ -112,7 +112,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | rev-parse | implemented | `HEAD`/refs/oids/`~n`/`^n` plus `--git-dir`, `--show-toplevel`, `--is-inside-work-tree`, `--abbrev-ref`, `--short` |
 | revert | implemented | inverse three-way replay per commit; `-n`, `-m`; `--continue`/`--skip`/`--abort` over `REVERT_HEAD` + todo state |
 | rm | implemented | `--cached`, `-r`; unknown paths fail |
-| show | implemented | `--oneline`, `-s`, `--stat`, `--name-only`, parent diff |
+| show | implemented | `--oneline`, `-s`, `--stat`/`--shortstat`/`--numstat`/`--summary`/`--raw`, `--name-only`, parent diff, `--output`; same word-diff/whitespace/prefix/filter/relative renderer knobs as `diff` (same `Unsupported` set) |
 | shortlog | implemented | `-s`/`-n`/`-e`, ranges, `--all` |
 | show-ref | implemented | `--head`, `--verify`, `--tags`, `--heads`, patterns |
 | sparse-checkout | implemented | `init`/`set` (patterns, `--stdin`, `--no-reapply`)/`list`/`disable`/`reapply` over `.ruk/info/sparse-checkout` + `core.sparseCheckout`; out-of-cone stage-zero rows carry skip-worktree, worktree holds only matches; dirty rewrites refuse; `--cone` is `Unsupported`; branch-switch checkouts and `status` ignore the sparse set |
