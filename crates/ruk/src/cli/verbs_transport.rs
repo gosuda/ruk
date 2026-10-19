@@ -176,7 +176,8 @@ enum FetchSource {
 /// refspecs with its own prune flag. Objects publish first and ref updates
 /// second: the fast-forward check walks the new tip's ancestry, which needs
 /// the just-fetched objects in the store (checking against the old object
-/// set rejects every advance through newly-fetched commits).
+/// set aborts the whole fetch with `NotFound` on every advance through
+/// newly-fetched commits).
 ///
 /// Oracle: `git/builtin/fetch.c`, `git/builtin/remote.c` (`update`).
 pub(crate) fn run_fetch(
@@ -297,7 +298,15 @@ pub(crate) fn run_fetch(
             .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
         if !plan.force_all && !fetched.force {
             if let Some(old) = current_as_direct(&current) {
-                if !is_ancestor(dest, old, oid)? {
+                // An unresolvable ancestry walk (shallow boundary, missing
+                // parent) refuses this ref, never the whole fetch: the
+                // objects already published stay either way.
+                let fast_forward = match is_ancestor(dest, old, oid) {
+                    Ok(reaches) => reaches,
+                    Err(GitError::NotFound { .. }) => false,
+                    Err(err) => return Err(err),
+                };
+                if !fast_forward {
                     lines.push(format!(
                         "! rejected {} (non-fast-forward)\n",
                         name.to_utf8().unwrap_or_default()
