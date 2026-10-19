@@ -10,7 +10,7 @@
 //! | `commit-tree` | canonical commit payload + publish | implemented |
 //! | `write-tree` | index tree build | implemented |
 //! | `verify-pack` | pack ingest in verify mode, staged output dropped | implemented |
-//! | `count-objects` | no object census in the store API | unsupported |
+//! | `count-objects` | `Store::iter_objects` census, no payload I/O | implemented (`<n> objects, <bytes>`) |
 //! | `ls-tree` | tree parse/flatten | implemented (`-r`, `--name-only`) |
 //! | `check-ref-format` | `RefName` validation | implemented |
 //! | `index-pack` | declared absent for this slice | unsupported |
@@ -547,14 +547,28 @@ pub(crate) fn verify_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
     Ok(out)
 }
 
-/// Counts objects. Unsupported: the store API exposes no object census.
+/// Counts committed objects and their decoded bytes: one pass over the
+/// [`Store::iter_objects`](ruk_core::store::Store::iter_objects) census,
+/// with no payload I/O. The store keeps no loose/pack split, so the
+/// rendering is ruk-native (`<n> objects, <bytes>`) instead of the
+/// oracle's loose/in-pack rows.
 ///
 /// Oracle: `git/builtin/count-objects.c`.
-pub(crate) fn count_objects(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "count-objects: the store exposes no object census".to_owned(),
-    })
+pub(crate) fn count_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let opts = collect(args, &[])?;
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: count-objects".to_owned(),
+        });
+    }
+    let store = ctx.store()?;
+    let mut count: u64 = 0;
+    let mut bytes: u64 = 0;
+    for (_, _, len) in store.iter_objects().map_err(GitError::from)? {
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(len);
+    }
+    Ok(line(format!("{count} objects, {bytes} bytes").into_bytes()))
 }
 
 /// Lists tree contents, flat or recursive.
