@@ -631,6 +631,312 @@ fn extract_short_len(args: &[String]) -> Result<(Vec<String>, Option<usize>), Gi
     Ok((kept, len))
 }
 
+/// Word-diff rendering selected by `--word-diff[=<mode>]` /
+/// `--color-words[=<regex>]`. `--color-words` renders the plain form: the
+/// output is never colorized, so color-only highlighting would carry no
+/// signal and the marked-up words are the honest degradation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordDiffMode {
+    /// No word diff: the usual line hunks.
+    Off,
+    /// Words wrapped inline (`[-gone-]{+new+}`), context lines bare.
+    Plain,
+    /// Script-consumable per-run lines (` `/`-`/`+`), newlines as `~`.
+    Porcelain,
+}
+
+/// Strips `-C[<n>[%]]` / `--find-copies[=<n>[%]]` before collecting: the
+/// threshold is optional, which [`collect`] cannot spell. Bare `-C` /
+/// `--find-copies` mean 50%, the rename default. A zero threshold disables
+/// detection, the way `-M0` keeps add-plus-delete output.
+fn extract_copies_arg(args: &[String]) -> Result<(Vec<String>, Option<u8>), GitError> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut threshold = None;
+    for arg in args {
+        if arg == "-C" || arg == "--find-copies" {
+            threshold = Some(50);
+        } else if let Some(spec) = arg.strip_prefix("--find-copies=") {
+            threshold = parse_copy_threshold(spec)?;
+        } else if let Some(spec) = arg.strip_prefix("-C") {
+            threshold = parse_copy_threshold(spec)?;
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    Ok((kept, threshold))
+}
+
+/// Parses one `-C<spec>` / `--find-copies=<spec>` threshold: an optional
+/// trailing `%`, defaulting to 50% when empty.
+fn parse_copy_threshold(spec: &str) -> Result<Option<u8>, GitError> {
+    let digits = spec.strip_suffix('%').unwrap_or(spec);
+    if digits.is_empty() {
+        return Ok(Some(50));
+    }
+    let value: u8 = digits.parse().map_err(|_| GitError::Invalid {
+        detail: format!("bad copy threshold {spec:?}: want 0-100"),
+    })?;
+    if value > 100 {
+        return Err(GitError::Invalid {
+            detail: format!("bad copy threshold {spec:?}: want 0-100"),
+        });
+    }
+    Ok(if value == 0 { None } else { Some(value) })
+}
+
+/// Strips `--word-diff[=<mode>]` / `--color-words[=<regex>]` before
+/// collecting: both take optional values, which [`collect`] cannot spell.
+/// Bare `--word-diff` means `plain`; `color` maps to `plain` (see
+/// [`WordDiffMode`]); `none` disables. The last occurrence wins, as in git.
+/// Returns the kept args, the mode, and the `--color-words=<regex>` or
+/// `--word-diff-regex` override (the dedicated spec handles the latter's
+/// valued form; a bare `--word-diff-regex` without `=` is rejected).
+fn extract_word_arg(
+    args: &[String],
+) -> Result<(Vec<String>, WordDiffMode, Option<String>), GitError> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut mode = WordDiffMode::Off;
+    let mut regex = None;
+    for arg in args {
+        if arg == "--word-diff" || arg == "--color-words" {
+            mode = WordDiffMode::Plain;
+        } else if let Some(value) = arg.strip_prefix("--word-diff=") {
+            mode = match value {
+                "plain" => WordDiffMode::Plain,
+                "porcelain" => WordDiffMode::Porcelain,
+                "none" => WordDiffMode::Off,
+                "color" => WordDiffMode::Plain,
+                _ => {
+                    return Err(GitError::Invalid {
+                        detail: format!(
+                            "bad --word-diff={value:?}: want plain|porcelain|none|color"
+                        ),
+                    });
+                }
+            };
+        } else if let Some(value) = arg.strip_prefix("--color-words=") {
+            mode = WordDiffMode::Plain;
+            regex = Some(value.to_owned());
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    Ok((kept, mode, regex))
+}
+
+/// Strips `--relative[=<path>]` before collecting: bare `--relative` takes
+/// the repo-relative working directory, which [`collect`] cannot spell.
+/// Returns the kept args and the request: `Some(None)` is bare,
+/// `Some(Some(path))` carries the prefix.
+fn extract_relative_arg(args: &[String]) -> Result<(Vec<String>, Option<Option<String>>), GitError> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut relative = None;
+    for arg in args {
+        if arg == "--relative" {
+            relative = Some(None);
+        } else if let Some(path) = arg.strip_prefix("--relative=") {
+            relative = Some(Some(path.to_owned()));
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    Ok((kept, relative))
+}
+
+/// Strips `--color` / `--color=<when>` before collecting: bare `--color`
+/// takes an optional value, which [`collect`] cannot spell. Every spelling
+/// is accepted and ignored — output is never colorized — but an unknown
+/// `<when>` is still a usage error, as in git.
+fn strip_color_arg(args: &[String]) -> Result<(Vec<String>, ()), GitError> {
+    let mut kept = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--color" {
+            continue;
+        }
+        if let Some(when) = arg.strip_prefix("--color=") {
+            match when {
+                "always" | "auto" | "never" | "true" | "false" => {}
+                _ => {
+                    return Err(GitError::Invalid {
+                        detail: format!("bad --color={when:?}: want always|auto|never"),
+                    });
+                }
+            }
+            continue;
+        }
+        kept.push(arg.clone());
+    }
+    Ok((kept, ()))
+}
+
+/// Strips `--color-moved[=<mode>]` before collecting. Any mode is accepted
+/// only to refuse it loudly in the shared renderer: moved-block coloring
+/// needs the color plumbing this renderer never emits.
+fn extract_color_moved_arg(args: &[String]) -> (Vec<String>, bool) {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut present = false;
+    for arg in args {
+        if arg == "--color-moved" || arg.starts_with("--color-moved=") {
+            present = true;
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    (kept, present)
+}
+
+/// Optional-value diff requests that [`collect`] cannot spell, extracted
+/// before collecting and injected back into the [`Collected`] map so the
+/// shared renderer reads every knob from one place.
+struct DiffExtras {
+    /// `-C[<n>]` / `--find-copies[=<n>]` threshold, when requested.
+    copies: Option<u8>,
+    /// `--word-diff[=<mode>]` / `--color-words` rendering.
+    word_mode: WordDiffMode,
+    /// `--color-words=<regex>` override for the word tokenizer.
+    word_regex: Option<String>,
+    /// `--relative[=<path>]`: `Some(None)` is bare, `Some(Some(path))`
+    /// carries the prefix.
+    relative: Option<Option<String>>,
+    /// `--color-moved[=<mode>]` was given (named gap in the renderer).
+    color_moved: bool,
+}
+
+/// Injects [`DiffExtras`] into the collected flags under `diff-`-prefixed
+/// keys (no declared spec uses that prefix). The shared renderer reads
+/// them back with [`Collected::single`] / [`is_set`], so `log` — which
+/// never injects — keeps its exact behavior.
+fn inject_diff_extras(opts: &mut super::Collected, extras: DiffExtras) {
+    if let Some(threshold) = extras.copies {
+        opts.present.insert(
+            "diff-copies".to_owned(),
+            vec![Some(threshold.to_string())],
+        );
+    }
+    match extras.word_mode {
+        WordDiffMode::Off => {}
+        WordDiffMode::Plain => {
+            opts.present
+                .insert("diff-word".to_owned(), vec![Some("plain".to_owned())]);
+        }
+        WordDiffMode::Porcelain => {
+            opts.present.insert(
+                "diff-word".to_owned(),
+                vec![Some("porcelain".to_owned())],
+            );
+        }
+    }
+    // `--word-diff-regex=<regex>` arrives via its declared spec; a
+    // `--color-words=<regex>` override wins over it, last-writer order
+    // matching the argv order git would honor.
+    if let Some(regex) = extras.word_regex {
+        opts.present
+            .insert("word-diff-regex".to_owned(), vec![Some(regex)]);
+    }
+    if let Some(relative) = extras.relative {
+        opts.present.insert(
+            "diff-relative".to_owned(),
+            vec![Some(relative.unwrap_or_default())],
+        );
+    }
+    if extras.color_moved {
+        opts.present
+            .insert("diff-color-moved".to_owned(), vec![None]);
+    }
+}
+
+/// Writes diff/show bytes to `--output=<file>` (resolved under the process
+/// working directory, as in git) and returns no stdout; without the flag
+/// the bytes pass through untouched.
+fn write_output_file(
+    ctx: &Ctx,
+    opts: &super::Collected,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, GitError> {
+    let Some(path) = opts.single("output")? else {
+        return Ok(bytes);
+    };
+    let full = ctx.env.cwd.join(&path);
+    std::fs::write(&full, &bytes).map_err(|err| GitError::Io {
+        detail: format!("writing --output {}: {err}", full.display()),
+    })?;
+    Ok(Vec::new())
+}
+
+/// Compares two filesystem paths with no revision or index involved.
+///
+/// Oracle: `git/builtin/diff.c` (`diff --no-index`). Operands resolve
+/// under the process working directory; the display strips a leading `/`
+/// the way the oracle spells absolute operands (`a/tmp/x`). Blob hashes
+/// use the open repository's format, else SHA-1. Directories fail
+/// `Unsupported` (recursive compare is a pack-only shape beside this
+/// renderer); `--relative` is inert here, as in the oracle.
+fn diff_no_index(
+    ctx: &Ctx,
+    opts: &super::Collected,
+    operands: &[String],
+) -> Result<Vec<u8>, GitError> {
+    let [old_text, new_text] = operands else {
+        return Err(GitError::Usage {
+            detail: "usage: diff --no-index <path> <path>".to_owned(),
+        });
+    };
+    // The oracle ignores `--relative` outside a repository: drop the
+    // injection so repo-scoped stripping cannot empty a valid compare.
+    let mut opts = opts.clone();
+    opts.present.remove("diff-relative");
+    let kind = ctx.kind().unwrap_or(HashKind::DEFAULT);
+    let mut sides = Vec::new();
+    for text in [old_text, new_text] {
+        let full = ctx.env.cwd.join(text);
+        let meta = std::fs::symlink_metadata(&full).map_err(|err| GitError::Io {
+            detail: format!("reading --no-index {text:?}: {err}"),
+        })?;
+        if meta.is_dir() {
+            return Err(GitError::Unsupported {
+                command: "diff --no-index on directories is not supported".to_owned(),
+            });
+        }
+        let bytes = std::fs::read(&full).map_err(|err| GitError::Io {
+            detail: format!("reading --no-index {text:?}: {err}"),
+        })?;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+        #[cfg(unix)]
+        let mode = if meta.permissions().mode() & 0o111 == 0 {
+            TreeMode::Regular
+        } else {
+            TreeMode::Executable
+        };
+        #[cfg(not(unix))]
+        let mode = TreeMode::Regular;
+        let oid = kind
+            .hash_git_object("blob", &bytes)
+            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        sides.push((mode, oid, bytes));
+    }
+    let [(old_mode, old_oid, old_bytes), (new_mode, new_oid, new_bytes)] =
+        sides.try_into().map_err(|_: Vec<_>| GitError::Invalid {
+            detail: "usage: diff --no-index <path> <path>".to_owned(),
+        })?;
+    if old_oid == new_oid && old_mode == new_mode {
+        // Identical inputs: the oracle prints nothing (not even headers).
+        return write_output_file(ctx, &opts, Vec::new());
+    }
+    // Display follows the operands as given, minus a leading `/`.
+    let display = |text: &str| text.strip_prefix('/').unwrap_or(text).as_bytes().to_vec();
+    let pair = TreePair {
+        path: display(new_text),
+        old_path: None,
+        old: Some((old_mode, old_oid)),
+        new: Some((new_mode, new_oid)),
+        new_bytes: Some(new_bytes),
+        old_bytes: Some(old_bytes),
+        similarity: None,
+        is_copy: false,
+    };
+    write_output_file(ctx, &opts, render_pairs(ctx, std::slice::from_ref(&pair), &opts)?)
+}
 /// Resolves one revision with the spellings [`resolve_rev`] lacks: `@` for
 /// `HEAD` (plus `@~`/`@^` suffixes) and `<rev>:<path>` / `:<path>` blob
 /// paths. Reflog `@{...}` fails closed with a clear message.
