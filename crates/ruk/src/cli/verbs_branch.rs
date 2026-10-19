@@ -587,11 +587,8 @@ fn run_editor(ctx: &Ctx, initial: &[u8], suffix: &str) -> Result<Vec<u8>, GitErr
         });
     }
     let nonce = EDIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let path = std::env::temp_dir().join(format!(
-        "ruk-edit-{}-{}{suffix}",
-        std::process::id(),
-        nonce
-    ));
+    let path =
+        std::env::temp_dir().join(format!("ruk-edit-{}-{}{suffix}", std::process::id(), nonce));
     std::fs::write(&path, initial).map_err(|err| GitError::Io {
         detail: format!("writing {}: {err}", path.display()),
     })?;
@@ -633,10 +630,7 @@ fn edit_branch_description(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec
             .ok_or_else(|| GitError::Invalid {
                 detail: "not on a branch".to_owned(),
             })?,
-        [name] => name
-            .strip_prefix("refs/heads/")
-            .unwrap_or(name)
-            .to_owned(),
+        [name] => name.strip_prefix("refs/heads/").unwrap_or(name).to_owned(),
         _ => {
             return Err(GitError::Invalid {
                 detail: "usage: branch --edit-description [<branch>]".to_owned(),
@@ -2299,11 +2293,12 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if let Some(name) = opts.single("create")? {
         let start = opts.positionals.first().map(String::as_str);
         let out = checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?;
-        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
+        if opts.is_set("track")
+            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
+        {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
-                    detail: "cannot set up tracking information; starting point is HEAD"
-                        .to_owned(),
+                    detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
                 });
             };
             record_tracking(ctx.store()?, &name, start)?;
@@ -2313,11 +2308,12 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if let Some(name) = opts.single("force-create")? {
         let start = opts.positionals.first().map(String::as_str);
         let out = checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"))?;
-        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
+        if opts.is_set("track")
+            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
+        {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
-                    detail: "cannot set up tracking information; starting point is HEAD"
-                        .to_owned(),
+                    detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
                 });
             };
             record_tracking(ctx.store()?, &name, start)?;
@@ -2417,8 +2413,8 @@ fn switch_guessing(
     if let Ok(name) = branch_name(branch) {
         if super::state::read_ref(store, &name)?.is_some() {
             if merge {
-                let tip = super::state::read_ref(store, &name)?
-                    .and_then(|target| peel_direct(&target));
+                let tip =
+                    super::state::read_ref(store, &name)?.and_then(|target| peel_direct(&target));
                 if let Some(tip) = tip {
                     switch_merge_guard(ctx, tree_for_tip(ctx, tip)?)?;
                 }
@@ -2758,6 +2754,13 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     }
     let record = super::state::commit_record(store, target)?;
     let tree = commit_tree_oid(&record)?;
+    if opts.is_set("intent-to-add") {
+        reset_tree_intent(ctx, tree)?;
+        if quiet {
+            return Ok(Vec::new());
+        }
+        return reset_unstaged_report(ctx, store, kind);
+    }
     reset_index_tree(ctx, tree)?;
     if opts.is_set("hard") {
         sync_worktree_to_index(ctx)?;
@@ -2910,6 +2913,61 @@ fn switch_merge_guard(ctx: &Ctx, new_tree: Oid) -> Result<(), GitError> {
             blocked.join(", ")
         ),
     })
+}
+
+/// Resets the whole index to one tree without moving `HEAD`, recording
+/// intent-to-add rows where the tree lacks a path the index names instead
+/// of dropping those rows.
+fn reset_tree_intent(ctx: &Ctx, tree: Oid) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let mut target = std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, tree)? {
+        target.insert(path, (mode, oid));
+    }
+    let rows = scan_index(store, kind)?;
+    let mut union: Vec<RepoPath> = Vec::new();
+    for (path, _, _) in &rows {
+        if !union.contains(path) {
+            union.push(path.clone());
+        }
+    }
+    for path in target.keys() {
+        let candidate =
+            RepoPath::new(path.clone()).map_err(|err| GitError::from(CoreError::from(err)))?;
+        if !union.contains(&candidate) {
+            union.push(candidate);
+        }
+    }
+    let (workspace, raw) = load_or_default(store)?;
+    let mut mutations = Vec::new();
+    for path in union {
+        let before = read_path_rows(store, kind, &path)?;
+        let after = match target.get(path.as_bytes()) {
+            Some((mode, oid)) => {
+                let entry =
+                    IndexEntry::new(*oid, mode.as_index_mode()?, None, IndexFlags::default())
+                        .map_err(|err| GitError::from(CoreError::from(err)))?;
+                vec![(Stage::Zero, entry)]
+            }
+            // The tree lacks this path: staged rows become intent-to-add
+            // reservations instead of deletions; paths with no rows stay
+            // absent.
+            None if before.is_empty() => Vec::new(),
+            None => {
+                let entry = IndexEntry::intent_to_add(kind, FileMode::Regular, None)
+                    .map_err(|err| GitError::from(CoreError::from(err)))?;
+                vec![(Stage::Zero, entry)]
+            }
+        };
+        mutations.extend(path_row_mutations(&path, &before, &after)?);
+    }
+    let next = workspace.mutate_index(workspace.stamp)?;
+    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    store
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
+    Ok(())
 }
 
 /// Resolves a start point to its tree for merge-guard purposes, peeling

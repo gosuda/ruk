@@ -6286,21 +6286,6 @@ fn log_notes_boundary_decorate() {
         text.lines().any(|line| line.starts_with("- ")),
         "got {text}"
     );
-    // A disjoint exclusion borders nothing, so no boundary rows print.
-    run(verbs_branch::checkout, &mut ctx, &["-b", "adrift"]).expect("checkout -b");
-    lane_commit(&mut ctx, &root, "z.txt", b"adrift\n", "adrift work");
-    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
-    let out = run(
-        verbs_history::log,
-        &mut ctx,
-        &["--oneline", "--boundary", "main", "^adrift"],
-    )
-    .expect("disjoint boundary");
-    let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(
-        text.lines().all(|line| !line.starts_with("- ")),
-        "got {text}"
-    );
     let out = run(
         verbs_history::log,
         &mut ctx,
@@ -6343,6 +6328,81 @@ fn log_rename_pathspec_shows_onesided() {
     .expect("spec old");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(text.contains("D\told.txt"), "got {text}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_boundary_ignores_disjoint_root() {
+    use ruk_core::ByteString;
+    use ruk_core::conflict::{Signature, TzOffset};
+    use ruk_core::heads::Head;
+    use ruk_core::ids::Oid;
+    use ruk_core::ops::{NewRequest, new as ops_new};
+    use ruk_core::store::ObjectKind;
+
+    // Two unrelated roots: excluding one borders nothing in the other's
+    // walk, so the shown commit prints with no boundary rows. (Excluding a
+    // descendant would empty the walk instead of testing this.)
+    let base = temp_base("logflags-disjoint");
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env,
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    let (alpha, beta) = {
+        let store = open_store(&root);
+        let tree =
+            super::tree::store_object(&store, ObjectKind::Tree, Vec::new()).expect("empty tree");
+        let sig = |timestamp: i64| Signature {
+            name: ByteString::from("Tariq"),
+            email: ByteString::from("tariq@example.invalid"),
+            timestamp,
+            offset: TzOffset::UTC,
+        };
+        let make = |parents: Vec<Head>, timestamp: i64, message: &str| -> Oid {
+            ops_new(
+                &store,
+                NewRequest {
+                    tree,
+                    parents,
+                    author: sig(timestamp),
+                    committer: sig(timestamp),
+                    message: ByteString::from(message),
+                    change_id: None,
+                    predecessor: None,
+                    provenance: None,
+                },
+            )
+            .expect("new commit")
+            .oid
+            .expect("git commit")
+        };
+        (make(vec![], 1000, "alpha\n"), make(vec![], 1000, "beta\n"))
+    };
+    let mut ctx = repo_ctx(&root, test_env(&root));
+    let alpha_hex = alpha.to_hex();
+    let beta_ex = format!("^{}", beta.to_hex());
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--boundary", &alpha_hex, &beta_ex],
+    )
+    .expect("disjoint boundary");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("alpha"), "got {text}");
+    assert!(!text.contains("beta"), "got {text}");
+    assert!(
+        text.lines().all(|line| !line.starts_with("- ")),
+        "got {text}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -7083,7 +7143,9 @@ fn wave_j_diff_raw_rename_old_first() {
 /// keep each commit's bytes distinct by construction.
 fn wave_j_stamp(ctx: &mut Ctx, epoch: i64) {
     let value = format!("{epoch} +0000");
-    ctx.env.vars.insert("GIT_AUTHOR_DATE".to_owned(), value.clone());
+    ctx.env
+        .vars
+        .insert("GIT_AUTHOR_DATE".to_owned(), value.clone());
     ctx.env.vars.insert("GIT_COMMITTER_DATE".to_owned(), value);
 }
 
@@ -7189,6 +7251,19 @@ fn wave_j_commit_squash_fixup_amend() {
         wave_j_head_message(&mut ctx),
         "squash! seed\n\nextra body\n"
     );
+    // A byte-identical amend (same stamp, no changes) reuses the tip
+    // instead of tripping the store's absent-expectation CAS.
+    let tip = super::state::head_oid(ctx.store().expect("store")).expect("head");
+    wave_j_stamp(&mut ctx, 1700000004);
+    run(verbs_history::commit, &mut ctx, &["--amend"]).expect("no-op amend");
+    assert_eq!(
+        super::state::head_oid(ctx.store().expect("store")).expect("head"),
+        tip
+    );
+    assert_eq!(
+        wave_j_head_message(&mut ctx),
+        "squash! seed\n\nextra body\n"
+    );
     // Both `amend:` spellings lift the empty-tree refusal on a clean tree;
     // `reword:` shares the `amend!` subject line, never `reword!`.
     let amend_arg = format!("--fixup=amend:{base}");
@@ -7200,11 +7275,19 @@ fn wave_j_commit_squash_fixup_amend() {
     wave_j_stamp(&mut ctx, 1700000006);
     run(verbs_history::commit, &mut ctx, &[reword_arg.as_str()]).expect("empty reword fixup");
     assert_eq!(wave_j_head_message(&mut ctx), "amend! seed\n\nseed\n");
-    let err = run(verbs_history::commit, &mut ctx, &[reword_arg.as_str(), "-m", "x"])
-        .expect_err("fixup reword -m");
+    let err = run(
+        verbs_history::commit,
+        &mut ctx,
+        &[reword_arg.as_str(), "-m", "x"],
+    )
+    .expect_err("fixup reword -m");
     assert!(err.to_string().contains("cannot be used together"), "{err}");
-    let err = run(verbs_history::commit, &mut ctx, &[reword_arg.as_str(), "-a"])
-        .expect_err("fixup reword -a");
+    let err = run(
+        verbs_history::commit,
+        &mut ctx,
+        &[reword_arg.as_str(), "-a"],
+    )
+    .expect_err("fixup reword -a");
     assert!(err.to_string().contains("cannot be used together"), "{err}");
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\nfour\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
@@ -7474,11 +7557,20 @@ fn wave_j_status_verbose_column_renames() {
     // `-vv` heads the staged diff; the grouped spelling parses as two hits.
     let out = run(verbs_stage::status, &mut ctx, &["-vv"]).expect("grouped vv");
     let text = String::from_utf8_lossy(&out).into_owned();
-    assert!(text.contains("Changes to be committed:\n"), "vv header: {text}");
+    assert!(
+        text.contains("Changes to be committed:\n"),
+        "vv header: {text}"
+    );
     // The verbose diff runs without `-M`, so the staged rename renders as
     // separate deletion/addition diffs, never a paired header.
-    assert!(text.contains("diff --git a/g.txt b/g.txt\n"), "vv diff: {text}");
-    assert!(!text.contains("diff --git a/f.txt b/g.txt\n"), "no pair: {text}");
+    assert!(
+        text.contains("diff --git a/g.txt b/g.txt\n"),
+        "vv diff: {text}"
+    );
+    assert!(
+        !text.contains("diff --git a/f.txt b/g.txt\n"),
+        "no pair: {text}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 

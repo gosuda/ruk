@@ -669,9 +669,8 @@ fn resolve_commit_message(
     }
     let fixup_parsed = fixup.as_deref().map(parse_fixup_flag);
     if have_m
-        && fixup_parsed.is_some_and(|(kind, _)| {
-            matches!(kind, FixupKind::Amend | FixupKind::Reword)
-        })
+        && fixup_parsed
+            .is_some_and(|(kind, _)| matches!(kind, FixupKind::Amend | FixupKind::Reword))
     {
         let shape = fixup.as_deref().unwrap_or("--fixup");
         return Err(GitError::Invalid {
@@ -851,7 +850,26 @@ fn commit_amend(
 ) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let tip = head_oid(store)?;
-    let old_tree = commit_tree_oid(&commit_record(store, tip)?)?;
+    let old = commit_record(store, tip)?;
+    let old_tree = commit_tree_oid(&old)?;
+    // A no-op amend (same tree, message, and idents down to the second)
+    // would republish byte-identical content and trip the store's
+    // absent-expectation CAS; reusing the tip matches the oracle, where
+    // the rewritten oid simply equals the old one.
+    let broken = |role: &str| GitError::Corrupt {
+        detail: format!("bad {role} ident"),
+    };
+    let incumbent_author = old.author().map_err(|_| broken("author"))?;
+    let incumbent_committer = old.committer().map_err(|_| broken("committer"))?;
+    if tree == old_tree
+        && message.as_bytes() == old.message()
+        && (!replace_author || author == incumbent_author)
+        && committer == incumbent_committer
+    {
+        let label = branch_label_of(ctx)?;
+        let subject = message.lines().next().unwrap_or_default().to_owned();
+        return commit_summary(ctx, Some(old_tree), tree, &tip, &label, &subject);
+    }
     let result = ops_edit(
         store,
         EditRequest {
@@ -5320,19 +5338,10 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
     let (mut tips, exclude) = parse_log_revs(store, kind, &rev_positionals, default_tip)?;
     let excludes = opts.all("exclude")?;
-    // An explicit order with no revisions walks every ref: the order only
-    // reads across branches when both sides are walked. Named revisions,
-    // `--all`, and ref filters keep their own tip sets.
-    let order_all = (opts.is_set("topo-order") || opts.is_set("date-order"))
-        && rev_positionals.is_empty()
-        && ref_filters.is_empty()
-        && !opts.is_set("all");
     // Tip labels feed `--source` text and `--left-right` sides; the first
     // symmetric range fixes left vs right.
     let mut tip_names: HashMap<Oid, String> = HashMap::new();
-    for (oid, name) in
-        log_ref_tips(store, opts.is_set("all") || order_all, &ref_filters, &excludes)?
-    {
+    for (oid, name) in log_ref_tips(store, opts.is_set("all"), &ref_filters, &excludes)? {
         if !tips.contains(&oid) {
             tips.push(oid);
         }
@@ -5428,7 +5437,9 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     // `--decorate` still means short names.
     let decorate = !opts.is_set("no-decorate")
         && (opts.is_set("decorate")
-            || decorate_mode.as_deref().is_some_and(|mode| mode == "short" || mode == "full"));
+            || decorate_mode
+                .as_deref()
+                .is_some_and(|mode| mode == "short" || mode == "full"));
     let full_names = decorate_mode.as_deref() == Some("full");
     let simplify = opts.is_set("simplify-by-decoration");
     let decorations = if decorate || line.format.is_some() || simplify {
@@ -6324,9 +6335,7 @@ fn split_offspec_renames(
     wants: &[Vec<u8>],
 ) -> Result<(), GitError> {
     for change in changes.iter_mut() {
-        let (Some((old_path, _, _)), Some((new_path, _, _))) =
-            (&change.old, &change.new)
-        else {
+        let (Some((old_path, _, _)), Some((new_path, _, _))) = (&change.old, &change.new) else {
             continue;
         };
         if old_path == new_path {
@@ -8860,7 +8869,8 @@ fn unified_pair(
         );
         return Ok((out, new_lines.len(), old_lines.len(), false, sizes));
     }
-    if render.ws != WsFold::Exact || render.blank || render.eol || render.word != WordDiffMode::Off {
+    if render.ws != WsFold::Exact || render.blank || render.eol || render.word != WordDiffMode::Off
+    {
         let (added, removed) = emit_aligned_hunks(&mut out, &old_lines, &new_lines, render)?;
         if added == 0 && removed == 0 {
             // Folding erased every difference (whitespace-only or
