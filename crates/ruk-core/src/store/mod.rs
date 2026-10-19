@@ -3076,7 +3076,10 @@ mod tests {
                 .collect()
         });
         let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
-        assert_eq!(winners, 1, "exactly one absent-expectation claim may commit");
+        assert_eq!(
+            winners, 1,
+            "exactly one absent-expectation claim may commit"
+        );
         for loser in outcomes.iter().filter_map(|outcome| outcome.as_ref().err()) {
             assert!(
                 matches!(loser, StoreError::StaleFact { .. }),

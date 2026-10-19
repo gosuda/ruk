@@ -320,10 +320,12 @@ pub(crate) fn stat_from_meta(meta: &std::fs::Metadata) -> Result<StatData, GitEr
                 }),
                 Err(before) => {
                     let back = before.duration();
-                    let secs =
-                        i64::try_from(back.as_secs()).map_err(|_| out_of_range())?;
+                    let secs = i64::try_from(back.as_secs()).map_err(|_| out_of_range())?;
                     if back.subsec_nanos() == 0 {
-                        return Ok(StatTime { secs: -secs, nanos: 0 });
+                        return Ok(StatTime {
+                            secs: -secs,
+                            nanos: 0,
+                        });
                     }
                     Ok(StatTime {
                         secs: -secs - 1,
@@ -422,14 +424,10 @@ pub(crate) fn refresh_stats_after_write(
             continue;
         };
         let before = read_path_rows(store, kind, &path)?;
-        if before
-            .iter()
-            .any(|(stage, _, _)| *stage != Stage::Zero)
-        {
+        if before.iter().any(|(stage, _, _)| *stage != Stage::Zero) {
             continue;
         }
-        let Some((_, entry, _)) = before.iter().find(|(stage, _, _)| *stage == Stage::Zero)
-        else {
+        let Some((_, entry, _)) = before.iter().find(|(stage, _, _)| *stage == Stage::Zero) else {
             continue;
         };
         if entry.mode() == FileMode::Gitlink || entry.stat() == Some(fresh) {
@@ -461,7 +459,9 @@ pub(crate) fn refresh_stats_after_write(
         .map_err(GitError::from)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(index_stamp_mutation()?);
-    store.publish(Vec::new(), &mutations).map_err(GitError::from)?;
+    store
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
     Ok(())
 }
 

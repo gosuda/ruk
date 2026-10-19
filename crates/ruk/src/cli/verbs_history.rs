@@ -7520,9 +7520,9 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
     }
     let mut pairs = Vec::new();
     for entry in super::tree::walk_worktree(&ctx.file_base)? {
-        let clean = lookup
-            .get(&entry.path)
-            .is_some_and(|cached| super::verbs_stage::is_stat_clean(ctx, cached, &entry.path, stamp));
+        let clean = lookup.get(&entry.path).is_some_and(|cached| {
+            super::verbs_stage::is_stat_clean(ctx, cached, &entry.path, stamp)
+        });
         if clean {
             index_map.remove(&entry.path);
             continue;

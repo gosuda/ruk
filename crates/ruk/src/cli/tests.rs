@@ -9079,9 +9079,8 @@ fn wave_l_stat_cache_clean_repo_reports_empty_status() {
     verbs_stage::add(&mut ctx, &adds).expect("add all");
     verbs_history::commit(&mut ctx, &["-m".to_owned(), "seed".to_owned()]).expect("commit");
     {
-        let rows =
-            super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
-                .expect("scan");
+        let rows = super::state::scan_index(ctx.store().expect("store"), ctx.kind().expect("kind"))
+            .expect("scan");
         let mut zeros = 0;
         for (_, stage, entry) in &rows {
             if *stage == ruk_core::index::Stage::Zero {
@@ -9261,12 +9260,7 @@ fn wave_l_stat_cache_trust_rule() {
     )
     .expect("assumed");
     assert!(matches!(
-        super::state::trust_index_entry(
-            &assumed,
-            &stat,
-            FileMode::Regular,
-            Some(stamp.secs + 10)
-        ),
+        super::state::trust_index_entry(&assumed, &stat, FileMode::Regular, Some(stamp.secs + 10)),
         super::state::StatTrust::Rehash
     ));
 }

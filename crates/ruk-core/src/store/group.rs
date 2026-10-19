@@ -295,7 +295,11 @@ impl Store {
                         .iter()
                         .map(|submission| {
                             Ok(Publication {
-                                objects: submission.objects.iter().map(PreparedObject::oid).collect(),
+                                objects: submission
+                                    .objects
+                                    .iter()
+                                    .map(PreparedObject::oid)
+                                    .collect(),
                                 generation: publication.generation,
                             })
                         })
