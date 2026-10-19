@@ -1479,6 +1479,11 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         });
     }
     if ff && !no_ff {
+        let (workspace, _) = load_or_default(store)?;
+        if matches!(workspace.head, HeadRef::Detached(_)) {
+            let out = merge_fast_forward_detached(ctx, current, tip)?;
+            return Ok(hush_merge(out, quiet));
+        }
         let out = merge_fast_forward(ctx, rev, current, tip)?;
         return Ok(hush_merge(out, quiet));
     }
@@ -1564,21 +1569,15 @@ fn merge_content(
     Ok(out)
 }
 
-/// Stages one tree wholesale over another: paths the target holds resolve to
-/// `Take`, paths only the old tree holds resolve to `Deleted`.
-fn take_tree_state(
-    ctx: &Ctx,
-    ours_tree: Oid,
-    target_tree: Oid,
-) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
-    let store = ctx.store()?;
-    let kind = ctx.kind()?;
-    let rows = require_clean_index(store, kind)?;
-    let target = lane_tree_map(store, kind, target_tree)?;
-    let ours_map = lane_tree_map(store, kind, ours_tree)?;
+/// Plans one tree staged wholesale over another: paths the target holds
+/// resolve to `Take`, paths only the old tree holds resolve to `Deleted`.
+fn plan_take_tree(
+    target: &BTreeMap<Vec<u8>, (TreeMode, Oid)>,
+    ours: &BTreeMap<Vec<u8>, (TreeMode, Oid)>,
+) -> Result<MergePlan, GitError> {
     let mut keys = std::collections::BTreeSet::new();
     keys.extend(target.keys().cloned());
-    keys.extend(ours_map.keys().cloned());
+    keys.extend(ours.keys().cloned());
     let mut resolutions = Vec::with_capacity(keys.len());
     for path in keys {
         match target.get(&path) {
@@ -1592,11 +1591,25 @@ fn take_tree_state(
             None => resolutions.push((path, PathResolution::Deleted)),
         }
     }
-    let plan = MergePlan {
+    Ok(MergePlan {
         resolutions,
         auto_merged: Vec::new(),
         conflicted: Vec::new(),
-    };
+    })
+}
+
+/// Stages one tree wholesale over another through the guarded lane.
+fn take_tree_state(
+    ctx: &Ctx,
+    ours_tree: Oid,
+    target_tree: Oid,
+) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let rows = require_clean_index(store, kind)?;
+    let target = lane_tree_map(store, kind, target_tree)?;
+    let ours_map = lane_tree_map(store, kind, ours_tree)?;
+    let plan = plan_take_tree(&target, &ours_map)?;
     guard_lane_worktree(ctx, &rows, &ours_map, &plan, "merge")?;
     apply_merge_plan(ctx, &plan)
 }
@@ -1751,7 +1764,7 @@ fn merge_into_unborn(ctx: &Ctx, rev: &str, tip: Oid) -> Result<Vec<u8>, GitError
                     change: RefChange::Set(RefTarget::Direct(tip)),
                 }],
             )?;
-            fast_forward_to(ctx, tip)?;
+            fast_forward_to(ctx, None, tip)?;
             Ok(format!("Fast-forwarded to {rev}\n").into_bytes())
         }
         HeadRef::Detached(_) => Err(GitError::Invalid {
@@ -1760,13 +1773,43 @@ fn merge_into_unborn(ctx: &Ctx, rev: &str, tip: Oid) -> Result<Vec<u8>, GitError
     }
 }
 
-/// Resets the index and worktree to one commit's tree after a branch move.
-fn fast_forward_to(ctx: &Ctx, tip: Oid) -> Result<(), GitError> {
+/// Resets the index and worktree to one commit's tree after a branch move,
+/// touching only paths the two trees disagree on: untracked files and staged
+/// extras elsewhere are never listed, read, or removed.
+fn fast_forward_to(ctx: &Ctx, old_tree: Option<Oid>, tip: Oid) -> Result<(), GitError> {
     let store = ctx.store()?;
-    let record = commit_record(store, tip)?;
-    let tree = commit_tree_oid(&record)?;
-    super::verbs_branch::reset_index_tree(ctx, tree)?;
-    super::verbs_branch::sync_worktree_to_index(ctx)
+    let kind = ctx.kind()?;
+    let new_tree = commit_tree_oid(&commit_record(store, tip)?)?;
+    let new_map = lane_tree_map(store, kind, new_tree)?;
+    let old_map = match old_tree {
+        Some(tree) => lane_tree_map(store, kind, tree)?,
+        None => BTreeMap::new(),
+    };
+    let rows = require_clean_index(store, kind)?;
+    let plan = plan_take_tree(&new_map, &old_map)?;
+    guard_lane_worktree(ctx, &rows, &old_map, &plan, "merge")?;
+    apply_merge_plan(ctx, &plan)?;
+    Ok(())
+}
+
+/// Fast-forwards a detached `HEAD` through the guarded lane: no new commit,
+/// only the scoped index and worktree move.
+fn merge_fast_forward_detached(ctx: &Ctx, before: Oid, tip: Oid) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let old_tree = commit_tree_oid(&commit_record(store, before)?)?;
+    let new_tree = commit_tree_oid(&commit_record(store, tip)?)?;
+    let changes = tree_file_changes(ctx, Some(old_tree), new_tree)?;
+    take_tree_state(ctx, old_tree, new_tree)?;
+    advance_head_to(ctx, tip)?;
+    let mut out = format!(
+        "Updating {}..{}\nFast-forward\n",
+        short_hex(&before),
+        short_hex(&tip)
+    )
+    .into_bytes();
+    out.extend_from_slice(&render_file_stat(&changes));
+    out.extend_from_slice(&render_mode_lines(&changes));
+    Ok(out)
 }
 
 /// Fast-forwards the current branch to a descendant tip, reporting
@@ -1785,7 +1828,7 @@ pub(crate) fn merge_fast_forward(
             let new_tree = commit_tree_oid(&commit_record(store, tip)?)?;
             let changes = tree_file_changes(ctx, Some(old_tree), new_tree)?;
             super::verbs_branch::move_branch_to(ctx, tip)?;
-            fast_forward_to(ctx, tip)?;
+            fast_forward_to(ctx, Some(old_tree), tip)?;
             let _ = rev;
             let mut out = format!(
                 "Updating {}..{}\nFast-forward\n",
@@ -2261,61 +2304,6 @@ fn pick_skip(ctx: &mut Ctx, verb: &str, head_key: Option<&str>) -> Result<Vec<u8
     }
     let rest = todos[1..].to_vec();
     apply_pick_todos(ctx, verb, head_key, &seq.head_hex, rest, false)
-}
-
-/// Resets every unmerged index path to its `HEAD` state, for `--skip`.
-fn reset_unmerged_to_head(ctx: &Ctx) -> Result<(), GitError> {
-    let store = ctx.store()?;
-    let kind = ctx.kind()?;
-    let head = head_oid(store)?;
-    let head_tree = commit_tree_oid(&commit_record(store, head)?)?;
-    let head_map = lane_tree_map(store, kind, head_tree)?;
-    let rows = scan_index(store, kind)?;
-    let mut paths = std::collections::BTreeSet::new();
-    for (path, stage, _) in &rows {
-        if *stage != Stage::Zero {
-            paths.insert(path.as_bytes().to_vec());
-        }
-    }
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let mut mutations = Vec::new();
-    let mut writes: Vec<(Vec<u8>, LaneWrite)> = Vec::new();
-    for path in paths {
-        let repo_path =
-            RepoPath::new(path.clone()).map_err(|err| GitError::from(CoreError::from(err)))?;
-        let before = read_path_rows(store, kind, &repo_path)?;
-        let after = match head_map.get(&path) {
-            Some((mode, oid)) => {
-                let entry = lane_entry(mode.as_index_mode()?, *oid)?;
-                writes.push((
-                    path.clone(),
-                    LaneWrite::Blob {
-                        mode: mode.as_index_mode()?,
-                        oid: *oid,
-                    },
-                ));
-                vec![(Stage::Zero, entry)]
-            }
-            None => {
-                writes.push((path.clone(), LaneWrite::Remove));
-                Vec::new()
-            }
-        };
-        mutations.extend(super::state::path_row_mutations(
-            &repo_path, &before, &after,
-        )?);
-    }
-    let (workspace, raw) = load_or_default(store)?;
-    let next = workspace
-        .mutate_index(workspace.stamp)
-        .map_err(|err| GitError::from(CoreError::from(err)))?;
-    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-    store
-        .publish(Vec::new(), &mutations)
-        .map_err(GitError::from)?;
-    sync_lane_worktree(ctx, &writes)
 }
 
 /// Abandons a pick sequence, restoring the pre-operation index and branch.
@@ -3512,6 +3500,31 @@ fn guard_lane_worktree(
         };
         if !touched {
             continue;
+        }
+        // A staged change on a merge-touched path would be silently re-homed
+        // by the apply step, so the index must match the ours head there.
+        // Untracked files and staged extras on untouched paths never enter
+        // the plan and are never inspected.
+        let head_side: Option<(FileMode, Oid)> =
+            ours_map.get(path).and_then(|(mode, oid)| {
+                mode.as_index_mode().ok().map(|file| (file, *oid))
+            });
+        // Gitlinks carry commit ids the worktree cannot materialize, so both
+        // checks below are meaningless for them; every other path must show
+        // an index that matches the ours head.
+        let gitlink = matches!(
+            stage_zero.get(path.as_slice()),
+            Some(entry) if entry.mode() == FileMode::Gitlink
+        );
+        if !gitlink {
+            let staged_side: Option<(FileMode, Oid)> = match stage_zero.get(path.as_slice()) {
+                Some(entry) => Some((entry.mode(), entry.oid())),
+                None => None,
+            };
+            if staged_side != head_side {
+                blocked.push(String::from_utf8_lossy(path).into_owned());
+                continue;
+            }
         }
         let dirty = match stage_zero.get(path.as_slice()) {
             Some(entry) if entry.mode() == FileMode::Gitlink => false,
