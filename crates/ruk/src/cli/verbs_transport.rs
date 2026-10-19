@@ -1256,7 +1256,9 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             let store = ctx.store()?;
             push_local(store, &dest, target, kind, flags.atomic, updates)
         }
-        Target::Net(endpoint) => push_net(ctx, &endpoint, target, &spec_texts, &flags, &remote_label),
+        Target::Net(endpoint) => {
+            push_net(ctx, &endpoint, target, &spec_texts, &flags, &remote_label)
+        }
     }
 }
 
@@ -3350,8 +3352,7 @@ fn push_lfs_upload(
         }
         let kind = ctx.kind()?;
         let zero = kind.zero_oid();
-        let live: Vec<&PushUpdate> =
-            updates.iter().filter(|update| update.new != zero).collect();
+        let live: Vec<&PushUpdate> = updates.iter().filter(|update| update.new != zero).collect();
         if live.is_empty() {
             return Ok(());
         }
