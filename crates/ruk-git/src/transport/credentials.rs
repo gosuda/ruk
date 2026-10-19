@@ -865,7 +865,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            shell_command_line("/bin/shell-helper --fast"),
+            shell_command_line("/bin/shell-helper --fast", "get"),
             "/bin/shell-helper --fast get"
         );
         // The stub seam sees the shell program form and answers through it.
