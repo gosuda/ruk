@@ -1,4 +1,4 @@
-//! Verb table: the 81 advertised names and their handlers.
+//! Verb table: the 90 advertised names and their handlers.
 //!
 //! The shape mirrors `git.c:commands[]`: one row per verb with its oracle
 //! anchor, whether it needs a repository, a one-line summary, and the entry
@@ -13,12 +13,16 @@ use super::verbs_branch;
 use super::verbs_bundle;
 use super::verbs_grep;
 use super::verbs_history;
+use super::verbs_merge_plumbing;
 use super::verbs_meta;
 use super::verbs_misc;
+use super::verbs_notes;
 use super::verbs_objects;
 use super::verbs_patch;
 use super::verbs_repo;
+use super::verbs_sparse;
 use super::verbs_stage;
+use super::verbs_submodule;
 use super::verbs_transport;
 use super::verbs_worktree;
 use super::{Ctx, line};
@@ -37,7 +41,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 81 advertised verbs in alphabetical order.
+/// The 90 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -136,6 +140,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Switch branches or restore working tree files",
         run: verbs_branch::checkout,
+    },
+    Verb {
+        name: "checkout-index",
+        oracle: "git/builtin/checkout-index.c",
+        needs_repo: true,
+        summary: "Copy files from the index to the working directory",
+        run: verbs_merge_plumbing::checkout_index,
     },
     Verb {
         name: "cherry",
@@ -348,6 +359,20 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_history::merge_base,
     },
     Verb {
+        name: "merge-file",
+        oracle: "git/builtin/merge-file.c",
+        needs_repo: false,
+        summary: "Run a three-way file merge",
+        run: verbs_merge_plumbing::merge_file_cmd,
+    },
+    Verb {
+        name: "merge-tree",
+        oracle: "git/builtin/merge-tree.c",
+        needs_repo: true,
+        summary: "Show three-way merge without touching the index",
+        run: verbs_merge_plumbing::merge_tree,
+    },
+    Verb {
         name: "migrate",
         oracle: "git/builtin/init-db.c",
         needs_repo: false,
@@ -376,6 +401,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_misc::name_rev,
     },
     Verb {
+        name: "notes",
+        oracle: "git/builtin/notes.c",
+        needs_repo: true,
+        summary: "Add or inspect object notes",
+        run: verbs_notes::notes,
+    },
+    Verb {
         name: "pack-objects",
         oracle: "git/builtin/pack-objects.c",
         needs_repo: true,
@@ -395,6 +427,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Update remote refs along with associated objects",
         run: verbs_transport::push,
+    },
+    Verb {
+        name: "read-tree",
+        oracle: "git/builtin/read-tree.c",
+        needs_repo: true,
+        summary: "Read tree information into the index",
+        run: verbs_merge_plumbing::read_tree,
     },
     Verb {
         name: "rebase",
@@ -423,6 +462,20 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Manage the set of tracked repositories",
         run: verbs_repo::remote,
+    },
+    Verb {
+        name: "replace",
+        oracle: "git/builtin/replace.c",
+        needs_repo: true,
+        summary: "Create, list, and delete object replacements",
+        run: verbs_notes::replace,
+    },
+    Verb {
+        name: "rerere",
+        oracle: "git/builtin/rerere.c",
+        needs_repo: true,
+        summary: "Reuse recorded resolution of conflicted merges",
+        run: verbs_merge_plumbing::rerere,
     },
     Verb {
         name: "reset",
@@ -488,6 +541,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_branch::show_ref,
     },
     Verb {
+        name: "sparse-checkout",
+        oracle: "git/builtin/sparse-checkout.c",
+        needs_repo: true,
+        summary: "Initialize and modify the sparse-checkout",
+        run: verbs_sparse::sparse_checkout,
+    },
+    Verb {
         name: "stash",
         oracle: "git/builtin/stash.c",
         needs_repo: true,
@@ -507,6 +567,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: false,
         summary: "Clean whitespace from standard input",
         run: verbs_misc::stripspace,
+    },
+    Verb {
+        name: "submodule",
+        oracle: "git/builtin/submodule--helper.c",
+        needs_repo: true,
+        summary: "Initialize, update or inspect submodules",
+        run: verbs_submodule::submodule,
     },
     Verb {
         name: "switch",

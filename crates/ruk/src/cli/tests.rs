@@ -21,10 +21,14 @@ use super::verbs_branch;
 use super::verbs_bundle;
 use super::verbs_grep;
 use super::verbs_history;
+use super::verbs_merge_plumbing;
+use super::verbs_notes;
 use super::verbs_objects;
 use super::verbs_patch;
 use super::verbs_repo;
+use super::verbs_sparse;
 use super::verbs_stage;
+use super::verbs_submodule;
 use super::verbs_transport;
 use super::verbs_worktree;
 use super::{CliEnv, Ctx, collect};
@@ -121,11 +125,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 81);
+    assert_eq!(VERBS.len(), 90);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 81);
+    assert_eq!(names.len(), 90);
     for name in [
         "add",
         "am",
@@ -141,6 +145,7 @@ fn verb_table_covers_advertised_names() {
         "check-ignore",
         "check-ref-format",
         "checkout",
+        "checkout-index",
         "cherry",
         "cherry-pick",
         "clean",
@@ -171,17 +176,23 @@ fn verb_table_covers_advertised_names() {
         "ls-tree",
         "merge",
         "merge-base",
+        "merge-file",
+        "merge-tree",
         "migrate",
         "mktree",
         "mv",
         "name-rev",
+        "notes",
         "pack-objects",
         "pull",
         "push",
         "rebase",
         "receive-pack",
+        "read-tree",
         "reflog",
         "remote",
+        "replace",
+        "rerere",
         "reset",
         "restore",
         "rev-list",
@@ -191,9 +202,11 @@ fn verb_table_covers_advertised_names() {
         "show",
         "shortlog",
         "show-ref",
+        "sparse-checkout",
         "stash",
         "status",
         "stripspace",
+        "submodule",
         "switch",
         "symbolic-ref",
         "tag",
@@ -4647,5 +4660,825 @@ fn am_abort_restores_session() {
         std::fs::read(root.join("f.txt")).expect("read"),
         b"one\nTWO\nthree\n"
     );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+// ---------------------------------------------------------------------------
+// submodule lane: gitlink bindings, child checkouts
+// ---------------------------------------------------------------------------
+
+/// Builds a parent repo with one submodule added at `vendor/lib`.
+///
+/// Returns the parent root, its env, the child root, and the child `HEAD`.
+fn submodule_case(case: &str) -> (PathBuf, CliEnv, PathBuf, String) {
+    let (child_root, _) = seeded_repo(case, "lib.txt", b"lib v1\n");
+    let child_head = {
+        let env = test_env(&child_root);
+        let mut ctx = repo_ctx(&child_root, env);
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("head"))
+            .expect("utf8")
+            .trim()
+            .to_owned()
+    };
+    let base = temp_base(case);
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["parent".to_owned()]).expect("init");
+    let root = base.join("parent");
+    let env = test_env(&root);
+    let mut ctx = repo_ctx(&root, env.clone());
+    let url = child_root.to_string_lossy().into_owned();
+    run(verbs_submodule::submodule, &mut ctx, &["add", &url, "vendor/lib"]).expect("add");
+    (root, env, child_root, child_head)
+}
+
+#[test]
+fn submodule_add_records_gitlink_and_modules() {
+    let (root, env, child_root, child_head) = submodule_case("submodule-add");
+    let ctx = repo_ctx(&root, env);
+    let store = ctx.store().expect("store");
+    let kind = ctx.kind().expect("kind");
+    let link = super::state::scan_index(store, kind)
+        .expect("scan")
+        .into_iter()
+        .find(|(path, stage, _)| path.as_bytes() == b"vendor/lib" && stage.as_u8() == 0)
+        .expect("gitlink row");
+    assert_eq!(link.2.mode(), ruk_core::index::FileMode::Gitlink);
+    assert_eq!(link.2.oid().to_hex(), child_head);
+    let text = String::from_utf8(
+        std::fs::read(root.join(".rukmodules")).expect("modules file"),
+    )
+    .expect("utf8");
+    assert!(text.contains("vendor/lib"), "got {text:?}");
+    assert!(
+        text.contains(&child_root.to_string_lossy().into_owned()),
+        "got {text:?}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("vendor/lib/lib.txt")).expect("read"),
+        b"lib v1\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
+}
+
+#[test]
+fn submodule_update_init_materializes_checkout() {
+    let (root, env, child_root, child_head) = submodule_case("submodule-update");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_submodule::submodule, &mut ctx, &["deinit", "vendor/lib"]).expect("deinit");
+    assert!(!root.join("vendor/lib").exists());
+    let out = run(verbs_submodule::submodule, &mut ctx, &["status"]).expect("status");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.starts_with('-') && text.contains("vendor/lib"),
+        "got {text:?}"
+    );
+    let out = run(verbs_submodule::submodule, &mut ctx, &["update", "--init"])
+        .expect("update");
+    assert!(
+        String::from_utf8(out).expect("utf8").contains("checked out"),
+        "update reports the checkout"
+    );
+    assert_eq!(
+        std::fs::read(root.join("vendor/lib/lib.txt")).expect("read"),
+        b"lib v1\n"
+    );
+    let child_root_path = root.join("vendor/lib");
+    let child_env = test_env(&child_root_path);
+    let child_ctx = repo_ctx(&child_root_path, child_env);
+    let checked_out = super::state::head_oid(child_ctx.store().expect("store")).expect("head");
+    assert_eq!(checked_out.to_hex(), child_head);
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
+}
+
+#[test]
+fn submodule_status_summary_foreach_and_gap() {
+    let (root, env, child_root, child_head) = submodule_case("submodule-misc");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_submodule::submodule, &mut ctx, &["status"]).expect("status");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains(&child_head), "got {text:?}");
+    assert!(text.contains("vendor/lib (main)"), "got {text:?}");
+    let out = run(
+        verbs_submodule::submodule,
+        &mut ctx,
+        &["foreach", "echo", "hello-$name"],
+    )
+    .expect("foreach");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains("Entering 'vendor/lib'"), "got {text:?}");
+    assert!(text.contains("hello-vendor/lib"), "got {text:?}");
+    // Uncommitted binding: summary reports the addition; after the parent
+    // commit the lane is quiet.
+    let out = run(verbs_submodule::submodule, &mut ctx, &["summary"]).expect("summary");
+    assert!(
+        String::from_utf8(out).expect("utf8").contains("vendor/lib"),
+        "summary reports the uncommitted binding"
+    );
+    run(verbs_history::commit, &mut ctx, &["-m", "add lib"]).expect("commit");
+    let out = run(verbs_submodule::submodule, &mut ctx, &["summary"]).expect("summary");
+    assert!(
+        out.is_empty(),
+        "in sync: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let err = run(verbs_submodule::submodule, &mut ctx, &["absorbgitdirs"]).expect_err("gap");
+    assert!(err.to_string().contains("absorbgitdirs"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
+}
+
+// ---------------------------------------------------------------------------
+// sparse + merge-plumbing lane: sparse-checkout, merge-file, merge-tree,
+// read-tree, checkout-index, rerere
+// ---------------------------------------------------------------------------
+
+/// Seeds a repo with several committed files.
+fn plumbing_repo(case: &str, files: &[(&str, &[u8])]) -> (PathBuf, CliEnv) {
+    let base = temp_base(case);
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    let root = base.join("repo");
+    for (name, body) in files {
+        let full = root.join(name);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("dirs");
+        }
+        std::fs::write(&full, body).expect("seed file");
+    }
+    let env = test_env(&base);
+    let mut ctx = repo_ctx(&root, env.clone());
+    run(verbs_stage::add, &mut ctx, &["-A"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "seed"]).expect("commit");
+    (root, env)
+}
+
+/// Resolves `HEAD` to its hex.
+fn plumbing_head(ctx: &mut Ctx) -> String {
+    String::from_utf8(run(verbs_history::rev_parse, ctx, &["HEAD"]).expect("head"))
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+/// Builds a file-only context for repository-optional verbs.
+fn file_ctx(base: &PathBuf, env: CliEnv) -> Ctx {
+    Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env,
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+#[test]
+fn merge_file_clean_writes_current() {
+    let base = temp_base("merge-file-clean");
+    std::fs::write(base.join("current.txt"), b"a\nours\nc\n").expect("write");
+    std::fs::write(base.join("base.txt"), b"a\nbase\nc\n").expect("write");
+    std::fs::write(base.join("other.txt"), b"a\nbase\nc\n").expect("write");
+    let mut ctx = file_ctx(&base, test_env(&base));
+    let out = run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["current.txt", "base.txt", "other.txt"],
+    )
+    .expect("merge");
+    assert!(out.is_empty());
+    assert_eq!(
+        std::fs::read(base.join("current.txt")).expect("read"),
+        b"a\nours\nc\n"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn merge_file_conflict_markers_stdout_and_resolve() {
+    let base = temp_base("merge-file-conflict");
+    std::fs::write(base.join("current.txt"), b"a\nours\nc\n").expect("write");
+    std::fs::write(base.join("base.txt"), b"a\nbase\nc\n").expect("write");
+    std::fs::write(base.join("other.txt"), b"a\ntheirs\nc\n").expect("write");
+    let mut ctx = file_ctx(&base, test_env(&base));
+    let err = run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["current.txt", "base.txt", "other.txt"],
+    )
+    .expect_err("conflict");
+    assert!(err.to_string().contains("conflicts"), "got {err:?}");
+    let body = std::fs::read(base.join("current.txt")).expect("read");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("<<<<<<< current.txt"), "got {text:?}");
+    assert!(text.contains(">>>>>>> other.txt"), "got {text:?}");
+    // `-p` keeps the bytes in the error detail with status 1; the file is
+    // rewritten by the earlier in-place run, so restore inputs first.
+    std::fs::write(base.join("current.txt"), b"a\nours\nc\n").expect("write");
+    let err = run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["-p", "current.txt", "base.txt", "other.txt"],
+    )
+    .expect_err("stdout conflict");
+    assert!(
+        err.to_string().contains("<<<<<<< current.txt"),
+        "got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(base.join("current.txt")).expect("read"),
+        b"a\nours\nc\n"
+    );
+    // `--ours` resolves without markers.
+    run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["--ours", "current.txt", "base.txt", "other.txt"],
+    )
+    .expect("ours");
+    assert_eq!(
+        std::fs::read(base.join("current.txt")).expect("read"),
+        b"a\nours\nc\n"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn merge_file_union_and_diff3_labels() {
+    let base = temp_base("merge-file-union");
+    std::fs::write(base.join("current.txt"), b"a\nours\nc\n").expect("write");
+    std::fs::write(base.join("base.txt"), b"a\nbase\nc\n").expect("write");
+    std::fs::write(base.join("other.txt"), b"a\ntheirs\nc\n").expect("write");
+    let mut ctx = file_ctx(&base, test_env(&base));
+    run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &[
+            "--union",
+            "-L",
+            "mine",
+            "current.txt",
+            "base.txt",
+            "other.txt",
+        ],
+    )
+    .expect("union");
+    let body = std::fs::read(base.join("current.txt")).expect("read");
+    assert_eq!(body, b"a\nours\ntheirs\nc\n");
+    std::fs::write(base.join("current.txt"), b"a\nours\nc\n").expect("write");
+    let err = run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["--diff3", "current.txt", "base.txt", "other.txt"],
+    )
+    .expect_err("diff3 conflict");
+    let detail = err.to_string();
+    assert!(detail.contains("||||||| base.txt"), "got {detail:?}");
+    let err = run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["--marker-size=9", "current.txt", "base.txt", "other.txt"],
+    )
+    .expect_err("marker size");
+    assert!(err.to_string().contains("<<<<<<<<<"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn merge_tree_merges_disjoint_sides() {
+    let (root, env) = plumbing_repo("merge-tree-clean", &[("f.txt", b"base\n")]);
+    let mut ctx = repo_ctx(&root, env);
+    let base = plumbing_head(&mut ctx);
+    std::fs::write(root.join("f.txt"), b"ours\n").expect("ours");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "ours side"]).expect("commit");
+    let ours = plumbing_head(&mut ctx);
+    run(verbs_branch::reset, &mut ctx, &["--hard", &base]).expect("reset");
+    std::fs::write(root.join("g.txt"), b"theirs\n").expect("theirs");
+    run(verbs_stage::add, &mut ctx, &["g.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "theirs side"]).expect("commit");
+    let theirs = plumbing_head(&mut ctx);
+    let out = run(
+        verbs_merge_plumbing::merge_tree,
+        &mut ctx,
+        &[base.as_str(), ours.as_str(), theirs.as_str()],
+    )
+    .expect("merge-tree");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(!text.contains("CONFLICT"), "got {text:?}");
+    let tree = text.lines().next().expect("tree").trim().to_owned();
+    assert!(tree.chars().all(|cell| cell.is_ascii_hexdigit()));
+    let body = run(verbs_objects::cat_file, &mut ctx, &["-p", &tree]).expect("cat tree");
+    let raw = String::from_utf8_lossy(&body);
+    assert!(raw.contains("f.txt"), "got {raw:?}");
+    assert!(raw.contains("g.txt"), "got {raw:?}");
+    // The index and worktree still hold the theirs tip untouched.
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"base\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("g.txt")).expect("read"),
+        b"theirs\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn merge_tree_reports_content_conflicts() {
+    let (root, env) = plumbing_repo("merge-tree-conflict", &[("f.txt", b"one\ntwo\n")]);
+    let mut ctx = repo_ctx(&root, env);
+    let base = plumbing_head(&mut ctx);
+    std::fs::write(root.join("f.txt"), b"one\ntwo B\n").expect("ours");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "ours side"]).expect("commit");
+    let ours = plumbing_head(&mut ctx);
+    run(verbs_branch::reset, &mut ctx, &["--hard", &base]).expect("reset");
+    std::fs::write(root.join("f.txt"), b"one\ntwo C\n").expect("theirs");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "theirs side"]).expect("commit");
+    let theirs = plumbing_head(&mut ctx);
+    let out = run(
+        verbs_merge_plumbing::merge_tree,
+        &mut ctx,
+        &[base.as_str(), ours.as_str(), theirs.as_str()],
+    )
+    .expect("merge-tree");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("CONFLICT (content): Merge conflict in f.txt"),
+        "got {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn read_tree_single_empty_and_checkout() {
+    let (root, env) = two_file_repo("read-tree-single");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("extra.txt"), b"extra\n").expect("extra");
+    run(verbs_stage::add, &mut ctx, &["extra.txt"]).expect("stage extra");
+    run(verbs_merge_plumbing::read_tree, &mut ctx, &["HEAD"]).expect("read-tree");
+    let out = run(verbs_stage::ls_files, &mut ctx, &[]).expect("ls-files");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(!text.contains("extra.txt"), "got {text:?}");
+    run(verbs_merge_plumbing::read_tree, &mut ctx, &["--empty"]).expect("empty");
+    let out = run(verbs_stage::ls_files, &mut ctx, &[]).expect("ls-files");
+    assert!(out.is_empty());
+    // `-u` restores the worktree from the reseated index.
+    std::fs::remove_file(root.join("s.txt")).expect("remove");
+    run(verbs_merge_plumbing::read_tree, &mut ctx, &["HEAD", "-u"]).expect("read -u");
+    assert_eq!(
+        std::fs::read(root.join("s.txt")).expect("read"),
+        b"one\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn read_tree_merge_stages_conflicts() {
+    let (root, env) = plumbing_repo("read-tree-m", &[("f.txt", b"base\n")]);
+    let mut ctx = repo_ctx(&root, env);
+    let base = plumbing_head(&mut ctx);
+    std::fs::write(root.join("f.txt"), b"b\n").expect("b");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "b side"]).expect("commit");
+    let b_side = plumbing_head(&mut ctx);
+    run(verbs_branch::reset, &mut ctx, &["--hard", &base]).expect("reset");
+    std::fs::write(root.join("f.txt"), b"c\n").expect("c");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "c side"]).expect("commit");
+    let c_side = plumbing_head(&mut ctx);
+    run(
+        verbs_merge_plumbing::read_tree,
+        &mut ctx,
+        &["-m", base.as_str(), b_side.as_str(), c_side.as_str()],
+    )
+    .expect("three-tree");
+    let out = run(verbs_stage::ls_files, &mut ctx, &["-u"]).expect("stages");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains("f.txt"), "got {text:?}");
+    // The worktree keeps the pre-merge bytes; no markers are written.
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"c\n"
+    );
+    // A clean three-way collapses back to stage zero.
+    run(
+        verbs_merge_plumbing::read_tree,
+        &mut ctx,
+        &["-m", base.as_str(), b_side.as_str(), b_side.as_str()],
+    )
+    .expect("clean");
+    let out = run(verbs_stage::ls_files, &mut ctx, &["-u"]).expect("no stages");
+    assert!(out.is_empty());
+    // One-tree `-m` only fast-forwards an unchanged index.
+    let err = run(
+        verbs_merge_plumbing::read_tree,
+        &mut ctx,
+        &["-m", c_side.as_str()],
+    )
+    .expect_err("one-tree refuses");
+    assert!(err.to_string().contains("two trees"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn checkout_index_round_trip() {
+    let (root, env) = seeded_repo("checkout-index", "f.txt", b"data\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::remove_file(root.join("f.txt")).expect("remove");
+    let out = run(verbs_merge_plumbing::checkout_index, &mut ctx, &["f.txt"]).expect("checkout");
+    assert_eq!(String::from_utf8(out).expect("utf8"), "f.txt\n");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"data\n"
+    );
+    // A dirty file refuses without `--force`.
+    std::fs::write(root.join("f.txt"), b"dirty\n").expect("dirty");
+    let err = run(verbs_merge_plumbing::checkout_index, &mut ctx, &["f.txt"]).expect_err("refuse");
+    assert!(err.to_string().contains("no checkout"), "got {err:?}");
+    run(verbs_merge_plumbing::checkout_index, &mut ctx, &["-f", "f.txt"]).expect("force");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"data\n"
+    );
+    // `--prefix` roots the materialization elsewhere.
+    run(
+        verbs_merge_plumbing::checkout_index,
+        &mut ctx,
+        &["-f", "--prefix=out", "f.txt"],
+    )
+    .expect("prefix");
+    assert_eq!(
+        std::fs::read(root.join("out/f.txt")).expect("read"),
+        b"data\n"
+    );
+    let err = run(verbs_merge_plumbing::checkout_index, &mut ctx, &["nope.txt"])
+        .expect_err("missing");
+    assert!(err.to_string().contains("not in the index"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn sparse_checkout_set_filters_worktree() {
+    let (root, env) = plumbing_repo(
+        "sparse",
+        &[("top.txt", b"top\n"), ("sub/a.txt", b"a\n"), ("sub/b.txt", b"b\n")],
+    );
+    let mut ctx = repo_ctx(&root, env);
+    run(
+        verbs_sparse::sparse_checkout,
+        &mut ctx,
+        &["set", "sub/", "!sub/b.txt"],
+    )
+    .expect("set");
+    assert!(!root.join("top.txt").exists());
+    assert!(root.join("sub/a.txt").exists());
+    assert!(!root.join("sub/b.txt").exists());
+    let store = ctx.store().expect("store");
+    let kind = ctx.kind().expect("kind");
+    for (name, skipped) in [("top.txt", true), ("sub/a.txt", false), ("sub/b.txt", true)] {
+        let rows = super::state::scan_index(store, kind).expect("scan");
+        let Some(row) = rows.iter().find(|(path, stage, _)| {
+            path.as_bytes() == name.as_bytes() && *stage == ruk_core::index::Stage::Zero
+        }) else {
+            panic!("row for {name}");
+        };
+        assert_eq!(row.2.flags().skip_worktree, skipped, "flag for {name}");
+    }
+    let out = run(verbs_sparse::sparse_checkout, &mut ctx, &["list"]).expect("list");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains("sub/"), "got {text:?}");
+    // A dirty in-cone file blocks reapply.
+    std::fs::write(root.join("sub/a.txt"), b"dirty\n").expect("dirty");
+    let err = run(verbs_sparse::sparse_checkout, &mut ctx, &["set", "sub/"])
+        .expect_err("dirty refuses");
+    assert!(
+        err.to_string().contains("would be overwritten"),
+        "got {err:?}"
+    );
+    std::fs::write(root.join("sub/a.txt"), b"a\n").expect("restore");
+    run(verbs_sparse::sparse_checkout, &mut ctx, &["disable"]).expect("disable");
+    assert_eq!(
+        std::fs::read(root.join("top.txt")).expect("read"),
+        b"top\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("sub/b.txt")).expect("read"),
+        b"b\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn rerere_records_and_replays_resolution() {
+    let (root, env) = seeded_repo("rerere", "f.txt", b"base\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
+    std::fs::write(root.join("f.txt"), b"side\n").expect("side");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "side work"]).expect("commit");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
+    std::fs::write(root.join("f.txt"), b"main\n").expect("main");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "main work"]).expect("commit");
+    let err = run(verbs_history::merge, &mut ctx, &["side"]).expect_err("conflict");
+    assert!(err.to_string().contains("Merge conflict"), "got {err:?}");
+    let body = std::fs::read(root.join("f.txt")).expect("read");
+    assert!(String::from_utf8_lossy(&body).contains("<<<<<<<"), "markers");
+    // First run records the preimage; nothing is resolved yet.
+    let out = run(verbs_merge_plumbing::rerere, &mut ctx, &[]).expect("record");
+    assert!(out.is_empty());
+    let out = run(verbs_merge_plumbing::rerere, &mut ctx, &["status"]).expect("status");
+    assert!(String::from_utf8(out).expect("utf8").contains("f.txt"));
+    let out = run(verbs_merge_plumbing::rerere, &mut ctx, &["remaining"]).expect("remaining");
+    assert!(String::from_utf8(out).expect("utf8").contains("f.txt"));
+    // Resolving graduates the preimage into a postimage.
+    std::fs::write(root.join("f.txt"), b"resolved\n").expect("resolve");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let out = run(verbs_merge_plumbing::rerere, &mut ctx, &[]).expect("graduate");
+    assert!(
+        String::from_utf8(out)
+            .expect("utf8")
+            .contains("Recorded resolution for 'f.txt'"),
+        "graduate"
+    );
+    let out = run(verbs_merge_plumbing::rerere, &mut ctx, &["remaining"]).expect("none left");
+    assert!(out.is_empty());
+    // Recreate the same conflict; the recorded resolution replays.
+    run(verbs_history::merge, &mut ctx, &["--abort"]).expect("abort");
+    run(verbs_history::merge, &mut ctx, &["side"]).expect_err("conflict again");
+    let out = run(verbs_merge_plumbing::rerere, &mut ctx, &[]).expect("replay");
+    assert!(
+        String::from_utf8(out)
+            .expect("utf8")
+            .contains("using previous resolution"),
+        "replay"
+    );
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"resolved\n"
+    );
+    let out = run(verbs_stage::ls_files, &mut ctx, &["-u"]).expect("no stages");
+    assert!(out.is_empty());
+    // Forgetting drops the record: the next identical conflict stays manual.
+    run(verbs_history::merge, &mut ctx, &["--abort"]).expect("abort");
+    run(verbs_history::merge, &mut ctx, &["side"]).expect_err("conflict third");
+    run(verbs_merge_plumbing::rerere, &mut ctx, &["forget", "f.txt"]).expect("forget");
+    let out = run(verbs_merge_plumbing::rerere, &mut ctx, &["remaining"]).expect("manual");
+    assert!(String::from_utf8(out).expect("utf8").contains("f.txt"));
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+// ---------------------------------------------------------------------------
+// notes + replace lane: commit-backed notes and refs/replace/* redirection
+// ---------------------------------------------------------------------------
+
+/// Reads `HEAD` as trimmed hex for notes/replace tests.
+fn notes_tip(ctx: &mut Ctx) -> String {
+    String::from_utf8(run(verbs_history::rev_parse, ctx, &["HEAD"]).expect("head"))
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+/// Rev-parses one explicit revision as trimmed hex.
+fn notes_tip_of(ctx: &mut Ctx, rev: &str) -> String {
+    String::from_utf8(run(verbs_history::rev_parse, ctx, &[rev]).expect("rev-parse"))
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn notes_add_show_list_round_trip() {
+    let (root, env) = seeded_repo("notes-round-trip", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let head = notes_tip(&mut ctx);
+    run(verbs_notes::notes, &mut ctx, &["add", "-m", "first note", head.as_str()]).expect("add");
+    let shown = run(verbs_notes::notes, &mut ctx, &["show", head.as_str()]).expect("show");
+    assert_eq!(shown, b"first note");
+    let listed = String::from_utf8(run(verbs_notes::notes, &mut ctx, &["list"]).expect("list"))
+        .expect("utf8");
+    let line = listed.trim();
+    assert_eq!(line.split_whitespace().count(), 2, "got {listed:?}");
+    assert!(line.ends_with(head.as_str()), "got {listed:?}");
+    // The notes ref always points at a commit, never a blob or tree.
+    let refname = String::from_utf8(
+        run(verbs_notes::notes, &mut ctx, &["get-ref"]).expect("get-ref"),
+    )
+    .expect("utf8");
+    assert_eq!(refname.trim(), "refs/notes/commits");
+    let tip = String::from_utf8(
+        run(verbs_history::rev_parse, &mut ctx, &["refs/notes/commits"]).expect("notes tip"),
+    )
+    .expect("utf8");
+    let kind = run(verbs_objects::cat_file, &mut ctx, &["-t", tip.trim()]).expect("type");
+    assert_eq!(kind, b"commit");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn notes_append_copy_remove() {
+    let (root, env) = seeded_repo("notes-acr", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    let first = notes_tip(&mut ctx);
+    lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second change");
+    let second = notes_tip(&mut ctx);
+    run(verbs_notes::notes, &mut ctx, &["add", "-m", "base", first.as_str()]).expect("add");
+    let err = run(verbs_notes::notes, &mut ctx, &["add", "-m", "again", first.as_str()])
+        .expect_err("clobber refused");
+    assert!(err.to_string().contains("already has a note"), "got {err:?}");
+    run(verbs_notes::notes, &mut ctx, &["append", "-m", "more", first.as_str()]).expect("append");
+    let shown = run(verbs_notes::notes, &mut ctx, &["show", first.as_str()]).expect("show");
+    assert_eq!(shown, b"base\nmore");
+    run(verbs_notes::notes, &mut ctx, &["copy", first.as_str(), second.as_str()]).expect("copy");
+    let shown = run(verbs_notes::notes, &mut ctx, &["show", second.as_str()]).expect("show copy");
+    assert_eq!(shown, b"base\nmore");
+    let err = run(verbs_notes::notes, &mut ctx, &["copy", first.as_str(), second.as_str()])
+        .expect_err("copy clobber refused");
+    assert!(err.to_string().contains("already has a note"), "got {err:?}");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["add", "-f", "-m", "new", first.as_str()],
+    )
+    .expect("force add");
+    let shown = run(verbs_notes::notes, &mut ctx, &["show", first.as_str()]).expect("show new");
+    assert_eq!(shown, b"new");
+    let shown = run(verbs_notes::notes, &mut ctx, &["show", second.as_str()]).expect("copy kept");
+    assert_eq!(shown, b"base\nmore");
+    run(verbs_notes::notes, &mut ctx, &["remove", first.as_str(), second.as_str()]).expect("remove");
+    let listed = run(verbs_notes::notes, &mut ctx, &["list"]).expect("list");
+    assert!(listed.is_empty(), "got {listed:?}");
+    let err = run(verbs_notes::notes, &mut ctx, &["show", first.as_str()]).expect_err("gone");
+    assert!(err.to_string().contains("no note"), "got {err:?}");
+    // Removing the last note deletes the ref instead of leaving emptiness.
+    run(verbs_history::rev_parse, &mut ctx, &["refs/notes/commits"]).expect_err("ref gone");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn notes_refs_merge_and_prune() {
+    let (root, env) = seeded_repo("notes-merge-prune", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    let head = notes_tip(&mut ctx);
+    let out = run(verbs_notes::notes, &mut ctx, &["get-ref", "--ref", "my-notes"])
+        .expect("get-ref");
+    assert_eq!(String::from_utf8(out).expect("utf8").trim(), "refs/notes/my-notes");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["--ref", "my-notes", "add", "-m", "custom", head.as_str()],
+    )
+    .expect("add other ref");
+    let listed = run(verbs_notes::notes, &mut ctx, &["list"]).expect("default empty");
+    assert!(listed.is_empty(), "got {listed:?}");
+    run(verbs_notes::notes, &mut ctx, &["merge", "my-notes"]).expect("merge");
+    let shown = run(verbs_notes::notes, &mut ctx, &["show", head.as_str()]).expect("merged");
+    assert_eq!(shown, b"custom");
+    run(
+        verbs_notes::notes,
+        &mut ctx,
+        &["--ref", "my-notes", "add", "-f", "-m", "diverged", head.as_str()],
+    )
+    .expect("diverge");
+    let err = run(verbs_notes::notes, &mut ctx, &["merge", "my-notes"])
+        .expect_err("conflict refused");
+    assert!(err.to_string().contains("differs on both sides"), "got {err:?}");
+    // A note for a missing object prunes away; live notes stay.
+    let mut ghost = head.clone();
+    ghost.replace_range(0..1, if &head[0..1] == "a" { "b" } else { "a" });
+    run(verbs_notes::notes, &mut ctx, &["add", "-m", "ghost", ghost.as_str()]).expect("ghost");
+    let dry = String::from_utf8(run(verbs_notes::notes, &mut ctx, &["prune", "-n"]).expect("dry"))
+        .expect("utf8");
+    assert!(dry.contains(&format!("would prune {ghost}")), "got {dry:?}");
+    let listed = String::from_utf8(run(verbs_notes::notes, &mut ctx, &["list"]).expect("list"))
+        .expect("utf8");
+    assert!(listed.contains(ghost.as_str()), "got {listed:?}");
+    let pruned =
+        String::from_utf8(run(verbs_notes::notes, &mut ctx, &["prune", "-v"]).expect("prune"))
+            .expect("utf8");
+    assert!(pruned.contains(&format!("pruned {ghost}")), "got {pruned:?}");
+    let shown = run(verbs_notes::notes, &mut ctx, &["show", head.as_str()]).expect("live kept");
+    assert_eq!(shown, b"custom");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn replace_redirects_history_verbs() {
+    let (root, env) = seeded_repo("replace-history", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    let first = notes_tip(&mut ctx);
+    lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second change");
+    let second = notes_tip(&mut ctx);
+    let before = run(verbs_history::diff, &mut ctx, &[first.as_str()]).expect("diff before");
+    assert!(!before.is_empty(), "baseline diff is empty");
+    run(verbs_notes::replace, &mut ctx, &[first.as_str(), second.as_str()]).expect("create");
+    // Raw resolution still spells the stored oid.
+    assert_eq!(notes_tip_of(&mut ctx, first.as_str()), first);
+    // Log walks the replacement: only the second subject renders.
+    let logged = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--oneline", first.as_str()]).expect("log"),
+    )
+    .expect("utf8");
+    assert!(logged.contains("second change"), "got {logged:?}");
+    assert!(!logged.contains("seed"), "got {logged:?}");
+    // Show renders the replacement commit.
+    let shown = String::from_utf8(
+        run(verbs_history::show, &mut ctx, &[first.as_str()]).expect("show"),
+    )
+    .expect("utf8");
+    assert!(shown.contains("second change"), "got {shown:?}");
+    // Diff against the worktree (which holds v2) goes quiet.
+    let after = run(verbs_history::diff, &mut ctx, &[first.as_str()]).expect("diff after");
+    assert!(after.is_empty(), "got {after:?}");
+    // Blame attributes lines to the replacement commit.
+    let blamed = String::from_utf8(
+        run(verbs_blame::blame, &mut ctx, &[first.as_str(), "f.txt"]).expect("blame"),
+    )
+    .expect("utf8");
+    assert!(blamed.contains(&second[..7]), "got {blamed:?}");
+    // Checkout materializes the replacement tree.
+    run(verbs_branch::checkout, &mut ctx, &["--detach", first.as_str()]).expect("detach");
+    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"v2\n");
+    // Deleting the replacement restores the original history.
+    run(verbs_notes::replace, &mut ctx, &["-d", first.as_str()]).expect("delete");
+    let logged = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--oneline", first.as_str()]).expect("log back"),
+    )
+    .expect("utf8");
+    assert!(logged.contains("seed"), "got {logged:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn replace_list_force_delete() {
+    let (root, env) = seeded_repo("replace-list", "f.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    let first = notes_tip(&mut ctx);
+    lane_commit(&mut ctx, &root, "f.txt", b"v2\n", "second change");
+    let second = notes_tip(&mut ctx);
+    lane_commit(&mut ctx, &root, "f.txt", b"v3\n", "third change");
+    let third = notes_tip(&mut ctx);
+    run(verbs_notes::replace, &mut ctx, &[first.as_str(), second.as_str()]).expect("create");
+    let err = run(verbs_notes::replace, &mut ctx, &[first.as_str(), third.as_str()])
+        .expect_err("clobber refused");
+    assert!(err.to_string().contains("already exists"), "got {err:?}");
+    let listed = String::from_utf8(run(verbs_notes::replace, &mut ctx, &["-l"]).expect("list"))
+        .expect("utf8");
+    assert_eq!(listed.trim(), first.as_str());
+    let pattern = format!("{}*", &first[..12]);
+    let filtered =
+        String::from_utf8(run(verbs_notes::replace, &mut ctx, &["-l", pattern.as_str()]).expect("glob"))
+            .expect("utf8");
+    assert_eq!(filtered.trim(), first.as_str());
+    let missed =
+        String::from_utf8(run(verbs_notes::replace, &mut ctx, &["-l", "no-such-*"]).expect("miss"))
+            .expect("utf8");
+    assert!(missed.is_empty(), "got {missed:?}");
+    run(verbs_notes::replace, &mut ctx, &["-f", first.as_str(), third.as_str()]).expect("force");
+    let shown = String::from_utf8(
+        run(verbs_history::show, &mut ctx, &[first.as_str()]).expect("show third"),
+    )
+    .expect("utf8");
+    assert!(shown.contains("third change"), "got {shown:?}");
+    run(verbs_notes::replace, &mut ctx, &["-d", first.as_str()]).expect("delete");
+    let listed = run(verbs_notes::replace, &mut ctx, &["-l"]).expect("empty");
+    assert!(listed.is_empty(), "got {listed:?}");
+    let err = run(verbs_notes::replace, &mut ctx, &["-d", first.as_str()])
+        .expect_err("double delete");
+    assert!(err.to_string().contains("no replacement"), "got {err:?}");
+    let err = run(verbs_notes::replace, &mut ctx, &[second.as_str(), second.as_str()])
+        .expect_err("self refused");
+    assert!(err.to_string().contains("itself"), "got {err:?}");
+    let mut ghost = second.clone();
+    ghost.replace_range(0..1, if &second[0..1] == "a" { "b" } else { "a" });
+    let err = run(verbs_notes::replace, &mut ctx, &[ghost.as_str(), third.as_str()])
+        .expect_err("missing orig");
+    assert!(err.to_string().contains("does not exist"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

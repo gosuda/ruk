@@ -1,6 +1,6 @@
 # CLI verb status
 
-81 verbs, one row each. Statuses: **implemented** (real native-store
+90 verbs, one row each. Statuses: **implemented** (real native-store
 transitions), **partial** (resolves and validates, then completes only the
 cases its backing covers), **unsupported** (typed `Unsupported` with the
 reason; exit code 1 through `GitError::exit_code`).
@@ -54,6 +54,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | check-ignore | implemented | `.rukignore` glob scan (`*`/`?`/`[...]`/`!`); no file means nothing ignored (exit 1) |
 | check-ref-format | implemented | `RefName` validation; `--print`, `--branch` |
 | checkout | implemented | branch switch, detach, `-b`/`-B`, path restore |
+| checkout-index | implemented | `-a`, `-f`, `-u` (accepts, stat-less), `-q`, `--prefix`, `--stage=1/2/3`, `--stdin` (`-z`); existing differing files refuse without `-f`; gitlinks skipped; `--stage=all`, `--temp` are `Unsupported` |
 | cherry | implemented | `upstream [head [base]]`, `+`/`-` by tree-diff content patch-id, `-v` |
 | cherry-pick | implemented | per-commit three-way replay (syntax lane, text fallback); `-n`, `-m`, `-x`; `--continue`/`--skip`/`--abort` over `CHERRY_PICK_HEAD` + todo state |
 | clean | implemented | `-f`/`-d`/`-n`/`-e`; `.rukignore` skipped by default, `-x` includes ignored, `-X` only ignored; files under untracked dirs need `-d` |
@@ -84,17 +85,23 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | ls-tree | implemented | `-r`, `--name-only`; gitlinks report as commits |
 | merge | implemented | fast-forward fast-path; three-way content merge via the syntax lane (bounded text fallback); `--no-ff`, `--ff-only`; conflicts leave stages 1/2/3, `MERGE_HEAD`/`ORIG_HEAD`, sequencer state with `--continue`/`--abort`/`--quit` |
 | merge-base | implemented | pairwise paint-down; `--is-ancestor` exits 1 when false |
+| merge-file | implemented | three worktree files, markers back into `<current>` (or `-p` stdout); `-q`, `-L`, `--ours`/`--theirs`/`--union`, `--diff3`, `--marker-size`; conflicts exit 1 (`-p` bytes ride the error detail); binary refuses without a resolve mode; needs no repository |
+| merge-tree | implemented | `<base> <ours> <theirs>` merged to a new tree, index/worktree untouched; prints the tree id plus `CONFLICT` lines, exit 0; no `--write-tree`/`--name-only` |
 | migrate | implemented | exact import of a real `.git` (loose, packs, refs, `HEAD`); `--force` replaces an existing `.ruk`; no checkout/config/hooks |
 | mktree | implemented | canonical sort, mode/type agreement checks |
 | mv | implemented | all stages renamed, worktree file renamed; `-f` allows overwrite |
 | name-rev | implemented | multi-tip breadth-first naming; `--tags`/`--name-only`/`--refs` |
+| notes | implemented | `add`/`show`/`list`/`append`/`edit`/`copy`/`remove`/`get-ref`/`merge`/`prune` over `refs/notes/commits` (commit-backed flat hex map); `--ref`, `GIT_NOTES_REF`, `core.notesRef`; `edit` reads `-m`/`-F`/stdin, no editor |
 | pack-objects | implemented | self-contained pack v2 to `<base>.pack` or `--stdout`; stdin-only input (exact oids, or rev-list args with `--revs`, plus `--all`); `--thin` needs `--stdout` and stays full without receiver haves; `--no-thin`, `--delta-base-offset`/`--no-delta-base-offset` inert |
 | pull | implemented | local paths only; fetch plus fast-forward merge |
 | push | implemented | local, `ssh://`, `git://`, and smart/dumb-http; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
+| read-tree | implemented | one-tree replace, `--empty`, `-m` two/three-tree (stages 1/2/3, no content merge), `--reset`, `-u` scoped checkout; one-tree `-m` only fast-forwards; `--prefix`, `--index-output`, `--trivial`, `--aggressive`, `--dry-run` are `Unsupported` |
 | rebase | implemented | `<upstream>` and `--onto <new> <upstream>` replay over the merge lane; `--continue`/`--skip`/`--abort`; drops merge commits; no branch switching |
 | receive-pack | implemented | serves pushes over stdin/stdout via `ruk receive-pack <dir>` and the `git-receive-pack` argv0 name; v0 wire |
 | reflog | implemented | `show`/`list`/`expire`/`delete` over the rows `update-ref -m` writes |
 | remote | implemented | backed by `remote.<name>.*` config records |
+| rerere | implemented | bare run replays recorded resolutions (staging stage zero) and records preimages/postimages under `cli/rerere/`; `status`/`diff`/`remaining`/`forget`/`clear`/`gc` (15d preimage / 60d resolved); ids hash conflict hunks, labels excluded; no `rerere.enabled` config |
+| replace | implemented | create (`-f`), `-l [<pattern>]`, `-d`; `refs/replace/*` redirects commit reads and history walks plus tip redirection in `log`/`blame`/`diff`/`checkout`; no graft/edit, no transfer over fetch/push/clone, `--no-replace-objects` stays inert |
 | reset | implemented | `--soft`, `--mixed` (default), `--hard` with worktree sync, path form |
 | restore | implemented | `--staged`/`--worktree` (default worktree), `--source` |
 | rev-list | implemented | `--count`, `-n`/`--max-count` |
@@ -104,9 +111,11 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | show | implemented | `--oneline`, `-s`, `--stat`, `--name-only`, parent diff |
 | shortlog | implemented | `-s`/`-n`/`-e`, ranges, `--all` |
 | show-ref | implemented | `--head`, `--verify`, `--tags`, `--heads`, patterns |
+| sparse-checkout | implemented | `init`/`set` (patterns, `--stdin`, `--no-reapply`)/`list`/`disable`/`reapply` over `.ruk/info/sparse-checkout` + `core.sparseCheckout`; out-of-cone stage-zero rows carry skip-worktree, worktree holds only matches; dirty rewrites refuse; `--cone` is `Unsupported`; branch-switch checkouts and `status` ignore the sparse set |
 | stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; oracle two-commit shape (index + `WIP` parents); apply refuses only staged or worktree changes on paths the stash touches |
 | status | implemented | `--porcelain`, `--short`, `--branch`, long format; staged renames always paired when identical, `-M` pairs by similarity staged and worktree |
 | stripspace | implemented | trailing-blank collapse; `--strip-comments` |
+| submodule | implemented | `add` (local clone, gitlink + `.rukmodules`), `status` (`--cached`/`--recursive`), `init`, `deinit`, `update` (`--init`/`--recursive`/`--remote`), `summary`, `foreach` (`--recursive`); `absorbgitdirs` is `Unsupported` (child `.ruk` needs no gitdir absorption) |
 | switch | implemented | `-c`/`-C`, `--detach`, remote guess |
 | symbolic-ref | implemented | `HEAD` moves the workspace row; other names are ref symrefs |
 | tag | implemented | lightweight, annotated (`-a`/`-m`), list with globs, delete |
