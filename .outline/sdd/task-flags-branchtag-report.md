@@ -1,0 +1,3 @@
+branch/tag/switch/checkout/reset flag parity (verbs_branch.rs).
+Added: branch -c/-C/-l/-vv/--merged/--no-merged/--contains/--no-contains/--points-at/--sort/--format/--abbrev/--track/--no-track/--create-reflog; tag --sort/--format/--points-at/--merged/--no-merged/--contains/--no-contains/--cleanup; switch --orphan/-t/--no-track/-m/--conflict; checkout --orphan/-m/--conflict/--guess/--ours/--theirs/--source/--staged/--worktree; reset --keep/-N/--no-refresh.
+Named-gap (Unsupported, concrete blocker): --edit-description/-e (no editor), checkout/reset -p (interactive), --pathspec-from-file (pathspec-file lane), checkout --ignore-skip-worktree-bits, reset --merge (three-way lane), tag signing (no GPG).

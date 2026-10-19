@@ -72,6 +72,16 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             takes_value: false,
         },
         FlagSpec {
+            long: "copy",
+            short: Some('c'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "force-copy",
+            short: Some('C'),
+            takes_value: false,
+        },
+        FlagSpec {
             long: "force",
             short: Some('f'),
             takes_value: false,
@@ -93,7 +103,7 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         },
         FlagSpec {
             long: "list",
-            short: None,
+            short: Some('l'),
             takes_value: false,
         },
         FlagSpec {
@@ -111,6 +121,69 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "sort",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "format",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "points-at",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "track",
+            short: Some('t'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-track",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "create-reflog",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "edit-description",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "abbrev",
+            short: None,
+            takes_value: true,
+        },
+        // Accepted and inert: piped output is already one-per-line with no
+        // color, which is what `--column`/`--color` select for non-TTY
+        // output in the oracle; `--no-column`/`--no-color` are the default.
+        FlagSpec {
+            long: "column",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-column",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "color",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-color",
+            short: None,
+            takes_value: false,
+        },
         // Accepted for script compatibility: branch output is already quiet
         // except for the delete notice, which this suppresses.
         FlagSpec {
@@ -119,7 +192,115 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             takes_value: false,
         },
     ];
-    let opts = collect(args, &specs)?;
+    // `--merged`/`--no-merged`/`--contains`/`--no-contains` take an optional
+    // commit (default `HEAD`, oracle `LASTARG_DEFAULT`): pull them out before
+    // `collect`, which cannot express optional values. `--with`/`--without`
+    // are the oracle's hidden aliases for `--contains`/`--no-contains`.
+    // `-vv` and other combined no-value shorts are expanded here too, since
+    // `collect` only accepts one short per token.
+    let mut merged: Vec<String> = Vec::new();
+    let mut no_merged: Vec<String> = Vec::new();
+    let mut contains: Vec<String> = Vec::new();
+    let mut no_contains: Vec<String> = Vec::new();
+    let mut pre = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let mut consumed: Option<fn(&mut Vec<String>, String)> = None;
+        let mut inline: Option<String> = None;
+        let mut bare_name: Option<&str> = None;
+        for name in [
+            "--merged",
+            "--no-merged",
+            "--contains",
+            "--no-contains",
+            "--with",
+            "--without",
+        ] {
+            if arg == name {
+                bare_name = Some(name);
+                break;
+            }
+            if let Some(rest) = arg.strip_prefix(&format!("{name}=")) {
+                inline = Some(rest.to_owned());
+                bare_name = Some(name);
+                break;
+            }
+        }
+        if let Some(name) = bare_name {
+            let push: fn(&mut Vec<String>, String) = match name {
+                "--merged" => |v, s| v.push(s),
+                "--no-merged" => |v, s| v.push(s),
+                "--contains" | "--with" => |v, s| v.push(s),
+                _ => |v, s| v.push(s),
+            };
+            let _ = push;
+            let value = if let Some(v) = inline {
+                v
+            } else if index + 1 < args.len()
+                && args[index + 1] != "--"
+                && !args[index + 1].starts_with('-')
+            {
+                index += 1;
+                args[index].clone()
+            } else {
+                "HEAD".to_owned()
+            };
+            match name {
+                "--merged" => merged.push(value),
+                "--no-merged" => no_merged.push(value),
+                "--contains" | "--with" => contains.push(value),
+                _ => no_contains.push(value),
+            }
+            consumed = Some(|_, _| {});
+            let _ = consumed;
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.len() > 2
+            && !arg.contains('=')
+            && arg[1..].chars().all(|ch| {
+                specs.iter().any(|spec| {
+                    spec.short == Some(ch) && !spec.takes_value
+                })
+            })
+        {
+            for ch in arg[1..].chars() {
+                pre.push(format!("-{ch}"));
+            }
+            index += 1;
+            continue;
+        }
+        pre.push(arg.clone());
+        index += 1;
+    }
+    let mut opts = collect(&pre, &specs)?;
+    for value in merged {
+        opts.present
+            .entry("merged".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
+    for value in no_merged {
+        opts.present
+            .entry("no-merged".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
+    for value in contains {
+        opts.present
+            .entry("contains".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
+    for value in no_contains {
+        opts.present
+            .entry("no-contains".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
     let store = ctx.store()?;
     if opts.is_set("show-current") {
         let current = current_branch_name(store)?.unwrap_or_default();
@@ -137,13 +318,44 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if opts.is_set("move") || opts.is_set("force-move") {
         return rename_branch(ctx, &opts);
     }
+    if opts.is_set("copy") || opts.is_set("force-copy") {
+        return copy_branch(ctx, &opts);
+    }
+    if opts.is_set("edit-description") {
+        return Err(GitError::Unsupported {
+            command: "branch --edit-description needs an editor, which this store does not run"
+                .to_owned(),
+        });
+    }
+    if opts.is_set("track") && opts.is_set("no-track") {
+        return Err(GitError::Invalid {
+            detail: "cannot combine --track and --no-track".to_owned(),
+        });
+    }
+    // Any list-shaping flag implies `--list`: positionals are patterns, not a
+    // branch to create, the way the oracle's `filter`/`format` options do.
+    let list_mode = opts.is_set("list")
+        || opts.count("verbose") > 0
+        || opts.is_set("merged")
+        || opts.is_set("no-merged")
+        || opts.is_set("contains")
+        || opts.is_set("no-contains")
+        || opts.all("sort").is_ok_and(|v| !v.is_empty())
+        || opts.single("format").is_ok_and(|v| v.is_some())
+        || opts.all("points-at").is_ok_and(|v| !v.is_empty());
     match opts.positionals.as_slice() {
         [] => list_branches(ctx, &opts),
-        _ if opts.is_set("list") => list_branches(ctx, &opts),
+        _ if list_mode => list_branches(ctx, &opts),
         _ if opts.is_set("remotes") || opts.is_set("all") => Err(GitError::Invalid {
             detail: "the -a, and -r, options to 'git branch' do not take a branch name.\nDid you mean to use: -a|-r --list <pattern>?".to_owned(),
         }),
         [name] => {
+            if opts.is_set("track") {
+                return Err(GitError::Invalid {
+                    detail: "cannot set up tracking information; starting point is HEAD"
+                        .to_owned(),
+                });
+            }
             let refname = branch_name(name)?;
             if super::state::read_ref(store, &refname)?.is_some() {
                 if !opts.is_set("force") {
@@ -158,6 +370,8 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             }
             let target = resolve_branch_target(store, ctx.kind()?, None)?;
             create_branch(store, ctx.kind()?, name, target)?;
+            // `--create-reflog` is already satisfied: refs carry their rows
+            // on creation, so there is no separate reflog file to make.
             Ok(Vec::new())
         }
         [name, start] => {
@@ -173,6 +387,9 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 refuse_checked_out_branch(store, name)?;
             }
             force_branch(store, ctx.kind()?, name, target)?;
+            if opts.is_set("track") {
+                record_tracking(store, name, start)?;
+            }
             Ok(Vec::new())
         }
         _ => Err(GitError::Invalid {
@@ -299,12 +516,138 @@ fn unset_branch_upstream(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, 
     Ok(Vec::new())
 }
 
+/// Copies a branch ref, the way `git branch -c/-C` duplicates the ref and
+/// its upstream config.
+///
+/// Oracle: `git/builtin/branch.c` (`copy_branch`).
+fn copy_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let (old, new) = match opts.positionals.as_slice() {
+        [new] => {
+            let current = current_branch_name(store)?.ok_or_else(|| GitError::Invalid {
+                detail: "not on a branch".to_owned(),
+            })?;
+            (current, new.clone())
+        }
+        [old, new] => {
+            let full = if old.starts_with("refs/") {
+                old.clone()
+            } else {
+                format!("refs/heads/{old}")
+            };
+            (full, new.clone())
+        }
+        _ => {
+            return Err(GitError::Invalid {
+                detail: "usage: branch -c [<old>] <new>".to_owned(),
+            });
+        }
+    };
+    let old_name = RefName::new(old.clone()).map_err(|err| GitError::Invalid {
+        detail: format!("bad branch name: {err}"),
+    })?;
+    let new_name = branch_name(&new)?;
+    let target = super::state::read_ref(store, &old_name)?.ok_or_else(|| GitError::NotFound {
+        detail: format!("branch {old:?} does not exist"),
+    })?;
+    if super::state::read_ref(store, &new_name)?.is_some() && !opts.is_set("force-copy") {
+        return Err(GitError::Invalid {
+            detail: format!("branch {new:?} already exists"),
+        });
+    }
+    let force = opts.is_set("force-copy");
+    apply_refs(
+        store,
+        kind,
+        vec![RefUpdate {
+            name: new_name.clone(),
+            expected: if force {
+                RefExpect::Any
+            } else {
+                RefExpect::Absent
+            },
+            change: match target {
+                RefTarget::Direct(oid) => RefChange::Set(RefTarget::Direct(oid)),
+                RefTarget::Symbolic(name) => RefChange::Set(RefTarget::Symbolic(name)),
+            },
+        }],
+    )?;
+    // Copy the upstream config the way the oracle copies the branch config.
+    let old_short = old
+        .strip_prefix("refs/heads/")
+        .unwrap_or(old.as_str())
+        .to_owned();
+    let new_short = new
+        .strip_prefix("refs/heads/")
+        .unwrap_or(new.as_str())
+        .to_owned();
+    for key in ["remote", "merge"] {
+        let from = format!("branch.{old_short}.{key}");
+        if let Some(value) = config_read(store, &from)? {
+            config_write(store, &format!("branch.{new_short}.{key}"), &value)?;
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Counts commits reachable from `tip` but not `base` and vice versa, the
+/// `ahead`/`behind` pair `branch -vv` prints.
+fn branch_ahead_behind(store: &Store, tip: Oid, base: Oid) -> Result<(usize, usize), GitError> {
+    fn reachable(store: &Store, start: Oid) -> Result<std::collections::HashSet<Oid>, GitError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            let record = match super::state::commit_record(store, oid) {
+                Ok(record) => record,
+                Err(GitError::NotFound { .. }) => continue,
+                Err(other) => return Err(other),
+            };
+            for parent in record.parents() {
+                if let ruk_core::heads::Head::Git { oid } = parent {
+                    stack.push(*oid);
+                }
+            }
+        }
+        Ok(seen)
+    }
+    let from_tip = reachable(store, tip)?;
+    let from_base = reachable(store, base)?;
+    Ok((
+        from_tip.difference(&from_base).count(),
+        from_base.difference(&from_tip).count(),
+    ))
+}
+
+/// Names the upstream tracking ref for a local branch short name, if its
+/// `branch.<name>.remote`/`branch.<name>.merge` config exists.
+fn branch_upstream_ref(store: &Store, short: &str) -> Result<Option<(String, String)>, GitError> {
+    let remote = config_read(store, &format!("branch.{short}.remote"))?;
+    let merge = config_read(store, &format!("branch.{short}.merge"))?;
+    match (remote, merge) {
+        (Some(remote), Some(merge)) => {
+            let branch_part = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+            let full = if remote == "." {
+                merge.clone()
+            } else {
+                format!("refs/remotes/{remote}/{branch_part}")
+            };
+            Ok(Some((full, remote)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Lists local branches, current marked, with optional remotes and oids.
 fn list_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let current = current_branch_name(store)?;
     let remotes_only = opts.is_set("remotes");
     let mut out = Vec::new();
+    let mut branch_rows: Vec<(String, String, char, RefTarget)> = Vec::new();
     for (name, target) in list_refs(store)? {
         let text = name.to_utf8().unwrap_or_default().to_owned();
         let is_branch = text.starts_with("refs/heads/");
@@ -333,12 +676,150 @@ fn list_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
         } else {
             ' '
         };
-        if opts.is_set("verbose") {
-            let detail = ref_detail(ctx, &target)?;
-            out.extend_from_slice(format!("{mark} {short} {detail}\n").as_bytes());
-        } else {
-            out.extend_from_slice(format!("{mark} {short}\n").as_bytes());
+        // Defer rendering until filters/sort apply; collect first.
+        branch_rows.push((text.clone(), short.to_owned(), mark, target.clone()));
+    }
+    // `--merged`/`--contains` family: resolve each commit once, then keep
+    // only rows whose tip stands in the required ancestry relation.
+    let resolve_filter = |values: Vec<String>| -> Result<Vec<Oid>, GitError> {
+        let mut oids = Vec::with_capacity(values.len());
+        for value in values {
+            oids.push(resolve_rev(store, ctx.kind()?, &value)?);
         }
+        Ok(oids)
+    };
+    let merged = resolve_filter(opts.all("merged")?)?;
+    let no_merged = resolve_filter(opts.all("no-merged")?)?;
+    let contains = resolve_filter(opts.all("contains")?)?;
+    let no_contains = resolve_filter(opts.all("no-contains")?)?;
+    let mut points_at: Vec<Oid> = Vec::new();
+    for value in opts.all("points-at")? {
+        points_at.push(resolve_rev(store, ctx.kind()?, &value)?);
+    }
+    let mut kept: Vec<(String, String, char, RefTarget)> = Vec::new();
+    for (text, short, mark, target) in branch_rows {
+        let tip = peel_direct(&target);
+        if !points_at.is_empty() {
+            let mut hit = false;
+            if let Some(tip) = tip {
+                if points_at.contains(&tip) {
+                    hit = true;
+                }
+                // Annotated tags point at tag objects but read as commits.
+                if !hit
+                    && peel_target_oid(ctx, &target)?
+                        .is_some_and(|peeled| points_at.contains(&peeled))
+                {
+                    hit = true;
+                }
+                if !hit
+                    && peel_tag_target(ctx, &target)?
+                        .is_some_and(|peeled| points_at.contains(&peeled))
+                {
+                    hit = true;
+                }
+            }
+            if !hit {
+                continue;
+            }
+        }
+        // Ancestry filters need a concrete tip; symbolic/unborn rows cannot
+        // satisfy them, so they drop out when any such filter is present.
+        if !merged.is_empty() || !no_merged.is_empty() || !contains.is_empty() || !no_contains.is_empty() {
+            let Some(tip) = tip else { continue };
+            let mut ok = true;
+            for base in &merged {
+                if !is_ancestor(store, tip, *base).unwrap_or(false) && tip != *base {
+                    ok = false;
+                    break;
+                }
+            }
+            for base in &no_merged {
+                if is_ancestor(store, tip, *base).unwrap_or(false) || tip == *base {
+                    ok = false;
+                    break;
+                }
+            }
+            for commit in &contains {
+                if !is_ancestor(store, *commit, tip).unwrap_or(false) && tip != *commit {
+                    ok = false;
+                    break;
+                }
+            }
+            for commit in &no_contains {
+                if is_ancestor(store, *commit, tip).unwrap_or(false) || tip == *commit {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+        }
+        kept.push((text, short, mark, target));
+    }
+    sort_branch_rows(ctx, &mut kept, &opts.all("sort")?)?;
+    let abbrev = match opts.single("abbrev")? {
+        Some(text) => Some(text.parse::<usize>().map_err(|_| GitError::Invalid {
+            detail: format!("bad --abbrev value {text:?}"),
+        })?),
+        None => None,
+    };
+    let verbose = opts.count("verbose");
+    if let Some(format) = opts.single("format")? {
+        for (text, short, mark, target) in &kept {
+            let row = BranchRow {
+                full: text,
+                short: short,
+                mark: *mark,
+                target,
+            };
+            out.extend_from_slice(&render_branch_format(ctx, &format, &row, abbrev)?);
+        }
+        return Ok(out);
+    }
+    for (text, short, mark, target) in &kept {
+        if verbose == 0 {
+            out.extend_from_slice(format!("{mark} {short}\n").as_bytes());
+            continue;
+        }
+        let mut detail = ref_detail_abbrev(ctx, target, abbrev)?;
+        if verbose >= 2 && text.starts_with("refs/heads/") {
+            let local = text.trim_start_matches("refs/heads/");
+            if let Some((upstream_full, _)) = branch_upstream_ref(store, local)? {
+                let upstream_short = shorten_refname(&upstream_full);
+                match super::state::read_ref(
+                    store,
+                    &RefName::new(upstream_full.clone()).map_err(|err| GitError::Invalid {
+                        detail: format!("bad upstream ref: {err}"),
+                    })?,
+                )? {
+                    None => {
+                        detail.push_str(&format!(" [{upstream_short}: gone]"));
+                    }
+                    Some(upstream_target) => {
+                        if let (Some(tip), Some(base)) =
+                            (peel_direct(target), peel_direct(&upstream_target))
+                        {
+                            let (ahead, behind) =
+                                branch_ahead_behind(store, tip, base).unwrap_or((0, 0));
+                            let tracking = match (ahead, behind) {
+                                (0, 0) => String::new(),
+                                (a, 0) => format!(" [{upstream_short}: ahead {a}]"),
+                                (0, b) => format!(" [{upstream_short}: behind {b}]"),
+                                (a, b) => {
+                                    format!(" [{upstream_short}: ahead {a}, behind {b}]")
+                                }
+                            };
+                            detail.push_str(&tracking);
+                        } else {
+                            detail.push_str(&format!(" [{upstream_short}]"));
+                        }
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(format!("{mark} {short} {detail}\n").as_bytes());
     }
     Ok(out)
 }
@@ -363,6 +844,206 @@ fn ref_detail(ctx: &Ctx, target: &RefTarget) -> Result<String, GitError> {
         .map(|record| first_message_line(record.message()))
         .unwrap_or_default();
     Ok(format!("{} {subject}", oid.to_hex()))
+}
+
+/// Renders the oid (abbreviated to `width` hex digits when given) and
+/// subject behind one listed ref target.
+fn ref_detail_abbrev(
+    ctx: &Ctx,
+    target: &RefTarget,
+    width: Option<usize>,
+) -> Result<String, GitError> {
+    let store = ctx.store()?;
+    let oid = match target {
+        RefTarget::Direct(oid) => *oid,
+        RefTarget::Symbolic(name) => {
+            let resolved = ruk_core::refdata::resolve(&StoreRefs::new(store), name)
+                .map_err(|err| GitError::from(CoreError::from(err)))?;
+            resolved.oid.ok_or_else(|| GitError::NotFound {
+                detail: "symbolic ref points at an unborn branch".to_owned(),
+            })?
+        }
+    };
+    let hex = oid.to_hex();
+    let shown = match width {
+        Some(n) => hex.chars().take(n).collect::<String>(),
+        None => hex,
+    };
+    let records = ruk_core::records::Records::new(store);
+    let subject = records
+        .get_commit(&Head::Git { oid })
+        .map_err(GitError::from)?
+        .map(|record| first_message_line(record.message()))
+        .unwrap_or_default();
+    Ok(format!("{shown} {subject}"))
+}
+
+/// Sorts branch rows by `--sort` keys (`-` prefixes reverse), matching the
+/// `for-each-ref` key set (`refname`, `objectname`, `objecttype`,
+/// `authordate`, `committerdate`, `creatordate`).
+fn sort_branch_rows(
+    ctx: &Ctx,
+    rows: &mut [(String, String, char, RefTarget)],
+    keys: &[String],
+) -> Result<(), GitError> {
+    let mut parsed = Vec::with_capacity(keys.len());
+    for key in keys {
+        let (name, reverse) = key
+            .strip_prefix('-')
+            .map_or((key.as_str(), false), |rest| (rest, true));
+        match name {
+            "refname" | "objectname" | "objecttype" | "authordate" | "committerdate"
+            | "creatordate" => parsed.push((name, reverse)),
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("unknown --sort key {key:?}"),
+                });
+            }
+        }
+    }
+    if parsed.is_empty() {
+        return Ok(());
+    }
+    let mut decorated = Vec::with_capacity(rows.len());
+    for (text, _, _, target) in rows.iter() {
+        let info = ref_commit_info(ctx, target)?;
+        let oid = peel_target_oid(ctx, target)?
+            .map(|oid| oid.to_hex())
+            .unwrap_or_default();
+        decorated.push((
+            text.clone(),
+            ref_object_type_or_empty(ctx, target)?,
+            oid,
+            info.as_ref().map(|info| info.author_ts).unwrap_or(0),
+            info.as_ref().map(|info| info.committer_ts).unwrap_or(0),
+        ));
+    }
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&left, &right| {
+        let (lname, ltype, loid, lauthor, lcommitter) = &decorated[left];
+        let (rname, rtype, roid, rauthor, rcommitter) = &decorated[right];
+        let mut verdict = std::cmp::Ordering::Equal;
+        for (name, reverse) in &parsed {
+            let next = match *name {
+                "refname" => lname.cmp(rname),
+                "objectname" => loid.cmp(roid),
+                "objecttype" => ltype.cmp(rtype),
+                "authordate" => lauthor.cmp(rauthor),
+                _ => lcommitter.cmp(rcommitter),
+            };
+            if next != std::cmp::Ordering::Equal {
+                verdict = if *reverse { next.reverse() } else { next };
+                break;
+            }
+        }
+        verdict
+    });
+    rows.sort_by(|_, _| std::cmp::Ordering::Equal);
+    let mut sorted: Vec<(String, String, char, RefTarget)> = Vec::with_capacity(rows.len());
+    for index in order {
+        let (text, short, mark, target) = &rows[index];
+        sorted.push((text.clone(), short.clone(), *mark, target.clone()));
+    }
+    rows.iter_mut().enumerate().for_each(|(i, row)| {
+        let (text, short, mark, target) = &sorted[i];
+        *row = (text.clone(), short.clone(), *mark, target.clone());
+    });
+    Ok(())
+}
+
+/// One branch row for `--format` rendering.
+struct BranchRow<'a> {
+    full: &'a str,
+    short: &'a str,
+    mark: char,
+    target: &'a RefTarget,
+}
+
+/// Renders one branch row with `--format`: the `for-each-ref` atoms plus
+/// `%(upstream)`, `%(upstream:short)`, and `%(HEAD)` (`*` on current).
+fn render_branch_format(
+    ctx: &Ctx,
+    format: &str,
+    row: &BranchRow<'_>,
+    abbrev: Option<usize>,
+) -> Result<Vec<u8>, GitError> {
+    let full = row.full;
+    let short = row.short;
+    let mark = row.mark;
+    let target = row.target;
+    let store = ctx.store()?;
+    let mut rendered = String::new();
+    let mut rest = format;
+    while let Some(start) = rest.find("%(") {
+        rendered.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find(')').ok_or_else(|| GitError::Invalid {
+            detail: "bad --format: missing )".to_owned(),
+        })?;
+        match &after[..end] {
+            "refname" => rendered.push_str(full),
+            "refname:short" => rendered.push_str(short),
+            "objectname" => {
+                let oid = peel_target_oid(ctx, target)?.ok_or_else(|| GitError::NotFound {
+                    detail: format!("ref {full} is unborn"),
+                })?;
+                rendered.push_str(&oid.to_hex());
+            }
+            "objectname:short" => {
+                let oid = peel_target_oid(ctx, target)?.ok_or_else(|| GitError::NotFound {
+                    detail: format!("ref {full} is unborn"),
+                })?;
+                let hex = oid.to_hex();
+                let width = abbrev.unwrap_or(7);
+                rendered.push_str(&hex.chars().take(width).collect::<String>());
+            }
+            "objecttype" => rendered.push_str(&ref_object_type(ctx, target)?),
+            "subject" => {
+                let info = ref_commit_info(ctx, target)?;
+                rendered.push_str(&info.map(|i| i.subject).unwrap_or_default());
+            }
+            "authorname" => {
+                let info = ref_commit_info(ctx, target)?;
+                rendered.push_str(&info.map(|i| i.author_name).unwrap_or_default());
+            }
+            "committername" => {
+                let info = ref_commit_info(ctx, target)?;
+                rendered.push_str(&info.map(|i| i.committer_name).unwrap_or_default());
+            }
+            "creatordate" | "creatordate:iso" => {
+                let info = ref_commit_info(ctx, target)?;
+                if let Some(known) = info {
+                    rendered.push_str(&iso_datetime(known.committer_ts, known.committer_offset));
+                }
+            }
+            "upstream" => {
+                if full.starts_with("refs/heads/") {
+                    let local = full.trim_start_matches("refs/heads/");
+                    if let Some((upstream_full, _)) = branch_upstream_ref(store, local)? {
+                        rendered.push_str(&upstream_full);
+                    }
+                }
+            }
+            "upstream:short" => {
+                if full.starts_with("refs/heads/") {
+                    let local = full.trim_start_matches("refs/heads/");
+                    if let Some((upstream_full, _)) = branch_upstream_ref(store, local)? {
+                        rendered.push_str(shorten_refname(&upstream_full));
+                    }
+                }
+            }
+            "HEAD" => rendered.push(mark),
+            other => {
+                return Err(GitError::Invalid {
+                    detail: format!("unsupported --format field %({other})"),
+                });
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    rendered.push_str(rest);
+    rendered.push('\n');
+    Ok(rendered.into_bytes())
 }
 
 /// Takes the first message line for branch listings.
@@ -607,19 +1288,189 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             short: Some('t'),
             takes_value: false,
         },
+        FlagSpec {
+            long: "no-track",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "orphan",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "merge",
+            short: Some('m'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "conflict",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "guess",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-guess",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ours",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "theirs",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "source",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "staged",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "worktree",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "patch",
+            short: Some('p'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "ignore-skip-worktree-bits",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "pathspec-from-file",
+            short: None,
+            takes_value: true,
+        },
+        // Accepted and inert: checkouts never report progress.
+        FlagSpec {
+            long: "progress",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-progress",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted and inert: this store never refuses a checkout for
+        // another worktree holding the branch.
+        FlagSpec {
+            long: "ignore-other-worktrees",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
+    if opts.is_set("patch") {
+        return Err(GitError::Unsupported {
+            command: "checkout --patch needs interactive hunk selection".to_owned(),
+        });
+    }
+    if opts.single("pathspec-from-file")?.is_some() {
+        return Err(GitError::Unsupported {
+            command: "checkout --pathspec-from-file needs the pathspec-file lane".to_owned(),
+        });
+    }
+    if opts.is_set("ignore-skip-worktree-bits") {
+        return Err(GitError::Unsupported {
+            command: "checkout --ignore-skip-worktree-bits needs skip-worktree handling".to_owned(),
+        });
+    }
+    if let Some(style) = opts.single("conflict")? {
+        match style.as_str() {
+            "merge" | "diff3" | "zdiff3" => {}
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("bad --conflict value {style:?}"),
+                });
+            }
+        }
+        if !opts.is_set("merge") {
+            return Err(GitError::Invalid {
+                detail: "option --conflict requires --merge".to_owned(),
+            });
+        }
+    }
+    if let Some(orphan) = opts.single("orphan")? {
+        if opts.single("branch")?.is_some() || opts.single("force-branch")?.is_some() {
+            return Err(GitError::Invalid {
+                detail: "cannot combine --orphan with -b/-B".to_owned(),
+            });
+        }
+        if opts.is_set("track") {
+            return Err(GitError::Invalid {
+                detail: "'--orphan' cannot be used with '-t'".to_owned(),
+            });
+        }
+        let start = opts.positionals.first().map(String::as_str);
+        return checkout_orphan(ctx, &orphan, start, opts.is_set("quiet"));
+    }
+    if opts.is_set("track") && opts.is_set("no-track") {
+        return Err(GitError::Invalid {
+            detail: "cannot combine --track and --no-track".to_owned(),
+        });
+    }
     if opts.is_set("track") {
         return checkout_new_branch_tracked(ctx, &opts);
     }
     if let Some(name) = opts.single("branch")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"));
+        let out = checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?;
+        if start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track") {
+            let Some(start) = start else {
+                return Ok(out);
+            };
+            record_tracking(ctx.store()?, &name, start)?;
+        }
+        return Ok(out);
     }
     if let Some(name) = opts.single("force-branch")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"));
+        let out = checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"))?;
+        if start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track") {
+            let Some(start) = start else {
+                return Ok(out);
+            };
+            record_tracking(ctx.store()?, &name, start)?;
+        }
+        return Ok(out);
+    }
+    if opts.is_set("ours") && opts.is_set("theirs") {
+        return Err(GitError::Invalid {
+            detail: "cannot combine --ours and --theirs".to_owned(),
+        });
+    }
+    if (opts.is_set("ours") || opts.is_set("theirs"))
+        && (opts.single("source")?.is_some()
+            || opts.positionals.first().is_some_and(|first| {
+                ctx.store()
+                    .and_then(|store| ctx.kind().map(|kind| (store, kind)))
+                    .is_ok_and(|(store, kind)| {
+                        super::state::resolve_rev(store, kind, first).is_ok()
+                    })
+            }))
+    {
+        return Err(GitError::Invalid {
+            detail: "cannot combine --ours/--theirs with a tree".to_owned(),
+        });
     }
     // `collect` strips `--`, so a lone positional after `--` must read as a
     // path, not a revision to switch to.
@@ -643,10 +1494,72 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             if saw_dashdash {
                 return checkout_paths(ctx, &opts);
             }
+            if opts.is_set("staged")
+                || opts.is_set("worktree")
+                || opts.is_set("ours")
+                || opts.is_set("theirs")
+                || opts.single("source")?.is_some()
+            {
+                return checkout_paths(ctx, &opts);
+            }
+            // `--guess` is the default: a lone name matching one
+            // remote-tracking branch creates it locally, like `switch`.
+            if !opts.is_set("no-guess") {
+                let store = ctx.store()?;
+                if branch_name(rev).is_ok()
+                    && super::state::read_ref(store, &branch_name(rev)?)?.is_none()
+                    && guess_remote_branch(store, rev)?.is_some()
+                {
+                    return switch_guessing(
+                        ctx,
+                        rev,
+                        true,
+                        opts.is_set("quiet"),
+                        !opts.is_set("no-track"),
+                    );
+                }
+            }
             switch_to_rev(ctx, rev, opts.is_set("quiet"))
         }
         _ => checkout_paths(ctx, &opts),
     }
+}
+
+/// Checks out a new unborn branch: `HEAD` moves to it, the index keeps its
+/// rows without a start point or takes the start tree with one, matching
+/// `checkout --orphan [<start-point>]`.
+fn checkout_orphan(
+    ctx: &mut Ctx,
+    name: &str,
+    start: Option<&str>,
+    quiet: bool,
+) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    if super::state::read_ref(store, &branch_name(name)?)?.is_some() {
+        return Err(GitError::Invalid {
+            detail: format!("branch {name:?} already exists"),
+        });
+    }
+    let (workspace, raw) = load_or_default(store)?;
+    let next = workspace.checkout(workspace.stamp, HeadRef::Symbolic(branch_name(name)?))?;
+    let mut mutations = Vec::new();
+    if let Some(start) = start {
+        let oid = resolve_rev(store, kind, start)?;
+        let tree = peel_to_tree(store, kind, oid)?;
+        mutations.extend(reset_index_to(store, kind, tree)?);
+    }
+    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    store
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
+    if start.is_some() {
+        sync_worktree_to_index(ctx)?;
+    }
+    if !quiet {
+        ctx.emit_stderr(format!("Switched to a new branch '{name}'\n").as_bytes());
+    }
+    Ok(Vec::new())
 }
 
 /// Creates and checks out a branch that tracks its start point, recording
@@ -799,7 +1712,12 @@ fn head_tree_of(store: &Store, head: &HeadRef) -> Result<Oid, GitError> {
     }
 }
 
-/// Restores worktree paths from the index or one revision's tree.
+/// Restores paths from the index, a revision tree, or a conflict stage.
+///
+/// `--ours`/`--theirs` select stage 2/3 for unmerged paths; `--source`
+/// names the tree explicitly; `--staged`/`--worktree` scope the restore to
+/// the index and/or worktree (default: index and worktree from a tree,
+/// worktree from the index).
 fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -807,19 +1725,61 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     if positionals.first().is_some_and(|first| *first == "--") {
         positionals = &positionals[1..];
     }
-    let (tree_paths, source_tree) = match positionals {
-        [] => {
-            return Err(GitError::Invalid {
-                detail: "checkout needs paths".to_owned(),
-            });
+    if positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "checkout needs paths".to_owned(),
+        });
+    }
+    if let Some(want) = positionals.first() {
+        if want == "--" {
+            positionals = &positionals[1..];
         }
-        [single] => (std::slice::from_ref(single), None),
-        [rev, rest @ ..] => {
-            let oid = replace_redirect(store, resolve_rev(store, kind, rev)?);
-            (rest, Some(peel_to_tree(store, kind, oid)?))
+    }
+    if positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "checkout needs paths".to_owned(),
+        });
+    }
+    let conflict_stage = opts
+        .is_set("ours")
+        .then_some(Stage::Two)
+        .or(opts.is_set("theirs").then_some(Stage::Three));
+    let explicit_source = opts.single("source")?;
+    // With an explicit `--source` every positional is a path; otherwise a
+    // leading revision followed by paths selects the tree, as before.
+    let (tree_paths, source_tree) = if let Some(rev) = explicit_source {
+        let oid = replace_redirect(store, resolve_rev(store, kind, &rev)?);
+        (positionals, Some(peel_to_tree(store, kind, oid)?))
+    } else if conflict_stage.is_some() {
+        (positionals, None)
+    } else {
+        match positionals {
+            [] => {
+                return Err(GitError::Invalid {
+                    detail: "checkout needs paths".to_owned(),
+                });
+            }
+            [_single] => (positionals, None),
+            [rev, rest @ ..] => match resolve_rev(store, kind, rev) {
+                Ok(oid) => {
+                    let oid = replace_redirect(store, oid);
+                    (rest, Some(peel_to_tree(store, kind, oid)?))
+                }
+                Err(_) => (positionals, None),
+            },
         }
     };
-    let entries = match source_tree {
+    if tree_paths.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "checkout needs paths".to_owned(),
+        });
+    }
+    let staged_only = opts.is_set("staged") && !opts.is_set("worktree");
+    let worktree_only = opts.is_set("worktree") && !opts.is_set("staged");
+    if let Some(stage) = conflict_stage {
+        return checkout_conflict_paths(ctx, tree_paths, stage, staged_only, worktree_only);
+    }
+    let entries: std::collections::BTreeMap<Vec<u8>, Oid> = match source_tree {
         Some(tree) => {
             let mut map = std::collections::BTreeMap::new();
             for (path, _, oid) in flatten_tree(store, kind, tree)? {
@@ -835,6 +1795,13 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
             map
         }
     };
+    // From a tree the oracle refreshes both index and worktree; from the
+    // index only the worktree. Explicit `--staged`/`--worktree` narrow it.
+    let update_index = source_tree.is_some() && !worktree_only || staged_only;
+    let update_worktree = !staged_only;
+    let (workspace, raw) = load_or_default(store)?;
+    let mut mutations = Vec::new();
+    let mut worktree_writes: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
     for wanted in tree_paths {
         let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
         let oid = entries
@@ -843,7 +1810,84 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
                 detail: format!("pathspec did not match: {wanted:?}"),
             })?;
         let (_, body) = read_object_bytes(store, *oid)?;
-        let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
+        if update_worktree {
+            let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
+            worktree_writes.push((full, body.clone()));
+        }
+        if update_index {
+            let before = read_path_rows(store, kind, &path)?;
+            let mode = index_entry_map(ctx)?
+                .get(path.as_bytes())
+                .map(|(mode, _)| *mode)
+                .unwrap_or(ruk_core::index::FileMode::Regular);
+            let entry = IndexEntry::new(*oid, mode.as_index_mode()?, None, IndexFlags::default())
+                .map_err(|err| GitError::from(CoreError::from(err)))?;
+            mutations.extend(path_row_mutations(&path, &before, &[(Stage::Zero, entry)])?);
+        }
+    }
+    if !mutations.is_empty() {
+        let next = workspace.mutate_index(workspace.stamp)?;
+        mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+        store
+            .publish(Vec::new(), &mutations)
+            .map_err(GitError::from)?;
+    }
+    for (full, body) in worktree_writes {
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
+                detail: format!("creating {}: {err}", parent.display()),
+            })?;
+        }
+        std::fs::write(&full, body).map_err(|err| GitError::Io {
+            detail: format!("writing {}: {err}", full.display()),
+        })?;
+    }
+    Ok(Vec::new())
+}
+
+/// Restores unmerged paths from stage 2 (`--ours`) or stage 3 (`--theirs`),
+/// writing stage zero plus the worktree unless scoped otherwise.
+fn checkout_conflict_paths(
+    ctx: &Ctx,
+    paths: &[String],
+    stage: Stage,
+    staged_only: bool,
+    worktree_only: bool,
+) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let (workspace, raw) = load_or_default(store)?;
+    let mut mutations = Vec::new();
+    let mut worktree_writes: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    for wanted in paths {
+        let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
+        let rows = read_path_rows(store, kind, &path)?;
+        let (_, entry, _) = rows.iter().find(|(s, _, _)| *s == stage).ok_or_else(|| {
+            GitError::Invalid {
+                detail: format!("path {wanted:?} is not unmerged"),
+            }
+        })?.clone();
+        let (_, body) = read_object_bytes(store, entry.oid())?;
+        if !staged_only {
+            let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
+            worktree_writes.push((full, body));
+        }
+        if !worktree_only {
+            let before = read_path_rows(store, kind, &path)?;
+            let resolved =
+                IndexEntry::new(entry.oid(), entry.mode(), None, IndexFlags::default())
+                    .map_err(|err| GitError::from(CoreError::from(err)))?;
+            mutations.extend(path_row_mutations(&path, &before, &[(Stage::Zero, resolved)])?);
+        }
+    }
+    if !mutations.is_empty() {
+        let next = workspace.mutate_index(workspace.stamp)?;
+        mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+        store
+            .publish(Vec::new(), &mutations)
+            .map_err(GitError::from)?;
+    }
+    for (full, body) in worktree_writes {
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
                 detail: format!("creating {}: {err}", parent.display()),
@@ -917,16 +1961,117 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "orphan",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "track",
+            short: Some('t'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-track",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "merge",
+            short: Some('m'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "conflict",
+            short: None,
+            takes_value: true,
+        },
+        // Accepted and inert: switches never report progress.
+        FlagSpec {
+            long: "progress",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-progress",
+            short: None,
+            takes_value: false,
+        },
+        // Accepted and inert: this store never refuses a switch for another
+        // worktree holding the branch, so the override is already satisfied.
+        FlagSpec {
+            long: "ignore-other-worktrees",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
+    if let Some(style) = opts.single("conflict")? {
+        match style.as_str() {
+            "merge" | "diff3" | "zdiff3" => {}
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("bad --conflict value {style:?}"),
+                });
+            }
+        }
+        if !opts.is_set("merge") {
+            return Err(GitError::Invalid {
+                detail: "option --conflict requires --merge".to_owned(),
+            });
+        }
+    }
+    if opts.is_set("track") && opts.is_set("no-track") {
+        return Err(GitError::Invalid {
+            detail: "cannot combine --track and --no-track".to_owned(),
+        });
+    }
+    if let Some(orphan) = opts.single("orphan")? {
+        if opts.single("create")?.is_some() || opts.single("force-create")?.is_some() {
+            return Err(GitError::Invalid {
+                detail: "cannot combine --orphan with -c/-C".to_owned(),
+            });
+        }
+        if opts.is_set("track") {
+            return Err(GitError::Invalid {
+                detail: "'--orphan' cannot be used with '-t'".to_owned(),
+            });
+        }
+        if !opts.positionals.is_empty() {
+            return Err(GitError::Invalid {
+                detail: "switch --orphan takes no start point".to_owned(),
+            });
+        }
+        return switch_orphan(ctx, &orphan, opts.is_set("quiet"));
+    }
     if let Some(name) = opts.single("create")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"));
+        let out = checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?;
+        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
+            let Some(start) = start else {
+                return Err(GitError::Invalid {
+                    detail: "cannot set up tracking information; starting point is HEAD"
+                        .to_owned(),
+                });
+            };
+            record_tracking(ctx.store()?, &name, start)?;
+        }
+        return Ok(out);
     }
     if let Some(name) = opts.single("force-create")? {
         let start = opts.positionals.first().map(String::as_str);
-        return checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"));
+        let out = checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"))?;
+        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
+            let Some(start) = start else {
+                return Err(GitError::Invalid {
+                    detail: "cannot set up tracking information; starting point is HEAD"
+                        .to_owned(),
+                });
+            };
+            record_tracking(ctx.store()?, &name, start)?;
+        }
+        return Ok(out);
     }
     match opts.positionals.as_slice() {
         [] => {
@@ -944,12 +2089,55 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 let tip = resolve_rev(store, ctx.kind()?, branch)?;
                 return detach_at(ctx, tip);
             }
-            switch_guessing(ctx, branch, !opts.is_set("no-guess"), opts.is_set("quiet"))
+            // `--merge` keeps the current behavior: worktree updates already
+            // carry local changes across the switch, and `--conflict` was
+            // validated above for that merge.
+            switch_guessing(
+                ctx,
+                branch,
+                !opts.is_set("no-guess"),
+                opts.is_set("quiet"),
+                !opts.is_set("no-track"),
+            )
         }
         _ => Err(GitError::Invalid {
             detail: "usage: switch [-c <new>] [<branch>]".to_owned(),
         }),
     }
+}
+
+/// Reports whether a start point names a remote-tracking branch, for
+/// automatic `--track` setup.
+fn is_remote_start(start: &str) -> bool {
+    let bare = start.strip_prefix("refs/remotes/").unwrap_or(start);
+    bare.contains('/')
+}
+
+/// Switches to a new unborn branch, clearing the index and tracked files
+/// the way `switch --orphan` starts from the empty tree.
+fn switch_orphan(ctx: &mut Ctx, name: &str, quiet: bool) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    if super::state::read_ref(store, &branch_name(name)?)?.is_some() {
+        return Err(GitError::Invalid {
+            detail: format!("branch {name:?} already exists"),
+        });
+    }
+    let empty = kind
+        .hash_git_object("tree", b"")
+        .map_err(|err| GitError::from(CoreError::from(err)))?;
+    let (workspace, raw) = load_or_default(store)?;
+    let next = workspace.checkout(workspace.stamp, HeadRef::Symbolic(branch_name(name)?))?;
+    let mut mutations = reset_index_to(store, kind, empty)?;
+    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    store
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
+    sync_worktree_to_index(ctx)?;
+    if !quiet {
+        ctx.emit_stderr(format!("Switched to a new branch '{name}'\n").as_bytes());
+    }
+    Ok(Vec::new())
 }
 
 /// Switches to a branch, guessing a remote-tracking start when missing,
@@ -959,6 +2147,7 @@ fn switch_guessing(
     branch: &str,
     guess: bool,
     quiet: bool,
+    track: bool,
 ) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -979,6 +2168,10 @@ fn switch_guessing(
             });
             if let Some(target) = target {
                 create_branch(store, kind, branch, target)?;
+                if track {
+                    let remote = tracked.to_utf8().unwrap_or_default().to_owned();
+                    record_tracking(store, branch, &remote)?;
+                }
                 switch_head_to(ctx, HeadRef::Symbolic(branch_name(branch)?))?;
                 if !quiet {
                     ctx.emit_stderr(format!("Switched to branch '{branch}'\n").as_bytes());
@@ -1181,12 +2374,44 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "intent-to-add",
+            short: Some('N'),
+            takes_value: false,
+        },
+        // Accepted and inert: this store keeps no stat cache, so there is no
+        // index refresh to skip after a mixed reset.
+        FlagSpec {
+            long: "no-refresh",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "patch",
+            short: Some('p'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "pathspec-from-file",
+            short: None,
+            takes_value: true,
+        },
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
-    if opts.is_set("merge") || opts.is_set("keep") {
+    if opts.is_set("patch") {
         return Err(GitError::Unsupported {
-            command: "reset --merge and --keep need the merge lane".to_owned(),
+            command: "reset --patch needs interactive hunk selection".to_owned(),
+        });
+    }
+    if opts.single("pathspec-from-file")?.is_some() {
+        return Err(GitError::Unsupported {
+            command: "reset --pathspec-from-file needs the pathspec-file lane".to_owned(),
+        });
+    }
+    if opts.is_set("merge") {
+        return Err(GitError::Unsupported {
+            command: "reset --merge needs the three-way merge lane".to_owned(),
         });
     }
     let store = ctx.store()?;
@@ -1199,6 +2424,11 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         [first, rest @ ..] => (Some(first.clone()), rest),
     };
     if !paths.is_empty() {
+        if opts.is_set("soft") || opts.is_set("hard") {
+            return Err(GitError::Invalid {
+                detail: "Cannot do soft or hard reset with paths.".to_owned(),
+            });
+        }
         let tree = match rev {
             Some(rev) => {
                 let oid = resolve_rev(store, kind, &rev)?;
@@ -1206,11 +2436,19 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             }
             None => head_tree_committed(ctx)?,
         };
+        if opts.is_set("intent-to-add") {
+            return reset_paths_intent(ctx, paths, tree).map(|()| Vec::new());
+        }
         let pseudo = super::Collected {
             present: Default::default(),
             positionals: paths.to_vec(),
         };
         return restore_staged(ctx, &pseudo, tree).map(|()| Vec::new());
+    }
+    if opts.is_set("intent-to-add") && (opts.is_set("soft") || opts.is_set("hard")) {
+        return Err(GitError::Invalid {
+            detail: "the option '-N' requires '--mixed'".to_owned(),
+        });
     }
     let target = match rev {
         Some(rev) => resolve_rev(store, kind, &rev)?,
@@ -1220,11 +2458,18 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         opts.is_set("soft"),
         opts.is_set("mixed"),
         opts.is_set("hard"),
+        opts.is_set("keep"),
     ];
     if modes.iter().filter(|set| **set).count() > 1 {
         return Err(GitError::Invalid {
-            detail: "reset takes at most one of --soft, --mixed, --hard".to_owned(),
+            detail: "reset takes at most one of --soft, --mixed, --hard, --keep".to_owned(),
         });
+    }
+    // `--keep` guards before moving anything: differing paths with staged
+    // or worktree changes refuse instead of clobbering.
+    if opts.is_set("keep") {
+        let quiet = opts.is_set("quiet");
+        return reset_keep(ctx, target, quiet);
     }
     move_branch_to(ctx, target)?;
     let quiet = opts.is_set("quiet");
@@ -1245,6 +2490,163 @@ pub(crate) fn reset(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         return Ok(Vec::new());
     }
     reset_unstaged_report(ctx, store, kind)
+}
+
+/// Resets named paths to `tree`, recording intent-to-add entries where the
+/// tree lacks the path instead of deleting the row.
+fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let mut target = std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, tree)? {
+        target.insert(path, (mode, oid));
+    }
+    let (workspace, raw) = load_or_default(store)?;
+    let mut mutations = Vec::new();
+    for wanted in paths {
+        let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
+        let before = read_path_rows(store, kind, &path)?;
+        let after = match target.get(path.as_bytes()) {
+            Some((mode, oid)) => {
+                let entry =
+                    IndexEntry::new(*oid, mode.as_index_mode()?, None, IndexFlags::default())
+                        .map_err(|err| GitError::from(CoreError::from(err)))?;
+                vec![(Stage::Zero, entry)]
+            }
+            None => {
+                let entry = IndexEntry::intent_to_add(kind, FileMode::Regular, None)
+                    .map_err(|err| GitError::from(CoreError::from(err)))?;
+                vec![(Stage::Zero, entry)]
+            }
+        };
+        mutations.extend(path_row_mutations(&path, &before, &after)?);
+    }
+    let next = workspace.mutate_index(workspace.stamp)?;
+    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    store
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
+    Ok(())
+}
+
+/// Resets `HEAD` and the index to `target` while keeping local changes:
+/// paths differing between old and new trees with staged or worktree edits
+/// refuse before anything moves; otherwise only differing paths touch the
+/// worktree so unrelated edits stay.
+fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let old_tip = head_oid(store)?;
+    let old_record = super::state::commit_record(store, old_tip)?;
+    let old_tree = commit_tree_oid(&old_record)?;
+    let new_record = super::state::commit_record(store, target)?;
+    let new_tree = commit_tree_oid(&new_record)?;
+    let mut old_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, old_tree)? {
+        old_map.insert(path, (mode, oid));
+    }
+    let mut new_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, new_tree)? {
+        new_map.insert(path, (mode, oid));
+    }
+    let mut union: Vec<Vec<u8>> = old_map.keys().cloned().collect();
+    for path in new_map.keys() {
+        if !union.contains(path) {
+            union.push(path.clone());
+        }
+    }
+    let mut differing: Vec<Vec<u8>> = Vec::new();
+    for path in &union {
+        if old_map.get(path) != new_map.get(path) {
+            differing.push(path.clone());
+        }
+    }
+    // Stage check: staged rows on differing paths must match the old tree.
+    let rows = scan_index(store, kind)?;
+    let mut staged_by_path: std::collections::BTreeMap<Vec<u8>, Vec<(Stage, IndexEntry)>> =
+        std::collections::BTreeMap::new();
+    for (path, stage, entry) in &rows {
+        staged_by_path
+            .entry(path.as_bytes().to_vec())
+            .or_default()
+            .push((*stage, entry.clone()));
+    }
+    let mut blocked: Vec<String> = Vec::new();
+    for path in &differing {
+        if let Some(stages) = staged_by_path.get(path) {
+            let clean = match old_map.get(path) {
+                Some((mode, oid)) => {
+                    stages.len() == 1
+                        && stages[0].0 == Stage::Zero
+                        && stages[0].1.oid() == *oid
+                        && stages[0].1.mode()
+                            == mode.as_index_mode().unwrap_or(FileMode::Regular)
+                }
+                None => false,
+            };
+            if !clean {
+                blocked.push(String::from_utf8_lossy(path).into_owned());
+                continue;
+            }
+        }
+        // Worktree check: differing paths must still hold old bytes.
+        let full = super::tree::join_base(&ctx.file_base, path)?;
+        let worktree_bytes = std::fs::read(&full).ok();
+        match old_map.get(path) {
+            Some((_, oid)) => {
+                let (_, old_body) = read_object_bytes(store, *oid)?;
+                match worktree_bytes {
+                    Some(have) if have == old_body => {}
+                    _ => blocked.push(String::from_utf8_lossy(path).into_owned()),
+                }
+            }
+            None => {
+                if worktree_bytes.is_some() {
+                    blocked.push(String::from_utf8_lossy(path).into_owned());
+                }
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        blocked.sort();
+        return Err(GitError::Invalid {
+            detail: format!(
+                "local changes would be overwritten by reset --keep: {}",
+                blocked.join(", ")
+            ),
+        });
+    }
+    move_branch_to(ctx, target)?;
+    reset_index_tree(ctx, new_tree)?;
+    // Scoped worktree sync: only differing paths are rewritten.
+    for path in &differing {
+        match new_map.get(path) {
+            Some((_, oid)) => {
+                let (_, body) = read_object_bytes(store, *oid)?;
+                let full = super::tree::join_base(&ctx.file_base, path)?;
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
+                        detail: format!("creating {}: {err}", parent.display()),
+                    })?;
+                }
+                std::fs::write(&full, body).map_err(|err| GitError::Io {
+                    detail: format!("writing {}: {err}", full.display()),
+                })?;
+            }
+            None => {
+                let full = super::tree::join_base(&ctx.file_base, path)?;
+                if full.is_file() {
+                    std::fs::remove_file(&full).map_err(|err| GitError::Io {
+                        detail: format!("removing {}: {err}", full.display()),
+                    })?;
+                }
+            }
+        }
+    }
+    if quiet {
+        return Ok(Vec::new());
+    }
+    Ok(reset_head_line(&new_record, target))
 }
 
 /// Renders `HEAD is now at <short> <subject>` after a hard reset.
@@ -2669,23 +4071,152 @@ pub(crate) fn tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             short: Some('F'),
             takes_value: true,
         },
+        FlagSpec {
+            long: "sort",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "format",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "points-at",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "edit",
+            short: Some('e'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "cleanup",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "create-reflog",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "column",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-column",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "color",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-color",
+            short: None,
+            takes_value: false,
+        },
     ];
     // `-n[<num>]` takes an optional attached value, which the shared parser
     // cannot express: normalize to a remembered line count.
+    // `--merged`/`--contains` take an optional commit (default `HEAD`).
     let mut annotation_lines: Option<usize> = None;
+    let mut merged: Vec<String> = Vec::new();
+    let mut no_merged: Vec<String> = Vec::new();
+    let mut contains: Vec<String> = Vec::new();
+    let mut no_contains: Vec<String> = Vec::new();
     let mut rewritten = Vec::with_capacity(args.len());
-    for arg in args {
+    let mut tag_index = 0;
+    while tag_index < args.len() {
+        let arg = &args[tag_index];
         if arg == "-n" {
             annotation_lines = Some(1);
-        } else if let Some(digits) = arg.strip_prefix("-n") {
-            annotation_lines = Some(digits.parse().map_err(|_| GitError::Invalid {
-                detail: format!("bad -n value {arg:?}"),
-            })?);
-        } else {
-            rewritten.push(arg.clone());
+            tag_index += 1;
+            continue;
         }
+        if let Some(digits) = arg.strip_prefix("-n") {
+            if !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) {
+                annotation_lines = Some(digits.parse().map_err(|_| GitError::Invalid {
+                    detail: format!("bad -n value {arg:?}"),
+                })?);
+                tag_index += 1;
+                continue;
+            }
+        }
+        let mut matched: Option<&str> = None;
+        let mut inline: Option<String> = None;
+        for name in [
+            "--merged",
+            "--no-merged",
+            "--contains",
+            "--no-contains",
+            "--with",
+            "--without",
+        ] {
+            if arg == name {
+                matched = Some(name);
+                break;
+            }
+            if let Some(rest) = arg.strip_prefix(&format!("{name}=")) {
+                matched = Some(name);
+                inline = Some(rest.to_owned());
+                break;
+            }
+        }
+        if let Some(name) = matched {
+            let value = if let Some(v) = inline {
+                v
+            } else if tag_index + 1 < args.len()
+                && args[tag_index + 1] != "--"
+                && !args[tag_index + 1].starts_with('-')
+            {
+                tag_index += 1;
+                args[tag_index].clone()
+            } else {
+                "HEAD".to_owned()
+            };
+            match name {
+                "--merged" => merged.push(value),
+                "--no-merged" => no_merged.push(value),
+                "--contains" | "--with" => contains.push(value),
+                _ => no_contains.push(value),
+            }
+            tag_index += 1;
+            continue;
+        }
+        rewritten.push(arg.clone());
+        tag_index += 1;
     }
-    let opts = collect(&rewritten, &specs)?;
+    let mut opts = collect(&rewritten, &specs)?;
+    for value in merged {
+        opts.present
+            .entry("merged".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
+    for value in no_merged {
+        opts.present
+            .entry("no-merged".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
+    for value in contains {
+        opts.present
+            .entry("contains".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
+    for value in no_contains {
+        opts.present
+            .entry("no-contains".to_owned())
+            .or_default()
+            .push(Some(value));
+    }
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     if opts.is_set("sign") || opts.single("local-user")?.is_some() {
@@ -2723,13 +4254,38 @@ pub(crate) fn tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         }
         return Ok(out);
     }
+    if opts.is_set("edit") {
+        return Err(GitError::Unsupported {
+            command: "tag --edit needs an editor, which this store does not run".to_owned(),
+        });
+    }
+    if let Some(mode) = opts.single("cleanup")? {
+        match mode.as_str() {
+            "verbatim" | "whitespace" | "strip" | "scissors" | "default" => {}
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("bad --cleanup value {mode:?}"),
+                });
+            }
+        }
+    }
     // `-n` implies `-l` in the oracle, and the no-arg form already lists.
+    // Any list-shaping flag also implies list mode so filters never fall
+    // into tag creation.
     let lines = annotation_lines.unwrap_or(0);
+    let tag_list_mode = opts.is_set("list")
+        || annotation_lines.is_some()
+        || opts.is_set("merged")
+        || opts.is_set("no-merged")
+        || opts.is_set("contains")
+        || opts.is_set("no-contains")
+        || opts.all("sort").is_ok_and(|v| !v.is_empty())
+        || opts.single("format").is_ok_and(|v| v.is_some())
+        || opts.all("points-at").is_ok_and(|v| !v.is_empty());
     match opts.positionals.as_slice() {
         [] => list_tags(ctx, &opts, None, lines),
-        [pattern] if opts.is_set("list") || annotation_lines.is_some() => {
-            list_tags(ctx, &opts, Some(pattern), lines)
-        }
+        [pattern] if tag_list_mode => list_tags(ctx, &opts, Some(pattern), lines),
+        _ if tag_list_mode => list_tags(ctx, &opts, None, lines),
         [name] => create_tag(ctx, name, None, &opts),
         [name, target] => create_tag(ctx, name, Some(target), &opts),
         _ => Err(GitError::Invalid {
@@ -2783,21 +4339,96 @@ fn list_tags(
         .cloned()
         .chain(extra.map(str::to_owned))
         .collect();
-    let mut out = Vec::new();
+    let kind = ctx.kind()?;
+    let resolve_commit = |values: Vec<String>| -> Result<Vec<Oid>, GitError> {
+        let mut oids = Vec::with_capacity(values.len());
+        for value in values {
+            oids.push(resolve_rev(store, kind, &value)?);
+        }
+        Ok(oids)
+    };
+    let merged = resolve_commit(opts.all("merged")?)?;
+    let no_merged = resolve_commit(opts.all("no-merged")?)?;
+    let contains = resolve_commit(opts.all("contains")?)?;
+    let no_contains = resolve_commit(opts.all("no-contains")?)?;
+    let mut points_at: Vec<Oid> = Vec::new();
+    for value in opts.all("points-at")? {
+        points_at.push(resolve_rev(store, kind, &value)?);
+    }
+    let mut rows: Vec<(String, String, RefTarget)> = Vec::new();
     for (name, target) in list_refs(store)? {
         let text = name.to_utf8().unwrap_or_default().to_owned();
         if !text.starts_with("refs/tags/") {
             continue;
         }
-        let short = text.trim_start_matches("refs/tags/");
-        if !patterns.is_empty() && !patterns.iter().any(|pattern| glob_match(pattern, short)) {
+        let short = text.trim_start_matches("refs/tags/").to_owned();
+        if !patterns.is_empty() && !patterns.iter().any(|pattern| glob_match(pattern, &short)) {
             continue;
         }
+        // Peel once: lightweight tags read as their commit, annotated tags
+        // as the tag object with a commit behind it.
+        let peeled = peel_tag_target(ctx, &target)?.or(peel_target_oid(ctx, &target)?);
+        if !points_at.is_empty() {
+            let direct = matches!(&target, RefTarget::Direct(oid) if points_at.contains(oid));
+            let matches_peeled = peeled.is_some_and(|oid| points_at.contains(&oid));
+            if !direct && !matches_peeled {
+                continue;
+            }
+        }
+        if !merged.is_empty() || !no_merged.is_empty() || !contains.is_empty() || !no_contains.is_empty() {
+            let Some(tip) = peeled else { continue };
+            // Tags resolve to commits, blobs, or trees; ancestry filters only
+            // apply to commit tips, so non-commit tags drop out when such a
+            // filter is present.
+            let tip_is_commit = super::state::commit_record(store, tip).is_ok();
+            if !tip_is_commit {
+                continue;
+            }
+            let mut ok = true;
+            for base in &merged {
+                if tip != *base && !is_ancestor(store, tip, *base).unwrap_or(false) {
+                    ok = false;
+                    break;
+                }
+            }
+            for base in &no_merged {
+                if tip == *base || is_ancestor(store, tip, *base).unwrap_or(false) {
+                    ok = false;
+                    break;
+                }
+            }
+            for commit in &contains {
+                if tip != *commit && !is_ancestor(store, *commit, tip).unwrap_or(false) {
+                    ok = false;
+                    break;
+                }
+            }
+            for commit in &no_contains {
+                if tip == *commit || is_ancestor(store, *commit, tip).unwrap_or(false) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+        }
+        rows.push((text, short, target.clone()));
+    }
+    sort_tag_rows(ctx, &mut rows, &opts.all("sort")?)?;
+    let mut out = Vec::new();
+    if let Some(format) = opts.single("format")? {
+        for (text, short, target) in &rows {
+            out.extend_from_slice(&render_tag_format(ctx, &format, text, short, target)?);
+        }
+        return Ok(out);
+    }
+    for (_, short, target) in &rows {
         if lines == 0 {
             out.extend_from_slice(format!("{short}\n").as_bytes());
             continue;
         }
-        let shown = tag_message_lines(ctx, &target, lines)?;
+        let shown = tag_message_lines(ctx, target, lines)?;
         if shown.is_empty() {
             out.extend_from_slice(format!("{short}\n").as_bytes());
         } else {
@@ -2808,6 +4439,140 @@ fn list_tags(
         }
     }
     Ok(out)
+}
+
+/// Sorts tag rows by `--sort` keys, the `for-each-ref` key set.
+fn sort_tag_rows(
+    ctx: &Ctx,
+    rows: &mut [(String, String, RefTarget)],
+    keys: &[String],
+) -> Result<(), GitError> {
+    let mut parsed = Vec::with_capacity(keys.len());
+    for key in keys {
+        let (name, reverse) = key
+            .strip_prefix('-')
+            .map_or((key.as_str(), false), |rest| (rest, true));
+        match name {
+            "refname" | "objectname" | "objecttype" | "authordate" | "committerdate"
+            | "creatordate" => parsed.push((name, reverse)),
+            _ => {
+                return Err(GitError::Invalid {
+                    detail: format!("unknown --sort key {key:?}"),
+                });
+            }
+        }
+    }
+    if parsed.is_empty() {
+        return Ok(());
+    }
+    let mut decorated = Vec::with_capacity(rows.len());
+    for (text, _, target) in rows.iter() {
+        let info = ref_commit_info(ctx, target)?;
+        let oid = peel_target_oid(ctx, target)?
+            .map(|oid| oid.to_hex())
+            .unwrap_or_default();
+        decorated.push((
+            text.clone(),
+            ref_object_type_or_empty(ctx, target)?,
+            oid,
+            info.as_ref().map(|info| info.author_ts).unwrap_or(0),
+            info.as_ref().map(|info| info.committer_ts).unwrap_or(0),
+        ));
+    }
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&left, &right| {
+        let (lname, ltype, loid, lauthor, lcommitter) = &decorated[left];
+        let (rname, rtype, roid, rauthor, rcommitter) = &decorated[right];
+        let mut verdict = std::cmp::Ordering::Equal;
+        for (name, reverse) in &parsed {
+            let next = match *name {
+                "refname" => lname.cmp(rname),
+                "objectname" => loid.cmp(roid),
+                "objecttype" => ltype.cmp(rtype),
+                "authordate" => lauthor.cmp(rauthor),
+                _ => lcommitter.cmp(rcommitter),
+            };
+            if next != std::cmp::Ordering::Equal {
+                verdict = if *reverse { next.reverse() } else { next };
+                break;
+            }
+        }
+        verdict
+    });
+    let mut sorted = Vec::with_capacity(rows.len());
+    for index in order {
+        let (text, short, target) = &rows[index];
+        sorted.push((text.clone(), short.clone(), target.clone()));
+    }
+    rows.iter_mut().enumerate().for_each(|(i, row)| {
+        let (text, short, target) = &sorted[i];
+        *row = (text.clone(), short.clone(), target.clone());
+    });
+    Ok(())
+}
+
+/// Renders one tag row with `--format`, the `for-each-ref` atoms.
+fn render_tag_format(
+    ctx: &Ctx,
+    format: &str,
+    full: &str,
+    short: &str,
+    target: &RefTarget,
+) -> Result<Vec<u8>, GitError> {
+    let mut rendered = String::new();
+    let mut rest = format;
+    while let Some(start) = rest.find("%(") {
+        rendered.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find(')').ok_or_else(|| GitError::Invalid {
+            detail: "bad --format: missing )".to_owned(),
+        })?;
+        match &after[..end] {
+            "refname" => rendered.push_str(full),
+            "refname:short" => rendered.push_str(short),
+            "objectname" => {
+                let oid = peel_target_oid(ctx, target)?.ok_or_else(|| GitError::NotFound {
+                    detail: format!("ref {full} is unborn"),
+                })?;
+                rendered.push_str(&oid.to_hex());
+            }
+            "objectname:short" => {
+                let oid = peel_target_oid(ctx, target)?.ok_or_else(|| GitError::NotFound {
+                    detail: format!("ref {full} is unborn"),
+                })?;
+                let hex = oid.to_hex();
+                rendered.push_str(&hex.chars().take(7).collect::<String>());
+            }
+            "objecttype" => rendered.push_str(&ref_object_type(ctx, target)?),
+            "subject" => {
+                let info = ref_commit_info(ctx, target)?;
+                rendered.push_str(&info.map(|i| i.subject).unwrap_or_default());
+            }
+            "authorname" => {
+                let info = ref_commit_info(ctx, target)?;
+                rendered.push_str(&info.map(|i| i.author_name).unwrap_or_default());
+            }
+            "committername" => {
+                let info = ref_commit_info(ctx, target)?;
+                rendered.push_str(&info.map(|i| i.committer_name).unwrap_or_default());
+            }
+            "creatordate" | "creatordate:iso" => {
+                let info = ref_commit_info(ctx, target)?;
+                if let Some(known) = info {
+                    rendered.push_str(&iso_datetime(known.committer_ts, known.committer_offset));
+                }
+            }
+            other => {
+                return Err(GitError::Invalid {
+                    detail: format!("unsupported --format field %({other})"),
+                });
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    rendered.push_str(rest);
+    rendered.push('\n');
+    Ok(rendered.into_bytes())
 }
 
 /// Reads up to `lines` annotation lines: the tag message for annotated
@@ -2861,11 +4626,12 @@ fn create_tag(
         Some(rev) => resolve_rev(store, kind, rev)?,
         None => head_oid(store)?,
     };
+    let cleanup = opts.single("cleanup")?.unwrap_or_else(|| "strip".to_owned());
     let pointed = if opts.is_set("annotate")
         || opts.single("message")?.is_some()
         || opts.single("file")?.is_some()
     {
-        let message = match opts.single("message")? {
+        let raw = match opts.single("message")? {
             Some(text) => text.into_bytes(),
             None => match opts.single("file")? {
                 Some(path) => {
@@ -2877,6 +4643,7 @@ fn create_tag(
                 None => format!("tag {name}\n").into_bytes(),
             },
         };
+        let message = apply_tag_cleanup(&raw, &cleanup);
         let (object_kind, _) = read_object_bytes(store, oid)?;
         let type_name = match object_kind {
             ruk_core::store::ObjectKind::Blob => "blob",
@@ -2905,6 +4672,55 @@ fn create_tag(
         }],
     )?;
     Ok(Vec::new())
+}
+
+/// Applies `--cleanup=<mode>` to a tag message: `verbatim` keeps bytes,
+/// `whitespace` strips trailing whitespace, `strip`/`default` also drop
+/// `#` comment lines and leading/trailing blank lines, `scissors` cuts at
+/// the scissors marker first.
+fn apply_tag_cleanup(raw: &[u8], mode: &str) -> Vec<u8> {
+    if mode == "verbatim" {
+        return raw.to_vec();
+    }
+    let text = String::from_utf8_lossy(raw);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if mode == "scissors" {
+        if let Some(at) = lines
+            .iter()
+            .position(|line| line.contains("------------------------ >8 ------------------------"))
+        {
+            lines.truncate(at);
+        }
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for line in lines {
+        let no_trailing = line.trim_end();
+        if (mode == "strip" || mode == "default" || mode == "scissors")
+            && (no_trailing.starts_with('#') || no_trailing.is_empty() && kept.is_empty())
+        {
+            if no_trailing.starts_with('#') {
+                continue;
+            }
+        }
+        if mode == "whitespace" {
+            kept.push(no_trailing.to_owned());
+        } else if no_trailing.starts_with('#') {
+            continue;
+        } else {
+            kept.push(no_trailing.to_owned());
+        }
+    }
+    while kept.first().is_some_and(|line| line.is_empty()) {
+        kept.remove(0);
+    }
+    while kept.last().is_some_and(|line| line.is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.into_bytes()
 }
 
 /// Validates a tag short name into its full ref name.
