@@ -430,8 +430,15 @@ pub fn fetch_pack(
     if req.depth.is_some() {
         warnings.push("server is dumb-http; fetched complete history".to_owned());
     }
-    let mut triples =
-        collect_pack_objects(base, store, kind, limits, interrupt, &mut warnings, extra_headers)?;
+    let mut triples = collect_pack_objects(
+        base,
+        store,
+        kind,
+        limits,
+        interrupt,
+        &mut warnings,
+        extra_headers,
+    )?;
     let mut seen: HashSet<Oid> = triples.iter().map(|(oid, _, _)| *oid).collect();
     let max_objects = usize::try_from(limits.max_objects).map_err(|_| GitError::Limit {
         detail: "object count limit does not fit".to_owned(),

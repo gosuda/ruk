@@ -748,7 +748,9 @@ mod tests {
         );
         // Section and key match case-insensitively; other sections and keys
         // never leak in.
-        let rows = parse_http_extra_header_entries("[HTTP]\n\tEXTRAHEADER = X-Up: yes\n[http]\n\tsslVerify = false\n");
+        let rows = parse_http_extra_header_entries(
+            "[HTTP]\n\tEXTRAHEADER = X-Up: yes\n[http]\n\tsslVerify = false\n",
+        );
         assert_eq!(
             rows,
             vec![http::ExtraHeaderRow {

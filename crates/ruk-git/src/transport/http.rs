@@ -167,9 +167,7 @@ pub fn extra_headers_for_url(url: &str, rows: &[ExtraHeaderRow]) -> Vec<(String,
         }
     }
     let selected = |row: &ExtraHeaderRow| match (winner, row.scope.as_deref()) {
-        (Some(want), Some(have)) => {
-            have.trim_end_matches('/') == want.trim_end_matches('/')
-        }
+        (Some(want), Some(have)) => have.trim_end_matches('/') == want.trim_end_matches('/'),
         (None, None) => true,
         _ => false,
     };
@@ -231,10 +229,7 @@ mod extra_header_tests {
             headers,
             vec![
                 ("X-One".to_owned(), "1".to_owned()),
-                (
-                    "Authorization".to_owned(),
-                    "Bearer scoped-token".to_owned()
-                ),
+                ("Authorization".to_owned(), "Bearer scoped-token".to_owned()),
             ]
         );
         assert!(extra_headers_for_url("https://host.x/a.git", &[]).is_empty());

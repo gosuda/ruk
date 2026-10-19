@@ -1739,12 +1739,20 @@ fn archive_zip_roundtrip_reads_back() {
     let (root, env) = seeded_repo("uarchive-zip", "a.txt", b"a\n");
     let mut ctx = repo_ctx(&root, env);
     // The tar path stays byte-identical to the default (no --format) flow.
-    let tar = run(verbs_transport::archive, &mut ctx, &["--format=tar", "HEAD"])
-        .expect("explicit tar");
+    let tar = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=tar", "HEAD"],
+    )
+    .expect("explicit tar");
     let default = run(verbs_transport::archive, &mut ctx, &["HEAD"]).expect("default tar");
     assert_eq!(tar, default);
-    let zip = run(verbs_transport::archive, &mut ctx, &["--format=zip", "HEAD"])
-        .expect("zip archive");
+    let zip = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=zip", "HEAD"],
+    )
+    .expect("zip archive");
     assert!(
         zip.starts_with(b"PK"),
         "zip magic, got {:?}",
@@ -1752,8 +1760,7 @@ fn archive_zip_roundtrip_reads_back() {
     );
     // Read back through the writer crate: the central directory parses and
     // the payload verifies against its CRC.
-    let mut archive =
-        zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
     let names: Vec<String> = archive
         .file_names()
         .map(|name| name.expect("entry name").into_owned())
@@ -1781,8 +1788,7 @@ fn archive_zip_prefix_and_path_limits() {
         &["--format=zip", "--prefix=pre/", "HEAD", "sub"],
     )
     .expect("zip with prefix and limit");
-    let mut archive =
-        zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
     let names: Vec<String> = archive
         .file_names()
         .map(|name| name.expect("entry name").into_owned())
@@ -1806,8 +1812,12 @@ fn archive_zip_prefix_and_path_limits() {
 fn archive_zip_output_file_matches_stdout() {
     let (root, env) = seeded_repo("uarchive-zip-out", "a.txt", b"a\n");
     let mut ctx = repo_ctx(&root, env);
-    let stdout = run(verbs_transport::archive, &mut ctx, &["--format=zip", "HEAD"])
-        .expect("stdout zip");
+    let stdout = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=zip", "HEAD"],
+    )
+    .expect("stdout zip");
     assert!(stdout.starts_with(b"PK"));
     let dest = root
         .parent()
@@ -1823,16 +1833,15 @@ fn archive_zip_output_file_matches_stdout() {
     )
     .expect("file zip");
     assert!(out.is_empty(), "file output returns no stdout bytes");
-    let filed = std::fs::read(
-        root.parent()
-            .expect("parent")
-            .join("out.zip"),
-    )
-    .expect("written zip");
+    let filed = std::fs::read(root.parent().expect("parent").join("out.zip")).expect("written zip");
     assert_eq!(filed, stdout, "-o writes the streamed bytes");
     // Only tar and zip are spoken.
-    let err = run(verbs_transport::archive, &mut ctx, &["--format=rar", "HEAD"])
-        .expect_err("unknown format must fail");
+    let err = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=rar", "HEAD"],
+    )
+    .expect_err("unknown format must fail");
     assert!(
         matches!(err, ruk_git::GitError::Unsupported { .. }),
         "{err}"

@@ -1218,8 +1218,7 @@ mod tests {
             body,
             false,
         )]);
-        let adv =
-            discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect("discover");
+        let adv = discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect("discover");
         assert!(adv.capabilities.has("side-band-64k"));
         assert_eq!(adv.refs.len(), 2);
         assert_eq!(adv.refs[0].oid, Some(oid(FOUR)));
@@ -1261,7 +1260,9 @@ mod tests {
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
         assert!(
-            requests[0].head.contains("X-Token: Bearer scoped-token\r\n"),
+            requests[0]
+                .head
+                .contains("X-Token: Bearer scoped-token\r\n"),
             "{:?}",
             requests[0].head
         );
@@ -1280,8 +1281,7 @@ mod tests {
             format!("{FOUR}\trefs/heads/main\n").into_bytes(),
             false,
         )]);
-        let err =
-            discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect_err("dumb");
+        let err = discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect_err("dumb");
         assert!(
             matches!(err, GitError::Unsupported { .. }),
             "unexpected {err:?}"
@@ -1435,8 +1435,7 @@ mod tests {
             panic!("expected v2");
         };
         assert!(probed.feature("fetch", "filter"));
-        let refs =
-            ls_refs_v2(&base, &probed, kind, &[], &Interrupt::none(), &[]).expect("ls-refs");
+        let refs = ls_refs_v2(&base, &probed, kind, &[], &Interrupt::none(), &[]).expect("ls-refs");
         assert_eq!(refs.len(), 2);
         assert_eq!(
             refs[0].symref_target.as_deref(),
@@ -1649,8 +1648,16 @@ mod tests {
         };
         let mut plan =
             PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
-        let outcomes = push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none(), &[])
-            .expect("push");
+        let outcomes = push_pack(
+            &base,
+            &adv,
+            &store,
+            &mut plan,
+            &req,
+            &Interrupt::none(),
+            &[],
+        )
+        .expect("push");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].name, b"refs/heads/x");
         assert!(

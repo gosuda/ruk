@@ -285,7 +285,8 @@ fn batch_check(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
     }
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: cat-file --batch-check [--batch-all-objects] (revisions on stdin)".to_owned(),
+            detail: "usage: cat-file --batch-check [--batch-all-objects] (revisions on stdin)"
+                .to_owned(),
         });
     }
     let stdin = super::read_stdin_text(&ctx.env)?;
@@ -309,8 +310,13 @@ fn batch_check(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
         // latched quarantine for, so only `NotFound` takes the missing arm.
         match read_object_bytes(store, oid) {
             Ok((object_kind, body)) => out.extend_from_slice(
-                format!("{} {} {}\n", oid.to_hex(), kind_name_of(object_kind), body.len())
-                    .as_bytes(),
+                format!(
+                    "{} {} {}\n",
+                    oid.to_hex(),
+                    kind_name_of(object_kind),
+                    body.len()
+                )
+                .as_bytes(),
             ),
             Err(GitError::NotFound { .. }) => {
                 out.extend_from_slice(format!("{} missing\n", oid.to_hex()).as_bytes());
