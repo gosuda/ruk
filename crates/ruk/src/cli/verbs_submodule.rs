@@ -470,7 +470,10 @@ fn cmd_add(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>, 
         })?;
     }
     let head_oid = clone_local_into(&src_store, &child_root, kind, url, depth)?;
-    checkout_child_attached(&child_root, kind, head_oid)?;
+    let child_store = open_child_store(&child_root)?.ok_or_else(|| GitError::Corrupt {
+        detail: format!("submodule {path_text:?} has no store after clone"),
+    })?;
+    checkout_child_attached(&child_store, &child_root, kind, head_oid)?;
     entries.retain(|entry| entry.path != path_text && entry.name != name);
     entries.push(SubmoduleEntry {
         name: name.clone(),
@@ -630,20 +633,24 @@ fn clone_local_into(
 }
 
 /// Checks a child worktree out at `oid`: files, index rows, and `HEAD`.
+///
+/// Takes the already-open child `Store`: reopening the same `.ruk` while
+/// the caller holds it would self-conflict on the redb OFD lock
+/// (`DatabaseAlreadyOpen`), so the handle is threaded through.
 fn checkout_child_inner(
+    child: &Store,
     child_root: &Path,
     kind: HashKind,
     oid: Oid,
     detach: bool,
 ) -> Result<(), GitError> {
-    let child = open_store(&child_root.join(".ruk"))?;
-    let record = commit_record(&child, oid)?;
+    let record = commit_record(child, oid)?;
     let tree = commit_tree_oid(&record)?;
-    let flat = flatten_tree(&child, kind, tree)?;
-    materialize_flat(&child, kind, &flat, child_root)?;
-    write_flat_index(&child, kind, &flat)?;
+    let flat = flatten_tree(child, kind, tree)?;
+    materialize_flat(child, kind, &flat, child_root)?;
+    write_flat_index(child, kind, &flat)?;
     if detach {
-        let (mut workspace, raw) = load_or_default(&child)?;
+        let (mut workspace, raw) = load_or_default(child)?;
         workspace.head = HeadRef::Detached(oid);
         let next = workspace.mutate_index(workspace.stamp)?;
         child
@@ -654,13 +661,23 @@ fn checkout_child_inner(
 }
 
 /// Checks a fresh clone out on its branch, keeping the attached `HEAD`.
-fn checkout_child_attached(child_root: &Path, kind: HashKind, oid: Oid) -> Result<(), GitError> {
-    checkout_child_inner(child_root, kind, oid, false)
+fn checkout_child_attached(
+    child: &Store,
+    child_root: &Path,
+    kind: HashKind,
+    oid: Oid,
+) -> Result<(), GitError> {
+    checkout_child_inner(child, child_root, kind, oid, false)
 }
 
 /// Checks a submodule out detached at its recorded oid: the `update` posture.
-fn checkout_child_detached(child_root: &Path, kind: HashKind, oid: Oid) -> Result<(), GitError> {
-    checkout_child_inner(child_root, kind, oid, true)
+fn checkout_child_detached(
+    child: &Store,
+    child_root: &Path,
+    kind: HashKind,
+    oid: Oid,
+) -> Result<(), GitError> {
+    checkout_child_inner(child, child_root, kind, oid, true)
 }
 
 /// Creates one child symlink from its recorded target blob, mirroring the
@@ -1306,7 +1323,7 @@ fn update_into(
                 })?
         };
         ensure_present(&child_store, view.kind, entry, want, flags.depth)?;
-        checkout_child_detached(&child_root, view.kind, want)?;
+        checkout_child_detached(&child_store, &child_root, view.kind, want)?;
         out.extend_from_slice(
             format!(
                 "Submodule path '{}': checked out '{}'\n",
