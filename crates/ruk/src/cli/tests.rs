@@ -951,29 +951,129 @@ fn receive_pack_enforces_store_lfs_policy() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
-#[test]
-fn unsupported_verbs_report_closed_codes() {
-    let base = temp_base("unsupported");
+/// Indexes one pack into a fresh repository, returning its context.
+fn indexed_repo(case: &str, pack: Vec<u8>) -> (PathBuf, CliEnv, Ctx) {
+    let base = temp_base(case);
     let env = test_env(&base);
-    let mut ctx = Ctx {
+    let mut init_ctx = Ctx {
         store: None,
         root: base.clone(),
         file_base: base.clone(),
         kind: None,
-        env,
+        env: env.clone(),
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
     };
-    for verb in [
-        verbs_objects::pack_objects
-            as fn(&mut Ctx, &[String]) -> Result<Vec<u8>, ruk_git::GitError>,
-        verbs_objects::index_pack,
-    ] {
-        let err = run(verb, &mut ctx, &[]).expect_err("unsupported");
-        assert_eq!(err.exit_code(), 1, "{err}");
-    }
-    let _ = std::fs::remove_dir_all(&base);
+    run(verbs_repo::init, &mut init_ctx, &["dst"]).expect("init");
+    let root = base.join("dst");
+    let env = test_env(&base);
+    let mut ctx = repo_ctx(&root, env.clone());
+    ctx.env.stdin = Some(pack);
+    run(verbs_objects::index_pack, &mut ctx, &["--stdin"]).expect("index-pack");
+    (root, env, ctx)
+}
+
+#[test]
+fn pack_objects_revs_round_trip_through_index_pack() {
+    let (root, env) = seeded_repo("packobj-rt", "a.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env.clone());
+    std::fs::write(root.join("b.txt"), b"two\n").expect("second file");
+    run(verbs_stage::add, &mut ctx, &["b.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m".to_owned(), "second".to_owned()])
+        .expect("commit");
+    let tip = String::from_utf8_lossy(
+        &run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
+    )
+    .trim()
+    .to_owned();
+    let mut pack_ctx = repo_ctx(&root, env);
+    pack_ctx.env.stdin = Some(b"HEAD\n".to_vec());
+    let pack = run(
+        verbs_objects::pack_objects,
+        &mut pack_ctx,
+        &["--revs", "--stdout"],
+    )
+    .expect("pack-objects");
+    assert!(pack.starts_with(b"PACK"), "not a pack stream");
+    let (_dst, _env, mut dst) = indexed_repo("packobj-rt-dst", pack);
+    let count = String::from_utf8_lossy(
+        &run(verbs_objects::count_objects, &mut dst, &[]).expect("count"),
+    )
+    .into_owned();
+    assert!(count.starts_with("6 objects,"), "{count}");
+    let walked = String::from_utf8_lossy(
+        &run(verbs_history::rev_list, &mut dst, &[tip.as_str(), "--count"]).expect("rev-list"),
+    )
+    .into_owned();
+    assert_eq!(walked, "2\n", "{walked}");
+}
+
+#[test]
+fn pack_objects_exact_mode_packs_named_objects_only() {
+    let (root, env) = seeded_repo("packobj-exact", "a.txt", b"one\n");
+    let store = open_store(&root);
+    let kind = store.hash_kind();
+    let blob = super::verbs_history::resolve_local(&store, kind, "HEAD:a.txt").expect("blob");
+    let commit = super::verbs_history::resolve_local(&store, kind, "HEAD").expect("commit");
+    let mut ctx = repo_ctx(&root, env);
+    ctx.env.stdin = Some(
+        format!("{}\n-{}\n{}\n", blob.to_hex(), blob.to_hex(), commit.to_hex()).into_bytes(),
+    );
+    let pack = run(verbs_objects::pack_objects, &mut ctx, &["--stdout"]).expect("pack-objects");
+    let (_dst, _env, mut dst) = indexed_repo("packobj-exact-dst", pack);
+    let count = String::from_utf8_lossy(
+        &run(verbs_objects::count_objects, &mut dst, &[]).expect("count"),
+    )
+    .into_owned();
+    assert!(count.starts_with("2 objects,"), "{count}");
+    let hex = commit.to_hex();
+    let present = run(verbs_objects::cat_file, &mut dst, &["-e", hex.as_str()]);
+    assert!(present.is_ok(), "indexed commit must exist");
+}
+
+#[test]
+fn pack_objects_file_mode_writes_base_pack() {
+    let (root, env) = seeded_repo("packobj-file", "a.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    ctx.env.stdin = Some(b"HEAD\n".to_vec());
+    let out = run(verbs_objects::pack_objects, &mut ctx, &["--revs", "out"])
+        .expect("pack-objects");
+    assert!(out.is_empty(), "file mode stays silent");
+    let pack = std::fs::read(root.join("out.pack")).expect("pack file");
+    assert!(pack.starts_with(b"PACK"), "not a pack stream");
+    let (_dst, _env, mut dst) = indexed_repo("packobj-file-dst", pack);
+    let count = String::from_utf8_lossy(
+        &run(verbs_objects::count_objects, &mut dst, &[]).expect("count"),
+    )
+    .into_owned();
+    assert!(count.starts_with("3 objects,"), "{count}");
+}
+
+#[test]
+fn pack_plumbing_rejects_thin_file_garbage_and_usage() {
+    let (root, env) = seeded_repo("packobj-err", "a.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env.clone());
+    let err = run(verbs_objects::pack_objects, &mut ctx, &["--thin", "out"])
+        .expect_err("thin file pack");
+    assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
+    let mut ctx = repo_ctx(&root, env.clone());
+    let err = run(verbs_objects::pack_objects, &mut ctx, &["--stdout", "extra"])
+        .expect_err("trailing argv");
+    assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
+    let mut ctx = repo_ctx(&root, env.clone());
+    ctx.env.stdin = Some(b"not-an-oid\n".to_vec());
+    let err = run(verbs_objects::pack_objects, &mut ctx, &["--stdout"])
+        .expect_err("garbage oid");
+    assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(verbs_objects::index_pack, &mut ctx, &[]).expect_err("no source");
+    assert!(matches!(err, ruk_git::GitError::Invalid { .. }), "{err}");
+    let mut ctx = repo_ctx(&root, test_env(&root));
+    ctx.env.stdin = Some(b"garbage".to_vec());
+    let err = run(verbs_objects::index_pack, &mut ctx, &["--stdin"])
+        .expect_err("garbage pack");
+    assert!(matches!(err, ruk_git::GitError::Corrupt { .. }), "{err}");
 }
 
 /// Builds a repo with one orphaned side commit, returning its hex.
