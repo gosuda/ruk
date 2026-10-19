@@ -1,12 +1,17 @@
 //! Per-repository coordinator sidecar: race, fallback, and lifecycle tests.
 //!
 //! These drive the real `ruk` binary (plus the `ruk coordinator` sidecar it
-//! spawns) through two racing commits, coordinator absence, a killed
-//! coordinator, forced-direct mode, required mode, and idle shutdown. The
-//! batch win is measured through the server's own proof file
-//! (`.ruk/coordinator.stats`): grouped publications share one metadata
-//! transaction, so two racing commits cost fewer publication commits than
-//! two solo ones.
+//! spawns) through cross-branch batched commits, a same-branch race,
+//! coordinator absence, a killed coordinator, forced-direct mode, required
+//! mode, and idle shutdown. The batch win is measured through the server's
+//! own proof file (`.ruk/coordinator.stats`). Sharing stops at the process
+//! boundary: sequential CLI submissions arrive hundreds of milliseconds
+//! apart, far outside the 50 ms burst and group-commit windows, so four
+//! branch commits cost four publication commits. Same-branch racers
+//! serialize instead, the loser reparenting onto the winner's tip. Sharing
+//! across refs is proven where overlap is real: concurrent lane
+//! submissions in `ruk_core::coord::hosted`, and concurrent store
+//! publications in `ruk_core::store`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -109,10 +114,6 @@ fn wait_for(path: &Path, present: bool, timeout: Duration) {
     assert_eq!(path.exists(), present, "wait for {}", path.display());
 }
 
-fn barrier(stats: (u64, u64, u64, u64, u64)) -> u64 {
-    stats.0 + stats.1 + stats.2 + stats.3 + stats.4
-}
-
 fn read_stats(repo: &Path) -> (u64, u64, u64, u64, u64) {
     (
         stat_field(repo, "publications"),
@@ -123,66 +124,138 @@ fn read_stats(repo: &Path) -> (u64, u64, u64, u64, u64) {
     )
 }
 
-/// Two racing commits on one branch both land, and the shared burst syncs
-/// fewer metadata transactions than two solo commits would.
+fn rev_parse(repo: &Path, rev: &str) -> String {
+    let (code, stdout, stderr) = run(repo, &["rev-parse", rev], &[]);
+    assert_eq!(code, 0, "rev-parse {rev} failed: {stderr}");
+    stdout.trim().to_owned()
+}
+
+fn cat_file(repo: &Path, oid: &str) -> String {
+    let (code, stdout, stderr) = run(repo, &["cat-file", "-p", oid], &[]);
+    assert_eq!(code, 0, "cat-file {oid} failed: {stderr}");
+    stdout
+}
+
+fn commit_parents(payload: &str) -> Vec<String> {
+    payload
+        .lines()
+        .filter_map(|line| line.strip_prefix("parent "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Four commits on four branches land exactly attributed: each branch holds
+/// its own commit parented on the seed, with no cross-talk, and each
+/// publication costs its own metadata commit.
+///
+/// Sequential on purpose. One store holds one `HEAD`, so concurrent
+/// checkout-then-commit processes cannot attribute branches (every commit
+/// captures whichever checkout finished last). And sequential CLI
+/// submissions never share a burst: the coordinator retires idle bursts
+/// after 50 ms and the store caps group-commit linger at 50 ms, while CLI
+/// submissions arrive hundreds of milliseconds apart. The equality below
+/// pins that boundary from the other side: if it ever fails with fewer
+/// commits than publications, CLI batching improved and this test needs a
+/// conscious update.
 #[test]
-fn racing_commits_share_one_burst() {
+fn cross_branch_commits_stay_isolated() {
+    const N: usize = 4;
     let idle = &[("RUK_COORDINATOR_IDLE_MS", "10000")];
-    // Solo baseline on its own repository and server generation.
-    let solo = fresh_repo("solo");
-    let (code, _, stderr) = commit_empty(&solo, "solo commit", idle);
-    assert_eq!(code, 0, "solo commit failed: {stderr}");
+    let repo = fresh_repo("cross");
+    // Seed with the sidecar off so the stats file measures only the four
+    // branch publications.
+    let (code, _, stderr) = commit_empty(&repo, "seed", &[("RUK_COORDINATOR", "off")]);
+    assert_eq!(code, 0, "seed commit failed: {stderr}");
+    let seed = rev_parse(&repo, "HEAD");
+    for k in 0..N {
+        let branch = format!("racer/{k}");
+        let (code, _, stderr) = run(&repo, &["branch", branch.as_str()], &[]);
+        assert_eq!(code, 0, "branch {branch} failed: {stderr}");
+    }
+    for k in 0..N {
+        let branch = format!("racer/{k}");
+        let subject = format!("racer {k}");
+        let (code, _, stderr) = run(&repo, &["checkout", branch.as_str()], idle);
+        assert_eq!(code, 0, "checkout {branch} failed: {stderr}");
+        let (code, _, stderr) = commit_empty(&repo, subject.as_str(), idle);
+        assert_eq!(code, 0, "commit {subject} failed: {stderr}");
+    }
+    // Exact attribution: each branch holds exactly its own commit,
+    // parented directly on the seed.
+    for k in 0..N {
+        let branch = format!("racer/{k}");
+        let tip = rev_parse(&repo, branch.as_str());
+        assert_ne!(tip, seed, "{branch} never advanced");
+        let parents = commit_parents(&cat_file(&repo, tip.as_str()));
+        assert_eq!(parents, vec![seed.clone()], "{branch} not parented on seed");
+    }
+    let (code, stdout, stderr) = run(&repo, &["log", "--all", "--oneline"], &[]);
+    assert_eq!(code, 0, "log failed: {stderr}");
+    for k in 0..N {
+        let subject = format!("racer {k}");
+        assert!(
+            stdout.contains(subject.as_str()),
+            "missing {subject}:\n{stdout}"
+        );
+    }
+    assert_eq!(
+        stdout.lines().count(),
+        N + 1,
+        "seed plus four commits:\n{stdout}"
+    );
+    // No sharing across processes: four spaced-out publications cost four
+    // metadata commits.
     wait_for(
-        &solo.join(".ruk").join("coordinator.stats"),
+        &repo.join(".ruk").join("coordinator.stats"),
         true,
         Duration::from_secs(15),
     );
-    let solo_stats = read_stats(&solo);
-    assert!(solo_stats.0 >= 1, "solo published: {solo_stats:?}");
-
-    // Racing pair on a fresh repository; retry once on scheduling blowout.
-    let mut raced: Option<(PathBuf, (u64, u64, u64, u64, u64))> = None;
-    for _ in 0..2 {
-        let repo = fresh_repo("race");
-        let start = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = ["race alpha", "race beta"]
-                .into_iter()
-                .map(|message| {
-                    scope.spawn(|| {
-                        start.wait();
-                        commit_empty(&repo, message, idle)
-                    })
-                })
-                .collect();
-            for handle in handles {
-                let (code, _, stderr) = handle.join().expect("racer panicked");
-                assert_eq!(code, 0, "racing commit failed: {stderr}");
-            }
-        });
-        let log = log_subjects(&repo);
-        assert!(log.contains("race alpha"), "missing alpha:\n{log}");
-        assert!(log.contains("race beta"), "missing beta:\n{log}");
-        wait_for(
-            &repo.join(".ruk").join("coordinator.stats"),
-            true,
-            Duration::from_secs(15),
-        );
-        let stats = read_stats(&repo);
-        if barrier(stats) < barrier(solo_stats) * 2 {
-            raced = Some((repo, stats));
-            break;
-        }
-        std::fs::remove_dir_all(&repo).expect("clear repo");
-    }
-    let (repo, stats) = raced.expect("racing commits never batched");
-    assert!(
-        stats.1 < solo_stats.1 * 2,
-        "race commits {} vs solo {} x2: {stats:?} vs {solo_stats:?}",
-        stats.1,
-        solo_stats.1
-    );
+    let stats = read_stats(&repo);
+    assert_eq!(stats.0, N as u64, "four publications: {stats:?}");
+    assert_eq!(stats.1, N as u64, "one metadata commit each: {stats:?}");
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Two racing commits on one branch both land, serialized: the winner
+/// takes the tip and the loser's client-side retry reparents onto the
+/// fresh tip, so both are durable and the second is a child of the first.
+/// No sharing is asserted: the retry needs a full round trip after
+/// observing the winner, which typically lands outside the 50 ms
+/// group-commit window (measured ~200 ms apart here, though a fast box
+/// could fit), so this test asserts the chain shape, not stats.
+#[test]
+fn same_branch_race_resolves() {
+    let idle = &[("RUK_COORDINATOR_IDLE_MS", "10000")];
+    // No seed: both racers commit onto the unborn branch, so the loser
+    // exercises the born-mid-flight adopt path.
+    let repo = fresh_repo("samerace");
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = ["race alpha", "race beta"]
+            .into_iter()
+            .map(|message| {
+                scope.spawn(|| {
+                    start.wait();
+                    commit_empty(&repo, message, idle)
+                })
+            })
+            .collect();
+        for handle in handles {
+            let (code, _, stderr) = handle.join().expect("racer panicked");
+            assert_eq!(code, 0, "racing commit failed: {stderr}");
+        }
+    });
+    let log = log_subjects(&repo);
+    assert!(log.contains("race alpha"), "missing alpha:\n{log}");
+    assert!(log.contains("race beta"), "missing beta:\n{log}");
+    assert_eq!(log.lines().count(), 2, "exactly two commits:\n{log}");
+    // The loser's retry adopted the winner as its parent: a linear chain
+    // of two with the winner at the root.
+    let head = rev_parse(&repo, "HEAD");
+    let middle = commit_parents(&cat_file(&repo, head.as_str()));
+    assert_eq!(middle.len(), 1, "head has one parent: {middle:?}");
+    let roots = commit_parents(&cat_file(&repo, middle[0].as_str()));
+    assert!(roots.is_empty(), "winner is the root: {roots:?}");
 }
 
 /// An unspawnable coordinator falls back to the direct publish path.

@@ -1391,6 +1391,7 @@ mod tests {
     use crate::capability::{AttestKind, AttestResult};
     use crate::change::{ClaimId, LeaseId, RequestId, StoreId};
     use crate::commit::ProvenanceClaims;
+    use crate::conflict::{Signature, TzOffset};
     use crate::coord::claims::{ClaimClock, seal_acquire};
     use crate::coord::receipt;
     use crate::coord::rows::{ReceiptRow, Retained, SweepCursors, Usage, encode, receipt_key};
@@ -1399,7 +1400,8 @@ mod tests {
     use crate::index::RepoPath;
     use crate::protocol::{
         AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement, BoundedList,
-        ClaimHolderFilter, ClaimListArgs, ClaimMode, ClaimTtl, Method, Mutation as WireMutation,
+        ClaimHolderFilter, ClaimListArgs, ClaimMode, ClaimTtl, GitCommitArgs, Method,
+        Mutation as WireMutation,
         MutationOutcome, OpLogArgs, PageCursor, PageLimit, PageRequest, PinArgs, QueryDigest,
         ReceiptRef, StatusArgs, TagSetArgs, Timestamp, UndoArgs, UndoReply, UndoSummary,
     };
@@ -2712,6 +2714,343 @@ mod tests {
             .await
             .expect_err("unknown session with valid shape stays forbidden");
         assert_eq!(err.code, ErrorCode::EForbidden);
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    fn signature() -> Signature {
+        Signature {
+            name: ByteString::from("Lane Test"),
+            email: ByteString::from("lane@test.invalid"),
+            timestamp: 1_700_000_000,
+            offset: TzOffset::UTC,
+        }
+    }
+
+    async fn submit(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: GitCommitArgs,
+    ) -> Oid {
+        let request = Request::GitCommit(Box::new(WireMutation {
+            request_id: RequestId::generate(),
+            args,
+        }));
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let prepared = match coord
+            .prepare_for_dispatch(session, request, &checkpoint)
+            .expect("prepare lane commit")
+        {
+            DispatchReady::Replay(reply) => {
+                panic!("distinct commits must not replay: {reply:?}")
+            }
+            DispatchReady::Prepared(prepared) => prepared,
+        };
+        let reply = coord
+            .submit_prepared(owner, prepared, cancel)
+            .await
+            .expect("submit lane commit");
+        let Reply::GitCommit(reply) = reply else {
+            panic!("git.commit must answer its own reply");
+        };
+        reply
+            .created
+            .head
+            .as_git()
+            .copied()
+            .expect("lane commit has a git identity")
+    }
+
+    /// Concurrent ref-less lane commits share one batch: without a
+    /// ref_update nothing touches refs, so the batch gate admits
+    /// overlapping submissions into shared store publications.
+    ///
+    /// This is the positive batching proof at the lane. The layered
+    /// `ref_update: None` path (detached and stash commits) genuinely
+    /// groups; branch commits serialize one per batch by design (see the
+    /// next test). Four fits the interactive storage permits, so
+    /// admission never sheds the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_detached_commits_share_one_batch() {
+        use std::time::Duration;
+
+        use crate::change::ChangeId;
+
+        const SUBMITS: usize = 4;
+
+        let (_temp, coord, owner) = coordinator();
+        coord
+            .store()
+            .set_commit_linger(Duration::from_millis(10));
+        let coord = Arc::new(coord);
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+
+        // One shared empty tree; every commit references it.
+        let tree = coord
+            .store()
+            .prepare(
+                ObjectKind::Tree,
+                0,
+                std::io::Cursor::new(Vec::new()),
+                None,
+            )
+            .expect("stage lane tree");
+        let tree_oid = tree.oid();
+        coord
+            .store()
+            .publish(vec![tree], &[])
+            .expect("publish lane tree");
+
+        // Sessions open sequentially up front so the storm is pure
+        // submissions.
+        let mut sessions = Vec::with_capacity(SUBMITS);
+        for _ in 0..SUBMITS {
+            let (session, _) = coord
+                .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+                .await
+                .expect("open race session");
+            sessions.push(session);
+        }
+
+        let before = coord.store().io_stats();
+        // Rendezvous so all four submissions hit the lane within
+        // microseconds of each other, well inside the 2 ms accumulate
+        // window regardless of task-startup jitter.
+        let barrier = Arc::new(tokio::sync::Barrier::new(SUBMITS));
+        let mut tasks = Vec::with_capacity(SUBMITS);
+        for (n, session) in sessions.into_iter().enumerate() {
+            let coord = Arc::clone(&coord);
+            let owner = owner.clone();
+            let cancel = cancel.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                submit(
+                    &coord,
+                    &owner,
+                    session,
+                    &cancel,
+                    GitCommitArgs {
+                        tree: tree_oid,
+                        parents: Vec::new(),
+                        author: signature(),
+                        committer: signature(),
+                        message: ByteString::from(format!("lane detached {n}")),
+                        change_id: Some(ChangeId::generate()),
+                        predecessor: None,
+                        ref_update: None,
+                    },
+                )
+                .await
+            }));
+        }
+        let mut oids = Vec::with_capacity(SUBMITS);
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for task in tasks {
+                oids.push(task.await.expect("lane task live"));
+            }
+        })
+        .await
+        .expect("lane race completes");
+
+        // Four distinct commits minted: nothing deduplicated or replayed.
+        let mut sorted = oids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), SUBMITS, "distinct detached commits");
+
+        // The batching proof: four submissions in fewer store publications,
+        // each costing at most one metadata commit.
+        let after = coord.store().io_stats();
+        let total = u64::try_from(SUBMITS).expect("submission count fits u64");
+        let publications = after.publications - before.publications;
+        let commits = after.publication_commits - before.publication_commits;
+        assert!(
+            publications < total,
+            "lane batches concurrent submissions: {after:?} vs {before:?}"
+        );
+        assert!(
+            commits <= publications,
+            "no batch splits metadata commits: {after:?} vs {before:?}"
+        );
+
+        coord.shutdown();
+        let _ = runner.abort();
+    }
+
+    /// Concurrent lane commits on distinct branches take separate batches:
+    /// the lane admits at most one ref-moving mutation per batch
+    /// (`can_admit` refuses a second item that touches refs), so four
+    /// submissions cost four store publications. Distinct ref_updates
+    /// still never CAS-conflict, so all four land exactly attributed with
+    /// nothing lost or retried.
+    ///
+    /// This pins the batching boundary from the lane side: cross-ref
+    /// batching would need a product change to the batch gate, not a
+    /// test change. The equalities below are structural, not timing:
+    /// they hold regardless of how the submissions overlap. (CLI
+    /// processes cannot even reach this layer concurrently: one store
+    /// holds one `HEAD`, and sequential CLI submissions arrive hundreds
+    /// of milliseconds apart, far outside the 50 ms windows.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_cross_ref_commits_take_separate_batches() {
+        use std::time::Duration;
+
+        use crate::change::ChangeId;
+        use crate::conflict::{Signature, TzOffset};
+        use crate::protocol::{
+            GitCommitArgs, GitCommitRefUpdate, Reply, Request, SessionOpenArgs,
+        };
+        use crate::refdata::{RefTarget, resolve};
+        use crate::refs::StoreRefs;
+
+        const BRANCHES: usize = 4;
+
+        let (_temp, coord, owner) = coordinator();
+        // Widen the store group-commit window past the task-startup spread
+        // so overlapping submissions land in shared groups deterministically.
+        coord
+            .store()
+            .set_commit_linger(Duration::from_millis(10));
+        let coord = Arc::new(coord);
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+
+        // One shared empty tree; every commit references it.
+        let tree = coord
+            .store()
+            .prepare(
+                ObjectKind::Tree,
+                0,
+                std::io::Cursor::new(Vec::new()),
+                None,
+            )
+            .expect("stage lane tree");
+        let tree_oid = tree.oid();
+        coord
+            .store()
+            .publish(vec![tree], &[])
+            .expect("publish lane tree");
+
+        // One seed commit with no ref move; every branch starts unborn and
+        // every first commit parents on the seed.
+        let (setup_session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open setup session");
+        let seed_oid = submit(
+            &coord,
+            &owner,
+            setup_session,
+            &cancel,
+            GitCommitArgs {
+                tree: tree_oid,
+                parents: Vec::new(),
+                author: signature(),
+                committer: signature(),
+                message: ByteString::from("lane seed"),
+                change_id: Some(ChangeId::generate()),
+                predecessor: None,
+                ref_update: None,
+            },
+        )
+        .await;
+        let seed_head = Head::Git { oid: seed_oid };
+
+        // Sessions open sequentially up front: any session-open writes
+        // stay out of the measured window, and every race task starts
+        // with a live session so the storm is pure submissions.
+        let mut sessions = Vec::with_capacity(BRANCHES);
+        for _ in 0..BRANCHES {
+            let (session, _) = coord
+                .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+                .await
+                .expect("open race session");
+            sessions.push(session);
+        }
+
+        let before = coord.store().io_stats();
+        let mut tasks = Vec::with_capacity(BRANCHES);
+        for (branch_no, session) in sessions.into_iter().enumerate() {
+            let coord = Arc::clone(&coord);
+            let owner = owner.clone();
+            let cancel = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                let branch =
+                    RefName::new(format!("refs/heads/lane-{branch_no}")).expect("branch name");
+                submit(
+                    &coord,
+                    &owner,
+                    session,
+                    &cancel,
+                    GitCommitArgs {
+                        tree: tree_oid,
+                        parents: vec![seed_head.clone()],
+                        author: signature(),
+                        committer: signature(),
+                        message: ByteString::from(format!("lane commit {branch_no}")),
+                        change_id: Some(ChangeId::generate()),
+                        predecessor: None,
+                        ref_update: Some(GitCommitRefUpdate {
+                            name: branch,
+                            expected: RefExpect::Absent,
+                        }),
+                    },
+                )
+                .await
+            }));
+        }
+        let mut finals = Vec::with_capacity(BRANCHES);
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for task in tasks {
+                finals.push(task.await.expect("lane task live"));
+            }
+        })
+        .await
+        .expect("lane race completes");
+
+        // Every branch holds exactly its own tip; tips are distinct.
+        let refs = StoreRefs::new(coord.store());
+        for (branch_no, oid) in finals.iter().enumerate() {
+            let name =
+                RefName::new(format!("refs/heads/lane-{branch_no}")).expect("branch name");
+            let resolved = resolve(&refs, &name).expect("resolve branch");
+            assert_eq!(resolved.oid, Some(*oid), "branch holds its own tip");
+        }
+        let mut sorted = finals.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), BRANCHES, "distinct branch tips");
+
+        // The boundary pin: four submissions, four publications, four
+        // metadata commits. If a future batch-gate change folds
+        // distinct-ref mutations into shared batches, these equalities
+        // fail and deserve a conscious update, not a retry.
+        let after = coord.store().io_stats();
+        let total = u64::try_from(BRANCHES).expect("submission count fits u64");
+        assert_eq!(
+            u64::try_from(finals.len()).expect("final count fits u64"),
+            total,
+            "every submission landed"
+        );
+        let publications = after.publications - before.publications;
+        let commits = after.publication_commits - before.publication_commits;
+        assert_eq!(
+            publications, total,
+            "one batch per ref-moving submission: {after:?} vs {before:?}"
+        );
+        assert_eq!(
+            commits, total,
+            "one metadata commit per batch: {after:?} vs {before:?}"
+        );
+
         coord.shutdown();
         let _ = runner.abort();
     }
