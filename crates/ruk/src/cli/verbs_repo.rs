@@ -969,7 +969,7 @@ fn remote_update(ctx: &mut Ctx, tail: &[String]) -> Result<Vec<u8>, GitError> {
     for name in names {
         let owned = name.to_owned();
         let specs = remote_fetch_specs(ctx, &owned);
-        out.extend_from_slice(&run_fetch(
+        let (bytes, _) = run_fetch(
             ctx,
             &owned,
             &specs,
@@ -979,7 +979,8 @@ fn remote_update(ctx: &mut Ctx, tail: &[String]) -> Result<Vec<u8>, GitError> {
                 fetch_tags: false,
                 prune,
             },
-        )?);
+        )?;
+        out.extend_from_slice(&bytes);
     }
     Ok(out)
 }

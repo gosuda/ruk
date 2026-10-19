@@ -23,10 +23,13 @@
 //! - HTTP remotes: [`parse_endpoint`](super::net::parse_endpoint) classifies
 //!   them, and the verbs serve smart-http there (dumb-http stays the named
 //!   gap); SSH and git-daemon remotes fetch and push for real;
-//! - LFS content sync: pointer discovery needs `cat-file --batch-check
-//!   --batch-all-objects`, an object census the store API does not expose
-//!   (see the `fsck` verb docs), and payload transfer rides the LFS HTTP
-//!   API against a separate content store;
+//! - LFS content sync: [`Store::iter_objects`](ruk_core::store::Store::iter_objects)
+//!   is the object census behind `cat-file --batch-check
+//!   --batch-all-objects`, and `ruk fetch --lfs` discovers pointer blobs in
+//!   the fetched tips and pulls their payloads through the LFS batch API
+//!   into the sidecar; the push-mirror upload direction
+//!   (`lfs-payload-sync --upload` exists as a verb, but no `push --lfs`
+//!   wiring drives it) stays the remaining gap;
 //! - symbolic refs are never mapped or pruned: only direct tips carry the
 //!   CAS expectations these updates need.
 //!

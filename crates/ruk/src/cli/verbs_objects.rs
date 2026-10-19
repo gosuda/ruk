@@ -297,12 +297,25 @@ fn batch_check(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
         }
         let oid = super::state::resolve_rev(store, kind, rev)
             .or_else(|_| ruk_git::parse_oid_for(rev, kind));
-        match oid.and_then(|oid| read_object_bytes(store, oid).map(|read| (oid, read))) {
-            Err(_) => out.extend_from_slice(format!("{rev} missing\n").as_bytes()),
-            Ok((oid, (object_kind, body))) => out.extend_from_slice(
+        let oid = match oid {
+            Err(_) => {
+                out.extend_from_slice(format!("{rev} missing\n").as_bytes());
+                continue;
+            }
+            Ok(oid) => oid,
+        };
+        // Absence reports `missing`; damage aborts. Collapsing `Corrupt`
+        // into `missing` would hide committed corruption the store already
+        // latched quarantine for, so only `NotFound` takes the missing arm.
+        match read_object_bytes(store, oid) {
+            Ok((object_kind, body)) => out.extend_from_slice(
                 format!("{} {} {}\n", oid.to_hex(), kind_name_of(object_kind), body.len())
                     .as_bytes(),
             ),
+            Err(GitError::NotFound { .. }) => {
+                out.extend_from_slice(format!("{} missing\n", oid.to_hex()).as_bytes());
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(out)

@@ -44,7 +44,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | archive | implemented | `--format=tar` (server default) and `--format=zip` (client-side transcode of the tar); `--prefix`, `-o`, path limits |
 | branch | implemented | list/create/delete/rename; `-d` checks ancestry, `-D` forces |
 | bundle | unsupported | no bundle format in this slice |
-| cat-file | implemented | `-p`, `-t`, `-s`, `-e` over the bounded object reader |
+| cat-file | implemented | `-p`, `-t`, `-s`, `-e` over the bounded object reader; `--batch-check [--batch-all-objects]` lists `<oid> <type> <size>` from the store census |
 | check-ref-format | implemented | `RefName` validation; `--print`, `--branch` |
 | checkout | implemented | branch switch, detach, `-b`/`-B`, path restore |
 | cherry-pick | partial | revisions resolve; `--abort`/`--quit`/`--continue` report absent sequencer state; application needs the merge lane |
@@ -52,11 +52,11 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | commit | implemented | `-m` (required, no editor), `-a`, `--amend` via `ops::edit`; empty tree-matching commits refuse |
 | commit-tree | implemented | canonical payload, parents verified as stored commits |
 | config | implemented | `--local` scope only; `--global`/`--system`/`--worktree` are `Unsupported` |
-| count-objects | unsupported | the store exposes no object census |
+| count-objects | unsupported | unimplemented; the store census (`Store::iter_objects`) exists but no verb reports it |
 | diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; hunks from a bounded LCS differ with labeled omissions |
-| fetch | implemented | local paths only; refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD` |
+| fetch | implemented | local paths only; refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; `--lfs` pulls LFS payloads for fetched tips (mirror parity) |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
-| fsck | implemented | reachable refs, history, trees, blobs, and index rows; unreachable-object (`dangling`) reporting needs the absent object census |
+| fsck | implemented | reachable refs, history, trees, blobs, and index rows; unreachable-object (`dangling`) reporting unimplemented (census available via `Store::iter_objects`) |
 | gc | unsupported | no repack or prune lane in this slice |
 | grep | implemented | subset: `-l`, `-c`, `-n`, `-e`, `-i`, `-w`, `-F`, `-E` (last of `-F`/`-E` wins), `-H`/`--with-filename`/`--no-filename`, one `<commit>` for tree scope; 0 hit / 1 no hit / 128 bad use; no pathspecs, no `.rukignore`, always-Rust-regex patterns |
 | hash-object | implemented | `-t blob/tree/commit`, `-w` stores; works outside a repository without `-w` |

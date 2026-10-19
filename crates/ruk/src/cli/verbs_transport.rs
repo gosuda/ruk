@@ -4,7 +4,7 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via a protocol-v2 probe first (`smart_http::fetch_pack_v2` over `ls-refs` refs) with a v0 `smart_http::fetch_pack` fallback, then `dumb_http` when the smart advertisement is absent | `--prune` drops orphaned remote-tracking refs (pull-mirror parity) |
+//! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via a protocol-v2 probe first (`smart_http::fetch_pack_v2` over `ls-refs` refs) with a v0 `smart_http::fetch_pack` fallback, then `dumb_http` when the smart advertisement is absent | `--prune` drops orphaned remote-tracking refs (pull-mirror parity); `--lfs` pulls LFS payloads for fetched tips (pull-mirror parity) |
 //! | `pull` | fetch + fast-forward | local, SSH/git and HTTP remotes (fast-forward only) |
 //! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
@@ -53,6 +53,10 @@ use super::{Ctx, FlagSpec, collect, line};
 
 /// Downloads objects and refs from a local repository.
 ///
+/// `--lfs` also pulls LFS payloads for the newly-fetched tips through the
+/// remote's batch endpoint (pull-mirror parity); without it the fetch stays
+/// pointer-only, the way `git fetch` never smudges.
+///
 /// Oracle: `git/builtin/fetch.c`.
 pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
@@ -81,6 +85,11 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: Some('q'),
             takes_value: false,
         },
+        FlagSpec {
+            long: "lfs",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
@@ -98,13 +107,22 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             })
         })
         .transpose()?;
+    let want_lfs = opts.is_set("lfs");
     let plan = FetchPlan {
         force_all: opts.is_set("force"),
         depth,
         fetch_tags: opts.is_set("tags"),
         prune: opts.is_set("prune"),
     };
-    run_fetch(ctx, &remote_label, &spec_texts, plan)
+    let (out, tips) = run_fetch(ctx, &remote_label, &spec_texts, plan)?;
+    // Mirror LFS sync, after the refs moved: walks the newly-arrived tips
+    // for pointer blobs and pulls their payloads through the remote's
+    // batch endpoint. Absence (no endpoint, non-`Full` policy) is silent;
+    // per-object misses go to stderr; only a refused batch document fails.
+    if want_lfs && !tips.is_empty() {
+        mirror_lfs_sync(ctx, &remote_label, &tips)?;
+    }
+    Ok(out)
 }
 
 /// How a fetch updates refs. Data, not selectors: one plan per invocation.
@@ -189,13 +207,17 @@ enum FetchSource {
 /// set aborts the whole fetch with `NotFound` on every advance through
 /// newly-fetched commits).
 ///
+/// Returns the fetch report plus the fetched tip oids (the wants, including
+/// tips whose ref update was refused): `fetch --lfs` walks exactly that
+/// newly-arrived range for pointer blobs instead of re-scanning every ref.
+///
 /// Oracle: `git/builtin/fetch.c`, `git/builtin/remote.c` (`update`).
 pub(crate) fn run_fetch(
     ctx: &Ctx,
     remote_label: &str,
     spec_texts: &[String],
     plan: FetchPlan,
-) -> Result<Vec<u8>, GitError> {
+) -> Result<(Vec<u8>, Vec<Oid>), GitError> {
     let dest = ctx.store()?;
     let dest_kind = ctx.kind()?;
     let (source, advertised) = match resolve_target(ctx, remote_label)? {
@@ -291,7 +313,7 @@ pub(crate) fn run_fetch(
         Vec::new()
     };
     if pairs.is_empty() && pruned.is_empty() {
-        return write_fetch_head(ctx, &[]);
+        return Ok((write_fetch_head(ctx, &[])?, Vec::new()));
     }
     // Wants cover every advertised tip, including refs this fetch may later
     // refuse to move: like git, refused ref updates keep their objects.
@@ -397,7 +419,8 @@ pub(crate) fn run_fetch(
     }
     let mut out = lines.concat().into_bytes();
     out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
-    Ok(out)
+    let tips: Vec<Oid> = pairs.iter().map(|fetched| fetched.oid).collect();
+    Ok((out, tips))
 }
 
 /// Publishes one fetch's objects with no ref deltas: phase one of
@@ -990,7 +1013,7 @@ pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         fetch_tags: false,
         prune: false,
     };
-    run_fetch(ctx, &remote_label, &[spec], plan)?;
+    let (_, _) = run_fetch(ctx, &remote_label, &[spec], plan)?;
     let tip = resolve_rev(
         store,
         ctx.kind()?,
@@ -2857,6 +2880,29 @@ fn sync_via_batch(
     if pending.is_empty() {
         return Ok(());
     }
+    sync_via_batch_at(ctx, store, &endpoint, pending, synced, missing, mutations)
+}
+
+/// Downloads `pending` payloads through the git-lfs batch API at an
+/// explicit endpoint: the transfer half of [`sync_via_batch`], shared with
+/// the mirror path, which resolves its own remote-specific endpoint.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a malformed endpoint or batch request,
+/// [`GitError::Offline`] when the batch endpoint refuses, plus transport
+/// failures from the HTTP client.
+fn sync_via_batch_at(
+    ctx: &Ctx,
+    store: &Store,
+    endpoint: &str,
+    pending: &[(String, u64)],
+    synced: &mut Vec<String>,
+    missing: &mut Vec<(String, String)>,
+    mutations: &mut Vec<FactMutation>,
+) -> Result<(), GitError> {
+    use ruk_core::store::lfs as sidecar;
+    use ruk_git::transport::http::{self, BatchEntry};
+
     let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
     let request = http::batch_request_body(pending)?;
     let mut headers: Vec<(String, String)> = vec![
@@ -2933,6 +2979,114 @@ fn sync_via_batch(
         }
     }
     Ok(())
+}
+
+/// Pulls LFS payloads for one fetch's newly-arrived tips: the `fetch --lfs`
+/// half of pull-mirror sync. Walks the fetched tips (not every ref) for
+/// pointer blobs, then batch-downloads the payloads the sidecar still lacks
+/// into `<store>/lfs/objects/` with presence rows, the same transfer the
+/// download half of [`lfs_payload_sync`] runs.
+///
+/// Best-effort by design: a non-`Full` policy or no batch endpoint
+/// (`lfs.url`, then `remote.<name>.lfsurl`, then `<fetch-url>/info/lfs` for
+/// http(s) remotes) skips silently, and per-object misses go to stderr
+/// without failing the fetch that already moved its refs. Only a refused
+/// batch document itself fails.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a malformed endpoint or batch request,
+/// [`GitError::Offline`] when the batch endpoint refuses, plus transport
+/// failures from the HTTP client.
+fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<(), GitError> {
+    use ruk_core::store::lfs as sidecar;
+
+    let store = ctx.store()?;
+    if mode_for_store(store.root()) != LfsMode::Full {
+        return Ok(());
+    }
+    let kind = ctx.kind()?;
+    // Pointers in the newly-arrived range, keyed by payload hex: the same
+    // small-blob walk the payload-sync verb runs, scoped to the fetched
+    // tips. Unreadable blobs are fsck's domain; the sync skips them.
+    let mut pointers: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (_, record) in super::state::walk_history(store, tips, None)? {
+        let tree = super::tree::commit_tree_oid(&record)?;
+        for (_, _, oid) in super::tree::flatten_tree(store, kind, tree)? {
+            let len = store.object_len(oid).map_err(GitError::from)?;
+            if len.is_some_and(|bytes| bytes >= 1024) {
+                continue;
+            }
+            let Ok((object_kind, bytes)) = super::tree::read_object_bytes(store, oid) else {
+                continue;
+            };
+            if object_kind != ObjectKind::Blob {
+                continue;
+            }
+            if let Some((hex, size)) = ruk_core::parse_pointer(&bytes) {
+                pointers.entry(hex).or_insert(size);
+            }
+        }
+    }
+    let pending: Vec<(String, u64)> = pointers
+        .into_iter()
+        .filter(|(hex, size)| !sidecar::sidecar_verified(store.root(), hex, *size))
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let Some(endpoint) = lfs_endpoint_for_remote(ctx, remote_label) else {
+        return Ok(());
+    };
+    let mut synced = Vec::new();
+    let mut missing: Vec<(String, String)> = Vec::new();
+    let mut mutations = Vec::new();
+    sync_via_batch_at(
+        ctx,
+        store,
+        &endpoint,
+        &pending,
+        &mut synced,
+        &mut missing,
+        &mut mutations,
+    )?;
+    if !mutations.is_empty() {
+        store
+            .publish(Vec::new(), &mutations)
+            .map_err(GitError::from)?;
+    }
+    for (hex, error) in &missing {
+        ctx.emit_stderr(format!("lfs: {hex} missing ({error})\n").as_bytes());
+    }
+    Ok(())
+}
+
+/// The LFS batch endpoint for a fetch remote: `lfs.url` first, then
+/// `remote.<name>.lfsurl`, then the git-lfs derivation `<fetch-url>/info/lfs`.
+/// `None` means LFS is absent and the caller skips silently. A raw-URL fetch
+/// target derives from the URL itself when no configured remote matches.
+fn lfs_endpoint_for_remote(ctx: &Ctx, remote_label: &str) -> Option<String> {
+    if let Some(url) = ctx.config_get("lfs.url") {
+        return Some(url);
+    }
+    if let Some(url) = ctx.config_get(&format!("remote.{remote_label}.lfsurl")) {
+        return Some(url);
+    }
+    match ctx.config_get(&format!("remote.{remote_label}.url")) {
+        Some(url) => derive_lfs_endpoint(&url),
+        None => derive_lfs_endpoint(remote_label),
+    }
+}
+
+/// Derives the git-lfs batch endpoint from a remote URL the way git-lfs
+/// does: an http(s) remote serves `<url>/info/lfs`. Local paths, SSH, and
+/// git-daemon remotes carry no batch endpoint.
+fn derive_lfs_endpoint(fetch_url: &str) -> Option<String> {
+    let lower = fetch_url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(format!("{}/info/lfs", fetch_url.trim_end_matches('/')))
+    } else {
+        None
+    }
 }
 
 /// Uploads `present` payloads through the git-lfs batch API at the
