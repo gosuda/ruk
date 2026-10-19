@@ -44,8 +44,6 @@ const SIG_V3: &str = "# v3 git bundle";
 
 /// Parsed bundle header plus the pack offset into the file bytes.
 pub(crate) struct ParsedBundle {
-    /// Bundle version (2 or 3).
-    pub(crate) version: u8,
     /// Declared or inferred object format.
     pub(crate) format: HashKind,
     /// Prerequisite tips (`^` exclusions at create time).
@@ -535,13 +533,9 @@ pub(crate) fn parse_bundle(bytes: &[u8], label: &str) -> Result<ParsedBundle, Gi
     }
     let mut lines = header.split(|byte| *byte == b'\n');
     let signature = lines.next().ok_or_else(|| corrupt("empty header"))?;
-    let version = if signature == SIG_V2.as_bytes() {
-        2
-    } else if signature == SIG_V3.as_bytes() {
-        3
-    } else {
+    if signature != SIG_V2.as_bytes() && signature != SIG_V3.as_bytes() {
         return Err(corrupt("not a bundle (bad signature)"));
-    };
+    }
     let mut format: Option<HashKind> = None;
     let mut prereqs: Vec<(Oid, String)> = Vec::new();
     let mut heads: Vec<(Oid, Vec<u8>)> = Vec::new();
@@ -599,7 +593,6 @@ pub(crate) fn parse_bundle(bytes: &[u8], label: &str) -> Result<ParsedBundle, Gi
         }
     }
     Ok(ParsedBundle {
-        version,
         format: format.unwrap_or(inferred),
         prereqs,
         heads,
