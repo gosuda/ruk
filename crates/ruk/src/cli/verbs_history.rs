@@ -8750,7 +8750,7 @@ fn unified_pair(
         );
         return Ok((out, new_lines.len(), old_lines.len(), false, sizes));
     }
-    if render.ws != WsFold::Exact || render.blank || render.word != WordDiffMode::Off {
+    if render.ws != WsFold::Exact || render.blank || render.eol || render.word != WordDiffMode::Off {
         let (added, removed) = emit_aligned_hunks(&mut out, &old_lines, &new_lines, render)?;
         if added == 0 && removed == 0 {
             // Folding erased every difference (whitespace-only or
