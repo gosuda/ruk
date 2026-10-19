@@ -4184,7 +4184,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             )?
                         }
                         Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => adv.refs,
-                                                Err(err)
+                        Err(err)
                             if ruk_git::transport::dumb_http::is_dumb_gap(&err) =>
                         {
                             let adv = ruk_git::transport::dumb_http::discover(
@@ -4199,10 +4199,8 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             // Real `info/refs` files name direct refs only,
                             // but a foreign server may list `HEAD` itself:
                             // never print the row twice.
-                            let file_names_head = adv
-                                .refs
-                                .iter()
-                                .any(|entry| entry.name == b"HEAD");
+                            let file_names_head =
+                                adv.refs.iter().any(|entry| entry.name == b"HEAD");
                             if !file_names_head {
                                 if let Some(pointed) =
                                     ruk_git::transport::dumb_http::fetch_head_symref(
