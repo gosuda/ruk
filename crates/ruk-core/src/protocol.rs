@@ -5475,6 +5475,7 @@ mod tests {
             "file",
             "blame",
             "query",
+            "git.commit",
         ];
         for method in required {
             assert!(names.contains(method), "missing method {method}");
