@@ -328,7 +328,7 @@ fn batch_check(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
 }
 
 /// Names one stored object kind.
-fn kind_name_of(kind: ObjectKind) -> &'static str {
+pub(crate) fn kind_name_of(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Blob => "blob",
         ObjectKind::Tree => "tree",

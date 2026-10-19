@@ -12,7 +12,7 @@
 //! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex session | tar and zip (`--format=zip` transcodes the tar client-side; every transport still answers tar); `--prefix`, `-o` and path limits rewrite the stream client-side |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
-//! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
+//! | `fsck` | ref walk + object existence, census-minus-reachable sweep | implemented; `--dangling`/`--unreachable` list `dangling <kind> <oid>` rows |
 //! | `ls-remote` | local `session::advertise` or one `net::discover` round trip; HTTP remotes probe protocol v2 first (`ls-refs`) | SSH/git and smart-http remotes served; dumb-http is the remaining HTTP gap |
 //!
 //! Oracle anchors: `git/builtin/fetch.c`, `git/builtin/pull.c`,
@@ -2720,19 +2720,33 @@ pub(crate) fn gc(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     })
 }
 
-/// Verifies reachable objects: every ref tip, its history, their trees and
-/// blobs, and every index row's blob must exist.
+/// Verifies reachable objects: every commit's tree must exist with every
+/// blob it names, and every index row must name a stored object. With
+/// `--dangling` or `--unreachable` the verb also lists census objects no
+/// ref reaches as `dangling <kind> <oid>` rows, the way the oracle lists
+/// unreachable objects. Both spellings report the same set: the store
+/// keeps no pack/loose split to tell dangling from unreachable. Index-only
+/// blobs count as unreachable (reachability closes over refs alone).
 ///
-/// Oracle: `git/builtin/fsck.c`. Unreachable-object reporting needs an
-/// object census the store API does not expose, so only reachable
-/// corruption fails; the absence of `dangling` lines is documented, not a
-/// clean bill for unreachable storage.
+/// Oracle: `git/builtin/fsck.c`.
 pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [FlagSpec {
-        long: "full",
-        short: None,
-        takes_value: false,
-    }];
+    let specs = [
+        FlagSpec {
+            long: "full",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "dangling",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "unreachable",
+            short: None,
+            takes_value: false,
+        },
+    ];
     let opts = collect(args, &specs)?;
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
@@ -2742,6 +2756,7 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let _ = opts.is_set("full");
+    let want_dangling = opts.is_set("dangling") || opts.is_set("unreachable");
     let mut tips = Vec::new();
     for (_, target) in list_refs(store)? {
         match target {
@@ -2755,10 +2770,32 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             }
         }
     }
+    // Peel tag tips to the commits the history walk accepts; every
+    // traversed oid joins the reachable set, so tag objects never report
+    // dangling. A ref aimed past commits (a tree, a blob) contributes
+    // itself, with trees walking their subtrees.
+    let mut reachable = HashSet::new();
+    let mut commits = Vec::new();
+    for tip in tips {
+        let (visited, commit) = peel_tip_chain(store, kind, tip)?;
+        reachable.extend(visited.iter().copied());
+        match commit {
+            Some(commit) => commits.push(commit),
+            None => {
+                if super::tree::read_object_bytes(store, tip)?.0 == ObjectKind::Tree {
+                    mark_tree(store, kind, tip, &mut reachable)?;
+                }
+            }
+        }
+    }
     let mut out = Vec::new();
-    for (oid, record) in walk_history(store, &tips, None)? {
+    for (oid, record) in walk_history(store, &commits, None)? {
         let tree = super::tree::commit_tree_oid(&record)?;
         check_tree(store, kind, tree, &mut out)?;
+        if want_dangling {
+            reachable.insert(oid);
+            mark_tree(store, kind, tree, &mut reachable)?;
+        }
         let _ = oid;
     }
     for (path, _, entry) in scan_index(store, kind)? {
@@ -2771,6 +2808,22 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 )
                 .as_bytes(),
             );
+        }
+    }
+    // Unreachable objects: the census minus the ref closure, in census
+    // (digest) order, one `dangling <kind> <oid>` row each like the oracle.
+    if want_dangling {
+        for (oid, object_kind, _) in store.iter_objects().map_err(GitError::from)? {
+            if !reachable.contains(&oid) {
+                out.extend_from_slice(
+                    format!(
+                        "dangling {} {}\n",
+                        super::verbs_objects::kind_name_of(object_kind),
+                        oid.to_hex()
+                    )
+                    .as_bytes(),
+                );
+            }
         }
     }
     Ok(out)
@@ -3351,20 +3404,27 @@ fn push_lfs_upload(
     Ok(())
 }
 
-/// Peels one fetched tip to the commit the history walk accepts: annotated
-/// tags dereference through their `object` lines (at most 32 hops, the
-/// same bound the rev-parse peel uses). Anything that never resolves to a
-/// commit contributes nothing to pointer discovery and yields `None`.
+/// Peels one tip through annotated tags to the commit the history walk
+/// accepts, returning every traversed oid plus the commit (at most 32 hops,
+/// the same bound the rev-parse peel uses). Anything that never resolves to
+/// a commit still contributes its traversed oids with no commit: the tip
+/// itself is reachable (a tree tip still walks its subtree), only history
+/// has nothing to add.
 ///
 /// # Errors
 /// Read failures and malformed tag payloads propagate; absence and damage
-/// are fetch-level facts, never per-tip silence.
-fn peel_to_commit_tip(store: &Store, kind: HashKind, tip: Oid) -> Result<Option<Oid>, GitError> {
+/// are caller-level facts, never per-tip silence.
+fn peel_tip_chain(
+    store: &Store,
+    kind: HashKind,
+    tip: Oid,
+) -> Result<(Vec<Oid>, Option<Oid>), GitError> {
+    let mut visited = vec![tip];
     let mut current = tip;
     for _ in 0..32 {
         let (object_kind, bytes) = super::tree::read_object_bytes(store, current)?;
         match object_kind {
-            ObjectKind::Commit => return Ok(Some(current)),
+            ObjectKind::Commit => return Ok((visited, Some(current))),
             ObjectKind::Tag => {
                 // Tag payloads open with `object <hex>`, the line the
                 // branch peel reads; anything else is a malformed tag.
@@ -3381,13 +3441,62 @@ fn peel_to_commit_tip(store: &Store, kind: HashKind, tip: Oid) -> Result<Option<
                     detail: format!("tag {} has a non-UTF-8 object header", current.to_hex()),
                 })?;
                 current = ruk_git::parse_oid_for(text, kind)?;
+                visited.push(current);
             }
-            _ => return Ok(None),
+            _ => return Ok((visited, None)),
         }
     }
     Err(GitError::Corrupt {
         detail: format!("tag chain from {} does not end", tip.to_hex()),
     })
+}
+
+/// Peels one fetched tip to the commit the history walk accepts: annotated
+/// tags dereference through their `object` lines (at most 32 hops, the
+/// same bound the rev-parse peel uses). Anything that never resolves to a
+/// commit contributes nothing to pointer discovery and yields `None`.
+///
+/// # Errors
+/// Read failures and malformed tag payloads propagate; absence and damage
+/// are fetch-level facts, never per-tip silence.
+fn peel_to_commit_tip(store: &Store, kind: HashKind, tip: Oid) -> Result<Option<Oid>, GitError> {
+    Ok(peel_tip_chain(store, kind, tip)?.1)
+}
+
+/// Marks one tree and its subtree reachable: the tree itself plus every
+/// entry oid, recursing into subtrees. Missing trees stay silent (the
+/// corruption half already reported them); anything else propagates.
+///
+/// # Errors
+/// Malformed tree bodies and damaged reads propagate; absence is the
+/// corruption half's report, never this walk's failure.
+fn mark_tree(
+    store: &Store,
+    kind: HashKind,
+    tree: Oid,
+    reachable: &mut HashSet<Oid>,
+) -> Result<(), GitError> {
+    if !reachable.insert(tree) {
+        return Ok(());
+    }
+    let body = match super::tree::read_object_bytes(store, tree) {
+        Ok((ObjectKind::Tree, body)) => body,
+        Ok(_) => {
+            return Err(GitError::Invalid {
+                detail: format!("object {} is not a tree", tree.to_hex()),
+            });
+        }
+        Err(GitError::NotFound { .. }) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in super::tree::parse_tree(kind, &body)? {
+        if entry.mode.is_tree() {
+            mark_tree(store, kind, entry.oid, reachable)?;
+        } else {
+            reachable.insert(entry.oid);
+        }
+    }
+    Ok(())
 }
 
 /// The LFS batch endpoint for a fetch remote: `lfs.url` first, then

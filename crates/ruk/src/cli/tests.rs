@@ -967,7 +967,6 @@ fn unsupported_verbs_report_closed_codes() {
         verbs_objects::pack_objects
             as fn(&mut Ctx, &[String]) -> Result<Vec<u8>, ruk_git::GitError>,
         verbs_objects::index_pack,
-        verbs_objects::count_objects,
         verbs_transport::gc,
         verbs_transport::bundle,
         verbs_repo::worktree,

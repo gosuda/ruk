@@ -56,7 +56,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; hunks from a bounded LCS differ with labeled omissions |
 | fetch | implemented | local paths only; refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; `--lfs` pulls LFS payloads for fetched tips (mirror parity) |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
-| fsck | implemented | reachable refs, history, trees, blobs, and index rows; unreachable-object (`dangling`) reporting unimplemented (census available via `Store::iter_objects`) |
+| fsck | implemented | reachable refs, history, trees, blobs, and index rows; `--dangling`/`--unreachable` list `dangling <kind> <oid>` from the census minus the ref closure |
 | gc | unsupported | no repack or prune lane in this slice |
 | grep | implemented | subset: `-l`, `-c`, `-n`, `-e`, `-i`, `-w`, `-F`, `-E` (last of `-F`/`-E` wins), `-H`/`--with-filename`/`--no-filename`, one `<commit>` for tree scope; 0 hit / 1 no hit / 128 bad use; no pathspecs, no `.rukignore`, always-Rust-regex patterns |
 | hash-object | implemented | `-t blob/tree/commit`, `-w` stores; works outside a repository without `-w` |
