@@ -692,7 +692,6 @@ pub fn fetch_archive_stream<R: Read + Write>(stream: R, rev: &str) -> Result<Vec
 }
 
 /// Maps wire refs onto local advertisement rows for refspec expansion:
-/// Maps wire refs onto local advertisement rows for refspec expansion:
 /// direct tips stay direct, symrefs stay symbolic, peeled `^{}` dupes and
 /// unborn entries without a target drop out.
 ///

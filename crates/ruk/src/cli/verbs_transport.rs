@@ -1852,25 +1852,6 @@ fn checksum_header(header: &mut [u8; 512]) {
     header[155] = b' ';
 }
 
-/// The logical path of a member: the pax `path` record when an `x` header
-/// carries one, else the ustar prefix/name fields joined with `/`.
-fn member_path(header: &[u8; 512], data: &[u8], typeflag: u8) -> Option<Vec<u8>> {
-    if typeflag == b'x' {
-        return pax_path_record(data);
-    }
-    let prefix_end = header[345..500].iter().position(|byte| *byte == 0).unwrap_or(155);
-    let name_end = header[..100].iter().position(|byte| *byte == 0).unwrap_or(100);
-    let (prefix, name) = (&header[345..345 + prefix_end], &header[..name_end]);
-    if prefix.is_empty() {
-        Some(name.to_vec())
-    } else {
-        let mut out = prefix.to_vec();
-        out.push(b'/');
-        out.extend_from_slice(name);
-        Some(out)
-    }
-}
-
 /// The ustar prefix/name fields joined with `/`, without consulting any
 /// `x` record beside the member.
 fn header_name(header: &[u8; 512]) -> Vec<u8> {
@@ -1887,7 +1868,6 @@ fn header_name(header: &[u8; 512]) -> Vec<u8> {
     }
 }
 
-/// Reads the `path` record out of pax extended-header data, if present.
 /// Reads the `path` record out of pax extended-header data, if present.
 fn pax_path_record(data: &[u8]) -> Option<Vec<u8>> {
     let mut rest = data;
@@ -2092,40 +2072,52 @@ fn rewrap_archive_tar(
     // synthesized header for an unsplittable rename emits the same way.
     let mut out = Vec::with_capacity(tar.len() + 512);
     let mut pending: Option<TarMember> = None;
-    for (index, (mut member, _)) in members.into_iter().enumerate() {
-        if member.header[156] == b'x' {
-            if keep[index] {
-                match pending.as_mut() {
-                    Some(first) => first.data.extend_from_slice(&member.data),
-                    None => pending = Some(member),
+    for (index, (mut member, flag)) in members.into_iter().enumerate() {
+        match flag {
+            // Pax headers buffer in memory until their entry arrives, so
+            // a synthesized header for an unsplittable rename emits the
+            // same way; consecutive headers merge onto the same entry.
+            b'x' => {
+                if keep[index] {
+                    buffer_pax(&mut pending, member);
                 }
             }
-            continue;
+            // The global header is not a member: it passes through
+            // verbatim, never renamed or filtered.
+            b'g' => emit_member(&mut out, &member),
+            _ => {
+                if !keep[index] {
+                    pending = None;
+                    continue;
+                }
+                if let Some(synth) = match prefix {
+                    Some(prefix) => rename_member(&mut member, &mut pending, prefix),
+                    None => None,
+                } {
+                    emit_member(&mut out, &synth);
+                }
+                if let Some(header) = pending.take() {
+                    emit_member(&mut out, &header);
+                }
+                emit_member(&mut out, &member);
+            }
         }
-        // The global header is not a member: it passes through verbatim,
-        // never renamed or filtered.
-        if member.header[156] == b'g' {
-            emit_member(&mut out, &member);
-            continue;
-        }
-        if !keep[index] {
-            pending = None;
-            continue;
-        }
-        let synth = match prefix {
-            Some(prefix) => rename_member(&mut member, &mut pending, prefix),
-            None => None,
-        };
-        if let Some(synth) = synth {
-            emit_member(&mut out, &synth);
-        }
-        if let Some(header) = pending.take() {
-            emit_member(&mut out, &header);
-        }
-        emit_member(&mut out, &member);
     }
     out.extend_from_slice(&[0u8; 1024]);
     Ok(out)
+}
+
+/// Buffers one `x` header onto the pending entry: consecutive headers
+/// merge, and the size and checksum track the grown data.
+fn buffer_pax(pending: &mut Option<TarMember>, member: TarMember) {
+    match pending.as_mut() {
+        Some(first) => {
+            first.data.extend_from_slice(&member.data);
+            octal_into(&mut first.header[124..136], first.data.len() as u64);
+            checksum_header(&mut first.header);
+        }
+        None => *pending = Some(member),
+    }
 }
 
 /// Appends one member with its padding.
@@ -2204,16 +2196,22 @@ fn truncate_header(header: &mut [u8; 512], renamed: &[u8]) {
 /// width iterates to its fixed point (at most two rounds, since the width
 /// only grows into wider digit counts).
 fn ext_record_bytes(keyword: &str, value: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(value);
-    let mut record = format!("0 {keyword}={text}\n");
+    // Paths are raw bytes, never coerced through UTF-8: the width counts
+    // the digits of the total, iterating to its fixed point (two rounds:
+    // the width only grows into wider digit counts).
+    let mut width = value.len() + keyword.len() + 4;
     loop {
-        let width = record.len();
-        let next = format!("{width} {keyword}={text}\n");
-        if next.len() == width {
-            return next.into_bytes();
+        let digits = width.ilog10() as usize + 1;
+        let total = digits + 1 + keyword.len() + 1 + value.len() + 1;
+        if total == width {
+            break;
         }
-        record = next;
+        width = total;
     }
+    let mut out = format!("{width} {keyword}=").into_bytes();
+    out.extend_from_slice(value);
+    out.push(b'\n');
+    out
 }
 
 /// Builds a 512-byte `x` pax header for `record` bytes of data.
@@ -3184,7 +3182,7 @@ mod archive_rewrap_tests {
             }
             let path = match pending.take().and_then(|records| pax_path_record(&records)) {
                 Some(path) => path,
-                None => member_path(&header, &data, flag).expect("name"),
+                None => header_name(&header),
             };
             out.push((flag, path, data));
         }
