@@ -249,12 +249,12 @@ fn tree_codec_round_trips() {
     let kind = HashKind::Sha1;
     let entries = vec![
         super::tree::TreeEntry {
-            mode: ruk_core::index::FileMode::Regular,
+            mode: super::tree::TreeMode::Regular,
             name: b"b.txt".to_vec(),
             oid: kind.hash_git_object("blob", b"b").expect("hash"),
         },
         super::tree::TreeEntry {
-            mode: ruk_core::index::FileMode::Executable,
+            mode: super::tree::TreeMode::Executable,
             name: b"a.txt".to_vec(),
             oid: kind.hash_git_object("blob", b"a").expect("hash"),
         },
@@ -263,6 +263,26 @@ fn tree_codec_round_trips() {
     let parsed = super::tree::parse_tree(kind, &body).expect("parse");
     assert_eq!(parsed, entries);
     assert!(super::tree::parse_tree(kind, b"100644 a.txt").is_err());
+    // Directory modes round-trip: `40000` encodes and both `40000` and
+    // zero-padded `040000` parse back to the tree mode the index refuses.
+    let dir_oid = kind.hash_git_object("tree", b"").expect("hash");
+    let dir_entries = vec![super::tree::TreeEntry {
+        mode: super::tree::TreeMode::Tree,
+        name: b"sub".to_vec(),
+        oid: dir_oid,
+    }];
+    let dir_body = super::tree::encode_tree(&dir_entries);
+    assert!(dir_body.starts_with(b"40000 sub\0"));
+    assert_eq!(
+        super::tree::parse_tree(kind, &dir_body).expect("parse dir"),
+        dir_entries
+    );
+    let mut padded = b"040000 sub\0".to_vec();
+    padded.extend_from_slice(dir_oid.as_bytes());
+    assert_eq!(
+        super::tree::parse_tree(kind, &padded).expect("parse padded"),
+        dir_entries
+    );
     let payload = super::tree::commit_payload(
         &"0".repeat(40),
         &["1".repeat(40)],
@@ -1776,10 +1796,16 @@ fn archive_zip_roundtrip_reads_back() {
 
 #[test]
 fn archive_zip_prefix_and_path_limits() {
-    // Root-level files only: nested paths trip the stage lane's directory
-    // modes, which is that lane's gap, not this verb's.
+    // A nested path commits through a `40000` directory tree entry, the
+    // mode the index lane refuses: the limited and full archives below
+    // prove that lane end to end.
     let (root, env) = seeded_two_file_repo("uarchive-zip-pre");
+    std::fs::create_dir_all(root.join("sub")).expect("seed dir");
+    std::fs::write(root.join("sub/b.txt"), b"b\n").expect("seed nested");
     let mut ctx = repo_ctx(&root, env);
+    verbs_stage::add(&mut ctx, &["sub/b.txt".to_owned()]).expect("add nested");
+    verbs_history::commit(&mut ctx, &["-m".to_owned(), "nested".to_owned()])
+        .expect("commit nested");
     let zip = run(
         verbs_transport::archive,
         &mut ctx,
@@ -1800,6 +1826,22 @@ fn archive_zip_prefix_and_path_limits() {
         );
     }
     assert!(names.iter().any(|name| name == "pre/b.txt"), "{names:?}");
+    let full = run(
+        verbs_transport::archive,
+        &mut ctx,
+        &["--format=zip", "--prefix=pre/", "HEAD"],
+    )
+    .expect("full zip");
+    let mut full_archive =
+        zip::ZipArchive::new(std::io::Cursor::new(&full)).expect("readable full zip");
+    let full_names: Vec<String> = full_archive
+        .file_names()
+        .map(|name| name.expect("entry name").into_owned())
+        .collect();
+    assert!(
+        full_names.iter().any(|name| name == "pre/sub/b.txt"),
+        "nested path archives: {full_names:?}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 

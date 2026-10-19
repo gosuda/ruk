@@ -16,11 +16,93 @@ use ruk_core::store::{ObjectKind, Store};
 use ruk_git::GitError;
 use std::io::Read;
 
+/// The mode of one tree entry: the four blob/commit modes plus the
+/// directory mode. The index [`FileMode`] deliberately refuses `040000`
+/// (index rows are never directories), so trees carry this wider type and
+/// map back through [`TreeMode::as_index_mode`] only for blob/commit rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum TreeMode {
+    Regular,
+    Executable,
+    Symlink,
+    Gitlink,
+    Tree,
+}
+
+impl TreeMode {
+    /// Canonical octal value, the way `ls-tree` spells it.
+    #[must_use]
+    pub(crate) const fn octal(self) -> u32 {
+        match self {
+            Self::Regular => 0o100_644,
+            Self::Executable => 0o100_755,
+            Self::Symlink => 0o120_000,
+            Self::Gitlink => 0o160_000,
+            Self::Tree => 0o040_000,
+        }
+    }
+
+    /// Canonical spelling for tree bodies.
+    fn spelling(self) -> &'static str {
+        match self {
+            Self::Regular => "100644",
+            Self::Executable => "100755",
+            Self::Symlink => "120000",
+            Self::Gitlink => "160000",
+            Self::Tree => "40000",
+        }
+    }
+
+    /// Parses a stored mode. The historical group-writable `100664` reads
+    /// as regular and a zero-padded `040000` as a tree, as Git reads them.
+    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
+        Some(match bytes {
+            b"100644" | b"100664" => Self::Regular,
+            b"100755" => Self::Executable,
+            b"120000" => Self::Symlink,
+            b"160000" => Self::Gitlink,
+            b"40000" | b"040000" => Self::Tree,
+            _ => return None,
+        })
+    }
+
+    /// Whether this entry names a subtree.
+    #[must_use]
+    pub(crate) const fn is_tree(self) -> bool {
+        matches!(self, Self::Tree)
+    }
+
+    /// The index mode for a blob/commit entry. Directories never reach
+    /// index rows; calling this on `Tree` is an internal error.
+    pub(crate) fn as_index_mode(self) -> Result<FileMode, GitError> {
+        match self {
+            Self::Regular => Ok(FileMode::Regular),
+            Self::Executable => Ok(FileMode::Executable),
+            Self::Symlink => Ok(FileMode::Symlink),
+            Self::Gitlink => Ok(FileMode::Gitlink),
+            Self::Tree => Err(GitError::Invalid {
+                detail: "tree directory has no index mode".to_owned(),
+            }),
+        }
+    }
+}
+
+impl From<FileMode> for TreeMode {
+    fn from(mode: FileMode) -> Self {
+        match mode {
+            FileMode::Regular => Self::Regular,
+            FileMode::Executable => Self::Executable,
+            FileMode::Symlink => Self::Symlink,
+            FileMode::Gitlink => Self::Gitlink,
+        }
+    }
+}
+
 /// One parsed tree entry in stored order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TreeEntry {
     /// Entry mode.
-    pub(crate) mode: FileMode,
+    pub(crate) mode: TreeMode,
     /// Entry name bytes (no `/`, no NUL).
     pub(crate) name: Vec<u8>,
     /// Entry target: blob/tree oid, or a commit oid for a gitlink.
@@ -43,11 +125,8 @@ pub(crate) fn parse_tree(kind: HashKind, bytes: &[u8]) -> Result<Vec<TreeEntry>,
             .iter()
             .map(|byte| *byte as char)
             .collect::<String>();
-        let mode_value = u32::from_str_radix(&mode_text, 8).map_err(|_| GitError::Invalid {
+        let mode = TreeMode::parse(&rest[..space]).ok_or_else(|| GitError::Invalid {
             detail: format!("tree entry has bad mode {mode_text:?}"),
-        })?;
-        let mode = FileMode::from_octal(mode_value).map_err(|err| GitError::Invalid {
-            detail: format!("tree entry has non-indexable mode: {err}"),
         })?;
         rest = &rest[space + 1..];
         let nul = rest
@@ -94,7 +173,7 @@ fn kind_width(kind: HashKind) -> usize {
 pub(crate) fn encode_tree(entries: &[TreeEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for entry in entries {
-        out.extend_from_slice(format!("{:o}", entry.mode.octal()).as_bytes());
+        out.extend_from_slice(entry.mode.spelling().as_bytes());
         out.push(b' ');
         out.extend_from_slice(&entry.name);
         out.push(0);
@@ -143,7 +222,7 @@ fn build_dir(
     if let Some(files) = by_dir.get(dir) {
         for (file, mode, oid) in files {
             entries.push(TreeEntry {
-                mode: *mode,
+                mode: TreeMode::from(*mode),
                 name: file.clone(),
                 oid: *oid,
             });
@@ -169,9 +248,7 @@ fn build_dir(
         full.extend_from_slice(child);
         let oid = build_dir(store, kind, by_dir, &full, published)?;
         entries.push(TreeEntry {
-            mode: FileMode::from_octal(0o040_000).map_err(|err| GitError::Invalid {
-                detail: format!("directory mode refused: {err}"),
-            })?,
+            mode: TreeMode::Tree,
             name: child.clone(),
             oid,
         });
@@ -193,10 +270,10 @@ fn build_dir(
 fn tree_order(left: &TreeEntry, right: &TreeEntry) -> std::cmp::Ordering {
     let mut left_key = left.name.clone();
     let mut right_key = right.name.clone();
-    if left.mode.octal() == 0o040_000 {
+    if left.mode.is_tree() {
         left_key.push(b'/');
     }
-    if right.mode.octal() == 0o040_000 {
+    if right.mode.is_tree() {
         right_key.push(b'/');
     }
     left_key.cmp(&right_key)
@@ -429,7 +506,7 @@ pub(crate) fn flatten_tree(
     store: &Store,
     kind: HashKind,
     oid: Oid,
-) -> Result<Vec<(Vec<u8>, FileMode, Oid)>, GitError> {
+) -> Result<Vec<(Vec<u8>, TreeMode, Oid)>, GitError> {
     let mut out = Vec::new();
     flatten_dir(store, kind, oid, &[], &mut out)?;
     Ok(out)
@@ -441,7 +518,7 @@ fn flatten_dir(
     kind: HashKind,
     oid: Oid,
     prefix: &[u8],
-    out: &mut Vec<(Vec<u8>, FileMode, Oid)>,
+    out: &mut Vec<(Vec<u8>, TreeMode, Oid)>,
 ) -> Result<(), GitError> {
     let (object_kind, body) = read_object_bytes(store, oid)?;
     if object_kind != ObjectKind::Tree {
@@ -455,7 +532,7 @@ fn flatten_dir(
             full.push(b'/');
         }
         full.extend_from_slice(&entry.name);
-        if entry.mode.octal() == 0o040_000 {
+        if entry.mode.is_tree() {
             flatten_dir(store, kind, entry.oid, &full, out)?;
         } else {
             out.push((full, entry.mode, entry.oid));

@@ -42,7 +42,8 @@ use super::state::{
     workspace_mutation,
 };
 use super::tree::{
-    WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree, read_object_bytes,
+    TreeMode, WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree,
+    read_object_bytes,
 };
 use super::{Ctx, FlagSpec, collect, line};
 
@@ -2265,9 +2266,9 @@ struct TreePair {
     /// Full path bytes.
     path: Vec<u8>,
     /// Old mode and oid, when present before.
-    old: Option<(ruk_core::index::FileMode, Oid)>,
+    old: Option<(TreeMode, Oid)>,
     /// New mode and oid, when present after.
-    new: Option<(ruk_core::index::FileMode, Oid)>,
+    new: Option<(TreeMode, Oid)>,
     /// New-side bytes when the content has no stored object (worktree
     /// edits). Overrides the object read keyed by `new`'s oid.
     new_bytes: Option<Vec<u8>>,
@@ -2324,7 +2325,10 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
     let mut index_map = BTreeMap::new();
     for (path, stage, entry) in &rows {
         if *stage == Stage::Zero {
-            index_map.insert(path.as_bytes().to_vec(), (entry.mode(), entry.oid()));
+            index_map.insert(
+                path.as_bytes().to_vec(),
+                (TreeMode::from(entry.mode()), entry.oid()),
+            );
         }
     }
     let mut pairs = Vec::new();
@@ -2335,7 +2339,7 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                 let oid = kind
                     .hash_git_object("blob", &bytes)
                     .map_err(|err| GitError::from(CoreError::from(err)))?;
-                let mode = entry_mode_of(&entry);
+                let mode = TreeMode::from(entry_mode_of(&entry));
                 pairs.push(TreePair {
                     path: entry.path,
                     old: None,
@@ -2405,7 +2409,10 @@ fn staged_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
     let mut index_map = BTreeMap::new();
     for (path, stage, entry) in scan_index(store, ctx.kind()?)? {
         if stage == Stage::Zero {
-            index_map.insert(path.as_bytes().to_vec(), (entry.mode(), entry.oid()));
+            index_map.insert(
+                path.as_bytes().to_vec(),
+                (TreeMode::from(entry.mode()), entry.oid()),
+            );
         }
     }
     tree_pairs_index(ctx, Some(tree), index_map)
@@ -2429,7 +2436,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                 let fresh = kind
                     .hash_git_object("blob", &bytes)
                     .map_err(|err| GitError::from(CoreError::from(err)))?;
-                let mode = entry_mode_of(&entry);
+                let mode = TreeMode::from(entry_mode_of(&entry));
                 pairs.push(TreePair {
                     path: entry.path,
                     old: None,
@@ -2474,7 +2481,10 @@ fn rev_staged_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
     let mut index_map = BTreeMap::new();
     for (path, stage, entry) in scan_index(store, kind)? {
         if stage == Stage::Zero {
-            index_map.insert(path.as_bytes().to_vec(), (entry.mode(), entry.oid()));
+            index_map.insert(
+                path.as_bytes().to_vec(),
+                (TreeMode::from(entry.mode()), entry.oid()),
+            );
         }
     }
     tree_pairs_index(ctx, Some(tree), index_map)
@@ -2484,7 +2494,7 @@ fn rev_staged_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
 fn tree_pairs_index(
     ctx: &Ctx,
     tree: Option<Oid>,
-    mut index_map: BTreeMap<Vec<u8>, (ruk_core::index::FileMode, Oid)>,
+    mut index_map: BTreeMap<Vec<u8>, (TreeMode, Oid)>,
 ) -> Result<Vec<TreePair>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
@@ -2607,9 +2617,9 @@ fn parse_unified_arg(opts: &super::Collected) -> Result<Option<usize>, GitError>
 /// reports `rename a.txt => aa.txt (100%)` for identical content.
 pub(crate) struct FileChange {
     /// Old path, mode, and blob; absent for additions.
-    pub(crate) old: Option<(Vec<u8>, ruk_core::index::FileMode, Oid)>,
+    pub(crate) old: Option<(Vec<u8>, TreeMode, Oid)>,
     /// New path, mode, and blob; absent for deletions.
-    pub(crate) new: Option<(Vec<u8>, ruk_core::index::FileMode, Oid)>,
+    pub(crate) new: Option<(Vec<u8>, TreeMode, Oid)>,
     /// Added lines (zero for renames, binaries, and mode-only changes).
     pub(crate) added: usize,
     /// Removed lines.
@@ -2646,8 +2656,8 @@ pub(crate) fn tree_file_changes(
         }
     }
     union.sort();
-    let mut added_paths: Vec<(Vec<u8>, ruk_core::index::FileMode, Oid)> = Vec::new();
-    let mut removed_paths: Vec<(Vec<u8>, ruk_core::index::FileMode, Oid)> = Vec::new();
+    let mut added_paths: Vec<(Vec<u8>, TreeMode, Oid)> = Vec::new();
+    let mut removed_paths: Vec<(Vec<u8>, TreeMode, Oid)> = Vec::new();
     let mut changes: Vec<FileChange> = Vec::new();
     for path in union {
         let old_entry = old_map.remove(&path);
@@ -2673,7 +2683,7 @@ pub(crate) fn tree_file_changes(
     }
     // Pair identical blobs first, the way similarity-100% renames collapse.
     let mut taken_new = vec![false; added_paths.len()];
-    let mut orphans: Vec<(Vec<u8>, ruk_core::index::FileMode, Oid)> = Vec::new();
+    let mut orphans: Vec<(Vec<u8>, TreeMode, Oid)> = Vec::new();
     for (old_path, old_mode, old_oid) in removed_paths {
         let mut paired = None;
         for (index, (new_path, new_mode, new_oid)) in added_paths.iter().enumerate() {

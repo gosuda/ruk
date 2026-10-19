@@ -25,8 +25,8 @@ use super::state::{
     unmerged_paths, workspace_mutation,
 };
 use super::tree::{
-    WorktreeEntry, WorktreeType, commit_tree_oid, flatten_tree, join_base, read_object_bytes,
-    read_worktree_file, walk_worktree,
+    TreeMode, WorktreeEntry, WorktreeType, commit_tree_oid, flatten_tree, join_base,
+    read_object_bytes, read_worktree_file, walk_worktree,
 };
 use super::{Ctx, FlagSpec, collect, line};
 
@@ -754,7 +754,7 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
 pub(crate) struct StatusPlan {
     /// `(path, staged code, index/head identity)` in path order. The
     /// identity backs exact-rename pairing; `None` for modified/unmerged.
-    pub(crate) staged: Vec<(Vec<u8>, char, Option<(FileMode, ruk_core::ids::Oid)>)>,
+    pub(crate) staged: Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
     /// `(old path, new path)` additions/deletions of identical blobs.
     pub(crate) renames: Vec<(Vec<u8>, Vec<u8>)>,
     /// `(path, worktree code)` in path order.
@@ -773,10 +773,13 @@ pub(crate) fn status_plan(
 ) -> Result<StatusPlan, GitError> {
     let head_tree = head_tree_map(ctx, store)?;
     let rows = scan_index(store, kind)?;
-    let mut index_merged: BTreeMap<Vec<u8>, (FileMode, ruk_core::ids::Oid)> = BTreeMap::new();
+    let mut index_merged: BTreeMap<Vec<u8>, (TreeMode, ruk_core::ids::Oid)> = BTreeMap::new();
     for (path, stage, entry) in &rows {
         if *stage == Stage::Zero {
-            index_merged.insert(path.as_bytes().to_vec(), (entry.mode(), entry.oid()));
+            index_merged.insert(
+                path.as_bytes().to_vec(),
+                (TreeMode::from(entry.mode()), entry.oid()),
+            );
         }
     }
     let unmerged = unmerged_paths(&rows);
@@ -850,11 +853,11 @@ pub(crate) fn status_plan(
 /// reports similarity-100% moves as `R  old -> new`; content-exact
 /// pairing reproduces that without a similarity engine.
 fn pair_exact_renames(
-    staged: &mut Vec<(Vec<u8>, char, Option<(FileMode, ruk_core::ids::Oid)>)>,
+    staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut renames = Vec::new();
     let mut kept = Vec::new();
-    let mut unmatched_adds: Vec<(Vec<u8>, FileMode, ruk_core::ids::Oid)> = Vec::new();
+    let mut unmatched_adds: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
     for (path, code, identity) in staged.drain(..) {
         if code == 'A' {
             if let Some((mode, oid)) = identity {
@@ -906,7 +909,7 @@ fn pair_exact_renames(
 fn head_tree_map(
     ctx: &Ctx,
     store: &Store,
-) -> Result<BTreeMap<Vec<u8>, (FileMode, ruk_core::ids::Oid)>, GitError> {
+) -> Result<BTreeMap<Vec<u8>, (TreeMode, ruk_core::ids::Oid)>, GitError> {
     let (workspace, _) = load_or_default(store)?;
     let resolved = super::state::resolve_head(store, &workspace.head)?;
     let oid = match resolved {

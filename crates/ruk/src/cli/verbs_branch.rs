@@ -41,8 +41,8 @@ use super::state::{
     scan_index, stash_alloc, stash_drop, stash_read, stash_write, workspace_mutation,
 };
 use super::tree::{
-    WorktreeType, build_index_tree, commit_tree_oid, flatten_tree, join_base, peel_to_tree,
-    read_object_bytes, store_object, tag_payload,
+    TreeMode, WorktreeType, build_index_tree, commit_tree_oid, flatten_tree, join_base,
+    peel_to_tree, read_object_bytes, store_object, tag_payload,
 };
 use super::{Ctx, FlagSpec, collect, line};
 
@@ -822,16 +822,22 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     let entries = match source_tree {
         Some(tree) => {
             let mut map = std::collections::BTreeMap::new();
-            for (path, mode, oid) in flatten_tree(store, kind, tree)? {
-                map.insert(path, (mode, oid));
+            for (path, _, oid) in flatten_tree(store, kind, tree)? {
+                map.insert(path, oid);
             }
             map
         }
-        None => index_entry_map(ctx)?,
+        None => {
+            let mut map = std::collections::BTreeMap::new();
+            for (path, (_, oid)) in index_entry_map(ctx)? {
+                map.insert(path, oid);
+            }
+            map
+        }
     };
     for wanted in tree_paths {
         let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
-        let (_, oid) = entries
+        let oid = entries
             .get(path.as_bytes())
             .ok_or_else(|| GitError::NotFound {
                 detail: format!("pathspec did not match: {wanted:?}"),
@@ -1080,7 +1086,7 @@ fn restore_staged(ctx: &Ctx, opts: &super::Collected, tree: Oid) -> Result<(), G
         let after = target
             .get(path.as_bytes())
             .map(|(mode, oid)| {
-                IndexEntry::new(*oid, *mode, None, IndexFlags::default())
+                IndexEntry::new(*oid, mode.as_index_mode()?, None, IndexFlags::default())
                     .map_err(|err| GitError::from(CoreError::from(err)))
             })
             .transpose()?
@@ -1105,16 +1111,22 @@ fn restore_worktree(ctx: &Ctx, opts: &super::Collected) -> Result<(), GitError> 
             let oid = resolve_rev(store, kind, &rev)?;
             let tree = peel_to_tree(store, kind, oid)?;
             let mut map = std::collections::BTreeMap::new();
-            for (path, mode, oid) in flatten_tree(store, kind, tree)? {
-                map.insert(path, (mode, oid));
+            for (path, _, oid) in flatten_tree(store, kind, tree)? {
+                map.insert(path, oid);
             }
             map
         }
-        None => index_entry_map(ctx)?,
+        None => {
+            let mut map = std::collections::BTreeMap::new();
+            for (path, (_, oid)) in index_entry_map(ctx)? {
+                map.insert(path, oid);
+            }
+            map
+        }
     };
     for positional in &opts.positionals {
         let path = super::verbs_stage::repo_path_of(ctx, positional.as_bytes())?;
-        let (_, oid) = entries
+        let oid = entries
             .get(path.as_bytes())
             .ok_or_else(|| GitError::NotFound {
                 detail: format!("pathspec did not match: {positional:?}"),
@@ -1340,7 +1352,7 @@ pub(crate) fn reset_index_to(
         let after = target
             .get(path.as_bytes())
             .map(|(mode, oid)| {
-                IndexEntry::new(*oid, *mode, None, IndexFlags::default())
+                IndexEntry::new(*oid, mode.as_index_mode()?, None, IndexFlags::default())
                     .map_err(|err| GitError::from(CoreError::from(err)))
             })
             .transpose()?
@@ -3389,7 +3401,7 @@ fn refuse_worktree_overwrite(
     store: &Store,
     kind: HashKind,
     tree: Oid,
-    base_paths: &[(Vec<u8>, FileMode, Oid)],
+    base_paths: &[(Vec<u8>, TreeMode, Oid)],
 ) -> Result<(), GitError> {
     let mut wip: std::collections::BTreeMap<Vec<u8>, Oid> = std::collections::BTreeMap::new();
     for (path, _, oid) in flatten_tree(store, kind, tree)? {
@@ -3460,17 +3472,17 @@ fn checkout_tree_files(
     tree: Oid,
     extra: &[Vec<u8>],
 ) -> Result<(), GitError> {
-    let mut wanted: std::collections::BTreeMap<Vec<u8>, (FileMode, Oid)> =
+    let mut wanted: std::collections::BTreeMap<Vec<u8>, (TreeMode, Oid)> =
         std::collections::BTreeMap::new();
     for (path, mode, oid) in flatten_tree(store, kind, tree)? {
         wanted.insert(path, (mode, oid));
     }
     for (path, (mode, oid)) in &wanted {
         let full = join_base(&ctx.file_base, path)?;
-        if *mode == FileMode::Gitlink {
+        if *mode == TreeMode::Gitlink {
             continue;
         }
-        if *mode == FileMode::Symlink {
+        if *mode == TreeMode::Symlink {
             create_worktree_link(store, *oid, &full)?;
             continue;
         }
@@ -3484,7 +3496,7 @@ fn checkout_tree_files(
             detail: format!("writing {}: {err}", full.display()),
         })?;
         #[cfg(unix)]
-        if *mode == FileMode::Executable {
+        if *mode == TreeMode::Executable {
             use std::os::unix::fs::PermissionsExt as _;
             let permissions = std::fs::Permissions::from_mode(0o755);
             std::fs::set_permissions(&full, permissions).map_err(|err| GitError::Io {
@@ -3697,9 +3709,11 @@ fn stash_restore(ctx: &Ctx, slot: u64, scope: IndexRestore) -> Result<Vec<u8>, G
                 current.len() == target.len()
                     && current.iter().all(|(path, stage, row)| {
                         *stage == Stage::Zero
-                            && target
-                                .get(path.as_bytes())
-                                .is_some_and(|(mode, oid)| *mode == row.mode() && *oid == row.oid())
+                            && target.get(path.as_bytes()).is_some_and(|(mode, oid)| {
+                                mode.as_index_mode()
+                                    .map_or(false, |index_mode| index_mode == row.mode())
+                                    && *oid == row.oid()
+                            })
                     })
             }
         };

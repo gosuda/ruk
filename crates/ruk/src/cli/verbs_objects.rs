@@ -24,7 +24,7 @@
 //! `git/builtin/pack-objects.c`.
 
 use ruk_core::heads::Head;
-use ruk_core::index::{FileMode, Stage};
+use ruk_core::index::Stage;
 use ruk_core::records::Records;
 use ruk_core::refdata::RefName;
 use ruk_core::store::{ObjectKind, Store};
@@ -32,7 +32,7 @@ use ruk_git::GitError;
 
 use super::state::{IdentityRole, identity, merged_rows, scan_index};
 use super::tree::{
-    TreeEntry, build_index_tree, commit_payload, encode_tree, parse_tree, peel_to_tree,
+    TreeEntry, TreeMode, build_index_tree, commit_payload, encode_tree, parse_tree, peel_to_tree,
     read_bounded, read_object_bytes, store_object,
 };
 use super::{Ctx, FlagSpec, collect, line};
@@ -364,10 +364,10 @@ pub(crate) fn mktree(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     entries.sort_by(|left: &TreeEntry, right: &TreeEntry| {
         let mut left_key = left.name.clone();
         let mut right_key = right.name.clone();
-        if left.mode.octal() == 0o040_000 {
+        if left.mode.is_tree() {
             left_key.push(b'/');
         }
-        if right.mode.octal() == 0o040_000 {
+        if right.mode.is_tree() {
             right_key.push(b'/');
         }
         left_key.cmp(&right_key)
@@ -393,15 +393,12 @@ fn parse_mktree_line(
     let (oid_text, name) = rest.split_once('\t').ok_or_else(|| GitError::Invalid {
         detail: format!("bad mktree line {stdin_line:?}"),
     })?;
-    let mode_value = u32::from_str_radix(mode_text, 8).map_err(|_| GitError::Invalid {
+    let mode = TreeMode::parse(mode_text.as_bytes()).ok_or_else(|| GitError::Invalid {
         detail: format!("bad mktree mode {mode_text:?}"),
     })?;
-    let mode = FileMode::from_octal(mode_value).map_err(|err| GitError::Invalid {
-        detail: format!("bad mktree mode: {err}"),
-    })?;
-    let want_type = match mode.octal() {
-        0o040_000 => "tree",
-        0o160_000 => "commit",
+    let want_type = match mode {
+        TreeMode::Tree => "tree",
+        TreeMode::Gitlink => "commit",
         _ => "blob",
     };
     if type_text != want_type {
@@ -600,7 +597,7 @@ pub(crate) fn ls_tree(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
             &entry.mode,
             &entry.oid,
             &entry.name,
-            entry.mode.octal() == 0o040_000,
+            entry.mode.is_tree(),
         )?);
     }
     Ok(out)
@@ -609,7 +606,7 @@ pub(crate) fn ls_tree(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
 /// Renders one `ls-tree` line in long or name-only form.
 fn ls_tree_line(
     opts: &super::Collected,
-    mode: &FileMode,
+    mode: &TreeMode,
     oid: &ruk_core::ids::Oid,
     name: &[u8],
     is_dir: bool,
@@ -622,9 +619,9 @@ fn ls_tree_line(
         out.push(b'\n');
         return Ok(out);
     }
-    let type_name = match mode.octal() {
-        0o040_000 => "tree",
-        0o160_000 => "commit",
+    let type_name = match mode {
+        TreeMode::Tree => "tree",
+        TreeMode::Gitlink => "commit",
         _ => "blob",
     };
     Ok(format!(
@@ -637,8 +634,8 @@ fn ls_tree_line(
 }
 
 /// Reports whether a mode is the directory mode.
-fn tree_is_dir(mode: FileMode) -> bool {
-    mode.octal() == 0o040_000
+fn tree_is_dir(mode: TreeMode) -> bool {
+    mode.is_tree()
 }
 
 /// Validates a ref name.

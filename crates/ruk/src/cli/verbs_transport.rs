@@ -3513,7 +3513,7 @@ fn check_tree(
         return Ok(());
     }
     for (path, mode, oid) in super::tree::flatten_tree(store, kind, tree)? {
-        if mode.octal() == 0o160_000 {
+        if mode == super::tree::TreeMode::Gitlink {
             continue;
         }
         if !has_object(store, oid)? {
@@ -3854,7 +3854,14 @@ mod archive_rewrap_tests {
         assert_eq!(file.unix_mode().unwrap_or(0), 0o100644);
         let mtime = file.last_modified().expect("mtime present");
         assert_eq!(
-            (mtime.year(), mtime.month(), mtime.day(), mtime.hour(), mtime.minute(), mtime.second()),
+            (
+                mtime.year(),
+                mtime.month(),
+                mtime.day(),
+                mtime.hour(),
+                mtime.minute(),
+                mtime.second()
+            ),
             (2023, 11, 14, 22, 13, 20)
         );
         let mut body = Vec::new();
