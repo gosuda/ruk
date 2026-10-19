@@ -231,7 +231,8 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
         | Method::Show
         | Method::File
         | Method::Blame
-        | Method::Query => return Ok(()),
+        | Method::Query
+        | Method::GitCommit => return Ok(()),
     };
     Err(CoreError::new(
         ErrorCode::EUndoConflict,

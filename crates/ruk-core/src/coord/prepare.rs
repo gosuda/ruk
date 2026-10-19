@@ -119,6 +119,7 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
+    GitCommitArgs,
     ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
     EditReply, EffectiveIdentity, HeadRewrite, IdentityClaim, IdentitySource, LandPrepareArgs,
     LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply, RebaseArgs,
@@ -135,7 +136,7 @@ use crate::records::Records;
 use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::head_key;
 use crate::records::types::{ChangeEntry, ChangeState};
-use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
+use crate::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate};
 use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked};
 use crate::store::ObjectKind;
 use crate::store::Store;
@@ -253,6 +254,7 @@ pub(crate) fn prepare_mutation_with(
         Request::Unpin(m) => unpin_parts(ctx, m.request_id, &m.args)?,
         Request::AttestAdd(m) => attest_add_parts(ctx, m.request_id, &m.args)?,
         Request::New(m) => new_parts(ctx, m.request_id, &m.args)?,
+        Request::GitCommit(m) => git_commit_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimAcquire(m) => claim_acquire_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimRelease(m) => claim_release_parts(ctx, m.request_id, &m.args)?,
         Request::WsNew(m) => ws_new_parts(ctx, m.request_id, &m.args)?,
@@ -889,7 +891,9 @@ fn mint_empty_commit(
     // must leave no state, so the checks `prepare_new` would run first run
     // here against committed state. They stay advisory — `prepare_new` and
     // the lane re-check authoritatively at commit time.
+    let kind = store.hash_kind();
     for parent in parents {
+        parent.validate(kind)?;
         if Records::new(store).get_commit(parent)?.is_none() {
             let describe = match parent {
                 Head::Git { oid } => oid.to_string(),
@@ -911,32 +915,191 @@ fn mint_empty_commit(
         .hash_kind()
         .hash_git_object("tree", b"")
         .map_err(CoreError::from)?;
-    // `prepare_new` below reads committed store state, so the deterministic
-    // empty tree must exist there first: publish it directly through the
-    // real store path. It carries no facts or records, so a later refusal
-    // still leaves no meaningful state, and the lane keeps publishing the
-    // minted commit atomically.
+    // The deterministic empty tree rides the lane with the minted commit:
+    // staging (never publishing) keeps preparation side-effect free, so a
+    // later refusal leaves no state and receipt replay never observes a
+    // half-minted commit. `prepare_new` only resolves committed trees, so
+    // the tail below replicates its staging against the staged tree instead
+    // of calling it.
+    let mut staged_prefix = Vec::new();
     if store.object_len(empty).map_err(CoreError::from)?.is_none() {
         let empty_bytes: &[u8] = b"";
-        let staged = store
-            .prepare(ObjectKind::Tree, 0, empty_bytes, None)
-            .map_err(CoreError::from)?;
-        store.publish(vec![staged], &[]).map_err(CoreError::from)?;
+        staged_prefix.push(
+            store
+                .prepare(ObjectKind::Tree, 0, empty_bytes, None)
+                .map_err(CoreError::from)?,
+        );
+    }
+    let records = Records::new(store);
+    let input = NativeCommitInput {
+        change_id: ChangeId::generate(),
+        tree: Merge::from_vec(vec![empty]),
+        parents: parents.to_vec(),
+        predecessor: None,
+        author: author.clone(),
+        committer: author,
+        extra_headers: Vec::new(),
+        message: message.clone(),
+        provenance: None,
+    };
+    let staged = records.prepare_native_commit(input)?;
+    let head = staged.head;
+    let output = NewResult {
+        head,
+        change_id: staged.record.change_id(),
+        oid: head.as_git().copied(),
+    };
+    if let Some(existing) = records.get_commit(&head)? {
+        if existing == staged.record {
+            return Ok((
+                PreparedOp {
+                    objects: staged_prefix,
+                    facts: Vec::new(),
+                    output,
+                },
+                identity,
+            ));
+        }
+    }
+    let mut objects = staged_prefix;
+    objects.push(staged.prepared_object);
+    Ok((
+        PreparedOp {
+            objects,
+            facts: staged.mutations,
+            output,
+        },
+        identity,
+    ))
+}
+
+/// Prepares `git.commit`: one concrete commit over a caller-staged tree with
+/// caller-supplied identities, plus the caller's branch move applied
+/// atomically on the lane.
+///
+/// Preparation is side-effect free: the tree arrives already stored (the
+/// caller stages content through its own brief object-only opens, which are
+/// content-addressed and idempotent), and every staged object below rides
+/// `Parts` to the lane's single linearizable publication. Unlike the
+/// empty-tree mint, any parent count is accepted: no tree merge is evaluated
+/// because the merged tree arrives precomputed.
+///
+/// A retried submission whose commit already landed and whose ref already
+/// holds it skips the ref transaction, so the lane replays the stored reply
+/// (same session, same request id) or succeeds idempotently instead of
+/// failing its own compare-and-swap.
+///
+/// # Errors
+/// - [`ErrorCode::EInvalid`] for a message carrying NUL.
+/// - [`ErrorCode::EHosted`] when the created head has no Git identity to
+///   move a ref to.
+/// - [`ErrorCode::ENotFound`] for an unstored tree or parent.
+/// - [`ErrorCode::EStale`] from the ref transaction when another writer won.
+fn git_commit_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &GitCommitArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let kind = store.hash_kind();
+    if args.message.as_bytes().contains(&0) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "commit message carries NUL",
+        ));
+    }
+    args.tree.expect_kind(kind, "tree")?;
+    let records = Records::new(store);
+    for parent in &args.parents {
+        parent.validate(kind)?;
+        if records.get_commit(parent)?.is_none() {
+            let describe = match parent {
+                Head::Git { oid } => oid.to_string(),
+                Head::Conflicted { key } => format!("{key:?}"),
+            };
+            return Err(CoreError::new(
+                ErrorCode::ENotFound,
+                format!("parent {describe} is not a stored commit"),
+            ));
+        }
+    }
+    let Some(len) = store.object_len(args.tree).map_err(CoreError::from)? else {
+        return Err(CoreError::new(
+            ErrorCode::ENotFound,
+            format!("tree {} is not stored", args.tree),
+        ));
+    };
+    let read = store.read(args.tree).map_err(CoreError::from)?;
+    if read.kind != ObjectKind::Tree {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "{} is a {:?} object of {len} bytes, not a tree",
+                args.tree, read.kind
+            ),
+        ));
     }
     let prepared = prepare_new(
         store,
         NewRequest {
-            tree: empty,
-            parents: parents.to_vec(),
-            author: author.clone(),
-            committer: author,
-            message: message.clone(),
-            change_id: Some(ChangeId::generate()),
-            predecessor: None,
+            tree: args.tree,
+            parents: args.parents.clone(),
+            author: args.author.clone(),
+            committer: args.committer.clone(),
+            message: args.message.clone(),
+            change_id: args.change_id,
+            predecessor: args.predecessor,
             provenance: None,
         },
     )?;
-    Ok((prepared, identity))
+    let output = prepared.output;
+    let new_oid = output
+        .oid
+        .or_else(|| output.head.as_git().copied())
+        .ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::EHosted,
+                "git.commit with `ref_update` needs a head with a Git identity",
+            )
+        })?;
+    let created = ChangeHead {
+        change: output.change_id,
+        head: output.head,
+    };
+    let mut facts = prepared.facts;
+    let mut transaction = None;
+    let mut dependencies = Vec::new();
+    if let Some(ref_update) = &args.ref_update {
+        let target = RefTarget::Direct(new_oid);
+        let landed = prepared.objects.is_empty()
+            && StoreRefs::new(store).get(&ref_update.name)?.as_ref() == Some(&target);
+        if !landed {
+            let (mut ref_facts, ref_transaction) = check_ref_update(
+                store,
+                RefUpdate {
+                    name: ref_update.name.clone(),
+                    expected: ref_update.expected.clone(),
+                    change: RefChange::Set(target),
+                },
+            )?;
+            facts.append(&mut ref_facts);
+            dependencies.push(ref_update.name.clone());
+            transaction = Some(ref_transaction);
+        }
+    }
+    Ok(Parts {
+        reply: Reply::GitCommit(Box::new(NewReply {
+            outcome: pending_outcome(session, request_id),
+            created,
+            state: None,
+        })),
+        objects: prepared.objects,
+        facts,
+        transaction,
+        dependencies,
+        fence: None,
+    })
 }
 
 /// Prepares `new`: one empty-tree native change on `parents`, with an
@@ -3554,6 +3717,7 @@ mod tests {
         AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
         BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
         ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs,
+        GitCommitArgs, GitCommitRefUpdate,
         IdentityClaim, LandExecuteArgs, LandPrepareArgs, MergeSelection, Mutation as WireMutation,
         NewArgs, OpLogArgs, PathSelection, PinArgs, PushArgs, PushAtomicity, PushReconcileArgs,
         PushSource, PushUpdate, RebaseArgs, RebaseScope, RemoteName, RemoteSpec, Resolution,
@@ -4574,12 +4738,13 @@ mod tests {
         };
         assert_eq!(identity.name, "Ada");
         assert_eq!(identity.source, IdentitySource::SessionClaim);
-        // The empty tree publishes standalone (so `prepare_new` resolves it)
-        // while the candidate carries only the commit object.
-        assert_eq!(prepared.objects.len(), 1);
-        assert_eq!(prepared.objects[0].kind(), ObjectKind::Commit);
-        let read = store.read(empty_tree_oid(&store)).expect("read empty tree");
-        assert_eq!(read.kind, ObjectKind::Tree);
+        // The empty tree stages with the candidate (so the lane publishes
+        // both atomically) while preparation itself publishes nothing: the
+        // tree is unreadable before the publish below.
+        assert_eq!(prepared.objects.len(), 2);
+        assert_eq!(prepared.objects[0].kind(), ObjectKind::Tree);
+        assert_eq!(prepared.objects[1].kind(), ObjectKind::Commit);
+        assert!(store.read(empty_tree_oid(&store)).is_err());
         assert!(!prepared.facts.is_empty());
         assert!(prepared.workspace_fence.is_none());
         assert!(prepared.ref_transaction.is_none());
@@ -4588,6 +4753,8 @@ mod tests {
         store
             .publish(prepared.objects, &prepared.facts)
             .expect("publish new");
+        let read = store.read(empty_tree_oid(&store)).expect("read empty tree");
+        assert_eq!(read.kind, ObjectKind::Tree);
         assert!(
             Records::new(&store)
                 .get_commit(&reply.created.head)
@@ -4614,6 +4781,112 @@ mod tests {
             panic!("new must answer its own reply");
         };
         assert_ne!(repeat_reply.created.change, reply.created.change);
+    }
+
+    fn git_commit_args(
+        store: &Store,
+        parent: Head,
+        branch: RefName,
+        expected: RefExpect,
+    ) -> GitCommitArgs {
+        let tree = store
+            .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
+            .expect("stage lane tree");
+        let tree_oid = tree.oid();
+        store.publish(vec![tree], &[]).expect("publish lane tree");
+        GitCommitArgs {
+            tree: tree_oid,
+            parents: vec![parent],
+            author: signature(),
+            committer: signature(),
+            message: ByteString::from("lane commit"),
+            change_id: None,
+            predecessor: None,
+            ref_update: Some(GitCommitRefUpdate {
+                name: branch,
+                expected,
+            }),
+        }
+    }
+
+    #[test]
+    fn git_commit_records_tree_and_moves_ref_atomically() {
+        let (_temp, store, session) = fixture();
+        let (parent, _, _) = seed_commit(&store, None);
+        let branch = name("refs/heads/main");
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::GitCommit(Box::new(WireMutation {
+                request_id: request_id(),
+                args: git_commit_args(&store, parent, branch.clone(), RefExpect::Absent),
+            })),
+        )
+        .expect("git.commit prepares");
+        let Reply::GitCommit(reply) = prepared.reply else {
+            panic!("git.commit must answer its own reply");
+        };
+        let new_oid = reply
+            .created
+            .head
+            .as_git()
+            .copied()
+            .expect("lane commit has a git identity");
+        assert!(prepared.ref_transaction.is_some());
+        store
+            .publish(prepared.objects, &prepared.facts)
+            .expect("publish lane commit");
+        assert!(
+            Records::new(&store)
+                .get_commit(&reply.created.head)
+                .expect("read commit")
+                .is_some()
+        );
+        let stored = StoreRefs::new(&store).get(&branch).expect("read ref");
+        assert_eq!(stored, Some(RefTarget::Direct(new_oid)));
+    }
+
+    #[test]
+    fn git_commit_replays_landed_ref_without_transaction() {
+        let (_temp, store, session) = fixture();
+        let (parent, _, _) = seed_commit(&store, None);
+        let branch = name("refs/heads/main");
+        let first = prepare_mutation(
+            &store,
+            session,
+            Request::GitCommit(Box::new(WireMutation {
+                request_id: request_id(),
+                args: git_commit_args(&store, parent.clone(), branch.clone(), RefExpect::Absent),
+            })),
+        )
+        .expect("first git.commit prepares");
+        assert!(first.ref_transaction.is_some());
+        store
+            .publish(first.objects, &first.facts)
+            .expect("publish first lane commit");
+        // The retry carries the original (now stale) expectation, but the
+        // commit already landed and the ref already holds it, so preparation
+        // succeeds with nothing left to publish instead of failing its own
+        // compare-and-swap.
+        let repeat = prepare_mutation(
+            &store,
+            session,
+            Request::GitCommit(Box::new(WireMutation {
+                request_id: request_id(),
+                args: git_commit_args(&store, parent, branch, RefExpect::Absent),
+            })),
+        )
+        .expect("landed git.commit re-prepares");
+        assert!(repeat.objects.is_empty());
+        assert!(repeat.facts.is_empty());
+        assert!(repeat.ref_transaction.is_none());
+        let Reply::GitCommit(repeat_reply) = repeat.reply else {
+            panic!("git.commit must answer its own reply");
+        };
+        let Reply::GitCommit(first_reply) = first.reply else {
+            panic!("git.commit must answer its own reply");
+        };
+        assert_eq!(repeat_reply.created.head, first_reply.created.head);
     }
 
     #[test]
