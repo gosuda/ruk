@@ -662,6 +662,9 @@ mod tests {
     fn fetch_sections_without_packfile_is_corrupt() {
         let mut script = frame(b"shallow-info\n");
         script.extend(frame(format!("shallow {A}\n").as_bytes()));
+        // One flush ends the section, a second ends the response with no
+        // packfile section: that is corrupt, not a hangup.
+        script.extend(b"0000");
         script.extend(b"0000");
         let store = test_store(HashKind::Sha1);
         let mut pkt = PktReader::new(&script[..], Interrupt::none());
