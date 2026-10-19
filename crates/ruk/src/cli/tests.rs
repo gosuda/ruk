@@ -6258,6 +6258,18 @@ fn log_notes_boundary_decorate() {
         &["--oneline", "--decorate=full", "-n", "1"],
     )
     .expect("decorate full");
+    // `auto` never decorates off-terminal; explicit full does.
+    let auto_out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--oneline", "--decorate=auto", "-n", "1"],
+    )
+    .expect("decorate auto");
+    assert!(
+        !String::from_utf8_lossy(&auto_out).contains("HEAD ->"),
+        "got {:?}",
+        auto_out
+    );
     assert!(
         String::from_utf8_lossy(&out).contains("refs/heads/main"),
         "got {:?}",
@@ -6301,6 +6313,36 @@ fn log_notes_boundary_decorate() {
         "got {:?}",
         out
     );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn log_rename_pathspec_shows_onesided() {
+    // The pathspec bounds pairing first: a rename with only its new side
+    // in spec prints as an addition, and vice versa for deletions.
+    let (root, env) = seeded_repo("logflags-renamepath", "old.txt", b"v1\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::rename(root.join("old.txt"), root.join("new.txt")).expect("rename");
+    run(verbs_stage::add, &mut ctx, &["new.txt"]).expect("add new");
+    run(verbs_stage::rm, &mut ctx, &["old.txt"]).expect("rm old");
+    run(verbs_history::commit, &mut ctx, &["-m", "rename"]).expect("commit");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--name-status", "-M", "--oneline", "--", "new.txt"],
+    )
+    .expect("spec new");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("A\tnew.txt"), "got {text}");
+    assert!(!text.contains('R'), "got {text}");
+    let out = run(
+        verbs_history::log,
+        &mut ctx,
+        &["--name-status", "-M", "--oneline", "--", "old.txt"],
+    )
+    .expect("spec old");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("D\told.txt"), "got {text}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
