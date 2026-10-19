@@ -7897,7 +7897,7 @@ fn wave_k_remote_helper_capabilities() {
         .expect("capabilities");
     assert_eq!(
         out,
-        b"import\nexport\nrefspec refs/heads/*:refs/ruk/test/heads/*\nrefspec refs/tags/*:refs/ruk/test/tags/*\noption\nobject-format\n\n"
+        b"connect\nimport\nexport\nrefspec refs/heads/*:refs/ruk/test/heads/*\nrefspec refs/tags/*:refs/ruk/test/tags/*\noption\nobject-format\n\n"
     );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -8081,7 +8081,7 @@ fn wave_k_remote_helper_verb_entry() {
     // The verb derives the alias from the real URL, so only the
     // capability structure (not the dynamic alias) is pinned here.
     assert!(
-        text.starts_with("import\nexport\nrefspec refs/heads/*:refs/ruk/"),
+        text.starts_with("connect\nimport\nexport\nrefspec refs/heads/*:refs/ruk/"),
         "caps first: {text:?}"
     );
     assert!(
@@ -8089,6 +8089,27 @@ fn wave_k_remote_helper_verb_entry() {
         "both refspecs: {text:?}"
     );
     assert!(text.contains("refs/heads/main\n"), "list follows: {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_rejects_unknown_connect_service() {
+    let (root, env) = seeded_repo("wavek-helperconn", "f.txt", b"one\n");
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"connect git-upload-archive\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    let err = super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out)
+        .expect_err("unknown service refused");
+    assert!(
+        err.to_string().contains("connect service"),
+        "got {err:?}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -8964,5 +8985,23 @@ fn hooks_post_merge_runs_on_fast_forward() {
     write_hook(&root, "post-merge", "#!/bin/sh\ntouch post-merge-ran\n");
     run(verbs_history::merge, &mut ctx, &["side"]).expect("merge");
     assert!(root.join("post-merge-ran").exists(), "post-merge did not run");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_edit_description_needs_terminal() {
+    let (root, env) = seeded_repo("wavej-noeditor-term", "f.txt", b"one\n");
+    // Configured editor but no terminal: verbs fail instead of hanging.
+    let mut vars = env.vars.clone();
+    vars.insert("GIT_EDITOR".to_owned(), "true".to_owned());
+    let term_env = super::CliEnv {
+        vars,
+        cwd: env.cwd.clone(),
+        stdin: None,
+    };
+    let mut ctx = repo_ctx(&root, term_env);
+    let err =
+        run(verbs_branch::branch, &mut ctx, &["--edit-description"]).expect_err("no tty");
+    assert!(err.to_string().contains("terminal"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
