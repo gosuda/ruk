@@ -1,5 +1,5 @@
 //! Misc plumbing and user verbs: `clean`, `describe`, `reflog`, `shortlog`,
-//! `cherry`, `name-rev`, `check-ignore`, `check-attr`, `stripspace`,
+//! `check-mailmap`, `cherry`, `name-rev`, `check-ignore`, `check-attr`, `stripspace`,
 //! `interpret-trailers`, `var`, `get-tar-commit-id`, `fmt-merge-msg`,
 //! `verify-tag`, `verify-commit`.
 //!
@@ -8,21 +8,23 @@
 //! | `clean` | index scan vs worktree walk | implemented (`-f`/`-d`/`-n`/`-e`; `.rukignore` skipped by default, `-x` includes ignored, `-X` only ignored) |
 //! | `describe` | breadth-first walk to the nearest tag | implemented (`--tags`/`--exact-match`/`--long`/`--abbrev`/`--always`) |
 //! | `reflog` | `Reflogs` rows `update-ref -m` writes | implemented (`show`/`list`/`expire --expire=now|never|<N>.days.ago`/`delete <ref>@{n}`) |
-//! | `shortlog` | ancestry walk grouped by author | implemented (`-s`/`-n`/`-e`, ranges) |
+//! | `shortlog` | ancestry walk grouped by author | implemented (`-s`/`-n`/`-e`, ranges; names and emails mapped through the mailmap) |
+//! | `check-mailmap` | mailmap lookup | implemented (`<contact>...`, `--stdin`, `--mailmap-file`; `--mailmap-blob` is `Unsupported`) |
 //! | `cherry` | tree-diff content patch-ids | implemented (`-v`, `upstream [head [base]]`; no whitespace normalization) |
 //! | `name-rev` | multi-source breadth-first naming | implemented (`--tags`/`--name-only`/`--refs`) |
 //! | `check-ignore` | `.rukignore` glob scan | implemented (no file means nothing ignored, exit 1) |
 //! | `check-attr` | `.rukattributes` scan | implemented (absent file means every attr unspecified) |
 //! | `stripspace` | stdin byte filter | implemented (`--strip-comments`) |
 //! | `interpret-trailers` | trailer-block parse | implemented (`--only-trailers`/`--only-input`/`--unfold`/`--trailer`/`--where`) |
-//! | `var` | identity/config facts | implemented (`GIT_AUTHOR_IDENT`, `GIT_COMMITTER_IDENT`, `GIT_DEFAULT_BRANCH`, `GIT_EDITOR`, `GIT_PAGER`, `-l`) |
+//! | `var` | identity/config facts | implemented (`GIT_AUTHOR_IDENT`, `GIT_COMMITTER_IDENT` through the mailmap, `GIT_DEFAULT_BRANCH`, `GIT_EDITOR`, `GIT_PAGER`, `-l`) |
 //! | `get-tar-commit-id` | tar `comment` pax scan | implemented (stdin tar only) |
 //! | `fmt-merge-msg` | `FETCH_HEAD` pseudo record | implemented (`-m`, `--log[=n]`/`--no-log`, `--stdin`/file) |
 //! | `verify-tag` | structural check, honest refusal | partial (no signatures: always refuses after validating) |
 //! | `verify-commit` | existence check, honest refusal | partial (no signatures: always refuses after validating) |
 //!
 //! Oracle anchors: `git/builtin/clean.c`, `git/builtin/describe.c`,
-//! `git/builtin/reflog.c`, `git/builtin/shortlog.c`, `git/builtin/cherry.c`,
+//! `git/builtin/reflog.c`, `git/builtin/shortlog.c`, `git/mailmap.c`,
+//! `git/builtin/check-mailmap.c`, `git/builtin/cherry.c`,
 //! `git/builtin/name-rev.c`, `git/builtin/check-ignore.c`,
 //! `git/builtin/check-attr.c`, `git/builtin/stripspace.c`,
 //! `git/builtin/interpret-trailers.c`, `git/builtin/var.c`,
@@ -33,6 +35,10 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use ruk_core::commit::CommitRecord;
+use ruk_core::conflict::Signature;
+
+use ruk_core::commit::CommitRecord;
+use ruk_core::conflict::Signature;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
@@ -962,6 +968,7 @@ pub(crate) fn shortlog(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         });
     }
     let history = walk_history_excluding(store, &tips, &exclude, limit)?;
+    let mailmap = load_mailmap(ctx);
     // Groups in first-seen order; `-n` re-sorts by count, else by key.
     let mut order: Vec<String> = Vec::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -970,9 +977,12 @@ pub(crate) fn shortlog(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         let author = record.author().map_err(|err| GitError::Corrupt {
             detail: format!("commit author does not decode: {err}"),
         })?;
-        let name = String::from_utf8_lossy(author.name.as_bytes()).into_owned();
+        let stored_name = String::from_utf8_lossy(author.name.as_bytes());
+        let stored_email = String::from_utf8_lossy(author.email.as_bytes());
+        let (name, email) = mailmap
+            .map_ident(&stored_name, &stored_email)
+            .unwrap_or((stored_name.into_owned(), stored_email.into_owned()));
         let key = if opts.is_set("email") {
-            let email = String::from_utf8_lossy(author.email.as_bytes()).into_owned();
             format!("{name} <{email}>")
         } else {
             name
@@ -1009,6 +1019,282 @@ pub(crate) fn shortlog(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             }
             out.push(b'\n');
         }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// mailmap
+// ---------------------------------------------------------------------------
+
+/// One email-keyed mailmap entry: the simple mapping plus the
+/// name-qualified sub-entries, mirroring `struct mailmap_entry` in
+/// `git/mailmap.c`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MailmapEntry {
+    /// Simple-entry replacement name.
+    name: Option<String>,
+    /// Simple-entry replacement email.
+    email: Option<String>,
+    /// `(lowercased old name, replacement name, replacement email)` rows.
+    names: Vec<(String, Option<String>, Option<String>)>,
+}
+
+/// The parsed mailmap: `(lowercased old email, entry)` rows in file order.
+/// Later files override earlier ones through [`Mailmap::merge`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Mailmap {
+    entries: Vec<(String, MailmapEntry)>,
+}
+
+impl Mailmap {
+    /// Parses mailmap text the way `read_mailmap_string` does: `#`
+    /// comments and lines without a `<...>` pair contribute nothing.
+    #[must_use]
+    pub(crate) fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for line in text.lines() {
+            out.add_line(line);
+        }
+        out
+    }
+
+    /// Folds one line into the map, mirroring `read_mailmap_line` plus
+    /// `add_mapping`: `Proper <proper> Commit <commit>` maps the pair,
+    /// `Proper <proper> <commit>` and `<proper> <commit>` map the email,
+    /// and a lone `Proper <proper>` canonicalizes that email's name.
+    fn add_line(&mut self, line: &str) {
+        if line.starts_with('#') {
+            return;
+        }
+        let Some((name1, email1, rest)) = split_mailmap_pair(line) else {
+            return;
+        };
+        if email1.is_empty() {
+            return;
+        }
+        let (name2, email2) = match rest {
+            None => (None, None),
+            Some(tail) => match split_mailmap_pair(tail) {
+                Some((name, email, _)) if !email.is_empty() => (name, Some(email)),
+                _ => return,
+            },
+        };
+        let (new_name, new_email, old_name, old_email) = match email2 {
+            Some(old) => (name1, Some(email1), name2, old),
+            None => (name1, None, None, email1),
+        };
+        let key = old_email.to_lowercase();
+        let entry = match self.entries.iter_mut().find(|(email, _)| *email == key) {
+            Some((_, entry)) => entry,
+            None => {
+                self.entries.push((key, MailmapEntry::default()));
+                &mut self.entries.last_mut().expect("mailmap entry just pushed").1
+            }
+        };
+        match old_name {
+            Some(old) if !old.is_empty() => {
+                let lower = old.to_lowercase();
+                match entry.names.iter_mut().find(|(name, _, _)| *name == lower) {
+                    Some(row) => *row = (lower, new_name, new_email),
+                    None => entry.names.push((lower, new_name, new_email)),
+                }
+            }
+            _ => {
+                if new_name.is_some() {
+                    entry.name = new_name;
+                }
+                if new_email.is_some() {
+                    entry.email = new_email;
+                }
+            }
+        }
+    }
+
+    /// Folds another mailmap's rows in, later rows winning per key.
+    fn merge(&mut self, other: &Self) {
+        for (key, entry) in &other.entries {
+            match self.entries.iter_mut().find(|(email, _)| email == key) {
+                Some((_, slot)) => {
+                    if entry.name.is_some() {
+                        slot.name.clone_from(&entry.name);
+                    }
+                    if entry.email.is_some() {
+                        slot.email.clone_from(&entry.email);
+                    }
+                    for row in &entry.names {
+                        match slot.names.iter_mut().find(|(name, _, _)| *name == row.0) {
+                            Some(slot_row) => *slot_row = row.clone(),
+                            None => slot.names.push(row.clone()),
+                        }
+                    }
+                }
+                None => self.entries.push((key.clone(), entry.clone())),
+            }
+        }
+    }
+
+    /// Maps one `(name, email)` pair, mirroring `map_user`: the email
+    /// matches case-insensitively, then a name-qualified row wins when the
+    /// name matches too, else the simple row applies. Returns `None` when
+    /// no row maps the pair. Display-only: callers never store the result.
+    #[must_use]
+    pub(crate) fn map_ident(&self, name: &str, email: &str) -> Option<(String, String)> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|(key, _)| *key == email.to_lowercase())
+            .map(|(_, entry)| entry)?;
+        if !entry.names.is_empty() {
+            if let Some((_, new_name, new_email)) = entry
+                .names
+                .iter()
+                .find(|(old, _, _)| *old == name.to_lowercase())
+            {
+                if new_name.is_none() && new_email.is_none() {
+                    return None;
+                }
+                return Some((
+                    new_name.clone().unwrap_or_else(|| name.to_owned()),
+                    new_email.clone().unwrap_or_else(|| email.to_owned()),
+                ));
+            }
+        }
+        if entry.name.is_none() && entry.email.is_none() {
+            return None;
+        }
+        Some((
+            entry.name.clone().unwrap_or_else(|| name.to_owned()),
+            entry.email.clone().unwrap_or_else(|| email.to_owned()),
+        ))
+    }
+}
+
+/// Splits one `Name <email>` pair: the name is the trimmed text before
+/// `<` (`None` when empty), the email is the text to the first `>`, and
+/// the rest is the trailing text when non-empty.
+fn split_mailmap_pair(text: &str) -> Option<(Option<String>, String, Option<&str>)> {
+    let left = text.find('<')?;
+    let after = &text[left + 1..];
+    let right = after.find('>')?;
+    let name = text[..left].trim();
+    let email = after[..right].trim().to_owned();
+    let rest = after[right + 1..].trim_start();
+    Some((
+        (!name.is_empty()).then(|| name.to_owned()),
+        email,
+        (!rest.is_empty()).then_some(rest),
+    ))
+}
+
+/// Splits a `check-mailmap` contact into `(name, email)`: `Name <email>`
+/// pairs split on the brackets, anything else is a bare email with no
+/// name, mirroring the oracle's `split_ident_line` fallback.
+#[must_use]
+pub(crate) fn split_contact(text: &str) -> (String, String) {
+    let trimmed = text.trim();
+    match split_mailmap_pair(trimmed) {
+        Some((name, email, _)) if !email.is_empty() => (name.unwrap_or_default(), email),
+        _ => (String::new(), trimmed.to_owned()),
+    }
+}
+
+/// Renders one mapped contact the way `check_mailmap` prints: the name
+/// and a space only when a name is present.
+#[must_use]
+pub(crate) fn render_contact(name: &str, email: &str) -> Vec<u8> {
+    if name.is_empty() {
+        format!("<{email}>\n").into_bytes()
+    } else {
+        format!("{name} <{email}>\n").into_bytes()
+    }
+}
+
+/// Loads the mailmap for one command: `.mailmap` at the root, then
+/// `.ruk/mailmap`, then the `mailmap.file` config path, later files
+/// overriding earlier ones. Missing or unreadable files read as empty
+/// instead of failing the command they annotate.
+#[must_use]
+pub(crate) fn load_mailmap(ctx: &Ctx) -> Mailmap {
+    let mut out = Mailmap::default();
+    for candidate in [
+        ctx.root.join(".mailmap"),
+        ctx.root.join(".ruk").join("mailmap"),
+    ] {
+        if let Ok(bytes) = std::fs::read(&candidate) {
+            out.merge(&Mailmap::parse(&String::from_utf8_lossy(&bytes)));
+        }
+    }
+    if let Some(path) = ctx.config_get("mailmap.file") {
+        let candidate = if std::path::Path::new(&path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            ctx.root.join(path)
+        };
+        if let Ok(bytes) = std::fs::read(&candidate) {
+            out.merge(&Mailmap::parse(&String::from_utf8_lossy(&bytes)));
+        }
+    }
+    out
+}
+
+/// Prints the canonical form of each contact through the mailmap.
+///
+/// Oracle: `git/builtin/check-mailmap.c`. Contacts are `Name <email>`
+/// pairs or bare emails, from argv plus `--stdin` lines; `--mailmap-file`
+/// appends one more mailmap layer, while `--mailmap-blob` is `Unsupported`.
+pub(crate) fn check_mailmap(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [
+        FlagSpec {
+            long: "stdin",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "mailmap-file",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "mailmap-blob",
+            short: None,
+            takes_value: true,
+        },
+    ];
+    let opts = collect(args, &specs)?;
+    if opts.is_set("mailmap-blob") {
+        return Err(GitError::Unsupported {
+            command: "check-mailmap --mailmap-blob is not supported".to_owned(),
+        });
+    }
+    let mut mailmap = load_mailmap(ctx);
+    if let Some(path) = opts.single("mailmap-file")? {
+        let bytes = std::fs::read(&path).map_err(|err| GitError::Io {
+            detail: format!("cannot read mailmap file {path:?}: {err}"),
+        })?;
+        mailmap.merge(&Mailmap::parse(&String::from_utf8_lossy(&bytes)));
+    }
+    let mut contacts: Vec<String> = opts.positionals.clone();
+    if opts.is_set("stdin") {
+        let input = super::read_stdin_bytes(&ctx.env)?;
+        contacts.extend(
+            String::from_utf8_lossy(&input)
+                .lines()
+                .map(str::to_owned),
+        );
+    }
+    if contacts.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: check-mailmap [--stdin] [--mailmap-file=<file>] <contact>...".to_owned(),
+        });
+    }
+    let mut out = Vec::new();
+    for contact in &contacts {
+        let (name, email) = split_contact(contact);
+        let (name, email) = mailmap
+            .map_ident(&name, &email)
+            .unwrap_or((name, email));
+        out.extend_from_slice(&render_contact(&name, &email));
     }
     Ok(out)
 }
@@ -1999,11 +2285,28 @@ pub(crate) fn var(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     Ok(line(var_value(ctx, name)?))
 }
 
+/// Reads one ident through the mailmap for `var`, mirroring how the `%aN`
+/// display shapes map the stored ident without rewriting it. A mapped
+/// ident that fails the canonical grammar falls back to the stored one
+/// instead of failing the lookup.
+fn mapped_ident(ctx: &Ctx, role: IdentityRole) -> Result<Signature, GitError> {
+    let ident = identity(ctx, role)?;
+    let mailmap = load_mailmap(ctx);
+    let stored_name = String::from_utf8_lossy(ident.name.as_bytes());
+    let stored_email = String::from_utf8_lossy(ident.email.as_bytes());
+    let mapped = mailmap.map_ident(&stored_name, &stored_email);
+    let Some((name, email)) = mapped else {
+        return Ok(ident);
+    };
+    let rendered = format!("{name} <{email}> {} {}", ident.timestamp, ident.offset);
+    Ok(Signature::parse(rendered.as_bytes()).unwrap_or(ident))
+}
+
 /// Reads one variable's value without the trailing newline.
 fn var_value(ctx: &Ctx, name: &str) -> Result<Vec<u8>, GitError> {
     match name {
-        "GIT_AUTHOR_IDENT" => Ok(identity(ctx, IdentityRole::Author)?.render()),
-        "GIT_COMMITTER_IDENT" => Ok(identity(ctx, IdentityRole::Committer)?.render()),
+        "GIT_AUTHOR_IDENT" => Ok(mapped_ident(ctx, IdentityRole::Author)?.render()),
+        "GIT_COMMITTER_IDENT" => Ok(mapped_ident(ctx, IdentityRole::Committer)?.render()),
         "GIT_DEFAULT_BRANCH" => Ok(ctx
             .config_get("init.defaultBranch")
             .unwrap_or_else(|| "main".to_owned())

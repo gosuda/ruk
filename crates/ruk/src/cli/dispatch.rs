@@ -43,7 +43,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 100 advertised verbs in alphabetical order.
+/// The 101 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -128,6 +128,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: false,
         summary: "Test whether paths are ignored",
         run: verbs_misc::check_ignore,
+    },
+    Verb {
+        name: "check-mailmap",
+        oracle: "git/builtin/check-mailmap.c",
+        needs_repo: false,
+        summary: "Show canonical names and emails",
+        run: verbs_misc::check_mailmap,
     },
     Verb {
         name: "check-ref-format",

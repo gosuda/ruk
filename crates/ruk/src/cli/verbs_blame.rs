@@ -2,7 +2,7 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `blame` | first-parent history walk + per-commit LCS alignment | implemented (default `<oid> (<author> <date> <line>) <content>`, `-L`, `-p`/`--porcelain`, `--line-porcelain`, `-l`, worktree overlay with `Not Committed Yet`) |
+//! | `blame` | first-parent history walk + per-commit LCS alignment | implemented (default `<oid> (<author> <date> <line>) <content>`, `-L`, `-p`/`--porcelain`, `--line-porcelain`, `-l`, worktree overlay with `Not Committed Yet`; author/committer names and emails mapped through the mailmap for display) |
 //! | `annotate` | same entry point as `blame` | implemented (alias row) |
 //!
 //! The walk follows first parents from the blamed tip, the way the oracle
@@ -33,6 +33,7 @@ use ruk_git::GitError;
 
 use super::state::{commit_record, head_oid, now_seconds, replace_redirect};
 use super::tree::{commit_tree_oid, flatten_tree, read_object_bytes};
+use super::verbs_misc::{Mailmap, load_mailmap};
 use super::{Ctx, FlagSpec, collect};
 
 /// LCS cell cap: `diff` omits hunks past four million cells instead of
@@ -161,7 +162,8 @@ pub(crate) fn blame(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         Some(spec) => parse_line_range(&spec, total)?,
         None => (1, total),
     };
-    let facts = load_commit_facts(store, &viewed.origins)?;
+    let mailmap = load_mailmap(ctx);
+    let facts = load_commit_facts(store, &viewed.origins, &mailmap)?;
 
     let mut out = Vec::new();
     if porcelain {
@@ -561,10 +563,13 @@ struct OriginFacts {
     previous: Option<String>,
 }
 
-/// Loads facts for every distinct origin commit.
+/// Loads facts for every distinct origin commit, mapping author and
+/// committer names and emails through the mailmap for display. The stored
+/// idents stay untouched; only the rendered columns map.
 fn load_commit_facts(
     store: &Store,
     origins: &[Origin],
+    mailmap: &Mailmap,
 ) -> Result<HashMap<Oid, OriginFacts>, GitError> {
     let mut out = HashMap::new();
     for origin in origins.iter().flatten() {
@@ -578,6 +583,26 @@ fn load_commit_facts(
         let committer = record.committer().map_err(|err| GitError::Corrupt {
             detail: format!("bad committer ident in {}: {err}", origin.0.to_hex()),
         })?;
+        let (author_name, author_email) = mailmap
+            .map_ident(
+                &String::from_utf8_lossy(author.name.as_bytes()),
+                &String::from_utf8_lossy(author.email.as_bytes()),
+            )
+            .map(|(name, email)| (name.into_bytes(), email.into_bytes()))
+            .unwrap_or((
+                author.name.as_bytes().to_vec(),
+                author.email.as_bytes().to_vec(),
+            ));
+        let (committer_name, committer_email) = mailmap
+            .map_ident(
+                &String::from_utf8_lossy(committer.name.as_bytes()),
+                &String::from_utf8_lossy(committer.email.as_bytes()),
+            )
+            .map(|(name, email)| (name.into_bytes(), email.into_bytes()))
+            .unwrap_or((
+                committer.name.as_bytes().to_vec(),
+                committer.email.as_bytes().to_vec(),
+            ));
         let summary = record
             .message()
             .split(|byte| *byte == b'\n')
@@ -588,12 +613,12 @@ fn load_commit_facts(
             origin.0,
             OriginFacts {
                 hex: origin.0.to_hex(),
-                author: author.name.as_bytes().to_vec(),
-                email: author.email.as_bytes().to_vec(),
+                author: author_name,
+                email: author_email,
                 author_time: author.timestamp,
                 author_tz: author.offset.to_string(),
-                committer: committer.name.as_bytes().to_vec(),
-                committer_email: committer.email.as_bytes().to_vec(),
+                committer: committer_name,
+                committer_email,
                 committer_time: committer.timestamp,
                 committer_tz: committer.offset.to_string(),
                 summary,

@@ -22,8 +22,10 @@ use super::verbs_bundle;
 use super::verbs_fastio;
 use super::verbs_grep;
 use super::verbs_history;
+use super::verbs_hooks;
 use super::verbs_maintenance;
 use super::verbs_merge_plumbing;
+use super::verbs_misc;
 use super::verbs_notes;
 use super::verbs_objects;
 use super::verbs_patch;
@@ -127,11 +129,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 100);
+    assert_eq!(VERBS.len(), 101);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 100);
+    assert_eq!(names.len(), 101);
     for name in [
         "add",
         "am",
@@ -145,6 +147,7 @@ fn verb_table_covers_advertised_names() {
         "cat-file",
         "check-attr",
         "check-ignore",
+        "check-mailmap",
         "check-ref-format",
         "checkout",
         "checkout-index",
@@ -7848,5 +7851,386 @@ fn housekeeping_update_server_info_writes_dumb_files() {
     // Idempotent without --force, rewrites with it.
     run(verbs_maintenance::update_server_info, &mut ctx, &[]).expect("rerun");
     run(verbs_maintenance::update_server_info, &mut ctx, &["--force"]).expect("force");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+#[test]
+fn hooks_mailmap_parse_forms() {
+    let map = verbs_misc::Mailmap::parse(
+        "# comment\n\nProper Name <proper@example.invalid> Commit Name <commit@example.invalid>\nMail Only <mail@example.invalid> <oldmail@example.invalid>\n<new@example.invalid> <old2@example.invalid>\nLone Name <lone@example.invalid>\nbroken line\n",
+    );
+    // Full pair maps name and email.
+    assert_eq!(
+        map.map_ident("Commit Name", "commit@example.invalid"),
+        Some((
+            "Proper Name".to_owned(),
+            "proper@example.invalid".to_owned()
+        ))
+    );
+    // Email-only old side maps any name, case-insensitively.
+    assert_eq!(
+        map.map_ident("Anything", "OLDMAIL@example.invalid"),
+        Some(("Mail Only".to_owned(), "mail@example.invalid".to_owned()))
+    );
+    // Bare `<new> <old>` keeps the caller's name, replaces the email.
+    assert_eq!(
+        map.map_ident("Whatever", "old2@example.invalid"),
+        Some(("Whatever".to_owned(), "new@example.invalid".to_owned()))
+    );
+    // A lone `Name <email>` canonicalizes that email's name.
+    assert_eq!(
+        map.map_ident("Other", "lone@example.invalid"),
+        Some(("Lone Name".to_owned(), "lone@example.invalid".to_owned()))
+    );
+    assert_eq!(map.map_ident("Nobody", "nowhere@example.invalid"), None);
+    // Later rows win per key; unknown names fall back to the simple row,
+    // which is empty here and maps nothing.
+    let map = verbs_misc::Mailmap::parse(
+        "Proper <proper@example.invalid> Commit <commit@example.invalid>\nOther <other@example.invalid> Commit <commit@example.invalid>\n",
+    );
+    assert_eq!(
+        map.map_ident("Commit", "commit@example.invalid"),
+        Some(("Other".to_owned(), "other@example.invalid".to_owned()))
+    );
+    assert_eq!(map.map_ident("Stranger", "commit@example.invalid"), None);
+}
+
+#[test]
+fn hooks_mailmap_check_mailmap_verb() {
+    let (root, env) = seeded_repo("hooksm-check", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(
+        root.join(".mailmap"),
+        "Proper Name <proper@example.invalid> Ada <ada@example.invalid>\n",
+    )
+    .expect("mailmap");
+    let out = String::from_utf8(
+        run(
+            verbs_misc::check_mailmap,
+            &mut ctx,
+            &["Ada <ada@example.invalid>"],
+        )
+        .expect("mapped"),
+    )
+    .expect("utf8");
+    assert_eq!(out, "Proper Name <proper@example.invalid>\n");
+    let out = String::from_utf8(
+        run(
+            verbs_misc::check_mailmap,
+            &mut ctx,
+            &["plain@example.invalid"],
+        )
+        .expect("bare"),
+    )
+    .expect("utf8");
+    assert_eq!(out, "<plain@example.invalid>\n");
+    ctx.env.stdin = Some(b"Second <second@example.invalid>\n".to_vec());
+    let out = String::from_utf8(
+        run(verbs_misc::check_mailmap, &mut ctx, &["--stdin"]).expect("stdin"),
+    )
+    .expect("utf8");
+    assert_eq!(out, "Second <second@example.invalid>\n");
+    assert!(run(verbs_misc::check_mailmap, &mut ctx, &[]).is_err());
+    assert!(
+        run(
+            verbs_misc::check_mailmap,
+            &mut ctx,
+            &["--mailmap-blob=HEAD:.mailmap", "Ada <ada@example.invalid>"]
+        )
+        .is_err()
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_mailmap_log_canon_placeholders() {
+    let (root, env) = seeded_repo("hooksm-log", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(
+        root.join(".mailmap"),
+        "Proper Name <proper@example.invalid> Ada <ada@example.invalid>\n",
+    )
+    .expect("mailmap");
+    let out = String::from_utf8(
+        run(
+            verbs_history::log,
+            &mut ctx,
+            &["--format=%aN <%aE> / %an <%ae> / %cN <%cE>"],
+        )
+        .expect("log"),
+    )
+    .expect("utf8");
+    assert_eq!(
+        out,
+        "Proper Name <proper@example.invalid> / Ada <ada@example.invalid> / Proper Name <proper@example.invalid>\n",
+        "got {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_mailmap_shortlog_canonicalizes() {
+    let (root, env) = seeded_repo("hooksm-short", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(
+        root.join(".mailmap"),
+        "Proper Name <proper@example.invalid> Ada <ada@example.invalid>\n",
+    )
+    .expect("mailmap");
+    let out = String::from_utf8(
+        run(verbs_misc::shortlog, &mut ctx, &["-s", "-e"]).expect("shortlog"),
+    )
+    .expect("utf8");
+    assert!(
+        out.contains("Proper Name <proper@example.invalid>"),
+        "got {out:?}"
+    );
+    assert!(!out.contains("Ada <ada@example.invalid>"), "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_mailmap_blame_author_column() {
+    let (root, env) = seeded_repo("hooksm-blame", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(
+        root.join(".mailmap"),
+        "Proper Name <proper@example.invalid> Ada <ada@example.invalid>\n",
+    )
+    .expect("mailmap");
+    let out = String::from_utf8(
+        run(verbs_blame::blame, &mut ctx, &["f.txt"]).expect("blame"),
+    )
+    .expect("utf8");
+    assert!(out.contains("Proper Name"), "got {out:?}");
+    assert!(!out.contains("Ada"), "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_mailmap_var_ident() {
+    let (root, env) = seeded_repo("hooksm-var", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(
+        root.join(".mailmap"),
+        "Proper Name <proper@example.invalid> Ada <ada@example.invalid>\n",
+    )
+    .expect("mailmap");
+    let out = String::from_utf8(
+        run(verbs_misc::var, &mut ctx, &["GIT_AUTHOR_IDENT"]).expect("var"),
+    )
+    .expect("utf8");
+    assert!(
+        out.starts_with("Proper Name <proper@example.invalid> "),
+        "got {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+/// Writes an executable hook script under `.ruk/hooks`.
+fn write_hook(root: &std::path::PathBuf, name: &str, body: &str) {
+    let dir = root.join(".ruk").join("hooks");
+    std::fs::create_dir_all(&dir).expect("hooks dir");
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("hook file");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+#[test]
+fn hooks_pre_commit_blocks_commit() {
+    let (root, env) = seeded_repo("hooksm-pre", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    write_hook(&root, "pre-commit", "#!/bin/sh\nexit 1\n");
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    let err = run(verbs_history::commit, &mut ctx, &["-m", "blocked"]).expect_err("blocked");
+    assert!(err.to_string().contains("pre-commit"), "got {err:?}");
+    run(
+        verbs_history::commit,
+        &mut ctx,
+        &["-m", "forced", "--no-verify"],
+    )
+    .expect("forced");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_commit_msg_rewrites_message() {
+    let (root, env) = seeded_repo("hooksm-msg", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    write_hook(&root, "commit-msg", "#!/bin/sh\necho hooked > \"$1\"\n");
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "original"]).expect("commit");
+    let out = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--format=%s"]).expect("log"),
+    )
+    .expect("utf8");
+    assert_eq!(out, "hooked\nseed\n", "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_post_commit_runs_after_commit() {
+    let (root, env) = seeded_repo("hooksm-post", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    write_hook(&root, "post-commit", "#!/bin/sh\ntouch post-commit-ran\n");
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit");
+    assert!(
+        root.join("post-commit-ran").exists(),
+        "post-commit did not run"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_core_hooks_path_beats_ruk_hooks() {
+    let (root, env) = seeded_repo("hooksm-path", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    // A failing hook in the default dir, a passing one behind
+    // `core.hooksPath`: the override wins and the commit lands.
+    write_hook(&root, "pre-commit", "#!/bin/sh\nexit 1\n");
+    let alt = root.join("alt-hooks");
+    std::fs::create_dir_all(&alt).expect("alt dir");
+    let path = alt.join("pre-commit");
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("alt hook");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    run(
+        verbs_repo::config,
+        &mut ctx,
+        &["core.hooksPath", alt.to_str().expect("utf8")],
+    )
+    .expect("config");
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "via-path"]).expect("commit");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_pre_push_records_args_and_stdin() {
+    let (root, env) = seeded_repo("hooksm-push", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    write_hook(
+        &root,
+        "pre-push",
+        "#!/bin/sh\necho \"$1 $2\" > pre-push-args\ncat > pre-push-stdin\nexit 1\n",
+    );
+    // Feed one resolved ref line: the hook must see it on stdin.
+    let err = verbs_hooks::run_pre_push(
+        &mut ctx,
+        "origin",
+        "origin-url",
+        b"refs/heads/main abcdef1 refs/heads/main 0000000\n",
+    )
+    .expect_err("blocked");
+    assert!(err.to_string().contains("pre-push"), "got {err:?}");
+    let args = std::fs::read_to_string(root.join("pre-push-args")).expect("args file");
+    assert_eq!(args.trim(), "origin origin-url", "got {args:?}");
+    let stdin = std::fs::read_to_string(root.join("pre-push-stdin")).expect("stdin file");
+    assert_eq!(
+        stdin, "refs/heads/main abcdef1 refs/heads/main 0000000\n",
+        "got {stdin:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_pre_push_blocks_local_push() {
+    let (src, _) = seeded_repo("hooksm-pushfull", "f.txt", b"one\n");
+    let base = src.parent().expect("parent").to_path_buf();
+    let env = test_env(&base);
+    // A bare destination repo beside the source.
+    let mut setup = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    run(
+        verbs_repo::init,
+        &mut setup,
+        &[base.join("dst").to_str().expect("utf8")],
+    )
+    .expect("init dst");
+    let mut ctx = repo_ctx(&src, test_env(&base));
+    run(
+        verbs_repo::remote,
+        &mut ctx,
+        &["add", "origin", base.join("dst").to_str().expect("utf8")],
+    )
+    .expect("remote add");
+    // A recording hook sees the expanded local ref on stdin: the short
+    // `main` refspec arrives as `refs/heads/main`.
+    write_hook(
+        &src,
+        "pre-push",
+        "#!/bin/sh\necho \"$1 $2\" > pre-push-args\ncat > pre-push-stdin\n",
+    );
+    run(verbs_transport::push, &mut ctx, &["origin", "main"]).expect("push");
+    let args = std::fs::read_to_string(src.join("pre-push-args")).expect("args file");
+    let want = format!("origin {}", base.join("dst").display());
+    assert_eq!(args.trim(), want, "got {args:?}");
+    let stdin = std::fs::read_to_string(src.join("pre-push-stdin")).expect("stdin file");
+    let fields: Vec<&str> = stdin.trim().split(' ').collect();
+    assert_eq!(fields.len(), 4, "got {stdin:?}");
+    assert_eq!(fields[0], "refs/heads/main", "expanded local ref: {stdin:?}");
+    assert_eq!(fields[2], "refs/heads/main", "got {stdin:?}");
+    assert_ne!(fields[1], fields[3], "new vs old: {stdin:?}");
+    assert_eq!(fields[1].len(), 40, "full hex: {stdin:?}");
+    // A failing hook blocks the push; `--no-verify` skips it.
+    write_hook(&src, "pre-push", "#!/bin/sh\nexit 1\n");
+    std::fs::write(src.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit");
+    let err = run(verbs_transport::push, &mut ctx, &["origin"]).expect_err("blocked");
+    assert!(err.to_string().contains("pre-push"), "got {err:?}");
+    run(
+        verbs_transport::push,
+        &mut ctx,
+        &["origin", "--no-verify"],
+    )
+    .expect("forced push");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn hooks_failing_post_commit_still_succeeds() {
+    let (root, env) = seeded_repo("hooksm-postfail", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    // The oracle discards `post-commit` status: the commit lands even
+    // when the hook fails.
+    write_hook(&root, "post-commit", "#!/bin/sh\nexit 1\n");
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit");
+    let out = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--format=%s"]).expect("log"),
+    )
+    .expect("utf8");
+    assert!(out.starts_with("second\n"), "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_post_merge_runs_on_fast_forward() {
+    let (root, env) = seeded_repo("hooksm-merge", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::branch, &mut ctx, &["side"]).expect("branch");
+    run(verbs_branch::checkout, &mut ctx, &["side"]).expect("checkout side");
+    std::fs::write(root.join("f.txt"), b"side\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "side work"]).expect("commit");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("back");
+    write_hook(&root, "post-merge", "#!/bin/sh\ntouch post-merge-ran\n");
+    run(verbs_history::merge, &mut ctx, &["side"]).expect("merge");
+    assert!(root.join("post-merge-ran").exists(), "post-merge did not run");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

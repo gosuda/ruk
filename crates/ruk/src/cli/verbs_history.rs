@@ -3,13 +3,13 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `commit` | tree build + `ops::new`/`ops::edit` + branch move | implemented (multi `-m`, `-a`, `--amend` (reuses `HEAD` message), `-F`, `--allow-empty`, `--allow-empty-message`, `-q`, `-C`/`-c`, `--author`, `--date`, `--signoff`, `--squash`, `--fixup`, `--reset-author`, `--cleanup`, `--template`, `--dry-run`, `--status`/`--no-status`/`--no-edit`/`--verbose` no-op, `--no-verify` no-op, `--edit` accepted with a message source, unsupported alone) |
-//! | `merge` | fast-forward fast-path + three-way lane | implemented (syntax lane first, bounded text fallback; `--no-ff`, `--ff-only`, `--continue`/`--abort`/`--quit`, `MERGE_HEAD` + stages 1/2/3 on conflict) |
+//! | `commit` | tree build + `ops::new`/`ops::edit` + branch move | implemented (multi `-m`, `-a`, `--amend` (reuses `HEAD` message), `-F`, `--allow-empty`, `--allow-empty-message`, `-q`, `-C`/`-c`, `--author`, `--date`, `--signoff`, `--squash`, `--fixup`, `--reset-author`, `--cleanup`, `--template`, `--dry-run`, `--status`/`--no-status`/`--no-edit`/`--verbose` no-op, `--no-verify` skips `pre-commit`/`commit-msg`, `--edit` accepted with a message source, unsupported alone; hooks `pre-commit`/`commit-msg` (message file, may rewrite)/`post-commit` run, and merge concludes run the same three) |
+//! | `merge` | fast-forward fast-path + three-way lane | implemented (syntax lane first, bounded text fallback; `--no-ff`, `--ff-only`, `--continue`/`--abort`/`--quit`, `MERGE_HEAD` + stages 1/2/3 on conflict; `post-merge` runs on every completed merge) |
 //! | `rebase` | range replay over the lane | implemented (`<upstream>` and `--onto`, `--continue`/`--skip`/`--abort`; drops merge commits, no branch switching) |
 //! | `cherry-pick` | per-commit replay over the lane | implemented (`-n`, `-m`, `-x`, `--continue`/`--skip`/`--abort`, `CHERRY_PICK_HEAD`) |
 //! | `revert` | inverse replay over the lane | implemented (`-n`, `-m`, `--continue`/`--skip`/`--abort`, `REVERT_HEAD`) |
-//! | `log` | commit ancestry walk | implemented (oneline, format/pretty incl. full/fuller/email/raw, ranges, paths, stat/patch/summary/shortstat/numstat/dirstat, filters incl. follow/pickaxe/merges, first-parent, left-right/cherry-pick, topo/date order, date shapes, abbrev, notes, decorate, source, simplify-by-decoration, branch/tag/remote/exclude tips, boundary, graph) |
-//! | `show` | commit read + tree diff, or blob bytes | implemented (format/pretty, stat/shortstat/numstat/summary/raw/patch, `rev:path` blob form, `--output`, word-diff/whitespace/prefix/filter/relative knobs) |
+//! | `log` | commit ancestry walk | implemented (oneline, format/pretty incl. full/fuller/email/raw and `%aN`/`%aE`/`%cN`/`%cE` mailmap placeholders, ranges, paths, stat/patch/summary/shortstat/numstat/dirstat, filters incl. follow/pickaxe/merges, first-parent, left-right/cherry-pick, topo/date order, date shapes, abbrev, notes, decorate, source, simplify-by-decoration, branch/tag/remote/exclude tips, boundary, graph) |
+//! | `show` | commit read + tree diff, or blob bytes | implemented (format/pretty incl. `%aN`/`%aE`/`%cN`/`%cE` mailmap placeholders, stat/shortstat/numstat/summary/raw/patch, `rev:path` blob form, `--output`, word-diff/whitespace/prefix/filter/relative knobs) |
 //! | `diff` | tree/index/worktree compare + line differ | implemented (`--cached`/`--staged`, ranges, stat/shortstat/numstat/summary/raw/patch, `-U`/`--inter-hunk-context`, name-status, `--diff-filter`, paths, `-C` copies, word-diff, whitespace folds, `--text`, prefixes, `--relative`, `--output`, `--no-index`, `--quiet`/`--no-patch`; `--minimal`/`--patience`/`--histogram`, `-W`, `--binary`, `--exit-code`, `--color-moved` are `Unsupported`) |
 //! | `merge-base` | breadth-first paint-down | implemented (`--is-ancestor`, `-a`/`--all`) |
 //! | `rev-list` | ancestry walk | implemented (`--count`, `-n`, `--all`, `--objects`, `--parents`, `--reverse`, ranges) |
@@ -54,6 +54,7 @@ use super::tree::{
     TreeMode, WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree,
     read_object_bytes,
 };
+use super::verbs_misc::{Mailmap, load_mailmap};
 use super::{Ctx, FlagSpec, collect, line};
 
 /// Records staged changes as a commit, or rewrites `HEAD` with `--amend`.
@@ -91,8 +92,7 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             short: None,
             takes_value: false,
         },
-        // Accepted and ignored: no hooks exist in this store, so there is
-        // nothing to skip; parsing it keeps `commit --no-verify` working.
+        // Accepted: skips the `pre-commit` and `commit-msg` hooks below.
         FlagSpec {
             long: "no-verify",
             short: Some('n'),
@@ -252,9 +252,11 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         } else {
             None
         };
+        if opts.is_set("no-verify") {
+            return conclude_merge_unverified(ctx, message);
+        }
         return conclude_merge(ctx, message);
     }
-    let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
     check_reset_author(&opts)?;
     let amending = opts.is_set("amend");
     let message = resolve_commit_message(ctx, &opts, store, kind, amending)?;
@@ -286,7 +288,33 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             }
         }
     };
+    // Hooks never run on dry runs or with `--no-verify`, and the tree is
+    // always rebuilt after `pre-commit`: hooks may stage their own fixes,
+    // so a pre-hook tree would omit them from the commit.
+    let no_verify = opts.is_set("no-verify");
     if opts.is_set("amend") {
+        // Dry runs report without hooks and without rewriting the commit.
+        if opts.is_set("dry-run") {
+            let label = branch_label_of(ctx)?;
+            let subject = message.lines().next().unwrap_or_default().to_owned();
+            return finish(format!("Would commit on {label}: {subject}\n").into_bytes());
+        }
+        let message = if no_verify {
+            message
+        } else {
+            super::verbs_hooks::run_pre_commit(ctx)?;
+            super::verbs_hooks::run_commit_msg(ctx, message)?
+        };
+        let store = ctx.store()?;
+        let rows = scan_index(store, kind)?;
+        for (_, stage, _) in &rows {
+            if *stage != Stage::Zero {
+                return Err(GitError::Invalid {
+                    detail: "unmerged paths must be resolved first".to_owned(),
+                });
+            }
+        }
+        let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
         let out = commit_amend(ctx, tree, message, author, committer, author_from_flag)?;
         return finish(out);
     }
@@ -294,11 +322,14 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         Ok(tip) => vec![Head::Git { oid: tip }],
         Err(_) => Vec::new(),
     };
-    let tree_unchanged = match parents.first().and_then(|head| head.as_git().copied()) {
+    // A clean tree refuses before any hook runs; hooks that clean the tree
+    // refuse again after the rebuild below.
+    let pre_tree = build_index_tree(store, kind, &merged_rows(&rows))?;
+    let pre_unchanged = match parents.first().and_then(|head| head.as_git().copied()) {
         None => false,
-        Some(tip) => commit_tree_oid(&commit_record(store, tip)?)? == tree,
+        Some(tip) => commit_tree_oid(&commit_record(store, tip)?)? == pre_tree,
     };
-    if tree_unchanged && !opts.is_set("allow-empty") && !fixup_allows_empty(&opts) {
+    if pre_unchanged && !opts.is_set("allow-empty") && !fixup_allows_empty(&opts) {
         return Err(GitError::Invalid {
             detail: "nothing to commit, working tree clean".to_owned(),
         });
@@ -307,6 +338,33 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         let label = branch_label_of(ctx)?;
         let subject = message.lines().next().unwrap_or_default().to_owned();
         return finish(format!("Would commit on {label}: {subject}\n").into_bytes());
+    }
+    if !no_verify {
+        super::verbs_hooks::run_pre_commit(ctx)?;
+    }
+    let message = if no_verify {
+        message
+    } else {
+        super::verbs_hooks::run_commit_msg(ctx, message)?
+    };
+    let store = ctx.store()?;
+    let rows = scan_index(store, kind)?;
+    for (_, stage, _) in &rows {
+        if *stage != Stage::Zero {
+            return Err(GitError::Invalid {
+                detail: "unmerged paths must be resolved first".to_owned(),
+            });
+        }
+    }
+    let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
+    let tree_unchanged = match parents.first().and_then(|head| head.as_git().copied()) {
+        None => false,
+        Some(tip) => commit_tree_oid(&commit_record(store, tip)?)? == tree,
+    };
+    if tree_unchanged && !opts.is_set("allow-empty") && !fixup_allows_empty(&opts) {
+        return Err(GitError::Invalid {
+            detail: "nothing to commit, working tree clean".to_owned(),
+        });
     }
     let old_tree = parents_tree(ctx, &parents)?;
     let root = parents.is_empty();
@@ -328,6 +386,7 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             detail: "new commit has no git identity".to_owned(),
         })?;
     advance_head_to(ctx, new_oid)?;
+    super::verbs_hooks::run_post_commit(ctx)?;
     let label = branch_label_of(ctx)?;
     let subject = message.lines().next().unwrap_or_default().to_owned();
     let summary = if root {
@@ -841,7 +900,7 @@ fn parse_author_flag(text: &str) -> Result<Signature, GitError> {
 
 /// Rewrites the current commit keeping its parents and change.
 fn commit_amend(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     tree: Oid,
     message: String,
     author: Signature,
@@ -889,6 +948,9 @@ fn commit_amend(
             detail: "rewritten commit has no git identity".to_owned(),
         })?;
     advance_head_to(ctx, new_oid)?;
+    // The no-op path above reuses the tip without a new commit, so only
+    // this path runs `post-commit`.
+    super::verbs_hooks::run_post_commit(ctx)?;
     let label = branch_label_of(ctx)?;
     let subject = message.lines().next().unwrap_or_default().to_owned();
     commit_summary(ctx, Some(old_tree), tree, &new_oid, &label, &subject)
@@ -1751,12 +1813,20 @@ enum FormatField {
     AuthorEmail,
     /// Author date.
     AuthorDate,
+    /// `%aN`, `%aE`: author name and email through the mailmap.
+    AuthorCanonName,
+    /// Author canonical email.
+    AuthorCanonEmail,
     /// `%cn`, `%ce`, `%cd`: committer name, email, date.
     CommitterName,
     /// Committer email.
     CommitterEmail,
     /// Committer date.
     CommitterDate,
+    /// `%cN`, `%cE`: committer name and email through the mailmap.
+    CommitterCanonName,
+    /// Committer canonical email.
+    CommitterCanonEmail,
     /// `%d`: decorations like ` (HEAD -> main)`, empty when none.
     Decoration,
     /// `%P`: parent oids, space-separated.
@@ -1784,7 +1854,7 @@ enum FormatPart {
 fn parse_log_format(text: &str) -> Result<Vec<FormatPart>, GitError> {
     let unknown = |letter: char| GitError::Invalid {
         detail: format!(
-            "unknown placeholder %{letter} (supported: %H %h %s %an %ae %ad %cn %ce %cd %d %P %T %S %% %n)"
+            "unknown placeholder %{letter} (supported: %H %h %s %an %ae %ad %aN %aE %cn %ce %cd %cN %cE %d %P %T %S %% %n)"
         ),
     };
     let bytes = text.as_bytes();
@@ -1821,6 +1891,14 @@ fn parse_log_format(text: &str) -> Result<Vec<FormatPart>, GitError> {
                     index += 1;
                     FormatField::AuthorDate
                 }
+                Some(b'N') => {
+                    index += 1;
+                    FormatField::AuthorCanonName
+                }
+                Some(b'E') => {
+                    index += 1;
+                    FormatField::AuthorCanonEmail
+                }
                 Some(letter) => return Err(unknown(char::from(*letter))),
                 None => return Err(unknown(' ')),
             },
@@ -1836,6 +1914,14 @@ fn parse_log_format(text: &str) -> Result<Vec<FormatPart>, GitError> {
                 Some(b'd') => {
                     index += 1;
                     FormatField::CommitterDate
+                }
+                Some(b'N') => {
+                    index += 1;
+                    FormatField::CommitterCanonName
+                }
+                Some(b'E') => {
+                    index += 1;
+                    FormatField::CommitterCanonEmail
                 }
                 Some(letter) => return Err(unknown(char::from(*letter))),
                 None => return Err(unknown(' ')),
@@ -2076,9 +2162,40 @@ fn short_hex_len(oid: &Oid, len: usize) -> String {
     oid.to_hex().chars().take(len.max(1)).collect()
 }
 
+/// Reports whether a parsed format uses a mailmap-mapped placeholder
+/// (`%aN`/`%aE`/`%cN`/`%cE`), so callers only load the mailmap then.
+fn format_uses_canon(line: &CommitLine) -> bool {
+    line.format.as_deref().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            matches!(
+                part,
+                FormatPart::Field(
+                    FormatField::AuthorCanonName
+                        | FormatField::AuthorCanonEmail
+                        | FormatField::CommitterCanonName
+                        | FormatField::CommitterCanonEmail
+                )
+            )
+        })
+    })
+}
+
+/// Maps one stored ident through the mailmap for display, keeping the
+/// stored spelling when no row matches.
+fn canon_ident(mailmap: &Mailmap, name: &[u8], email: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let stored_name = String::from_utf8_lossy(name);
+    let stored_email = String::from_utf8_lossy(email);
+    mailmap
+        .map_ident(&stored_name, &stored_email)
+        .map(|(name, email)| (name.into_bytes(), email.into_bytes()))
+        .unwrap_or((stored_name.into_owned().into_bytes(), stored_email.into_owned().into_bytes()))
+}
+
 /// Renders parsed format parts for one commit. `decoration` is the `%d`
 /// text including its leading space, or empty when undecorated; `source`
-/// is the `--source` ref name (`%S`), empty when none.
+/// is the `--source` ref name (`%S`), empty when none. `mailmap` backs
+/// the `%aN`/`%aE`/`%cN`/`%cE` placeholders; every other placeholder reads
+/// the stored ident untouched.
 fn render_log_format(
     parts: &[FormatPart],
     line: &CommitLine,
@@ -2092,6 +2209,26 @@ fn render_log_format(
     };
     let author = record.author().map_err(|_| broken("author"))?;
     let committer = record.committer().map_err(|_| broken("committer"))?;
+    // The canonical placeholders read the mailmap the caller staged on the
+    // line; without one they fall back to the stored ident.
+    let (canon_author_name, canon_author_email) = match line.mailmap.as_ref() {
+        Some(mailmap) => canon_ident(mailmap, author.name.as_bytes(), author.email.as_bytes()),
+        None => (
+            author.name.as_bytes().to_vec(),
+            author.email.as_bytes().to_vec(),
+        ),
+    };
+    let (canon_committer_name, canon_committer_email) = match line.mailmap.as_ref() {
+        Some(mailmap) => canon_ident(
+            mailmap,
+            committer.name.as_bytes(),
+            committer.email.as_bytes(),
+        ),
+        None => (
+            committer.name.as_bytes().to_vec(),
+            committer.email.as_bytes().to_vec(),
+        ),
+    };
     let mut out = Vec::new();
     for part in parts {
         match part {
@@ -2106,6 +2243,8 @@ fn render_log_format(
                 }
                 FormatField::AuthorName => out.extend_from_slice(author.name.as_bytes()),
                 FormatField::AuthorEmail => out.extend_from_slice(author.email.as_bytes()),
+                FormatField::AuthorCanonName => out.extend_from_slice(&canon_author_name),
+                FormatField::AuthorCanonEmail => out.extend_from_slice(&canon_author_email),
                 FormatField::AuthorDate => {
                     out.extend_from_slice(
                         render_date(author.timestamp, author.offset, line.date, line.now)
@@ -2114,6 +2253,8 @@ fn render_log_format(
                 }
                 FormatField::CommitterName => out.extend_from_slice(committer.name.as_bytes()),
                 FormatField::CommitterEmail => out.extend_from_slice(committer.email.as_bytes()),
+                FormatField::CommitterCanonName => out.extend_from_slice(&canon_committer_name),
+                FormatField::CommitterCanonEmail => out.extend_from_slice(&canon_committer_email),
                 FormatField::CommitterDate => {
                     out.extend_from_slice(
                         render_date(committer.timestamp, committer.offset, line.date, line.now)
@@ -2158,6 +2299,8 @@ struct CommitLine {
     date: DateMode,
     /// Invocation time for relative dates.
     now: i64,
+    /// Staged mailmap for `%aN`/`%aE`/`%cN`/`%cE`; `None` renders stored idents.
+    mailmap: Option<Mailmap>,
 }
 
 /// Renders one commit's identity line for `log` and `show`.
@@ -2618,6 +2761,7 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         Ok(tip) => tip,
         Err(_) => {
             let out = merge_into_unborn(ctx, rev, tip)?;
+            super::verbs_hooks::run_post_merge(ctx)?;
             return Ok(hush_merge(out, quiet));
         }
     };
@@ -2634,15 +2778,20 @@ pub(crate) fn merge(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         let (workspace, _) = load_or_default(store)?;
         if matches!(workspace.head, HeadRef::Detached(_)) {
             let out = merge_fast_forward_detached(ctx, current, tip)?;
+            super::verbs_hooks::run_post_merge(ctx)?;
             return Ok(hush_merge(out, quiet));
         }
         let out = merge_fast_forward(ctx, rev, current, tip)?;
+        super::verbs_hooks::run_post_merge(ctx)?;
         return Ok(hush_merge(out, quiet));
     }
     if is_ancestor(store, tip, current)? {
         return Ok(hush_merge(b"Already up to date.\n".to_vec(), quiet));
     }
+    // Conflicts refuse inside `merge_content`, so reaching here means the
+    // merge commit exists and `post-merge` runs.
     let out = merge_content(ctx, rev, current, tip, message)?;
+    super::verbs_hooks::run_post_merge(ctx)?;
     Ok(hush_merge(out, quiet))
 }
 
@@ -2799,10 +2948,30 @@ fn merge_conflict_error(plan: &MergePlan) -> GitError {
 
 /// Concludes a conflicted merge from the resolved index: the shared body of
 /// `merge --continue` and an explicit `commit` over `MERGE_HEAD`.
+/// Runs `pre-commit` and `commit-msg`; the commit below runs `post-commit`.
 fn conclude_merge(ctx: &mut Ctx, message: Option<String>) -> Result<Vec<u8>, GitError> {
+    let text = pending_merge_text(ctx, message)?;
+    super::verbs_hooks::run_pre_commit(ctx)?;
+    let text = super::verbs_hooks::run_commit_msg(ctx, text)?;
+    finish_merge_commit(ctx, text)
+}
+
+/// Concludes a conflicted merge for `commit --no-verify`: the message
+/// hooks stay off, `post-commit` still runs with the new commit.
+fn conclude_merge_unverified(
+    ctx: &mut Ctx,
+    message: Option<String>,
+) -> Result<Vec<u8>, GitError> {
+    let text = pending_merge_text(ctx, message)?;
+    finish_merge_commit(ctx, text)
+}
+
+/// Resolves the pending merge message: the caller's text, the stored
+/// `MERGE_MSG`, or the default `Merge <tip> into <branch>`. Unmerged paths
+/// and a missing `MERGE_HEAD` refuse before any hook runs.
+fn pending_merge_text(ctx: &Ctx, message: Option<String>) -> Result<String, GitError> {
     let store = ctx.store()?;
-    let kind = ctx.kind()?;
-    let rows = scan_index(store, kind)?;
+    let rows = scan_index(store, ctx.kind()?)?;
     if rows.iter().any(|(_, stage, _)| *stage != Stage::Zero) {
         return Err(GitError::Invalid {
             detail: "you have not concluded your merge (MERGE_HEAD exists)".to_owned(),
@@ -2811,9 +2980,9 @@ fn conclude_merge(ctx: &mut Ctx, message: Option<String>) -> Result<Vec<u8>, Git
     let merge_head = pseudo_read_oid(store, "MERGE_HEAD")?.ok_or_else(|| GitError::Corrupt {
         detail: "MERGE_HEAD is missing".to_owned(),
     })?;
-    let text = match message {
-        Some(text) => text,
-        None => pseudo_read(store, "MERGE_MSG")?
+    match message {
+        Some(text) => Ok(text),
+        None => Ok(pseudo_read(store, "MERGE_MSG")?
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_else(|| {
                 format!(
@@ -2821,16 +2990,31 @@ fn conclude_merge(ctx: &mut Ctx, message: Option<String>) -> Result<Vec<u8>, Git
                     merge_head.to_hex(),
                     branch_label_of(ctx).unwrap_or_default()
                 )
-            }),
-    };
+            })),
+    }
+}
+
+/// Writes the merge commit for resolved text and reports it. The index is
+/// re-scanned here (not shared with the message step) because `pre-commit`
+/// hooks may stage their own fixes.
+fn finish_merge_commit(ctx: &mut Ctx, text: String) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let merge_head = pseudo_read_oid(store, "MERGE_HEAD")?.ok_or_else(|| GitError::Corrupt {
+        detail: "MERGE_HEAD is missing".to_owned(),
+    })?;
+    let rows = scan_index(store, kind)?;
     let head = head_oid(store)?;
     let old_tree = commit_tree_oid(&commit_record(store, head)?)?;
     let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
     let new_oid = lane_commit(ctx, tree, vec![head, merge_head], text)?;
+    // The merge concludes with the ref update above: sequencer state goes
+    // first so a failing `post-commit` never replays a finished merge.
     sequencer_delete(store, "merge")?;
     pseudo_delete(store, "MERGE_HEAD")?;
     pseudo_delete(store, "MERGE_MSG")?;
     pseudo_delete(store, "abort-index/merge")?;
+    super::verbs_hooks::run_post_commit(ctx)?;
     let label = branch_label_of(ctx)?;
     let subject = message_subject(ctx, &new_oid)?;
     commit_summary(ctx, Some(old_tree), tree, &new_oid, &label, &subject)
@@ -5583,6 +5767,9 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
     let graph = opts.is_set("graph");
     let source = opts.is_set("source");
+    if format_uses_canon(&line) {
+        line.mailmap = Some(load_mailmap(ctx));
+    }
     let mut out = Vec::new();
     for shown in &shown {
         let decoration = if full_names {
@@ -6517,6 +6704,7 @@ fn commit_line_of(opts: &super::Collected) -> Result<CommitLine, GitError> {
         pretty,
         date,
         now: now_seconds()?,
+        mailmap: None,
     })
 }
 
@@ -6881,6 +7069,10 @@ pub(crate) fn show(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     } else {
         String::new()
     };
+    let mut line = line;
+    if format_uses_canon(&line) {
+        line.mailmap = Some(load_mailmap(ctx));
+    }
     let mut out = render_commit_line(&line, &oid, &record, &decoration)?;
     if opts.is_set("no-patch") || opts.is_set("quiet") {
         return write_output_file(ctx, &opts, out);

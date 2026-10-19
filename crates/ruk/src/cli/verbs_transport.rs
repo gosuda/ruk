@@ -141,6 +141,8 @@ pub(crate) struct PushFlags {
     pub(crate) mirror: bool,
     /// Upload outgoing LFS payloads through the batch API before pushing.
     pub(crate) want_lfs: bool,
+    /// Skip the `pre-push` hook.
+    pub(crate) no_verify: bool,
 }
 
 /// How a fetch updates refs. Data, not selectors: one plan per invocation.
@@ -1041,6 +1043,40 @@ fn dwell_dest(store: &Store, text: &str) -> Result<RefName, GitError> {
     })
 }
 
+/// Expands a push source for `pre-push` stdin lines: full names pass
+/// through, otherwise the first existing `heads`/`tags` spelling wins and
+/// unexpandable spellings (oids, `HEAD~`) go out as originally given, the
+/// way `send-pack` feeds `peer_ref->name`.
+fn expand_push_source(store: &Store, src: &str) -> String {
+    if src.starts_with("refs/") {
+        return src.to_owned();
+    }
+    let reader = StoreRefs::new(store);
+    for candidate in [format!("refs/heads/{src}"), format!("refs/tags/{src}")] {
+        let Ok(name) = RefName::new(candidate.clone()) else {
+            continue;
+        };
+        if reader.get(&name).is_ok_and(|found| found.is_some()) {
+            return candidate;
+        }
+    }
+    src.to_owned()
+}
+
+/// Splits the local side off one refspec, dropping the force `+` prefix.
+fn push_spec_source(spec: &str) -> &str {
+    let bare = spec.strip_prefix('+').unwrap_or(spec);
+    bare.split_once(':').map_or(bare, |(left, _)| left)
+}
+
+/// Expands every spec's local side for `pre-push` stdin lines.
+fn push_spec_locals(store: &Store, specs: &[String]) -> Vec<String> {
+    specs
+        .iter()
+        .map(|spec| expand_push_source(store, push_spec_source(spec)))
+        .collect()
+}
+
 /// Matches one glob with a single `*` against a name.
 fn glob_pair(pattern: &str, text: &str) -> bool {
     match pattern.split_once('*') {
@@ -1200,6 +1236,12 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: None,
             takes_value: false,
         },
+        // Accepted: skips the `pre-push` hook below.
+        FlagSpec {
+            long: "no-verify",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let kind = ctx.kind()?;
@@ -1213,6 +1255,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         delete: opts.is_set("delete"),
         mirror: opts.is_set("mirror"),
         want_lfs: opts.is_set("lfs"),
+        no_verify: opts.is_set("no-verify"),
     };
     let remote_label = configured_name(ctx, target).unwrap_or_else(|| target.to_owned());
     if flags.mirror && opts.positionals.len() > 1 {
@@ -1252,6 +1295,19 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                     &|name| peel_dest_oid(&dest, name),
                 )?
             };
+            if !flags.no_verify {
+                let url = ctx
+                    .config_get(&format!("remote.{target}.url"))
+                    .unwrap_or_else(|| target.to_owned());
+                let store = ctx.store()?;
+                let lines = if flags.delete {
+                    super::verbs_hooks::pre_push_delete_stdin(&updates)
+                } else {
+                    let locals = push_spec_locals(store, &spec_texts);
+                    super::verbs_hooks::pre_push_stdin(&locals, &updates)
+                };
+                super::verbs_hooks::run_pre_push(ctx, &remote_label, &url, &lines)?;
+            }
             if flags.want_lfs {
                 push_lfs_upload(ctx, &updates, &remote_label)?;
             }
@@ -1428,6 +1484,21 @@ fn push_net(
         };
         (updates, http_adv)
     };
+    if !flags.no_verify {
+        let url = ctx
+            .config_get(&format!("remote.{target}.url"))
+            .unwrap_or_else(|| target.to_owned());
+        let store = ctx.store()?;
+        let lines = if flags.mirror {
+            super::verbs_hooks::pre_push_mirror_stdin(&updates)
+        } else if flags.delete {
+            super::verbs_hooks::pre_push_delete_stdin(&updates)
+        } else {
+            let locals = push_spec_locals(store, spec_texts);
+            super::verbs_hooks::pre_push_stdin(&locals, &updates)
+        };
+        super::verbs_hooks::run_pre_push(ctx, remote_label, &url, &lines)?;
+    }
     if flags.mirror && updates.is_empty() {
         return Ok(Vec::new());
     }
@@ -1514,6 +1585,13 @@ fn push_mirror(
     };
     let remote = direct_tips(dest)?;
     let updates = mirror_push_updates(kind, &local, &remote);
+    if !flags.no_verify {
+        let url = ctx
+            .config_get(&format!("remote.{target}.url"))
+            .unwrap_or_else(|| target.to_owned());
+        let lines = super::verbs_hooks::pre_push_mirror_stdin(&updates);
+        super::verbs_hooks::run_pre_push(ctx, remote_label, &url, &lines)?;
+    }
     if updates.is_empty() {
         return Ok(Vec::new());
     }
