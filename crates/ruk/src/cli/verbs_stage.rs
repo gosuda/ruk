@@ -734,11 +734,12 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             takes_value: false,
         },
     ];
-    let opts = collect(args, &specs)?;
+    let (args, rename_mode) = super::rename::split_rename_args(args)?;
+    let opts = collect(&args, &specs)?;
     ctx.require_worktree()?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let plan = status_plan(ctx, store, kind)?;
+    let plan = status_plan_with_mode(ctx, store, kind, rename_mode)?;
     if opts.is_set("porcelain") || opts.is_set("short") {
         let branch = opts
             .is_set("branch")
@@ -757,6 +758,10 @@ pub(crate) struct StatusPlan {
     pub(crate) staged: Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
     /// `(old path, new path)` additions/deletions of identical blobs.
     pub(crate) renames: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `(old path, new path)` worktree deletions paired with untracked
+    /// files (`-M` only; the oracle never reports these, so the default
+    /// plan leaves them as delete plus untracked).
+    pub(crate) renames_unstaged: Vec<(Vec<u8>, Vec<u8>)>,
     /// `(path, worktree code)` in path order.
     pub(crate) unstaged: Vec<(Vec<u8>, char)>,
     /// Unmerged paths in path order.
@@ -765,11 +770,25 @@ pub(crate) struct StatusPlan {
     pub(crate) untracked: Vec<Vec<u8>>,
 }
 
-/// Compares `HEAD` tree, index rows, and worktree files.
+/// Compares `HEAD` tree, index rows, and worktree files with the default
+/// exact-only rename pairing.
 pub(crate) fn status_plan(
     ctx: &Ctx,
     store: &Store,
     kind: HashKind,
+) -> Result<StatusPlan, GitError> {
+    status_plan_with_mode(ctx, store, kind, super::rename::RenameMode::ExactOnly)
+}
+
+/// Compares `HEAD` tree, index rows, and worktree files, pairing renames
+/// per `mode`: staged additions/deletions always pair when identical
+/// (unless disabled), and `-M` additionally pairs by similarity both
+/// staged and worktree (deleted tracked plus untracked).
+pub(crate) fn status_plan_with_mode(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    mode: super::rename::RenameMode,
 ) -> Result<StatusPlan, GitError> {
     let head_tree = head_tree_map(ctx, store)?;
     let rows = scan_index(store, kind)?;
@@ -806,7 +825,7 @@ pub(crate) fn status_plan(
         }
     }
     staged.sort();
-    let renames = pair_exact_renames(&mut staged);
+    let renames = pair_staged_renames(ctx, store, &mut staged, mode)?;
     let mut blobs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut unstaged = Vec::new();
     let mut untracked = Vec::new();
@@ -837,15 +856,46 @@ pub(crate) fn status_plan(
     }
     unstaged.sort();
     untracked.sort();
+    // Worktree renames pair only under `-M`: the default plan keeps the
+    // oracle's delete-plus-untracked output.
+    let renames_unstaged = match mode {
+        super::rename::RenameMode::Similar(threshold) => {
+            pair_unstaged_renames(store, &index_merged, &blobs, &mut unstaged, &mut untracked, threshold)?
+        }
+        super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => Vec::new(),
+    };
     let mut unmerged_paths_sorted: Vec<Vec<u8>> = unmerged.into_keys().collect();
     unmerged_paths_sorted.sort();
     Ok(StatusPlan {
         staged,
         renames,
+        renames_unstaged,
         unstaged,
         unmerged: unmerged_paths_sorted,
         untracked,
     })
+}
+
+/// Pairs staged additions with staged deletions per `mode`, removing both
+/// sides from `staged`. `Disabled` pairs nothing; `ExactOnly` pairs
+/// identical blobs (the historical behavior); `Similar` additionally pairs
+/// edited blobs at or above the threshold.
+fn pair_staged_renames(
+    ctx: &Ctx,
+    store: &Store,
+    staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
+    mode: super::rename::RenameMode,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, GitError> {
+    if mode == super::rename::RenameMode::Disabled {
+        return Ok(Vec::new());
+    }
+    if mode == super::rename::RenameMode::ExactOnly {
+        return Ok(pair_exact_renames(staged));
+    }
+    let super::rename::RenameMode::Similar(threshold) = mode else {
+        return Ok(pair_exact_renames(staged));
+    };
+    pair_similar_staged(ctx, store, staged, threshold)
 }
 
 /// Pairs staged additions with staged deletions of identical blobs into
@@ -902,6 +952,207 @@ fn pair_exact_renames(
     renames.sort();
     *staged = restaged;
     renames
+}
+
+/// Pairs staged additions with staged deletions by blob similarity at or
+/// above `threshold`, after exact-oid pairing. Blob bodies read once per
+/// side; oversized sides only pair when their oids already match.
+fn pair_similar_staged(
+    _ctx: &Ctx,
+    store: &Store,
+    staged: &mut Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)>,
+    threshold: u8,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, GitError> {
+    use super::rename::{RenameSide, pair_renames, similarity};
+    let mut renames = Vec::new();
+    let mut keep: Vec<(Vec<u8>, char, Option<(TreeMode, ruk_core::ids::Oid)>)> = Vec::new();
+    let mut dels: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
+    let mut adds: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
+    for (path, code, identity) in staged.drain(..) {
+        match (code, identity) {
+            ('D', Some((mode, oid))) => dels.push((path, mode, oid)),
+            ('A', Some((mode, oid))) => adds.push((path, mode, oid)),
+            _ => keep.push((path, code, identity)),
+        }
+    }
+    // Exact oids pair regardless of mode, in path order.
+    let mut taken = vec![false; adds.len()];
+    let mut live_dels: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = Vec::new();
+    for (old_path, old_mode, old_oid) in dels {
+        let mut paired = None;
+        for (index, (new_path, _, new_oid)) in adds.iter().enumerate() {
+            if !taken[index] && *new_oid == old_oid {
+                paired = Some(index);
+                renames.push((old_path.clone(), new_path.clone()));
+                break;
+            }
+        }
+        match paired {
+            Some(index) => taken[index] = true,
+            None => live_dels.push((old_path, old_mode, old_oid)),
+        }
+    }
+    let live_adds: Vec<(Vec<u8>, TreeMode, ruk_core::ids::Oid)> = adds
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !taken[*index])
+        .map(|(_, triple)| triple)
+        .collect();
+    // Similarity over the leftovers; mode plays no role here.
+    const MAX_SCORE_BYTES: usize = 1 << 20;
+    let mut del_side = Vec::with_capacity(live_dels.len());
+    let mut del_body: Vec<Option<Vec<u8>>> = Vec::with_capacity(live_dels.len());
+    for (path, _, oid) in &live_dels {
+        let (_, body) = read_object_bytes(store, *oid)?;
+        del_side.push(RenameSide {
+            path: path.clone(),
+            size: body.len(),
+        });
+        del_body.push(if body.len() > MAX_SCORE_BYTES {
+            None
+        } else {
+            Some(body)
+        });
+    }
+    let mut add_side = Vec::with_capacity(live_adds.len());
+    let mut add_body: Vec<Option<Vec<u8>>> = Vec::with_capacity(live_adds.len());
+    for (path, _, oid) in &live_adds {
+        let (_, body) = read_object_bytes(store, *oid)?;
+        add_side.push(RenameSide {
+            path: path.clone(),
+            size: body.len(),
+        });
+        add_body.push(if body.len() > MAX_SCORE_BYTES {
+            None
+        } else {
+            Some(body)
+        });
+    }
+    let mut used_del = vec![false; live_dels.len()];
+    let mut used_add = vec![false; live_adds.len()];
+    for win in pair_renames(&del_side, &add_side, threshold, |oi, ni| {
+        if live_dels[oi].2 == live_adds[ni].2 {
+            return 100;
+        }
+        match (&del_body[oi], &add_body[ni]) {
+            (Some(old), Some(new)) => similarity(old, new),
+            _ => 0,
+        }
+    }) {
+        if used_del[win.old] || used_add[win.new] {
+            continue;
+        }
+        used_del[win.old] = true;
+        used_add[win.new] = true;
+        renames.push((live_dels[win.old].0.clone(), live_adds[win.new].0.clone()));
+    }
+    // Rebuild: survivors are the kept rows plus unpaired leftovers.
+    let mut restaged = keep;
+    for (index, (path, mode, oid)) in live_dels.into_iter().enumerate() {
+        if !used_del[index] {
+            restaged.push((path, 'D', Some((mode, oid))));
+        }
+    }
+    for (index, (path, mode, oid)) in live_adds.into_iter().enumerate() {
+        if !used_add[index] {
+            restaged.push((path, 'A', Some((mode, oid))));
+        }
+    }
+    restaged.sort();
+    *staged = restaged;
+    renames.sort();
+    Ok(renames)
+}
+
+/// Pairs worktree deletions of tracked files with untracked files by blob
+/// similarity at or above `threshold`, removing both sides from `unstaged`
+/// and `untracked`. Runs only under `-M`; the default plan keeps the
+/// oracle's delete-plus-untracked output.
+fn pair_unstaged_renames(
+    store: &Store,
+    index: &BTreeMap<Vec<u8>, (TreeMode, ruk_core::ids::Oid)>,
+    worktree: &BTreeMap<Vec<u8>, Vec<u8>>,
+    unstaged: &mut Vec<(Vec<u8>, char)>,
+    untracked: &mut Vec<Vec<u8>>,
+    threshold: u8,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, GitError> {
+    use super::rename::{RenameSide, pair_renames, similarity};
+    let mut dels: Vec<(Vec<u8>, ruk_core::ids::Oid)> = Vec::new();
+    let mut keep: Vec<(Vec<u8>, char)> = Vec::new();
+    for (path, code) in unstaged.drain(..) {
+        match code {
+            'D' => match index.get(&path) {
+                Some((_, oid)) => dels.push((path, *oid)),
+                None => keep.push((path, code)),
+            },
+            _ => keep.push((path, code)),
+        }
+    }
+    if dels.is_empty() || untracked.is_empty() {
+        *unstaged = keep;
+        return Ok(Vec::new());
+    }
+    const MAX_SCORE_BYTES: usize = 1 << 20;
+    let mut del_side = Vec::with_capacity(dels.len());
+    let mut del_body: Vec<Option<Vec<u8>>> = Vec::with_capacity(dels.len());
+    for (path, oid) in &dels {
+        let (_, body) = read_object_bytes(store, *oid)?;
+        del_side.push(RenameSide {
+            path: path.clone(),
+            size: body.len(),
+        });
+        del_body.push(if body.len() > MAX_SCORE_BYTES {
+            None
+        } else {
+            Some(body)
+        });
+    }
+    let mut add_side = Vec::with_capacity(untracked.len());
+    for path in untracked.iter() {
+        let bytes = worktree.get(path).cloned().unwrap_or_default();
+        add_side.push(RenameSide {
+            path: path.clone(),
+            size: bytes.len(),
+        });
+    }
+    let mut used_untracked = vec![false; untracked.len()];
+    let mut renames = Vec::new();
+    for win in pair_renames(&del_side, &add_side, threshold, |oi, ni| {
+        let bytes = worktree
+            .get(&add_side[ni].path)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match &del_body[oi] {
+            Some(old) => similarity(old, bytes),
+            None => 0,
+        }
+    }) {
+        used_untracked[win.new] = true;
+        renames.push((dels[win.old].0.clone(), add_side[win.new].path.clone()));
+    }
+    let mut used_del = vec![false; dels.len()];
+    for win in renames.iter() {
+        if let Some(index) = dels.iter().position(|(path, _)| path == &win.0) {
+            used_del[index] = true;
+        }
+    }
+    let mut restaged = keep;
+    for (index, (path, _)) in dels.into_iter().enumerate() {
+        if !used_del[index] {
+            restaged.push((path, 'D'));
+        }
+    }
+    restaged.sort();
+    *unstaged = restaged;
+    let mut kept_untracked = Vec::with_capacity(untracked.len());
+    for (index, path) in untracked.drain(..).enumerate() {
+        if !used_untracked[index] {
+            kept_untracked.push(path);
+        }
+    }
+    *untracked = kept_untracked;
+    renames.sort();
+    Ok(renames)
 }
 
 /// Maps every path of the `HEAD` tree to its mode and oid. Unborn `HEAD`
@@ -970,7 +1221,9 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
     }
     let mut lines: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     for path in staged_map.keys().chain(unstaged_map.keys()) {
-        if plan.renames.iter().any(|(old, _)| old == *path) {
+        if plan.renames.iter().any(|(old, _)| old == *path)
+            || plan.renames_unstaged.iter().any(|(old, _)| old == *path)
+        {
             continue;
         }
         let staged_code = staged_map.get(path).copied().unwrap_or(' ');
@@ -1006,6 +1259,14 @@ fn render_porcelain(plan: &StatusPlan, branch: Option<&str>) -> Vec<u8> {
             String::from_utf8_lossy(new)
         );
         lines.insert((*new).clone(), line.into_bytes());
+    }
+    for (old, new) in &plan.renames_unstaged {
+        let line = format!(
+            " R {} -> {}\n",
+            String::from_utf8_lossy(old),
+            String::from_utf8_lossy(new)
+        );
+        lines.insert(new.clone(), line.into_bytes());
     }
     for line in lines.into_values() {
         out.extend_from_slice(&line);
@@ -1086,6 +1347,7 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
     }
     if plan.staged.is_empty()
         && plan.renames.is_empty()
+        && plan.renames_unstaged.is_empty()
         && plan.unstaged.is_empty()
         && plan.untracked.is_empty()
     {
@@ -1112,7 +1374,7 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
         }
         sections.push(section);
     }
-    if !plan.unstaged.is_empty() {
+    if !plan.unstaged.is_empty() || !plan.renames_unstaged.is_empty() {
         let mut section = Vec::from(b"Changes not staged for commit:\n".as_slice());
         if plan.unstaged.iter().any(|(_, code)| *code == 'D') {
             section.extend_from_slice(
@@ -1130,6 +1392,18 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
             let word = if *code == 'D' { "deleted" } else { "modified" };
             section.extend_from_slice(&status_entry(word, path));
         }
+        let mut renamed: Vec<&(Vec<u8>, Vec<u8>)> = plan.renames_unstaged.iter().collect();
+        renamed.sort_by(|left, right| left.1.cmp(&right.1));
+        for (old, new) in renamed {
+            let display = format!(
+                "{} -> {}",
+                String::from_utf8_lossy(old),
+                String::from_utf8_lossy(new)
+            );
+            section.extend_from_slice(
+                &format!("\t{:11} {}\n", "renamed:", display).into_bytes(),
+            );
+        }
         sections.push(section);
     }
     if !plan.untracked.is_empty() {
@@ -1144,7 +1418,7 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
     }
     let footer: &[u8] = if !plan.staged.is_empty() || !plan.renames.is_empty() {
         b""
-    } else if !plan.unstaged.is_empty() {
+    } else if !plan.unstaged.is_empty() || !plan.renames_unstaged.is_empty() {
         b"\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n"
     } else {
         b"\nnothing added to commit but untracked files present (use \"git add\" to track)\n"

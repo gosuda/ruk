@@ -1,6 +1,6 @@
 # CLI verb status
 
-59 verbs, one row each. Statuses: **implemented** (real native-store
+60 verbs, one row each. Statuses: **implemented** (real native-store
 transitions), **partial** (resolves and validates, then completes only the
 cases its backing covers), **unsupported** (typed `Unsupported` with the
 reason; exit code 1 through `GitError::exit_code`).
@@ -53,7 +53,8 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | commit-tree | implemented | canonical payload, parents verified as stored commits |
 | config | implemented | `--local` scope only; `--global`/`--system`/`--worktree` are `Unsupported` |
 | count-objects | implemented | `<n> objects, <bytes>` from the store census, no payload I/O |
-| diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; hunks from a bounded LCS differ with labeled omissions |
+| credential | implemented | `fill`/`approve`/`reject` over stdin `key=value` descriptions through the configured helpers (`get`/`store`/`erase`); needs no repository |
+| diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; `-M`/`--find-renames` pairs renames by similarity, merge lane tracks rename-plus-edit |
 | fetch | implemented | refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; local, `ssh://`, `git://`, smart-http v2→v0, dumb-http fetch fallback; `--lfs` pulls payloads for fetched tips under `LfsMode::Full` (mirror parity) |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
 | fsck | implemented | reachable refs, history, trees, blobs, and index rows; `--dangling`/`--unreachable` list `dangling <kind> <oid>` from the census minus the ref closure |
@@ -65,7 +66,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | init | implemented | `--object-format`, `--bare`, reinit; unborn `HEAD` on `refs/heads/main` |
 | log | implemented | `--oneline`, `-n`/`--max-count` |
 | ls-files | implemented | `-s`, `-u`, `--others`, `--error-unmatch` |
-| ls-remote | implemented | local, `ssh://`, `git://`, smart-http |
+| ls-remote | implemented | local, `ssh://`, `git://`, smart-http v2→v0, dumb-http text fallback |
 | ls-tree | implemented | `-r`, `--name-only`; gitlinks report as commits |
 | merge | implemented | fast-forward fast-path; three-way content merge via the syntax lane (bounded text fallback); `--no-ff`, `--ff-only`; conflicts leave stages 1/2/3, `MERGE_HEAD`/`ORIG_HEAD`, sequencer state with `--continue`/`--abort`/`--quit` |
 | merge-base | implemented | pairwise paint-down; `--is-ancestor` exits 1 when false |
@@ -86,8 +87,8 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | rm | implemented | `--cached`, `-r`; unknown paths fail |
 | show | implemented | `--oneline`, `-s`, `--stat`, `--name-only`, parent diff |
 | show-ref | implemented | `--head`, `--verify`, `--tags`, `--heads`, patterns |
-| stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; oracle two-commit shape (index + `WIP` parents); apply requires a clean index on the stashed base |
-| status | implemented | `--porcelain`, `--short`, `--branch`, long format; renames undetected |
+| stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; oracle two-commit shape (index + `WIP` parents); apply refuses only staged or worktree changes on paths the stash touches |
+| status | implemented | `--porcelain`, `--short`, `--branch`, long format; staged renames always paired when identical, `-M` pairs by similarity staged and worktree |
 | switch | implemented | `-c`/`-C`, `--detach`, remote guess |
 | symbolic-ref | implemented | `HEAD` moves the workspace row; other names are ref symrefs |
 | tag | implemented | lightweight, annotated (`-a`/`-m`), list with globs, delete |
@@ -110,10 +111,10 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
   bare format exists.
 - `diff` hunks come from a simple bounded LCS differ, split every 20
   operations; large inputs are labeled omissions, never silent truncation.
-- `status` and `diff` do not detect renames.
-- `stash apply`/`pop` require a clean index on the stashed base and a clean
-  worktree on the restored paths instead of merging; the index rows come
-  back only with `--index` (`stash branch` always restores them); bare
-  subcommands address the newest slot; dropped slots leave numbering gaps.
+- `diff`/`log`/`show` pair renames by similarity only with `-M`/`--find-renames` (default 50%, `--no-renames`/`-M0` disables); worktree diffs never pair untracked sides.
+- `stash apply`/`pop` refuse only staged or worktree changes on paths the
+  stash touches instead of merging; the index rows come back only with
+  `--index` (`stash branch` always restores them); bare subcommands address
+  the newest slot; dropped slots leave numbering gaps.
 - `rev-list` order is ancestry-discovery order, not date order.
-- `fetch`/`push`/`clone`/`pull`/`ls-remote` route local paths only.
+- `clone` routes local paths only; network sources are `Offline`.
