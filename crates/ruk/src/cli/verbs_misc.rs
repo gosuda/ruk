@@ -2598,8 +2598,8 @@ mod tests {
         std::fs::write(root.join("keep.txt"), b"k\n").expect("write");
         std::fs::write(root.join("skip.log"), b"s\n").expect("write");
         std::fs::write(root.join(".rukignore"), b"*.log\n").expect("write");
-        let preview = String::from_utf8(call(clean, &mut ctx, &["-n"]).expect("dry run"))
-            .expect("utf8");
+        let preview =
+            String::from_utf8(call(clean, &mut ctx, &["-n"]).expect("dry run")).expect("utf8");
         assert!(preview.contains("keep.txt"), "got {preview:?}");
         assert!(!preview.contains("skip.log"), "got {preview:?}");
         let preview = String::from_utf8(call(clean, &mut ctx, &["-n", "-x"]).expect("with -x"))

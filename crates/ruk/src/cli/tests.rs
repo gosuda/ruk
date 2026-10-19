@@ -4497,7 +4497,12 @@ fn patch_round_trip_format_patch_am() {
     );
     // Authors (name, email, and date) survive the mbox round-trip.
     let authors = String::from_utf8(
-        run(verbs_history::log, &mut ctx, &["--format=%an <%ae>", "-n", "2"]).expect("authors"),
+        run(
+            verbs_history::log,
+            &mut ctx,
+            &["--format=%an <%ae>", "-n", "2"],
+        )
+        .expect("authors"),
     )
     .expect("utf8");
     assert_eq!(authors.lines().count(), 2);

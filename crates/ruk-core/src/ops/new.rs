@@ -124,14 +124,24 @@ pub fn prepare_new(store: &Store, request: NewRequest) -> Result<PreparedOp<NewR
     let prepared = records.prepare_native_commit(input)?;
     let head = prepared.head;
     let oid = head.as_git().copied();
+    let output = NewResult {
+        head,
+        change_id: prepared.record.change_id(),
+        oid,
+    };
+    if let Some(existing) = records.get_commit(&head)? {
+        if existing == prepared.record {
+            return Ok(PreparedOp {
+                objects: Vec::new(),
+                facts: Vec::new(),
+                output,
+            });
+        }
+    }
     Ok(PreparedOp {
         objects: vec![prepared.prepared_object],
         facts: prepared.mutations,
-        output: NewResult {
-            head,
-            change_id: prepared.record.change_id(),
-            oid,
-        },
+        output,
     })
 }
 
