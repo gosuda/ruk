@@ -5,7 +5,10 @@
 //! the way a damaged or foreign file would actually arrive.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use redb::{
     Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition,
@@ -171,6 +174,118 @@ fn create(dir: &TestDir) -> Metadata {
 
 fn reopen(dir: &TestDir) -> Metadata {
     Metadata::open(&dir.meta_path()).expect("open metadata")
+}
+
+/// Metadata path the [`lock_hold_child`] holds open, set only on the child.
+const LOCK_HOLD_PATH_ENV: &str = "RUK_STORE_LOCK_HOLD_PATH";
+/// Ready-marker path the child writes once it holds the lock.
+const LOCK_HOLD_READY_ENV: &str = "RUK_STORE_LOCK_HOLD_READY";
+/// Full libtest path of [`lock_hold_child`], which is what `--exact`
+/// compares against (crate name excluded).
+const LOCK_HOLD_ENTRY: &str = "store::metadata_tests::lock_hold_child";
+
+/// Child of [`open_releases_the_lock_when_the_holder_is_killed`]: holds the
+/// metadata lock open, signals the parent, then sleeps until killed. The
+/// parent spawns it from the current test executable; it never runs
+/// standalone.
+#[test]
+#[ignore = "child of open_releases_the_lock_when_the_holder_is_killed; the parent test spawns it"]
+fn lock_hold_child() {
+    let path =
+        std::env::var(LOCK_HOLD_PATH_ENV).expect("the parent test sets the metadata path");
+    let ready = std::env::var(LOCK_HOLD_READY_ENV).expect("the parent test sets the marker path");
+    let _holder = Metadata::open(Path::new(&path)).expect("child holds the metadata lock");
+    std::fs::write(ready, b"held").expect("signal the parent the lock is held");
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn open_waits_for_a_live_holder_instead_of_refusing() {
+    let dir = TestDir::new("open-lock-wait");
+    let holder = create(&dir);
+    let path = dir.meta_path();
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let meta = Metadata::open_with_timeout(&path, Duration::from_secs(10))
+            .expect("the waiter opens after the holder drops");
+        assert_eq!(meta.generation().expect("waiter reads generation"), 0);
+        done_tx.send(Instant::now()).expect("report the waiter completion");
+    });
+    // Backoff starts near 1 ms, so 300 ms is many busy retries: the waiter
+    // must still be queued behind the live holder here.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the second open must queue behind the live holder, not refuse or slip through"
+    );
+    let released = Instant::now();
+    drop(holder);
+    let completed = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the waiter completes after the release");
+    assert!(
+        completed >= released,
+        "the second open completes after the first drops, not before"
+    );
+    waiter.join().expect("join the waiter");
+}
+
+#[test]
+fn open_refuses_corruption_without_burning_the_wait_budget() {
+    let dir = TestDir::new("open-corrupt-no-wait");
+    std::fs::write(dir.meta_path(), vec![0xAB_u8; 8192]).expect("seed a foreign file");
+    let budget = Duration::from_secs(4);
+    let started = Instant::now();
+    let err = Metadata::open_with_timeout(&dir.meta_path(), budget)
+        .expect_err("a foreign file still refuses");
+    assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+    assert!(
+        started.elapsed() < budget / 2,
+        "corruption refuses on the first attempt and never retries the lock"
+    );
+}
+
+#[test]
+fn open_releases_the_lock_when_the_holder_is_killed() {
+    let dir = TestDir::new("open-kill-release");
+    drop(create(&dir));
+    let ready = dir.0.join("held.marker");
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .arg(LOCK_HOLD_ENTRY)
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(LOCK_HOLD_PATH_ENV, dir.meta_path())
+        .env(LOCK_HOLD_READY_ENV, &ready)
+        .spawn()
+        .expect("spawn the lock-holder child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if ready.exists() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the child never took the lock");
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            panic!("the lock-holder child exited early: {status:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Zero budget is one attempt: it must see the child's cross-process
+    // lock as the real busy signal, not corruption or success.
+    let busy = Metadata::open_with_timeout(&dir.meta_path(), Duration::ZERO)
+        .expect_err("the child's lock is held");
+    assert!(
+        matches!(
+            busy,
+            StoreError::Database(redb::DatabaseError::DatabaseAlreadyOpen)
+        ),
+        "{busy:?}"
+    );
+    child.kill().expect("SIGKILL the holder");
+    child.wait().expect("reap the holder");
+    // The kernel closed the holder's descriptors on death: no stale lock
+    // exists to detect, so the waiter's retry succeeds.
+    Metadata::open(&dir.meta_path()).expect("open after the holder dies");
 }
 
 fn hex(bytes: &[u8]) -> String {
