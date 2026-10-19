@@ -34,6 +34,7 @@ pub(crate) mod verbs_bundle;
 pub(crate) mod verbs_fastio;
 pub(crate) mod verbs_grep;
 pub(crate) mod verbs_history;
+pub(crate) mod verbs_maintenance;
 pub(crate) mod verbs_merge_plumbing;
 pub(crate) mod verbs_meta;
 pub(crate) mod verbs_misc;

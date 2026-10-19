@@ -22,6 +22,7 @@ use super::verbs_bundle;
 use super::verbs_fastio;
 use super::verbs_grep;
 use super::verbs_history;
+use super::verbs_maintenance;
 use super::verbs_merge_plumbing;
 use super::verbs_notes;
 use super::verbs_objects;
@@ -126,11 +127,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 94);
+    assert_eq!(VERBS.len(), 100);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 94);
+    assert_eq!(names.len(), 100);
     for name in [
         "add",
         "am",
@@ -152,6 +153,7 @@ fn verb_table_covers_advertised_names() {
         "clean",
         "clone",
         "commit",
+        "commit-graph",
         "commit-tree",
         "config",
         "count-objects",
@@ -177,6 +179,7 @@ fn verb_table_covers_advertised_names() {
         "ls-files",
         "ls-remote",
         "ls-tree",
+        "maintenance",
         "merge",
         "merge-base",
         "merge-file",
@@ -187,6 +190,8 @@ fn verb_table_covers_advertised_names() {
         "name-rev",
         "notes",
         "pack-objects",
+        "pack-refs",
+        "prune",
         "pull",
         "push",
         "range-diff",
@@ -195,6 +200,7 @@ fn verb_table_covers_advertised_names() {
         "read-tree",
         "reflog",
         "remote",
+        "repack",
         "replace",
         "request-pull",
         "rerere",
@@ -217,6 +223,7 @@ fn verb_table_covers_advertised_names() {
         "tag",
         "update-index",
         "update-ref",
+        "update-server-info",
         "upload-archive",
         "upload-pack",
         "var",
@@ -7612,5 +7619,234 @@ fn wave_j_reset_intent_full_tree() {
     )
     .expect("utf8");
     assert!(out.contains("new.txt"), "intent row kept: {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_prune_drops_orphan_and_honors_expire() {
+    let (root, env, orphan) = orphaned_side_commit("hk-prune");
+    let mut ctx = repo_ctx(&root, env);
+    // Dry run lists without deleting.
+    let dry = String::from_utf8_lossy(
+        &run(verbs_maintenance::prune, &mut ctx, &["--dry-run"]).expect("dry run"),
+    )
+    .into_owned();
+    assert!(dry.contains(&orphan), "dry run lists orphan: {dry}");
+    run(verbs_objects::cat_file, &mut ctx, &["-e", &orphan]).expect("orphan kept");
+    // Verbose prune deletes and reports the oid.
+    let out = String::from_utf8_lossy(
+        &run(verbs_maintenance::prune, &mut ctx, &["--verbose"]).expect("prune"),
+    )
+    .into_owned();
+    assert!(out.contains(&orphan), "verbose lists pruned oid: {out}");
+    assert!(
+        run(verbs_objects::cat_file, &mut ctx, &["-e", &orphan]).is_err(),
+        "orphan pruned"
+    );
+    run(verbs_objects::cat_file, &mut ctx, &["-e", "HEAD"]).expect("HEAD kept");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_prune_expire_never_keeps_and_dates_refuse() {
+    let (root, env, orphan) = orphaned_side_commit("hk-prune-expire");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(verbs_maintenance::prune, &mut ctx, &["--expire=never"]).expect("never");
+    assert!(out.is_empty(), "never prunes nothing quietly");
+    run(verbs_objects::cat_file, &mut ctx, &["-e", &orphan]).expect("orphan kept");
+    let err = run(verbs_maintenance::prune, &mut ctx, &["--expire=2.weeks.ago"])
+        .expect_err("dated expire");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_pack_refs_keeps_refs_resolving() {
+    let (root, env) = seeded_repo("hk-packrefs", "a.txt", b"alpha\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::branch, &mut ctx, &["side"]).expect("branch");
+    let out = String::from_utf8_lossy(
+        &run(verbs_maintenance::pack_refs, &mut ctx, &["--all"]).expect("pack-refs"),
+    )
+    .into_owned();
+    assert!(out.contains("Packed 2 refs"), "got {out}");
+    let head = String::from_utf8_lossy(
+        &run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
+    )
+    .trim()
+    .to_owned();
+    assert!(!head.is_empty(), "HEAD resolves after pack-refs");
+    run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("side resolves");
+    run(verbs_maintenance::pack_refs, &mut ctx, &["--all", "--prune"]).expect("prune accepted");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_repack_prunes_compacts_and_refreshes_server_info() {
+    let (root, env, orphan) = orphaned_side_commit("hk-repack");
+    let mut ctx = repo_ctx(&root, env);
+    assert!(
+        !root.join(".ruk/info/refs").exists(),
+        "no server info before repack"
+    );
+    let out = String::from_utf8_lossy(
+        &run(verbs_maintenance::repack, &mut ctx, &["-a", "-d", "-n"]).expect("repack -n"),
+    )
+    .into_owned();
+    assert!(out.contains("Pruned"), "prune phase reported: {out}");
+    assert!(
+        run(verbs_objects::cat_file, &mut ctx, &["-e", &orphan]).is_err(),
+        "orphan pruned"
+    );
+    run(verbs_objects::cat_file, &mut ctx, &["-e", "HEAD"]).expect("HEAD kept");
+    assert!(
+        !root.join(".ruk/info/refs").exists(),
+        "-n skips the server-info refresh"
+    );
+    run(verbs_maintenance::repack, &mut ctx, &[]).expect("bare repack");
+    assert!(root.join(".ruk/info/refs").exists(), "refresh wrote info/refs");
+    let err =
+        run(verbs_maintenance::repack, &mut ctx, &["-a", "--window=10"]).expect_err("window gap");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_maintenance_run_registry_and_tasks() {
+    let (root, env) = seeded_repo("hk-maint", "a.txt", b"alpha\n");
+    let mut ctx = repo_ctx(&root, env);
+    // Default run covers gc plus pack-refs with visible reports.
+    let out = String::from_utf8_lossy(
+        &run(verbs_maintenance::maintenance, &mut ctx, &["run"]).expect("run"),
+    )
+    .into_owned();
+    assert!(out.contains("Packed"), "pack-refs ran: {out}");
+    // Registry rows round-trip through config.
+    run(verbs_maintenance::maintenance, &mut ctx, &["register"]).expect("register");
+    let registered = String::from_utf8_lossy(
+        &run(verbs_repo::config, &mut ctx, &["maintenance.registered"]).expect("read registered"),
+    )
+    .into_owned();
+    assert!(registered.contains("true"), "registered: {registered}");
+    // Task list flips with stop/start.
+    run(
+        verbs_maintenance::maintenance,
+        &mut ctx,
+        &["stop", "--task=gc"],
+    )
+    .expect("stop gc");
+    let list = String::from_utf8_lossy(
+        &run(verbs_maintenance::maintenance, &mut ctx, &["task"]).expect("task list"),
+    )
+    .into_owned();
+    assert!(list.contains("gc: disabled"), "stop recorded: {list}");
+    assert!(list.contains("pack-refs: enabled"), "untouched task stays enabled: {list}");
+    run(
+        verbs_maintenance::maintenance,
+        &mut ctx,
+        &["start", "--task=gc"],
+    )
+    .expect("start gc");
+    let list = String::from_utf8_lossy(
+        &run(verbs_maintenance::maintenance, &mut ctx, &["task"]).expect("task list"),
+    )
+    .into_owned();
+    assert!(list.contains("gc: enabled"), "start recorded: {list}");
+    let alias = String::from_utf8_lossy(
+        &run(verbs_maintenance::maintenance, &mut ctx, &["task", "list"]).expect("task list"),
+    )
+    .into_owned();
+    assert!(alias.contains("pack-refs: enabled"), "list alias: {alias}");
+    let one = String::from_utf8_lossy(
+        &run(verbs_maintenance::maintenance, &mut ctx, &["task", "gc"]).expect("task gc"),
+    )
+    .into_owned();
+    assert!(one.contains("gc: enabled"), "single task row: {one}");
+    let err = run(verbs_maintenance::maintenance, &mut ctx, &["task", "bogus"])
+        .expect_err("unknown task name");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    run(verbs_maintenance::maintenance, &mut ctx, &["unregister"]).expect("unregister");
+    // Single-task runs and unknown tasks.
+    run(verbs_maintenance::maintenance, &mut ctx, &["run", "--task=prefetch"])
+        .expect("prefetch with no remotes");
+    let err = run(
+        verbs_maintenance::maintenance,
+        &mut ctx,
+        &["run", "--task=bogus"],
+    )
+    .expect_err("unknown task");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    let err = run(verbs_maintenance::maintenance, &mut ctx, &[]).expect_err("no subcommand");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_maintenance_loose_objects_task_prunes() {
+    let (root, env, orphan) = orphaned_side_commit("hk-loose");
+    let mut ctx = repo_ctx(&root, env);
+    let out = String::from_utf8_lossy(
+        &run(
+            verbs_maintenance::maintenance,
+            &mut ctx,
+            &["run", "--task=loose-objects"],
+        )
+        .expect("loose-objects"),
+    )
+    .into_owned();
+    assert!(out.contains("Pruned"), "got {out}");
+    assert!(
+        run(verbs_objects::cat_file, &mut ctx, &["-e", &orphan]).is_err(),
+        "orphan pruned"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_commit_graph_verify_list_and_named_gaps() {
+    let (root, env) = seeded_repo("hk-cgraph", "a.txt", b"alpha\n");
+    let mut ctx = repo_ctx(&root, env);
+    let out = String::from_utf8_lossy(
+        &run(verbs_maintenance::commit_graph, &mut ctx, &["verify"]).expect("verify"),
+    )
+    .into_owned();
+    assert!(out.contains("Verified"), "got {out}");
+    let head = String::from_utf8_lossy(
+        &run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
+    )
+    .trim()
+    .to_owned();
+    let list = String::from_utf8_lossy(
+        &run(verbs_maintenance::commit_graph, &mut ctx, &["list"]).expect("list"),
+    )
+    .into_owned();
+    assert!(list.contains(&head), "list covers HEAD: {list}");
+    for subcommand in ["write", "read"] {
+        let err = run(verbs_maintenance::commit_graph, &mut ctx, &[subcommand])
+            .expect_err("named gap");
+        assert_eq!(err.exit_code(), 1, "{subcommand}: {err}");
+    }
+    let err =
+        run(verbs_maintenance::commit_graph, &mut ctx, &["bogus"]).expect_err("bad subcommand");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn housekeeping_update_server_info_writes_dumb_files() {
+    let (root, env) = seeded_repo("hk-serverinfo", "a.txt", b"alpha\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_maintenance::update_server_info, &mut ctx, &[]).expect("update");
+    let refs_body =
+        std::fs::read_to_string(root.join(".ruk/info/refs")).expect("info/refs written");
+    assert!(
+        refs_body.contains("refs/heads/main"),
+        "refs advertised: {refs_body}"
+    );
+    let packs_body = std::fs::read(root.join(".ruk/objects/info/packs")).expect("packs written");
+    assert_eq!(packs_body, b"\n", "empty pack list body");
+    // Idempotent without --force, rewrites with it.
+    run(verbs_maintenance::update_server_info, &mut ctx, &[]).expect("rerun");
+    run(verbs_maintenance::update_server_info, &mut ctx, &["--force"]).expect("force");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

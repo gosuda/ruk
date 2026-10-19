@@ -14,6 +14,7 @@ use super::verbs_bundle;
 use super::verbs_fastio;
 use super::verbs_grep;
 use super::verbs_history;
+use super::verbs_maintenance;
 use super::verbs_merge_plumbing;
 use super::verbs_meta;
 use super::verbs_misc;
@@ -183,6 +184,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Record changes to the repository",
         run: verbs_history::commit,
+    },
+    Verb {
+        name: "commit-graph",
+        oracle: "git/builtin/commit-graph.c",
+        needs_repo: true,
+        summary: "Verify and list the reachable commit closure (no graph file is kept)",
+        run: verbs_maintenance::commit_graph,
     },
     Verb {
         name: "commit-tree",
@@ -362,6 +370,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_objects::ls_tree,
     },
     Verb {
+        name: "maintenance",
+        oracle: "git/builtin/maintenance.c",
+        needs_repo: true,
+        summary: "Run scheduled repository housekeeping tasks",
+        run: verbs_maintenance::maintenance,
+    },
+    Verb {
         name: "merge",
         oracle: "git/builtin/merge.c",
         needs_repo: true,
@@ -432,6 +447,20 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_objects::pack_objects,
     },
     Verb {
+        name: "pack-refs",
+        oracle: "git/builtin/pack-refs.c",
+        needs_repo: true,
+        summary: "Pack references already held in the ref table",
+        run: verbs_maintenance::pack_refs,
+    },
+    Verb {
+        name: "prune",
+        oracle: "git/builtin/prune.c",
+        needs_repo: true,
+        summary: "Prune unreachable objects without compacting",
+        run: verbs_maintenance::prune,
+    },
+    Verb {
         name: "pull",
         oracle: "git/builtin/pull.c",
         needs_repo: true,
@@ -486,6 +515,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Manage the set of tracked repositories",
         run: verbs_repo::remote,
+    },
+    Verb {
+        name: "repack",
+        oracle: "git/builtin/repack.c",
+        needs_repo: true,
+        summary: "Prune unreachable objects and repack segments",
+        run: verbs_maintenance::repack,
     },
     Verb {
         name: "replace",
@@ -640,6 +676,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Update the object name stored in a ref safely",
         run: verbs_branch::update_ref,
+    },
+    Verb {
+        name: "update-server-info",
+        oracle: "git/builtin/update-server-info.c",
+        needs_repo: true,
+        summary: "Write dumb-http server info files",
+        run: verbs_maintenance::update_server_info,
     },
     Verb {
         name: "upload-archive",
