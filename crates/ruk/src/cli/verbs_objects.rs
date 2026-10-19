@@ -773,8 +773,8 @@ pub(crate) fn index_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
 /// input always comes from stdin (exactly one output target: `--stdout`
 /// xor `<base>`, no trailing positionals). Without `--revs`/`--all`,
 /// stdin lines name exact objects (`<hex>[ SP <path>]`, one per line; a
-/// leading `-` marks a thin preferred base, accepted while its entry
-/// stays full, see below). With `--revs`, stdin lines are rev-list
+/// leading `-` marks a thin preferred base, accepted and skipped, see
+/// below). With `--revs`, stdin lines are rev-list
 /// arguments (one per line, ending at the first blank line; `--not` and
 /// `--shallow` lines are refused with their ruk spellings), and `--all`
 /// unions every ref tip. Selected commits close over their trees, blobs,
@@ -887,9 +887,9 @@ pub(crate) fn pack_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
 /// Packs exactly the objects stdin names, with no closure expansion.
 ///
 /// One `<hex>[ SP <path>]` per line, the oracle's object-list grammar; a
-/// leading `-` marks a thin preferred base, which is accepted and packed
-/// as a full entry (thin delta pairing belongs to the push negotiation,
-/// which owns the permitted-base contract). A blank or non-hex line is
+/// leading `-` marks a thin preferred base, which is accepted and skipped:
+/// it names no object to pack (thin delta pairing belongs to the push
+/// negotiation, which owns the permitted-base contract). A blank or non-hex
 /// `Invalid`, the way the oracle dies on garbage.
 fn pack_exact_objects(
     store: &Store,
