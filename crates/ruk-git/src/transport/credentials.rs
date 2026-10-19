@@ -7,13 +7,23 @@
 //! `<program> get <args...>` with the `protocol=`/`host=`/`url=` description
 //! on stdin, parsing the `username=`/`password=` answer lines.
 //!
+//! `!`-prefixed values run through `sh -c "<command> get"`, exactly like
+//! git (`git/credential.c` `credential_do` appends the operation to the
+//! command line and always uses a shell). The command travels verbatim from
+//! the user's own config files with only the fixed ` get` suffix appended:
+//! no URL, host, or other input is interpolated into the shell line. That is
+//! the same trust shape as `GIT_SSH_COMMAND`, which [`super::net`] already
+//! runs through `sh -c`; spawning `sh` here introduces no new principal.
+//!
 //! Named gaps (fall through to the `GIT_AUTH_*` environment, then to
 //! anonymous):
 //!
 //! - Bare built-in helper names (`store`, `cache`, `manager`, ...): those
-//!   live behind the `git` binary (`git-credential-<name>`), which this
-//!   crate never executes.
-//! - `!`-prefixed shell commands: no shell is spawned here.
+//!   resolve to `git-credential-<name>` binaries from the Git distribution,
+//!   which this crate never executes. PATH-resolved Git binaries would widen
+//!   the trust boundary past explicitly configured programs, and interactive
+//!   ones like `manager` can block on GUI prompts, which is unsafe for a
+//!   daemon.
 //! - URL-scoped sections match by prefix only (see [`scope_matches`]); git
 //!   config `include` directives are not followed.
 //!
@@ -257,14 +267,23 @@ fn expand_home(path: &str) -> Option<String> {
 }
 
 /// Classifies one helper value into a directly runnable `(program, args)`:
-/// only values whose first word names a path (contains `/` or starts with
-/// `~`) run. Bare built-in names (`store`, `cache`, ...) resolve through
-/// the `git` binary, which this crate never executes; `!` shell commands
-/// would need a shell. Both are named gaps (`None`).
+/// a `!`-prefixed value runs through the shell as
+/// `("sh", ["-c", <command>])` ([`run_helper`] appends the ` get`
+/// operation, mirroring `git/credential.c` `credential_do`); otherwise only
+/// values whose first word names a path (contains `/` or starts with `~`)
+/// run. Bare built-in names (`store`, `cache`, ...) resolve to
+/// `git-credential-<name>` binaries, which this crate never executes: a
+/// named gap (`None`).
 fn classify_helper(value: &str) -> Option<(String, Vec<String>)> {
     let value = value.trim();
-    if value.is_empty() || value.starts_with('!') {
+    if value.is_empty() {
         return None;
+    }
+    if let Some(line) = value.strip_prefix('!') {
+        if line.trim().is_empty() {
+            return None;
+        }
+        return Some(("sh".to_owned(), vec!["-c".to_owned(), line.to_owned()]));
     }
     let mut words = value.split_whitespace();
     let first = words.next()?;
@@ -320,13 +339,36 @@ fn helper_commands(url: &str) -> Vec<(String, Vec<String>)> {
     helper_commands_for(url, &entries)
 }
 
-/// Spawns one external helper as `<program> get <args...>` with `input` on
-/// stdin, bounded by [`HELPER_TIMEOUT`] on a monotonic deadline. A refusal,
-/// a non-zero exit, an unreadable answer, or a timeout is `None`.
+/// Whether `(program, args)` names a `!` shell helper: exactly
+/// `("sh", ["-c", <line>])`, the only shape [`classify_helper`] produces
+/// for one. An explicitly configured absolute `sh` path never collides:
+/// its program spells the full path, not the bare `"sh"`.
+fn is_shell_helper(program: &str, args: &[String]) -> bool {
+    program == "sh" && args.len() == 2 && args[0] == "-c"
+}
+
+/// The shell line git runs for a `!` helper: the configured command
+/// verbatim plus the `get` operation (`git/credential.c`
+/// `credential_do`).
+fn shell_command_line(line: &str) -> String {
+    format!("{line} get")
+}
+
+/// Spawns one external helper as `<program> get <args...>` — or, for a `!`
+/// shell helper, as `sh -c "<command> get"` — with `input` on stdin,
+/// bounded by [`HELPER_TIMEOUT`] on a monotonic deadline. A refusal, a
+/// non-zero exit, an unreadable answer, or a timeout is `None`.
 fn run_helper(program: &str, args: &[String], input: &[u8]) -> Option<Vec<u8>> {
-    let mut child = Command::new(program)
-        .arg("get")
-        .args(args)
+    let mut command = if is_shell_helper(program, args) {
+        let mut shell = Command::new("sh");
+        shell.arg("-c").arg(shell_command_line(&args[1]));
+        shell
+    } else {
+        let mut direct = Command::new(program);
+        direct.arg("get").args(args);
+        direct
+    };
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -570,11 +612,38 @@ mod tests {
     }
 
     #[test]
-    fn builtins_shell_and_non_matching_scopes_are_gaps() {
+    fn shell_helpers_run_and_builtins_stay_gaps() {
         let entries = parse_config_entries(
-            "[credential]\n\thelper = store\n\thelper = !shell-cmd\n\thelper = cache --timeout 300\n",
+            "[credential]\n\thelper = store\n\thelper = !/bin/shell-helper --fast\n\thelper = cache --timeout 300\n\thelper = manager-core\n\thelper = !\n",
         );
-        assert!(helper_commands_for("https://host.x/a", &entries).is_empty());
+        // Bare built-in names and the empty `!` stay gaps; only the shell
+        // helper classifies, as `sh -c <line>` (the live layer appends
+        // ` get`, mirroring `git/credential.c` `credential_do`).
+        let chain = helper_commands_for("https://host.x/a", &entries);
+        assert_eq!(
+            chain,
+            vec![(
+                "sh".to_owned(),
+                vec!["-c".to_owned(), "/bin/shell-helper --fast".to_owned()]
+            )]
+        );
+        assert_eq!(
+            shell_command_line("/bin/shell-helper --fast"),
+            "/bin/shell-helper --fast get"
+        );
+        // The stub seam sees the shell program form and answers through it.
+        let out = credential_fill_with("https://host.x/a", &chain, |program, args, input| {
+            assert_eq!(program, "sh");
+            assert_eq!(
+                args,
+                &["-c".to_owned(), "/bin/shell-helper --fast".to_owned()]
+            );
+            let text = std::str::from_utf8(input).expect("stdin");
+            assert!(text.contains("protocol=https\n"), "{text:?}");
+            assert!(text.contains("host=host.x\n"), "{text:?}");
+            Some(b"username=carol\npassword=pw\n".to_vec())
+        });
+        assert_eq!(out, Some(("carol".to_owned(), "pw".to_owned())));
         assert!(scope_matches("https://host.x/sub", "https://host.x/sub/a"));
         assert!(!scope_matches("https://host", "https://hostile.x/a"));
         assert!(!scope_matches("", "https://host.x/a"));
@@ -632,6 +701,19 @@ mod tests {
         );
         assert!(credential_parts("ftp://host.x/a").is_none());
         assert!(credential_parts("https:///a").is_none());
+    }
+
+    #[test]
+    fn shell_helper_appends_get_inside_the_sh_dash_c_string() {
+        // `sh -c "echo hello get"`: the operation must land inside the
+        // `-c` string as one argument, never as an argv element before it.
+        let out = run_helper(
+            "sh",
+            &["-c".to_owned(), "echo hello".to_owned()],
+            b"protocol=https\nhost=h\n\n",
+        )
+        .expect("shell helper answers");
+        assert_eq!(String::from_utf8(out).expect("utf8"), "hello get\n");
     }
 
     #[test]
