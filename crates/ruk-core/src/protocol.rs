@@ -63,7 +63,9 @@ use crate::workspace::{HeadRef, Scope, WorkspaceStamp, WorkspaceState};
 pub const SCHEMA_MAJOR: u32 = 1;
 
 /// Minor schema version within the current major; increments are additive.
-pub const SCHEMA_MINOR: u32 = 0;
+/// Minor 1 appends the `git.commit` lane method for per-repository commit
+/// batching; older readers refuse its frames as unknown methods.
+pub const SCHEMA_MINOR: u32 = 1;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -1350,6 +1352,45 @@ pub struct NewArgs {
     /// When present, the workspace switches to the new change.
     #[serde(default)]
     pub workspace: Option<WorkspaceBinding>,
+}
+
+/// `git.commit`: records one concrete commit with a caller-staged tree and
+/// caller-supplied identities, plus one branch move applied atomically on
+/// the lane. Unlike `new` (which mints an empty-tree change), every commit
+/// input arrives stored and validated; the lane stages nothing but the
+/// commit object itself.
+///
+/// A retried submission whose commit already landed and whose ref already
+/// holds it skips the ref transaction, so the lane replays the stored reply
+/// (same session, same request id) or succeeds idempotently instead of
+/// failing its own compare-and-swap.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitCommitArgs {
+    pub tree: Oid,
+    pub parents: Vec<Head>,
+    pub author: Signature,
+    pub committer: Signature,
+    pub message: ByteString,
+    /// Change to extend, when the caller resolved one. Absent keeps the
+    /// stable by-OID mapping, exactly like `ops::prepare_new` with no id.
+    #[serde(default)]
+    pub change_id: Option<ChangeId>,
+    /// The earlier head this commit rewrites for an amend-style rewrite.
+    /// `prepare_new` requires it to be a current head of `change_id`.
+    #[serde(default)]
+    pub predecessor: Option<Head>,
+    /// Branch move to apply atomically with the commit. Absent leaves refs
+    /// alone; detached-HEAD advances have no producer on this path.
+    #[serde(default)]
+    pub ref_update: Option<GitCommitRefUpdate>,
+}
+
+/// One branch move bundled with a `git.commit`: the ref, the target the
+/// caller saw, and a `Set` to the created commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitCommitRefUpdate {
+    pub name: RefName,
+    pub expected: RefExpect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2767,6 +2808,19 @@ impl Validate for WriteArgs {
     }
 }
 
+impl Validate for GitCommitArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_unique("parent", &self.parents)?;
+        if self.message.as_bytes().contains(&0) {
+            return Err(invalid("commit message carries NUL"));
+        }
+        if let Some(ref_update) = &self.ref_update {
+            require_conditional("git.commit ref", &ref_update.expected)?;
+        }
+        Ok(())
+    }
+}
+
 impl Validate for NewArgs {
     fn validate(&self) -> Result<(), CoreError> {
         require_unique("parent", &self.parents)?;
@@ -3275,6 +3329,7 @@ method_table! {
     File, "file", Read, FileArgs, FileReply;
     Blame, "blame", Read, BlameArgs, BlameReply;
     Query, "query", Read, QueryArgs, QueryReply;
+    GitCommit, "git.commit", Mutation, Mutation<GitCommitArgs>, NewReply;
 }
 
 // ---------------------------------------------------------------------------
