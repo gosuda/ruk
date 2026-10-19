@@ -15,6 +15,8 @@ use ruk_core::ids::HashKind;
 use ruk_core::store::{FactTable, PreparationBudget, Store};
 
 use super::dispatch::{VERBS, lookup};
+use super::verbs_bisect;
+use super::verbs_blame;
 use super::verbs_branch;
 use super::verbs_bundle;
 use super::verbs_grep;
@@ -118,36 +120,47 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 60);
+    assert_eq!(VERBS.len(), 78);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 60);
+    assert_eq!(names.len(), 78);
     for name in [
         "add",
+        "annotate",
         "archive",
+        "bisect",
+        "blame",
         "branch",
         "bundle",
         "cat-file",
+        "check-attr",
+        "check-ignore",
         "check-ref-format",
         "checkout",
+        "cherry",
         "cherry-pick",
+        "clean",
         "clone",
         "commit",
         "commit-tree",
         "config",
         "count-objects",
         "credential",
+        "describe",
         "diff",
         "fetch",
+        "fmt-merge-msg",
         "for-each-ref",
         "fsck",
         "gc",
+        "get-tar-commit-id",
         "grep",
         "hash-object",
         "help",
         "index-pack",
         "init",
+        "interpret-trailers",
         "log",
         "ls-files",
         "ls-remote",
@@ -157,11 +170,13 @@ fn verb_table_covers_advertised_names() {
         "migrate",
         "mktree",
         "mv",
+        "name-rev",
         "pack-objects",
         "pull",
         "push",
         "rebase",
         "receive-pack",
+        "reflog",
         "remote",
         "reset",
         "restore",
@@ -170,9 +185,11 @@ fn verb_table_covers_advertised_names() {
         "revert",
         "rm",
         "show",
+        "shortlog",
         "show-ref",
         "stash",
         "status",
+        "stripspace",
         "switch",
         "symbolic-ref",
         "tag",
@@ -180,7 +197,10 @@ fn verb_table_covers_advertised_names() {
         "update-ref",
         "upload-archive",
         "upload-pack",
+        "var",
+        "verify-commit",
         "verify-pack",
+        "verify-tag",
         "version",
         "worktree",
         "write-tree",
@@ -3892,5 +3912,240 @@ fn rebase_replays_side_onto_main() {
     )
     .expect("utf8");
     assert_eq!(count.trim(), "3", "got {count:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+/// Commits `body` as `file` under one author name for blame tests.
+fn blame_commit(ctx: &mut Ctx, root: &PathBuf, file: &str, body: &[u8], name: &str, message: &str) {
+    for role in ["AUTHOR", "COMMITTER"] {
+        ctx.env.vars.insert(
+            format!("GIT_{role}_NAME"),
+            name.to_owned(),
+        );
+        ctx.env.vars.insert(
+            format!("GIT_{role}_EMAIL"),
+            format!("{}@example.invalid", name.to_lowercase()),
+        );
+    }
+    std::fs::write(root.join(file), body).expect("write blamed file");
+    run(verbs_stage::add, ctx, &[file]).expect("add blamed file");
+    run(verbs_history::commit, ctx, &["-m", message]).expect("commit blamed file");
+}
+
+/// Starts a repository whose root commit is blame-controlled (unlike
+/// [`seeded_repo`], whose seed commit would steal the boundary role).
+fn blame_repo(case: &str) -> (PathBuf, CliEnv) {
+    let base = temp_base(case);
+    let env = test_env(&base);
+    let mut ctx = Ctx {
+        store: None,
+        root: base.clone(),
+        file_base: base.clone(),
+        kind: None,
+        env: env.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
+    (base.join("repo"), env)
+}
+
+/// Splits one default blame line into `(id, author, lineno, content)`.
+fn parse_blame_line(line: &str) -> (String, String, usize, String) {
+    let (head, content) = line.split_once(") ").expect("close paren");
+    let (id, rest) = head.split_once(" (").expect("open paren");
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let lineno: usize = parts.last().expect("lineno").parse().expect("lineno number");
+    (
+        id.to_owned(),
+        parts.first().expect("author").to_string(),
+        lineno,
+        content.to_owned(),
+    )
+}
+
+/// Reads one rev's full hex through `rev-parse`.
+fn blame_hex(ctx: &mut Ctx, rev: &str) -> String {
+    String::from_utf8(run(verbs_history::rev_parse, ctx, &[rev]).expect("rev-parse"))
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn blame_attributes_three_commit_interleaved_history() {
+    let (root, env) = blame_repo("blame-interleaved");
+    let mut ctx = repo_ctx(&root, env);
+    // c1 introduces alpha/bravo/charlie/zulu; c2 edits bravo, deletes
+    // zulu, appends delta; c3 edits alpha, appends echo. The blamed lines
+    // interleave origins c3/c2/c1/c2/c3, and the deleted zulu exercises
+    // the walk's parent-only slots.
+    blame_commit(&mut ctx, &root, "poem.txt", b"alpha\nbravo\ncharlie\nzulu\n", "Ada", "first");
+    blame_commit(
+        &mut ctx,
+        &root,
+        "poem.txt",
+        b"alpha\nBRAVO\ncharlie\ndelta\n",
+        "Ben",
+        "second",
+    );
+    blame_commit(
+        &mut ctx,
+        &root,
+        "poem.txt",
+        b"ALPHA\nBRAVO\ncharlie\ndelta\necho\n",
+        "Cat",
+        "third",
+    );
+    let first = blame_hex(&mut ctx, "HEAD~2");
+    let second = blame_hex(&mut ctx, "HEAD~1");
+    let third = blame_hex(&mut ctx, "HEAD");
+
+    let out = run(verbs_blame::blame, &mut ctx, &["HEAD", "--", "poem.txt"]).expect("blame");
+    let text = String::from_utf8(out).expect("utf8");
+    let rows: Vec<(String, String, usize, String)> =
+        text.lines().map(parse_blame_line).collect();
+    assert_eq!(rows.len(), 5, "got {text:?}");
+    // (expected short id, author, lineno, content) per final line.
+    let want = [
+        (third.clone(), "Cat", 1, "ALPHA"),
+        (second.clone(), "Ben", 2, "BRAVO"),
+        (first.clone(), "Ada", 3, "charlie"),
+        (second.clone(), "Ben", 4, "delta"),
+        (third.clone(), "Cat", 5, "echo"),
+    ];
+    for (index, (oid, author, lineno, content)) in want.iter().enumerate() {
+        let (id, got_author, got_lineno, got_content) = &rows[index];
+        let mut expected_id: String = oid.chars().take(8).collect();
+        if index == 2 {
+            // The root commit's lines carry the boundary marker.
+            expected_id = format!("^{expected_id}");
+        }
+        assert_eq!(id, &expected_id, "line {}", index + 1);
+        assert_eq!(got_author, author, "line {}", index + 1);
+        assert_eq!(got_lineno, lineno, "line {}", index + 1);
+        assert_eq!(got_content, content, "line {}", index + 1);
+    }
+
+    // `-L` slices the same attribution with real line numbers.
+    let out = run(verbs_blame::blame, &mut ctx, &["-L", "2,4", "HEAD", "--", "poem.txt"])
+        .expect("blame -L");
+    let ranged: Vec<(String, String, usize, String)> = String::from_utf8(out)
+        .expect("utf8")
+        .lines()
+        .map(parse_blame_line)
+        .collect();
+    assert_eq!(ranged.len(), 3, "got {ranged:?}");
+    assert_eq!(ranged[0].2, 2);
+    assert_eq!(ranged[1].2, 3);
+    assert_eq!(ranged[2].2, 4);
+    assert_eq!(ranged[0].0, second.chars().take(8).collect::<String>());
+
+    // Porcelain groups carry author facts, summaries, and boundary/previous
+    // markers: c1 is the root (boundary, no previous), c2/c3 name parents.
+    let out = run(verbs_blame::blame, &mut ctx, &["-p", "HEAD", "--", "poem.txt"])
+        .expect("blame -p");
+    let porcelain = String::from_utf8(out).expect("utf8");
+    assert!(
+        porcelain.contains(&format!("{third} 1 1 1\n")),
+        "c3 ALPHA header: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains(&format!("{second} 2 2 1\n")),
+        "c2 BRAVO header: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains(&format!("{first} 3 3 1\n")),
+        "c1 charlie header: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains("author Cat\nauthor-mail <cat@example.invalid>\n"),
+        "c3 author facts: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains("summary third\n"),
+        "c3 summary: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains(&format!("previous {second} poem.txt\n")),
+        "c3 previous: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains(&format!("previous {first} poem.txt\n")),
+        "c2 previous: {porcelain:?}"
+    );
+    assert!(porcelain.contains("boundary\n"), "c1 boundary: {porcelain:?}");
+    assert!(
+        porcelain.contains("filename poem.txt\n\tALPHA\n"),
+        "content lines: {porcelain:?}"
+    );
+    // The root group has no `previous` line: every other group (two c3,
+    // two c2) names its parent.
+    assert_eq!(
+        porcelain.matches("previous ").count(),
+        4,
+        "two c3 groups plus two c2 groups: {porcelain:?}"
+    );
+
+    // The `annotate` row reaches the same entry point.
+    let annotate = lookup("annotate").expect("annotate row");
+    let out = (annotate.run)(
+        &mut ctx,
+        &["HEAD".to_owned(), "--".to_owned(), "poem.txt".to_owned()],
+    )
+    .expect("annotate");
+    assert_eq!(
+        out,
+        run(verbs_blame::blame, &mut ctx, &["HEAD", "--", "poem.txt"]).expect("blame again"),
+        "annotate matches blame"
+    );
+
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn blame_worktree_overlay_reports_uncommitted_lines() {
+    let (root, env) = blame_repo("blame-worktree");
+    let mut ctx = repo_ctx(&root, env);
+    blame_commit(&mut ctx, &root, "note.txt", b"one\ntwo\n", "Ada", "first");
+    // Uncommitted edit plus append: no revision names the worktree file.
+    std::fs::write(root.join("note.txt"), b"one\nTWO\nthree\n").expect("dirty");
+    let out = run(verbs_blame::blame, &mut ctx, &["note.txt"]).expect("blame worktree");
+    let text = String::from_utf8(out).expect("utf8");
+    let rows: Vec<(String, String, usize, String)> =
+        text.lines().map(parse_blame_line).collect();
+    assert_eq!(rows.len(), 3, "got {text:?}");
+    assert_eq!(rows[0].3, "one");
+    assert_eq!(rows[0].1, "Ada");
+    assert_eq!(rows[1].0, "00000000");
+    assert_eq!(rows[1].1, "Not");
+    assert_eq!(rows[1].3, "TWO");
+    assert_eq!(rows[2].0, "00000000");
+    assert_eq!(rows[2].3, "three");
+    // An explicit revision ignores the worktree edits.
+    let out = run(verbs_blame::blame, &mut ctx, &["HEAD", "--", "note.txt"]).expect("blame HEAD");
+    let committed: Vec<(String, String, usize, String)> = String::from_utf8(out)
+        .expect("utf8")
+        .lines()
+        .map(parse_blame_line)
+        .collect();
+    assert_eq!(committed.len(), 2, "explicit rev skips worktree");
+    assert!(committed.iter().all(|row| row.0 != "00000000"));
+    // Porcelain marks the uncommitted group with the zero oid.
+    let out = run(verbs_blame::blame, &mut ctx, &["-p", "note.txt"]).expect("blame -p");
+    let porcelain = String::from_utf8(out).expect("utf8");
+    assert!(
+        porcelain.contains("author Not Committed Yet\n"),
+        "uncommitted header: {porcelain:?}"
+    );
+    assert!(
+        porcelain.contains("\tTWO\n"),
+        "uncommitted content: {porcelain:?}"
+    );
+    // Unknown paths fail instead of blaming nothing.
+    run(verbs_blame::blame, &mut ctx, &["missing.txt"]).expect_err("unknown path");
+    run(verbs_blame::blame, &mut ctx, &["-L", "99", "HEAD", "--", "note.txt"])
+        .expect_err("line range past end");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

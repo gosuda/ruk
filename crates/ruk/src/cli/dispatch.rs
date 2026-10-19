@@ -1,4 +1,4 @@
-//! Verb table: the 60 advertised names and their handlers.
+//! Verb table: the 78 advertised names and their handlers.
 //!
 //! The shape mirrors `git.c:commands[]`: one row per verb with its oracle
 //! anchor, whether it needs a repository, a one-line summary, and the entry
@@ -7,11 +7,14 @@
 
 use ruk_git::GitError;
 
+use super::verbs_bisect;
+use super::verbs_blame;
 use super::verbs_branch;
 use super::verbs_bundle;
 use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_meta;
+use super::verbs_misc;
 use super::verbs_objects;
 use super::verbs_repo;
 use super::verbs_stage;
@@ -33,7 +36,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 60 advertised verbs in alphabetical order.
+/// The 78 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -43,11 +46,32 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_stage::add,
     },
     Verb {
+        name: "annotate",
+        oracle: "git/builtin/blame.c",
+        needs_repo: true,
+        summary: "Annotate each line with its introducing commit",
+        run: verbs_blame::blame,
+    },
+    Verb {
         name: "archive",
         oracle: "git/builtin/archive.c",
         needs_repo: true,
         summary: "Create an archive of files from a named tree",
         run: verbs_transport::archive,
+    },
+    Verb {
+        name: "bisect",
+        oracle: "git/builtin/bisect.c",
+        needs_repo: true,
+        summary: "Find the commit that introduced a bug",
+        run: verbs_bisect::bisect,
+    },
+    Verb {
+        name: "blame",
+        oracle: "git/builtin/blame.c",
+        needs_repo: true,
+        summary: "Show what revision and author last modified each line",
+        run: verbs_blame::blame,
     },
     Verb {
         name: "branch",
@@ -71,6 +95,20 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_objects::cat_file,
     },
     Verb {
+        name: "check-attr",
+        oracle: "git/builtin/check-attr.c",
+        needs_repo: false,
+        summary: "Display gitattributes information",
+        run: verbs_misc::check_attr,
+    },
+    Verb {
+        name: "check-ignore",
+        oracle: "git/builtin/check-ignore.c",
+        needs_repo: false,
+        summary: "Test whether paths are ignored",
+        run: verbs_misc::check_ignore,
+    },
+    Verb {
         name: "check-ref-format",
         oracle: "git/builtin/check-ref-format.c",
         needs_repo: false,
@@ -85,11 +123,25 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_branch::checkout,
     },
     Verb {
+        name: "cherry",
+        oracle: "git/builtin/cherry.c",
+        needs_repo: true,
+        summary: "Find commits not yet applied upstream",
+        run: verbs_misc::cherry,
+    },
+    Verb {
         name: "cherry-pick",
         oracle: "git/builtin/revert.c (cmd_cherry_pick)",
         needs_repo: true,
         summary: "Apply the changes introduced by existing commits",
         run: verbs_history::cherry_pick,
+    },
+    Verb {
+        name: "clean",
+        oracle: "git/builtin/clean.c",
+        needs_repo: true,
+        summary: "Remove untracked files from the working tree",
+        run: verbs_misc::clean,
     },
     Verb {
         name: "clone",
@@ -134,6 +186,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_transport::credential,
     },
     Verb {
+        name: "describe",
+        oracle: "git/builtin/describe.c",
+        needs_repo: true,
+        summary: "Name a commit by its nearest tag",
+        run: verbs_misc::describe,
+    },
+    Verb {
         name: "diff",
         oracle: "git/builtin/diff.c",
         needs_repo: true,
@@ -146,6 +205,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Download objects and refs from another repository",
         run: verbs_transport::fetch,
+    },
+    Verb {
+        name: "fmt-merge-msg",
+        oracle: "git/builtin/fmt-merge-msg.c",
+        needs_repo: true,
+        summary: "Format a merge message from FETCH_HEAD",
+        run: verbs_misc::fmt_merge_msg,
     },
     Verb {
         name: "for-each-ref",
@@ -167,6 +233,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Cleanup unnecessary files and optimize the local repository",
         run: verbs_transport::gc,
+    },
+    Verb {
+        name: "get-tar-commit-id",
+        oracle: "git/builtin/get-tar-commit-id.c",
+        needs_repo: false,
+        summary: "Print the commit id stored in a tar archive",
+        run: verbs_misc::get_tar_commit_id,
     },
     Verb {
         name: "grep",
@@ -202,6 +275,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: false,
         summary: "Create an empty Ruk repository",
         run: verbs_repo::init,
+    },
+    Verb {
+        name: "interpret-trailers",
+        oracle: "git/builtin/interpret-trailers.c",
+        needs_repo: false,
+        summary: "Parse commit-message trailers",
+        run: verbs_misc::interpret_trailers,
     },
     Verb {
         name: "log",
@@ -267,6 +347,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_stage::mv,
     },
     Verb {
+        name: "name-rev",
+        oracle: "git/builtin/name-rev.c",
+        needs_repo: true,
+        summary: "Name an object by a nearby ref",
+        run: verbs_misc::name_rev,
+    },
+    Verb {
         name: "pack-objects",
         oracle: "git/builtin/pack-objects.c",
         needs_repo: true,
@@ -300,6 +387,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: false,
         summary: "Receive what is pushed into the repository",
         run: verbs_transport::receive_pack,
+    },
+    Verb {
+        name: "reflog",
+        oracle: "git/builtin/reflog.c",
+        needs_repo: true,
+        summary: "Show and expire reflog records",
+        run: verbs_misc::reflog,
     },
     Verb {
         name: "remote",
@@ -358,6 +452,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_history::show,
     },
     Verb {
+        name: "shortlog",
+        oracle: "git/builtin/shortlog.c",
+        needs_repo: true,
+        summary: "Summarize history by author",
+        run: verbs_misc::shortlog,
+    },
+    Verb {
         name: "show-ref",
         oracle: "git/builtin/show-ref.c",
         needs_repo: true,
@@ -377,6 +478,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Show the working tree status",
         run: verbs_stage::status,
+    },
+    Verb {
+        name: "stripspace",
+        oracle: "git/builtin/stripspace.c",
+        needs_repo: false,
+        summary: "Clean whitespace from standard input",
+        run: verbs_misc::stripspace,
     },
     Verb {
         name: "switch",
@@ -428,11 +536,32 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_transport::upload_pack,
     },
     Verb {
+        name: "var",
+        oracle: "git/builtin/var.c",
+        needs_repo: false,
+        summary: "Show a Git logical variable",
+        run: verbs_misc::var,
+    },
+    Verb {
+        name: "verify-commit",
+        oracle: "git/builtin/verify-commit.c",
+        needs_repo: true,
+        summary: "Check commit signatures (refuses: none exist)",
+        run: verbs_misc::verify_commit,
+    },
+    Verb {
         name: "verify-pack",
         oracle: "git/builtin/verify-pack.c",
         needs_repo: true,
         summary: "Validate packed Git archive files",
         run: verbs_objects::verify_pack,
+    },
+    Verb {
+        name: "verify-tag",
+        oracle: "git/builtin/verify-tag.c",
+        needs_repo: true,
+        summary: "Check tag signatures (refuses: none exist)",
+        run: verbs_misc::verify_tag,
     },
     Verb {
         name: "version",

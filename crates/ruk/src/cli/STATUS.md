@@ -1,6 +1,6 @@
 # CLI verb status
 
-60 verbs, one row each. Statuses: **implemented** (real native-store
+78 verbs, one row each. Statuses: **implemented** (real native-store
 transitions), **partial** (resolves and validates, then completes only the
 cases its backing covers), **unsupported** (typed `Unsupported` with the
 reason; exit code 1 through `GitError::exit_code`).
@@ -41,29 +41,40 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | verb | status | notes |
 | --- | --- | --- |
 | add | implemented | explicit paths, `-u`, `-A`, `-N`; worktree bytes hashed per file |
+| annotate | implemented | alias of `blame` through the same first-parent LCS attribution |
 | archive | implemented | `--format=tar` (server default) and `--format=zip` (client-side transcode of the tar); `--prefix`, `-o`, path limits |
+| bisect | implemented | `start`/`bad`/`good`/`skip`/`reset`/`log`/`terms`/`run` over an ancestor paint-down; midpoint minimizes `|total-2·weight|` (~log2 steps); `--first-parent`, `--no-checkout`, `--term-*`; `BISECT_*` pseudo-heads under `cli/pseudo/`; `replay`/`visualize` are `Unsupported` |
+| blame | implemented | first-parent walk with per-commit LCS alignment; default `<oid> (<author> <date> <line>) <content>`, `-L`, `-p`/`--porcelain`, `--line-porcelain`, `-l`; no `<rev>` blames the worktree with `Not Committed Yet` lines; `-C`/`-M` parse but do no cross-file copy/move detection |
 | branch | implemented | list/create/delete/rename; `-d` checks ancestry, `-D` forces |
 | bundle | implemented | git bundle v2/v3 headers plus pack v2; `create [--all] [<rev>...]` (refs only, `^rev` exclusions become prerequisites), `verify`, `list-heads`, `unbundle` (objects only, no refs); `clone <file>` plants refs; bundle verbs need a repository |
 | cat-file | implemented | `-p`, `-t`, `-s`, `-e` over the bounded object reader; `--batch-check [--batch-all-objects]` lists `<oid> <type> <size>` from the store census |
+| check-attr | implemented | `.rukattributes` glob scan; absent file means every attr `unspecified` |
+| check-ignore | implemented | `.rukignore` glob scan (`*`/`?`/`[...]`/`!`); no file means nothing ignored (exit 1) |
 | check-ref-format | implemented | `RefName` validation; `--print`, `--branch` |
 | checkout | implemented | branch switch, detach, `-b`/`-B`, path restore |
+| cherry | implemented | `upstream [head [base]]`, `+`/`-` by tree-diff content patch-id, `-v` |
 | cherry-pick | implemented | per-commit three-way replay (syntax lane, text fallback); `-n`, `-m`, `-x`; `--continue`/`--skip`/`--abort` over `CHERRY_PICK_HEAD` + todo state |
+| clean | implemented | `-f`/`-d`/`-n`/`-e`; `-x` inert and `-X` empty (no ignore rules); files under untracked dirs need `-d` |
 | clone | implemented | local paths only; branches, tags, remote-tracking refs, `HEAD` branch, fetch refspec config; network sources are `Offline` |
 | commit | implemented | `-m` (required, no editor), `-a`, `--amend` via `ops::edit`; empty tree-matching commits refuse; concludes `MERGE_HEAD` merges with two parents |
 | commit-tree | implemented | canonical payload, parents verified as stored commits |
 | config | implemented | `--local` scope only; `--global`/`--system`/`--worktree` are `Unsupported` |
 | count-objects | implemented | `<n> objects, <bytes>` from the store census, no payload I/O |
 | credential | implemented | `fill`/`approve`/`reject` over stdin `key=value` descriptions through the configured helpers (`get`/`store`/`erase`); needs no repository |
+| describe | implemented | nearest tag by parent depth; `--tags`/`--exact-match`/`--long`/`--abbrev`/`--always` |
 | diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; `-M`/`--find-renames` pairs renames by similarity, merge lane tracks rename-plus-edit |
 | fetch | implemented | refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; local, `ssh://`, `git://`, smart-http v2→v0, dumb-http fetch fallback; `--lfs` pulls payloads for fetched tips under `LfsMode::Full` (mirror parity) |
+| fmt-merge-msg | implemented | subject from the `FETCH_HEAD` pseudo record; `-m`, `--log[=n]`/`--no-log`, `--stdin`/file |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
 | fsck | implemented | reachable refs, history, trees, blobs, and index rows; `--dangling`/`--unreachable` list `dangling <kind> <oid>` from the census minus the ref closure |
 | gc | implemented | prune unreachable (ref closure + detached `HEAD`/index/stash/`FETCH_HEAD`/sequencer/reflog pins, delta-base closure in store) then compact; `--aggressive` repeats compaction, `--auto` exits quietly with no work, `--dry-run` reports, `--prune=now` (default) prunes and `--prune=never` compacts only (other dates are `Unsupported`: no object ages, no grace period) |
+| get-tar-commit-id | implemented | stdin tar `comment` pax scan; honest miss when no id is stored |
 | grep | implemented | subset: `-l`, `-c`, `-n`, `-e`, `-i`, `-w`, `-F`, `-E` (last of `-F`/`-E` wins), `-H`/`--with-filename`/`--no-filename`, one `<commit>` for tree scope; 0 hit / 1 no hit / 128 bad use; no pathspecs, no `.rukignore`, always-Rust-regex patterns |
 | hash-object | implemented | `-t blob/tree/commit`, `-w` stores; works outside a repository without `-w` |
 | help | implemented | verb list and per-verb summaries |
 | index-pack | implemented | ingest plus publication with commit-record facts; `-v`, `--stdin`; no `.idx` (the store keeps no loose/pack split); thin bases must already be committed |
 | init | implemented | `--object-format`, `--bare`, reinit; unborn `HEAD` on `refs/heads/main` |
+| interpret-trailers | implemented | trailer-block parse; `--only-trailers`/`--only-input`/`--parse`/`--unfold`/`--trailer`/`--where`/`--key` |
 | log | implemented | `--oneline`, `-n`/`--max-count` |
 | ls-files | implemented | `-s`, `-u`, `--others`, `--error-unmatch` |
 | ls-remote | implemented | local, `ssh://`, `git://`, smart-http v2→v0, dumb-http text fallback |
@@ -73,11 +84,13 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | migrate | implemented | exact import of a real `.git` (loose, packs, refs, `HEAD`); `--force` replaces an existing `.ruk`; no checkout/config/hooks |
 | mktree | implemented | canonical sort, mode/type agreement checks |
 | mv | implemented | all stages renamed, worktree file renamed; `-f` allows overwrite |
+| name-rev | implemented | multi-tip breadth-first naming; `--tags`/`--name-only`/`--refs` |
 | pack-objects | implemented | self-contained pack v2 to `<base>.pack` or `--stdout`; stdin-only input (exact oids, or rev-list args with `--revs`, plus `--all`); `--thin` needs `--stdout` and stays full without receiver haves; `--no-thin`, `--delta-base-offset`/`--no-delta-base-offset` inert |
 | pull | implemented | local paths only; fetch plus fast-forward merge |
 | push | implemented | local, `ssh://`, `git://`, and smart/dumb-http; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
 | rebase | implemented | `<upstream>` and `--onto <new> <upstream>` replay over the merge lane; `--continue`/`--skip`/`--abort`; drops merge commits; no branch switching |
 | receive-pack | implemented | serves pushes over stdin/stdout via `ruk receive-pack <dir>` and the `git-receive-pack` argv0 name; v0 wire |
+| reflog | implemented | `show`/`list`/`expire`/`delete` over the rows `update-ref -m` writes |
 | remote | implemented | backed by `remote.<name>.*` config records |
 | reset | implemented | `--soft`, `--mixed` (default), `--hard` with worktree sync, path form |
 | restore | implemented | `--staged`/`--worktree` (default worktree), `--source` |
@@ -86,9 +99,11 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | revert | implemented | inverse three-way replay per commit; `-n`, `-m`; `--continue`/`--skip`/`--abort` over `REVERT_HEAD` + todo state |
 | rm | implemented | `--cached`, `-r`; unknown paths fail |
 | show | implemented | `--oneline`, `-s`, `--stat`, `--name-only`, parent diff |
+| shortlog | implemented | `-s`/`-n`/`-e`, ranges, `--all` |
 | show-ref | implemented | `--head`, `--verify`, `--tags`, `--heads`, patterns |
 | stash | implemented | `push`/`list`/`show`/`drop`/`pop`/`apply`/`clear`; oracle two-commit shape (index + `WIP` parents); apply refuses only staged or worktree changes on paths the stash touches |
 | status | implemented | `--porcelain`, `--short`, `--branch`, long format; staged renames always paired when identical, `-M` pairs by similarity staged and worktree |
+| stripspace | implemented | trailing-blank collapse; `--strip-comments` |
 | switch | implemented | `-c`/`-C`, `--detach`, remote guess |
 | symbolic-ref | implemented | `HEAD` moves the workspace row; other names are ref symrefs |
 | tag | implemented | lightweight, annotated (`-a`/`-m`), list with globs, delete |
@@ -96,7 +111,10 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | update-ref | implemented | expected-value CAS, `-d`, `-m` reflog rows |
 | upload-archive | implemented | serves archives over the upload-archive protocol |
 | upload-pack | implemented | serves fetches over stdin/stdout via `ruk upload-pack <dir>` and the `git-upload-pack` argv0 name; protocol v2 negotiated on `GIT_PROTOCOL`, v0 fallback |
+| var | implemented | `GIT_AUTHOR_IDENT`, `GIT_COMMITTER_IDENT`, `GIT_DEFAULT_BRANCH`, `GIT_EDITOR`, `GIT_PAGER`, `-l` |
+| verify-commit | partial | existence checked, then honest refusal (the store holds no signatures) |
 | verify-pack | implemented | header, version, and trailer validation plus full verify-mode ingest with staged output dropped |
+| verify-tag | partial | structure checked, then honest refusal (the store holds no signatures) |
 | version | implemented | reports `CARGO_PKG_VERSION` |
 | worktree | implemented | `add` (branches, detach, `-b`/`-B`, `--force`)/`list` (`--porcelain`) /`remove` (`--force`)/`prune` (`--dry-run`) over `cli/worktrees/` snapshot checkouts; secondaries share the store but not `HEAD`/index, and `add` inside the root is refused |
 | write-tree | implemented | refuses unmerged paths |
