@@ -35,6 +35,7 @@ pub(crate) mod verbs_objects;
 pub(crate) mod verbs_repo;
 pub(crate) mod verbs_stage;
 pub(crate) mod verbs_transport;
+pub(crate) mod verbs_worktree;
 
 #[cfg(test)]
 mod tests;

@@ -7,10 +7,9 @@
 //! | `migrate` | `Store::create` + `import::import_repository` + workspace row | implemented; carries `remote.*.url/fetch` over, worktree checkout, remaining config conversion, and hooks are out of scope |
 //! | `config` | `Pins` records under `cli/config/` | implemented, `--local` scope only |
 //! | `remote` | `remote.<name>.*` config records | implemented, plus `update [--prune]` over configured refspecs (mirror parity) |
-//! | `worktree` | absent workcopy lane | unsupported |
 //!
 //! Oracle anchors: `git/builtin/init-db.c`, `git/builtin/clone.c`,
-//! `git/builtin/config.c`, `git/builtin/remote.c`, `git/builtin/worktree.c`.
+//! `git/builtin/config.c`, `git/builtin/remote.c`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1028,16 +1027,6 @@ fn all_remote_names(store: &Store) -> Result<Vec<String>, GitError> {
         }
     }
     Ok(names)
-}
-
-/// Manages multiple working trees. Unsupported: no workcopy lane exists.
-///
-/// Oracle: `git/builtin/worktree.c`.
-pub(crate) fn worktree(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "worktree: multiple working trees need the workcopy lane".to_owned(),
-    })
 }
 
 /// Rejects positionals for verbs that take none.

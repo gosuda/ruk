@@ -16,6 +16,7 @@ use super::verbs_objects;
 use super::verbs_repo;
 use super::verbs_stage;
 use super::verbs_transport;
+use super::verbs_worktree;
 use super::{Ctx, line};
 
 /// One advertised verb, after `struct cmd_struct` in `git.c`.
@@ -438,7 +439,7 @@ pub(crate) static VERBS: &[Verb] = &[
         oracle: "git/builtin/worktree.c",
         needs_repo: true,
         summary: "Manage multiple working trees",
-        run: verbs_repo::worktree,
+        run: verbs_worktree::worktree,
     },
     Verb {
         name: "write-tree",
