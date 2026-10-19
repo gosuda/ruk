@@ -802,25 +802,33 @@ fn commit_graph_verify(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
             let Some(parent_oid) = parent.as_git() else {
                 continue;
             };
-            if super::tree::read_object_bytes(store, *parent_oid).is_err() {
-                return Err(GitError::Corrupt {
-                    detail: format!(
-                        "commit {} names missing parent {}",
-                        oid.to_hex(),
-                        parent_oid.to_hex()
-                    ),
-                });
+            match super::tree::read_object_bytes(store, *parent_oid) {
+                Ok(_) => {}
+                Err(GitError::NotFound { .. }) => {
+                    return Err(GitError::Corrupt {
+                        detail: format!(
+                            "commit {} names missing parent {}",
+                            oid.to_hex(),
+                            parent_oid.to_hex()
+                        ),
+                    });
+                }
+                Err(other) => return Err(other),
             }
         }
         let tree = super::tree::commit_tree_oid(record)?;
-        if super::tree::read_object_bytes(store, tree).is_err() {
-            return Err(GitError::Corrupt {
-                detail: format!(
-                    "commit {} names missing tree {}",
-                    oid.to_hex(),
-                    tree.to_hex()
-                ),
-            });
+        match super::tree::read_object_bytes(store, tree) {
+            Ok(_) => {}
+            Err(GitError::NotFound { .. }) => {
+                return Err(GitError::Corrupt {
+                    detail: format!(
+                        "commit {} names missing tree {}",
+                        oid.to_hex(),
+                        tree.to_hex()
+                    ),
+                });
+            }
+            Err(other) => return Err(other),
         }
     }
     Ok(line(
