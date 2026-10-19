@@ -206,7 +206,6 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        let mut consumed: Option<fn(&mut Vec<String>, String)> = None;
         let mut inline: Option<String> = None;
         let mut bare_name: Option<&str> = None;
         for name in [
@@ -228,13 +227,6 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             }
         }
         if let Some(name) = bare_name {
-            let push: fn(&mut Vec<String>, String) = match name {
-                "--merged" => |v, s| v.push(s),
-                "--no-merged" => |v, s| v.push(s),
-                "--contains" | "--with" => |v, s| v.push(s),
-                _ => |v, s| v.push(s),
-            };
-            let _ = push;
             let value = if let Some(v) = inline {
                 v
             } else if index + 1 < args.len()
@@ -252,8 +244,6 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 "--contains" | "--with" => contains.push(value),
                 _ => no_contains.push(value),
             }
-            consumed = Some(|_, _| {});
-            let _ = consumed;
             index += 1;
             continue;
         }
@@ -364,21 +354,39 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                     });
                 }
                 refuse_checked_out_branch(store, name)?;
+                let before = super::state::read_ref(store, &refname)?;
                 let target = resolve_branch_target(store, ctx.kind()?, None)?;
                 force_branch(store, ctx.kind()?, name, target)?;
+                if opts.is_set("create-reflog") {
+                    maybe_create_reflog(
+                        ctx,
+                        &refname,
+                        before,
+                        target,
+                        "branch: Created from HEAD".to_owned(),
+                    )?;
+                }
                 return Ok(Vec::new());
             }
             let target = resolve_branch_target(store, ctx.kind()?, None)?;
             create_branch(store, ctx.kind()?, name, target)?;
-            // `--create-reflog` is already satisfied: refs carry their rows
-            // on creation, so there is no separate reflog file to make.
+            if opts.is_set("create-reflog") {
+                maybe_create_reflog(
+                    ctx,
+                    &refname,
+                    None,
+                    target,
+                    "branch: Created from HEAD".to_owned(),
+                )?;
+            }
             Ok(Vec::new())
         }
         [name, start] => {
             let target = resolve_branch_target(store, ctx.kind()?, Some(start))?;
+            let refname = branch_name(name)?;
+            let before = super::state::read_ref(store, &refname)?;
             if !opts.is_set("force") {
-                let refname = branch_name(name)?;
-                if super::state::read_ref(store, &refname)?.is_some() {
+                if before.is_some() {
                     return Err(GitError::Invalid {
                         detail: format!("branch {name:?} already exists"),
                     });
@@ -387,6 +395,15 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 refuse_checked_out_branch(store, name)?;
             }
             force_branch(store, ctx.kind()?, name, target)?;
+            if opts.is_set("create-reflog") {
+                maybe_create_reflog(
+                    ctx,
+                    &refname,
+                    before,
+                    target,
+                    format!("branch: Created from {start}"),
+                )?;
+            }
             if opts.is_set("track") {
                 record_tracking(store, name, start)?;
             }
@@ -516,6 +533,31 @@ fn unset_branch_upstream(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, 
     Ok(Vec::new())
 }
 
+/// Writes a reflog creation entry for a new branch when `--create-reflog`
+/// is given. Without configured identity there is no committer to record,
+/// so creation still succeeds and the reflog materializes on the first
+/// logged update instead of failing the branch.
+fn maybe_create_reflog(
+    ctx: &Ctx,
+    name: &RefName,
+    before: Option<RefTarget>,
+    oid: Oid,
+    message: String,
+) -> Result<(), GitError> {
+    if super::state::identity(ctx, super::state::IdentityRole::Committer).is_err() {
+        return Ok(());
+    }
+    append_reflog(
+        ctx,
+        &[AppliedRef {
+            name: name.clone(),
+            before,
+            after: Some(RefTarget::Direct(oid)),
+        }],
+        Some(message),
+    )
+}
+
 /// Copies a branch ref, the way `git branch -c/-C` duplicates the ref and
 /// its upstream config.
 ///
@@ -557,6 +599,8 @@ fn copy_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
         });
     }
     let force = opts.is_set("force-copy");
+    let before = super::state::read_ref(store, &new_name)?;
+    let copied_oid = peel_direct(&target);
     apply_refs(
         store,
         kind,
@@ -567,12 +611,23 @@ fn copy_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
             } else {
                 RefExpect::Absent
             },
-            change: match target {
+            change: match target.clone() {
                 RefTarget::Direct(oid) => RefChange::Set(RefTarget::Direct(oid)),
                 RefTarget::Symbolic(name) => RefChange::Set(RefTarget::Symbolic(name)),
             },
         }],
     )?;
+    if opts.is_set("create-reflog") {
+        if let Some(oid) = copied_oid {
+            maybe_create_reflog(
+                ctx,
+                &new_name,
+                before,
+                oid,
+                format!("branch: Copied from {old}"),
+            )?;
+        }
+    }
     // Copy the upstream config the way the oracle copies the branch config.
     let old_short = old
         .strip_prefix("refs/heads/")
@@ -2573,21 +2628,23 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
     }
     let mut blocked: Vec<String> = Vec::new();
     for path in &differing {
-        if let Some(stages) = staged_by_path.get(path) {
-            let clean = match old_map.get(path) {
-                Some((mode, oid)) => {
-                    stages.len() == 1
-                        && stages[0].0 == Stage::Zero
-                        && stages[0].1.oid() == *oid
-                        && stages[0].1.mode()
-                            == mode.as_index_mode().unwrap_or(FileMode::Regular)
-                }
-                None => false,
-            };
-            if !clean {
-                blocked.push(String::from_utf8_lossy(path).into_owned());
-                continue;
+        let clean_staged = match (old_map.get(path), staged_by_path.get(path)) {
+            (Some((mode, oid)), Some(stages)) => {
+                stages.len() == 1
+                    && stages[0].0 == Stage::Zero
+                    && stages[0].1.oid() == *oid
+                    && stages[0].1.mode()
+                        == mode.as_index_mode().unwrap_or(FileMode::Regular)
             }
+            // A missing index row where the old tree names one is a staged
+            // deletion; a present row where it names none is a staged
+            // addition. Both refuse instead of clobbering.
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => true,
+        };
+        if !clean_staged {
+            blocked.push(String::from_utf8_lossy(path).into_owned());
+            continue;
         }
         // Worktree check: differing paths must still hold old bytes.
         let full = super::tree::join_base(&ctx.file_base, path)?;
@@ -2617,7 +2674,30 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
         });
     }
     move_branch_to(ctx, target)?;
-    reset_index_tree(ctx, new_tree)?;
+    // Scoped index reset: only differing paths take the new tree's rows, so
+    // staged edits on unrelated paths stay exactly as they were.
+    let (workspace, raw) = load_or_default(store)?;
+    let mut index_mutations = Vec::new();
+    for path in &differing {
+        let repo_path = RepoPath::new(path.clone())
+            .map_err(|err| GitError::from(CoreError::from(err)))?;
+        let before = read_path_rows(store, kind, &repo_path)?;
+        let after = match new_map.get(path) {
+            Some((mode, oid)) => {
+                let entry =
+                    IndexEntry::new(*oid, mode.as_index_mode()?, None, IndexFlags::default())
+                        .map_err(|err| GitError::from(CoreError::from(err)))?;
+                vec![(Stage::Zero, entry)]
+            }
+            None => Vec::new(),
+        };
+        index_mutations.extend(path_row_mutations(&repo_path, &before, &after)?);
+    }
+    let next = workspace.mutate_index(workspace.stamp)?;
+    index_mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    store
+        .publish(Vec::new(), &index_mutations)
+        .map_err(GitError::from)?;
     // Scoped worktree sync: only differing paths are rewritten.
     for path in &differing {
         match new_map.get(path) {

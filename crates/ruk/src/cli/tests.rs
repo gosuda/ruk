@@ -5896,3 +5896,92 @@ fn fastio_request_pull_template() {
     assert!(err.to_string().contains("request-pull -p"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn wave_j_branch_copy_and_filters() {
+    let (root, env) = seeded_repo("wavej-branch", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::branch, &mut ctx, &["-c", "copied"]).expect("copy");
+    let out = String::from_utf8(run(verbs_branch::branch, &mut ctx, &[]).expect("list")).expect("utf8");
+    assert!(out.contains("copied"), "got {out:?}");
+    let out = String::from_utf8(
+        run(verbs_branch::branch, &mut ctx, &["--merged", "HEAD"]).expect("merged"),
+    ).expect("utf8");
+    assert!(out.contains("main"), "got {out:?}");
+    let out = String::from_utf8(
+        run(verbs_branch::branch, &mut ctx, &["--format=%(refname:short)"]).expect("format"),
+    ).expect("utf8");
+    assert!(out.contains("main"), "got {out:?}");
+    let out = String::from_utf8(
+        run(verbs_branch::branch, &mut ctx, &["--sort=-refname"]).expect("sort"),
+    ).expect("utf8");
+    assert!(out.contains("main"), "got {out:?}");
+    let err = run(verbs_branch::branch, &mut ctx, &["--edit-description"]).expect_err("edit-description");
+    assert!(err.to_string().contains("editor"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_tag_filters_cleanup_and_format() {
+    let (root, env) = seeded_repo("wavej-tag", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::tag, &mut ctx, &["-a", "-m", "note", "v1"]).expect("annotated");
+    run(verbs_branch::tag, &mut ctx, &["v2"]).expect("lightweight");
+    let out = String::from_utf8(
+        run(verbs_branch::tag, &mut ctx, &["--contains", "HEAD"]).expect("contains"),
+    ).expect("utf8");
+    assert!(out.contains("v1"), "got {out:?}");
+    let out = String::from_utf8(
+        run(verbs_branch::tag, &mut ctx, &["--format=%(refname:short)"]).expect("format"),
+    ).expect("utf8");
+    assert!(out.contains("v1"), "got {out:?}");
+    run(
+        verbs_branch::tag,
+        &mut ctx,
+        &["-a", "-m", "  spaced  ", "--cleanup=verbatim", "v3"],
+    ).expect("verbatim");
+    let err = run(verbs_branch::tag, &mut ctx, &["-e", "v4"]).expect_err("edit");
+    assert!(err.to_string().contains("editor"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_switch_orphan_and_track() {
+    let (root, env) = seeded_repo("wavej-switch", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::switch, &mut ctx, &["--orphan", "fresh"]).expect("orphan");
+    let out = String::from_utf8(
+        run(verbs_history::rev_parse, &mut ctx, &["--abbrev-ref", "HEAD"]).expect("abbrev"),
+    ).expect("utf8");
+    assert!(out.trim() == "fresh", "got {out:?}");
+    let err = run(verbs_branch::switch, &mut ctx, &["--conflict", "merge"]).expect_err("conflict");
+    assert!(err.to_string().contains("--merge"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_checkout_orphan_source_and_stages() {
+    let (root, env) = seeded_repo("wavej-checkout", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::checkout, &mut ctx, &["--orphan", "fresh2"]).expect("orphan");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("back");
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_branch::checkout, &mut ctx, &["--source", "HEAD", "--", "f.txt"]).expect("source");
+    let err = run(verbs_branch::checkout, &mut ctx, &["-p", "--", "f.txt"]).expect_err("patch");
+    assert!(err.to_string().contains("interactive"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_j_reset_keep_and_intent() {
+    let (root, env) = seeded_repo("wavej-reset", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::reset, &mut ctx, &["--keep", "HEAD"]).expect("keep");
+    run(verbs_branch::reset, &mut ctx, &["-N", "--", "f.txt"]).expect("intent");
+    let err = run(verbs_branch::reset, &mut ctx, &["--merge", "HEAD"]).expect_err("merge");
+    assert!(err.to_string().contains("merge lane"), "got {err:?}");
+    let err = run(verbs_branch::reset, &mut ctx, &["-p"]).expect_err("patch");
+    assert!(err.to_string().contains("interactive"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}

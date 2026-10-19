@@ -47,13 +47,13 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | archive | implemented | `--format=tar` (server default) and `--format=zip` (client-side transcode of the tar); `--prefix`, `-o`, path limits |
 | bisect | implemented | `start`/`bad`/`good`/`skip`/`reset`/`log`/`terms`/`run` over an ancestor paint-down; midpoint minimizes `|total-2·weight|` (~log2 steps); `--first-parent`, `--no-checkout`, `--term-*`; `BISECT_*` pseudo-heads under `cli/pseudo/`; `replay`/`visualize` are `Unsupported` |
 | blame | implemented | first-parent walk with per-commit LCS alignment; default `<oid> (<author> <date> <line>) <content>`, `-L`, `-p`/`--porcelain`, `--line-porcelain`, `-l`; no `<rev>` blames the worktree with `Not Committed Yet` lines; `-C`/`-M` parse but do no cross-file copy/move detection |
-| branch | implemented | list/create/delete/rename; `-d` checks ancestry, `-D` forces |
+| branch | implemented | list/create/delete/rename/copy; `-d` checks ancestry, `-D` forces, `-m`/`-M` move, `-c`/`-C` copy, `-u`/`--unset-upstream`, `--list`/`--show-current`, `-r`/`-a`, `-v`/`-vv` with upstream ahead/behind, `--merged`/`--no-merged`/`--contains`/`--no-contains`/`--points-at`, `--sort`/`--format`/`--abbrev`, `--track`/`--no-track`/`--create-reflog`; `--edit-description` is `Unsupported` (needs editor) |
 | bundle | implemented | git bundle v2/v3 headers plus pack v2; `create [--all] [<rev>...]` (refs only, `^rev` exclusions become prerequisites), `verify`, `list-heads`, `unbundle` (objects only, no refs); `clone <file>` plants refs; bundle verbs need a repository |
 | cat-file | implemented | `-p`, `-t`, `-s`, `-e` over the bounded object reader; `--batch-check [--batch-all-objects]` lists `<oid> <type> <size>` from the store census |
 | check-attr | implemented | `.rukattributes` glob scan; absent file means every attr `unspecified` |
 | check-ignore | implemented | `.rukignore` glob scan (`*`/`?`/`[...]`/`!`); no file means nothing ignored (exit 1) |
 | check-ref-format | implemented | `RefName` validation; `--print`, `--branch` |
-| checkout | implemented | branch switch, detach, `-b`/`-B`, path restore |
+| checkout | implemented | branch switch, detach, `-b`/`-B`, `--orphan`, `-t`/`--no-track`, `-m`/`--conflict`, `--guess`/`--no-guess`, path restore with `--ours`/`--theirs`/`--source`/`--staged`/`--worktree`; `-p`, `--pathspec-from-file`, `--ignore-skip-worktree-bits` are `Unsupported` |
 | checkout-index | implemented | `-a`, `-f`, `-u` (accepts, stat-less), `-q`, `--prefix`, `--stage=1/2/3`, `--stdin` (`-z`); existing differing files refuse without `-f`; gitlinks skipped; `--stage=all`, `--temp` are `Unsupported` |
 | cherry | implemented | `upstream [head [base]]`, `+`/`-` by tree-diff content patch-id, `-v` |
 | cherry-pick | implemented | per-commit three-way replay (syntax lane, text fallback); `-n`, `-m`, `-x`; `--continue`/`--skip`/`--abort` over `CHERRY_PICK_HEAD` + todo state |
@@ -106,7 +106,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | rerere | implemented | bare run replays recorded resolutions (staging stage zero) and records preimages/postimages under `cli/rerere/`; `status`/`diff`/`remaining`/`forget`/`clear`/`gc` (15d preimage / 60d resolved); ids hash conflict hunks, labels excluded; no `rerere.enabled` config |
 | replace | implemented | create (`-f`), `-l [<pattern>]`, `-d`; `refs/replace/*` redirects commit reads and history walks plus tip redirection in `log`/`blame`/`diff`/`checkout`; no graft/edit, no transfer over fetch/push/clone, `--no-replace-objects` stays inert |
 | request-pull | implemented | mail template with base, end subject, source url, oldest-first shortlog, and range diffstat; `-p` is `Unsupported` |
-| reset | implemented | `--soft`, `--mixed` (default), `--hard` with worktree sync, path form |
+| reset | implemented | `--soft`, `--mixed` (default), `--hard` with worktree sync, `--keep` with non-overwrite guard, path form with `-N`/`--intent-to-add`, `--no-refresh`; `--merge`, `-p`, `--pathspec-from-file` are `Unsupported` |
 | restore | implemented | `--staged`/`--worktree` (default worktree), `--source` |
 | rev-list | implemented | `--count`, `-n`/`--max-count` |
 | rev-parse | implemented | `HEAD`/refs/oids/`~n`/`^n` plus `--git-dir`, `--show-toplevel`, `--is-inside-work-tree`, `--abbrev-ref`, `--short` |
@@ -120,9 +120,9 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | status | implemented | `--porcelain`, `--short`, `--branch`, long format; staged renames always paired when identical, `-M` pairs by similarity staged and worktree |
 | stripspace | implemented | trailing-blank collapse; `--strip-comments` |
 | submodule | implemented | `add` (local clone, gitlink + `.rukmodules`), `status` (`--cached`/`--recursive`), `init`, `deinit` (refuses dirty trees without `--force`), `update` (`--init`/`--recursive`/`--remote`), `summary`, `foreach` (`--recursive`); `absorbgitdirs` is `Unsupported` (child `.ruk` needs no gitdir absorption) |
-| switch | implemented | `-c`/`-C`, `--detach`, remote guess |
+| switch | implemented | `-c`/`-C`, `--detach`, `--orphan`, `-t`/`--no-track`, `--guess`/`--no-guess`, `-f`, `-m`/`--conflict`, remote guess with tracking |
 | symbolic-ref | implemented | `HEAD` moves the workspace row; other names are ref symrefs |
-| tag | implemented | lightweight, annotated (`-a`/`-m`), list with globs, delete |
+| tag | implemented | lightweight, annotated (`-a`/`-m`/`-F`) with `--cleanup`, list with globs/`-n`, `--sort`/`--format`/`--points-at`/`--merged`/`--no-merged`/`--contains`/`--no-contains`, delete, verify; `-e`/`--edit` is `Unsupported` (needs editor), signing is `Unsupported` (no GPG) |
 | update-index | implemented | `--cacheinfo`, `--stdin`, `--add`, `--remove`, `--assume-unchanged`, `--skip-worktree`, `--refresh` |
 | update-ref | implemented | expected-value CAS, `-d`, `-m` reflog rows |
 | upload-archive | implemented | serves archives over the upload-archive protocol |
