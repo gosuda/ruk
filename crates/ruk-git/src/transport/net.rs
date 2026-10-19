@@ -617,7 +617,9 @@ pub fn discover_endpoint(
                 Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
                 Service::UploadArchive => super::smart_http::SmartService::UploadArchive,
             };
-            Ok(super::smart_http::discover(&base, smart, kind)?.refs)
+            // No repo config reaches this layer, so no `http.extraHeader`
+            // rows join here; the verbs pass them explicitly.
+            Ok(super::smart_http::discover(&base, smart, kind, &[])?.refs)
         }
         _ => discover(open_stream(endpoint, service)?, kind),
     }

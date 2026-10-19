@@ -24,8 +24,10 @@
 //! fill` for the endpoint, non-fatal to anonymous attempts), then Bearer
 //! from `GIT_AUTH_TOKEN`, else Basic from `GIT_AUTH_USER` plus
 //! `GIT_AUTH_PASSWORD` (see [`crate::transport::http::git_auth_header`]).
-//! `http.<url>.extraHeader` stays a named gap: no config parser for it
-//! exists.
+//! `http.<url>.extraHeader` lines join every request: the caller resolves
+//! them from config for the base through
+//! [`extra_headers_for_url`](crate::transport::http::extra_headers_for_url)
+//! and passes them in as `extra_headers`.
 //!
 //! Fetch tries protocol v2 first ([`discover_v2_caps`] plus the
 //! [`ls_refs_v2`]/[`fetch_pack_v2`] command RPCs in
@@ -148,7 +150,8 @@ pub fn rpc_url(base: &str, service: SmartService) -> String {
     format!("{base}/{}", service.name())
 }
 
-/// Builds owned request headers from `extra` plus the helper-then-
+/// Builds owned request headers from `extra_headers` (resolved
+/// `http.extraHeader` rows for `url`) plus `extra` plus the helper-then-
 /// environment auth header for `url`, when either carries credentials.
 /// [`request_headers_with`] is the pure seam tests inject a stub helper
 /// through; live callers pass the process environment.
@@ -157,19 +160,23 @@ pub fn request_headers(
     url: &str,
     vars: &HashMap<String, String>,
     extra: &[(&str, &str)],
+    extra_headers: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = extra
-        .iter()
-        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-        .collect();
+    let mut out: Vec<(String, String)> = extra_headers.to_vec();
+    out.extend(
+        extra
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
     if let Some((name, value)) = credentials::auth_header_for_url(url, vars) {
         out.push((name, value));
     }
     out
 }
 
-/// Builds owned request headers from `extra` plus the auth header the
-/// `runner` helper chain (or, failing that, `vars`) yields for `url`.
+/// Builds owned request headers from `extra_headers` plus `extra` plus the
+/// auth header the `runner` helper chain (or, failing that, `vars`) yields
+/// for `url`.
 #[must_use]
 pub fn request_headers_with(
     url: &str,
@@ -177,11 +184,14 @@ pub fn request_headers_with(
     extra: &[(&str, &str)],
     helpers: &[(String, Vec<String>)],
     runner: impl Fn(&str, &[String], &[u8]) -> Option<Vec<u8>>,
+    extra_headers: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = extra
-        .iter()
-        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-        .collect();
+    let mut out: Vec<(String, String)> = extra_headers.to_vec();
+    out.extend(
+        extra
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
     if let Some((name, value)) = credentials::auth_header_for_url_with(url, vars, helpers, runner) {
         out.push((name, value));
     }
@@ -189,8 +199,12 @@ pub fn request_headers_with(
 }
 
 /// Collects the process environment for [`request_headers`].
-fn live_headers(url: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
-    request_headers(url, &std::env::vars().collect(), extra)
+fn live_headers(
+    url: &str,
+    extra: &[(&str, &str)],
+    extra_headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    request_headers(url, &std::env::vars().collect(), extra, extra_headers)
 }
 
 /// Borrows owned headers for the HTTP client.
@@ -230,9 +244,10 @@ pub fn discover(
     base: &str,
     service: SmartService,
     kind: HashKind,
+    extra_headers: &[(String, String)],
 ) -> Result<Advertisement, GitError> {
     let url = refs_url(base, service);
-    let owned = live_headers(&url, &[("Accept", "*/*")]);
+    let owned = live_headers(&url, &[("Accept", "*/*")], extra_headers);
     let mut body = Vec::new();
     let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
     check_status(&url, status)?;
@@ -275,6 +290,7 @@ pub fn discover_versioned(
     base: &str,
     service: SmartService,
     kind: HashKind,
+    extra_headers: &[(String, String)],
 ) -> Result<VersionedDiscovery, GitError> {
     let url = refs_url(base, service);
     let owned = live_headers(
@@ -286,6 +302,7 @@ pub fn discover_versioned(
                 proto_v2::GIT_PROTOCOL_V2_VALUE,
             ),
         ],
+        extra_headers,
     );
     let mut body = Vec::new();
     let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
@@ -313,6 +330,7 @@ pub fn ls_refs_v2(
     kind: HashKind,
     prefixes: &[&[u8]],
     interrupt: &Interrupt,
+    extra_headers: &[(String, String)],
 ) -> Result<Vec<AdvertisedRef>, GitError> {
     let body = proto_v2::ls_refs_request(
         caps,
@@ -334,6 +352,7 @@ pub fn ls_refs_v2(
                 proto_v2::GIT_PROTOCOL_V2_VALUE,
             ),
         ],
+        extra_headers,
     );
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
     check_status(&url, status)?;
@@ -364,6 +383,7 @@ pub fn fetch_pack_v2(
     req: &FetchWireRequest,
     limits: IngestLimits,
     interrupt: &Interrupt,
+    extra_headers: &[(String, String)],
 ) -> Result<ReceivedPack, GitError> {
     if req.wants.is_empty() {
         return Err(GitError::Invalid {
@@ -415,6 +435,7 @@ pub fn fetch_pack_v2(
                 proto_v2::GIT_PROTOCOL_V2_VALUE,
             ),
         ],
+        extra_headers,
     );
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
     check_status(&url, status)?;
@@ -471,6 +492,7 @@ pub fn fetch_pack(
     req: &FetchWireRequest,
     limits: IngestLimits,
     interrupt: &Interrupt,
+    extra_headers: &[(String, String)],
 ) -> Result<ReceivedPack, GitError> {
     if req.wants.is_empty() {
         return Err(GitError::Invalid {
@@ -556,6 +578,7 @@ pub fn fetch_pack(
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
         ],
+        extra_headers,
     );
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
     check_status(&url, status)?;
@@ -629,6 +652,7 @@ pub fn push_pack(
     plan: &mut PushPlanRecord,
     req: &PushWireRequest,
     interrupt: &Interrupt,
+    extra_headers: &[(String, String)],
 ) -> Result<Vec<RefOutcome>, GitError> {
     if req.updates.is_empty() {
         return Err(GitError::Invalid {
@@ -649,7 +673,7 @@ pub fn push_pack(
     }
     let kind = store.hash_kind();
     push::persist(store, plan, kind, None)?;
-    let outcome = push_pack_inner(base, adv, store, plan, req, interrupt);
+    let outcome = push_pack_inner(base, adv, store, plan, req, interrupt, extra_headers);
     match outcome {
         Ok(outcomes) => Ok(outcomes),
         Err(err) => {
@@ -667,6 +691,7 @@ fn push_pack_inner(
     plan: &mut PushPlanRecord,
     req: &PushWireRequest,
     interrupt: &Interrupt,
+    extra_headers: &[(String, String)],
 ) -> Result<Vec<RefOutcome>, GitError> {
     let kind = store.hash_kind();
     let caps = &adv.capabilities;
@@ -807,6 +832,7 @@ fn push_pack_inner(
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
         ],
+        extra_headers,
     );
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
     check_status(&url, status)?;
@@ -885,6 +911,7 @@ pub fn fetch_archive(
     base: &str,
     req: &ArchiveWireRequest,
     interrupt: &Interrupt,
+    extra_headers: &[(String, String)],
 ) -> Result<ArchiveOutput, GitError> {
     let body = archive_request_body(&req.rev)?;
     let url = rpc_url(base, SmartService::UploadArchive);
@@ -896,6 +923,7 @@ pub fn fetch_archive(
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
         ],
+        extra_headers,
     );
     let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
     check_status(&url, status)?;
@@ -999,6 +1027,7 @@ mod tests {
             &[("Accept", "*/*")],
             &[],
             |_, _, _| None,
+            &[],
         );
         assert!(headers.contains(&("Accept".to_owned(), "*/*".to_owned())));
         assert!(headers.contains(&("authorization".to_owned(), "Bearer tok".to_owned())));
@@ -1008,13 +1037,15 @@ mod tests {
             ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
             ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),
         ]);
-        let headers = request_headers_with("https://host.x/a.git", &vars, &[], &[], |_, _, _| None);
+        let headers =
+            request_headers_with("https://host.x/a.git", &vars, &[], &[], |_, _, _| None, &[]);
         assert_eq!(headers.len(), 1);
         let vars = HashMap::from([
             ("GIT_AUTH_USER".to_owned(), "user".to_owned()),
             ("GIT_AUTH_PASSWORD".to_owned(), "pass".to_owned()),
         ]);
-        let headers = request_headers_with("https://host.x/a.git", &vars, &[], &[], |_, _, _| None);
+        let headers =
+            request_headers_with("https://host.x/a.git", &vars, &[], &[], |_, _, _| None, &[]);
         assert_eq!(
             headers,
             vec![("authorization".to_owned(), "Basic dXNlcjpwYXNz".to_owned())]
@@ -1025,7 +1056,8 @@ mod tests {
                 &HashMap::new(),
                 &[],
                 &[],
-                |_, _, _| None
+                |_, _, _| None,
+                &[]
             )
             .is_empty()
         );
@@ -1035,10 +1067,14 @@ mod tests {
     fn helper_answer_wins_over_the_environment() {
         let helpers = vec![("/bin/helper".to_owned(), Vec::new())];
         let vars = HashMap::from([("GIT_AUTH_TOKEN".to_owned(), "tok".to_owned())]);
-        let headers =
-            request_headers_with("https://host.x/a.git", &vars, &[], &helpers, |_, _, _| {
-                Some(b"username=alice\npassword=s3cret\n".to_vec())
-            });
+        let headers = request_headers_with(
+            "https://host.x/a.git",
+            &vars,
+            &[],
+            &helpers,
+            |_, _, _| Some(b"username=alice\npassword=s3cret\n".to_vec()),
+            &[],
+        );
         assert_eq!(
             headers,
             vec![(
@@ -1182,7 +1218,8 @@ mod tests {
             body,
             false,
         )]);
-        let adv = discover(&base, SmartService::UploadPack, HashKind::Sha1).expect("discover");
+        let adv =
+            discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect("discover");
         assert!(adv.capabilities.has("side-band-64k"));
         assert_eq!(adv.refs.len(), 2);
         assert_eq!(adv.refs[0].oid, Some(oid(FOUR)));
@@ -1202,6 +1239,40 @@ mod tests {
     }
 
     #[test]
+    fn extra_headers_join_the_wire_verbatim() {
+        let body = advertisement_bytes(
+            FOUR,
+            "multi_ack_detailed side-band-64k thin-pack ofs-delta symref=HEAD:refs/heads/main object-format=sha1",
+        );
+        let (base, server) = fake_smart_server(vec![(
+            200,
+            vec![(
+                "Content-Type".to_owned(),
+                SmartService::UploadPack.advertisement_type(),
+            )],
+            body,
+            false,
+        )]);
+        let configured = vec![
+            ("X-Token".to_owned(), "Bearer scoped-token".to_owned()),
+            ("X-Empty".to_owned(), String::new()),
+        ];
+        discover(&base, SmartService::UploadPack, HashKind::Sha1, &configured).expect("discover");
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].head.contains("X-Token: Bearer scoped-token\r\n"),
+            "{:?}",
+            requests[0].head
+        );
+        assert!(
+            requests[0].head.contains("X-Empty: \r\n"),
+            "{:?}",
+            requests[0].head
+        );
+    }
+
+    #[test]
     fn discover_names_dumb_http_as_the_gap() {
         let (base, server) = fake_smart_server(vec![(
             200,
@@ -1209,7 +1280,8 @@ mod tests {
             format!("{FOUR}\trefs/heads/main\n").into_bytes(),
             false,
         )]);
-        let err = discover(&base, SmartService::UploadPack, HashKind::Sha1).expect_err("dumb");
+        let err =
+            discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect_err("dumb");
         assert!(
             matches!(err, GitError::Unsupported { .. }),
             "unexpected {err:?}"
@@ -1254,7 +1326,7 @@ mod tests {
                 true,
             ),
         ]);
-        let adv = discover(&base, SmartService::UploadPack, kind).expect("discover");
+        let adv = discover(&base, SmartService::UploadPack, kind, &[]).expect("discover");
         let dest = test_store(kind);
         let req = FetchWireRequest {
             wants: vec![oid(FOUR)],
@@ -1272,6 +1344,7 @@ mod tests {
             &req,
             IngestLimits::default(),
             &Interrupt::none(),
+            &[],
         )
         .expect("fetch");
         assert!(received.warnings.is_empty());
@@ -1357,12 +1430,13 @@ mod tests {
             ),
         ]);
         let VersionedDiscovery::V2(probed) =
-            discover_versioned(&base, SmartService::UploadPack, kind).expect("probe")
+            discover_versioned(&base, SmartService::UploadPack, kind, &[]).expect("probe")
         else {
             panic!("expected v2");
         };
         assert!(probed.feature("fetch", "filter"));
-        let refs = ls_refs_v2(&base, &probed, kind, &[], &Interrupt::none()).expect("ls-refs");
+        let refs =
+            ls_refs_v2(&base, &probed, kind, &[], &Interrupt::none(), &[]).expect("ls-refs");
         assert_eq!(refs.len(), 2);
         assert_eq!(
             refs[0].symref_target.as_deref(),
@@ -1424,7 +1498,7 @@ mod tests {
             false,
         )]);
         let VersionedDiscovery::V0(adv) =
-            discover_versioned(&base, SmartService::UploadPack, HashKind::Sha1).expect("v0")
+            discover_versioned(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect("v0")
         else {
             panic!("expected v0");
         };
@@ -1481,6 +1555,7 @@ mod tests {
             &req,
             IngestLimits::default(),
             &Interrupt::none(),
+            &[],
         )
         .expect("fetch");
         verify_closure(
@@ -1562,7 +1637,7 @@ mod tests {
         ]);
         // The test drives discovery itself so the advertisement (with its
         // capabilities) reaches the push half the way the verbs pass it.
-        let adv = discover(&base, SmartService::ReceivePack, kind).expect("discover");
+        let adv = discover(&base, SmartService::ReceivePack, kind, &[]).expect("discover");
         let updates = vec![PushUpdate {
             name: b"refs/heads/x".to_vec(),
             old: zero,
@@ -1574,8 +1649,8 @@ mod tests {
         };
         let mut plan =
             PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
-        let outcomes =
-            push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none()).expect("push");
+        let outcomes = push_pack(&base, &adv, &store, &mut plan, &req, &Interrupt::none(), &[])
+            .expect("push");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].name, b"refs/heads/x");
         assert!(
@@ -1634,6 +1709,7 @@ mod tests {
             &mut plan,
             &req,
             &Interrupt::none(),
+            &[],
         )
         .expect_err("no report-status");
         assert!(
@@ -1692,6 +1768,7 @@ mod tests {
                 rev: "HEAD".to_owned(),
             },
             &Interrupt::none(),
+            &[],
         )
         .expect("archive");
         assert_eq!(out.tar, tar);
@@ -1752,6 +1829,7 @@ mod tests {
                 rev: "nope".to_owned(),
             },
             &Interrupt::none(),
+            &[],
         )
         .expect_err("unknown revision");
         assert!(

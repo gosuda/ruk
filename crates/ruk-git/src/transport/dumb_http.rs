@@ -80,7 +80,8 @@ fn check_status(url: &str, status: u16) -> Result<(), GitError> {
     Err(GitError::Offline { detail })
 }
 
-/// Builds owned request headers from `extra` plus the helper-then-
+/// Builds owned request headers from `extra_headers` (resolved
+/// `http.extraHeader` rows for `url`) plus `extra` plus the helper-then-
 /// environment auth header for `url`, when either carries credentials.
 /// Live callers pass the process environment.
 #[must_use]
@@ -88,11 +89,14 @@ pub fn request_headers(
     url: &str,
     vars: &HashMap<String, String>,
     extra: &[(&str, &str)],
+    extra_headers: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = extra
-        .iter()
-        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-        .collect();
+    let mut out: Vec<(String, String)> = extra_headers.to_vec();
+    out.extend(
+        extra
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
     if let Some((name, value)) = credentials::auth_header_for_url(url, vars) {
         out.push((name, value));
     }
@@ -100,8 +104,12 @@ pub fn request_headers(
 }
 
 /// Collects the process environment for [`request_headers`].
-fn live_headers(url: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
-    request_headers(url, &std::env::vars().collect(), extra)
+fn live_headers(
+    url: &str,
+    extra: &[(&str, &str)],
+    extra_headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    request_headers(url, &std::env::vars().collect(), extra, extra_headers)
 }
 
 /// Borrows owned headers for the HTTP client.
@@ -114,8 +122,8 @@ fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// GETs `url` into memory, returning status plus body. Error statuses sink
 /// nothing (the client reports them); callers map statuses per route.
-fn get(url: &str) -> Result<(u16, Vec<u8>), GitError> {
-    let owned = live_headers(url, &[("Accept", "*/*")]);
+fn get(url: &str, extra_headers: &[(String, String)]) -> Result<(u16, Vec<u8>), GitError> {
+    let owned = live_headers(url, &[("Accept", "*/*")], extra_headers);
     let mut body = Vec::new();
     let (status, _) = http::get_to_writer(url, &borrow(&owned), &mut body)?;
     Ok((status, body))
@@ -193,9 +201,13 @@ pub fn parse_dumb_info_refs(body: &[u8], kind: HashKind) -> Result<Vec<Advertise
 /// # Errors
 /// Transport failures from the HTTP client and grammar failures from the
 /// text parse.
-pub fn discover(base: &str, kind: HashKind) -> Result<Advertisement, GitError> {
+pub fn discover(
+    base: &str,
+    kind: HashKind,
+    extra_headers: &[(String, String)],
+) -> Result<Advertisement, GitError> {
     let url = dumb_refs_url(base);
-    let (status, body) = get(&url)?;
+    let (status, body) = get(&url, extra_headers)?;
     check_status(&url, status)?;
     Ok(Advertisement {
         version: ProtocolVersion::V0,
@@ -225,9 +237,9 @@ fn pack_names(body: &[u8]) -> Vec<String> {
 /// Lists the pack files a dumb server holds: GETs `objects/info/packs`. A
 /// 404 means no pack list (pack-less repositories answer that way), which
 /// is an empty list, not an error; other error statuses propagate.
-fn list_packs(base: &str) -> Result<Vec<String>, GitError> {
+fn list_packs(base: &str, extra_headers: &[(String, String)]) -> Result<Vec<String>, GitError> {
     let url = format!("{base}/objects/info/packs");
-    let (status, body) = get(&url)?;
+    let (status, body) = get(&url, extra_headers)?;
     if status == 404 {
         return Ok(Vec::new());
     }
@@ -283,11 +295,16 @@ fn decode_loose(raw: &[u8]) -> Result<(ObjectKind, Vec<u8>), GitError> {
 /// Fetches one loose object at `objects/xx/rest`. A 404 is a corrupt
 /// remote (the refs file advertised an object the server does not hold);
 /// other error statuses are transport failures.
-fn fetch_loose(base: &str, oid: Oid, max_bytes: u64) -> Result<(ObjectKind, Vec<u8>), GitError> {
+fn fetch_loose(
+    base: &str,
+    oid: Oid,
+    max_bytes: u64,
+    extra_headers: &[(String, String)],
+) -> Result<(ObjectKind, Vec<u8>), GitError> {
     let hex = oid.to_hex();
     let (fan, rest) = hex.split_at(2);
     let url = format!("{base}/objects/{fan}/{rest}");
-    let (status, body) = get(&url)?;
+    let (status, body) = get(&url, extra_headers)?;
     match status {
         _ if http::is_success(status) => {}
         404 => {
@@ -311,9 +328,14 @@ fn fetch_loose(base: &str, oid: Oid, max_bytes: u64) -> Result<(ObjectKind, Vec<
 /// Downloads one pack file into memory, capped at `max_bytes`. A 404 means
 /// the pack vanished between the list and the fetch: `None`, so the caller
 /// warns and continues loose.
-fn fetch_pack_file(base: &str, name: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, GitError> {
+fn fetch_pack_file(
+    base: &str,
+    name: &str,
+    max_bytes: u64,
+    extra_headers: &[(String, String)],
+) -> Result<Option<Vec<u8>>, GitError> {
     let url = format!("{base}/objects/pack/{name}");
-    let (status, body) = get(&url)?;
+    let (status, body) = get(&url, extra_headers)?;
     if status == 404 {
         return Ok(None);
     }
@@ -341,9 +363,10 @@ fn collect_pack_objects(
     limits: IngestLimits,
     interrupt: &Interrupt,
     warnings: &mut Vec<String>,
+    extra_headers: &[(String, String)],
 ) -> Result<Vec<(Oid, ObjectKind, Vec<u8>)>, GitError> {
     let mut triples = Vec::new();
-    let names = list_packs(base)?;
+    let names = list_packs(base, extra_headers)?;
     if names.len() > MAX_PACK_FILES {
         return Err(GitError::Limit {
             detail: format!(
@@ -354,7 +377,7 @@ fn collect_pack_objects(
     }
     for name in &names {
         interrupt.check("listing dumb-http packs")?;
-        let Some(bytes) = fetch_pack_file(base, name, limits.max_pack_bytes)? else {
+        let Some(bytes) = fetch_pack_file(base, name, limits.max_pack_bytes, extra_headers)? else {
             warnings.push(format!(
                 "dumb-http pack {name} vanished; fetching loose instead"
             ));
@@ -389,6 +412,7 @@ pub fn fetch_pack(
     req: &FetchWireRequest,
     limits: IngestLimits,
     interrupt: &Interrupt,
+    extra_headers: &[(String, String)],
 ) -> Result<ReceivedPack, GitError> {
     if req.wants.is_empty() {
         return Err(GitError::Invalid {
@@ -406,7 +430,8 @@ pub fn fetch_pack(
     if req.depth.is_some() {
         warnings.push("server is dumb-http; fetched complete history".to_owned());
     }
-    let mut triples = collect_pack_objects(base, store, kind, limits, interrupt, &mut warnings)?;
+    let mut triples =
+        collect_pack_objects(base, store, kind, limits, interrupt, &mut warnings, extra_headers)?;
     let mut seen: HashSet<Oid> = triples.iter().map(|(oid, _, _)| *oid).collect();
     let max_objects = usize::try_from(limits.max_objects).map_err(|_| GitError::Limit {
         detail: "object count limit does not fit".to_owned(),
@@ -428,7 +453,7 @@ pub fn fetch_pack(
             continue;
         }
         interrupt.check("fetching dumb-http objects")?;
-        let (obj_kind, payload) = fetch_loose(base, oid, limits.max_object_bytes)?;
+        let (obj_kind, payload) = fetch_loose(base, oid, limits.max_object_bytes, extra_headers)?;
         for link in links_of(obj_kind, &payload, kind)? {
             queue.push(link);
         }
@@ -716,7 +741,7 @@ mod tests {
         let refs_body = format!("{FOUR}\trefs/heads/main\n").into_bytes();
         let (base, handle) = fake_dumb_server(server, refs_body, total);
 
-        let adv = discover(&base, kind).expect("discover");
+        let adv = discover(&base, kind, &[]).expect("discover");
         assert_eq!(adv.refs.len(), 1);
         assert_eq!(adv.refs[0].oid, Some(tip));
 
@@ -736,6 +761,7 @@ mod tests {
             &req,
             IngestLimits::default(),
             &Interrupt::none(),
+            &[],
         )
         .expect("fetch");
         assert!(received.warnings.is_empty());
@@ -800,6 +826,7 @@ mod tests {
             &req,
             IngestLimits::default(),
             &Interrupt::none(),
+            &[],
         )
         .expect("fetch");
         assert_eq!(received.warnings.len(), 2);
