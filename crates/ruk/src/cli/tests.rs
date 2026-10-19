@@ -7199,6 +7199,13 @@ fn wave_j_commit_rejections() {
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     let err = run(verbs_history::commit, &mut ctx, &["-m", ""]).expect_err("empty");
     assert!(err.to_string().contains("empty commit message"), "{err}");
+    // A signoff-only message still counts as empty, like the oracle.
+    let blank = root.join("blank.txt");
+    std::fs::write(&blank, b"\n").expect("blank");
+    let blank_arg = blank.to_str().expect("utf8").to_owned();
+    let err = run(verbs_history::commit, &mut ctx, &[&"-F", &blank_arg, &"-s"])
+        .expect_err("signoff-only");
+    assert!(err.to_string().contains("empty commit message"), "{err}");
     run(
         verbs_history::commit,
         &mut ctx,

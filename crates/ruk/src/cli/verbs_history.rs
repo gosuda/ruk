@@ -608,9 +608,9 @@ fn commit_subject(store: &Store, kind: HashKind, rev: &str) -> Result<String, Gi
 /// Resolves the full commit message in oracle precedence: a `--squash`
 /// subject prefix with a `-m`/`-F`/`-C` body, else `-m` paragraphs, a `-F`
 /// file, a `-C`/`-c` message, a `--fixup` subject line, a `--template`
-/// file (verbatim, never cleaned), or the `HEAD` message under
-/// `--amend --no-edit`. Cleanup (except for templates), `--signoff`, and
-/// the empty-message refusal apply on top.
+/// file, or the `HEAD` message under `--amend`. Cleanup (every source
+/// passes the final pass), `--signoff`, and the empty-message refusal
+/// apply on top.
 fn resolve_commit_message(
     ctx: &Ctx,
     opts: &super::Collected,
@@ -677,7 +677,6 @@ fn resolve_commit_message(
         (Some(_), Some(_)) => unreachable!("-C/-c combination refused above"),
     };
     let template = opts.single("template")?;
-    let mut from_template = false;
     let raw = if let Some(rev) = squash.as_deref() {
         let subject = commit_subject(store, kind, rev)?;
         match (m_text, file, reuse_text) {
@@ -732,7 +731,6 @@ fn resolve_commit_message(
     } else if let Some(text) = reuse_text {
         text
     } else if let Some(spec) = template {
-        from_template = true;
         std::fs::read_to_string(&spec).map_err(|err| GitError::Invalid {
             detail: format!("could not read template {spec:?}: {err}"),
         })?
@@ -745,17 +743,24 @@ fn resolve_commit_message(
             detail: "commit needs -m <message> (no editor is implemented)".to_owned(),
         });
     };
-    let mut message = if from_template {
-        // Templates seed the editor buffer verbatim; with no editor the
-        // bytes (plus any signoff) become the message uncleaned.
-        raw
-    } else {
-        apply_cleanup(&raw, cleanup_mode_of(ctx, opts)?)
-    };
+    // Templates skip the pre-editor cleanup in the oracle but still pass
+    // the final `cleanup_message`, so every source cleans here alike.
+    let mode = cleanup_mode_of(ctx, opts)?;
+    let mut message = apply_cleanup(&raw, mode);
     if opts.is_set("signoff") {
         append_signoff(ctx, &mut message)?;
     }
-    if message.trim().is_empty() && !opts.is_set("allow-empty-message") {
+    // The oracle counts a message holding only blanks and `Signed-off-by`
+    // lines as empty (except verbatim, where any byte counts).
+    let empty = if mode == CleanupMode::Verbatim {
+        message.is_empty()
+    } else {
+        !message.lines().any(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("Signed-off-by:")
+        })
+    };
+    if empty && !opts.is_set("allow-empty-message") {
         return Err(GitError::Invalid {
             detail: "empty commit message".to_owned(),
         });

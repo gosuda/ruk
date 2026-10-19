@@ -1594,10 +1594,10 @@ fn render_porcelain(
         if lines.contains_key(*new) {
             continue;
         }
-        lines.insert((*new).clone(), v1_rename_line("R  ", new, old, eol));
+        lines.insert((*new).clone(), v1_rename_line("R ", new, old, eol));
     }
     for (old, new, _) in &plan.renames_unstaged {
-        lines.insert(new.clone(), v1_rename_line(" R ", new, old, eol));
+        lines.insert(new.clone(), v1_rename_line(" R", new, old, eol));
     }
     // `-z` rename records self-terminate (`XY new\0old\0`); every other
     // line still takes the entry terminator. A path can never end in NUL,
