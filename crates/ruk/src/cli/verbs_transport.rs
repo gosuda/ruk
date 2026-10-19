@@ -246,10 +246,7 @@ fn http_extra_headers(ctx: &Ctx, url: &str) -> Vec<(String, String)> {
                 }
             }
             if let Some(value) = unscoped {
-                rows.push(http::ExtraHeaderRow {
-                    scope: None,
-                    value,
-                });
+                rows.push(http::ExtraHeaderRow { scope: None, value });
             }
             scoped.sort();
             for (scope, value) in scoped {
@@ -339,7 +336,11 @@ pub(crate) fn run_fetch(
                     Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => {
                         let advertised = net::to_local_refs(adv.refs.clone())?;
                         (
-                            FetchSource::Http { base, adv, extra_headers },
+                            FetchSource::Http {
+                                base,
+                                adv,
+                                extra_headers,
+                            },
                             advertised,
                         )
                     }
@@ -351,7 +352,10 @@ pub(crate) fn run_fetch(
                         )?;
                         let advertised = net::to_local_refs(adv.refs.clone())?;
                         (
-                            FetchSource::DumbHttp { base, extra_headers },
+                            FetchSource::DumbHttp {
+                                base,
+                                extra_headers,
+                            },
                             advertised,
                         )
                     }
@@ -708,7 +712,11 @@ fn fetch_pack_dumb(
     tracking: &[(RefName, RefTarget)],
     ref_mutations: &[FactMutation],
 ) -> Result<(), GitError> {
-    let FetchSource::DumbHttp { base, extra_headers } = source else {
+    let FetchSource::DumbHttp {
+        base,
+        extra_headers,
+    } = source
+    else {
         return Err(GitError::Invalid {
             detail: "dumb-http fetch needs a dumb-http source".to_owned(),
         });
@@ -2454,9 +2462,8 @@ fn parse_zip_entries(tar: &[u8]) -> Result<Vec<ZipEntry>, GitError> {
             b'g' => {}
             flag @ (b'0' | b'5' | b'2') => {
                 let name = held_path.take().unwrap_or_else(|| header_name(&header));
-                let mode = u32::try_from(parse_octal(&header[100..108], "mode")?).map_err(|_| {
-                    corrupt("archive member mode overflows".to_owned())
-                })?;
+                let mode = u32::try_from(parse_octal(&header[100..108], "mode")?)
+                    .map_err(|_| corrupt("archive member mode overflows".to_owned()))?;
                 let mtime = parse_octal(&header[136..148], "mtime")?;
                 let (dir, symlink, data) = match flag {
                     b'5' => (true, false, Vec::new()),
@@ -2473,9 +2480,7 @@ fn parse_zip_entries(tar: &[u8]) -> Result<Vec<ZipEntry>, GitError> {
                 });
             }
             other => {
-                return Err(corrupt(format!(
-                    "archive member has unknown type {other}"
-                )));
+                return Err(corrupt(format!("archive member has unknown type {other}")));
             }
         }
     }
@@ -3125,11 +3130,23 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
         return Ok(());
     }
     let kind = ctx.kind()?;
+    // Fetched tips include annotated tag objects under `--tags`, which the
+    // commit walk rejects: peel tags to their commit targets first.
+    // Non-commit tips (a tag to a tree, etc.) carry no history to scan.
+    let mut commits = Vec::with_capacity(tips.len());
+    for tip in tips {
+        if let Some(commit) = peel_to_commit_tip(store, kind, *tip)? {
+            commits.push(commit);
+        }
+    }
+    if commits.is_empty() {
+        return Ok(());
+    }
     // Pointers in the newly-arrived range, keyed by payload hex: the same
     // small-blob walk the payload-sync verb runs, scoped to the fetched
     // tips. Unreadable blobs are fsck's domain; the sync skips them.
     let mut pointers: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    for (_, record) in super::state::walk_history(store, tips, None)? {
+    for (_, record) in super::state::walk_history(store, &commits, None)? {
         let tree = super::tree::commit_tree_oid(&record)?;
         for (_, _, oid) in super::tree::flatten_tree(store, kind, tree)? {
             let len = store.object_len(oid).map_err(GitError::from)?;
@@ -3178,6 +3195,45 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
         ctx.emit_stderr(format!("lfs: {hex} missing ({error})\n").as_bytes());
     }
     Ok(())
+}
+
+/// Peels one fetched tip to the commit the history walk accepts: annotated
+/// tags dereference through their `object` lines (at most 32 hops, the
+/// same bound the rev-parse peel uses). Anything that never resolves to a
+/// commit contributes nothing to pointer discovery and yields `None`.
+///
+/// # Errors
+/// Read failures and malformed tag payloads propagate; absence and damage
+/// are fetch-level facts, never per-tip silence.
+fn peel_to_commit_tip(store: &Store, kind: HashKind, tip: Oid) -> Result<Option<Oid>, GitError> {
+    let mut current = tip;
+    for _ in 0..32 {
+        let (object_kind, bytes) = super::tree::read_object_bytes(store, current)?;
+        match object_kind {
+            ObjectKind::Commit => return Ok(Some(current)),
+            ObjectKind::Tag => {
+                // Tag payloads open with `object <hex>`, the line the
+                // branch peel reads; anything else is a malformed tag.
+                let first = bytes
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .unwrap_or_default();
+                let hex = first
+                    .strip_prefix(b"object ")
+                    .ok_or_else(|| GitError::Corrupt {
+                        detail: format!("tag {} has no object header", current.to_hex()),
+                    })?;
+                let text = std::str::from_utf8(hex).map_err(|_| GitError::Corrupt {
+                    detail: format!("tag {} has a non-UTF-8 object header", current.to_hex()),
+                })?;
+                current = ruk_git::parse_oid_for(text, kind)?;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Err(GitError::Corrupt {
+        detail: format!("tag chain from {} does not end", tip.to_hex()),
+    })
 }
 
 /// The LFS batch endpoint for a fetch remote: `lfs.url` first, then
