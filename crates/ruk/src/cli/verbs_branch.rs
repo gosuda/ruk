@@ -600,7 +600,10 @@ fn copy_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
     }
     let force = opts.is_set("force-copy");
     let before = super::state::read_ref(store, &new_name)?;
-    let copied_oid = peel_direct(&target);
+    // Resolve symbolic targets so the creation log names an object even
+    // when the copied ref itself is symbolic; unresolvable targets skip
+    // the log rather than failing the copy.
+    let copied_oid = peel_target_oid(ctx, &target)?;
     apply_refs(
         store,
         kind,
