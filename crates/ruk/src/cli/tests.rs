@@ -5002,6 +5002,73 @@ fn merge_file_union_and_diff3_labels() {
 }
 
 #[test]
+fn merge_file_union_preserves_repeated_lines() {
+    // Union concatenates both sides verbatim: lines shared across the
+    // sides (Y) and repeated within one side (W, W) are all kept.
+    let base = temp_base("merge-file-union-dups");
+    std::fs::write(base.join("current.txt"), b"a\nX\nY\nc\n").expect("write");
+    std::fs::write(base.join("base.txt"), b"a\nb\nc\n").expect("write");
+    std::fs::write(base.join("other.txt"), b"a\nY\nZ\nc\n").expect("write");
+    let mut ctx = file_ctx(&base, test_env(&base));
+    run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["--union", "current.txt", "base.txt", "other.txt"],
+    )
+    .expect("union");
+    assert_eq!(
+        std::fs::read(base.join("current.txt")).expect("read"),
+        b"a\nX\nY\nY\nZ\nc\n"
+    );
+    // Repeated lines within one side survive as well.
+    std::fs::write(base.join("current.txt"), b"a\nQ\nc\n").expect("write");
+    std::fs::write(base.join("other.txt"), b"a\nW\nW\nc\n").expect("write");
+    run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &["--union", "current.txt", "base.txt", "other.txt"],
+    )
+    .expect("union");
+    assert_eq!(
+        std::fs::read(base.join("current.txt")).expect("read"),
+        b"a\nQ\nW\nW\nc\n"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn merge_file_custom_labels_in_markers() {
+    // `-L` labels replace the file names on every marker line.
+    let base = temp_base("merge-file-labels");
+    std::fs::write(base.join("current.txt"), b"a\nours\nc\n").expect("write");
+    std::fs::write(base.join("base.txt"), b"a\nbase\nc\n").expect("write");
+    std::fs::write(base.join("other.txt"), b"a\ntheirs\nc\n").expect("write");
+    let mut ctx = file_ctx(&base, test_env(&base));
+    let err = run(
+        verbs_merge_plumbing::merge_file_cmd,
+        &mut ctx,
+        &[
+            "--diff3",
+            "-L",
+            "mine",
+            "-L",
+            "ancestor",
+            "-L",
+            "theirs-side",
+            "current.txt",
+            "base.txt",
+            "other.txt",
+        ],
+    )
+    .expect_err("labeled conflict");
+    let detail = err.to_string();
+    assert!(detail.contains("<<<<<<< mine\n"), "got {detail:?}");
+    assert!(detail.contains("||||||| ancestor\n"), "got {detail:?}");
+    assert!(detail.contains(">>>>>>> theirs-side\n"), "got {detail:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn merge_tree_merges_disjoint_sides() {
     let (root, env) = plumbing_repo("merge-tree-clean", &[("f.txt", b"base\n")]);
     let mut ctx = repo_ctx(&root, env);

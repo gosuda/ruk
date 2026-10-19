@@ -226,7 +226,8 @@ fn push_text_conflict(out: &mut Vec<u8>, block: &ConflictBlock<'_>) {
         out.extend_from_slice(format!(" {}\n", block.base_label).as_bytes());
         push_text_lines(out, block.base.unwrap_or(&[]));
     }
-    out.extend_from_slice(b"=======\n");
+    push_fence(out, b'=', width);
+    out.push(b'\n');
     push_text_lines(out, block.theirs);
     push_fence(out, b'>', width);
     out.extend_from_slice(format!(" {}\n", block.theirs_label).as_bytes());
@@ -337,19 +338,10 @@ fn text_merge(request: &TextMerge<'_>) -> Option<(Vec<u8>, bool)> {
                         ResolveMode::Ours => push_text_lines(&mut out, &ours_lines),
                         ResolveMode::Theirs => push_text_lines(&mut out, &theirs_lines),
                         ResolveMode::Union => {
+                            // Union takes both sides verbatim, ours first;
+                            // repeated lines are preserved on each side.
                             push_text_lines(&mut out, &ours_lines);
-                            // Theirs lines already present through ours are
-                            // not repeated; ordering stays ours-first.
-                            let mut seen: std::collections::HashSet<&[u8]> =
-                                ours_lines.iter().copied().collect();
-                            for text_line in &theirs_lines {
-                                if seen.insert(text_line) {
-                                    out.extend_from_slice(text_line);
-                                    if !text_line.ends_with(b"\n") {
-                                        out.push(b'\n');
-                                    }
-                                }
-                            }
+                            push_text_lines(&mut out, &theirs_lines);
                         }
                     }
                 }
@@ -562,7 +554,7 @@ pub(crate) fn merge_file_cmd(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, 
         // in the error detail (truncated past 1 MiB) with status 1; the
         // file on disk is untouched.
         return if conflicted {
-            Err(stdout_conflict_error(&merged, &current))
+            Err(conflict_error(&merged, &current))
         } else {
             Ok(merged)
         };
@@ -597,18 +589,6 @@ fn conflict_error(merged: &[u8], path: &str) -> GitError {
 
 /// Largest conflict output embedded in an error detail.
 const MAX_ERROR_MERGED: usize = 1 << 20;
-
-/// Builds the exit-1 `-p` conflict report with the merged bytes inline.
-fn stdout_conflict_error(merged: &[u8], path: &str) -> GitError {
-    let mut detail = format!("merge-file: {path}: merged with conflicts\n");
-    if merged.len() > MAX_ERROR_MERGED {
-        detail.push_str(&String::from_utf8_lossy(&merged[..MAX_ERROR_MERGED]));
-        detail.push_str("\n[merge-file: output truncated]\n");
-    } else {
-        detail.push_str(&String::from_utf8_lossy(merged));
-    }
-    GitError::Invalid { detail }
-}
 
 /// Reads one lane file relative to the worktree base.
 fn read_lane_file(base: &std::path::Path, name: &str) -> Result<Vec<u8>, GitError> {
