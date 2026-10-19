@@ -7,8 +7,8 @@
 //! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via a protocol-v2 probe first (`smart_http::fetch_pack_v2` over `ls-refs` refs) with a v0 `smart_http::fetch_pack` fallback, then `dumb_http` when the smart advertisement is absent | `--prune` drops orphaned remote-tracking refs (pull-mirror parity); `--lfs` pulls LFS payloads for fetched tips (pull-mirror parity) |
 //! | `pull` | fetch + fast-forward | local, SSH/git and HTTP remotes (fast-forward only) |
 //! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); `--lfs` uploads the outgoing range's verified payloads through the batch API before pushing (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
-//! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
-//! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
+//! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0; v2 defines no push command) |
+//! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0, plus v2 `ls-refs`/`fetch` via `serve_v2` when `GIT_PROTOCOL` asks for `version=2`) |
 //! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex session | tar and zip (`--format=zip` transcodes the tar client-side; every transport still answers tar); `--prefix`, `-o` and path limits rewrite the stream client-side |
 //! | `bundle` | git bundle v2/v3 headers plus pack v2, see `verbs_bundle` | `create`/`verify`/`list-heads`/`unbundle` over the native store |
 //! | `gc` | ref closure plus workspace pins through `Store::prune_unreachable`, then `Store::compact` | `--aggressive` repeats compaction; `--auto` exits quietly with no work; `--dry-run` reports; `--prune=now` (default) prunes, `--prune=never` compacts only, other dates are `Unsupported` (no object ages) |
@@ -39,6 +39,7 @@ use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::push::{PushUpdate, PushWireRequest};
 use ruk_git::transport::refadv::Capabilities;
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
+use ruk_git::transport::serve_v2::{git_protocol_requests_v2, serve_upload_pack_v2};
 use ruk_git::transport::session::{
     AdvertisedLocalRef, LocalFetchRequest, Service, advertise, local_fetch, local_push,
     open_local_store,
@@ -1670,10 +1671,19 @@ pub(crate) fn upload_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
     let store = serve_store(ctx, args)?;
     let kind = store.hash_kind();
     let head = serve_head(&store)?;
+    // Protocol selection rides on `GIT_PROTOCOL`, the way the oracle's
+    // `determine_protocol_version_server` reads it: a v2-speaking client
+    // sets `GIT_PROTOCOL=version=2` on the spawned server (ssh `SendEnv`,
+    // daemon extra parameter), and anything else keeps the v0 default.
+    let v2 = git_protocol_requests_v2(std::env::var("GIT_PROTOCOL").ok().as_deref());
     match ctx.env.stdin.as_deref() {
         Some(input) => {
             let mut out = Vec::new();
-            serve_upload_pack(input, &mut out, &store, kind, &head, &Interrupt::none())?;
+            if v2 {
+                serve_upload_pack_v2(input, &mut out, &store, kind, &head, &Interrupt::none())?;
+            } else {
+                serve_upload_pack(input, &mut out, &store, kind, &head, &Interrupt::none())?;
+            }
             Ok(out)
         }
         // Live pipes stream the advertisement and pack straight to stdout;
@@ -1683,14 +1693,25 @@ pub(crate) fn upload_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
             let mut input = stdin.lock();
             let stdout = std::io::stdout();
             let mut output = stdout.lock();
-            serve_upload_pack(
-                &mut input,
-                &mut output,
-                &store,
-                kind,
-                &head,
-                &Interrupt::none(),
-            )?;
+            if v2 {
+                serve_upload_pack_v2(
+                    &mut input,
+                    &mut output,
+                    &store,
+                    kind,
+                    &head,
+                    &Interrupt::none(),
+                )?;
+            } else {
+                serve_upload_pack(
+                    &mut input,
+                    &mut output,
+                    &store,
+                    kind,
+                    &head,
+                    &Interrupt::none(),
+                )?;
+            }
             Ok(Vec::new())
         }
     }
