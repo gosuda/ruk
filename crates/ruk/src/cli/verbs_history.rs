@@ -4297,7 +4297,7 @@ fn clear_lane_state(ctx: &Ctx, verb: &str, head_key: Option<&str>) -> Result<(),
 /// terminal, and this interpreter never renders to one.
 ///
 /// Accepted history flags beyond the identity line: `--follow`, `-S`, `-G`,
-/// `--merges`/`--no-merges` (later `--no-merges` wins when both are given),
+/// `--merges`/`--no-merges` (both apply, so together they select nothing),
 /// `--first-parent`, `--left-right`/`--cherry-pick` (sides come from the
 /// first `A...B` range; without one every commit reads as right-side `>`),
 /// `--topo-order`, `--date-order` (the walk already pops newest
