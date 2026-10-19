@@ -3,7 +3,7 @@
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
-//! | `commit` | tree build + `ops::new`/`ops::edit` + branch move | implemented (multi `-m`, `-a`, `--amend`, `--allow-empty`, `-q`, `-C`/`-c`, `--author`, `--date`, `--dry-run`, `--no-verify` no-op) |
+//! | `commit` | tree build + `ops::new`/`ops::edit` + branch move | implemented (multi `-m`, `-a`, `--amend` (reuses `HEAD` message), `-F`, `--allow-empty`, `--allow-empty-message`, `-q`, `-C`/`-c`, `--author`, `--date`, `--signoff`, `--squash`, `--fixup`, `--reset-author`, `--cleanup`, `--template`, `--dry-run`, `--status`/`--no-status`/`--no-edit`/`--verbose` no-op, `--no-verify` no-op, `--edit` accepted with a message source, unsupported alone) |
 //! | `merge` | fast-forward fast-path + three-way lane | implemented (syntax lane first, bounded text fallback; `--no-ff`, `--ff-only`, `--continue`/`--abort`/`--quit`, `MERGE_HEAD` + stages 1/2/3 on conflict) |
 //! | `rebase` | range replay over the lane | implemented (`<upstream>` and `--onto`, `--continue`/`--skip`/`--abort`; drops merge commits, no branch switching) |
 //! | `cherry-pick` | per-commit replay over the lane | implemented (`-n`, `-m`, `-x`, `--continue`/`--skip`/`--abort`, `CHERRY_PICK_HEAD`) |
@@ -110,6 +110,84 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             takes_value: true,
         },
         FlagSpec {
+            long: "file",
+            short: Some('F'),
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "allow-empty-message",
+            short: None,
+            takes_value: false,
+        },
+        // Appends a `Signed-off-by` trailer from the committer identity.
+        FlagSpec {
+            long: "signoff",
+            short: Some('s'),
+            takes_value: false,
+        },
+        // Builds the message as `squash! <subject>` of the target commit;
+        // combinable with `-m` (body) the way the oracle concatenates.
+        FlagSpec {
+            long: "squash",
+            short: None,
+            takes_value: true,
+        },
+        // Builds the message as `fixup!`/`amend!`/`reword! <subject>`.
+        FlagSpec {
+            long: "fixup",
+            short: None,
+            takes_value: true,
+        },
+        // No editor exists, so `--no-edit` only selects the
+        // non-interactive path (already the only path); `--edit` fails
+        // closed below when it is the sole message source.
+        FlagSpec {
+            long: "no-edit",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "edit",
+            short: Some('e'),
+            takes_value: false,
+        },
+        // Editor-template flags only: accepted so scripts pass through,
+        // with no editor buffer to shape.
+        FlagSpec {
+            long: "status",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-status",
+            short: None,
+            takes_value: false,
+        },
+        // Shows the staged diff in the editor template only; the stored
+        // commit is identical, so this is a documented no-op.
+        FlagSpec {
+            long: "verbose",
+            short: Some('v'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "cleanup",
+            short: None,
+            takes_value: true,
+        },
+        // Seeds the message when no message option is given; ignored (but
+        // still required to read) otherwise, as in the oracle.
+        FlagSpec {
+            long: "template",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "reset-author",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
             long: "reuse-message",
             short: Some('C'),
             takes_value: true,
@@ -147,30 +225,47 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         refresh_tracked(ctx)?;
     }
     let rows = scan_index(store, kind)?;
+    let merging = pseudo_read_oid(store, "MERGE_HEAD")?.is_some();
+    // `--edit` only needs the editor when it is the sole message source:
+    // with `-m`/`-F`/`-C`/`--squash`/`--fixup`/`--template` (or the merge
+    // message, or `--amend --no-edit`) a no-op editor keeps the text
+    // as-is, so the flag is accepted and inert.
+    if opts.is_set("edit")
+        && !merging
+        && !has_message_source(&opts)
+        && !(opts.is_set("amend") && opts.is_set("no-edit"))
+    {
+        return Err(GitError::Unsupported {
+            command: "commit --edit needs an interactive editor".to_owned(),
+        });
+    }
     // An explicit `commit` over a conflicted merge concludes it the way the
     // oracle does: two parents and the pending merge message.
-    if pseudo_read_oid(store, "MERGE_HEAD")?.is_some() {
+    if merging {
         if opts.is_set("amend") {
             return Err(GitError::Invalid {
                 detail: "cannot amend while merging".to_owned(),
             });
         }
-        let message = if opts.is_set("message")
-            || opts.is_set("reuse-message")
-            || opts.is_set("reedit-message")
-        {
-            Some(commit_message(&opts, store, kind)?)
+        check_reset_author(&opts)?;
+        let message = if has_message_source(&opts) {
+            Some(resolve_commit_message(ctx, &opts, store, kind, false)?)
         } else {
             None
         };
         return conclude_merge(ctx, message);
     }
     let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
-    let message = commit_message(&opts, store, kind)?;
+    check_reset_author(&opts)?;
+    let amending = opts.is_set("amend");
+    let message = resolve_commit_message(ctx, &opts, store, kind, amending)?;
+    let committer = identity(ctx, IdentityRole::Committer)?;
     let author_text = opts.single("author")?;
-    let author_from_flag = author_text.is_some();
+    let author_from_flag = author_text.is_some() || opts.is_set("reset-author");
     let author = match author_text {
         Some(text) => parse_author_flag(&text)?,
+        // `--reset-author` renews authorship from the committer identity.
+        None if opts.is_set("reset-author") => committer.clone(),
         None => identity(ctx, IdentityRole::Author)?,
     };
     // `git commit --date` overrides the author date only.
@@ -192,7 +287,6 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             }
         }
     };
-    let committer = identity(ctx, IdentityRole::Committer)?;
     if opts.is_set("amend") {
         let out = commit_amend(ctx, tree, message, author, committer, author_from_flag)?;
         return finish(out);
@@ -356,14 +450,187 @@ fn refresh_tracked(ctx: &Ctx) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Reads the commit message: repeated `-m` paragraphs joined with a blank
-/// line (as in git), else the message reused from `-C`/`-c`.
-fn commit_message(
+/// Reports whether any message-source option was given (`-m`, `-F`,
+/// `-C`/`-c`, `--squash`, `--fixup`, `--template`).
+fn has_message_source(opts: &super::Collected) -> bool {
+    opts.is_set("message")
+        || opts.is_set("file")
+        || opts.is_set("reuse-message")
+        || opts.is_set("reedit-message")
+        || opts.is_set("squash")
+        || opts.is_set("fixup")
+        || opts.is_set("template")
+}
+
+/// Validates `--reset-author`: only with `-C`, `-c`, or `--amend`, and
+/// never with `--author`, the way the oracle refuses both shapes.
+fn check_reset_author(opts: &super::Collected) -> Result<(), GitError> {
+    if !opts.is_set("reset-author") {
+        return Ok(());
+    }
+    if opts.single("author")?.is_some() {
+        return Err(GitError::Invalid {
+            detail: "options '--reset-author' and '--author' cannot be used together".to_owned(),
+        });
+    }
+    let reused = opts.single("reuse-message")?.is_some() || opts.single("reedit-message")?.is_some();
+    if !opts.is_set("amend") && !reused {
+        return Err(GitError::Invalid {
+            detail: "--reset-author can be used only with -C, -c or --amend".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// How `--fixup` shapes the message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixupKind {
+    /// `--fixup <commit>`: `fixup! <subject>`, combinable with `-m`.
+    Fixup,
+    /// `--fixup=amend:<commit>`: `amend! <subject>` plus the full target
+    /// message, never with `-m`.
+    Amend,
+    /// `--fixup=reword:<commit>`: `reword! <subject>`; `-m` is ignored.
+    Reword,
+}
+
+/// Splits `--fixup=[(amend|reword):]<commit>` into its kind and revision.
+fn parse_fixup_flag(value: &str) -> (FixupKind, &str) {
+    if let Some(rev) = value.strip_prefix("amend:") {
+        return (FixupKind::Amend, rev);
+    }
+    if let Some(rev) = value.strip_prefix("reword:") {
+        return (FixupKind::Reword, rev);
+    }
+    (FixupKind::Fixup, value)
+}
+
+/// Message cleanup modes for `--cleanup` (and `commit.cleanup`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupMode {
+    /// Trim, drop `#` comments, collapse blanks (the default).
+    Strip,
+    /// Trim and collapse blanks, keep comments.
+    Whitespace,
+    /// No cleanup at all.
+    Verbatim,
+    /// Cut at the scissors marker, then clean like `whitespace`.
+    Scissors,
+}
+
+/// Reads the cleanup mode from `--cleanup` (falling back to
+/// `commit.cleanup`, then `strip`), refusing unknown modes.
+fn cleanup_mode_of(ctx: &Ctx, opts: &super::Collected) -> Result<CleanupMode, GitError> {
+    let flag = opts.single("cleanup")?;
+    let raw = match flag.as_deref() {
+        Some("default") | None => ctx.config_get("commit.cleanup"),
+        Some(mode) => Some(mode.to_owned()),
+    };
+    match raw.as_deref() {
+        None | Some("strip") | Some("default") => Ok(CleanupMode::Strip),
+        Some("whitespace") => Ok(CleanupMode::Whitespace),
+        Some("verbatim") => Ok(CleanupMode::Verbatim),
+        Some("scissors") => Ok(CleanupMode::Scissors),
+        Some(other) => Err(GitError::Invalid {
+            detail: format!(
+                "bad --cleanup {other:?}: want strip|whitespace|verbatim|scissors|default"
+            ),
+        }),
+    }
+}
+
+/// Reports whether one line is the scissors cut marker: `-- >8 --` with an
+/// optional `#` comment prefix, the way the oracle cuts the template.
+fn is_scissors_line(line: &str) -> bool {
+    let body = line.strip_prefix('#').unwrap_or(line);
+    let body = body.strip_prefix(' ').unwrap_or(body);
+    body == "-- >8 --"
+}
+
+/// Applies one cleanup mode: `strip` also drops `#` comment lines and
+/// `scissors` cuts at the marker first; every cleaning mode strips
+/// trailing whitespace, drops leading/trailing blank lines, collapses
+/// blank runs, and ends a non-empty message with one newline.
+fn apply_cleanup(text: &str, mode: CleanupMode) -> String {
+    if mode == CleanupMode::Verbatim {
+        return text.to_owned();
+    }
+    let mut lines: Vec<&str> = text.lines().collect();
+    if mode == CleanupMode::Scissors {
+        if let Some(cut) = lines.iter().position(|line| is_scissors_line(line)) {
+            lines.truncate(cut);
+        }
+    }
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if mode == CleanupMode::Strip && line.starts_with('#') {
+            continue;
+        }
+        kept.push(line.trim_end().to_owned());
+    }
+    while kept.first().is_some_and(|line| line.is_empty()) {
+        kept.remove(0);
+    }
+    while kept.last().is_some_and(|line| line.is_empty()) {
+        kept.pop();
+    }
+    let mut out = String::new();
+    let mut blank = false;
+    for line in kept {
+        if line.is_empty() {
+            blank = true;
+            continue;
+        }
+        if blank && !out.is_empty() {
+            out.push('\n');
+        }
+        blank = false;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Reads a `-F` log file, or standard input for `-`, the way the oracle
+/// reads the log from the file or descriptor zero.
+fn read_log_file(ctx: &Ctx, spec: &str) -> Result<String, GitError> {
+    if spec == "-" {
+        return super::read_stdin_text(&ctx.env);
+    }
+    std::fs::read_to_string(&spec).map_err(|err| GitError::Invalid {
+        detail: format!("could not read log file {spec:?}: {err}"),
+    })
+}
+
+/// Reads the full message of `HEAD` for `--amend --no-edit` without a
+/// message option, the oracle's `use_message = "HEAD"` fallback.
+fn head_message_text(store: &Store) -> Result<String, GitError> {
+    let tip = head_oid(store)?;
+    Ok(String::from_utf8_lossy(commit_record(store, tip)?.message()).into_owned())
+}
+
+/// Reads the subject (first line) of one revision for `--squash`/`--fixup`.
+fn commit_subject(store: &Store, kind: HashKind, rev: &str) -> Result<String, GitError> {
+    let oid = resolve_local(store, kind, rev)?;
+    Ok(first_subject_line(commit_record(store, oid)?.message()))
+}
+
+/// Resolves the full commit message in oracle precedence: a `--squash`
+/// subject prefix with a `-m`/`-F`/`-C` body, else `-m` paragraphs, a `-F`
+/// file, a `-C`/`-c` message, a `--fixup` subject line, a `--template`
+/// file (verbatim, never cleaned), or the `HEAD` message under
+/// `--amend --no-edit`. Cleanup (except for templates), `--signoff`, and
+/// the empty-message refusal apply on top.
+fn resolve_commit_message(
+    ctx: &Ctx,
     opts: &super::Collected,
     store: &Store,
     kind: HashKind,
+    amending: bool,
 ) -> Result<String, GitError> {
-    let reuse = match (
+    let have_m = opts.is_set("message");
+    let file = opts.single("file")?;
+    let (reuse_rev, reedit_rev) = match (
         opts.single("reuse-message")?,
         opts.single("reedit-message")?,
     ) {
@@ -372,28 +639,162 @@ fn commit_message(
                 detail: "cannot combine -C and -c".to_owned(),
             });
         }
+        pair => pair,
+    };
+    let squash = opts.single("squash")?;
+    let fixup = opts.single("fixup")?;
+    if have_m && (reuse_rev.is_some() || reedit_rev.is_some()) {
+        return Err(GitError::Invalid {
+            detail: "option -m cannot be combined with -C/-c".to_owned(),
+        });
+    }
+    if have_m && file.is_some() {
+        return Err(GitError::Invalid {
+            detail: "option -m cannot be combined with -F".to_owned(),
+        });
+    }
+    if squash.is_some() && fixup.is_some() {
+        return Err(GitError::Invalid {
+            detail: "options '--squash' and '--fixup' cannot be used together".to_owned(),
+        });
+    }
+    if fixup.is_some() && (reuse_rev.is_some() || reedit_rev.is_some() || file.is_some()) {
+        return Err(GitError::Invalid {
+            detail: "options '--fixup' and '-C/-c/-F' cannot be used together".to_owned(),
+        });
+    }
+    let fixup_parsed = fixup.as_deref().map(parse_fixup_flag);
+    if have_m && fixup_parsed.is_some_and(|(kind, _)| kind == FixupKind::Amend) {
+        return Err(GitError::Invalid {
+            detail: "options '-m' and '--fixup=amend:...' cannot be used together".to_owned(),
+        });
+    }
+    // Git terminates the joined `-m` paragraphs with a newline (`-m one`
+    // stores `one\n`), so the stored bytes match the oracle exactly.
+    let m_text = if have_m {
+        let parts = opts.all("message")?;
+        let mut text = parts.join("\n\n");
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        Some(text)
+    } else {
+        None
+    };
+    let reuse_text = match (reuse_rev, reedit_rev) {
         (Some(rev), None) | (None, Some(rev)) => Some(reused_message(store, kind, &rev)?),
         (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("-C/-c combination refused above"),
     };
-    let parts = opts.all("message")?;
-    match (reuse, parts.as_slice()) {
-        (Some(_), [_, ..]) => Err(GitError::Invalid {
-            detail: "option -m cannot be combined with -C/-c".to_owned(),
-        }),
-        (Some(text), _) => Ok(text),
-        (None, []) => Err(GitError::Invalid {
-            detail: "commit needs -m <message> (no editor is implemented)".to_owned(),
-        }),
-        // Git terminates the joined `-m` paragraphs with a newline (`-m one`
-        // stores `one\n`), so the stored bytes match the oracle exactly.
-        (None, _) => {
-            let mut message = parts.join("\n\n");
-            if !message.ends_with('\n') {
-                message.push('\n');
-            }
-            Ok(message)
+    let template = opts.single("template")?;
+    let mut from_template = false;
+    let raw = if let Some(rev) = squash.as_deref() {
+        let subject = commit_subject(store, kind, rev)?;
+        match (m_text, file, reuse_text) {
+            (Some(text), _, _) => format!("squash! {subject}\n\n{text}"),
+            (None, Some(spec), _) => format!("squash! {subject}\n\n{}", read_log_file(ctx, &spec)?),
+            // With `-C`, the oracle keeps only the reused body behind a
+            // `squash! ` marker, dropping a missing body entirely.
+            (None, None, Some(reused)) => match reused.split_once("\n\n") {
+                Some((_, body)) => format!("squash! {}", body.trim_start_matches('\n')),
+                None => "squash! ".to_owned(),
+            },
+            (None, None, None) => format!("squash! {subject}\n\n"),
         }
+    } else if let Some((fixup_kind, rev)) = fixup_parsed {
+        let subject = commit_subject(store, kind, rev)?;
+        let prefix = match fixup_kind {
+            FixupKind::Fixup => "fixup",
+            FixupKind::Amend => "amend",
+            FixupKind::Reword => "reword",
+        };
+        let mut text = format!("{prefix}! {subject}\n\n");
+        match fixup_kind {
+            // `-m` appends to a plain `fixup!` message only.
+            FixupKind::Fixup => {
+                if let Some(extra) = m_text {
+                    text.push_str(&extra);
+                }
+            }
+            FixupKind::Reword => {}
+            // An `amend!` target carries its full message (or just the
+            // body when the subject already says `amend!`), so the new
+            // message stays actionable for autosquash.
+            FixupKind::Amend => {
+                let oid = resolve_local(store, kind, rev)?;
+                let full =
+                    String::from_utf8_lossy(commit_record(store, oid)?.message()).into_owned();
+                if subject.starts_with("amend!") {
+                    match full.split_once('\n') {
+                        Some((_, body)) => text.push_str(body.trim_start_matches('\n')),
+                        None => {}
+                    }
+                } else {
+                    text.push_str(&full);
+                }
+            }
+        }
+        text
+    } else if let Some(text) = m_text {
+        text
+    } else if let Some(spec) = file {
+        read_log_file(ctx, &spec)?
+    } else if let Some(text) = reuse_text {
+        text
+    } else if let Some(spec) = template {
+        from_template = true;
+        std::fs::read_to_string(&spec).map_err(|err| GitError::Invalid {
+            detail: format!("could not read template {spec:?}: {err}"),
+        })?
+    } else if amending {
+        // The oracle seeds every sourceless `--amend` with the `HEAD`
+        // message for the editor; with no editor the seed is the message.
+        head_message_text(store)?
+    } else {
+        return Err(GitError::Invalid {
+            detail: "commit needs -m <message> (no editor is implemented)".to_owned(),
+        });
+    };
+    let mut message = if from_template {
+        // Templates seed the editor buffer verbatim; with no editor the
+        // bytes (plus any signoff) become the message uncleaned.
+        raw
+    } else {
+        apply_cleanup(&raw, cleanup_mode_of(ctx, opts)?)
+    };
+    if opts.is_set("signoff") {
+        append_signoff(ctx, &mut message)?;
     }
+    if message.trim().is_empty() && !opts.is_set("allow-empty-message") {
+        return Err(GitError::Invalid {
+            detail: "empty commit message".to_owned(),
+        });
+    }
+    Ok(message)
+}
+
+/// Appends a `Signed-off-by` trailer from the committer identity, keeping
+/// a blank-line separator and skipping a trailer that is already there.
+fn append_signoff(ctx: &Ctx, message: &mut String) -> Result<(), GitError> {
+    let committer = identity(ctx, IdentityRole::Committer)?;
+    let trailer = format!(
+        "Signed-off-by: {} <{}>",
+        String::from_utf8_lossy(committer.name.as_bytes()),
+        String::from_utf8_lossy(committer.email.as_bytes())
+    );
+    if message.lines().any(|line| line.trim() == trailer) {
+        return Ok(());
+    }
+    if message.trim().is_empty() {
+        *message = format!("{trailer}\n");
+        return Ok(());
+    }
+    let mut base = message.trim_end().to_owned();
+    base.push_str("\n\n");
+    base.push_str(&trailer);
+    base.push('\n');
+    *message = base;
+    Ok(())
 }
 
 /// Reads the message of one existing commit for `-C`/`-c`.
