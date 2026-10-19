@@ -785,7 +785,7 @@ fn read_bundle_file(ctx: &Ctx, file: &str) -> Result<Vec<u8>, GitError> {
 }
 
 /// Resolves `path` against the command's working directory.
-fn join_cwd(ctx: &Ctx, path: &str) -> std::path::PathBuf {
+pub(crate) fn join_cwd(ctx: &Ctx, path: &str) -> std::path::PathBuf {
     let candidate = std::path::Path::new(path);
     if candidate.is_absolute() {
         candidate.to_path_buf()

@@ -1831,8 +1831,324 @@ pub(crate) fn rebase(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     })
 }
 
-/// Applies existing commits elsewhere. Sequencer readers are real; content
-/// application needs the absent merge lane.
+/// Builds pick todos for `cherry-pick`: each commit replays parent→commit.
+fn cherry_pick_todos(
+    ctx: &Ctx,
+    oids: &[Oid],
+    mainline: Option<usize>,
+    with_reference: bool,
+) -> Result<Vec<PickTodo>, GitError> {
+    let store = ctx.store()?;
+    let mut todos = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let parents = commit_parents(store, *oid)?;
+        let base = match parents.len() {
+            0 => None,
+            1 => Some(parents[0]),
+            _ => match mainline {
+                Some(n) if n >= 1 && n <= parents.len() => Some(parents[n - 1]),
+                _ => {
+                    return Err(GitError::Invalid {
+                        detail: format!(
+                            "commit {} is a merge but no -m option was given",
+                            short_hex(oid)
+                        ),
+                    });
+                }
+            },
+        };
+        let record = commit_record(store, *oid)?;
+        let mut message =
+            String::from_utf8_lossy(record.message()).into_owned();
+        if with_reference {
+            message = format!(
+                "{}\n(cherry picked from commit {})",
+                message.trim_end(),
+                oid.to_hex()
+            );
+            message.push('\n');
+        }
+        todos.push(PickTodo {
+            oid: oid.to_hex(),
+            base: base.map_or_else(String::new, |parent| parent.to_hex()),
+            theirs: oid.to_hex(),
+            message,
+            label: short_hex(oid),
+        });
+    }
+    Ok(todos)
+}
+
+/// Builds pick todos for `revert`: each commit replays commit→parent, the
+/// inverse of a cherry-pick.
+fn revert_todos(
+    ctx: &Ctx,
+    oids: &[Oid],
+    mainline: Option<usize>,
+) -> Result<Vec<PickTodo>, GitError> {
+    let store = ctx.store()?;
+    let mut todos = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let parents = commit_parents(store, *oid)?;
+        let parent = match parents.len() {
+            0 => {
+                return Err(GitError::Invalid {
+                    detail: format!("commit {} is a root commit", short_hex(oid)),
+                });
+            }
+            1 => parents[0],
+            _ => match mainline {
+                Some(n) if n >= 1 && n <= parents.len() => parents[n - 1],
+                _ => {
+                    return Err(GitError::Invalid {
+                        detail: format!(
+                            "commit {} is a merge but no -m option was given",
+                            short_hex(oid)
+                        ),
+                    });
+                }
+            },
+        };
+        let record = commit_record(store, *oid)?;
+        let subject = String::from_utf8_lossy(record.message())
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        todos.push(PickTodo {
+            oid: oid.to_hex(),
+            base: oid.to_hex(),
+            theirs: parent.to_hex(),
+            message: format!("Revert \"{subject}\"\n\nThis reverts commit {}.\n", oid.to_hex()),
+            label: format!("revert of {}", short_hex(oid)),
+        });
+    }
+    Ok(todos)
+}
+
+/// Applies pending picks in order, committing each clean one and stopping
+/// with sequencer state at the first conflict.
+fn apply_pick_todos(
+    ctx: &mut Ctx,
+    verb: &str,
+    head_key: Option<&str>,
+    orig_hex: &str,
+    todos: Vec<PickTodo>,
+    no_commit: bool,
+) -> Result<Vec<u8>, GitError> {
+    let mut remaining = todos;
+    let mut out = Vec::new();
+    while let Some(todo) = remaining.first().cloned() {
+        let store = ctx.store()?;
+        let kind = ctx.kind()?;
+        let head = head_oid(store)?;
+        let head_tree = commit_tree_oid(&commit_record(store, head)?)?;
+        let empty = build_index_tree(store, kind, &[])?;
+        let base_tree = if todo.base.is_empty() {
+            empty
+        } else {
+            let base_oid = Oid::from_hex(&todo.base).map_err(|_| GitError::Corrupt {
+                detail: format!("sequencer todo for {verb} does not decode"),
+            })?;
+            commit_tree_oid(&commit_record(store, base_oid)?)?
+        };
+        let picked = Oid::from_hex(&todo.oid).map_err(|_| GitError::Corrupt {
+            detail: format!("sequencer todo for {verb} does not decode"),
+        })?;
+        let theirs_tree = commit_tree_oid(&commit_record(store, picked)?)?;
+        let rows = require_clean_index(store, kind)?;
+        let plan = plan_merge_trees(ctx, base_tree, head_tree, theirs_tree, "HEAD", &todo.label)?;
+        let head_map = lane_tree_map(store, kind, head_tree)?;
+        guard_lane_worktree(ctx, &rows, &head_map, &plan, verb)?;
+        let staged = apply_merge_plan(ctx, &plan)?;
+        if plan.conflicted.is_empty() {
+            if !no_commit {
+                let new_oid = lane_commit(
+                    ctx,
+                    build_index_tree(store, kind, &staged)?,
+                    vec![head],
+                    todo.message.clone(),
+                )?;
+                out.extend_from_slice(&pick_summary(ctx, head_tree, new_oid)?);
+            }
+            remaining.remove(0);
+        } else {
+            write_lane_state(ctx, verb, head_key, orig_hex, &todo.oid, &todo.message, &remaining)?;
+            return Err(pick_conflict_error(verb, &todo, &plan));
+        }
+    }
+    clear_lane_state(ctx, verb, head_key)?;
+    Ok(out)
+}
+
+/// Renders `[branch short] subject` for one applied pick.
+fn pick_summary(ctx: &Ctx, old_tree: Oid, new_oid: Oid) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let new_tree = commit_tree_oid(&commit_record(store, new_oid)?)?;
+    let label = branch_label_of(ctx)?;
+    let subject = message_subject(ctx, &new_oid)?;
+    commit_summary(ctx, Some(old_tree), new_tree, &new_oid, &label, &subject)
+}
+
+/// Renders the oracle-style conflict report for a stopped pick.
+fn pick_conflict_error(verb: &str, todo: &PickTodo, plan: &MergePlan) -> GitError {
+    let subject = todo.message.lines().next().unwrap_or_default().to_owned();
+    let short = &todo.oid[..todo.oid.len().min(7)];
+    let mut detail = String::new();
+    for path in &plan.auto_merged {
+        detail.push_str(&format!("Auto-merging {path}\n"));
+    }
+    for path in &plan.conflicted {
+        detail.push_str(&format!("CONFLICT (content): Merge conflict in {path}\n"));
+    }
+    detail.push_str(&format!("error: could not apply {short}... {subject}\n"));
+    detail.push_str(&format!(
+        "hint: after resolving the conflicts, run `{verb} --continue`\n"
+    ));
+    detail.push_str(&format!("hint: use `{verb} --skip` to skip this patch\n"));
+    detail.push_str(&format!("hint: use `{verb} --abort` to cancel"));
+    GitError::Invalid { detail }
+}
+
+/// Resumes a stopped pick sequence from the resolved index.
+fn pick_continue(
+    ctx: &mut Ctx,
+    verb: &str,
+    head_key: Option<&str>,
+) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let Some(seq) = sequencer_read(store, verb)? else {
+        return no_sequencer(verb, "continue");
+    };
+    let todos = read_lane_todos(store, verb)?.ok_or_else(|| GitError::Corrupt {
+        detail: format!("sequencer todo for {verb} does not decode"),
+    })?;
+    let Some(current) = todos.first().cloned() else {
+        return Err(GitError::Corrupt {
+            detail: format!("sequencer todo for {verb} is empty"),
+        });
+    };
+    let kind = ctx.kind()?;
+    let rows = scan_index(store, kind)?;
+    if rows.iter().any(|(_, stage, _)| *stage != Stage::Zero) {
+        return Err(GitError::Invalid {
+            detail: "unmerged paths must be resolved first".to_owned(),
+        });
+    }
+    let head = head_oid(store)?;
+    let head_tree = commit_tree_oid(&commit_record(store, head)?)?;
+    let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
+    let new_oid = lane_commit(ctx, tree, vec![head], current.message.clone())?;
+    let mut out = pick_summary(ctx, head_tree, new_oid)?;
+    let rest = todos[1..].to_vec();
+    if rest.is_empty() {
+        clear_lane_state(ctx, verb, head_key)?;
+        return Ok(out);
+    }
+    out.extend_from_slice(&apply_pick_todos(ctx, verb, head_key, &seq.head_hex, rest, false)?);
+    Ok(out)
+}
+
+/// Skips the stopped pick, resets its conflict rows to `HEAD`, and applies
+/// the rest of the sequence.
+fn pick_skip(ctx: &mut Ctx, verb: &str, head_key: Option<&str>) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let Some(seq) = sequencer_read(store, verb)? else {
+        return no_sequencer(verb, "skip");
+    };
+    let todos = read_lane_todos(store, verb)?.ok_or_else(|| GitError::Corrupt {
+        detail: format!("sequencer todo for {verb} does not decode"),
+    })?;
+    if todos.len() <= 1 {
+        clear_lane_state(ctx, verb, head_key)?;
+        return Ok(Vec::new());
+    }
+    reset_unmerged_to_head(ctx)?;
+    let rest = todos[1..].to_vec();
+    apply_pick_todos(ctx, verb, head_key, &seq.head_hex, rest, false)
+}
+
+/// Resets every unmerged index path to its `HEAD` state, for `--skip`.
+fn reset_unmerged_to_head(ctx: &Ctx) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let head = head_oid(store)?;
+    let head_tree = commit_tree_oid(&commit_record(store, head)?)?;
+    let head_map = lane_tree_map(store, kind, head_tree)?;
+    let rows = scan_index(store, kind)?;
+    let mut paths = std::collections::BTreeSet::new();
+    for (path, stage, _) in &rows {
+        if *stage != Stage::Zero {
+            paths.insert(path.as_bytes().to_vec());
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut mutations = Vec::new();
+    let mut writes: Vec<(Vec<u8>, LaneWrite)> = Vec::new();
+    for path in paths {
+        let repo_path =
+            RepoPath::new(path.clone()).map_err(|err| GitError::from(CoreError::from(err)))?;
+        let before = read_path_rows(store, kind, &repo_path)?;
+        let after = match head_map.get(&path) {
+            Some((mode, oid)) => {
+                let entry = lane_entry(mode.as_index_mode()?, *oid)?;
+                writes.push((
+                    path.clone(),
+                    LaneWrite::Blob {
+                        mode: mode.as_index_mode()?,
+                        oid: *oid,
+                    },
+                ));
+                vec![(Stage::Zero, entry)]
+            }
+            None => {
+                writes.push((path.clone(), LaneWrite::Remove));
+                Vec::new()
+            }
+        };
+        mutations.extend(super::state::path_row_mutations(&repo_path, &before, &after)?);
+    }
+    let (workspace, raw) = load_or_default(store)?;
+    let next = workspace
+        .mutate_index(workspace.stamp)
+        .map_err(|err| GitError::from(CoreError::from(err)))?;
+    mutations.push(workspace_mutation(raw.as_deref(), &next)?);
+    store
+        .publish(Vec::new(), &mutations)
+        .map_err(GitError::from)?;
+    sync_lane_worktree(ctx, &writes)
+}
+
+/// Abandons a pick sequence, restoring the pre-operation index and branch.
+fn pick_abort(ctx: &mut Ctx, verb: &str, head_key: Option<&str>) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let Some(seq) = sequencer_read(store, verb)? else {
+        return no_sequencer(verb, "abort");
+    };
+    let orig = Oid::from_hex(&seq.head_hex).map_err(|_| GitError::Corrupt {
+        detail: format!("{verb} sequencer head does not decode"),
+    })?;
+    if head_oid(store)? != orig {
+        super::verbs_branch::move_branch_to(ctx, orig)?;
+    }
+    restore_abort_index(ctx, verb)?;
+    clear_lane_state(ctx, verb, head_key)?;
+    Ok(Vec::new())
+}
+
+/// Drops pick state while keeping the index and worktree as they are.
+fn pick_quit(ctx: &mut Ctx, verb: &str, head_key: Option<&str>) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    if sequencer_read(store, verb)?.is_none() {
+        return no_sequencer(verb, "quit");
+    }
+    clear_lane_state(ctx, verb, head_key)?;
+    Ok(Vec::new())
+}
+
+/// Applies existing commits elsewhere, one three-way merge per commit.
 ///
 /// Oracle: `git/builtin/revert.c` (`cmd_cherry_pick`).
 pub(crate) fn cherry_pick(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
@@ -1882,14 +2198,17 @@ pub(crate) fn cherry_pick(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
     ];
     let opts = collect_expanded(args, &specs)?;
     ctx.require_worktree()?;
-    if opts.is_set("abort") || opts.is_set("quit") {
-        return no_sequencer("cherry-pick", "abort");
+    if opts.is_set("abort") {
+        return pick_abort(ctx, "cherry-pick", Some("CHERRY_PICK_HEAD"));
+    }
+    if opts.is_set("quit") {
+        return pick_quit(ctx, "cherry-pick", Some("CHERRY_PICK_HEAD"));
     }
     if opts.is_set("continue") {
-        return no_sequencer("cherry-pick", "continue");
+        return pick_continue(ctx, "cherry-pick", Some("CHERRY_PICK_HEAD"));
     }
     if opts.is_set("skip") {
-        return no_sequencer("cherry-pick", "skip");
+        return pick_skip(ctx, "cherry-pick", Some("CHERRY_PICK_HEAD"));
     }
     check_mainline(&opts)?;
     if opts.positionals.is_empty() {
@@ -1899,16 +2218,32 @@ pub(crate) fn cherry_pick(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
     }
     let store = ctx.store()?;
     let kind = ctx.kind()?;
+    let mut oids = Vec::with_capacity(opts.positionals.len());
     for rev in &opts.positionals {
-        resolve_rev(store, kind, rev)?;
+        oids.push(resolve_rev(store, kind, rev)?);
     }
-    let _ = sequencer_read(store, "cherry-pick")?;
-    Err(GitError::Unsupported {
-        command: "cherry-pick needs the merge lane".to_owned(),
-    })
+    let mainline = opts
+        .single("mainline")?
+        .map(|text| {
+            text.parse::<usize>().map_err(|_| GitError::Invalid {
+                detail: format!("bad --mainline {text:?}: want a parent number"),
+            })
+        })
+        .transpose()?;
+    let todos = cherry_pick_todos(ctx, &oids, mainline, opts.is_set("x"))?;
+    let orig_hex = head_oid(store)?.to_hex();
+    snapshot_abort_index(ctx, "cherry-pick")?;
+    apply_pick_todos(
+        ctx,
+        "cherry-pick",
+        Some("CHERRY_PICK_HEAD"),
+        &orig_hex,
+        todos,
+        opts.is_set("no-commit"),
+    )
 }
 
-/// Reverts existing commits. Same backing shape as `cherry-pick`.
+/// Reverts existing commits, one inverse three-way merge per commit.
 ///
 /// Oracle: `git/builtin/revert.c` (`cmd_revert`).
 pub(crate) fn revert(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
@@ -1951,14 +2286,17 @@ pub(crate) fn revert(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     ];
     let opts = collect_expanded(args, &specs)?;
     ctx.require_worktree()?;
-    if opts.is_set("abort") || opts.is_set("quit") {
-        return no_sequencer("revert", "abort");
+    if opts.is_set("abort") {
+        return pick_abort(ctx, "revert", Some("REVERT_HEAD"));
+    }
+    if opts.is_set("quit") {
+        return pick_quit(ctx, "revert", Some("REVERT_HEAD"));
     }
     if opts.is_set("continue") {
-        return no_sequencer("revert", "continue");
+        return pick_continue(ctx, "revert", Some("REVERT_HEAD"));
     }
     if opts.is_set("skip") {
-        return no_sequencer("revert", "skip");
+        return pick_skip(ctx, "revert", Some("REVERT_HEAD"));
     }
     check_mainline(&opts)?;
     if opts.positionals.is_empty() {
@@ -1968,13 +2306,29 @@ pub(crate) fn revert(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     }
     let store = ctx.store()?;
     let kind = ctx.kind()?;
+    let mut oids = Vec::with_capacity(opts.positionals.len());
     for rev in &opts.positionals {
-        resolve_rev(store, kind, rev)?;
+        oids.push(resolve_rev(store, kind, rev)?);
     }
-    let _ = sequencer_read(store, "revert")?;
-    Err(GitError::Unsupported {
-        command: "revert needs the merge lane".to_owned(),
-    })
+    let mainline = opts
+        .single("mainline")?
+        .map(|text| {
+            text.parse::<usize>().map_err(|_| GitError::Invalid {
+                detail: format!("bad --mainline {text:?}: want a parent number"),
+            })
+        })
+        .transpose()?;
+    let todos = revert_todos(ctx, &oids, mainline)?;
+    let orig_hex = head_oid(store)?.to_hex();
+    snapshot_abort_index(ctx, "revert")?;
+    apply_pick_todos(
+        ctx,
+        "revert",
+        Some("REVERT_HEAD"),
+        &orig_hex,
+        todos,
+        opts.is_set("no-commit"),
+    )
 }
 
 // ===========================================================================

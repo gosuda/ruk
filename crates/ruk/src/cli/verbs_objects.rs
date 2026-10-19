@@ -13,8 +13,8 @@
 //! | `count-objects` | `Store::iter_objects` census, no payload I/O | implemented (`<n> objects, <bytes>`) |
 //! | `ls-tree` | tree parse/flatten | implemented (`-r`, `--name-only`) |
 //! | `check-ref-format` | `RefName` validation | implemented |
-//! | `index-pack` | declared absent for this slice | unsupported |
-//! | `pack-objects` | declared absent for this slice | unsupported |
+//! | `index-pack` | ingest plus publication with commit-record facts (no `.idx`: the store keeps no loose/pack split) | implemented (`-v`, `--stdin`) |
+//! | `pack-objects` | self-contained pack v2 to `<base>.pack` or `--stdout` | implemented (`--stdout`, `--revs`, `--all`, `--thin` with `--stdout`, `--no-thin`, `--delta-base-offset`/`--no-delta-base-offset`) |
 //!
 //! Oracle anchors: `git/builtin/hash-object.c`, `git/builtin/cat-file.c`,
 //! `git/builtin/mktree.c`, `git/builtin/commit-tree.c`,
@@ -690,22 +690,397 @@ pub(crate) fn check_ref_format(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8
     Ok(Vec::new())
 }
 
-/// Builds a pack index. Declared absent for this slice.
+/// Indexes a pack file into the store: integrity-verified ingest plus
+/// publication, the store's analog of writing the oracle's `.idx`.
 ///
-/// Oracle: `git/builtin/index-pack.c`.
-pub(crate) fn index_pack(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "index-pack: pack indexing is absent in this slice".to_owned(),
-    })
+/// Oracle: `git/builtin/index-pack.c`. The store keeps no loose/pack
+/// split, so there is no index file to write: the pack is verified the
+/// way `verify-pack` verifies it (header, entries, trailer checksum,
+/// deltas, identities) and then published with its commit-record facts,
+/// the same tail `unbundle` and fetch use, so history verbs see the
+/// arrivals. The pack comes from `--stdin` or from the one `<pack>`
+/// positional, never both. Named gaps (usage errors): `-o`,
+/// `--index-version`, `--fix-thin` (thin bases must already be committed,
+/// the thin-pack rule ingest enforces), `--strict`, `--verify`,
+/// `--check-self-contained-and-connected`, `--keep`, `--progress`,
+/// `--threads`, `--max-input-size`.
+pub(crate) fn index_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    const USAGE: &str = "usage: index-pack [-v] (--stdin | <pack>)";
+    let specs = [
+        FlagSpec {
+            long: "verbose",
+            short: Some('v'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "stdin",
+            short: None,
+            takes_value: false,
+        },
+    ];
+    let opts = collect(args, &specs)?;
+    let path = match (opts.is_set("stdin"), opts.positionals.as_slice()) {
+        (true, []) => None,
+        (false, [path]) => Some(path.clone()),
+        _ => {
+            return Err(GitError::Invalid {
+                detail: USAGE.to_owned(),
+            });
+        }
+    };
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let (label, bytes) = match path {
+        Some(path) => {
+            let bytes = std::fs::read(&path).map_err(|err| GitError::Io {
+                detail: format!("reading {path}: {err}"),
+            })?;
+            (path, bytes)
+        }
+        None => (
+            "stdin".to_owned(),
+            super::read_stdin_bytes(&ctx.env)?,
+        ),
+    };
+    let staged = ruk_git::transport::pack::ingest_pack(
+        &bytes[..],
+        kind,
+        store,
+        ruk_git::transport::pack::IngestLimits::default(),
+        &ruk_git::transport::Interrupt::none(),
+    )?;
+    let count = staged.oids().len();
+    let mut out = Vec::new();
+    if opts.is_set("verbose") {
+        for object in staged.objects() {
+            out.extend_from_slice(
+                format!("{} {}\n", object.oid().to_hex(), kind_name_of(object.kind())).as_bytes(),
+            );
+        }
+    }
+    let facts = ruk_git::transport::fetch::commit_record_facts(store, &staged)?;
+    store
+        .publish(staged.into_objects(), &facts)
+        .map_err(GitError::from)?;
+    out.extend_from_slice(format!("{label}: ok ({count} objects indexed)\n").as_bytes());
+    Ok(out)
 }
 
-/// Creates a packed archive. Declared absent for this slice.
+/// Creates a packed archive of objects, into `<base>.pack` or, with
+/// `--stdout`, onto standard output.
 ///
-/// Oracle: `git/builtin/pack-objects.c`.
-pub(crate) fn pack_objects(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "pack-objects: pack generation is absent in this slice".to_owned(),
-    })
+/// Oracle: `git/builtin/pack-objects.c`. Selection mirrors the oracle:
+/// input always comes from stdin (exactly one output target: `--stdout`
+/// xor `<base>`, no trailing positionals). Without `--revs`/`--all`,
+/// stdin lines name exact objects (`<hex>[ SP <path>]`, one per line; a
+/// leading `-` marks a thin preferred base, accepted while its entry
+/// stays full, see below). With `--revs`, stdin lines are rev-list
+/// arguments (one per line, ending at the first blank line; `--not` and
+/// `--shallow` lines are refused with their ruk spellings), and `--all`
+/// unions every ref tip. Selected commits close over their trees, blobs,
+/// and tag targets (a directly named tag packs the tag plus its target's
+/// tree, not the target's ancestry: name the commit rev for ancestry);
+/// gitlink entries are never packed (entries minus gitlinks, the pack
+/// layer's own link rule), and a native conflict entry is refused the way
+/// the wire writer refuses it. Emission is always a self-contained pack
+/// v2: `--thin` is honored only with `--stdout` (the oracle refuses
+/// `--thin` for an indexable pack) and, with no receiver haves to pair,
+/// entries stay full rather than `REF_DELTA`; `--delta-base-offset` and
+/// `--no-delta-base-offset` are accepted inert (the writer emits full
+/// entries, never `OFS_DELTA`). Named gaps (usage errors): `--depth`,
+/// `--window`, `--compression`, `--threads`, `--max-pack-size`,
+/// `--progress`/`-q`, `--non-empty`, `--unpacked`, `--filter`,
+/// `--shallow`, `--keep-true-parents`, `--honor-pack-keep`,
+/// `--include-tag`, `--stdin-packs`, `--cruft`, `--keep-pack`,
+/// `--local`, `--incremental`.
+pub(crate) fn pack_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    const USAGE: &str = "usage: pack-objects [--stdout | <base>] [--revs] [--all] [--thin] < <list>";
+    let specs = [
+        FlagSpec {
+            long: "stdout",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "revs",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "all",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "thin",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-thin",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "delta-base-offset",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-delta-base-offset",
+            short: None,
+            takes_value: false,
+        },
+    ];
+    let opts = collect(args, &specs)?;
+    if opts.is_set("thin") && !opts.is_set("stdout") {
+        return Err(GitError::Invalid {
+            detail: "--thin cannot be used to build an indexable pack".to_owned(),
+        });
+    }
+    let base = match (opts.is_set("stdout"), opts.positionals.as_slice()) {
+        (true, []) => None,
+        (false, [base]) => Some(base.clone()),
+        _ => {
+            return Err(GitError::Invalid {
+                detail: USAGE.to_owned(),
+            });
+        }
+    };
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let stdin = super::read_stdin_text(&ctx.env)?;
+    let payloads = if opts.is_set("revs") || opts.is_set("all") {
+        pack_rev_closure(store, kind, &opts, &stdin)?
+    } else {
+        pack_exact_objects(store, &stdin)?
+    };
+    let entries: Vec<ruk_git::transport::pack::PackEntry<'_>> = payloads
+        .iter()
+        .map(|(oid, object_kind, bytes)| ruk_git::transport::pack::PackEntry {
+            oid: *oid,
+            kind: *object_kind,
+            bytes,
+            base: None,
+        })
+        .collect();
+    let mut pack = Vec::new();
+    ruk_git::transport::pack::write_pack(
+        &mut pack,
+        kind,
+        &entries,
+        &ruk_git::transport::Interrupt::none(),
+    )?;
+    match base {
+        None => Ok(pack),
+        Some(base) => {
+            let name = format!("{base}.pack");
+            let dest = super::verbs_bundle::join_cwd(ctx, &name);
+            std::fs::write(&dest, &pack).map_err(|err| GitError::Io {
+                detail: format!("writing {}: {err}", dest.display()),
+            })?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Packs exactly the objects stdin names, with no closure expansion.
+///
+/// One `<hex>[ SP <path>]` per line, the oracle's object-list grammar; a
+/// leading `-` marks a thin preferred base, which is accepted and packed
+/// as a full entry (thin delta pairing belongs to the push negotiation,
+/// which owns the permitted-base contract). A blank or non-hex line is
+/// `Invalid`, the way the oracle dies on garbage.
+fn pack_exact_objects(
+    store: &Store,
+    stdin: &str,
+) -> Result<Vec<(ruk_core::ids::Oid, ObjectKind, Vec<u8>)>, GitError> {
+    let mut payloads = Vec::new();
+    for line_text in stdin.lines() {
+        let token = line_text.split_whitespace().next().unwrap_or("");
+        if let Some(_base) = token.strip_prefix('-') {
+            continue;
+        }
+        let oid = ruk_core::ids::Oid::from_hex(token).map_err(|_| GitError::Invalid {
+            detail: format!("expected object ID, got garbage:\n {line_text}"),
+        })?;
+        let (object_kind, bytes) = read_object_bytes(store, oid)?;
+        if object_kind == ObjectKind::Conflict {
+            return Err(GitError::Invalid {
+                detail: format!(
+                    "object {} is a native conflict and cannot travel on the Git wire",
+                    oid.to_hex()
+                ),
+            });
+        }
+        payloads.push((oid, object_kind, bytes));
+    }
+    payloads.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(payloads)
+}
+
+/// Expands `--revs`/`--all` stdin lines through the `rev-list` machinery
+/// and closes over the selected commits.
+fn pack_rev_closure(
+    store: &Store,
+    kind: ruk_core::ids::HashKind,
+    opts: &super::Collected,
+    stdin: &str,
+) -> Result<Vec<(ruk_core::ids::Oid, ObjectKind, Vec<u8>)>, GitError> {
+    let mut rev_args = Vec::new();
+    for line_text in stdin.lines() {
+        if line_text.is_empty() {
+            break;
+        }
+        if line_text == "--not" {
+            return Err(GitError::Invalid {
+                detail: "--not lines are not supported; spell excludes as ^<rev> or <a>..<b>"
+                    .to_owned(),
+            });
+        }
+        if line_text.starts_with("--shallow") {
+            return Err(GitError::Unsupported {
+                command: "pack-objects: shallow lines are not supported".to_owned(),
+            });
+        }
+        rev_args.push(line_text.to_owned());
+    }
+    let (tips, exclude) =
+        super::verbs_history::parse_log_revs(store, kind, &rev_args, None)?;
+    let mut all_tips = tips;
+    if opts.is_set("all") {
+        all_tips.extend(pack_all_tips(store, kind)?);
+    }
+    // The history walk takes commits only (`enqueue` fails closed on any
+    // other kind), so partition first: other objects seed the closure
+    // directly and traverse freely.
+    let mut commit_tips = Vec::new();
+    let mut extra_seeds = Vec::new();
+    let mut seen_tip = std::collections::HashSet::new();
+    for tip in all_tips {
+        if !seen_tip.insert(tip) {
+            continue;
+        }
+        if super::state::commit_record(store, tip).is_ok() {
+            commit_tips.push(tip);
+        } else {
+            extra_seeds.push(tip);
+        }
+    }
+    let history =
+        super::verbs_history::walk_history_excluding(store, &commit_tips, &exclude, None)?;
+    let mut allowed: std::collections::HashSet<ruk_core::ids::Oid> =
+        history.iter().map(|(oid, _)| *oid).collect();
+    let mut seeds: Vec<ruk_core::ids::Oid> = history.iter().map(|(oid, _)| *oid).collect();
+    for tip in extra_seeds {
+        allowed.insert(tip);
+        seeds.push(tip);
+    }
+    pack_closure(store, kind, &seeds, &allowed)
+}
+
+/// Collects every ref tip for `--all`: commit tips for the history walk
+/// plus tag objects as-is. Unlike the `rev-list --all` tip set, tag tips
+/// are kept: the pack must carry the tag objects themselves.
+fn pack_all_tips(
+    store: &Store,
+    kind: ruk_core::ids::HashKind,
+) -> Result<Vec<ruk_core::ids::Oid>, GitError> {
+    let mut tips = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (name, _) in super::state::list_refs(store)? {
+        let text = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        match super::state::resolve_rev(store, kind, &text) {
+            Ok(oid) => {
+                if seen.insert(oid) {
+                    tips.push(oid);
+                }
+            }
+            Err(GitError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(tips)
+}
+
+/// Collects the pack closure for revision-selected seeds: every seed plus
+/// its tree subtree, every traversed tag with its target. Commit parents
+/// outside `allowed` stay out, so `^` excludes and range floors hold;
+/// non-commit seeds traverse freely. Termination is by visited set, so no
+/// depth bound is needed. Gitlink entries are never queued (entries minus
+/// gitlinks, the pack layer's own link rule); a native conflict entry is
+/// refused, the way the wire writer refuses it.
+fn pack_closure(
+    store: &Store,
+    kind: ruk_core::ids::HashKind,
+    seeds: &[ruk_core::ids::Oid],
+    allowed: &std::collections::HashSet<ruk_core::ids::Oid>,
+) -> Result<Vec<(ruk_core::ids::Oid, ObjectKind, Vec<u8>)>, GitError> {
+    use std::collections::{HashSet, VecDeque};
+    let mut visited: HashSet<ruk_core::ids::Oid> = HashSet::new();
+    let mut queue: VecDeque<ruk_core::ids::Oid> = seeds.iter().copied().collect();
+    let mut out = Vec::new();
+    while let Some(oid) = queue.pop_front() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        let (object_kind, bytes) = read_object_bytes(store, oid)?;
+        if object_kind == ObjectKind::Conflict {
+            return Err(GitError::Invalid {
+                detail: format!(
+                    "object {} is a native conflict and cannot travel on the Git wire",
+                    oid.to_hex()
+                ),
+            });
+        }
+        match object_kind {
+            ObjectKind::Commit => {
+                let record = super::state::commit_record(store, oid)?;
+                for parent in record
+                    .parents()
+                    .iter()
+                    .filter_map(|head| head.as_git().copied())
+                {
+                    if allowed.contains(&parent) {
+                        queue.push_back(parent);
+                    }
+                }
+                queue.push_back(super::tree::commit_tree_oid(&record)?);
+            }
+            ObjectKind::Tree => {
+                for entry in parse_tree(kind, &bytes)? {
+                    if !matches!(entry.mode, TreeMode::Gitlink) {
+                        queue.push_back(entry.oid);
+                    }
+                }
+            }
+            ObjectKind::Tag => {
+                queue.push_back(pack_tag_target(kind, oid, &bytes)?);
+            }
+            ObjectKind::Blob | ObjectKind::Conflict => {}
+        }
+        out.push((oid, object_kind, bytes));
+    }
+    out.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(out)
+}
+
+/// Reads the `object <hex>` target of one tag payload, the same header
+/// the bundle peel reads. The target's own kind decides traversal; a
+/// tag-to-blob needs no commit.
+fn pack_tag_target(
+    kind: ruk_core::ids::HashKind,
+    oid: ruk_core::ids::Oid,
+    bytes: &[u8],
+) -> Result<ruk_core::ids::Oid, GitError> {
+    let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let hex = first
+        .strip_prefix(b"object ")
+        .ok_or_else(|| GitError::Corrupt {
+            detail: format!("tag {} has no object header", oid.to_hex()),
+        })?;
+    let text = std::str::from_utf8(hex).map_err(|_| GitError::Corrupt {
+        detail: format!("tag {} has a non-UTF-8 object header", oid.to_hex()),
+    })?;
+    ruk_git::parse_oid_for(text, kind)
 }

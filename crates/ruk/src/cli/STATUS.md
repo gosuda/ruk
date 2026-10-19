@@ -61,7 +61,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | grep | implemented | subset: `-l`, `-c`, `-n`, `-e`, `-i`, `-w`, `-F`, `-E` (last of `-F`/`-E` wins), `-H`/`--with-filename`/`--no-filename`, one `<commit>` for tree scope; 0 hit / 1 no hit / 128 bad use; no pathspecs, no `.rukignore`, always-Rust-regex patterns |
 | hash-object | implemented | `-t blob/tree/commit`, `-w` stores; works outside a repository without `-w` |
 | help | implemented | verb list and per-verb summaries |
-| index-pack | unsupported | declared absent for this slice |
+| index-pack | implemented | ingest plus publication with commit-record facts; `-v`, `--stdin`; no `.idx` (the store keeps no loose/pack split); thin bases must already be committed |
 | init | implemented | `--object-format`, `--bare`, reinit; unborn `HEAD` on `refs/heads/main` |
 | log | implemented | `--oneline`, `-n`/`--max-count` |
 | ls-files | implemented | `-s`, `-u`, `--others`, `--error-unmatch` |
@@ -72,7 +72,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | migrate | implemented | exact import of a real `.git` (loose, packs, refs, `HEAD`); `--force` replaces an existing `.ruk`; no checkout/config/hooks |
 | mktree | implemented | canonical sort, mode/type agreement checks |
 | mv | implemented | all stages renamed, worktree file renamed; `-f` allows overwrite |
-| pack-objects | unsupported | declared absent for this slice |
+| pack-objects | implemented | self-contained pack v2 to `<base>.pack` or `--stdout`; stdin-only input (exact oids, or rev-list args with `--revs`, plus `--all`); `--thin` needs `--stdout` and stays full without receiver haves; `--no-thin`, `--delta-base-offset`/`--no-delta-base-offset` inert |
 | pull | implemented | local paths only; fetch plus fast-forward merge |
 | push | implemented | local, `ssh://`, `git://`, and smart/dumb-http; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
 | rebase | partial | up-to-date succeeds; `--abort`/`--quit`/`--continue` report absent state; replay needs the merge lane |
