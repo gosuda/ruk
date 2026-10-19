@@ -249,22 +249,33 @@ pub fn discover(
     }
 }
 
-/// Probes one smart-http endpoint for protocol v2: GETs the advertisement
-/// with `Git-Protocol: version=2` (`gitprotocol-v2.adoc`, "HTTP
-/// Transport"). A v2 server answers its capability advertisement;
-/// anything else (a v0 advertisement from a server that ignored the
-/// header, or a non-smart content type from a dumb-http server) is
-/// `Ok(None)`, and the caller falls back to [`discover`], which owns the
-/// v0 parse and the dumb-http refusal.
+/// What one `Git-Protocol` advertisement GET established: the v2
+/// capability advertisement, or the parsed v0 document from a server
+/// that ignored the header — from that single response, with no second
+/// round trip for the fallback.
+pub enum VersionedDiscovery {
+    /// The server speaks v2: refs come from one [`ls_refs_v2`] RPC.
+    V2(Capabilities),
+    /// The server answered v0: the parsed advertisement, reused directly.
+    V0(Advertisement),
+}
+
+/// Discovers one smart-http endpoint at the highest protocol the server
+/// offers: GETs the advertisement with `Git-Protocol: version=2`
+/// (`gitprotocol-v2.adoc`, "HTTP Transport") and parses whatever answers —
+/// the v2 capability advertisement, or the v0 document when the server
+/// ignored the header. A response without the smart content type is
+/// dumb-http, the remaining HTTP gap.
 ///
 /// # Errors
-/// Transport failures from the HTTP client and grammar failures from the
-/// advertisement parse.
-pub fn discover_v2_caps(
+/// Transport failures from the HTTP client, [`GitError::Unsupported`] for
+/// dumb-http servers, grammar failures from the advertisement parse.
+pub fn discover_versioned(
     base: &str,
+    service: SmartService,
     kind: HashKind,
-) -> Result<Option<Capabilities>, GitError> {
-    let url = refs_url(base, SmartService::UploadPack);
+) -> Result<VersionedDiscovery, GitError> {
+    let url = refs_url(base, service);
     let owned = live_headers(
         &url,
         &[
@@ -278,14 +289,13 @@ pub fn discover_v2_caps(
     let mut body = Vec::new();
     let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
     check_status(&url, status)?;
-    if http::header(&reply, "content-type") != Some(SmartService::UploadPack.advertisement_type().as_str())
-    {
-        return Ok(None);
+    if http::header(&reply, "content-type") != Some(service.advertisement_type().as_str()) {
+        return Err(net::dumb_http_gap(&url));
     }
     let mut pkt = PktReader::new(Cursor::new(body), Interrupt::none());
     match refadv::read_initial(&mut pkt, kind)? {
-        Initial::V2(caps) => Ok(Some(caps)),
-        Initial::Refs(_) => Ok(None),
+        Initial::V2(caps) => Ok(VersionedDiscovery::V2(caps)),
+        Initial::Refs(adv) => Ok(VersionedDiscovery::V0(adv)),
     }
 }
 
@@ -1348,9 +1358,11 @@ mod tests {
                 false,
             ),
         ]);
-        let probed = discover_v2_caps(&base, kind)
-            .expect("probe")
-            .expect("v2");
+        let VersionedDiscovery::V2(probed) =
+            discover_versioned(&base, SmartService::UploadPack, kind).expect("probe")
+        else {
+            panic!("expected v2");
+        };
         assert!(probed.feature("fetch", "filter"));
         let refs = ls_refs_v2(&base, &probed, kind, &[], &Interrupt::none()).expect("ls-refs");
         assert_eq!(refs.len(), 2);
@@ -1395,52 +1407,36 @@ mod tests {
     }
 
     #[test]
-    fn v2_probe_yields_to_v0_servers() {
-        // A server that ignores `Git-Protocol` answers v0: the probe
-        // reports `None` and the plain `discover` fallback parses it.
+    fn versioned_discovery_parses_v0_in_one_round_trip() {
+        // A server that ignores `Git-Protocol` answers v0: the single
+        // GET parses it directly, with no second round trip. This is
+        // the regression net for the double-GET probe, which consumed
+        // one-shot servers' first scripted reply.
         let body = advertisement_bytes(
             FOUR,
             "multi_ack_detailed side-band-64k thin-pack ofs-delta object-format=sha1",
         );
-        let (base, server) = fake_smart_server(vec![
-            (
-                200,
-                vec![(
-                    "Content-Type".to_owned(),
-                    SmartService::UploadPack.advertisement_type(),
-                )],
-                body.clone(),
-                false,
-            ),
-            (
-                200,
-                vec![(
-                    "Content-Type".to_owned(),
-                    SmartService::UploadPack.advertisement_type(),
-                )],
-                body,
-                false,
-            ),
-        ]);
-        assert!(
-            discover_v2_caps(&base, HashKind::Sha1)
-                .expect("probe")
-                .is_none(),
-            "v0 is not v2"
-        );
-        let adv = discover(&base, SmartService::UploadPack, HashKind::Sha1).expect("fallback");
+        let (base, server) = fake_smart_server(vec![(
+            200,
+            vec![(
+                "Content-Type".to_owned(),
+                SmartService::UploadPack.advertisement_type(),
+            )],
+            body,
+            false,
+        )]);
+        let VersionedDiscovery::V0(adv) =
+            discover_versioned(&base, SmartService::UploadPack, HashKind::Sha1).expect("v0")
+        else {
+            panic!("expected v0");
+        };
         assert_eq!(adv.refs.len(), 2);
         let requests = server.join().expect("server");
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1, "one GET, no fallback round trip");
         assert!(
             requests[0].head.contains("Git-Protocol: version=2"),
             "{:?}",
             requests[0].head
-        );
-        assert!(
-            !requests[1].head.contains("Git-Protocol"),
-            "fallback drops the probe header: {:?}",
-            requests[1].head
         );
     }
 
