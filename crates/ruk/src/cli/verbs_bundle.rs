@@ -294,7 +294,10 @@ fn bundle_verify(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
     if !missing.is_empty() {
         return Err(GitError::NotFound {
-            detail: format!("repository lacks these prerequisite commits: {}", missing.join(" ")),
+            detail: format!(
+                "repository lacks these prerequisite commits: {}",
+                missing.join(" ")
+            ),
         });
     }
     let mut out = format!("The bundle contains these {} refs:\n", parsed.heads.len()).into_bytes();
@@ -306,8 +309,11 @@ fn bundle_verify(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     }
     if !parsed.prereqs.is_empty() {
         out.extend_from_slice(
-            format!("The bundle requires these {} prerequisites:\n", parsed.prereqs.len())
-                .as_bytes(),
+            format!(
+                "The bundle requires these {} prerequisites:\n",
+                parsed.prereqs.len()
+            )
+            .as_bytes(),
         );
         for (oid, rev) in &parsed.prereqs {
             out.extend_from_slice(format!("{} {rev}\n", oid.to_hex()).as_bytes());
@@ -357,7 +363,9 @@ fn bundle_unbundle(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     let mut out = Vec::new();
     for (oid, name) in &parsed.heads {
         if !patterns.is_empty()
-            && !patterns.iter().any(|pattern| ref_matches(pattern.as_bytes(), name))
+            && !patterns
+                .iter()
+                .any(|pattern| ref_matches(pattern.as_bytes(), name))
         {
             continue;
         }
@@ -382,7 +390,9 @@ pub(crate) fn clone_bundle(
             detail: "clone --depth from a bundle is not supported".to_owned(),
         });
     }
-    let origin = opts.single("origin")?.unwrap_or_else(|| "origin".to_owned());
+    let origin = opts
+        .single("origin")?
+        .unwrap_or_else(|| "origin".to_owned());
     let bytes = std::fs::read(&bundle_path).map_err(|err| GitError::Io {
         detail: format!("reading {}: {err}", bundle_path.display()),
     })?;
@@ -636,11 +646,20 @@ fn head_ref(store: &Store, kind: HashKind, rev: &str) -> Result<(Oid, Vec<u8>), 
         return Ok((oid, b"HEAD".to_vec()));
     }
     let refs = list_refs(store)?;
-    for candidate in [rev.to_owned(), format!("refs/heads/{rev}"), format!("refs/tags/{rev}")] {
-        if let Some((name, target)) = refs.iter().find(|(name, _)| name.as_bytes() == candidate.as_bytes()) {
+    for candidate in [
+        rev.to_owned(),
+        format!("refs/heads/{rev}"),
+        format!("refs/tags/{rev}"),
+    ] {
+        if let Some((name, target)) = refs
+            .iter()
+            .find(|(name, _)| name.as_bytes() == candidate.as_bytes())
+        {
             let oid = match target {
                 RefTarget::Direct(oid) => *oid,
-                RefTarget::Symbolic(target) => resolve_rev(store, kind, &String::from_utf8_lossy(target.as_bytes()))?,
+                RefTarget::Symbolic(target) => {
+                    resolve_rev(store, kind, &String::from_utf8_lossy(target.as_bytes()))?
+                }
             };
             return Ok((oid, name.as_bytes().to_vec()));
         }
@@ -666,10 +685,15 @@ fn peel_to_commit(
         match object_kind {
             ObjectKind::Commit => return Ok((visited, Some(current))),
             ObjectKind::Tag => {
-                let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
-                let hex = first.strip_prefix(b"object ").ok_or_else(|| GitError::Corrupt {
-                    detail: format!("tag {} has no object header", current.to_hex()),
-                })?;
+                let first = bytes
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .unwrap_or_default();
+                let hex = first
+                    .strip_prefix(b"object ")
+                    .ok_or_else(|| GitError::Corrupt {
+                        detail: format!("tag {} has no object header", current.to_hex()),
+                    })?;
                 let text = std::str::from_utf8(hex).map_err(|_| GitError::Corrupt {
                     detail: format!("tag {} has a non-UTF-8 object header", current.to_hex()),
                 })?;
@@ -716,10 +740,9 @@ fn split_head_line(line: &[u8]) -> Result<(&str, &str), GitError> {
     let text = std::str::from_utf8(line).map_err(|_| GitError::Corrupt {
         detail: "bundle header is not UTF-8".to_owned(),
     })?;
-    text.split_once(' ')
-        .ok_or_else(|| GitError::Corrupt {
-            detail: "malformed bundle header line".to_owned(),
-        })
+    text.split_once(' ').ok_or_else(|| GitError::Corrupt {
+        detail: "malformed bundle header line".to_owned(),
+    })
 }
 
 /// Parses one header oid, inferring its format from the hex width.
@@ -734,7 +757,11 @@ fn parse_bundle_oid(hex: &str, label: &str) -> Result<Oid, GitError> {
 fn require_format(format: HashKind, kind: HashKind, file: &str) -> Result<(), GitError> {
     if format != kind {
         return Err(GitError::ObjectFormat {
-            detail: format!("{file} holds {}, this repository is {}", format.format_name(), kind.format_name()),
+            detail: format!(
+                "{file} holds {}, this repository is {}",
+                format.format_name(),
+                kind.format_name()
+            ),
         });
     }
     Ok(())

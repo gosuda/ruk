@@ -907,10 +907,7 @@ impl PublicationTxn {
     /// Redb failures.
     pub(crate) fn remove_object(&self, oid: &Oid) -> Result<bool, StoreError> {
         let mut table = self.txn.open_table(OBJECTS).map_err(table_error)?;
-        Ok(table
-            .remove(oid.as_bytes())
-            .map_err(storage)?
-            .is_some())
+        Ok(table.remove(oid.as_bytes()).map_err(storage)?.is_some())
     }
 
     /// Replaces a `Pending` ledger row with its post-append state, normally

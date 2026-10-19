@@ -170,10 +170,7 @@ impl Store {
     /// # Errors
     /// [`StoreError::Corrupt`] for committed damage (which latches
     /// quarantine, like any committed read); quarantine refuses.
-    pub fn prune_unreachable(
-        &self,
-        reachable: &HashSet<Oid>,
-    ) -> Result<PruneStats, StoreError> {
+    pub fn prune_unreachable(&self, reachable: &HashSet<Oid>) -> Result<PruneStats, StoreError> {
         self.refuse_if_quarantined()?;
         let _serial = self.compaction_lock.lock().map_err(|_| {
             StoreError::WriterClosed("compaction lock poisoned by a panic".to_owned())
@@ -210,10 +207,7 @@ impl Store {
     /// # Errors
     /// [`StoreError::Corrupt`] for committed damage (which latches
     /// quarantine, like any committed read); quarantine refuses.
-    pub fn unreachable_oids(
-        &self,
-        reachable: &HashSet<Oid>,
-    ) -> Result<Vec<Oid>, StoreError> {
+    pub fn unreachable_oids(&self, reachable: &HashSet<Oid>) -> Result<Vec<Oid>, StoreError> {
         self.refuse_if_quarantined()?;
         let census = self.page_all_objects()?;
         Ok(plan_doomed(&census, reachable).1)
@@ -713,10 +707,7 @@ impl Store {
 /// keeps its whole base chain, so pruning can never strand a survivor on
 /// a deleted base. Oids in `reachable` but absent from the census are not
 /// objects and change nothing.
-fn plan_doomed(
-    census: &[(Oid, ObjectLocation)],
-    reachable: &HashSet<Oid>,
-) -> (usize, Vec<Oid>) {
+fn plan_doomed(census: &[(Oid, ObjectLocation)], reachable: &HashSet<Oid>) -> (usize, Vec<Oid>) {
     let mut live: HashSet<Oid> = reachable.clone();
     let mut bases: HashMap<Oid, Oid> = HashMap::new();
     for (oid, location) in census {

@@ -2787,9 +2787,7 @@ pub(crate) fn gc(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let census = store.iter_objects().map_err(GitError::from)?.len();
     let reachable = gc_reachable(store, kind)?;
     let doomed = store.unreachable_oids(&reachable).map_err(GitError::from)?;
-    let backlog = store
-        .compaction_backlog()
-        .map_err(GitError::from)?;
+    let backlog = store.compaction_backlog().map_err(GitError::from)?;
     if opts.is_set("auto") && doomed.is_empty() && !backlog.has_work() {
         return Ok(Vec::new());
     }
@@ -3058,8 +3056,7 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             // terminal is reachable, and a terminal tree walks its subtree.
             None => {
                 if let Some(&terminal) = visited.last() {
-                    if super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree
-                    {
+                    if super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree {
                         mark_tree(store, kind, terminal, &mut reachable)?;
                     }
                 }

@@ -201,7 +201,12 @@ fn add(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
             Some((refname, start, RefExpect::Any)),
         )
     } else if opts.is_set("detach") {
-        (resolve_detached_head(store, kind, rev_arg)?, None, false, None)
+        (
+            resolve_detached_head(store, kind, rev_arg)?,
+            None,
+            false,
+            None,
+        )
     } else {
         let (oid, branch) = resolve_attached_head(store, kind, rev_arg)?;
         (oid, branch, false, None)
@@ -295,7 +300,10 @@ fn resolve_attached_head(
         Some(rev) => {
             let oid = resolve_rev(store, kind, rev)?;
             commit_record(store, oid)?;
-            Ok((oid, attach_candidate(store, rev)?.map(|name| name.to_string())))
+            Ok((
+                oid,
+                attach_candidate(store, rev)?.map(|name| name.to_string()),
+            ))
         }
     }
 }
@@ -444,10 +452,9 @@ fn remove(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
             detail: format!("{} is not a registered worktree", target.display()),
         });
     };
-    let record: WorktreeRecord =
-        sonic_rs::from_slice(&raw).map_err(|err| GitError::Corrupt {
-            detail: format!("worktree record does not decode: {err}"),
-        })?;
+    let record: WorktreeRecord = sonic_rs::from_slice(&raw).map_err(|err| GitError::Corrupt {
+        detail: format!("worktree record does not decode: {err}"),
+    })?;
     let base = PathBuf::from(&record.path);
     if !base.exists() {
         return Err(GitError::Invalid {
@@ -571,12 +578,7 @@ fn dir_non_empty(dir: &Path) -> Result<bool, GitError> {
 }
 
 /// Writes one commit's tree into `base`, refusing divergent files.
-fn materialize_tree(
-    store: &Store,
-    kind: HashKind,
-    tree: Oid,
-    base: &Path,
-) -> Result<(), GitError> {
+fn materialize_tree(store: &Store, kind: HashKind, tree: Oid, base: &Path) -> Result<(), GitError> {
     materialize_impl(store, kind, tree, base, Overwrite::Refuse)
 }
 
@@ -821,9 +823,11 @@ fn record_key(path: &str) -> Vec<u8> {
 
 /// Renders a path as UTF-8 for keys and records.
 fn display_path(path: &Path) -> Result<String, GitError> {
-    path.to_str().map(str::to_owned).ok_or_else(|| GitError::Invalid {
-        detail: "worktree path is not valid UTF-8".to_owned(),
-    })
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| GitError::Invalid {
+            detail: "worktree path is not valid UTF-8".to_owned(),
+        })
 }
 
 /// Shortens `refs/heads/<name>` to `<name>` for display.

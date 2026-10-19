@@ -1008,8 +1008,8 @@ fn gc_prunes_orphaned_commit_and_keeps_reachable() {
         &run(verbs_objects::count_objects, &mut ctx, &[]).expect("count before"),
     )
     .into_owned();
-    let out = String::from_utf8_lossy(&run(verbs_transport::gc, &mut ctx, &[]).expect("gc"))
-        .into_owned();
+    let out =
+        String::from_utf8_lossy(&run(verbs_transport::gc, &mut ctx, &[]).expect("gc")).into_owned();
     assert!(out.contains("pruned"), "{out}");
     assert!(
         run(verbs_objects::cat_file, &mut ctx, &["-e", &orphan]).is_err(),
@@ -1056,7 +1056,8 @@ fn gc_dry_run_reports_without_mutating() {
     .into_owned();
     assert!(!out.contains("pruned"), "{out}");
     run(verbs_objects::cat_file, &mut ctx, &["-e", &orphan]).expect("orphan still kept");
-    let err = run(verbs_transport::gc, &mut ctx, &["--prune=2.weeks.ago"]).expect_err("dated prune");
+    let err =
+        run(verbs_transport::gc, &mut ctx, &["--prune=2.weeks.ago"]).expect_err("dated prune");
     assert_eq!(err.exit_code(), 1, "{err}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -2713,14 +2714,18 @@ fn worktree_add_list_remove_round_trip() {
         text.contains(&wt_arg) && text.contains("(detached)"),
         "got {text:?}"
     );
-    let out = run(verbs_worktree::worktree, &mut ctx, &["list", "--porcelain"])
-        .expect("porcelain");
+    let out = run(verbs_worktree::worktree, &mut ctx, &["list", "--porcelain"]).expect("porcelain");
     let text = String::from_utf8_lossy(&out).into_owned();
     assert!(
         text.contains(&format!("worktree {wt_arg}")) && text.contains("\ndetached\n"),
         "got {text:?}"
     );
-    run(verbs_worktree::worktree, &mut ctx, &["remove", wt_arg.as_str()]).expect("remove");
+    run(
+        verbs_worktree::worktree,
+        &mut ctx,
+        &["remove", wt_arg.as_str()],
+    )
+    .expect("remove");
     assert!(!base.join("wt-round-trip").exists());
     let out = run(verbs_worktree::worktree, &mut ctx, &["list"]).expect("list");
     assert!(
@@ -2737,9 +2742,16 @@ fn worktree_add_refuses_checked_out_branch() {
     let base = root.parent().expect("parent").to_path_buf();
     let wt_arg = base.join("wt-busy").to_str().expect("utf8").to_owned();
     let mut ctx = repo_ctx(&root, env);
-    let err = run(verbs_worktree::worktree, &mut ctx, &["add", wt_arg.as_str()])
-        .expect_err("same branch");
-    assert!(format!("{err}").contains("already used by worktree"), "{err}");
+    let err = run(
+        verbs_worktree::worktree,
+        &mut ctx,
+        &["add", wt_arg.as_str()],
+    )
+    .expect_err("same branch");
+    assert!(
+        format!("{err}").contains("already used by worktree"),
+        "{err}"
+    );
     assert!(!base.join("wt-busy").exists());
     let out = run(
         verbs_worktree::worktree,
@@ -2758,8 +2770,16 @@ fn worktree_add_refuses_checked_out_branch() {
         &["add", other.as_str(), "feature"],
     )
     .expect_err("branch busy");
-    assert!(format!("{err}").contains("already used by worktree"), "{err}");
-    run(verbs_worktree::worktree, &mut ctx, &["remove", wt_arg.as_str()]).expect("remove");
+    assert!(
+        format!("{err}").contains("already used by worktree"),
+        "{err}"
+    );
+    run(
+        verbs_worktree::worktree,
+        &mut ctx,
+        &["remove", wt_arg.as_str()],
+    )
+    .expect("remove");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -2776,8 +2796,12 @@ fn worktree_remove_refuses_dirty_without_force() {
     )
     .expect("add");
     std::fs::write(base.join("wt-dirty").join("a.txt"), b"dirty\n").expect("dirty");
-    let err = run(verbs_worktree::worktree, &mut ctx, &["remove", wt_arg.as_str()])
-        .expect_err("dirty");
+    let err = run(
+        verbs_worktree::worktree,
+        &mut ctx,
+        &["remove", wt_arg.as_str()],
+    )
+    .expect_err("dirty");
     assert!(format!("{err}").contains("modified or untracked"), "{err}");
     assert!(base.join("wt-dirty").exists());
     run(
@@ -2803,8 +2827,7 @@ fn worktree_prune_drops_missing_checkout() {
     )
     .expect("add");
     std::fs::remove_dir_all(base.join("wt-prune")).expect("drop dir");
-    let out = run(verbs_worktree::worktree, &mut ctx, &["prune", "--dry-run"])
-        .expect("dry run");
+    let out = run(verbs_worktree::worktree, &mut ctx, &["prune", "--dry-run"]).expect("dry run");
     assert!(
         String::from_utf8_lossy(&out).contains(&wt_arg),
         "got {out:?}"
@@ -2838,12 +2861,11 @@ fn grep_bad_invocation_exits_128() {
 fn bundle_create_verify_unbundle_round_trip() {
     let (root, env) = seeded_repo("bundle-rt", "file.txt", b"hello bundle\n");
     let mut ctx = repo_ctx(&root, env.clone());
-    let tip = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let tip =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     let bundle = root
         .parent()
         .expect("parent")
@@ -2868,10 +2890,9 @@ fn bundle_create_verify_unbundle_round_trip() {
     assert!(report.ends_with("is okay\n"), "got {report:?}");
 
     // `verify` stages the pack without publishing: the census is unchanged.
-    let before = String::from_utf8(
-        run(verbs_objects::count_objects, &mut ctx, &[]).expect("count"),
-    )
-    .expect("utf8");
+    let before =
+        String::from_utf8(run(verbs_objects::count_objects, &mut ctx, &[]).expect("count"))
+            .expect("utf8");
 
     // Fresh repository ingests the bundle's objects but gains no refs.
     let base = root.parent().expect("parent").to_path_buf();
@@ -2892,7 +2913,11 @@ fn bundle_create_verify_unbundle_round_trip() {
         run(verbs_bundle::bundle, &mut ctx2, &["unbundle", &bundle]).expect("unbundle"),
     )
     .expect("utf8");
-    assert_eq!(unbundled, format!("{tip} refs/heads/main\n"), "got {unbundled:?}");
+    assert_eq!(
+        unbundled,
+        format!("{tip} refs/heads/main\n"),
+        "got {unbundled:?}"
+    );
     let kind = String::from_utf8(
         run(verbs_objects::cat_file, &mut ctx2, &["-t", &tip]).expect("cat type"),
     )
@@ -2904,10 +2929,8 @@ fn bundle_create_verify_unbundle_round_trip() {
     .expect("utf8");
     assert!(body.contains("seed"), "got {body:?}");
 
-    let after = String::from_utf8(
-        run(verbs_objects::count_objects, &mut ctx, &[]).expect("count"),
-    )
-    .expect("utf8");
+    let after = String::from_utf8(run(verbs_objects::count_objects, &mut ctx, &[]).expect("count"))
+        .expect("utf8");
     assert_eq!(before, after, "verify mutated the store");
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -2916,15 +2939,19 @@ fn bundle_create_verify_unbundle_round_trip() {
 fn bundle_clone_from_file_plants_refs() {
     let (root, env) = seeded_repo("bundle-clone", "file.txt", b"clone me\n");
     let mut ctx = repo_ctx(&root, env.clone());
-    let tip = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let tip =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     let base = root.parent().expect("parent").to_path_buf();
     let bundle = base.join("clone.bundle").display().to_string();
-    run(verbs_bundle::bundle, &mut ctx, &["create", &bundle, "main", "HEAD"]).expect("create");
+    run(
+        verbs_bundle::bundle,
+        &mut ctx,
+        &["create", &bundle, "main", "HEAD"],
+    )
+    .expect("create");
 
     let mut naked = Ctx {
         store: None,
@@ -2936,10 +2963,9 @@ fn bundle_clone_from_file_plants_refs() {
         cli_config: Vec::new(),
         stderr: Vec::new(),
     };
-    let out = String::from_utf8(
-        run(verbs_repo::clone, &mut naked, &[&bundle, "cloned"]).expect("clone"),
-    )
-    .expect("utf8");
+    let out =
+        String::from_utf8(run(verbs_repo::clone, &mut naked, &[&bundle, "cloned"]).expect("clone"))
+            .expect("utf8");
     assert!(out.contains("Cloned into"), "got {out:?}");
     let mut cloned = repo_ctx(&base.join("cloned"), test_env(&base));
     let head = String::from_utf8(
@@ -2949,12 +2975,11 @@ fn bundle_clone_from_file_plants_refs() {
     .trim()
     .to_owned();
     assert_eq!(head, tip, "clone tip moved");
-    let branch = String::from_utf8(
-        run(verbs_history::rev_parse, &mut cloned, &["main"]).expect("branch"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let branch =
+        String::from_utf8(run(verbs_history::rev_parse, &mut cloned, &["main"]).expect("branch"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     assert_eq!(branch, tip, "clone branch moved");
     let _ = std::fs::remove_dir_all(&base);
 }
