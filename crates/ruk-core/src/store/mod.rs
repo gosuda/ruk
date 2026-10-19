@@ -131,6 +131,10 @@ struct IoCounters {
     publication_commits: AtomicU64,
     /// Segment files synced by publications.
     segment_syncs: AtomicU64,
+    /// Pending-reservation commits (one Immediate metadata commit each).
+    pending_commits: AtomicU64,
+    /// Directory syncs for newly created segment files.
+    directory_syncs: AtomicU64,
 }
 
 /// A copy of [`Store`]'s I/O counters at one instant.
@@ -149,6 +153,10 @@ pub struct IoStats {
     pub publication_commits: u64,
     /// Segment files synced by publications.
     pub segment_syncs: u64,
+    /// Pending-reservation commits. Each is an Immediate metadata commit.
+    pub pending_commits: u64,
+    /// Directory syncs for newly created segment files.
+    pub directory_syncs: u64,
 }
 
 pub struct Store {
@@ -825,6 +833,8 @@ impl Store {
             publications: self.io.publications.load(Ordering::Relaxed),
             publication_commits: self.io.publication_commits.load(Ordering::Relaxed),
             segment_syncs: self.io.segment_syncs.load(Ordering::Relaxed),
+            pending_commits: self.io.pending_commits.load(Ordering::Relaxed),
+            directory_syncs: self.io.directory_syncs.load(Ordering::Relaxed),
         }
     }
     /// A bounded page of raw fact rows strictly after `after` in key order.
@@ -1177,6 +1187,7 @@ impl Store {
             charges: Vec::new(),
         };
         self.observe(self.meta.commit_pending(&key, &row))?;
+        self.io.pending_commits.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         crash_tests::crash_at("capacity_pending_persisted");
         Ok(Some(PendingHandle { key, row }))
@@ -1240,6 +1251,7 @@ impl Store {
         let dir_start = ProfileClock::now(profile);
         if batch.new_entries {
             sync_entries(&segments_dir)?;
+            self.io.directory_syncs.fetch_add(1, Ordering::Relaxed);
         }
         let sync_dir_ms = dir_start.elapsed_ms();
         #[cfg(test)]
@@ -2944,11 +2956,30 @@ mod tests {
 
         const WRITERS: usize = 4;
         const COMMITS: usize = 20;
+        const SOLO: u64 = 5;
+        fn barriers(stats: IoStats) -> u64 {
+            stats.pending_commits
+                + stats.publication_commits
+                + stats.segment_syncs
+                + stats.directory_syncs
+        }
         let seed_of = |writer: usize, seq: usize| {
             u64::try_from(writer * COMMITS + seq).expect("seed fits u64") + 1
         };
         let temp = TempRoot::new("group-commit");
         let store = Arc::new(create(&temp, HashKind::Sha1));
+        // Solo baseline on this store: no linger, one publication at a time.
+        store.set_commit_linger(Duration::ZERO);
+        store
+            .publish(vec![blob(&store, &pseudo(64, 9_999))], &[])
+            .expect("warm-up publish");
+        let solo_before = store.io_stats();
+        for seed in 0..SOLO {
+            store
+                .publish(vec![blob(&store, &pseudo(512, 20_000 + seed))], &[])
+                .expect("solo publish");
+        }
+        let solo = barriers(store.io_stats()) - barriers(solo_before);
         store.set_commit_linger(Duration::from_millis(10));
         let before = store.io_stats();
         std::thread::scope(|scope| {
@@ -2987,6 +3018,12 @@ mod tests {
         assert!(
             syncs < total,
             "{syncs} segment syncs for {total} publications: nothing grouped"
+        );
+        let grouped = barriers(after) - barriers(before);
+        let solo_projection = solo * total / SOLO;
+        assert!(
+            grouped < solo_projection,
+            "{grouped} grouped durability barriers for {total} publications; solo projection {solo_projection}"
         );
         drop(store);
 
