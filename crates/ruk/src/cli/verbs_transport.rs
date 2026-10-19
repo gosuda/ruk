@@ -1675,7 +1675,10 @@ pub(crate) fn upload_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
     // `determine_protocol_version_server` reads it: a v2-speaking client
     // sets `GIT_PROTOCOL=version=2` on the spawned server (ssh `SendEnv`,
     // daemon extra parameter), and anything else keeps the v0 default.
-    let v2 = git_protocol_requests_v2(std::env::var("GIT_PROTOCOL").ok().as_deref());
+    // The read goes through `CliEnv` (populated from the process by
+    // `capture`, per request by the daemon) so verbs never touch the real
+    // process environment directly.
+    let v2 = git_protocol_requests_v2(ctx.env.get("GIT_PROTOCOL"));
     match ctx.env.stdin.as_deref() {
         Some(input) => {
             let mut out = Vec::new();

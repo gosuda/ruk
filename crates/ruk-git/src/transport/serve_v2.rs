@@ -424,29 +424,35 @@ fn matches_prefixes(name: &[u8], prefixes: &[Vec<u8>]) -> bool {
 
 /// Peels a tag target to its final object, following nested tags. Returns
 /// `None` for non-tag targets (the oracle reports no `peeled` attribute
-/// for those) and for a tag that peels to itself.
+/// for those), for a tag that peels to itself, and for a target whose
+/// object is missing (a failed peel drops the attribute, the way the
+/// oracle's `send_ref` skips it when peeling fails).
 fn peel_tag(store: &Store, oid: Oid, kind: HashKind) -> Result<Option<Oid>, GitError> {
     const TAG_READ_MAX: u64 = 1 << 20;
     const MAX_TAG_DEPTH: usize = 32;
-    let (first_kind, _) = read_object(store, oid, TAG_READ_MAX)?;
+    let (first_kind, mut current_bytes) = match read_object(store, oid, TAG_READ_MAX) {
+        Err(err) if matches!(err, GitError::NotFound { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+        Ok(read) => read,
+    };
     if first_kind != ObjectKind::Tag {
         return Ok(None);
     }
-    let mut current = oid;
     for _ in 0..MAX_TAG_DEPTH {
-        let (_, bytes) = read_object(store, current, TAG_READ_MAX)?;
-        let Some(next) = parse_tag_target(&bytes, kind)? else {
-            return Err(corrupt(format!("tag {current} names no object")));
+        let Some(next) = parse_tag_target(&current_bytes, kind)? else {
+            return Err(corrupt(format!("tag {oid} names no object")));
         };
-        let (next_kind, _) = read_object(store, next, TAG_READ_MAX)?;
+        let (next_kind, next_bytes) = match read_object(store, next, TAG_READ_MAX) {
+            Err(err) if matches!(err, GitError::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err),
+            Ok(read) => read,
+        };
         if next_kind != ObjectKind::Tag {
             return Ok(if next == oid { None } else { Some(next) });
         }
-        current = next;
+        current_bytes = next_bytes;
     }
-    Err(corrupt(format!(
-        "tag {oid} nests deeper than {MAX_TAG_DEPTH}"
-    )))
+    Err(corrupt(format!("tag {oid} nests deeper than {MAX_TAG_DEPTH}")))
 }
 
 /// The OID a tag object points at: the hex after its `object ` header line.
@@ -872,10 +878,11 @@ mod tests {
         let store = server_store();
         let tag_bytes =
             format!("object {FOUR}\ntype commit\ntag v1\ntagger test <t@t> 0 +0000\n\nv1\n");
+        let tag_len = u64::try_from(tag_bytes.len()).expect("tag fits in memory");
         let prepared = store
             .prepare(
                 ObjectKind::Tag,
-                tag_bytes.len() as u64,
+                tag_len,
                 &tag_bytes.as_bytes()[..],
                 None,
             )
