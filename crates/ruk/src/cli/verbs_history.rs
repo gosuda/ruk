@@ -9,8 +9,8 @@
 //! | `cherry-pick` | per-commit replay over the lane | implemented (`-n`, `-m`, `-x`, `--continue`/`--skip`/`--abort`, `CHERRY_PICK_HEAD`) |
 //! | `revert` | inverse replay over the lane | implemented (`-n`, `-m`, `--continue`/`--skip`/`--abort`, `REVERT_HEAD`) |
 //! | `log` | commit ancestry walk | implemented (oneline, format/pretty incl. full/fuller/email/raw, ranges, paths, stat/patch/summary/shortstat/numstat/dirstat, filters incl. follow/pickaxe/merges, first-parent, left-right/cherry-pick, topo/date order, date shapes, abbrev, notes, decorate, source, simplify-by-decoration, branch/tag/remote/exclude tips, boundary, graph) |
-//! | `show` | commit read + tree diff, or blob bytes | implemented (format/pretty, stat/patch, `rev:path` blob form) |
-//! | `diff` | tree/index/worktree compare + line differ | implemented (`--cached`/`--staged`, ranges, stat/patch, `-U`, name-status, paths) |
+//! | `show` | commit read + tree diff, or blob bytes | implemented (format/pretty, stat/shortstat/numstat/summary/raw/patch, `rev:path` blob form, `--output`, word-diff/whitespace/prefix/filter/relative knobs) |
+//! | `diff` | tree/index/worktree compare + line differ | implemented (`--cached`/`--staged`, ranges, stat/shortstat/numstat/summary/raw/patch, `-U`/`--inter-hunk-context`, name-status, `--diff-filter`, paths, `-C` copies, word-diff, whitespace folds, `--text`, prefixes, `--relative`, `--output`, `--no-index`, `--quiet`/`--no-patch`; `--minimal`/`--patience`/`--histogram`, `-W`, `--binary`, `--exit-code`, `--color-moved` are `Unsupported`) |
 //! | `merge-base` | breadth-first paint-down | implemented (`--is-ancestor`, `-a`/`--all`) |
 //! | `rev-list` | ancestry walk | implemented (`--count`, `-n`, `--all`, `--objects`, `--parents`, `--reverse`, ranges) |
 //! | `rev-parse` | revision resolution + repo facts | implemented (`--verify` arity, `--short[=N]`, `--abbrev-ref`, `--git-dir`, `--show-toplevel`, `--is-inside-work-tree`, `--is-bare-repository`, `@`/`:path`) |
