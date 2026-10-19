@@ -1401,9 +1401,9 @@ mod tests {
     use crate::protocol::{
         AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement, BoundedList,
         ClaimHolderFilter, ClaimListArgs, ClaimMode, ClaimTtl, GitCommitArgs, Method,
-        Mutation as WireMutation,
-        MutationOutcome, OpLogArgs, PageCursor, PageLimit, PageRequest, PinArgs, QueryDigest,
-        ReceiptRef, StatusArgs, TagSetArgs, Timestamp, UndoArgs, UndoReply, UndoSummary,
+        Mutation as WireMutation, MutationOutcome, OpLogArgs, PageCursor, PageLimit, PageRequest,
+        PinArgs, QueryDigest, ReceiptRef, StatusArgs, TagSetArgs, Timestamp, UndoArgs, UndoReply,
+        UndoSummary,
     };
     use crate::refdata::{RefExpect, RefName};
     use crate::store::PreparationBudget;
@@ -2781,9 +2781,7 @@ mod tests {
         const SUBMITS: usize = 4;
 
         let (_temp, coord, owner) = coordinator();
-        coord
-            .store()
-            .set_commit_linger(Duration::from_millis(10));
+        coord.store().set_commit_linger(Duration::from_millis(10));
         let coord = Arc::new(coord);
         let runner = coord
             .spawn_on(&tokio::runtime::Handle::current())
@@ -2793,12 +2791,7 @@ mod tests {
         // One shared empty tree; every commit references it.
         let tree = coord
             .store()
-            .prepare(
-                ObjectKind::Tree,
-                0,
-                std::io::Cursor::new(Vec::new()),
-                None,
-            )
+            .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("stage lane tree");
         let tree_oid = tree.oid();
         coord
@@ -2902,9 +2895,7 @@ mod tests {
 
         use crate::change::ChangeId;
         use crate::conflict::{Signature, TzOffset};
-        use crate::protocol::{
-            GitCommitArgs, GitCommitRefUpdate, Reply, Request, SessionOpenArgs,
-        };
+        use crate::protocol::{GitCommitArgs, GitCommitRefUpdate, Reply, Request, SessionOpenArgs};
         use crate::refdata::{RefTarget, resolve};
         use crate::refs::StoreRefs;
 
@@ -2913,9 +2904,7 @@ mod tests {
         let (_temp, coord, owner) = coordinator();
         // Widen the store group-commit window past the task-startup spread
         // so overlapping submissions land in shared groups deterministically.
-        coord
-            .store()
-            .set_commit_linger(Duration::from_millis(10));
+        coord.store().set_commit_linger(Duration::from_millis(10));
         let coord = Arc::new(coord);
         let runner = coord
             .spawn_on(&tokio::runtime::Handle::current())
@@ -2925,12 +2914,7 @@ mod tests {
         // One shared empty tree; every commit references it.
         let tree = coord
             .store()
-            .prepare(
-                ObjectKind::Tree,
-                0,
-                std::io::Cursor::new(Vec::new()),
-                None,
-            )
+            .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("stage lane tree");
         let tree_oid = tree.oid();
         coord
@@ -3024,8 +3008,7 @@ mod tests {
         // Every branch holds exactly its own tip; tips are distinct.
         let refs = StoreRefs::new(coord.store());
         for (branch_no, oid) in finals.iter().enumerate() {
-            let name =
-                RefName::new(format!("refs/heads/lane-{branch_no}")).expect("branch name");
+            let name = RefName::new(format!("refs/heads/lane-{branch_no}")).expect("branch name");
             let resolved = resolve(&refs, &name).expect("resolve branch");
             assert_eq!(resolved.oid, Some(*oid), "branch holds its own tip");
         }
