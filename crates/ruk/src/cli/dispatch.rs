@@ -451,9 +451,20 @@ pub(crate) static VERBS: &[Verb] = &[
 ];
 
 /// Looks up one verb by name.
+///
+/// A leading `git-` falls back to the bare verb (`git-upload-pack` resolves
+/// to `upload-pack`), mirroring how `git.c` strips the prefix before its
+/// builtin lookup. No advertised name starts with `git-`, so the direct
+/// match always wins and the fallback can never shadow one.
 #[must_use]
 pub(crate) fn lookup(name: &str) -> Option<&'static Verb> {
-    VERBS.iter().find(|verb| verb.name == name)
+    VERBS
+        .iter()
+        .find(|verb| verb.name == name)
+        .or_else(|| {
+            name.strip_prefix("git-")
+                .and_then(|rest| VERBS.iter().find(|verb| verb.name == rest))
+        })
 }
 
 /// Renders `ruk version`.

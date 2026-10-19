@@ -321,6 +321,11 @@ fn main() -> ExitCode {
     }
     // Git-compatibility dispatch: invoked as `git`, or `ruk git <verb>`.
     let argv: Vec<String> = std::env::args().collect();
+    // Server-side entry: `git-upload-pack '<dir>'` as argv[0] (what ssh
+    // spawns for a remote clone/fetch), or `ruk upload-pack <dir>`.
+    if let Some(rest) = cli::serve_argv(&argv) {
+        return cli::run(rest, cli::CliEnv::capture());
+    }
     let invoked_as_git = argv
         .first()
         .and_then(|arg0| std::path::Path::new(arg0).file_name())

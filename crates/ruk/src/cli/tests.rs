@@ -1173,6 +1173,82 @@ fn upload_archive_argv_reaches_serve_half() {
 }
 
 #[test]
+fn serve_argv_maps_ssh_argv0_and_ruk_spellings() {
+    // argv[0] dashed names: ssh spawns `git-upload-pack '<dir>'` verbatim.
+    for (arg0, verb) in [
+        ("git-upload-pack", "upload-pack"),
+        ("git-receive-pack", "receive-pack"),
+        ("git-upload-archive", "upload-archive"),
+        ("/usr/lib/ssh/git-upload-pack", "upload-pack"),
+    ] {
+        let argv = vec![arg0.to_owned(), "repo".to_owned()];
+        let rest = super::serve_argv(&argv).expect("server argv");
+        assert_eq!(
+            rest,
+            vec![arg0.to_owned(), verb.to_owned(), "repo".to_owned()]
+        );
+    }
+    // `ruk upload-pack <dir>` (and `git upload-pack <dir>`) from a shell.
+    for prog in ["ruk", "git"] {
+        let argv = vec![
+            prog.to_owned(),
+            "upload-pack".to_owned(),
+            "repo".to_owned(),
+        ];
+        assert_eq!(super::serve_argv(&argv).expect("plain spelling"), argv);
+    }
+    // Untouched: ordinary verbs and the `ruk git` path keep their dispatch.
+    assert!(super::serve_argv(&["ruk".to_owned(), "status".to_owned()]).is_none());
+    assert!(super::serve_argv(&["ruk".to_owned()]).is_none());
+    assert!(super::serve_argv(&[]).is_none());
+    assert!(super::serve_argv(
+        &[
+            "ruk".to_owned(),
+            "git".to_owned(),
+            "upload-pack".to_owned()
+        ]
+    )
+    .is_none());
+    // Dashed names resolve through the dispatch table like `git.c`.
+    for (dashed, plain) in [
+        ("git-upload-pack", "upload-pack"),
+        ("git-receive-pack", "receive-pack"),
+        ("git-upload-archive", "upload-archive"),
+    ] {
+        let entry = lookup(dashed).expect("dashed resolves");
+        assert_eq!(entry.name, plain);
+        assert_eq!(lookup(plain).expect("plain resolves").name, plain);
+    }
+    assert!(lookup("git-nope").is_none());
+}
+
+#[test]
+fn dashed_upload_archive_argv_reaches_serve_half() {
+    use ruk_git::transport::pktline::encode_data;
+
+    let (root, env) = seeded_repo("serve-archive-dashed", "a.txt", b"a\n");
+    let mut input = Vec::new();
+    encode_data(&mut input, b"argument HEAD\n").expect("frame");
+    input.extend_from_slice(b"0000");
+    let env = CliEnv {
+        stdin: Some(input),
+        ..env
+    };
+    let argv = vec![
+        "ruk".to_owned(),
+        "git-upload-archive".to_owned(),
+        root.to_str().expect("utf8 root").to_owned(),
+    ];
+    let (stdout, _) = super::run_inner(&argv, env).expect("dashed routes");
+    assert!(
+        stdout.starts_with(b"0008ACK\n0000"),
+        "dashed argv reaches serve_upload_archive: {stdout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn parity_cosmetic_output_shapes() {
     let (root, env) = seeded_repo("shapes", "a.txt", b"hello\n");
     let mut ctx = repo_ctx(&root, env);

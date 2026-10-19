@@ -246,6 +246,50 @@ pub fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
     ExitCode::from(outcome.code)
 }
 
+/// Server-side argv for the pack-protocol builtins (`upload-pack`,
+/// `receive-pack`, `upload-archive`).
+///
+/// A remote `git` client spawns `git-upload-pack '<dir>'` on the server over
+/// ssh, so when this binary is on PATH under that name (or a symlink of that
+/// name) argv[0]'s basename carries the verb — the same dashed-argv0
+/// convention `git.c` handles before its builtin table. `ruk upload-pack
+/// <dir>` from a shell rewrites the same way. Returns the argv `run_inner`
+/// dispatches (program name, verb, verb args) when either shape matches,
+/// else `None` so the caller falls through to the other dispatches.
+#[must_use]
+pub(crate) fn serve_argv(argv: &[String]) -> Option<Vec<String>> {
+    if let Some(verb) = argv
+        .first()
+        .and_then(|arg0| Path::new(arg0).file_name())
+        .and_then(|name| name.to_str())
+        .and_then(serve_verb_for_dashed)
+    {
+        let mut rest = vec![argv[0].clone(), verb.to_owned()];
+        rest.extend_from_slice(&argv[1..]);
+        return Some(rest);
+    }
+    if argv.get(1).is_some_and(|verb| {
+        matches!(
+            verb.as_str(),
+            "upload-pack" | "receive-pack" | "upload-archive"
+        )
+    }) {
+        return Some(argv.to_vec());
+    }
+    None
+}
+
+/// Maps a dashed server name (`git-upload-pack`, the argv[0] ssh spawns) to
+/// its verb. Anything else is not a server invocation.
+fn serve_verb_for_dashed(name: &str) -> Option<&'static str> {
+    match name {
+        "git-upload-pack" => Some("upload-pack"),
+        "git-receive-pack" => Some("receive-pack"),
+        "git-upload-archive" => Some("upload-archive"),
+        _ => None,
+    }
+}
+
 /// Parses globals, discovers the repository, and dispatches the verb.
 pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8>), GitError> {
     let rest = argv.first().map_or(&[][..], |_| &argv[1.min(argv.len())..]);
