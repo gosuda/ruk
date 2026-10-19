@@ -9,7 +9,7 @@
 //! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
-//! | `archive` | no archive writer; the `git-upload-archive` smart-http client exists in transport but no verb consumes it | unsupported |
+//! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC | tar only; ssh/git-daemon remotes, prefixes, outputs and path limits are named gaps |
 //! | `bundle` | no bundle format | unsupported |
 //! | `gc` | no repack/prune lane | unsupported |
 //! | `fsck` | ref walk + object existence | implemented (reachable only; no dangling census) |
@@ -1560,14 +1560,161 @@ fn first_hop(head: &ruk_core::workspace::HeadRef) -> Option<Vec<u8>> {
     }
 }
 
-/// Writes an archive. Unsupported: no archive writer exists.
+/// Streams a tar archive of one revision: local trees through the
+/// `upload-archive` serve half over a loopback, `--remote` trees over the
+/// smart-http `git-upload-archive` RPC.
 ///
-/// Oracle: `git/builtin/archive.c`.
-pub(crate) fn archive(_ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let _ = args;
-    Err(GitError::Unsupported {
-        command: "archive: no archive writer in this slice".to_owned(),
-    })
+/// Oracle: `git/builtin/archive.c` (`run_remote_archiver` client grammar
+/// for the `--remote` arm). Only `tar` is spoken (the server default);
+/// `--prefix`, `--output` and path limiting are named gaps the server
+/// half also refuses, and SSH/git-daemon remotes stay a named gap (no
+/// `upload-archive` duplex client exists there): use a local path,
+/// `file://` or `http(s)://`.
+pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [
+        FlagSpec {
+            long: "remote",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "format",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "prefix",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "output",
+            short: Some('o'),
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "verbose",
+            short: Some('v'),
+            takes_value: false,
+        },
+    ];
+    let opts = collect(args, &specs)?;
+    if opts.is_set("prefix") {
+        return Err(GitError::Unsupported {
+            command: "archive --prefix is a named gap; the server half archives whole trees only"
+                .to_owned(),
+        });
+    }
+    if opts.is_set("output") {
+        return Err(GitError::Unsupported {
+            command: "archive --output is a named gap; redirect stdout instead".to_owned(),
+        });
+    }
+    if let Some(format) = opts.single("format")? {
+        if format != "tar" {
+            return Err(GitError::Unsupported {
+                command: format!("archive format {format:?} (only tar is spoken)"),
+            });
+        }
+    }
+    if opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: archive [--remote=<repo>] [--format=tar] <tree-ish>".to_owned(),
+        });
+    }
+    if opts.positionals.len() > 1 {
+        return Err(GitError::Unsupported {
+            command: "archive paths are a named gap; the server half archives whole trees only"
+                .to_owned(),
+        });
+    }
+    let rev = opts.positionals[0].clone();
+    match opts.single("remote")? {
+        None => {
+            let store = ctx.store()?;
+            archive_local(store, store.hash_kind(), &rev)
+        }
+        Some(raw) => {
+            let url = ctx
+                .config_get(&format!("remote.{raw}.url"))
+                .unwrap_or(raw.clone());
+            match net::parse_endpoint(&url)? {
+                Endpoint::Local { path } => {
+                    let base = if path.is_absolute() {
+                        path
+                    } else {
+                        ctx.env.cwd.join(path)
+                    };
+                    let store = open_store_at(&base).or_else(|_| open_local_store(&base))?;
+                    let kind = store.hash_kind();
+                    archive_local(&store, kind, &rev)
+                }
+                Endpoint::Http { url, .. } => {
+                    let base = ruk_git::transport::smart_http::normalize_base(&url)?;
+                    let out = ruk_git::transport::smart_http::fetch_archive(
+                        &base,
+                        &ruk_git::transport::smart_http::ArchiveWireRequest { rev },
+                        &Interrupt::none(),
+                    )?;
+                    Ok(out.tar)
+                }
+                Endpoint::Ssh { .. } | Endpoint::Git { .. } => Err(GitError::Unsupported {
+                    command: format!(
+                        "archive over {url:?} (ssh/git-daemon transports are a named gap; use a local path, file:// or http(s)://)"
+                    ),
+                }),
+            }
+        }
+    }
+}
+
+/// Archives one revision of a local store through the `upload-archive`
+/// serve half over a loopback: the request framing is the shared
+/// `archive_request_body` grammar, and the reply demuxes exactly like the
+/// smart-http client tail (ACK, flush, sideband tar).
+fn archive_local(store: &Store, kind: HashKind, rev: &str) -> Result<Vec<u8>, GitError> {
+    use std::io::Read as _;
+
+    let input = ruk_git::transport::smart_http::archive_request_body(rev)?;
+    let head = serve_head(store)?;
+    let mut framed = Vec::new();
+    serve_upload_archive(
+        std::io::Cursor::new(input),
+        &mut framed,
+        store,
+        kind,
+        &head,
+        &Interrupt::none(),
+    )?;
+    let mut pkt = ruk_git::transport::pktline::PktReader::new(
+        std::io::Cursor::new(framed),
+        Interrupt::none(),
+    );
+    let first = pkt.read_line("the archive acknowledgement")?.to_vec();
+    if first != b"ACK" {
+        return Err(GitError::Corrupt {
+            detail: format!("upload-archive answered {}", first.escape_ascii()),
+        });
+    }
+    match pkt.read_packet()? {
+        ruk_git::transport::pktline::Packet::Flush => {}
+        other => {
+            return Err(GitError::Corrupt {
+                detail: format!("upload-archive misses its flush, got {other:?}"),
+            });
+        }
+    }
+    let mut sideband = ruk_git::transport::pktline::SidebandReader::new(
+        &mut pkt,
+        ruk_git::transport::pktline::LARGE_PACKET_MAX,
+    );
+    let mut tar = Vec::new();
+    sideband
+        .read_to_end(&mut tar)
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot read the archive stream: {err}"),
+        })?;
+    Ok(tar)
 }
 
 /// Handles bundles. Unsupported: no bundle format exists.
