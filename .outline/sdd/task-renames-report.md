@@ -1,6 +1,7 @@
 # task-renames report
 - c4d7e24 core: `cli/rename.rs` parses `-M[n]`/`--find-renames[=n]`/`--no-renames` (bare=50%, `-M0`=off, later-wins, `--` passthrough), scores line-multiset Dice similarity (identical=100, binary exact-only, 1MiB/20k-line caps), and pairs basename-first greedy capped at 20k evals.
 - 6b19174 diff/log/show + merge: `TreePair.old_path/similarity` with `apply_pair_renames` on tree/tree and tree/index pairs only (worktree pairs keep untracked adds unpaired, as the oracle); output `similarity index N%` + `rename from/to` + hunks, `R<score>` name-status, `old => new` stat; merge `detect_lane_renames` at 50% redirects rename-plus-edit to a synthetic three-way at the new path (source resolves Deleted).
-- 676fbed status: staged exact (default) plus similarity with `-M`; worktree del-plus-untracked pairs only with `-M` (` R old -> new`, `renamed:` in the unstaged section); `--no-renames` pairs nothing.
-- Proof: `cargo test -p ruk --bin ruk cli::rename` (8 passed); `cargo check`/`--tests` clean.
+- 676fbed status: staged exact (default) plus similarity with `-M`; worktree del-plus-untracked pairs only with `-M` (` R old -> new`, `renamed:` in the unstaged section, an opt-in extension since default output matches the oracle's delete-plus-untracked); `--no-renames` pairs nothing.
+- ae2bd36 follow-up: name-status scores zero-padded (`R080`, as the oracle); diff pathspec filters before pairing (old-only/new-only specs stay delete/add).
+- Proof: `cargo test -p ruk --bin ruk cli::rename` (9 passed); `cargo check`/`--tests` clean.
 - Gaps: default diff shows add+delete for pure renames (needs `-M`, unlike the oracle); rename+delete and double-rename keep old resolutions; `tree_file_changes` (commit/merge stats) stays exact-only; merge threshold fixed at 50% with no flag.
