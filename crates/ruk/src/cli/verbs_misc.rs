@@ -3327,31 +3327,71 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
     let verb = super::dispatch::lookup(verb_name).ok_or_else(|| GitError::Unsupported {
         command: verb_name.clone(),
     })?;
+    // The store serializes opens against live handles (reads included),
+    // so a listed repository that is already open here cannot be opened
+    // again: when the listed root is this context's root, the open store
+    // moves into the sub-context for the run and moves back after, the
+    // way the oracle's per-repository processes each own exactly one
+    // handle. Anything else opens (and drops) its own handle per run.
+    let here = std::fs::canonicalize(&ctx.root).ok();
     let mut out = Vec::new();
+    let mut result = Ok(());
     for repo in &repos {
+        if result.is_err() {
+            break;
+        }
         let root = std::path::PathBuf::from(repo);
         let dot = if root.file_name().is_some_and(|name| name == ".ruk") {
             root.clone()
         } else {
             root.join(".ruk")
         };
-        let store = ruk_core::store::Store::open(
-            &dot,
-            std::sync::Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
-        )
-        .map_err(|err| GitError::Io {
-            detail: format!("opening {repo}: {err}"),
-        })?;
-        let kind = store.hash_kind();
-        let mut sub = Ctx {
-            store: Some(store),
-            root: root.clone(),
-            file_base: root.clone(),
-            kind: Some(kind),
-            env: ctx.env.clone(),
-            bare: false,
-            cli_config: Vec::new(),
-            stderr: Vec::new(),
+        let same_root = here.as_ref().is_some_and(|here| {
+            std::fs::canonicalize(&root)
+                .ok()
+                .is_some_and(|there| there == *here)
+        });
+        let reused = if same_root {
+            ctx.store.take()
+        } else {
+            None
+        };
+        let mut sub = if let Some(store) = reused {
+            let kind = store.hash_kind();
+            Ctx {
+                store: Some(store),
+                root: ctx.root.clone(),
+                file_base: ctx.file_base.clone(),
+                kind: Some(kind),
+                env: ctx.env.clone(),
+                bare: false,
+                cli_config: Vec::new(),
+                stderr: Vec::new(),
+            }
+        } else {
+            let store = match ruk_core::store::Store::open(
+                &dot,
+                std::sync::Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+            ) {
+                Ok(store) => store,
+                Err(err) => {
+                    result = Err(GitError::Io {
+                        detail: format!("opening {repo}: {err}"),
+                    });
+                    break;
+                }
+            };
+            let kind = store.hash_kind();
+            Ctx {
+                store: Some(store),
+                root: root.clone(),
+                file_base: root.clone(),
+                kind: Some(kind),
+                env: ctx.env.clone(),
+                bare: false,
+                cli_config: Vec::new(),
+                stderr: Vec::new(),
+            }
         };
         match (verb.run)(&mut sub, verb_args) {
             Ok(bytes) => {
@@ -3360,11 +3400,16 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
             }
             Err(err) => {
                 ctx.emit_stderr(format!("for-each-repo: {repo}: {err}\n").as_bytes());
-                return Err(err);
+                result = Err(err);
+            }
+        }
+        if let Some(store) = sub.store.take() {
+            if ctx.store.is_none() {
+                ctx.store = Some(store);
             }
         }
     }
-    Ok(out)
+    result.map(|()| out)
 }
 
 // ---------------------------------------------------------------------------
