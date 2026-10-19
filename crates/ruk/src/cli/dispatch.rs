@@ -494,7 +494,7 @@ pub(crate) static VERBS: &[Verb] = &[
     },
     Verb {
         name: "request-pull",
-        oracle: "git/builtin/request-pull.c",
+        oracle: "git/git-request-pull.sh",
         needs_repo: true,
         summary: "Print a pull-request mail template for a range",
         run: verbs_fastio::request_pull,

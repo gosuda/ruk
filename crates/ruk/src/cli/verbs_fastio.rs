@@ -9,7 +9,7 @@
 //! | `request-pull` | history walk plus tree stat | implemented (template with shortlog and diffstat; `-p` refused) |
 //!
 //! Oracle anchors: `git/builtin/fast-export.c`, `git/builtin/fast-import.c`,
-//! `git/builtin/range-diff.c`, `git/builtin/request-pull.c`.
+//! `git/builtin/range-diff.c`, `git/git-request-pull.sh`.
 //!
 //! Divergences from the oracles:
 //! - The stream subset omits notes (`N` file ops), `ls`/`cat-blob`/`get-mark`
@@ -355,13 +355,29 @@ fn tag_object_target(payload: &[u8]) -> Option<Oid> {
 }
 
 /// Claims every walked commit for the first exporting ref that reaches
-/// it, so each `commit` line names a real ref.
+/// it, so each `commit` line names a real ref. Tag-only commits (beyond
+/// every named tip) ride under their tag's name; the tag's own trailing
+/// `tag`/`reset` block pins the ref, so the import converges.
 fn claim_commits(store: &Store, plan: &ExportPlan) -> Result<HashMap<Oid, String>, GitError> {
     let mut claim: HashMap<Oid, String> = HashMap::new();
     for (name, tip) in &plan.named {
         let closure = walk_history_excluding(store, &[*tip], &plan.exclude, None)?;
         for (oid, _) in &closure {
             claim.entry(*oid).or_insert_with(|| name.clone());
+        }
+    }
+    let mut tag_tips: Vec<(&str, Oid)> = plan
+        .tags
+        .iter()
+        .map(|tag| (tag.name.as_str(), tag.target))
+        .collect();
+    for (name, tip) in &plan.lightweight {
+        tag_tips.push((name.as_str(), *tip));
+    }
+    for (name, tip) in tag_tips {
+        let closure = walk_history_excluding(store, &[tip], &plan.exclude, None)?;
+        for (oid, _) in &closure {
+            claim.entry(*oid).or_insert_with(|| name.to_owned());
         }
     }
     Ok(claim)
@@ -865,12 +881,9 @@ impl<'a> Cursor<'a> {
         }
         let body = self.data[self.pos..end].to_vec();
         self.pos = end;
-        if self.pos < self.data.len() {
-            if self.data[self.pos] != b'\n' {
-                return Err(GitError::Invalid {
-                    detail: "data block is not followed by a newline".to_owned(),
-                });
-            }
+        // One trailing newline ends the block when present, matching the
+        // oracle's `skip_optional_lf`; empty `data 0` blocks carry none.
+        if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
             self.pos += 1;
         }
         Ok(body)
