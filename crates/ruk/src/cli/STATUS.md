@@ -43,7 +43,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | add | implemented | explicit paths, `-u`, `-A`, `-N`; worktree bytes hashed per file |
 | archive | implemented | `--format=tar` (server default) and `--format=zip` (client-side transcode of the tar); `--prefix`, `-o`, path limits |
 | branch | implemented | list/create/delete/rename; `-d` checks ancestry, `-D` forces |
-| bundle | unsupported | no bundle format in this slice |
+| bundle | implemented | git bundle v2/v3 headers plus pack v2; `create [--all] [<rev>...]` (refs only, `^rev` exclusions become prerequisites), `verify`, `list-heads`, `unbundle` (objects only, no refs); `clone <file>` plants refs; bundle verbs need a repository |
 | cat-file | implemented | `-p`, `-t`, `-s`, `-e` over the bounded object reader; `--batch-check [--batch-all-objects]` lists `<oid> <type> <size>` from the store census |
 | check-ref-format | implemented | `RefName` validation; `--print`, `--branch` |
 | checkout | implemented | branch switch, detach, `-b`/`-B`, path restore |
@@ -57,7 +57,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | fetch | implemented | local paths only; refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; `--lfs` pulls LFS payloads for fetched tips (mirror parity) |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
 | fsck | implemented | reachable refs, history, trees, blobs, and index rows; `--dangling`/`--unreachable` list `dangling <kind> <oid>` from the census minus the ref closure |
-| gc | unsupported | no repack or prune lane in this slice |
+| gc | implemented | prune unreachable (ref closure + detached `HEAD`/index/stash/`FETCH_HEAD`/sequencer/reflog pins, delta-base closure in store) then compact; `--aggressive` repeats compaction, `--auto` exits quietly with no work, `--dry-run` reports, `--prune=now` (default) prunes and `--prune=never` compacts only (other dates are `Unsupported`: no object ages, no grace period) |
 | grep | implemented | subset: `-l`, `-c`, `-n`, `-e`, `-i`, `-w`, `-F`, `-E` (last of `-F`/`-E` wins), `-H`/`--with-filename`/`--no-filename`, one `<commit>` for tree scope; 0 hit / 1 no hit / 128 bad use; no pathspecs, no `.rukignore`, always-Rust-regex patterns |
 | hash-object | implemented | `-t blob/tree/commit`, `-w` stores; works outside a repository without `-w` |
 | help | implemented | verb list and per-verb summaries |
@@ -97,7 +97,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | upload-pack | unsupported | `ruk-git` holds the client half; serving fetches is absent |
 | verify-pack | implemented | header, version, and trailer validation plus full verify-mode ingest with staged output dropped |
 | version | implemented | reports `CARGO_PKG_VERSION` |
-| worktree | unsupported | no workcopy lane in this slice |
+| worktree | implemented | `add` (branches, detach, `-b`/`-B`, `--force`)/`list` (`--porcelain`) /`remove` (`--force`)/`prune` (`--dry-run`) over `cli/worktrees/` snapshot checkouts; secondaries share the store but not `HEAD`/index, and `add` inside the root is refused |
 | write-tree | implemented | refuses unmerged paths |
 
 ## Known divergences from Git
