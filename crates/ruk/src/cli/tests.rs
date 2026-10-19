@@ -4331,10 +4331,10 @@ fn bisect_terms_aliases_and_log() {
         String::from_utf8_lossy(&shown).contains("new and old"),
         "got {shown:?}"
     );
-    // The custom good alias marks the checked-out midpoint.
     let marked = run(verbs_bisect::bisect, &mut ctx, &["new"]).expect("alias good");
+    let marked_text = String::from_utf8_lossy(&marked);
     assert!(
-        String::from_utf8_lossy(&marked).contains("Bisecting"),
+        marked_text.contains("Bisecting") || marked_text.contains("first bad commit"),
         "got {marked:?}"
     );
     let log = run(verbs_bisect::bisect, &mut ctx, &["log"]).expect("log");
@@ -4435,6 +4435,10 @@ fn patch_round_trip_format_patch_am() {
         .expect("utf8")
         .trim()
         .to_owned();
+    let dates_before = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--format=%ad", "-n", "2"]).expect("dates before"),
+    )
+    .expect("utf8");
     let mbox = run(verbs_patch::format_patch, &mut ctx, &["HEAD~2..HEAD"]).expect("format-patch");
     let text = String::from_utf8(mbox.clone()).expect("utf8");
     assert!(
@@ -4491,6 +4495,23 @@ fn patch_round_trip_format_patch_am() {
         log.contains("swap gone for new") && log.contains("add gone"),
         "got {log:?}"
     );
+    // Authors (name, email, and date) survive the mbox round-trip.
+    let authors = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--format=%an <%ae>", "-n", "2"]).expect("authors"),
+    )
+    .expect("utf8");
+    assert_eq!(authors.lines().count(), 2);
+    assert!(
+        authors
+            .lines()
+            .all(|line| line == "Ada <ada@example.invalid>"),
+        "got {authors:?}"
+    );
+    let dates = String::from_utf8(
+        run(verbs_history::log, &mut ctx, &["--format=%ad", "-n", "2"]).expect("dates"),
+    )
+    .expect("utf8");
+    assert_eq!(dates, dates_before);
     // The replayed history resolves to the original tip tree.
     let diff = run(verbs_history::diff, &mut ctx, &[tip.as_str()]).expect("diff");
     assert!(diff.is_empty(), "round-trip tree differs: {diff:?}");

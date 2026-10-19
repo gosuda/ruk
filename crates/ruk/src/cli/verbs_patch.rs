@@ -939,13 +939,19 @@ struct PatchFile {
 /// --git` headers and traditional `---`/`+++` openings. Unknown leading
 /// lines fail naming the line instead of guessing.
 fn parse_patch(bytes: &[u8]) -> Result<Vec<PatchFile>, GitError> {
-    let lines: Vec<Vec<u8>> = bytes
+    let mut lines: Vec<Vec<u8>> = bytes
         .split(|byte| *byte == b'\n')
         .map(|line| {
             line.strip_suffix(b"\r")
                 .map_or_else(|| line.to_vec(), <[u8]>::to_vec)
         })
         .collect();
+    // The split leaves one artifact empty string after a trailing newline;
+    // drop it so it is never read as a context line. A genuine trailing
+    // blank context line still parses: its `" "` line precedes this one.
+    if bytes.ends_with(b"\n") {
+        lines.pop();
+    }
     let mut files = Vec::new();
     let mut index = 0;
     while index < lines.len() {
@@ -1139,10 +1145,17 @@ fn parse_hunks(
             no_newline_old: false,
             no_newline_new: false,
         };
+        let mut old_seen = 0usize;
+        let mut new_seen = 0usize;
         while index < lines.len() {
             let Some(line) = lines.get(index) else {
                 break;
             };
+            // A hunk ends when both side counts are met; a trailing `\`
+            // marker still binds to the last body line.
+            if old_seen >= old_count && new_seen >= new_count {
+                break;
+            }
             if line.is_empty() {
                 // An empty line is a context empty line, as git reads it.
                 hunk.lines.push(HunkLine {
@@ -1150,6 +1163,8 @@ fn parse_hunks(
                     body: Vec::new(),
                     newline: true,
                 });
+                old_seen += 1;
+                new_seen += 1;
                 index += 1;
             } else {
                 match line.first() {
@@ -1717,9 +1732,11 @@ fn plan_one_file(
     let result = join_text(&result_lines);
     let result_mode =
         patch_result_mode(file, base_mode).map_err(|err| wrap_path(&new_path, err))?;
-    // Operational rename: the stripped paths differ, so the pre-image rows
-    // and file must go (header-only renames still strip to equal paths).
-    let renamed = old_path != new_path;
+    // Operational rename: the stripped paths differ on a modified file, so
+    // the pre-image rows and file must go. New files keep the `/dev/null`
+    // side, which is never a repository path; deletes already normalized
+    // the new side onto the old one above.
+    let renamed = !file.is_new && old_path != new_path;
     Ok(ApplyPlan {
         old_path,
         new_path,
@@ -2267,10 +2284,17 @@ fn split_mbox(bytes: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Joins split lines into one normalized message raw.
+/// Joins split lines into one normalized message raw: trailing blank
+/// lines collapse so the raw ends in exactly one newline. Without this,
+/// the split artifact after a trailing newline would double it and push
+/// the mbox signature out of the strip window below.
 fn join_raw(lines: &[Vec<u8>]) -> Vec<u8> {
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].is_empty() {
+        end -= 1;
+    }
     let mut out = Vec::new();
-    for line in lines {
+    for line in &lines[..end] {
         out.extend_from_slice(line);
         out.push(b'\n');
     }
@@ -2330,7 +2354,7 @@ fn am_resume(
             Ok(message) => message,
             Err(err) => {
                 save_am_state(store, abort, &pending)?;
-                return Err(err);
+                return Err(with_am_hint(err));
             }
         };
         match am_apply_message(ctx, &message, &mut map, opts, strip) {
@@ -2340,16 +2364,22 @@ fn am_resume(
             }
             Err(err) => {
                 save_am_state(store, abort, &pending)?;
-                let mut detail = err.to_string();
-                detail.push_str(
-                    "\nhint: resolve the failure and run `am --continue`, `am --skip`, or `am --abort`",
-                );
-                return Err(GitError::Invalid { detail });
+                return Err(with_am_hint(err));
             }
         }
     }
     pseudo_delete(store, AM_STATE)?;
     Ok(out)
+}
+
+/// Points a stopped `am` at its resumption verbs. Every stoppage leaves
+/// the session behind, so every failure carries the same hint.
+fn with_am_hint(err: GitError) -> GitError {
+    let mut detail = err.to_string();
+    detail.push_str(
+        "\nhint: resolve the failure and run `am --continue`, `am --skip`, or `am --abort`",
+    );
+    GitError::Invalid { detail }
 }
 
 /// Parses `-p/--strip` (default 1) for `apply` and `am`.
@@ -2468,7 +2498,7 @@ fn am_apply_message(
     let mut mutations = Vec::new();
     let mut objects = Vec::new();
     for (old_path, new_path, result, result_mode, is_delete) in &results {
-        if old_path != new_path {
+        if old_path != new_path && old_path != b"/dev/null" {
             let old_repo = RepoPath::new(old_path.clone()).map_err(to_core_invalid)?;
             let before = read_path_rows(store, kind, &old_repo)?;
             mutations.extend(path_row_mutations(&old_repo, &before, &[])?);
@@ -2539,7 +2569,7 @@ fn am_apply_message(
             map.remove(old_path);
             continue;
         }
-        if old_path != new_path {
+        if old_path != new_path && old_path != b"/dev/null" {
             let old_full = join_base(&ctx.file_base, old_path)?;
             if old_full.is_symlink() || old_full.is_file() {
                 std::fs::remove_file(&old_full).map_err(|err| GitError::Io {
@@ -2667,7 +2697,9 @@ fn am_continue(
     for file in &message.patches {
         let old_path = strip_path(&file.old_path, strip)?;
         let new_path = strip_path(&file.new_path, strip)?;
-        if file.is_delete || new_path != old_path {
+        // New files keep the `/dev/null` side, which is never a repository
+        // path and has no rows to remove.
+        if file.is_delete || (new_path != old_path && old_path != b"/dev/null") {
             let old_repo = RepoPath::new(old_path.clone()).map_err(to_core_invalid)?;
             touched.push((old_repo, None));
         }
@@ -3029,10 +3061,16 @@ fn strip_bracket_prefix(subject: &str) -> String {
 /// lines: the last `-- ` line with at most two short lines after it, none
 /// of which open a new diff section.
 fn strip_signature(lines: &[Vec<u8>]) -> Vec<u8> {
+    // Trailing blank lines are padding, not content: ignore them when
+    // locating the signature block, so padded mboxes strip like clean ones.
     let mut end = lines.len();
-    for (index, line) in lines.iter().enumerate() {
+    while end > 0 && lines.get(end - 1).is_some_and(|line| line.is_empty()) {
+        end -= 1;
+    }
+    let mut cut = end;
+    for (index, line) in lines.iter().enumerate().take(end) {
         if line == b"-- " {
-            let tail = lines.get(index + 1..).unwrap_or_default();
+            let tail = lines.get(index + 1..end).unwrap_or_default();
             if tail.len() <= 2
                 && tail.iter().all(|line| {
                     !(line.starts_with(b"diff --git ")
@@ -3041,12 +3079,12 @@ fn strip_signature(lines: &[Vec<u8>]) -> Vec<u8> {
                         || line.starts_with(b"+++ "))
                 })
             {
-                end = index;
+                cut = index;
             }
         }
     }
     let mut out = Vec::new();
-    for line in lines.get(..end).unwrap_or_default() {
+    for line in lines.get(..cut).unwrap_or_default() {
         out.extend_from_slice(line);
         out.push(b'\n');
     }
