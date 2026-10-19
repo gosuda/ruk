@@ -2794,7 +2794,9 @@ pub(crate) fn gc(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let quiet = opts.is_set("quiet");
     let mut out = format!("Enumerating objects: {census}, done.\n").into_bytes();
     if opts.is_set("dry-run") {
-        if doomed.is_empty() {
+        if !prune {
+            out.extend_from_slice(b"Prune disabled (--prune=never).\n");
+        } else if doomed.is_empty() {
             out.extend_from_slice(b"Nothing to prune.\n");
         } else {
             out.extend_from_slice(
@@ -2866,8 +2868,9 @@ pub(crate) fn gc(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
 /// exactly like [`fsck`]; failures there propagate, since a broken ref
 /// walk is corruption either verb must report. Pins — index blobs, stash
 /// commits and their captured rows, `FETCH_HEAD` tips, sequencer tips, and
-/// reflog oids — are best effort: an unreadable pin keeps its own oid and
-/// continues, because collection is cleanup, not verification.
+/// reflog oids — keep their own oid unconditionally; an absent pin walks
+/// nothing further, while any other pin failure propagates, since the
+/// reachable set decides deletions and a half walk must not prune blind.
 fn gc_reachable(store: &Store, kind: HashKind) -> Result<HashSet<Oid>, GitError> {
     let mut reachable = HashSet::new();
     let mut commits = Vec::new();
@@ -2951,24 +2954,30 @@ fn gc_reachable(store: &Store, kind: HashKind) -> Result<HashSet<Oid>, GitError>
         }
     }
     pin_tips.extend(all_reflog_oids(store).map_err(GitError::from)?);
-    // One pin at a time, so one unreadable pin cannot abort the rest.
+    // One absent pin cannot abort the rest; any other failure aborts the
+    // collection, since an incomplete reachable set would delete blind.
     for tip in pin_tips {
         reachable.insert(tip);
-        let _ = gc_walk_pin_tip(store, kind, &mut reachable, tip);
+        gc_walk_pin_tip(store, kind, &mut reachable, tip)?;
     }
     Ok(reachable)
 }
 
-/// Walks one lenient pin tip into `reachable`: tags peel, commits walk
-/// history, trees walk their subtree. Any failure belongs to the caller
-/// to ignore — collection is cleanup, not verification.
+/// Walks one pin tip into `reachable`: tags peel, commits walk history,
+/// trees walk their subtree. Only an absent tip is tolerated (its own oid
+/// is already pinned above; there is no history to walk). Every other
+/// failure propagates: the reachable set decides deletions, so a half
+/// walk must abort collection rather than prune blind.
 fn gc_walk_pin_tip(
     store: &Store,
     kind: HashKind,
     reachable: &mut HashSet<Oid>,
     tip: Oid,
 ) -> Result<(), GitError> {
-    let (visited, commit) = peel_tip_chain(store, kind, tip)?;
+    let (visited, commit) = match peel_tip_chain(store, kind, tip) {
+        Err(GitError::NotFound { .. }) => return Ok(()),
+        other => other?,
+    };
     reachable.extend(visited.iter().copied());
     let Some(commit) = commit else {
         if let Some(&terminal) = visited.last()
