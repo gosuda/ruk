@@ -435,7 +435,10 @@ mod tests {
             &mut ctx,
             &["--cached", "-M", "--name-status"],
         );
-        assert_eq!(String::from_utf8(out).expect("utf8"), "R90\ta.txt\tb.txt\n");
+                assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "R090\ta.txt\tb.txt\n"
+        );
         let out = run(
             super::super::verbs_history::diff,
             &mut ctx,
@@ -443,6 +446,42 @@ mod tests {
         );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("a.txt => b.txt"), "got:\n{text}");
+        let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[test]
+    fn diff_pathspec_applies_before_pairing() {
+        let (root, env) = seeded("diffpaths", "a.txt", TEN);
+        let mut ctx = ctx_for(&root, &env);
+        run(super::super::verbs_stage::mv, &mut ctx, &["a.txt", "b.txt"]);
+        std::fs::write(root.join("b.txt"), TEN_EDIT).expect("edit");
+        run(super::super::verbs_stage::add, &mut ctx, &["b.txt"]);
+        // New side only: plain add, never half of a rename.
+        let out = run(
+            super::super::verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-M", "--", "b.txt"],
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("new file mode"), "got:\n{text}");
+        assert!(!text.contains("rename from"), "got:\n{text}");
+        // Old side only: plain delete.
+        let out = run(
+            super::super::verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-M", "--", "a.txt"],
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("deleted file mode"), "got:\n{text}");
+        assert!(!text.contains("rename from"), "got:\n{text}");
+        // Both sides: the rename shows.
+        let out = run(
+            super::super::verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-M", "--", "a.txt", "b.txt"],
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("rename from a.txt"), "got:\n{text}");
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     }
 

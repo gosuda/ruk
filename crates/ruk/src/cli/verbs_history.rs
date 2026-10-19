@@ -4451,22 +4451,18 @@ pub(crate) fn diff(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         (None, Some(_)) => unreachable!("a second rev never outlives a missing first"),
     };
     let mut pairs = pairs;
+    if !paths.is_empty() {
+        // The oracle applies the pathspec before rename detection: sides
+        // outside it stay add or delete, never half of a rename.
+        pairs.retain(|pair| {
+            paths
+                .iter()
+                .any(|want| want.as_bytes() == pair.path.as_slice())
+        });
+    }
     if track_renames {
         apply_pair_renames(ctx, &mut pairs, rename_mode)?;
     }
-    let pairs: Vec<TreePair> = pairs
-        .into_iter()
-        .filter(|pair| {
-            paths.is_empty()
-                || paths.iter().any(|want| {
-                    want.as_bytes() == pair.path.as_slice()
-                        || pair
-                            .old_path
-                            .as_ref()
-                            .is_some_and(|old| want.as_bytes() == old.as_slice())
-                })
-        })
-        .collect();
     render_pairs(ctx, &pairs, &opts)
 }
 
@@ -4932,7 +4928,7 @@ fn render_pairs(
             if let (Some(old_path), Some(score)) = (&pair.old_path, pair.similarity) {
                 out.extend_from_slice(
                     format!(
-                        "R{score}\t{}\t{}\n",
+                        "R{score:03}\t{}\t{}\n",
                         String::from_utf8_lossy(old_path),
                         String::from_utf8_lossy(&pair.path)
                     )
