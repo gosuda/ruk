@@ -35,7 +35,9 @@ const KNOWN_HOOKS: &[&str] = &[
     "post-checkout",
 ];
 
-/// Locates one hook file, mirroring `find_hook`.
+/// Locates one hook file, mirroring `find_hook`: a configured
+/// `core.hooksPath` replaces the defaults entirely (no fallback), else
+/// `.ruk/hooks` beats `.git/hooks`.
 #[must_use]
 pub(crate) fn hook_path(ctx: &Ctx, name: &str) -> Option<PathBuf> {
     if !KNOWN_HOOKS.contains(&name) || name.contains('/') || name.contains('\0') {
@@ -48,9 +50,7 @@ pub(crate) fn hook_path(ctx: &Ctx, name: &str) -> Option<PathBuf> {
             ctx.root.join(dir)
         };
         let candidate = base.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
+        return is_executable(&candidate).then_some(candidate);
     }
     for dir in [
         ctx.root.join(".ruk").join("hooks"),

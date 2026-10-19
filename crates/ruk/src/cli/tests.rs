@@ -8826,6 +8826,19 @@ fn hooks_core_hooks_path_beats_ruk_hooks() {
     std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     run(verbs_history::commit, &mut ctx, &["-m", "via-path"]).expect("commit");
+    // A configured hooks path replaces the defaults: with an empty
+    // override dir the failing `.ruk/hooks` hook never runs.
+    let empty = root.join("empty-hooks");
+    std::fs::create_dir_all(&empty).expect("empty dir");
+    run(
+        verbs_repo::config,
+        &mut ctx,
+        &["core.hooksPath", empty.to_str().expect("utf8")],
+    )
+    .expect("config");
+    std::fs::write(root.join("f.txt"), b"three\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "via-empty-path"]).expect("commit");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
