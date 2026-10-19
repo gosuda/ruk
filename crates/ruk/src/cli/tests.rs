@@ -4998,6 +4998,7 @@ fn merge_file_union_and_diff3_labels() {
     )
     .expect_err("marker size");
     assert!(err.to_string().contains("<<<<<<<<<"), "got {err:?}");
+    assert!(err.to_string().contains("=========\n"), "got {err:?}");
     let _ = std::fs::remove_dir_all(&base);
 }
 

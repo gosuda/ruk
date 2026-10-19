@@ -347,9 +347,10 @@ fn tag_object_target(payload: &[u8]) -> Option<Oid> {
         if line.is_empty() {
             break;
         }
-        let rest = line.strip_prefix(b"object ")?;
-        let text = std::str::from_utf8(rest).ok()?;
-        return text.parse::<Oid>().ok();
+        if let Some(rest) = line.strip_prefix(b"object ") {
+            let text = std::str::from_utf8(rest).ok()?;
+            return text.parse::<Oid>().ok();
+        }
     }
     None
 }
