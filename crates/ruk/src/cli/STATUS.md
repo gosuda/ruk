@@ -54,7 +54,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | config | implemented | `--local` scope only; `--global`/`--system`/`--worktree` are `Unsupported` |
 | count-objects | implemented | `<n> objects, <bytes>` from the store census, no payload I/O |
 | diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; hunks from a bounded LCS differ with labeled omissions |
-| fetch | implemented | local paths only; refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; `--lfs` pulls LFS payloads for fetched tips (mirror parity) |
+| fetch | implemented | refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; local, `ssh://`, `git://`, smart-http v2→v0, dumb-http fetch fallback; `--lfs` pulls payloads for fetched tips under `LfsMode::Full` (mirror parity) |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
 | fsck | implemented | reachable refs, history, trees, blobs, and index rows; `--dangling`/`--unreachable` list `dangling <kind> <oid>` from the census minus the ref closure |
 | gc | implemented | prune unreachable (ref closure + detached `HEAD`/index/stash/`FETCH_HEAD`/sequencer/reflog pins, delta-base closure in store) then compact; `--aggressive` repeats compaction, `--auto` exits quietly with no work, `--dry-run` reports, `--prune=now` (default) prunes and `--prune=never` compacts only (other dates are `Unsupported`: no object ages, no grace period) |
@@ -65,7 +65,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | init | implemented | `--object-format`, `--bare`, reinit; unborn `HEAD` on `refs/heads/main` |
 | log | implemented | `--oneline`, `-n`/`--max-count` |
 | ls-files | implemented | `-s`, `-u`, `--others`, `--error-unmatch` |
-| ls-remote | implemented | local paths only; network remotes are `Offline` |
+| ls-remote | implemented | local, `ssh://`, `git://`, smart-http |
 | ls-tree | implemented | `-r`, `--name-only`; gitlinks report as commits |
 | merge | implemented | fast-forward only; anything needing content resolution is `Unsupported` and writes no state |
 | merge-base | implemented | pairwise paint-down; `--is-ancestor` exits 1 when false |
@@ -74,9 +74,9 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | mv | implemented | all stages renamed, worktree file renamed; `-f` allows overwrite |
 | pack-objects | unsupported | declared absent for this slice |
 | pull | implemented | local paths only; fetch plus fast-forward merge |
-| push | implemented | local paths only; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
+| push | implemented | local, `ssh://`, `git://`, and smart/dumb-http; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
 | rebase | partial | up-to-date succeeds; `--abort`/`--quit`/`--continue` report absent state; replay needs the merge lane |
-| receive-pack | unsupported | `ruk-git` holds the client half; serving pushes is absent |
+| receive-pack | implemented | serves pushes over stdin/stdout via `ruk receive-pack <dir>` and the `git-receive-pack` argv0 name; v0 wire |
 | remote | implemented | backed by `remote.<name>.*` config records |
 | reset | implemented | `--soft`, `--mixed` (default), `--hard` with worktree sync, path form |
 | restore | implemented | `--staged`/`--worktree` (default worktree), `--source` |
@@ -94,7 +94,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | update-index | implemented | `--cacheinfo`, `--stdin`, `--add`, `--remove`, `--assume-unchanged`, `--skip-worktree`, `--refresh` |
 | update-ref | implemented | expected-value CAS, `-d`, `-m` reflog rows |
 | upload-archive | implemented | serves archives over the upload-archive protocol |
-| upload-pack | unsupported | `ruk-git` holds the client half; serving fetches is absent |
+| upload-pack | implemented | serves fetches over stdin/stdout via `ruk upload-pack <dir>` and the `git-upload-pack` argv0 name; protocol v2 negotiated on `GIT_PROTOCOL`, v0 fallback |
 | verify-pack | implemented | header, version, and trailer validation plus full verify-mode ingest with staged output dropped |
 | version | implemented | reports `CARGO_PKG_VERSION` |
 | worktree | implemented | `add` (branches, detach, `-b`/`-B`, `--force`)/`list` (`--porcelain`) /`remove` (`--force`)/`prune` (`--dry-run`) over `cli/worktrees/` snapshot checkouts; secondaries share the store but not `HEAD`/index, and `add` inside the root is refused |
