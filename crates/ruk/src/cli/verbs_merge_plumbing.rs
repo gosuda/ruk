@@ -1039,19 +1039,39 @@ fn read_tree_merge(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     let revs = opts.positionals.clone();
     let (base_tree, ours_tree, theirs_tree) = match revs.len() {
         1 => {
-            // One-tree `-m` only fast-forwards an unchanged index: anything
-            // else is a real merge the two/three-tree form performs.
+            // One-tree `-m` is a oneway fast-forward: it only runs on an
+            // unchanged index (matching `HEAD`, with nothing unmerged).
+            // Anything else is a real merge the two/three-tree form performs.
             let tree = peel_to_tree(store, kind, resolve_rev(store, kind, &revs[0])?)?;
-            let head_tree = head_tree_of(ctx)?;
-            if head_tree == tree {
+            let rows = scan_index(store, kind)?;
+            if rows.iter().any(|(_, stage, _)| *stage != Stage::Zero) {
+                return Err(GitError::Invalid {
+                    detail: "unmerged paths must be resolved first".to_owned(),
+                });
+            }
+            let head_map = tree_path_map(store, kind, head_tree_of(ctx)?)?;
+            let mut head_index_map = BTreeMap::new();
+            for (path, (mode, oid)) in &head_map {
+                head_index_map
+                    .insert(path.clone(), (mode.as_index_mode().map_err(core_err)?, *oid));
+            }
+            if stage_zero_map(store, kind)? != head_index_map {
+                return Err(GitError::Invalid {
+                    detail: format!(
+                        "refusing to merge {:?} into the current index (use two trees)",
+                        revs[0]
+                    ),
+                });
+            }
+            if opts.is_set("u") {
+                ctx.require_worktree()?;
+                let before = stage_zero_map(store, kind)?;
+                super::verbs_branch::reset_index_tree(ctx, tree)?;
+                checkout_touched(ctx, &before, &stage_zero_map(store, kind)?)?;
                 return Ok(Vec::new());
             }
-            return Err(GitError::Invalid {
-                detail: format!(
-                    "refusing to merge {:?} into the current index (use two trees)",
-                    revs[0]
-                ),
-            });
+            super::verbs_branch::reset_index_tree(ctx, tree)?;
+            return Ok(Vec::new());
         }
         2 => {
             let head_tree = head_tree_of(ctx)?;
