@@ -3266,16 +3266,43 @@ pub(crate) fn diagnose(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
 /// against each store in turn, and the first failure aborts with its own
 /// error after naming the repository on stderr.
 pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [FlagSpec {
-        long: "config",
-        short: None,
-        takes_value: true,
-    }];
-    let opts = collect(args, &specs)?;
-    let keys = opts.all("config")?;
-    if keys.is_empty() || opts.positionals.is_empty() {
+    // Leading `--config` options name the repositories; the first
+    // non-option token (or anything after `--`) starts the child command,
+    // whose own flags pass through untouched. Routing the whole argv
+    // through `collect` would reject the child's flags as unknown options,
+    // so the split is manual, mirroring how the oracle stops option
+    // parsing at the command.
+    const USAGE: &str = "usage: for-each-repo --config=<key>... <command> [<args>...]";
+    let mut keys = Vec::new();
+    let mut command: &[String] = &[];
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            command = &args[index + 1..];
+            break;
+        }
+        if let Some(key) = arg.strip_prefix("--config=") {
+            keys.push(key.to_owned());
+        } else if arg == "--config" {
+            index += 1;
+            keys.push(args.get(index).cloned().ok_or_else(|| GitError::Invalid {
+                detail: "option --config requires a value".to_owned(),
+            })?);
+        } else if let Some(name) = arg.strip_prefix("--") {
+            let name = name.split('=').next().unwrap_or_default();
+            return Err(GitError::Invalid {
+                detail: format!("unknown option --{name} ({USAGE})"),
+            });
+        } else {
+            command = &args[index..];
+            break;
+        }
+        index += 1;
+    }
+    if keys.is_empty() || command.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: for-each-repo --config=<key>... <command> [<args>...]".to_owned(),
+            detail: USAGE.to_owned(),
         });
     }
     let mut repos = Vec::new();
@@ -3295,8 +3322,8 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
             detail: "no repositories listed by --config".to_owned(),
         });
     }
-    let verb_name = &opts.positionals[0];
-    let verb_args = &opts.positionals[1..];
+    let verb_name = &command[0];
+    let verb_args = &command[1..];
     let verb = super::dispatch::lookup(verb_name).ok_or_else(|| GitError::Unsupported {
         command: verb_name.clone(),
     })?;
