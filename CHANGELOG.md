@@ -6,7 +6,7 @@ Entries describe implemented, unreleased functionality.
 
 ### Added
 
-- `ruk model` command rendering the draft 2020-12 JSON schema for the Ruk core protocol, including framing boundaries, the 30-code closed error registry, object formats, and 46 protocol method contracts.
+- `ruk model` command rendering the draft 2020-12 JSON schema for the Ruk core protocol, including framing boundaries, the 30-code closed error registry, object formats, and 47 protocol method contracts.
 - `ruk encode-conflict` command converting JSON `ConflictRecordInput` documents into byte-exact framed binary `conflict-v1` records for SHA-1 and SHA-256 repositories.
 - `ruk decode-conflict` command parsing framed binary `conflict-v1` records into canonical JSON documents with byte-for-byte roundtrip verification.
 - Support for both SHA-1 (40 hex characters) and SHA-256 (64 hex characters) object identity validation in conflict records via `--object-format`.
@@ -24,6 +24,7 @@ Entries describe implemented, unreleased functionality.
 
 ### Changed
 
+- **Breaking:** renamed `ruk forgejo serve` to `ruk serve`. No alias or shim remains.
 - Migrated authored JSON parsing and serialization to `sonic-rs`; `serde` and `schemars` remain in use.
 - Limited CLI conflict input, protocol envelope decoding, and `protocol::decode_json` to 128 open arrays or objects. Deeper input returns `E_INVALID`. Bounded parsing adds stack space when needed; existing CLI and control-frame byte limits are unchanged.
 - Normalized parsed `-0` and `-0.0` to positive zero.

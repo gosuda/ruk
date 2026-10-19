@@ -285,7 +285,7 @@ impl Store {
     /// Windows requires an existing, already durable parent and an absent
     /// `root`. Nothing proves that an ancestor some other actor created is
     /// durable, so none is created here and none is trusted: the caller
-    /// (standalone setup, the Forgejo patch) provisions the parent and makes
+    /// (standalone setup, a hosting process) provisions the parent and makes
     /// it durable before this call. A missing parent fails before any change,
     /// an existing `root` of any kind is never adopted, and only the call
     /// whose exclusive publication of `root` succeeds builds inside it.

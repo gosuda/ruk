@@ -37,9 +37,8 @@ pub(crate) const FRAME_PREFIX_BYTES: usize = 4;
 /// Wire width of the kind plus stream identifier header in bytes.
 pub(crate) const FRAME_HEADER_BYTES: usize = 9;
 
-/// Feature strings this daemon build negotiates, matching the Forgejo
-/// Go backend client: directional credit flow, structured merge notices,
-/// and outcome lookup for reconnects.
+/// Feature strings this daemon build negotiates: directional credit flow,
+/// structured merge notices, and outcome lookup for reconnects.
 pub(crate) const SUPPORTED_FEATURES: &[&str] = &["credits", "merge-notices", "outcome-lookup"];
 
 /// The kind byte of one IPC frame.
@@ -425,12 +424,12 @@ impl StreamCredits {
 pub(crate) struct HandshakeHello {
     /// The client's protocol major version.
     pub protocol_major: u32,
-    /// The client's protocol minor version. The Forgejo Go backend omits
+    /// The client's protocol minor version. Older clients omit
     /// this field, so it defaults to zero (unknown) instead of rejecting
     /// the handshake.
     #[serde(default)]
     pub protocol_minor: u32,
-    /// The requested service profile, such as `forgejo`.
+    /// The requested service profile, such as `host`.
     pub profile: String,
     /// The object formats the client speaks, such as `sha1`.
     pub object_formats: Vec<String>,
@@ -565,7 +564,7 @@ pub(crate) fn authenticate_peer(
     if !allowed_uids.is_empty() && !allowed_uids.contains(&uid) {
         return Err(CoreError::new(
             ErrorCode::EForbidden,
-            "Unix-socket peer user is not an authorized Forgejo service identity",
+            "Unix-socket peer user is not an authorized service identity",
         ));
     }
     let gid = cred.gid();
@@ -658,7 +657,7 @@ mod tests {
         let hello = HandshakeHello {
             protocol_major: 999,
             protocol_minor: 0,
-            profile: String::from("forgejo"),
+            profile: String::from("host"),
             object_formats: vec![String::from("sha1")],
             features: Vec::new(),
         };

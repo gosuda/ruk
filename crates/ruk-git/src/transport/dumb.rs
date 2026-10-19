@@ -1,6 +1,6 @@
 //! Dumb HTTP byte producers: `info/refs` text and loose objects.
 //!
-//! The HTTP layer lives outside this crate (Forgejo/daemon); this module
+//! The HTTP layer lives outside this crate (host/daemon); this module
 //! owns only the byte shapes a dumb client (`git clone` over plain HTTP)
 //! reads, mirroring the oracle's dumb handlers:
 //!

@@ -1,6 +1,6 @@
-//! Hosted multi-repository daemon behind `ruk forgejo serve`.
+//! Hosted multi-repository daemon behind `ruk serve`.
 //!
-//! One process owns every opened repository of a Forgejo instance. The
+//! One process owns every opened repository of a hosted instance. The
 //! [`Registry`] authorizes each open by canonicalized path or opaque
 //! handle, each repository serializes publication on its own lane, and one
 //! shared [`BoundedExecutor`] runs blocking store work. The Unix-socket IPC
@@ -49,7 +49,7 @@ pub(crate) const DEFAULT_FRAME_TIMEOUT_MS: u64 = 60_000;
 /// Default interval between periodic retention sweeps in milliseconds.
 pub(crate) const DEFAULT_RETENTION_INTERVAL_MS: u64 = 60_000;
 
-/// Configuration of one `ruk forgejo serve` process.
+/// Configuration of one `ruk serve` process.
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonConfig {
     /// Filesystem path of the Unix socket to bind.
@@ -401,7 +401,7 @@ const OUTCOME_CANCELLED: &str = "CancelledBeforeCommit";
 /// program name before running the interpreter.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CommandOpen {
-    /// The Forgejo service session; accepted and ignored, reserved for the
+    /// The service session; accepted and ignored, reserved for the
     /// day the service session becomes a coordinator session.
     pub session_id: String,
     /// The authorized repository path, canonicalized under the roots.
@@ -665,7 +665,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
     config.validate()?;
     #[cfg(not(unix))]
     return Err(Error::Unsupported(String::from(
-        "ruk forgejo serve needs a Unix socket; the Windows named-pipe transport is not implemented",
+        "ruk serve needs a Unix socket; the Windows named-pipe transport is not implemented",
     )));
     #[cfg(unix)]
     {
@@ -675,7 +675,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .max_blocking_threads(config.blocking_pool_size * 2)
-            .thread_name("ruk-forgejo-serve")
+            .thread_name("ruk-serve")
             .enable_io()
             .enable_time()
             .build()?;

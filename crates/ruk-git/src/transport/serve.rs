@@ -150,8 +150,8 @@ fn read_frame<R: Read>(pkt: &mut PktReader<R>, what: &str) -> Result<Option<Vec<
 }
 
 /// Largest push-option count accepted: the oracle bounds nothing, but an
-/// unbounded pre-pack read is a memory sink, and no real client (Forgejo
-/// uses at most four AGit keys) approaches this.
+/// unbounded pre-pack read is a memory sink, and no real client (review
+/// backends use at most four AGit keys) approaches this.
 const MAX_PUSH_OPTIONS: usize = 256;
 
 /// One parsed `want` line: the requested OID and whether the client asked
@@ -610,7 +610,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     }
     // Push options follow the commands flush and precede the pack, exactly
     // like the oracle's `read_push_options` before `unpack_with_sideband`.
-    // Forgejo advertises them on every repository
+    // Hosts advertise them on every repository
     // (`receive.advertisePushOptions`), and AGit reads `topic`,
     // `force-push`, `title` and `description` from them.
     let mut push_options: Vec<String> = Vec::new();
@@ -729,9 +729,9 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         return Ok(());
     }
     // `update` per live ref over argv (`<ref> <old> <new>`, mirroring the
-    // oracle and Forgejo's dispatcher): a refusal marks only its own ref.
+    // oracle and the host dispatcher): a refusal marks only its own ref.
     // Proc-receive refs skip this phase: the oracle's `update()` runs only
-    // for commands the hook did not claim, and Forgejo never sees an
+    // for commands the hook did not claim, and the review backend never sees an
     // `update` call for `refs/for/` either.
     for (index, update) in &live {
         if is_proc_receive_ref(&update.name) {

@@ -262,7 +262,7 @@ enum SshInvocation {
 
 /// Grace period for the ssh child to exit once its stdin closes. Closing
 /// the pipe lets the remote run post-receive/post-update hooks to
-/// completion (Forgejo's `forgejo hook post-receive` settles push state
+/// completion (the host's `hook post-receive` settles push state
 /// there); the grace only binds a hung network or a child that outlives
 /// its pipes, and then the child is killed and reaped.
 const SSH_EXIT_GRACE: Duration = Duration::from_secs(30);

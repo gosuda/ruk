@@ -2,7 +2,7 @@
 //!
 //! The composed-file specification fixes a single structured notice record
 //! that every surface reuses unchanged: native JSON replies (`merge_notices`),
-//! the hosted IPC `MergeNotices` event, CLI stderr, and the Forgejo merge
+//! the hosted IPC `MergeNotices` event, CLI stderr, and the hosted merge
 //! result. This module is that record's only definition; nothing re-defines
 //! its fields, its coalescing rule, its entry cap, or its truncation flag.
 //!

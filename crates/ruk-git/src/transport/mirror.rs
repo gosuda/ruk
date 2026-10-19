@@ -1,6 +1,6 @@
-//! Mirror-sync mapping for Forgejo pull/push mirrors.
+//! Mirror-sync mapping for pull/push mirrors.
 //!
-//! Forgejo syncs mirrors with plain Git commands run in the repository
+//! Hosts sync mirrors with plain Git commands run in the repository
 //! directory (`services/mirror/`):
 //!
 //! - pull mirrors: `git fetch --prune --tags <remote>` (and

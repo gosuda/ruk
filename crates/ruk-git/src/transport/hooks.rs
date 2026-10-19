@@ -19,17 +19,18 @@
 //! - a legacy bare `.git` directory served as `repo_dir` (its hooks
 //!   already live at `.git/hooks/`, and Git-format endpoints are refused
 //!   elsewhere, so no special case is needed),
-//! - Forgejo repositories: Forgejo generates dispatcher scripts at exactly
-//!   `<repo>/hooks/<name>` which chain `hooks/<name>.d/*` (including its
-//!   internal `gitea` hook) — see `forgejo/modules/git/hook_generate.go`.
-//!   Executing the top-level script runs the whole chain, so no separate
-//!   `.d` handling exists here.
+//! - Host-managed repositories: the host generates dispatcher scripts at
+//!   exactly `<repo>/hooks/<name>` which chain `hooks/<name>.d/*`
+//!   (including its internal `gitea` hook) — see
+//!   `forgejo/modules/git/hook_generate.go`. Executing the top-level
+//!   script runs the whole chain, so no separate `.d` handling exists
+//!   here.
 //!
 //! Phase semantics mirror `git-receive-pack` (`git/builtin/receive-pack.c`):
 //!
 //! - `pre-receive` reads `<old> <new> <ref>` lines on stdin; a nonzero exit
 //!   refuses the whole push (every live ref reports `ng`).
-//! - `update` takes `<ref> <old> <new>` as argv (this is why Forgejo's own
+//! - `update` takes `<ref> <old> <new>` as argv (this is why the host's own
 //!   `update` dispatcher forwards `$1 $2 $3`); a nonzero exit refuses only
 //!   that ref, and the remaining refs still land.
 //! - `post-receive` reads the landed `<old> <new> <ref>` lines on stdin

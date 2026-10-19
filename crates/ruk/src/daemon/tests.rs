@@ -1,9 +1,9 @@
 //! Command-stream serving tests driving the daemon wire.
 //!
-//! The tests speak the Forgejo backend's field names over a socket pair
+//! The tests speak the daemon's field names over a socket pair
 //! (`protocol_major` without `protocol_minor`, `argv`/`dir`/`env` opens,
 //! `outcome-lookup` on stream zero) so a field rename or shape drift fails
-//! here instead of against Forgejo.
+//! here instead of against a live peer.
 
 #![cfg(unix)]
 
@@ -120,7 +120,7 @@ fn command_open_payload(
     digest: &str,
 ) -> Vec<u8> {
     format!(
-        "{{\"session_id\":\"forgejo-svc\",\"repository\":{},\"request_id\":{},\"argv\":{},\"dir\":{},\"env\":[],\"command_digest\":{},\"stdout_credit\":262144,\"stderr_credit\":262144}}",
+        "{{\"session_id\":\"test-svc\",\"repository\":{},\"request_id\":{},\"argv\":{},\"dir\":{},\"env\":[],\"command_digest\":{},\"stdout_credit\":262144,\"stderr_credit\":262144}}",
         jstr(repository),
         jstr(request_id),
         argv,
@@ -319,7 +319,7 @@ impl Driver {
 /// Completes the stream-zero handshake with the Go client's shape: no
 /// `protocol_minor` field.
 async fn handshake(driver: &mut Driver) {
-    let hello = r#"{"protocol_major":1,"profile":"forgejo","object_formats":["sha1"],"features":["credits","merge-notices","outcome-lookup"]}"#;
+    let hello = r#"{"protocol_major":1,"profile":"host","object_formats":["sha1"],"features":["credits","merge-notices","outcome-lookup"]}"#;
     driver
         .send(FrameKind::Open, CONTROL_STREAM_ID, hello.as_bytes())
         .await;
@@ -373,8 +373,7 @@ fn retention_interval_defaults_to_sixty_seconds_and_parses() {
 
 #[test]
 fn handshake_hello_without_minor_decodes() {
-    let raw =
-        br#"{"protocol_major":1,"profile":"forgejo","object_formats":["sha1"],"features":[]}"#;
+    let raw = br#"{"protocol_major":1,"profile":"host","object_formats":["sha1"],"features":[]}"#;
     let hello: ipc::HandshakeHello = ipc::decode_control(raw).expect("decodes");
     assert_eq!(hello.protocol_minor, 0);
     let accept = ipc::negotiate(&hello).expect("negotiates");
