@@ -764,7 +764,7 @@ pub(crate) fn current_encoding(
 
 /// One object of the push closure with its optional permitted thin base.
 #[derive(Clone, Debug)]
-pub(crate) struct ClosureObject {
+pub struct ClosureObject {
     /// Identity.
     pub oid: Oid,
     /// Git kind.
@@ -794,7 +794,9 @@ impl ClosureObject {
 /// never emitted. Callers with private state use
 /// [`push_closure_filtered`]; this entry point filters nothing explicitly.
 /// Local transports reuse this; the wire path pairs thin bases on top.
-pub(crate) fn push_closure(
+/// `push --lfs` reuses the same closure to find outgoing pointer blobs
+/// (the entries carry canonical bytes, so no second object read is needed).
+pub fn push_closure(
     store: &Store,
     kind: HashKind,
     live: &[&PushUpdate],

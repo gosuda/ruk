@@ -25,11 +25,12 @@
 //!   gap); SSH and git-daemon remotes fetch and push for real;
 //! - LFS content sync: [`Store::iter_objects`](ruk_core::store::Store::iter_objects)
 //!   is the object census behind `cat-file --batch-check
-//!   --batch-all-objects`, and `ruk fetch --lfs` discovers pointer blobs in
+//!   --batch-all-objects`, `ruk fetch --lfs` discovers pointer blobs in
 //!   the fetched tips and pulls their payloads through the LFS batch API
-//!   into the sidecar; the push-mirror upload direction
-//!   (`lfs-payload-sync --upload` exists as a verb, but no `push --lfs`
-//!   wiring drives it) stays the remaining gap;
+//!   into the sidecar, and `ruk push --lfs` discovers pointer blobs in the
+//!   outgoing push closure and uploads their sidecar-verified payloads
+//!   through the LFS batch API before the pack moves (`lfs-payload-sync
+//!   --upload` stays as the manual verb for the same transfer);
 //! - symbolic refs are never mapped or pruned: only direct tips carry the
 //!   CAS expectations these updates need.
 //!

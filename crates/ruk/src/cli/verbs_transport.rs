@@ -6,7 +6,7 @@
 //! | --- | --- | --- |
 //! | `fetch` | local stores via `session::local_fetch`, SSH/git-daemon remotes via `fetch::receive` over `net` streams, HTTP remotes via a protocol-v2 probe first (`smart_http::fetch_pack_v2` over `ls-refs` refs) with a v0 `smart_http::fetch_pack` fallback, then `dumb_http` when the smart advertisement is absent | `--prune` drops orphaned remote-tracking refs (pull-mirror parity); `--lfs` pulls LFS payloads for fetched tips (pull-mirror parity) |
 //! | `pull` | fetch + fast-forward | local, SSH/git and HTTP remotes (fast-forward only) |
-//! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
+//! | `push` | local stores via `session::local_push`, SSH/git-daemon remotes via `push::push_over`, HTTP remotes via `smart_http::push_pack`, all with a persisted plan | `--mirror` sets every ref and deletes stale ones (push-mirror parity); `--lfs` uploads the outgoing range's verified payloads through the batch API before pushing (push-mirror parity); push over dumb-http stays refused (static files accept no pack) |
 //! | `receive-pack` | `serve::serve_receive_pack` + `session::apply_refs` | served (protocol v0) |
 //! | `upload-pack` | `serve::serve_upload_pack` + `session::local_closure` | served (protocol v0) |
 //! | `archive` | local trees through the `upload-archive` serve half over a loopback, `--remote` trees through the smart-http `git-upload-archive` RPC or the SSH/git-daemon duplex session | tar and zip (`--format=zip` transcodes the tar client-side; every transport still answers tar); `--prefix`, `-o` and path limits rewrite the stream client-side |
@@ -123,6 +123,22 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         mirror_lfs_sync(ctx, &remote_label, &tips)?;
     }
     Ok(out)
+}
+
+/// How a push updates refs. Data, not selectors: one flag set per
+/// invocation, so the local, network, and mirror lanes share one shape
+/// instead of a positional list.
+pub(crate) struct PushFlags {
+    /// Every update behaves as forced.
+    pub(crate) force_all: bool,
+    /// All-or-nothing across refs.
+    pub(crate) atomic: bool,
+    /// Refspecs delete their destination refs.
+    pub(crate) delete: bool,
+    /// Every local ref mirrors to the same name, deleting stale ones.
+    pub(crate) mirror: bool,
+    /// Upload outgoing LFS payloads through the batch API before pushing.
+    pub(crate) want_lfs: bool,
 }
 
 /// How a fetch updates refs. Data, not selectors: one plan per invocation.
@@ -1143,7 +1159,16 @@ pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
     super::verbs_history::merge_fast_forward(ctx, &wanted, before, tip)
 }
 
-/// Pushes refs to a local repository through a persisted plan.
+/// Pushes refs through a persisted plan: local stores, SSH/git-daemon
+/// remotes, and HTTP remotes.
+///
+/// `--lfs` uploads the outgoing pointer blobs' payloads through the
+/// remote's LFS batch endpoint before the pack moves (push-mirror parity):
+/// the same wants-minus-haves closure the pack carries is scanned for
+/// pointer blobs, and every payload already verified in the sidecar is
+/// offered with one batch `upload` request. Full mode only; a missing
+/// endpoint, no payloads, or a non-`Full` policy skips silently, per-object
+/// misses go to stderr, and only a refused batch document fails.
 ///
 /// Oracle: `git/builtin/push.c`.
 pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
@@ -1168,28 +1193,37 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "lfs",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
-    let store = ctx.store()?;
     let kind = ctx.kind()?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
     // Mirror force: the oracle's `--mirror` forces every ref update, the
     // way a push mirror (`git push --mirror --force`) syncs deletions and
     // rewinds alike.
-    let force_all = opts.is_set("force") || opts.is_set("mirror");
-    let mirror = opts.is_set("mirror");
-    let atomic = opts.is_set("atomic");
-    let delete = opts.is_set("delete");
-    if mirror && opts.positionals.len() > 1 {
+    let flags = PushFlags {
+        force_all: opts.is_set("force") || opts.is_set("mirror"),
+        atomic: opts.is_set("atomic"),
+        delete: opts.is_set("delete"),
+        mirror: opts.is_set("mirror"),
+        want_lfs: opts.is_set("lfs"),
+    };
+    let remote_label = configured_name(ctx, target).unwrap_or_else(|| target.to_owned());
+    if flags.mirror && opts.positionals.len() > 1 {
         return Err(GitError::Invalid {
             detail: "usage: push [--mirror] [<remote>]".to_owned(),
         });
     }
-    let spec_texts: Vec<String> = if mirror {
+    let spec_texts: Vec<String> = if flags.mirror {
         Vec::new()
     } else if opts.positionals.len() > 1 {
         opts.positionals[1..].to_vec()
     } else {
+        let store = ctx.store()?;
         default_push_specs(store)?
     };
     match resolve_target(ctx, target)? {
@@ -1200,25 +1234,29 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                     detail: "source and destination object formats disagree".to_owned(),
                 });
             }
-            if mirror {
-                return push_mirror(ctx, &dest, target, atomic);
+            if flags.mirror {
+                return push_mirror(ctx, &dest, target, &flags, &remote_label);
             }
-            let updates =
-                build_push_updates(store, &dest, &spec_texts, delete, force_all, &|name| {
-                    peel_dest_oid(&dest, name)
-                })?;
-            push_local(store, &dest, target, kind, atomic, updates)
+            // Scoped borrows: the store borrow ends before the LFS upload
+            // reborrows `ctx` mutably for stderr.
+            let updates = {
+                let store = ctx.store()?;
+                build_push_updates(
+                    store,
+                    &dest,
+                    &spec_texts,
+                    flags.delete,
+                    flags.force_all,
+                    &|name| peel_dest_oid(&dest, name),
+                )?
+            };
+            if flags.want_lfs {
+                push_lfs_upload(ctx, &updates, &remote_label)?;
+            }
+            let store = ctx.store()?;
+            push_local(store, &dest, target, kind, flags.atomic, updates)
         }
-        Target::Net(endpoint) => push_net(
-            ctx,
-            &endpoint,
-            target,
-            &spec_texts,
-            mirror,
-            atomic,
-            delete,
-            force_all,
-        ),
+        Target::Net(endpoint) => push_net(ctx, &endpoint, target, &spec_texts, &flags, &remote_label),
     }
 }
 
@@ -1325,70 +1363,84 @@ fn push_local(
 ///
 /// Oracle: `git/builtin/push.c`.
 fn push_net(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     endpoint: &Endpoint,
     target: &str,
     spec_texts: &[String],
-    mirror: bool,
-    atomic: bool,
-    delete: bool,
-    force_all: bool,
+    flags: &PushFlags,
+    remote_label: &str,
 ) -> Result<Vec<u8>, GitError> {
-    let store = ctx.store()?;
     let kind = ctx.kind()?;
-    // HTTP discovery keeps the full advertisement: the POST half reuses
-    // its capabilities, while the other transports only need the refs.
-    // Stateless, so no connection is held between the two round trips.
-    let http_adv = match endpoint {
-        Endpoint::Http { url, .. } => {
-            let base = ruk_git::transport::smart_http::normalize_base(url)?;
-            let extra_headers = http_extra_headers(ctx, &base);
-            Some((
-                base.clone(),
-                ruk_git::transport::smart_http::discover(
-                    &base,
-                    ruk_git::transport::smart_http::SmartService::ReceivePack,
-                    kind,
-                    &extra_headers,
-                )?,
-                extra_headers,
-            ))
-        }
-        _ => None,
+    // Discovery plus the update list under one scoped store borrow, so the
+    // LFS upload below can reborrow `ctx` mutably for stderr.
+    let (updates, http_adv) = {
+        let store = ctx.store()?;
+        // HTTP discovery keeps the full advertisement: the POST half reuses
+        // its capabilities, while the other transports only need the refs.
+        // Stateless, so no connection is held between the two round trips.
+        let http_adv = match endpoint {
+            Endpoint::Http { url, .. } => {
+                let base = ruk_git::transport::smart_http::normalize_base(url)?;
+                let extra_headers = http_extra_headers(ctx, &base);
+                Some((
+                    base.clone(),
+                    ruk_git::transport::smart_http::discover(
+                        &base,
+                        ruk_git::transport::smart_http::SmartService::ReceivePack,
+                        kind,
+                        &extra_headers,
+                    )?,
+                    extra_headers,
+                ))
+            }
+            _ => None,
+        };
+        let advertised = match &http_adv {
+            Some((_, adv, _)) => net::to_local_refs(adv.refs.clone())?,
+            None => net::to_local_refs(net::discover_endpoint(
+                endpoint,
+                Service::ReceivePack,
+                kind,
+            )?)?,
+        };
+        let remote: Vec<(Vec<u8>, Oid)> = advertised
+            .iter()
+            .filter_map(|entry| match &entry.target {
+                RefTarget::Direct(oid) => Some((entry.name.clone(), *oid)),
+                RefTarget::Symbolic(_) => None,
+            })
+            .collect();
+        let updates = if flags.mirror {
+            mirror_push_updates(kind, &direct_tips(store)?, &remote)
+        } else {
+            build_push_updates(
+                store,
+                store,
+                spec_texts,
+                flags.delete,
+                flags.force_all,
+                &|name| peel_advertised(&advertised, name),
+            )?
+        };
+        (updates, http_adv)
     };
-    let advertised = match &http_adv {
-        Some((_, adv, _)) => net::to_local_refs(adv.refs.clone())?,
-        None => net::to_local_refs(net::discover_endpoint(
-            endpoint,
-            Service::ReceivePack,
-            kind,
-        )?)?,
-    };
-    let remote: Vec<(Vec<u8>, Oid)> = advertised
-        .iter()
-        .filter_map(|entry| match &entry.target {
-            RefTarget::Direct(oid) => Some((entry.name.clone(), *oid)),
-            RefTarget::Symbolic(_) => None,
-        })
-        .collect();
-    let updates = if mirror {
-        mirror_push_updates(kind, &direct_tips(store)?, &remote)
-    } else {
-        build_push_updates(store, store, spec_texts, delete, force_all, &|name| {
-            peel_advertised(&advertised, name)
-        })?
-    };
-    if mirror && updates.is_empty() {
+    if flags.mirror && updates.is_empty() {
         return Ok(Vec::new());
     }
+    // LFS payloads ride the batch API, never the pack: upload the outgoing
+    // range's verified payloads before the first pack byte moves.
+    if flags.want_lfs {
+        push_lfs_upload(ctx, &updates, remote_label)?;
+    }
+    let store = ctx.store()?;
     let request = PushWireRequest {
         updates: updates.clone(),
-        atomic,
+        atomic: flags.atomic,
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
         target.as_bytes().to_vec(),
-        atomic,
+        flags.atomic,
         updates,
     );
     match &http_adv {
@@ -1439,26 +1491,40 @@ fn peel_advertised(
 
 /// Pushes every local ref to the same name on the destination and deletes
 /// destination refs with no local counterpart: `push --mirror`, the verb a
-/// push-mirror sync (`git push --mirror --force`) routes through.
+/// push-mirror sync (`git push --mirror --force`) routes through. With
+/// `--lfs` the outgoing range's verified payloads upload through the batch
+/// API before the refs move, the same pre-push step [`push_net`] runs.
 ///
 /// Oracle: `git/builtin/push.c` (`--mirror`).
-fn push_mirror(ctx: &Ctx, dest: &Store, target: &str, atomic: bool) -> Result<Vec<u8>, GitError> {
-    let store = ctx.store()?;
+fn push_mirror(
+    ctx: &mut Ctx,
+    dest: &Store,
+    target: &str,
+    flags: &PushFlags,
+    remote_label: &str,
+) -> Result<Vec<u8>, GitError> {
     let kind = ctx.kind()?;
-    let local = direct_tips(store)?;
+    let local = {
+        let store = ctx.store()?;
+        direct_tips(store)?
+    };
     let remote = direct_tips(dest)?;
     let updates = mirror_push_updates(kind, &local, &remote);
     if updates.is_empty() {
         return Ok(Vec::new());
     }
+    if flags.want_lfs {
+        push_lfs_upload(ctx, &updates, remote_label)?;
+    }
+    let store = ctx.store()?;
     let request = PushWireRequest {
         updates: updates.clone(),
-        atomic,
+        atomic: flags.atomic,
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
         target.as_bytes().to_vec(),
-        atomic,
+        flags.atomic,
         updates,
     );
     push_outcomes(local_push(
@@ -3197,6 +3263,94 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
     Ok(())
 }
 
+/// Uploads LFS payloads for one push's outgoing range: the `push --lfs`
+/// half of push-mirror sync. Scans the same wants-minus-haves closure the
+/// pack carries for pointer blobs, then batch-uploads the payloads the
+/// sidecar already verifies to the push remote's batch endpoint (the same
+/// transfer the upload half of [`lfs_payload_sync`] runs).
+///
+/// Best-effort by design: a non-`Full` policy, no batch endpoint
+/// (`lfs.url`, then `remote.<name>.lfsurl`, then `<push-url>/info/lfs` for
+/// http(s) remotes), or no outgoing pointers skip silently, and
+/// per-object misses go to stderr without failing the push that follows.
+/// Only a refused batch document itself fails.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a malformed batch request,
+/// [`GitError::Offline`] when the batch endpoint refuses, plus transport
+/// failures from the HTTP client and closure reads.
+fn push_lfs_upload(
+    ctx: &mut Ctx,
+    updates: &[PushUpdate],
+    remote_label: &str,
+) -> Result<(), GitError> {
+    use ruk_core::store::lfs as sidecar;
+
+    // The outgoing range's pointers, keyed by payload hex: the closure
+    // entries carry canonical bytes, so pointer parsing needs no second
+    // object read. Deletes carry nothing; an all-delete push uploads
+    // nothing.
+    let (present, pending): (Vec<(String, u64)>, Vec<(String, u64)>) = {
+        let store = ctx.store()?;
+        if mode_for_store(store.root()) != LfsMode::Full {
+            return Ok(());
+        }
+        let kind = ctx.kind()?;
+        let zero = kind.zero_oid();
+        let live: Vec<&PushUpdate> =
+            updates.iter().filter(|update| update.new != zero).collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let closure =
+            ruk_git::transport::push::push_closure(store, kind, &live, &Interrupt::none())?;
+        let mut pointers: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for entry in &closure {
+            if entry.kind != ObjectKind::Blob {
+                continue;
+            }
+            if let Some((hex, size)) = ruk_core::parse_pointer(&entry.bytes) {
+                pointers.entry(hex).or_insert(size);
+            }
+        }
+        let mut present = Vec::new();
+        let mut pending = Vec::new();
+        for (hex, size) in pointers {
+            if sidecar::sidecar_verified(store.root(), &hex, size) {
+                present.push((hex, size));
+            } else {
+                pending.push((hex, size));
+            }
+        }
+        (present, pending)
+    };
+    if present.is_empty() && pending.is_empty() {
+        return Ok(());
+    }
+    // No batch endpoint means LFS is absent: silent, the way a push
+    // without `--lfs` behaves.
+    let Some(endpoint) = lfs_endpoint_for_remote(ctx, remote_label) else {
+        return Ok(());
+    };
+    // Pointers with no local payload cannot be offered; the push still
+    // moves them as pointers, the way `Full` admits pushes with absent
+    // payloads.
+    let mut missing: Vec<(String, String)> = pending
+        .into_iter()
+        .map(|(hex, _)| (hex, "no local payload to upload".to_owned()))
+        .collect();
+    let mut uploaded = Vec::new();
+    {
+        let store = ctx.store()?;
+        sync_via_batch_upload_at(ctx, store, &endpoint, &present, &mut uploaded, &mut missing)?;
+    }
+    for (hex, error) in &missing {
+        ctx.emit_stderr(format!("lfs: {hex} missing ({error})\n").as_bytes());
+    }
+    Ok(())
+}
+
 /// Peels one fetched tip to the commit the history walk accepts: annotated
 /// tags dereference through their `object` lines (at most 32 hops, the
 /// same bound the rev-parse peel uses). Anything that never resolves to a
@@ -3285,8 +3439,6 @@ fn sync_via_batch_upload(
     uploaded: &mut Vec<String>,
     missing: &mut Vec<(String, String)>,
 ) -> Result<(), GitError> {
-    use ruk_git::transport::http::{self, UploadEntry};
-
     if present.is_empty() {
         return Ok(());
     }
@@ -3302,6 +3454,30 @@ fn sync_via_batch_upload(
         }
         return Ok(());
     };
+    sync_via_batch_upload_at(ctx, store, &endpoint, present, uploaded, missing)
+}
+
+/// Uploads `present` payloads through the git-lfs batch API at an explicit
+/// endpoint: the transfer half of [`sync_via_batch_upload`], shared with
+/// the push path, which resolves its own remote-specific endpoint.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a malformed batch request,
+/// [`GitError::Offline`] when the batch endpoint refuses, plus transport
+/// failures from the HTTP client.
+fn sync_via_batch_upload_at(
+    ctx: &Ctx,
+    store: &Store,
+    endpoint: &str,
+    present: &[(String, u64)],
+    uploaded: &mut Vec<String>,
+    missing: &mut Vec<(String, String)>,
+) -> Result<(), GitError> {
+    use ruk_git::transport::http::{self, UploadEntry};
+
+    if present.is_empty() {
+        return Ok(());
+    }
     let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
     let request = http::batch_upload_request_body(present)?;
     let mut headers: Vec<(String, String)> = vec![
