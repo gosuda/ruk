@@ -191,12 +191,64 @@ pub fn parse_dumb_info_refs(body: &[u8], kind: HashKind) -> Result<Vec<Advertise
     Ok(refs)
 }
 
+/// The dumb `HEAD` resource URL: `<base>/HEAD` with no service parameter,
+/// keeping a base query string like [`dumb_refs_url`].
+#[must_use]
+pub fn dumb_head_url(base: &str) -> String {
+    match base.split_once('?') {
+        Some((path, query)) => format!("{path}/HEAD?{query}"),
+        None => format!("{base}/HEAD"),
+    }
+}
+
+/// Parses a dumb `HEAD` body: one `ref: <name>` first line names the
+/// default branch target. Anything else (a detached-HEAD oid, garbage, an
+/// empty body) is no symref (`None`), never an error: callers that need no
+/// default-branch info skip the row instead of failing the listing.
+#[must_use]
+pub fn parse_head_symref(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let target = text
+        .lines()
+        .next()
+        .map(str::trim)
+        .and_then(|line| line.strip_prefix("ref:"))
+        .map(str::trim)?;
+    if target.is_empty() || target.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(target.to_owned())
+}
+
+/// Reads a dumb endpoint's `HEAD` symref target for listings: GETs the
+/// text file the oracle fetches for dumb remotes (`git/remote-curl.c`
+/// resolves it into the leading `HEAD` row). A 404 means the server holds
+/// no `HEAD` resource (no row, not an error); other error statuses
+/// propagate. The fetch lane never calls this: refspec expansion over
+/// explicit refs needs no default-branch info.
+///
+/// # Errors
+/// Transport failures from the HTTP client.
+pub fn fetch_head_symref(
+    base: &str,
+    extra_headers: &[(String, String)],
+) -> Result<Option<String>, GitError> {
+    let url = dumb_head_url(base);
+    let (status, body) = get(&url, extra_headers)?;
+    if status == 404 {
+        return Ok(None);
+    }
+    check_status(&url, status)?;
+    Ok(parse_head_symref(&body))
+}
+
 /// Discovers a dumb endpoint's refs: GETs the text file and parses it with
 /// the dumb grammar. The returned advertisement carries no capabilities.
 /// Dumb servers negotiate nothing, so filter/depth requests warn and fetch
-/// complete history. The `HEAD` resource is never requested, so the
+/// complete history. The `HEAD` resource is never requested here, so the
 /// advertisement carries no symref/default-branch info; refspec expansion
-/// over explicit refs is unaffected.
+/// over explicit refs is unaffected (listings read it separately through
+/// [`fetch_head_symref`]).
 ///
 /// # Errors
 /// Transport failures from the HTTP client and grammar failures from the
@@ -515,6 +567,31 @@ mod tests {
             dumb_refs_url("https://host.x/a?token=t"),
             "https://host.x/a/info/refs?token=t"
         );
+    }
+
+    #[test]
+    fn head_url_and_symref_parse() {
+        assert_eq!(
+            dumb_head_url("https://host.x/a.git"),
+            "https://host.x/a.git/HEAD"
+        );
+        assert_eq!(
+            dumb_head_url("https://host.x/a?token=t"),
+            "https://host.x/a/HEAD?token=t"
+        );
+        assert_eq!(
+            parse_head_symref(b"ref: refs/heads/main\n"),
+            Some("refs/heads/main".to_owned())
+        );
+        assert_eq!(
+            parse_head_symref(b"ref: refs/heads/main"),
+            Some("refs/heads/main".to_owned())
+        );
+        // Detached HEAD, garbage, and empty bodies carry no symref.
+        assert_eq!(parse_head_symref(b"705446959e9d34f504c3c368dbf61264e603fa2d\n"), None);
+        assert_eq!(parse_head_symref(b"not a ref\n"), None);
+        assert_eq!(parse_head_symref(b""), None);
+        assert_eq!(parse_head_symref(b"ref: \n"), None);
     }
 
     #[test]

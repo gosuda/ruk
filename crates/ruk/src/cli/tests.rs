@@ -2042,6 +2042,7 @@ fn ls_remote_over_dumb_http_reads_info_refs() {
     let (base, log) = smart_http_server(vec![
         (b"not a smart advertisement".to_vec(), "text/plain"),
         (dumb.into_bytes(), "text/plain"),
+        (b"ref: refs/heads/main\n".to_vec(), "text/plain"),
     ]);
     let (root, env) = seeded_repo("httpdumb", "l.txt", b"l\n");
     let mut ctx = repo_ctx(&root, env);
@@ -2049,10 +2050,12 @@ fn ls_remote_over_dumb_http_reads_info_refs() {
     let text = String::from_utf8_lossy(&out);
     assert!(text.contains(TIP), "{text}");
     assert!(text.contains("refs/heads/main"), "{text}");
+    // The oracle reads the `HEAD` text file for the leading symref row.
+    assert!(text.contains("ref: refs/heads/main\tHEAD\n"), "{text}");
     let requests = log
         .recv_timeout(Duration::from_secs(30))
-        .expect("server saw both GETs");
-    assert_eq!(requests.len(), 2);
+        .expect("server saw all GETs");
+    assert_eq!(requests.len(), 3);
     assert!(
         requests[0].0.contains("service=git-upload-pack"),
         "{:?}",
@@ -2062,6 +2065,11 @@ fn ls_remote_over_dumb_http_reads_info_refs() {
         requests[1].0.contains("GET /a.git/info/refs "),
         "{:?}",
         requests[1].0
+    );
+    assert!(
+        requests[2].0.contains("GET /a.git/HEAD "),
+        "{:?}",
+        requests[2].0
     );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }

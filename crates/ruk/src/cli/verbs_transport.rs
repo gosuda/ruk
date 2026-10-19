@@ -38,7 +38,7 @@ use ruk_git::transport::mirror::{prune_for_spec, push_mirror_updates};
 use ruk_git::transport::net::{self, Endpoint};
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::push::{PushUpdate, PushWireRequest};
-use ruk_git::transport::refadv::Capabilities;
+use ruk_git::transport::refadv::{AdvertisedRef, Capabilities};
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
 use ruk_git::transport::serve_v2::{git_protocol_requests_v2, serve_upload_pack_v2};
 use ruk_git::transport::session::{
@@ -4184,13 +4184,42 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             )?
                         }
                         Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => adv.refs,
-                        Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
-                            ruk_git::transport::dumb_http::discover(
+                                                Err(err)
+                            if ruk_git::transport::dumb_http::is_dumb_gap(&err) =>
+                        {
+                            let adv = ruk_git::transport::dumb_http::discover(
                                 &base,
                                 ctx.kind()?,
                                 &extra_headers,
-                            )?
-                            .refs
+                            )?;
+                            // Dumb `info/refs` carries no symref: the
+                            // oracle reads the `HEAD` text file for the
+                            // leading row, so this fallback does too.
+                            let mut refs = Vec::new();
+                            // Real `info/refs` files name direct refs only,
+                            // but a foreign server may list `HEAD` itself:
+                            // never print the row twice.
+                            let file_names_head = adv
+                                .refs
+                                .iter()
+                                .any(|entry| entry.name == b"HEAD");
+                            if !file_names_head {
+                                if let Some(pointed) =
+                                    ruk_git::transport::dumb_http::fetch_head_symref(
+                                        &base,
+                                        &extra_headers,
+                                    )?
+                                {
+                                    refs.push(AdvertisedRef {
+                                        name: b"HEAD".to_vec(),
+                                        oid: None,
+                                        peeled: None,
+                                        symref_target: Some(pointed.into_bytes()),
+                                    });
+                                }
+                            }
+                            refs.extend(adv.refs);
+                            refs
                         }
                         Err(err) => return Err(err),
                     }
