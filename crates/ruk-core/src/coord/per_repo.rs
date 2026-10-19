@@ -308,6 +308,19 @@ struct Server {
     active: AtomicU64,
     last_activity: Mutex<Instant>,
     burst: Mutex<Option<Burst>>,
+    /// Serializes burst open/install only.
+    ///
+    /// Each connection runs `dispatch` on its own task, so two first
+    /// submissions can otherwise race two store opens and the loser fails
+    /// `E_IO: Database already open`, surfacing as a spurious Uncertain
+    /// instead of a clean lost-race Stale. Prepare-plus-submit stay
+    /// concurrent by design: the lane linearizes same-ref mutations
+    /// itself (re-checking each against fresh state at apply), and the
+    /// loser retries through the client with the fresh tip. Holding this
+    /// across a full submit would only add the winner's whole publish
+    /// latency to the loser's retry gap and push it out of the
+    /// group-commit sharing window.
+    burst_open: tokio::sync::Mutex<()>,
 }
 
 impl Server {
@@ -384,7 +397,13 @@ impl Server {
     }
 
     /// Returns the live burst, opening a fresh store burst when idle.
+    ///
+    /// The open/install section is serialized: concurrent first
+    /// submissions must not race two store opens (the loser would fail
+    /// `E_IO: Database already open`). Live-burst reuse stays cheap under
+    /// the same guard.
     async fn burst(&self) -> Result<(Arc<HostedCoordinator>, SessionId), CoreError> {
+        let _open_serial = self.burst_open.lock().await;
         if let Some(live) = self.live_burst() {
             return Ok(live);
         }
@@ -480,8 +499,13 @@ impl Server {
             Ok(SubmissionOutcome::Replayed) => self.note_replayed(),
             Err(_) => self.note_error(),
         }
-        self.active.fetch_sub(1, Ordering::SeqCst);
+        // Timestamp before dropping the count: the idle loop retires when it
+        // samples active==0 past the linger, so the stamp must already cover
+        // this worker. Releasing the count first lets a descheduled task
+        // retire a live burst on a stale stamp just as the loser's retry
+        // arrives, forcing a second store open and breaking burst sharing.
         self.note_activity();
+        self.active.fetch_sub(1, Ordering::SeqCst);
     }
 
     async fn serve_one(&self, stream: &mut Incoming) -> Result<SubmissionOutcome, CoreError> {
@@ -541,6 +565,9 @@ impl Server {
         })?;
         let id = request_id.to_string();
         call.body.validate()?;
+        // The burst guard inside `burst()` covers the store open; prepare
+        // and submit stay concurrent so the loser's retry gap stays small
+        // enough for the group-commit sharing window.
         let (coord, session) = self.burst().await?;
         let reply = match coord.prepare_for_dispatch(session, call.body.clone(), &allow)? {
             DispatchReady::Replay(reply) => reply,
@@ -657,6 +684,7 @@ pub async fn cli_serve(
         active: AtomicU64::new(0),
         last_activity: Mutex::new(Instant::now()),
         burst: Mutex::new(None),
+        burst_open: tokio::sync::Mutex::new(()),
     });
     lock.publish(&LockBody {
         pid: std::process::id(),

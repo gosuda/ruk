@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ruk_core::change::RequestId;
-use ruk_core::coord::per_repo::{self, CommitAnswer, CommitCall, ServeOutcome};
 #[cfg(all(unix, not(test)))]
 use ruk_core::coord::per_repo::socket_path;
+use ruk_core::coord::per_repo::{self, CommitAnswer, CommitCall, ServeOutcome};
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::ops::{
@@ -215,6 +215,9 @@ fn direct_amend(
 /// advance compares against the tip the commit was built on, not a fresh
 /// read, so a fallback can never strand a commit a racing writer landed
 /// while this process was off its store. A moved tip fails stale instead.
+/// The retry loop rebuilds this expectation (and the request's parents)
+/// against the current tip after every lost race.
+#[derive(Clone)]
 enum Direct {
     /// Ordinary commit: `ops::new` plus the branch advance.
     New {
@@ -250,9 +253,10 @@ pub(crate) fn commit_stash(
         predecessor: request.predecessor,
         ref_update: None,
     };
+    let runtime = client_runtime()?;
     let mut request_id = request_id;
     for _ in 0..MAX_STALE_RETRIES {
-        match try_remote(ctx, &args, request_id)? {
+        match try_remote(ctx, &runtime, &args, request_id)? {
             Remote::Done(reply) => {
                 return reply
                     .created
@@ -311,23 +315,74 @@ fn direct_stash(ctx: &mut Ctx, request: NewRequest) -> Result<Oid, GitError> {
 }
 
 /// Retries lane submissions across lost branch races with fresh tips.
+///
+/// First-contact fallbacks publish the caller's commit with identical
+/// arguments. Only proven movement rebuilds: a lane Stale, or a Stale
+/// refusal from a fallback publish, rebuilds the lane arguments, the
+/// request parents, and the fallback expectation against the current tip,
+/// so a lost race retries instead of dying `E_STALE`. The budget bounds
+/// the whole loop; exhaustion publishes the freshest triple once more,
+/// and a genuinely stale tip still refuses there.
 fn commit_via_coordinator(
     ctx: &mut Ctx,
-    request: NewRequest,
+    mut request: NewRequest,
     mut args: GitCommitArgs,
     mut request_id: RequestId,
-    direct: Direct,
+    mut direct: Direct,
 ) -> Result<NewResult, GitError> {
+    let runtime = client_runtime()?;
     for _ in 0..MAX_STALE_RETRIES {
-        match try_remote(ctx, &args, request_id)? {
+        match try_remote(ctx, &runtime, &args, request_id)? {
             Remote::Done(reply) => return Ok(finish(reply)),
-            Remote::Direct => return publish_direct(ctx, request, direct),
+            // No coordinator answered: publish the caller's commit
+            // directly with identical arguments. A Stale refusal proves a
+            // racing writer landed first; only then rebuild against its
+            // tip and retry through the lane.
+            Remote::Direct => match publish_direct(ctx, request.clone(), direct.clone()) {
+                Ok(out) => return Ok(out),
+                Err(GitError::Stale { .. }) => {
+                    request_id = RequestId::generate();
+                    let fresh = refresh_both(ctx, request, direct)?;
+                    args = fresh.0;
+                    request = fresh.1;
+                    direct = fresh.2;
+                }
+                Err(err) => return Err(err),
+            },
+            // The submission may have committed: return its identity when
+            // it landed, refuse in required mode, else publish the caller's
+            // commit directly under the same proven-movement retry rule.
             Remote::Uncertain => {
-                return settle_uncertain(ctx, &request, &args, Mode::from_ctx(ctx), direct);
+                if let Some(landed) = landed_output(ctx, &request, &args)? {
+                    return Ok(landed);
+                }
+                if Mode::from_ctx(ctx) == Mode::Required {
+                    return Err(GitError::Io {
+                        detail: "coordinator answer unreachable and RUK_COORDINATOR=required"
+                            .to_owned(),
+                    });
+                }
+                match publish_direct(ctx, request.clone(), direct.clone()) {
+                    Ok(out) => return Ok(out),
+                    Err(GitError::Stale { .. }) => {
+                        request_id = RequestId::generate();
+                        let fresh = refresh_both(ctx, request, direct)?;
+                        args = fresh.0;
+                        request = fresh.1;
+                        direct = fresh.2;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
+            // Lost branch race: rebuild everything against the current tip
+            // and retry through the lane. Refresh refusals (amend, merge,
+            // orphan) surface immediately: retrying cannot help them.
             Remote::Stale => {
                 request_id = RequestId::generate();
-                args = refresh_args(ctx, &request)?;
+                let fresh = refresh_both(ctx, request, direct)?;
+                args = fresh.0;
+                request = fresh.1;
+                direct = fresh.2;
             }
         }
     }
@@ -348,27 +403,6 @@ fn publish_direct(
             expected,
         } => direct_amend(ctx, request, tip, author, expected),
     }
-}
-
-/// Resolves an unreachable answer: when the submission already landed,
-/// return its identity without publishing anything; otherwise publish
-/// directly (or refuse when the sidecar is required but unreachable).
-fn settle_uncertain(
-    ctx: &mut Ctx,
-    request: &NewRequest,
-    args: &GitCommitArgs,
-    mode: Mode,
-    direct: Direct,
-) -> Result<NewResult, GitError> {
-    if let Some(landed) = landed_output(ctx, request, args)? {
-        return Ok(landed);
-    }
-    if mode == Mode::Required {
-        return Err(GitError::Io {
-            detail: "coordinator answer unreachable and RUK_COORDINATOR=required".to_owned(),
-        });
-    }
-    publish_direct(ctx, request.clone(), direct)
 }
 
 /// Returns the stored identity when the submission already landed (its
@@ -413,33 +447,114 @@ fn finish(reply: NewReply) -> NewResult {
     }
 }
 
-/// Rebuilds lane arguments against the current tip after a lost race.
-fn refresh_args(ctx: &mut Ctx, request: &NewRequest) -> Result<GitCommitArgs, GitError> {
+/// Rebuilds the lane arguments, the commit request, and the fallback
+/// expectation against the current tip after a lost race.
+///
+/// A retry that rebuilt only the lane arguments would leave the eventual
+/// `publish_direct` fallback CASing against the stale captured tip with
+/// the stale parent, so the second racer died `E_STALE` on exhaustion.
+/// The refreshed request carries the fresh tip as its single parent (so a
+/// fallback commit stays parented on the tip its CAS expects, never a
+/// stranded orphan) and the refreshed fallback carries the fresh
+/// expectation. A genuinely stale commit built on a moved tip still
+/// refuses on the direct path; only a coordinator-lost-race retry moves
+/// onto the fresh tip here.
+///
+/// Only intent-preserving rebuilds retry; anything that would strand or
+/// rewrite a racing writer refuses `E_STALE` so the caller rebuilds
+/// explicitly:
+/// * amend: the rewritten head is fixed; advancing the branch from the
+///   winner's tip to a rewrite of the old tip would strand the winner.
+/// * root on a born branch, or merge / non-tip parent on a moved tip: the
+///   recorded parents do not descend from the fresh tip, so publishing
+///   under its CAS would strand the winner (or silently revert its tree).
+/// * root on a branch born mid-flight (unborn `Absent` to `Present`): the
+///   branch-tip parent is adopted, exactly what a re-run commit would do.
+fn refresh_both(
+    ctx: &mut Ctx,
+    request: NewRequest,
+    direct: Direct,
+) -> Result<(GitCommitArgs, NewRequest, Direct), GitError> {
+    let Direct::New { expected: captured } = direct else {
+        return Err(GitError::Stale {
+            detail: "branch moved under this amend".to_owned(),
+        });
+    };
+    let Some((_, stale_expected)) = captured else {
+        return Err(GitError::Stale {
+            detail: "commit carries no captured tip to rebuild from".to_owned(),
+        });
+    };
     let store = ctx.store()?;
     let Some((name, expected)) = symbolic_target(store)? else {
         return Err(GitError::Stale {
             detail: "branch moved under a detached HEAD".to_owned(),
         });
     };
-    // A still-unborn branch retries as-is; a moved tip becomes the new
-    // single parent, while merges keep their recorded parents and let the
-    // lane's compare-and-swap arbitrate again.
+    let stale_tip = expected_tip(&stale_expected).ok();
+    let fresh_tip = expected_tip(&expected).ok();
     let mut parents = request.parents.clone();
-    if let Ok(tip) = expected_tip(&expected) {
-        if parents.len() == 1 {
-            parents[0] = Head::Git { oid: tip };
+    match (stale_tip, fresh_tip) {
+        // Still unborn (or otherwise tip-less): retry as-is; the
+        // compare-and-swap arbitrates creation.
+        (None, None) => {}
+        // Born mid-flight: adopt the tip as the root's parent, exactly
+        // what a re-run commit would record. Anything deliberately
+        // parented elsewhere cannot adopt; refuse instead of stranding.
+        (None, Some(tip)) => {
+            if parents.is_empty() {
+                parents.push(Head::Git { oid: tip });
+            } else {
+                return Err(GitError::Stale {
+                    detail: "branch was created under this commit; rebuild it on the new tip"
+                        .to_owned(),
+                });
+            }
         }
+        // Moved tip: only an exact single-parent fast-forward reparents.
+        // Merges, orphans, and off-tip parents refuse: publishing them
+        // under the fresh CAS would strand the winner.
+        (Some(stale), Some(tip)) if stale != tip => {
+            let stale_head = Head::Git { oid: stale };
+            if parents.len() == 1 && parents[0] == stale_head {
+                parents[0] = Head::Git { oid: tip };
+            } else {
+                return Err(GitError::Stale {
+                    detail: "branch moved under this commit; rebuild it on the new tip".to_owned(),
+                });
+            }
+        }
+        // Tip unchanged, or branch deleted: retry as-is; the
+        // compare-and-swap arbitrates or refuses.
+        _ => {}
     }
-    Ok(GitCommitArgs {
+    let refreshed_request = NewRequest {
         tree: request.tree,
-        parents,
-        author: request.author.clone(),
-        committer: request.committer.clone(),
-        message: request.message.clone(),
+        parents: parents.clone(),
+        author: request.author,
+        committer: request.committer,
+        message: request.message,
         change_id: request.change_id,
         predecessor: request.predecessor,
-        ref_update: Some(GitCommitRefUpdate { name, expected }),
-    })
+        provenance: request.provenance,
+    };
+    let args = GitCommitArgs {
+        tree: refreshed_request.tree,
+        parents,
+        author: refreshed_request.author.clone(),
+        committer: refreshed_request.committer.clone(),
+        message: refreshed_request.message.clone(),
+        change_id: refreshed_request.change_id,
+        predecessor: refreshed_request.predecessor,
+        ref_update: Some(GitCommitRefUpdate {
+            name: name.clone(),
+            expected: expected.clone(),
+        }),
+    };
+    let refreshed_direct = Direct::New {
+        expected: Some((name, expected)),
+    };
+    Ok((args, refreshed_request, refreshed_direct))
 }
 
 /// Extracts the tip a fresh compare-and-swap must expect.
@@ -541,18 +656,33 @@ enum Remote {
     Uncertain,
 }
 
+/// Builds the shared client runtime once per commit verb: every lane round
+/// would otherwise pay a fresh runtime build, stretching the loser's retry
+/// gap past the group-commit sharing window for no reason.
+fn client_runtime() -> Result<tokio::runtime::Runtime, GitError> {
+    tokio::runtime::Builder::new_current_thread()
+        .thread_name("ruk-coordinator-client")
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|err| GitError::Io {
+            detail: format!("coordinator runtime: {err}"),
+        })
+}
+
 /// Submits through the sidecar, restoring the caller's store first on every
 /// path. The store is dropped across the round trip so the server can
 /// burst-open it without waiting on this process's lock.
 fn try_remote(
     ctx: &mut Ctx,
+    runtime: &tokio::runtime::Runtime,
     args: &GitCommitArgs,
     request_id: RequestId,
 ) -> Result<Remote, GitError> {
     let root = ctx.root.clone();
     let store_dir = root.join(".ruk");
     ctx.store.take();
-    let outcome = remote_round(&store_dir, Mode::from_ctx(ctx), args, request_id);
+    let outcome = remote_round(runtime, &store_dir, Mode::from_ctx(ctx), args, request_id);
     let budget = Arc::new(PreparationBudget::reference_defaults());
     ctx.store = Some(Store::open(&store_dir, budget).map_err(GitError::from)?);
     outcome
@@ -560,19 +690,12 @@ fn try_remote(
 
 /// One remote round: connect, submit, and classify the failure phase.
 fn remote_round(
+    runtime: &tokio::runtime::Runtime,
     store_dir: &Path,
     mode: Mode,
     args: &GitCommitArgs,
     request_id: RequestId,
 ) -> Result<Remote, GitError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .thread_name("ruk-coordinator-client")
-        .enable_io()
-        .enable_time()
-        .build()
-        .map_err(|err| GitError::Io {
-            detail: format!("coordinator runtime: {err}"),
-        })?;
     runtime.block_on(async move {
         match round(store_dir, args, request_id).await {
             Ok(answer) => settle(answer),
@@ -699,15 +822,25 @@ fn spawn_server(store_dir: &Path) {
 #[cfg(test)]
 fn spawn_server(_store_dir: &Path) {}
 
-/// Polls for a connectable socket after a spawn. Unix only: elsewhere the
+/// Polls for a serving coordinator after a spawn. Unix only: elsewhere the
 /// coordinator cannot serve, so spawns simply fall back to direct publish.
 /// Never compiled into unit tests, where spawning is stubbed out.
+///
+/// The rendezvous is the published lock body, not the socket file: the
+/// server binds the socket before publishing, so a connectable socket
+/// alone can still precede a readable endpoint, and the next round would
+/// give up to a direct publish while the server is starting. Requiring
+/// both keeps racing commits on the lane. A dead owner still times out:
+/// its socket never connects, so the fallback path is unchanged.
 #[cfg(all(unix, not(test)))]
 fn wait_socket(store_dir: &Path) {
     let sock = socket_path(store_dir);
     let end = std::time::Instant::now() + SPAWN_WAIT;
     while std::time::Instant::now() < end {
-        if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        if per_repo::read_cli_endpoint(store_dir).is_ok()
+            && sock.exists()
+            && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
