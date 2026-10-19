@@ -107,10 +107,7 @@ fn maintenance_reachable(store: &Store, kind: HashKind) -> Result<HashSet<Oid>, 
         }
     }
     if let Some(raw) = store
-        .fact(
-            ruk_core::store::FactTable::Pins,
-            b"cli/pseudo/FETCH_HEAD",
-        )
+        .fact(ruk_core::store::FactTable::Pins, b"cli/pseudo/FETCH_HEAD")
         .map_err(GitError::from)?
     {
         for span in raw.split(|byte| *byte == b'\n') {
@@ -172,10 +169,9 @@ fn peel_chain(
                     .ok_or_else(|| GitError::Corrupt {
                         detail: format!("tag {} has no object header", current.to_hex()),
                     })?;
-                let text =
-                    std::str::from_utf8(hex).map_err(|_| GitError::Corrupt {
-                        detail: format!("tag {} has a non-UTF-8 object header", current.to_hex()),
-                    })?;
+                let text = std::str::from_utf8(hex).map_err(|_| GitError::Corrupt {
+                    detail: format!("tag {} has a non-UTF-8 object header", current.to_hex()),
+                })?;
                 current = ruk_git::parse_oid_for(text, kind)?;
                 visited.push(current);
             }
@@ -600,8 +596,9 @@ pub(crate) fn repack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     let opts = collect(args, &specs)?;
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: repack [-a] [-d] [-q] [-l] [-n] [--pack-kept-objects] [--keep-unreachable]"
-                .to_owned(),
+            detail:
+                "usage: repack [-a] [-d] [-q] [-l] [-n] [--pack-kept-objects] [--keep-unreachable]"
+                    .to_owned(),
         });
     }
     for flag in [
@@ -926,7 +923,10 @@ fn check_tasks(tasks: &[String]) -> Result<(), GitError> {
     for task in tasks {
         if !KNOWN_TASKS.contains(&task.as_str()) {
             return Err(GitError::Invalid {
-                detail: format!("unknown maintenance task {task:?} (tasks: {})", KNOWN_TASKS.join(", ")),
+                detail: format!(
+                    "unknown maintenance task {task:?} (tasks: {})",
+                    KNOWN_TASKS.join(", ")
+                ),
             });
         }
     }
@@ -938,7 +938,10 @@ fn maintenance_run(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, Gi
     let requested = opts.all("task")?;
     check_tasks(&requested)?;
     let tasks: Vec<String> = if requested.is_empty() {
-        DEFAULT_RUN_TASKS.iter().map(|task| (*task).to_owned()).collect()
+        DEFAULT_RUN_TASKS
+            .iter()
+            .map(|task| (*task).to_owned())
+            .collect()
     } else {
         requested
     };
@@ -1059,7 +1062,10 @@ fn set_tasks_enabled(
         });
     }
     let tasks: Vec<String> = if requested.is_empty() {
-        DEFAULT_RUN_TASKS.iter().map(|task| (*task).to_owned()).collect()
+        DEFAULT_RUN_TASKS
+            .iter()
+            .map(|task| (*task).to_owned())
+            .collect()
     } else {
         requested
     };
@@ -1120,10 +1126,7 @@ fn set_registered(
         if registered { "true" } else { "false" },
     )?;
     Ok(line(
-        format!(
-            "Registered for background maintenance: {registered}.\n",
-        )
-        .into_bytes(),
+        format!("Registered for background maintenance: {registered}.\n",).into_bytes(),
     ))
 }
 

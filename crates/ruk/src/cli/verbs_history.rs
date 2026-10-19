@@ -2188,7 +2188,10 @@ fn canon_ident(mailmap: &Mailmap, name: &[u8], email: &[u8]) -> (Vec<u8>, Vec<u8
     mailmap
         .map_ident(&stored_name, &stored_email)
         .map(|(name, email)| (name.into_bytes(), email.into_bytes()))
-        .unwrap_or((stored_name.into_owned().into_bytes(), stored_email.into_owned().into_bytes()))
+        .unwrap_or((
+            stored_name.into_owned().into_bytes(),
+            stored_email.into_owned().into_bytes(),
+        ))
 }
 
 /// Renders parsed format parts for one commit. `decoration` is the `%d`
@@ -2958,10 +2961,7 @@ fn conclude_merge(ctx: &mut Ctx, message: Option<String>) -> Result<Vec<u8>, Git
 
 /// Concludes a conflicted merge for `commit --no-verify`: the message
 /// hooks stay off, `post-commit` still runs with the new commit.
-fn conclude_merge_unverified(
-    ctx: &mut Ctx,
-    message: Option<String>,
-) -> Result<Vec<u8>, GitError> {
+fn conclude_merge_unverified(ctx: &mut Ctx, message: Option<String>) -> Result<Vec<u8>, GitError> {
     let text = pending_merge_text(ctx, message)?;
     finish_merge_commit(ctx, text)
 }

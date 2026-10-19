@@ -273,9 +273,7 @@ fn helper_alias(url: &str, remote: &str) -> String {
         .char_indices()
         .nth(48)
         .map_or(trimmed, |(index, _)| &trimmed[..index]);
-    if !capped.is_empty()
-        && RefName::new(format!("refs/ruk/{capped}/heads/main")).is_ok()
-    {
+    if !capped.is_empty() && RefName::new(format!("refs/ruk/{capped}/heads/main")).is_ok() {
         return capped.to_owned();
     }
     if !remote.is_empty()
@@ -496,7 +494,9 @@ fn run_option<W: std::io::Write>(
 
 /// Unquotes one C-style option value (`option` sends quoted values).
 fn unquote_option(value: &str) -> String {
-    let quoted = value.strip_prefix('"').and_then(|inner| inner.strip_suffix('"'));
+    let quoted = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'));
     let Some(inner) = quoted else {
         return value.to_owned();
     };
@@ -564,11 +564,8 @@ fn emit_list<W: std::io::Write>(session: &HelperSession, writer: &mut W) -> Resu
             RefTarget::Symbolic(dest) => {
                 writer
                     .write_all(
-                        format!(
-                            "@{} {text}\n",
-                            String::from_utf8_lossy(dest.as_bytes())
-                        )
-                        .as_bytes(),
+                        format!("@{} {text}\n", String::from_utf8_lossy(dest.as_bytes()))
+                            .as_bytes(),
                     )
                     .map_err(io_error)?;
             }
@@ -669,7 +666,10 @@ fn run_import_batch<R: BufRead, W: std::io::Write>(
         writer.flush().map_err(io_error)?;
         return Ok(());
     }
-    if !exportable.iter().any(|name| name.starts_with("refs/heads/")) {
+    if !exportable
+        .iter()
+        .any(|name| name.starts_with("refs/heads/"))
+    {
         // Tag-only batches name no exporting branch ref, which the
         // exporter refuses: carry the tag history on the `HEAD` branch
         // (else the first branch), whose commits land harmlessly in the
@@ -844,9 +844,7 @@ fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> Result<usi
             chunk_len = newline_at.map_or(chunk.len(), |pos| pos + 1);
             if total.saturating_add(chunk_len) > MAX_COMMAND_LINE {
                 return Err(GitError::Limit {
-                    detail: format!(
-                        "helper command line exceeds {MAX_COMMAND_LINE} bytes"
-                    ),
+                    detail: format!("helper command line exceeds {MAX_COMMAND_LINE} bytes"),
                 });
             }
             buf.extend_from_slice(&chunk[..chunk_len]);
@@ -910,17 +908,14 @@ fn remap_stream(stream: &[u8], session: &HelperSession) -> Result<Vec<u8>, GitEr
             }
         } else if let Some(name) = text.strip_prefix("tag ") {
             let rest = name.strip_prefix("refs/tags/").unwrap_or(name);
-            let in_tag_space =
-                !name.starts_with("refs/") || name.starts_with("refs/tags/");
+            let in_tag_space = !name.starts_with("refs/") || name.starts_with("refs/tags/");
             let already = rest
                 .strip_prefix("ruk/")
                 .and_then(|tail| tail.strip_prefix(session.alias.as_str()))
                 .and_then(|tail| tail.strip_prefix('/'));
             if in_tag_space && !rest.is_empty() && already.is_none() {
                 out.extend_from_slice(b"tag ");
-                out.extend_from_slice(
-                    format!("ruk/{}/{}", session.alias, rest).as_bytes(),
-                );
+                out.extend_from_slice(format!("ruk/{}/{}", session.alias, rest).as_bytes());
                 out.push(b'\n');
                 rewritten = true;
             }
@@ -939,11 +934,7 @@ fn remap_stream(stream: &[u8], session: &HelperSession) -> Result<Vec<u8>, GitEr
 
 /// Copies one `data` block from a byte slice, advancing the cursor past
 /// it. Mirrors [`copy_data_block`] for already-buffered streams.
-fn copy_data_slice(
-    cursor: &mut &[u8],
-    header: &str,
-    out: &mut Vec<u8>,
-) -> Result<(), GitError> {
+fn copy_data_slice(cursor: &mut &[u8], header: &str, out: &mut Vec<u8>) -> Result<(), GitError> {
     if let Some(marker) = header.strip_prefix("data<<") {
         if marker.is_empty() {
             return Err(GitError::Invalid {
@@ -1113,7 +1104,11 @@ fn is_data_header(text: &str) -> bool {
 
 /// Copies one `data` block verbatim: `<n>` bytes plus its newline, or a
 /// `<<marker` heredoc through the closing marker line.
-fn copy_data_block<R: BufRead>(reader: &mut R, header: &str, out: &mut Vec<u8>) -> Result<(), GitError> {
+fn copy_data_block<R: BufRead>(
+    reader: &mut R,
+    header: &str,
+    out: &mut Vec<u8>,
+) -> Result<(), GitError> {
     if let Some(marker) = header.strip_prefix("data<<") {
         if marker.is_empty() {
             return Err(GitError::Invalid {

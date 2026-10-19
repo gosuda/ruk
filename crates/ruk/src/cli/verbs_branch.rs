@@ -2704,14 +2704,7 @@ fn switch_guessing_merging(
     quiet: bool,
     track: bool,
 ) -> Result<Vec<u8>, GitError> {
-    switch_guessing_with(
-        ctx,
-        branch,
-        guess,
-        quiet,
-        track,
-        SwitchTransition::Merging,
-    )
+    switch_guessing_with(ctx, branch, guess, quiet, track, SwitchTransition::Merging)
 }
 
 /// The private guess implementation shared by both switch flavors: resolves
@@ -3165,8 +3158,7 @@ fn merge_blocked_paths(
                 stages.len() == 1
                     && stages[0].0 == Stage::Zero
                     && stages[0].1.oid() == *oid
-                    && stages[0].1.mode()
-                        == mode.as_index_mode().unwrap_or(FileMode::Regular)
+                    && stages[0].1.mode() == mode.as_index_mode().unwrap_or(FileMode::Regular)
             }
             (None, None) => true,
             _ => false,
@@ -3248,8 +3240,7 @@ fn switch_merge_guard(ctx: &Ctx, new_tree: Oid) -> Result<(), GitError> {
             differing.push(path.clone());
         }
     }
-    let mut blocked =
-        merge_blocked_paths(ctx, store, kind, &old_map, &new_map, &differing)?;
+    let mut blocked = merge_blocked_paths(ctx, store, kind, &old_map, &new_map, &differing)?;
     if blocked.is_empty() {
         return Ok(());
     }
@@ -3367,8 +3358,7 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
             differing.push(path.clone());
         }
     }
-    let mut blocked =
-        merge_blocked_paths(ctx, store, kind, &old_map, &new_map, &differing)?;
+    let mut blocked = merge_blocked_paths(ctx, store, kind, &old_map, &new_map, &differing)?;
     if !blocked.is_empty() {
         blocked.sort();
         return Err(GitError::Invalid {

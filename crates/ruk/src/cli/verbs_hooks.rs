@@ -19,8 +19,8 @@
 
 use std::path::PathBuf;
 
-use ruk_git::transport::push::PushUpdate;
 use ruk_git::GitError;
+use ruk_git::transport::push::PushUpdate;
 
 use super::Ctx;
 

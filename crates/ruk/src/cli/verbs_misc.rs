@@ -1115,7 +1115,11 @@ impl Mailmap {
             Some((_, entry)) => entry,
             None => {
                 self.entries.push((key, MailmapEntry::default()));
-                &mut self.entries.last_mut().expect("mailmap entry just pushed").1
+                &mut self
+                    .entries
+                    .last_mut()
+                    .expect("mailmap entry just pushed")
+                    .1
             }
         };
         match old_name {
@@ -1303,23 +1307,18 @@ pub(crate) fn check_mailmap(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
     let mut contacts: Vec<String> = opts.positionals.clone();
     if opts.is_set("stdin") {
         let input = super::read_stdin_bytes(&ctx.env)?;
-        contacts.extend(
-            String::from_utf8_lossy(&input)
-                .lines()
-                .map(str::to_owned),
-        );
+        contacts.extend(String::from_utf8_lossy(&input).lines().map(str::to_owned));
     }
     if contacts.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: check-mailmap [--stdin] [--mailmap-file=<file>] <contact>...".to_owned(),
+            detail: "usage: check-mailmap [--stdin] [--mailmap-file=<file>] <contact>..."
+                .to_owned(),
         });
     }
     let mut out = Vec::new();
     for contact in &contacts {
         let (name, email) = split_contact(contact);
-        let (name, email) = mailmap
-            .map_ident(&name, &email)
-            .unwrap_or((name, email));
+        let (name, email) = mailmap.map_ident(&name, &email).unwrap_or((name, email));
         out.extend_from_slice(&render_contact(&name, &email));
     }
     Ok(out)
@@ -2834,9 +2833,10 @@ pub(crate) fn whatchanged(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
             break;
         }
         shown += 1;
-        out.extend_from_slice(
-            &super::verbs_history::show(&mut *ctx, &["--raw".to_owned(), oid.to_hex()])?,
-        );
+        out.extend_from_slice(&super::verbs_history::show(
+            &mut *ctx,
+            &["--raw".to_owned(), oid.to_hex()],
+        )?);
     }
     Ok(out)
 }
@@ -2903,7 +2903,9 @@ pub(crate) fn show_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
     let crc_len = count
         .checked_mul(4)
         .ok_or_else(|| corrupt("pack index crc table overflows"))?;
-    let oids_base = 8usize.checked_add(1024).ok_or_else(|| corrupt("pack index header overflows"))?;
+    let oids_base = 8usize
+        .checked_add(1024)
+        .ok_or_else(|| corrupt("pack index header overflows"))?;
     let crc_base = oids_base
         .checked_add(oids_len)
         .ok_or_else(|| corrupt("pack index entry table overflows"))?;
@@ -2946,9 +2948,7 @@ pub(crate) fn show_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
         .and_then(|end| end.checked_add(width))
         .ok_or_else(|| corrupt("pack index trailer overflows"))?;
     if bytes.len() != expected {
-        return Err(corrupt(
-            "pack index length disagrees with its entry count",
-        ));
+        return Err(corrupt("pack index length disagrees with its entry count"));
     }
     let mut out = Vec::new();
     for index in 0..count {
@@ -2974,8 +2974,7 @@ pub(crate) fn show_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
                 return Err(corrupt("pack index large-offset slot escapes its table"));
             }
             let base = off_end.checked_add(
-                slot
-                    .checked_mul(8)
+                slot.checked_mul(8)
                     .ok_or_else(|| corrupt("pack index large-offset slot overflows"))?,
             );
             let base = base.ok_or_else(|| corrupt("pack index large-offset table overflows"))?;
@@ -2990,7 +2989,9 @@ pub(crate) fn show_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
         out.extend_from_slice(
             format!(
                 "{offset} {} {crc:08x}\n",
-                oid.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                oid.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
             )
             .as_bytes(),
         );
@@ -3172,9 +3173,9 @@ fn report_bytes(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
             for (name, target) in refs {
                 let text = name.to_utf8().unwrap_or_default();
                 match target {
-                    RefTarget::Direct(oid) => out.extend_from_slice(
-                        format!("{text} {}\n", oid.to_hex()).as_bytes(),
-                    ),
+                    RefTarget::Direct(oid) => {
+                        out.extend_from_slice(format!("{text} {}\n", oid.to_hex()).as_bytes())
+                    }
                     RefTarget::Symbolic(dest) => out.extend_from_slice(
                         format!("{text} ref: {}\n", dest.to_utf8().unwrap_or_default()).as_bytes(),
                     ),
@@ -3356,11 +3357,7 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
                 .ok()
                 .is_some_and(|there| there == *here)
         });
-        let reused = if same_root {
-            ctx.store.take()
-        } else {
-            None
-        };
+        let reused = if same_root { ctx.store.take() } else { None };
         let mut sub = if let Some(store) = reused {
             let kind = store.hash_kind();
             Ctx {
@@ -3514,7 +3511,9 @@ fn gap(command: &str) -> Result<Vec<u8>, GitError> {
 /// with a warning baked in; here it is a typed refusal pointing at the
 /// supported rewrites (`rebase`, `fast-export`/`fast-import`).
 pub(crate) fn filter_branch(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
-    gap("filter-branch is deprecated upstream and unimplemented: use rebase or fast-export/fast-import")
+    gap(
+        "filter-branch is deprecated upstream and unimplemented: use rebase or fast-export/fast-import",
+    )
 }
 
 /// The store keeps no loose/pack split for redundancy to prune.
