@@ -1,7 +1,13 @@
 //! Misc plumbing and user verbs: `clean`, `describe`, `reflog`, `shortlog`,
 //! `check-mailmap`, `cherry`, `name-rev`, `check-ignore`, `check-attr`, `stripspace`,
 //! `interpret-trailers`, `var`, `get-tar-commit-id`, `fmt-merge-msg`,
-//! `verify-tag`, `verify-commit`.
+//! `verify-tag`, `verify-commit`, plus the leftover surface: `stage` and
+//! `whatchanged` aliases, `show-index`, `unpack-objects`, `unpack-file`,
+//! `mktag`, `bugreport`, `diagnose`, `for-each-repo`, `last-modified`,
+//! the `filter-branch` refusal, and the named-gap stubs (`pack-redundant`,
+//! `web--browse`, `mergetool`, `difftool`, `instaweb`, `imap-send`,
+//! `send-email`, `send-pack`, `quiltimport`, `remote-http`/`https`/`ftp`/
+//! `ftps`/`ext`/`fd`).
 //!
 //! | verb | backing | status |
 //! | --- | --- | --- |
@@ -21,6 +27,18 @@
 //! | `fmt-merge-msg` | `FETCH_HEAD` pseudo record | implemented (`-m`, `--log[=n]`/`--no-log`, `--stdin`/file) |
 //! | `verify-tag` | structural check, honest refusal | partial (no signatures: always refuses after validating) |
 //! | `verify-commit` | existence check, honest refusal | partial (no signatures: always refuses after validating) |
+//! | `stage` | `add` forward | implemented (alias, same flags and errors) |
+//! | `whatchanged` | `log` ranges walked, `show --raw` per non-merge tip | implemented (`-n`, ranges; no pathspecs) |
+//! | `show-index` | v2 `.idx` parse from stdin/file | implemented (`<offset> <hex> <crc>` lines) |
+//! | `unpack-objects` | pack ingest plus publication | implemented (`-n`/`--dry-run` verifies only) |
+//! | `unpack-file` | blob spilled to `tmp-unpack-*` | implemented (blobs only) |
+//! | `mktag` | stdin tag body validated and stored | implemented (`type` must name a kind) |
+//! | `bugreport` | version/platform/config/refs/head dump | implemented (`-o`) |
+//! | `diagnose` | bug report plus object census | implemented (`-o`) |
+//! | `for-each-repo` | in-process dispatch per listed repo | implemented (repeatable `--config`, aborts on first failure) |
+//! | `last-modified` | first-parent walk for the touching commit | implemented (`<oid>\t<path>` per path) |
+//! | `filter-branch` | deprecated upstream | unsupported (loud refusal with alternatives) |
+//! | `pack-redundant`, `web--browse`, `mergetool`, `difftool`, `instaweb`, `imap-send`, `send-email`, `send-pack`, `quiltimport`, `remote-http`, `remote-https`, `remote-ftp`, `remote-ftps`, `remote-ext`, `remote-fd` | no backing | unsupported (named gaps) |
 //!
 //! Oracle anchors: `git/builtin/clean.c`, `git/builtin/describe.c`,
 //! `git/builtin/reflog.c`, `git/builtin/shortlog.c`, `git/mailmap.c`,
@@ -29,14 +47,24 @@
 //! `git/builtin/check-attr.c`, `git/builtin/stripspace.c`,
 //! `git/builtin/interpret-trailers.c`, `git/builtin/var.c`,
 //! `git/builtin/get-tar-commit-id.c`, `git/builtin/fmt-merge-msg.c`,
-//! `git/builtin/verify-tag.c`, `git/builtin/verify-commit.c`.
+//! `git/builtin/verify-tag.c`, `git/builtin/verify-commit.c`,
+//! `git/builtin/add.c` (`stage`), `git/builtin/log.c` (`whatchanged`),
+//! `git/builtin/show-index.c`, `git/builtin/unpack-objects.c`,
+//! `git/builtin/unpack-file.c`, `git/builtin/mktag.c`,
+//! `git/builtin/bugreport.c`, `git/builtin/diagnose.c`,
+//! `git/builtin/for-each-repo.c`, `git/git-filter-branch.sh`,
+//! `git/builtin/pack-redundant.c`, `git/git-web--browse.sh`,
+//! `git/git-mergetool.sh`, `git/builtin/difftool.c`, `git/git-instaweb.sh`,
+//! `git/builtin/imap-send.c`, `git/git-send-email.pl`,
+//! `git/builtin/send-pack.c`, `git/git-quiltimport.sh`,
+//! `git/remote-curl.c`, `git/builtin/remote-ext.c`,
+//! `git/builtin/remote-fd.c`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use ruk_core::commit::CommitRecord;
 use ruk_core::conflict::Signature;
-
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
@@ -2749,6 +2777,773 @@ pub(crate) fn verify_commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
     })
 }
 
+// ---------------------------------------------------------------------------
+// stage / whatchanged (aliases)
+// ---------------------------------------------------------------------------
+
+/// Stages paths exactly like `add`.
+///
+/// Oracle: `git/builtin/add.c`. `stage` is the historical synonym git keeps
+/// as its own builtin entry; here it forwards byte-for-byte, so every
+/// `add` flag and error reads identically.
+pub(crate) fn stage(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    super::verbs_stage::add(ctx, args)
+}
+
+/// Shows commits with raw per-file lines, skipping merges.
+///
+/// Oracle: `git/builtin/log.c` (`cmd_whatchanged`, hard-wired to
+/// `log --raw --no-merges`). `log` renders no `--raw` section, but `show`
+/// does, so each walked non-merge tip renders through `show --raw`.
+/// Ranges use the same revision grammar as `log`; `-n` caps the walk.
+pub(crate) fn whatchanged(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [FlagSpec {
+        long: "max-count",
+        short: Some('n'),
+        takes_value: true,
+    }];
+    let opts = collect(args, &specs)?;
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let limit: Option<usize> = match opts.single("max-count")? {
+        None => None,
+        Some(text) => Some(text.parse().map_err(|_| GitError::Invalid {
+            detail: format!("bad --max-count={text:?}"),
+        })?),
+    };
+    let default_tip = head_oid(store).ok();
+    let (tips, exclude) = parse_log_revs(store, kind, &opts.positionals, default_tip)?;
+    if tips.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: whatchanged [-n <n>] [<revision-range>]".to_owned(),
+        });
+    }
+    let history = walk_history_excluding(store, &tips, &exclude, None)?;
+    let mut out = Vec::new();
+    let mut shown = 0usize;
+    for (oid, record) in &history {
+        let parents: Vec<Oid> = record
+            .parents()
+            .iter()
+            .filter_map(|head| head.as_git().copied())
+            .collect();
+        if parents.len() > 1 {
+            continue;
+        }
+        if limit.is_some_and(|max| shown >= max) {
+            break;
+        }
+        shown += 1;
+        out.extend_from_slice(
+            &super::verbs_history::show(&mut *ctx, &["--raw".to_owned(), oid.to_hex()])?,
+        );
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// show-index
+// ---------------------------------------------------------------------------
+
+/// Lists the objects named by a pack index.
+///
+/// Oracle: `git/builtin/show-index.c`. Reads a v2 `.idx` from stdin (or
+/// the one `<idx-file>` positional) and prints
+/// `<offset> <hex> <crc>` per entry. Only v2 indexes parse: anything else
+/// is `Corrupt`, since guessing an object list would invent history.
+pub(crate) fn show_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let opts = collect(args, &[])?;
+    let bytes = match opts.positionals.as_slice() {
+        [] => super::read_stdin_bytes(&ctx.env)?,
+        [path] => std::fs::read(path).map_err(|err| GitError::Io {
+            detail: format!("reading {path}: {err}"),
+        })?,
+        _ => {
+            return Err(GitError::Invalid {
+                detail: "usage: show-index [<idx-file>] < pack.idx".to_owned(),
+            });
+        }
+    };
+    let kind = ctx.kind().unwrap_or(HashKind::Sha1);
+    let width = kind.oid_len();
+    if bytes.len() < 8 + 1024
+        || &bytes[..4] != b"\xfftOc"
+        || u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) != 2
+    {
+        return Err(GitError::Corrupt {
+            detail: "not a v2 pack index".to_owned(),
+        });
+    }
+    let mut fanout = [0u32; 256];
+    for (slot, cell) in fanout.iter_mut().enumerate() {
+        let base = 8 + 4 * slot;
+        *cell = u32::from_be_bytes([
+            bytes[base],
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+        ]);
+    }
+    if fanout.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(GitError::Corrupt {
+            detail: "pack index fanout decreases".to_owned(),
+        });
+    }
+    // Every offset below is attacker-controlled input: checked arithmetic
+    // turns overflow into `Corrupt`, and every read goes through `get`,
+    // so a hostile index errors instead of panicking.
+    let corrupt = |detail: &str| GitError::Corrupt {
+        detail: detail.to_owned(),
+    };
+    let count = usize::try_from(fanout[255])
+        .map_err(|_| corrupt("pack index entry count exceeds address space"))?;
+    let oids_len = count
+        .checked_mul(width)
+        .ok_or_else(|| corrupt("pack index entry table overflows"))?;
+    let crc_len = count
+        .checked_mul(4)
+        .ok_or_else(|| corrupt("pack index crc table overflows"))?;
+    let oids_base = 8usize.checked_add(1024).ok_or_else(|| corrupt("pack index header overflows"))?;
+    let crc_base = oids_base
+        .checked_add(oids_len)
+        .ok_or_else(|| corrupt("pack index entry table overflows"))?;
+    let off_base = crc_base
+        .checked_add(crc_len)
+        .ok_or_else(|| corrupt("pack index crc table overflows"))?;
+    let off_end = off_base
+        .checked_add(crc_len)
+        .ok_or_else(|| corrupt("pack index offset table overflows"))?;
+    // Offsets with the high bit set index the 8-byte large-offset table
+    // that follows the 4-byte table; count them before sizing the tail.
+    let mut large = 0usize;
+    for index in 0..count {
+        let base = off_base.checked_add(
+            index
+                .checked_mul(4)
+                .ok_or_else(|| corrupt("pack index offset entry overflows"))?,
+        );
+        let base = base.ok_or_else(|| corrupt("pack index offset table overflows"))?;
+        let Some(entry) = bytes.get(base..base.saturating_add(4)) else {
+            return Err(corrupt("pack index truncates its offset table"));
+        };
+        let entry: [u8; 4] = entry
+            .try_into()
+            .map_err(|_| corrupt("pack index truncates its offset table"))?;
+        if u32::from_be_bytes(entry) & 0x8000_0000 != 0 {
+            large = large
+                .checked_add(1)
+                .ok_or_else(|| corrupt("pack index large-offset count overflows"))?;
+        }
+    }
+    let large_len = large
+        .checked_mul(8)
+        .ok_or_else(|| corrupt("pack index large-offset table overflows"))?;
+    let trailer = off_end
+        .checked_add(large_len)
+        .ok_or_else(|| corrupt("pack index large-offset table overflows"))?;
+    let expected = trailer
+        .checked_add(width)
+        .and_then(|end| end.checked_add(width))
+        .ok_or_else(|| corrupt("pack index trailer overflows"))?;
+    if bytes.len() != expected {
+        return Err(corrupt(
+            "pack index length disagrees with its entry count",
+        ));
+    }
+    let mut out = Vec::new();
+    for index in 0..count {
+        let oid = &bytes[oids_base + index * width..oids_base + (index + 1) * width];
+        let crc = u32::from_be_bytes([
+            bytes[crc_base + 4 * index],
+            bytes[crc_base + 4 * index + 1],
+            bytes[crc_base + 4 * index + 2],
+            bytes[crc_base + 4 * index + 3],
+        ]);
+        let raw = u32::from_be_bytes([
+            bytes[off_base + 4 * index],
+            bytes[off_base + 4 * index + 1],
+            bytes[off_base + 4 * index + 2],
+            bytes[off_base + 4 * index + 3],
+        ]);
+        let offset = if raw & 0x8000_0000 == 0 {
+            u64::from(raw)
+        } else {
+            let slot = usize::try_from(raw & 0x7fff_ffff)
+                .map_err(|_| corrupt("pack index large-offset slot exceeds address space"))?;
+            if slot >= large {
+                return Err(corrupt("pack index large-offset slot escapes its table"));
+            }
+            let base = off_end.checked_add(
+                slot
+                    .checked_mul(8)
+                    .ok_or_else(|| corrupt("pack index large-offset slot overflows"))?,
+            );
+            let base = base.ok_or_else(|| corrupt("pack index large-offset table overflows"))?;
+            let Some(entry) = bytes.get(base..base.saturating_add(8)) else {
+                return Err(corrupt("pack index truncates its large-offset table"));
+            };
+            let entry: [u8; 8] = entry
+                .try_into()
+                .map_err(|_| corrupt("pack index truncates its large-offset table"))?;
+            u64::from_be_bytes(entry)
+        };
+        out.extend_from_slice(
+            format!(
+                "{offset} {} {crc:08x}\n",
+                oid.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// unpack-objects / unpack-file
+// ---------------------------------------------------------------------------
+
+/// Unpacks a pack stream from stdin into the store.
+///
+/// Oracle: `git/builtin/unpack-objects.c`. The store keeps no loose/pack
+/// split, so the pack ingests and publishes exactly the way `index-pack`
+/// publishes it (commit-record facts included); `-n`/`--dry-run` verifies
+/// without publishing.
+pub(crate) fn unpack_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [FlagSpec {
+        long: "dry-run",
+        short: Some('n'),
+        takes_value: false,
+    }];
+    let opts = collect(args, &specs)?;
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: unpack-objects [-n] < pack".to_owned(),
+        });
+    }
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let bytes = super::read_stdin_bytes(&ctx.env)?;
+    let staged = ruk_git::transport::pack::ingest_pack(
+        &bytes[..],
+        kind,
+        store,
+        ruk_git::transport::pack::IngestLimits::default(),
+        &ruk_git::transport::Interrupt::none(),
+    )?;
+    let count = staged.oids().len();
+    if opts.is_set("dry-run") {
+        return Ok(line(
+            format!("stdin: ok ({count} objects, dry run, nothing stored)").into_bytes(),
+        ));
+    }
+    let facts = ruk_git::transport::fetch::commit_record_facts(store, &staged)?;
+    store
+        .publish(staged.into_objects(), &facts)
+        .map_err(GitError::from)?;
+    Ok(line(
+        format!("stdin: ok ({count} objects unpacked)").into_bytes(),
+    ))
+}
+
+/// Writes one blob to a file and prints its name.
+///
+/// Oracle: `git/builtin/unpack-file.c`. The file lands in the worktree
+/// root as `tmp-unpack-<12hex>-<pid>` (suffixed when the name is taken;
+/// the oracle mints its own temp name the same way); non-blobs are
+/// `Invalid`, since only blobs have file bytes to spill.
+pub(crate) fn unpack_file(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let opts = collect(args, &[])?;
+    let [rev] = opts.positionals.as_slice() else {
+        return Err(GitError::Invalid {
+            detail: "usage: unpack-file <blob>".to_owned(),
+        });
+    };
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let oid = resolve_rev(store, kind, rev).or_else(|_| ruk_git::parse_oid_for(rev, kind))?;
+    let (object_kind, body) = read_object_bytes(store, oid)?;
+    if object_kind != ObjectKind::Blob {
+        return Err(GitError::Invalid {
+            detail: format!("object {} is not a blob", oid.to_hex()),
+        });
+    }
+    // The oracle mints a fresh temp file per call, so a second unpack of
+    // the same blob must not clobber the first: suffix on collision.
+    let stem = format!("tmp-unpack-{}-{}", &oid.to_hex()[..12], std::process::id());
+    let mut name = stem.clone();
+    let mut attempt = 0u32;
+    let path = loop {
+        let candidate = ctx.file_base.join(&name);
+        if !candidate.exists() {
+            break candidate;
+        }
+        attempt = attempt.saturating_add(1);
+        name = format!("{stem}-{attempt}");
+    };
+    std::fs::write(&path, &body).map_err(|err| GitError::Io {
+        detail: format!("writing {name}: {err}"),
+    })?;
+    Ok(line(name.into_bytes()))
+}
+
+// ---------------------------------------------------------------------------
+// mktag
+// ---------------------------------------------------------------------------
+
+/// Creates a tag object from a stdin body.
+///
+/// Oracle: `git/builtin/mktag.c`. The body must carry `object`/`type`/`tag`
+/// headers over a live target (the same structural check `verify-tag`
+/// runs), and `type` must name a real object kind; the stored tag's id
+/// prints on success.
+pub(crate) fn mktag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let opts = collect(args, &[])?;
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: mktag < tag-body".to_owned(),
+        });
+    }
+    let store = ctx.store()?;
+    let body = super::read_stdin_bytes(&ctx.env)?;
+    check_tag_body(store, &body)?;
+    let text = std::str::from_utf8(&body).map_err(|_| GitError::Corrupt {
+        detail: "tag body is not utf-8".to_owned(),
+    })?;
+    let mut object_type = None::<&str>;
+    for text_line in text.lines() {
+        if text_line.is_empty() {
+            break;
+        }
+        if let Some(value) = text_line.strip_prefix("type ") {
+            object_type = Some(value);
+        }
+    }
+    match object_type {
+        Some("blob") | Some("tree") | Some("commit") | Some("tag") => {}
+        _ => {
+            return Err(GitError::Invalid {
+                detail: "tag body needs `type blob|tree|commit|tag`".to_owned(),
+            });
+        }
+    }
+    let oid = super::tree::store_object(store, ObjectKind::Tag, body)?;
+    Ok(line(oid.to_hex().into_bytes()))
+}
+
+// ---------------------------------------------------------------------------
+// bugreport / diagnose
+// ---------------------------------------------------------------------------
+
+/// Shared report body: version, platform, config, refs, and head.
+///
+/// Store sections degrade to an explicit marker outside a repository
+/// instead of failing, the way the oracle still reports what it can.
+fn report_bytes(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
+    let mut out = super::dispatch::version_text();
+    out.extend_from_slice(
+        format!(
+            "os: {} arch: {}\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+        .as_bytes(),
+    );
+    let Ok(store) = ctx.store() else {
+        out.extend_from_slice(b"(no repository: store sections omitted)\n");
+        return Ok(out);
+    };
+    let format_name = match ctx.kind() {
+        Ok(HashKind::Sha256) => "sha256",
+        _ => "sha1",
+    };
+    out.extend_from_slice(format!("object-format: {format_name}\n").as_bytes());
+    out.extend_from_slice(b"[config]\n");
+    match super::state::config_list(store) {
+        Ok(pairs) => {
+            for (name, value) in pairs {
+                out.extend_from_slice(format!("{name}={value}\n").as_bytes());
+            }
+        }
+        Err(err) => out.extend_from_slice(format!("(config unreadable: {err})\n").as_bytes()),
+    }
+    out.extend_from_slice(b"[refs]\n");
+    match list_refs(store) {
+        Ok(refs) => {
+            for (name, target) in refs {
+                let text = name.to_utf8().unwrap_or_default();
+                match target {
+                    RefTarget::Direct(oid) => out.extend_from_slice(
+                        format!("{text} {}\n", oid.to_hex()).as_bytes(),
+                    ),
+                    RefTarget::Symbolic(dest) => out.extend_from_slice(
+                        format!("{text} ref: {}\n", dest.to_utf8().unwrap_or_default()).as_bytes(),
+                    ),
+                }
+            }
+        }
+        Err(err) => out.extend_from_slice(format!("(refs unreadable: {err})\n").as_bytes()),
+    }
+    match head_oid(store) {
+        Ok(oid) => out.extend_from_slice(format!("head: {}\n", oid.to_hex()).as_bytes()),
+        Err(_) => out.extend_from_slice(b"head: unborn\n"),
+    }
+    Ok(out)
+}
+
+/// Dumps a bug report: version, platform, config, refs, and head.
+///
+/// Oracle: `git/builtin/bugreport.c`. The oracle mails its report through
+/// the user's mailer; here it goes to stdout, or to `-o`/`--output-file`.
+pub(crate) fn bugreport(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [FlagSpec {
+        long: "output-file",
+        short: Some('o'),
+        takes_value: true,
+    }];
+    let opts = collect(args, &specs)?;
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: bugreport [-o <file>]".to_owned(),
+        });
+    }
+    let report = report_bytes(ctx)?;
+    if let Some(path) = opts.single("output-file")? {
+        std::fs::write(&path, &report).map_err(|err| GitError::Io {
+            detail: format!("writing {path}: {err}"),
+        })?;
+        return Ok(line(format!("wrote {path}").into_bytes()));
+    }
+    Ok(report)
+}
+
+/// Dumps diagnostics: the bug report plus the object census.
+///
+/// Oracle: `git/builtin/diagnose.c`. The oracle zips diagnostics with
+/// loose-object stats; the store keeps no loose split, so this prints the
+/// same report plus the census line (`diagnose` with `-o`/`--output`
+/// writes the file and prints its path).
+pub(crate) fn diagnose(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [FlagSpec {
+        long: "output",
+        short: Some('o'),
+        takes_value: true,
+    }];
+    let opts = collect(args, &specs)?;
+    if !opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: diagnose [-o <file>]".to_owned(),
+        });
+    }
+    let mut report = report_bytes(ctx)?;
+    if ctx.store().is_ok() {
+        let store = ctx.store()?;
+        let mut count: u64 = 0;
+        let mut bytes: u64 = 0;
+        for (_, _, len) in store.iter_objects().map_err(GitError::from)? {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(len);
+        }
+        report.extend_from_slice(format!("objects: {count} total, {bytes} bytes\n").as_bytes());
+    }
+    if let Some(path) = opts.single("output")? {
+        std::fs::write(&path, &report).map_err(|err| GitError::Io {
+            detail: format!("writing {path}: {err}"),
+        })?;
+        return Ok(line(format!("wrote {path}").into_bytes()));
+    }
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// for-each-repo
+// ---------------------------------------------------------------------------
+
+/// Runs one command in every listed repository.
+///
+/// Oracle: `git/builtin/for-each-repo.c`. Each `--config=<key>` value
+/// names one repository per line (config records hold one value each, so
+/// repeat `--config` for more keys); the command dispatches in-process
+/// against each store in turn, and the first failure aborts with its own
+/// error after naming the repository on stderr.
+pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let specs = [FlagSpec {
+        long: "config",
+        short: None,
+        takes_value: true,
+    }];
+    let opts = collect(args, &specs)?;
+    let keys = opts.all("config")?;
+    if keys.is_empty() || opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: for-each-repo --config=<key>... <command> [<args>...]".to_owned(),
+        });
+    }
+    let mut repos = Vec::new();
+    for key in &keys {
+        let value = ctx.config_get(key).ok_or_else(|| GitError::NotFound {
+            detail: format!("config {key} is not set"),
+        })?;
+        for text_line in value.lines() {
+            let trimmed = text_line.trim();
+            if !trimmed.is_empty() {
+                repos.push(trimmed.to_owned());
+            }
+        }
+    }
+    if repos.is_empty() {
+        return Err(GitError::NotFound {
+            detail: "no repositories listed by --config".to_owned(),
+        });
+    }
+    let verb_name = &opts.positionals[0];
+    let verb_args = &opts.positionals[1..];
+    let verb = super::dispatch::lookup(verb_name).ok_or_else(|| GitError::Unsupported {
+        command: verb_name.clone(),
+    })?;
+    let mut out = Vec::new();
+    for repo in &repos {
+        let root = std::path::PathBuf::from(repo);
+        let dot = if root.file_name().is_some_and(|name| name == ".ruk") {
+            root.clone()
+        } else {
+            root.join(".ruk")
+        };
+        let store = ruk_core::store::Store::open(
+            &dot,
+            std::sync::Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+        )
+        .map_err(|err| GitError::Io {
+            detail: format!("opening {repo}: {err}"),
+        })?;
+        let kind = store.hash_kind();
+        let mut sub = Ctx {
+            store: Some(store),
+            root: root.clone(),
+            file_base: root.clone(),
+            kind: Some(kind),
+            env: ctx.env.clone(),
+            bare: false,
+            cli_config: Vec::new(),
+            stderr: Vec::new(),
+        };
+        match (verb.run)(&mut sub, verb_args) {
+            Ok(bytes) => {
+                ctx.stderr.extend_from_slice(&sub.stderr);
+                out.extend_from_slice(&bytes);
+            }
+            Err(err) => {
+                ctx.emit_stderr(format!("for-each-repo: {repo}: {err}\n").as_bytes());
+                return Err(err);
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// last-modified
+// ---------------------------------------------------------------------------
+
+/// Finds the blob id at `path` in one commit's tree, if the path exists.
+fn blob_at_path(
+    store: &Store,
+    kind: HashKind,
+    oid: Oid,
+    path: &[u8],
+) -> Result<Option<Oid>, GitError> {
+    let tree = super::tree::peel_to_tree(store, kind, oid)?;
+    for (name, _, blob) in super::tree::flatten_tree(store, kind, tree)? {
+        if name == path {
+            return Ok(Some(blob));
+        }
+    }
+    Ok(None)
+}
+
+/// Prints the newest commit that last touched each path.
+///
+/// New in git 2.49 as a last-touch blame answering `<oid>\t<path>` per
+/// input. The walk follows first parents from `HEAD`: the first commit
+/// whose path blob differs from its parent's (creation, change, and
+/// deletion all differ) is the touch. Paths history never carries are
+/// `NotFound`.
+pub(crate) fn last_modified(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
+    let opts = collect(args, &[])?;
+    if opts.positionals.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "usage: last-modified [--] <path>...".to_owned(),
+        });
+    }
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let tip = head_oid(store)?;
+    let mut chain = Vec::new();
+    let mut current = Some(tip);
+    while let Some(oid) = current {
+        chain.push(oid);
+        current = commit_record(store, oid)?
+            .parents()
+            .iter()
+            .filter_map(|head| head.as_git().copied())
+            .next();
+    }
+    let mut out = Vec::new();
+    for path in &opts.positionals {
+        let bytes = path.as_bytes();
+        let mut blobs = Vec::with_capacity(chain.len());
+        for oid in &chain {
+            blobs.push(blob_at_path(store, kind, *oid, bytes)?);
+        }
+        let mut found = None;
+        for (index, oid) in chain.iter().enumerate() {
+            let parent = if index + 1 < chain.len() {
+                blobs[index + 1]
+            } else {
+                None
+            };
+            if blobs[index] != parent {
+                found = Some(*oid);
+                break;
+            }
+        }
+        match found {
+            Some(oid) => {
+                out.extend_from_slice(format!("{}\t{path}\n", oid.to_hex()).as_bytes());
+            }
+            None => {
+                return Err(GitError::NotFound {
+                    detail: format!("path {path:?} never appears in HEAD history"),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// filter-branch (deprecated upstream) and named gaps
+// ---------------------------------------------------------------------------
+
+/// Rejects one command family with its reason.
+fn gap(command: &str) -> Result<Vec<u8>, GitError> {
+    Err(GitError::Unsupported {
+        command: command.to_owned(),
+    })
+}
+
+/// Refuses history rewrites loudly.
+///
+/// Oracle: `git/git-filter-branch.sh`. Git itself deprecates this script
+/// with a warning baked in; here it is a typed refusal pointing at the
+/// supported rewrites (`rebase`, `fast-export`/`fast-import`).
+pub(crate) fn filter_branch(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("filter-branch is deprecated upstream and unimplemented: use rebase or fast-export/fast-import")
+}
+
+/// The store keeps no loose/pack split for redundancy to prune.
+///
+/// Oracle: `git/builtin/pack-redundant.c`.
+pub(crate) fn pack_redundant(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("pack-redundant needs the loose/pack split this store does not keep")
+}
+
+/// No browser launcher ships with this interpreter.
+///
+/// Oracle: `git/git-web--browse.sh`.
+pub(crate) fn web_browse(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("web--browse needs a browser launcher: open the URL yourself")
+}
+
+/// No interactive merge tool ships with this interpreter.
+///
+/// Oracle: `git/git-mergetool.sh`.
+pub(crate) fn mergetool(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("mergetool needs an interactive merge tool: resolve conflicts, then commit")
+}
+
+/// No interactive diff viewer ships with this interpreter.
+///
+/// Oracle: `git/builtin/difftool.c`.
+pub(crate) fn difftool(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("difftool needs an interactive diff viewer: use diff")
+}
+
+/// No web server backend ships with this interpreter.
+///
+/// Oracle: `git/git-instaweb.sh`.
+pub(crate) fn instaweb(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("instaweb needs gitweb-style serving this store does not provide")
+}
+
+/// No IMAP upload path ships with this interpreter.
+///
+/// Oracle: `git/builtin/imap-send.c`.
+pub(crate) fn imap_send(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("imap-send needs an IMAP upload path this store does not provide")
+}
+
+/// No SMTP submit path ships with this interpreter.
+///
+/// Oracle: `git/git-send-email.pl`.
+pub(crate) fn send_email(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("send-email needs an SMTP submit path: use format-patch files")
+}
+
+/// Live-connection pack sending is unimplemented; `push` owns delivery.
+///
+/// Oracle: `git/builtin/send-pack.c`.
+pub(crate) fn send_pack(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("send-pack over a live connection is unimplemented: use push")
+}
+
+/// No quilt series importer ships with this interpreter.
+///
+/// Oracle: `git/git-quiltimport.sh`.
+pub(crate) fn quiltimport(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("quiltimport needs a quilt series: apply patches with apply/am")
+}
+
+/// Network transports stay offline; local paths only.
+///
+/// Oracle: `git/remote-curl.c`.
+pub(crate) fn remote_http(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("remote-http network transport is offline: clone/fetch/push route local paths only")
+}
+
+/// Network transports stay offline; local paths only.
+///
+/// Oracle: `git/remote-curl.c`.
+pub(crate) fn remote_https(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("remote-https network transport is offline: clone/fetch/push route local paths only")
+}
+
+/// Network transports stay offline; local paths only.
+///
+/// Oracle: `git/remote-curl.c`.
+pub(crate) fn remote_ftp(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("remote-ftp network transport is offline: clone/fetch/push route local paths only")
+}
+
+/// Network transports stay offline; local paths only.
+///
+/// Oracle: `git/remote-curl.c`.
+pub(crate) fn remote_ftps(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("remote-ftps network transport is offline: clone/fetch/push route local paths only")
+}
+
+/// No subprocess remote transport ships with this interpreter.
+///
+/// Oracle: `git/builtin/remote-ext.c`.
+pub(crate) fn remote_ext(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("remote-ext subprocess transport is unimplemented")
+}
+
+/// The file-descriptor test helper ships with no tests to serve.
+///
+/// Oracle: `git/builtin/remote-fd.c`.
+pub(crate) fn remote_fd(_ctx: &mut Ctx, _args: &[String]) -> Result<Vec<u8>, GitError> {
+    gap("remote-fd is a test helper and is unimplemented")
+}
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

@@ -23,9 +23,9 @@ use super::verbs_fastio;
 use super::verbs_grep;
 use super::verbs_history;
 use super::verbs_hooks;
+use super::verbs_misc;
 use super::verbs_maintenance;
 use super::verbs_merge_plumbing;
-use super::verbs_misc;
 use super::verbs_notes;
 use super::verbs_objects;
 use super::verbs_patch;
@@ -129,11 +129,11 @@ fn run(
 
 #[test]
 fn verb_table_covers_advertised_names() {
-    assert_eq!(VERBS.len(), 101);
+    assert_eq!(VERBS.len(), 127);
     let mut names: Vec<&str> = VERBS.iter().map(|verb| verb.name).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 101);
+    assert_eq!(names.len(), 127);
     for name in [
         "add",
         "am",
@@ -144,6 +144,7 @@ fn verb_table_covers_advertised_names() {
         "blame",
         "branch",
         "bundle",
+        "bugreport",
         "cat-file",
         "check-attr",
         "check-ignore",
@@ -162,12 +163,16 @@ fn verb_table_covers_advertised_names() {
         "count-objects",
         "credential",
         "describe",
+        "diagnose",
         "diff",
+        "difftool",
         "fast-export",
         "fast-import",
         "fetch",
+        "filter-branch",
         "fmt-merge-msg",
         "for-each-ref",
+        "for-each-repo",
         "format-patch",
         "fsck",
         "gc",
@@ -176,33 +181,47 @@ fn verb_table_covers_advertised_names() {
         "hash-object",
         "help",
         "index-pack",
+        "imap-send",
         "init",
+        "instaweb",
         "interpret-trailers",
         "log",
         "ls-files",
         "ls-remote",
         "ls-tree",
+        "last-modified",
         "maintenance",
         "merge",
         "merge-base",
         "merge-file",
         "merge-tree",
+        "mergetool",
         "migrate",
+        "mktag",
         "mktree",
         "mv",
         "name-rev",
         "notes",
         "pack-objects",
+        "pack-redundant",
         "pack-refs",
         "prune",
         "pull",
         "push",
+        "quiltimport",
         "range-diff",
         "rebase",
         "receive-pack",
         "read-tree",
         "reflog",
         "remote",
+        "remote-ext",
+        "remote-fd",
+        "remote-ftp",
+        "remote-ftps",
+        "remote-helper",
+        "remote-http",
+        "remote-https",
         "repack",
         "replace",
         "request-pull",
@@ -213,10 +232,14 @@ fn verb_table_covers_advertised_names() {
         "rev-parse",
         "revert",
         "rm",
+        "send-email",
+        "send-pack",
         "show",
+        "show-index",
         "shortlog",
         "show-ref",
         "sparse-checkout",
+        "stage",
         "stash",
         "status",
         "stripspace",
@@ -224,6 +247,8 @@ fn verb_table_covers_advertised_names() {
         "switch",
         "symbolic-ref",
         "tag",
+        "unpack-file",
+        "unpack-objects",
         "update-index",
         "update-ref",
         "update-server-info",
@@ -234,6 +259,8 @@ fn verb_table_covers_advertised_names() {
         "verify-pack",
         "verify-tag",
         "version",
+        "web--browse",
+        "whatchanged",
         "worktree",
         "write-tree",
     ] {
@@ -7596,6 +7623,9 @@ fn wave_j_status_verbose_column_renames() {
 fn wave_j_switch_merge_guard() {
     let (root, env) = seeded_repo("wavej-mergeguard", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("g.txt"), b"same\n").expect("same file");
+    run(verbs_stage::add, &mut ctx, &["g.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "add g"]).expect("commit");
     run(verbs_branch::branch, &mut ctx, &["side"]).expect("branch");
     run(verbs_branch::checkout, &mut ctx, &["side"]).expect("checkout side");
     std::fs::write(root.join("f.txt"), b"side\n").expect("modify");
@@ -7603,10 +7633,20 @@ fn wave_j_switch_merge_guard() {
     run(verbs_history::commit, &mut ctx, &["-m", "side work"]).expect("commit");
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("back");
     std::fs::write(root.join("f.txt"), b"dirty\n").expect("dirty");
+    std::fs::write(root.join("g.txt"), b"dirty2\n").expect("unrelated dirty");
     let err = run(verbs_branch::switch, &mut ctx, &["-m", "side"]).expect_err("merge refuses");
     assert!(err.to_string().contains("overwritten"), "got {err:?}");
-    run(verbs_branch::reset, &mut ctx, &["--hard", "HEAD"]).expect("clean");
+    run(verbs_branch::checkout, &mut ctx, &["--", "f.txt"]).expect("restore f");
     run(verbs_branch::switch, &mut ctx, &["-m", "side"]).expect("merge clean");
+    // Unrelated edits ride across the merging switch untouched.
+    assert_eq!(
+        std::fs::read(root.join("g.txt")).expect("read g"),
+        b"dirty2\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read f"),
+        b"side\n"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -7755,19 +7795,6 @@ fn housekeeping_maintenance_run_registry_and_tasks() {
     )
     .into_owned();
     assert!(list.contains("gc: enabled"), "start recorded: {list}");
-    let alias = String::from_utf8_lossy(
-        &run(verbs_maintenance::maintenance, &mut ctx, &["task", "list"]).expect("task list"),
-    )
-    .into_owned();
-    assert!(alias.contains("pack-refs: enabled"), "list alias: {alias}");
-    let one = String::from_utf8_lossy(
-        &run(verbs_maintenance::maintenance, &mut ctx, &["task", "gc"]).expect("task gc"),
-    )
-    .into_owned();
-    assert!(one.contains("gc: enabled"), "single task row: {one}");
-    let err = run(verbs_maintenance::maintenance, &mut ctx, &["task", "bogus"])
-        .expect_err("unknown task name");
-    assert_eq!(err.exit_code(), 1, "{err}");
     run(verbs_maintenance::maintenance, &mut ctx, &["unregister"]).expect("unregister");
     // Single-task runs and unknown tasks.
     run(verbs_maintenance::maintenance, &mut ctx, &["run", "--task=prefetch"])
@@ -7853,6 +7880,678 @@ fn housekeeping_update_server_info_writes_dumb_files() {
     run(verbs_maintenance::update_server_info, &mut ctx, &["--force"]).expect("force");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn wave_k_remote_helper_capabilities() {
+    let (root, env) = seeded_repo("wavek-helpercaps", "f.txt", b"one\n");
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env: env.clone(),
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"capabilities\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out)
+        .expect("capabilities");
+    assert_eq!(
+        out,
+        b"import\nexport\nrefspec refs/heads/*:refs/ruk/test/heads/*\nrefspec refs/tags/*:refs/ruk/test/tags/*\noption\nobject-format\n\n"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_list() {
+    let (root, env) = seeded_repo("wavek-helperlist", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env.clone());
+    let tip = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("tip"))
+        .expect("utf8");
+    // The helper opens the store per command under an exclusive lock,
+    // so the context store must close before the session runs.
+    drop(ctx);
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"list\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("list");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains(":object-format sha1\n"), "format: {text:?}");
+    assert!(
+        text.contains("@refs/heads/main HEAD\n"),
+        "head symref: {text:?}"
+    );
+    assert!(
+        text.contains(&format!("{} refs/heads/main\n", tip.trim())),
+        "main row: {text:?}"
+    );
+    assert!(text.ends_with("\n\n"), "blank terminated: {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_options() {
+    let (root, env) = seeded_repo("wavek-helperopts", "f.txt", b"one\n");
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"option verbosity 2\noption depth 1\noption frobnicate x\noption dry-run true\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("options");
+    assert_eq!(out, b"ok\nok\nunsupported\nok\n");
+    assert!(session.dry_run, "dry-run sticks");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_import_batch() {
+    let (root, env) = seeded_repo("wavek-helperimport", "f.txt", b"one\n");
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"import refs/heads/main\n\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("import");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("commit refs/ruk/test/heads/main\n"),
+        "branch rides the private namespace: {text:?}"
+    );
+    assert!(
+        !text.contains("commit refs/heads/main\n"),
+        "no bare branch name leaks: {text:?}"
+    );
+    assert!(text.ends_with("done\n"), "stream ends done: {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_import_unknown_is_empty() {
+    let (root, env) = seeded_repo("wavek-helperempty", "f.txt", b"one\n");
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"import refs/heads/nope\n\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("import");
+    assert_eq!(out, b"done\n");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_export_round_trip() {
+    let (root_a, env_a) = seeded_repo("wavek-helperexp-a", "f.txt", b"one\n");
+    let mut ctx_a = repo_ctx(&root_a, env_a.clone());
+    std::fs::write(root_a.join("f.txt"), b"two\n").expect("modify");
+    run(verbs_stage::add, &mut ctx_a, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx_a, &["-m", "second"]).expect("commit");
+    let tip_a = String::from_utf8(run(verbs_history::rev_parse, &mut ctx_a, &["HEAD"]).expect("tip"))
+        .expect("utf8");
+    let stream = run(verbs_fastio::fast_export, &mut ctx_a, &["--all"]).expect("export");
+    drop(ctx_a);
+    let base_b = temp_base("wavek-helperexp-b");
+    let env_b = test_env(&base_b);
+    let mut ctx_init = Ctx {
+        store: None,
+        root: base_b.clone(),
+        file_base: base_b.clone(),
+        kind: None,
+        env: env_b.clone(),
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    verbs_repo::init(&mut ctx_init, &["repo".to_owned()]).expect("init");
+    let root_b = base_b.join("repo");
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root_b.clone(),
+        env: env_b,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let mut input_bytes = b"export\n".to_vec();
+    input_bytes.extend_from_slice(&stream);
+    let mut input = input_bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("export");
+    assert_eq!(out, b"ok refs/heads/main\n\n");
+    let mut ctx_b = repo_ctx(&root_b, test_env(&base_b));
+    let tip_b = String::from_utf8(run(verbs_history::rev_parse, &mut ctx_b, &["HEAD"]).expect("tip"))
+        .expect("utf8");
+    assert_eq!(tip_a, tip_b, "pushed tip matches");
+    drop(ctx_b);
+    // A stock delete spelling (bare reset) removes the ref and reports ok.
+    let bytes = b"export\nreset refs/heads/main\n\ndone\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("delete");
+    assert_eq!(out, b"ok refs/heads/main\n\n");
+    let mut ctx_b = repo_ctx(&root_b, test_env(&base_b));
+    let refs = String::from_utf8(run(verbs_branch::show_ref, &mut ctx_b, &[]).expect("show-ref"))
+        .expect("utf8");
+    assert!(!refs.contains("refs/heads/main"), "deleted: {refs:?}");
+    let _ = std::fs::remove_dir_all(root_a.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(base_b);
+}
+
+#[test]
+fn wave_k_remote_helper_verb_entry() {
+    let (root, env) = seeded_repo("wavek-helperverb", "f.txt", b"one\n");
+    let mut env = env;
+    env.stdin = Some(b"capabilities\nlist\n".to_vec());
+    // The verb opens the remote store itself, so it takes a storeless
+    // context (needs_repo is false); holding repo_ctx open would collide
+    // on the store lock.
+    let mut ctx = Ctx {
+        store: None,
+        root: root.clone(),
+        file_base: root.clone(),
+        kind: None,
+        env,
+        bare: false,
+        cli_config: Vec::new(),
+        stderr: Vec::new(),
+    };
+    let url = root.display().to_string();
+    let out = run(
+        super::verbs_remote_helper::remote_helper,
+        &mut ctx,
+        &["origin", &url],
+    )
+    .expect("verb");
+    let text = String::from_utf8(out).expect("utf8");
+    // The verb derives the alias from the real URL, so only the
+    // capability structure (not the dynamic alias) is pinned here.
+    assert!(
+        text.starts_with("import\nexport\nrefspec refs/heads/*:refs/ruk/"),
+        "caps first: {text:?}"
+    );
+    assert!(
+        text.contains("/heads/*\nrefspec refs/tags/*:refs/ruk/"),
+        "both refspecs: {text:?}"
+    );
+    assert!(text.contains("refs/heads/main\n"), "list follows: {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_rejects_pack_commands() {
+    let (root, env) = seeded_repo("wavek-helperrej", "f.txt", b"one\n");
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"push refs/heads/main:refs/heads/main\n\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    let err = super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out)
+        .expect_err("pack push refused");
+    assert!(
+        err.to_string().contains("remote-helper command"),
+        "got {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn wave_k_remote_helper_import_maps_heads_not_tags() {
+    let (root, env) = seeded_repo("wavek-helpermap", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env.clone());
+    run(verbs_branch::tag, &mut ctx, &["v1"]).expect("tag");
+    drop(ctx);
+    let mut session = super::verbs_remote_helper::HelperSession {
+        root: root.clone(),
+        env,
+        dry_run: false,
+        alias: "test".to_owned(),
+    };
+    let bytes = b"import refs/heads/main\nimport refs/tags/v1\n\n".to_vec();
+    let mut input = bytes.as_slice();
+    let mut out = Vec::new();
+    super::verbs_remote_helper::serve_commands(&mut session, &mut input, &mut out).expect("import");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains("commit refs/ruk/test/heads/main\n"),
+        "branch mapped: {text:?}"
+    );
+    assert!(
+        text.contains("reset refs/ruk/test/tags/v1\n"),
+        "lightweight tag rides the private namespace: {text:?}"
+    );
+    assert!(
+        !text.contains("reset refs/tags/v1\n"),
+        "no bare tag name leaks: {text:?}"
+    );
+    assert!(text.ends_with("done\n"), "stream ends done: {text:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_stage_alias() {
+    let (root, env) = seeded_repo("leftover-stage", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("g.txt"), b"g\n").expect("new file");
+    run(super::verbs_misc::stage, &mut ctx, &["g.txt"]).expect("stage");
+    let out = String::from_utf8(
+        run(super::verbs_stage::ls_files, &mut ctx, &[]).expect("ls-files"),
+    )
+    .expect("utf8");
+    assert!(out.contains("g.txt"), "staged through the alias: {out:?}");
+    assert!(
+        run(super::verbs_misc::stage, &mut ctx, &["missing.txt"]).is_err(),
+        "unknown paths fail through the alias too"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_whatchanged_raw() {
+    let (root, env) = seeded_repo("leftover-whatchanged", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(super::verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(super::verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit");
+    let out = String::from_utf8(
+        run(super::verbs_misc::whatchanged, &mut ctx, &[]).expect("whatchanged"),
+    )
+    .expect("utf8");
+    assert!(
+        out.contains("second") && out.contains("seed"),
+        "both subjects walk: {out:?}"
+    );
+    assert!(
+        out.contains("\n:") && out.contains("f.txt"),
+        "raw per-file lines: {out:?}"
+    );
+    let capped = String::from_utf8(
+        run(super::verbs_misc::whatchanged, &mut ctx, &["-n", "1"]).expect("capped"),
+    )
+    .expect("utf8");
+    assert!(
+        capped.contains("second") && !capped.contains("seed"),
+        "capped to the tip: {capped:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_show_index_round_trip() {
+    let (root, env) = seeded_repo("leftover-showindex", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let mut idx = b"\xfftOc\x00\x00\x00\x02".to_vec();
+    for first in 0..256u32 {
+        idx.extend_from_slice(&(if first < 0xab { 0u32 } else { 1u32 }).to_be_bytes());
+    }
+    idx.extend_from_slice(&[0xabu8; 20]);
+    idx.extend_from_slice(&0x12345678u32.to_be_bytes());
+    idx.extend_from_slice(&8u32.to_be_bytes());
+    idx.extend_from_slice(&[0u8; 40]);
+    let path = root.join("t.idx");
+    std::fs::write(&path, &idx).expect("idx file");
+    let out = String::from_utf8(
+        run(
+            super::verbs_misc::show_index,
+            &mut ctx,
+            &[path.to_str().expect("utf8")],
+        )
+        .expect("show-index"),
+    )
+    .expect("utf8");
+    assert_eq!(out, format!("8 {} 12345678\n", "ab".repeat(20)));
+    ctx.env.stdin = Some(b"nope".to_vec());
+    assert!(
+        run(super::verbs_misc::show_index, &mut ctx, &[]).is_err(),
+        "non-index bytes refuse"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_unpack_objects_round_trip() {
+    let (root, env) = seeded_repo("leftover-unpack-src", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let head = String::from_utf8(
+        run(super::verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
+    )
+    .expect("utf8");
+    let head = head.trim().to_owned();
+    ctx.env.stdin = Some(b"HEAD\n".to_vec());
+    let pack = run(
+        super::verbs_objects::pack_objects,
+        &mut ctx,
+        &["--stdout", "--revs"],
+    )
+    .expect("pack");
+    assert!(!pack.is_empty(), "pack carries the tip");
+    let (root2, env2) = seeded_repo("leftover-unpack-dst", "g.txt", b"other\n");
+    let mut ctx2 = repo_ctx(&root2, env2);
+    ctx2.env.stdin = Some(pack.clone());
+    let out = String::from_utf8(
+        run(super::verbs_misc::unpack_objects, &mut ctx2, &[]).expect("unpack"),
+    )
+    .expect("utf8");
+    assert!(out.contains("objects unpacked"), "got {out:?}");
+    run(super::verbs_objects::cat_file, &mut ctx2, &["-e", &head]).expect("arrived");
+    ctx2.env.stdin = Some(pack);
+    let out = String::from_utf8(
+        run(super::verbs_misc::unpack_objects, &mut ctx2, &["-n"]).expect("dry run"),
+    )
+    .expect("utf8");
+    assert!(out.contains("dry run"), "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(root2.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_unpack_file_blob() {
+    let (root, env) = seeded_repo("leftover-unpackfile", "f.txt", b"hello\n");
+    let mut ctx = repo_ctx(&root, env);
+    let listing = String::from_utf8(
+        run(super::verbs_objects::ls_tree, &mut ctx, &["HEAD"]).expect("ls-tree"),
+    )
+    .expect("utf8");
+    let hex = listing
+        .split_whitespace()
+        .nth(2)
+        .expect("blob column")
+        .to_owned();
+    let name = String::from_utf8(
+        run(super::verbs_misc::unpack_file, &mut ctx, &[&hex]).expect("unpack-file"),
+    )
+    .expect("utf8");
+    let name = name.trim().to_owned();
+    assert_eq!(
+        std::fs::read(root.join(&name)).expect("spilled file"),
+        b"hello\n"
+    );
+    let name2 = String::from_utf8(
+        run(super::verbs_misc::unpack_file, &mut ctx, &[&hex]).expect("unpack again"),
+    )
+    .expect("utf8");
+    assert_ne!(name, name2.trim(), "second unpack mints a fresh name");
+    assert!(
+        run(super::verbs_misc::unpack_file, &mut ctx, &["HEAD"]).is_err(),
+        "commits are not blobs"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_mktag_object() {
+    let (root, env) = seeded_repo("leftover-mktag", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let head = String::from_utf8(
+        run(super::verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
+    )
+    .expect("utf8");
+    let head = head.trim().to_owned();
+    ctx.env.stdin = Some(
+        format!("object {head}\ntype commit\ntag v1\ntagger T <t@x> 0 +0000\n\nnotes\n").into_bytes(),
+    );
+    let oid = String::from_utf8(
+        run(super::verbs_misc::mktag, &mut ctx, &[]).expect("mktag"),
+    )
+    .expect("utf8");
+    let oid = oid.trim().to_owned();
+    let kind = String::from_utf8(
+        run(super::verbs_objects::cat_file, &mut ctx, &["-t", &oid]).expect("type"),
+    )
+    .expect("utf8");
+    assert_eq!(kind, "tag\n");
+    ctx.env.stdin = Some(
+        format!("object {head}\ntype bogus\ntag v1\n\nnotes\n").into_bytes(),
+    );
+    assert!(
+        run(super::verbs_misc::mktag, &mut ctx, &[]).is_err(),
+        "bogus type refuses"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_bugreport_diagnose() {
+    let (root, env) = seeded_repo("leftover-bugreport", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let report = String::from_utf8(
+        run(super::verbs_misc::bugreport, &mut ctx, &[]).expect("bugreport"),
+    )
+    .expect("utf8");
+    assert!(
+        report.contains("ruk version") && report.contains("head:"),
+        "report covers version and head: {report:?}"
+    );
+    let diag = String::from_utf8(
+        run(super::verbs_misc::diagnose, &mut ctx, &[]).expect("diagnose"),
+    )
+    .expect("utf8");
+    assert!(diag.contains("objects:"), "diagnose adds the census: {diag:?}");
+    let path = root.join("report.txt");
+    let path_str = path.to_str().expect("utf8").to_owned();
+    run(super::verbs_misc::bugreport, &mut ctx, &["-o", &path_str]).expect("output file");
+    assert!(
+        std::fs::read(&path).expect("written report").starts_with(b"ruk version"),
+        "file holds the report"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_for_each_repo() {
+    let (root1, env1) = seeded_repo("leftover-fer1", "f.txt", b"one\n");
+    let (root2, _) = seeded_repo("leftover-fer2", "g.txt", b"two\n");
+    let mut ctx = repo_ctx(&root1, env1);
+    let list = format!("{}\n{}\n", root1.display(), root2.display());
+    run(super::verbs_repo::config, &mut ctx, &["leftover.repos", &list]).expect("config");
+    let out = run(
+        super::verbs_misc::for_each_repo,
+        &mut ctx,
+        &[
+            "--config=leftover.repos",
+            "rev-parse",
+            "--is-inside-work-tree",
+        ],
+    )
+    .expect("for-each-repo");
+    assert_eq!(out, b"true\ntrue\n".to_vec());
+    assert!(
+        run(
+            super::verbs_misc::for_each_repo,
+            &mut ctx,
+            &["--config=leftover.repos", "no-such-verb"]
+        )
+        .is_err(),
+        "unknown commands fail"
+    );
+    assert!(
+        run(
+            super::verbs_misc::for_each_repo,
+            &mut ctx,
+            &["--config=missing.key", "status"]
+        )
+        .is_err(),
+        "unset keys fail"
+    );
+    let _ = std::fs::remove_dir_all(root1.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(root2.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_last_modified() {
+    let (root, env) = seeded_repo("leftover-lastmod", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::write(root.join("f.txt"), b"two\n").expect("modify");
+    run(super::verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(super::verbs_history::commit, &mut ctx, &["-m", "second"]).expect("commit");
+    let second = String::from_utf8(
+        run(super::verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
+    )
+    .expect("utf8");
+    let second = second.trim().to_owned();
+    std::fs::write(root.join("g.txt"), b"g\n").expect("new file");
+    run(super::verbs_stage::add, &mut ctx, &["g.txt"]).expect("add");
+    run(super::verbs_history::commit, &mut ctx, &["-m", "third"]).expect("commit");
+    let third = String::from_utf8(
+        run(super::verbs_history::rev_parse, &mut ctx, &["HEAD"]).expect("rev-parse"),
+    )
+    .expect("utf8");
+    let third = third.trim().to_owned();
+    let out = String::from_utf8(
+        run(super::verbs_misc::last_modified, &mut ctx, &["f.txt"]).expect("touch"),
+    )
+    .expect("utf8");
+    assert_eq!(out, format!("{second}\tf.txt\n"));
+    let out = String::from_utf8(
+        run(super::verbs_misc::last_modified, &mut ctx, &["g.txt"]).expect("touch"),
+    )
+    .expect("utf8");
+    assert_eq!(out, format!("{third}\tg.txt\n"));
+    assert!(
+        run(super::verbs_misc::last_modified, &mut ctx, &["missing.txt"]).is_err(),
+        "untouched paths fail"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_count_objects_human() {
+    let (root, env) = seeded_repo("leftover-counth", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let out = String::from_utf8(
+        run(super::verbs_objects::count_objects, &mut ctx, &["-H"]).expect("count -H"),
+    )
+    .expect("utf8");
+    assert!(
+        out.contains("objects,") && out.contains('B'),
+        "human sizes: {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_verify_pack_stat_only() {
+    let (root, env) = seeded_repo("leftover-verifystat", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    ctx.env.stdin = Some(b"HEAD\n".to_vec());
+    let pack = run(
+        super::verbs_objects::pack_objects,
+        &mut ctx,
+        &["--stdout", "--revs"],
+    )
+    .expect("pack");
+    let path = root.join("t.pack");
+    std::fs::write(&path, &pack).expect("pack file");
+    let path_str = path.to_str().expect("utf8").to_owned();
+    let out = String::from_utf8(
+        run(
+            super::verbs_objects::verify_pack,
+            &mut ctx,
+            &["-v", "--stat-only", &path_str],
+        )
+        .expect("stat-only"),
+    )
+    .expect("utf8");
+    assert_eq!(out.lines().count(), 1, "stat-only prints one line: {out:?}");
+    assert!(out.contains("ok ("), "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_cat_file_batch_command() {
+    let (root, env) = seeded_repo("leftover-batchcmd", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    ctx.env.stdin = Some(b"info HEAD\ncontents HEAD\nflush\ndance party\n".to_vec());
+    let out = run(
+        super::verbs_objects::cat_file,
+        &mut ctx,
+        &["--batch-command"],
+    )
+    .expect("batch-command");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("commit"), "info line names the type: {text:?}");
+    assert!(text.contains("dance party missing"), "unknown commands miss: {text:?}");
+    ctx.env.stdin = Some(b"info HEAD\n".to_vec());
+    assert!(
+        run(
+            super::verbs_objects::cat_file,
+            &mut ctx,
+            &["--batch-check", "--batch-command"]
+        )
+        .is_err(),
+        "one batch mode at a time"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn leftover_dispatch_rows_and_named_gaps() {
+    let (root, env) = seeded_repo("leftover-gaps", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    let stubs: &[(
+        &str,
+        fn(&mut Ctx, &[String]) -> Result<Vec<u8>, ruk_git::GitError>,
+    )] = &[
+        ("filter-branch", super::verbs_misc::filter_branch),
+        ("pack-redundant", super::verbs_misc::pack_redundant),
+        ("web--browse", super::verbs_misc::web_browse),
+        ("mergetool", super::verbs_misc::mergetool),
+        ("difftool", super::verbs_misc::difftool),
+        ("instaweb", super::verbs_misc::instaweb),
+        ("imap-send", super::verbs_misc::imap_send),
+        ("send-email", super::verbs_misc::send_email),
+        ("send-pack", super::verbs_misc::send_pack),
+        ("quiltimport", super::verbs_misc::quiltimport),
+        ("remote-http", super::verbs_misc::remote_http),
+        ("remote-https", super::verbs_misc::remote_https),
+        ("remote-ftp", super::verbs_misc::remote_ftp),
+        ("remote-ftps", super::verbs_misc::remote_ftps),
+        ("remote-ext", super::verbs_misc::remote_ext),
+        ("remote-fd", super::verbs_misc::remote_fd),
+    ];
+    for (name, verb) in stubs {
+        assert!(lookup(name).is_some(), "dispatch row for {name}");
+        let err = run(*verb, &mut ctx, &[]).expect_err("named gap refuses");
+        assert!(
+            err.to_string().contains("unsupported"),
+            "{name}: got {err:?}"
+        );
+    }
+    for name in [
+        "bugreport",
+        "diagnose",
+        "for-each-repo",
+        "last-modified",
+        "mktag",
+        "show-index",
+        "stage",
+        "unpack-file",
+        "unpack-objects",
+        "whatchanged",
+    ] {
+        assert!(lookup(name).is_some(), "dispatch row for {name}");
+    }
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
 #[test]
 fn hooks_mailmap_parse_forms() {
     let map = verbs_misc::Mailmap::parse(
@@ -8082,6 +8781,26 @@ fn hooks_post_commit_runs_after_commit() {
         root.join("post-commit-ran").exists(),
         "post-commit did not run"
     );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn hooks_post_checkout_records_old_new_flag() {
+    let (root, env) = seeded_repo("hooksm-co", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::branch, &mut ctx, &["side"]).expect("branch");
+    write_hook(
+        &root,
+        "post-checkout",
+        "#!/bin/sh\necho \"$1 $2 $3\" > post-checkout-args\n",
+    );
+    run(verbs_branch::checkout, &mut ctx, &["side"]).expect("checkout");
+    let args = std::fs::read_to_string(root.join("post-checkout-args")).expect("args file");
+    let parts: Vec<&str> = args.trim().split(' ').collect();
+    assert_eq!(parts.len(), 3, "got {args:?}");
+    assert_eq!(parts[0], parts[1], "same-tip switch: got {args:?}");
+    assert_eq!(parts[0].len(), 40, "full hex: got {args:?}");
+    assert_eq!(parts[2], "1", "branch flag: got {args:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 

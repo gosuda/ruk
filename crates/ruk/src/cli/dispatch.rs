@@ -1,4 +1,4 @@
-//! Verb table: the 100 advertised names and their handlers.
+//! Verb table: the 94 advertised names and their handlers.
 //!
 //! The shape mirrors `git.c:commands[]`: one row per verb with its oracle
 //! anchor, whether it needs a repository, a one-line summary, and the entry
@@ -21,6 +21,7 @@ use super::verbs_misc;
 use super::verbs_notes;
 use super::verbs_objects;
 use super::verbs_patch;
+use super::verbs_remote_helper;
 use super::verbs_repo;
 use super::verbs_sparse;
 use super::verbs_stage;
@@ -43,7 +44,7 @@ pub(crate) struct Verb {
     pub(crate) run: fn(&mut Ctx, &[String]) -> Result<Vec<u8>, GitError>,
 }
 
-/// The 101 advertised verbs in alphabetical order.
+/// The 94 advertised verbs in alphabetical order.
 pub(crate) static VERBS: &[Verb] = &[
     Verb {
         name: "add",
@@ -107,6 +108,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Move objects and refs by archive",
         run: verbs_bundle::bundle,
+    },
+    Verb {
+        name: "bugreport",
+        oracle: "git/builtin/bugreport.c",
+        needs_repo: false,
+        summary: "Collect information for a bug report",
+        run: verbs_misc::bugreport,
     },
     Verb {
         name: "cat-file",
@@ -235,6 +243,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_misc::describe,
     },
     Verb {
+        name: "diagnose",
+        oracle: "git/builtin/diagnose.c",
+        needs_repo: false,
+        summary: "Collect diagnostics for the repository",
+        run: verbs_misc::diagnose,
+    },
+    Verb {
         name: "diff",
         oracle: "git/builtin/diff.c",
         // Repository discovery stays mandatory (the open store backs every
@@ -242,6 +257,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Show changes between commits, commit and working tree, etc",
         run: verbs_history::diff,
+    },
+    Verb {
+        name: "difftool",
+        oracle: "git/builtin/difftool.c",
+        needs_repo: true,
+        summary: "Open diffs in a viewer (unavailable)",
+        run: verbs_misc::difftool,
     },
     Verb {
         name: "fast-export",
@@ -265,6 +287,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_transport::fetch,
     },
     Verb {
+        name: "filter-branch",
+        oracle: "git/git-filter-branch.sh",
+        needs_repo: true,
+        summary: "Rewrite history (deprecated upstream)",
+        run: verbs_misc::filter_branch,
+    },
+    Verb {
         name: "fmt-merge-msg",
         oracle: "git/builtin/fmt-merge-msg.c",
         needs_repo: true,
@@ -277,6 +306,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Output information on each ref",
         run: verbs_branch::for_each_ref,
+    },
+    Verb {
+        name: "for-each-repo",
+        oracle: "git/builtin/for-each-repo.c",
+        needs_repo: false,
+        summary: "Run a command in each listed repository",
+        run: verbs_misc::for_each_repo,
     },
     Verb {
         name: "format-patch",
@@ -335,11 +371,25 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_objects::index_pack,
     },
     Verb {
+        name: "imap-send",
+        oracle: "git/builtin/imap-send.c",
+        needs_repo: false,
+        summary: "Send patches via IMAP (unavailable)",
+        run: verbs_misc::imap_send,
+    },
+    Verb {
         name: "init",
         oracle: "git/builtin/init-db.c",
         needs_repo: false,
         summary: "Create an empty Ruk repository",
         run: verbs_repo::init,
+    },
+    Verb {
+        name: "instaweb",
+        oracle: "git/git-instaweb.sh",
+        needs_repo: true,
+        summary: "Serve the repository on the web (unavailable)",
+        run: verbs_misc::instaweb,
     },
     Verb {
         name: "interpret-trailers",
@@ -377,6 +427,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_objects::ls_tree,
     },
     Verb {
+        name: "last-modified",
+        oracle: "git/builtin/last-modified.c",
+        needs_repo: true,
+        summary: "Show the commit that last touched each path",
+        run: verbs_misc::last_modified,
+    },
+    Verb {
         name: "maintenance",
         oracle: "git/builtin/maintenance.c",
         needs_repo: true,
@@ -412,11 +469,25 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_merge_plumbing::merge_tree,
     },
     Verb {
+        name: "mergetool",
+        oracle: "git/git-mergetool.sh",
+        needs_repo: true,
+        summary: "Resolve conflicts with a tool (unavailable)",
+        run: verbs_misc::mergetool,
+    },
+    Verb {
         name: "migrate",
         oracle: "git/builtin/init-db.c",
         needs_repo: false,
         summary: "Import an existing Git repository into a .ruk store",
         run: verbs_repo::migrate,
+    },
+    Verb {
+        name: "mktag",
+        oracle: "git/builtin/mktag.c",
+        needs_repo: true,
+        summary: "Create a tag object from standard input",
+        run: verbs_misc::mktag,
     },
     Verb {
         name: "mktree",
@@ -454,6 +525,13 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_objects::pack_objects,
     },
     Verb {
+        name: "pack-redundant",
+        oracle: "git/builtin/pack-redundant.c",
+        needs_repo: true,
+        summary: "Find redundant pack files (unavailable)",
+        run: verbs_misc::pack_redundant,
+    },
+    Verb {
         name: "pack-refs",
         oracle: "git/builtin/pack-refs.c",
         needs_repo: true,
@@ -480,6 +558,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Update remote refs along with associated objects",
         run: verbs_transport::push,
+    },
+    Verb {
+        name: "quiltimport",
+        oracle: "git/git-quiltimport.sh",
+        needs_repo: true,
+        summary: "Import a quilt series (unavailable)",
+        run: verbs_misc::quiltimport,
     },
     Verb {
         name: "range-diff",
@@ -522,6 +607,55 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Manage the set of tracked repositories",
         run: verbs_repo::remote,
+    },
+    Verb {
+        name: "remote-ext",
+        oracle: "git/builtin/remote-ext.c",
+        needs_repo: false,
+        summary: "Subprocess remote transport (unavailable)",
+        run: verbs_misc::remote_ext,
+    },
+    Verb {
+        name: "remote-fd",
+        oracle: "git/builtin/remote-fd.c",
+        needs_repo: false,
+        summary: "File-descriptor remote helper (unavailable)",
+        run: verbs_misc::remote_fd,
+    },
+    Verb {
+        name: "remote-ftp",
+        oracle: "git/remote-curl.c",
+        needs_repo: false,
+        summary: "FTP remote transport (unavailable)",
+        run: verbs_misc::remote_ftp,
+    },
+    Verb {
+        name: "remote-ftps",
+        oracle: "git/remote-curl.c",
+        needs_repo: false,
+        summary: "FTPS remote transport (unavailable)",
+        run: verbs_misc::remote_ftps,
+    },
+    Verb {
+        name: "remote-helper",
+        oracle: "git/Documentation/gitremote-helpers.adoc",
+        needs_repo: false,
+        summary: "Run the git-remote-ruk transport helper session",
+        run: verbs_remote_helper::remote_helper,
+    },
+    Verb {
+        name: "remote-http",
+        oracle: "git/remote-curl.c",
+        needs_repo: false,
+        summary: "HTTP remote transport (unavailable)",
+        run: verbs_misc::remote_http,
+    },
+    Verb {
+        name: "remote-https",
+        oracle: "git/remote-curl.c",
+        needs_repo: false,
+        summary: "HTTPS remote transport (unavailable)",
+        run: verbs_misc::remote_https,
     },
     Verb {
         name: "repack",
@@ -594,11 +728,32 @@ pub(crate) static VERBS: &[Verb] = &[
         run: verbs_stage::rm,
     },
     Verb {
+        name: "send-email",
+        oracle: "git/git-send-email.pl",
+        needs_repo: false,
+        summary: "Send patches by mail (unavailable)",
+        run: verbs_misc::send_email,
+    },
+    Verb {
+        name: "send-pack",
+        oracle: "git/builtin/send-pack.c",
+        needs_repo: true,
+        summary: "Push objects to a peer (unavailable)",
+        run: verbs_misc::send_pack,
+    },
+    Verb {
         name: "show",
         oracle: "git/builtin/log.c (cmd_show)",
         needs_repo: true,
         summary: "Show various types of objects",
         run: verbs_history::show,
+    },
+    Verb {
+        name: "show-index",
+        oracle: "git/builtin/show-index.c",
+        needs_repo: false,
+        summary: "List objects named by a pack index",
+        run: verbs_misc::show_index,
     },
     Verb {
         name: "shortlog",
@@ -620,6 +775,13 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Initialize and modify the sparse-checkout",
         run: verbs_sparse::sparse_checkout,
+    },
+    Verb {
+        name: "stage",
+        oracle: "git/builtin/add.c",
+        needs_repo: true,
+        summary: "Add file contents to the index (alias of add)",
+        run: verbs_misc::stage,
     },
     Verb {
         name: "stash",
@@ -669,6 +831,20 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: true,
         summary: "Create, list, delete or verify a tag object",
         run: verbs_branch::tag,
+    },
+    Verb {
+        name: "unpack-file",
+        oracle: "git/builtin/unpack-file.c",
+        needs_repo: true,
+        summary: "Write a blob to a file and print its name",
+        run: verbs_misc::unpack_file,
+    },
+    Verb {
+        name: "unpack-objects",
+        oracle: "git/builtin/unpack-objects.c",
+        needs_repo: true,
+        summary: "Unpack objects from a pack stream",
+        run: verbs_misc::unpack_objects,
     },
     Verb {
         name: "update-index",
@@ -739,6 +915,20 @@ pub(crate) static VERBS: &[Verb] = &[
         needs_repo: false,
         summary: "Display version information",
         run: verbs_meta::version,
+    },
+    Verb {
+        name: "web--browse",
+        oracle: "git/git-web--browse.sh",
+        needs_repo: false,
+        summary: "Open a URL in a browser (unavailable)",
+        run: verbs_misc::web_browse,
+    },
+    Verb {
+        name: "whatchanged",
+        oracle: "git/builtin/log.c (cmd_whatchanged)",
+        needs_repo: true,
+        summary: "Show commits with raw file lines, skipping merges",
+        run: verbs_misc::whatchanged,
     },
     Verb {
         name: "worktree",

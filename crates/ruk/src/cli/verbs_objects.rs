@@ -5,12 +5,12 @@
 //! | verb | backing | status |
 //! | --- | --- | --- |
 //! | `hash-object` | `HashKind::hash_git_object` + optional store write | implemented |
-//! | `cat-file` | bounded transport object read | implemented (`-p`, `-t`, `-s`, `-e`, `--batch-check [--batch-all-objects]`) |
+//! | `cat-file` | bounded transport object read | implemented (`-p`, `-t`, `-s`, `-e`, `--batch-check [--batch-all-objects]`, `--batch-command` with `info`/`contents`/`flush`) |
 //! | `mktree` | canonical tree build + publish | implemented |
 //! | `commit-tree` | canonical commit payload + publish | implemented |
 //! | `write-tree` | index tree build | implemented |
-//! | `verify-pack` | pack ingest in verify mode, staged output dropped | implemented |
-//! | `count-objects` | `Store::iter_objects` census, no payload I/O | implemented (`<n> objects, <bytes>`) |
+//! | `verify-pack` | pack ingest in verify mode, staged output dropped | implemented (`-v`, `--stat-only` forces the summary line) |
+//! | `count-objects` | `Store::iter_objects` census, no payload I/O | implemented (`<n> objects, <bytes>`, `-H` renders human sizes) |
 //! | `ls-tree` | tree parse/flatten | implemented (`-r`, `--name-only`) |
 //! | `check-ref-format` | `RefName` validation | implemented |
 //! | `index-pack` | ingest plus publication with commit-record facts (no `.idx`: the store keeps no loose/pack split) | implemented (`-v`, `--stdin`) |
@@ -215,6 +215,11 @@ pub(crate) fn cat_file(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "batch-command",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
     let store = ctx.store()?;
@@ -224,8 +229,16 @@ pub(crate) fn cat_file(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             detail: "cat-file --batch-all-objects requires --batch-check".to_owned(),
         });
     }
+    if opts.is_set("batch-check") && opts.is_set("batch-command") {
+        return Err(GitError::Invalid {
+            detail: "cat-file takes one batch mode: --batch-check or --batch-command".to_owned(),
+        });
+    }
     if opts.is_set("batch-check") {
         return batch_check(ctx, &opts);
+    }
+    if opts.is_set("batch-command") {
+        return batch_command(ctx);
     }
     let [rev] = opts.positionals.as_slice() else {
         return Err(GitError::Invalid {
@@ -318,6 +331,69 @@ fn batch_check(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
                 )
                 .as_bytes(),
             ),
+            Err(GitError::NotFound { .. }) => {
+                out.extend_from_slice(format!("{} missing\n", oid.to_hex()).as_bytes());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(out)
+}
+
+/// Answers `info`/`contents` commands from standard input, one per line.
+///
+/// Oracle: `git/builtin/cat-file.c` (`batch_command`). `info <rev>`
+/// prints `<oid> <type> <size>`; `contents <rev>` prints that info line
+/// followed by the raw bytes and a newline; `flush` is an accepted no-op.
+/// Unknown revisions report `<rev> missing`, and unknown commands report
+/// the whole line `missing`, so one bad line never aborts the batch.
+fn batch_command(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let stdin = super::read_stdin_text(&ctx.env)?;
+    let mut out = Vec::new();
+    for input in stdin.lines() {
+        let text_line = input.trim();
+        if text_line.is_empty() {
+            continue;
+        }
+        if text_line == "flush" {
+            continue;
+        }
+        let Some((command, rest)) = text_line.split_once(char::is_whitespace) else {
+            out.extend_from_slice(format!("{text_line} missing\n").as_bytes());
+            continue;
+        };
+        let rev = rest.trim();
+        if command != "info" && command != "contents" || rev.is_empty() {
+            out.extend_from_slice(format!("{text_line} missing\n").as_bytes());
+            continue;
+        }
+        let oid = super::state::resolve_rev(store, kind, rev)
+            .or_else(|_| ruk_git::parse_oid_for(rev, kind));
+        let oid = match oid {
+            Err(_) => {
+                out.extend_from_slice(format!("{rev} missing\n").as_bytes());
+                continue;
+            }
+            Ok(oid) => oid,
+        };
+        match read_object_bytes(store, oid) {
+            Ok((object_kind, body)) => {
+                out.extend_from_slice(
+                    format!(
+                        "{} {} {}\n",
+                        oid.to_hex(),
+                        kind_name_of(object_kind),
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                if command == "contents" {
+                    out.extend_from_slice(&body);
+                    out.push(b'\n');
+                }
+            }
             Err(GitError::NotFound { .. }) => {
                 out.extend_from_slice(format!("{} missing\n", oid.to_hex()).as_bytes());
             }
@@ -505,17 +581,24 @@ pub(crate) fn write_tree(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
 /// Oracle: `git/builtin/verify-pack.c`. Staged objects are dropped: no
 /// repository state changes, so this stays verification, not import.
 pub(crate) fn verify_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [FlagSpec {
-        long: "verbose",
-        short: Some('v'),
-        takes_value: false,
-    }];
+    let specs = [
+        FlagSpec {
+            long: "verbose",
+            short: Some('v'),
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "stat-only",
+            short: None,
+            takes_value: false,
+        },
+    ];
     let opts = collect(args, &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let [path] = opts.positionals.as_slice() else {
         return Err(GitError::Invalid {
-            detail: "usage: verify-pack [-v] <pack>".to_owned(),
+            detail: "usage: verify-pack [-v] [--stat-only] <pack>".to_owned(),
         });
     };
     let file = std::fs::File::open(path).map_err(|err| GitError::Io {
@@ -529,7 +612,7 @@ pub(crate) fn verify_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
         &ruk_git::transport::Interrupt::none(),
     )?;
     let mut out = Vec::new();
-    if opts.is_set("verbose") {
+    if opts.is_set("verbose") && !opts.is_set("stat-only") {
         for object in staged.objects() {
             out.extend_from_slice(
                 format!(
@@ -555,10 +638,15 @@ pub(crate) fn verify_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Git
 ///
 /// Oracle: `git/builtin/count-objects.c`.
 pub(crate) fn count_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let opts = collect(args, &[])?;
+    let specs = [FlagSpec {
+        long: "human-readable",
+        short: Some('H'),
+        takes_value: false,
+    }];
+    let opts = collect(args, &specs)?;
     if !opts.positionals.is_empty() {
         return Err(GitError::Invalid {
-            detail: "usage: count-objects".to_owned(),
+            detail: "usage: count-objects [-H]".to_owned(),
         });
     }
     let store = ctx.store()?;
@@ -568,7 +656,29 @@ pub(crate) fn count_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
         count = count.saturating_add(1);
         bytes = bytes.saturating_add(len);
     }
-    Ok(line(format!("{count} objects, {bytes} bytes").into_bytes()))
+    let size = if opts.is_set("human-readable") {
+        human_bytes(bytes)
+    } else {
+        format!("{bytes} bytes")
+    };
+    Ok(line(format!("{count} objects, {size}").into_bytes()))
+}
+
+/// Renders a byte count the way `count-objects -H` does: exact bytes
+/// below one kibibyte, one-decimal binary units above.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Lists tree contents, flat or recursive.
