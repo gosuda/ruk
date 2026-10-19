@@ -3728,7 +3728,9 @@ fn refuse_index_overlap(
     let entry_matches = |rows: &[(Vec<u8>, TreeMode, Oid)], path: &[u8], row: &IndexEntry| {
         rows.iter().any(|(known, mode, oid)| {
             known.as_slice() == path
-                && mode.as_index_mode().is_ok_and(|index_mode| index_mode == row.mode())
+                && mode
+                    .as_index_mode()
+                    .is_ok_and(|index_mode| index_mode == row.mode())
                 && *oid == row.oid()
         })
     };
@@ -3769,7 +3771,8 @@ fn stash_recorded_is_base(stashed: &[(Stage, IndexEntry)], base: Option<(TreeMod
     match (stashed, base) {
         ([], None) => true,
         ([(Stage::Zero, row)], Some((mode, oid))) => {
-            mode.as_index_mode().is_ok_and(|index_mode| index_mode == row.mode())
+            mode.as_index_mode()
+                .is_ok_and(|index_mode| index_mode == row.mode())
                 && oid == row.oid()
         }
         _ => false,
@@ -3853,7 +3856,10 @@ fn checkout_stash_files(
     let mut wanted: std::collections::BTreeMap<Vec<u8>, (TreeMode, Oid)> =
         std::collections::BTreeMap::new();
     for (path, mode, oid) in wip {
-        if touched.iter().any(|known| known.as_slice() == path.as_slice()) {
+        if touched
+            .iter()
+            .any(|known| known.as_slice() == path.as_slice())
+        {
             wanted.insert(path.clone(), (*mode, *oid));
         }
     }

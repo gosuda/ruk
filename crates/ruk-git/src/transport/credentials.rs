@@ -400,10 +400,7 @@ fn helper_commands(url: &str) -> Vec<(String, Vec<String>)> {
 
 /// The [`helper_commands`] chain resolved against an explicit environment
 /// map, so environment-carrying callers stay hermetic under test.
-fn helper_commands_in(
-    url: &str,
-    vars: &HashMap<String, String>,
-) -> Vec<(String, Vec<String>)> {
+fn helper_commands_in(url: &str, vars: &HashMap<String, String>) -> Vec<(String, Vec<String>)> {
     let mut entries = Vec::new();
     for path in config_paths_in(vars) {
         let Ok(bytes) = std::fs::read(&path) else {
@@ -1055,7 +1052,10 @@ mod tests {
         // An empty global still pins discovery to it, skipping home files.
         let env = vars(&[("GIT_CONFIG_GLOBAL", "")]);
         assert_eq!(config_paths_in(&env), vec![PathBuf::from("/etc/gitconfig")]);
-        let env = vars(&[("GIT_CONFIG_NOSYSTEM", "1"), ("HOME", "/tmp/cred-test-home")]);
+        let env = vars(&[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("HOME", "/tmp/cred-test-home"),
+        ]);
         assert_eq!(
             config_paths_in(&env),
             vec![
@@ -1137,11 +1137,9 @@ mod tests {
         );
         // A helper answer without a username is no answer.
         assert_eq!(
-            credential_fill_desc_with(
-                &desc,
-                &[external_helper("/bin/helper")],
-                |_, _, _, _| Some(b"password=orphan\n".to_vec())
-            ),
+            credential_fill_desc_with(&desc, &[external_helper("/bin/helper")], |_, _, _, _| Some(
+                b"password=orphan\n".to_vec()
+            )),
             None
         );
     }
@@ -1155,7 +1153,9 @@ mod tests {
             "store",
             &[external_helper("/bin/a"), external_helper("/bin/b")],
             |program, _, op, _| {
-                seen.lock().expect("seen").push((program.to_owned(), op.to_owned()));
+                seen.lock()
+                    .expect("seen")
+                    .push((program.to_owned(), op.to_owned()));
                 None
             },
         );

@@ -2126,13 +2126,13 @@ fn credential_fill_approve_reject_round_trip() {
     // Helper config files resolve against the captured environment only:
     // pointing the chain at the temp config touches no process state, so
     // parallel tests stay isolated.
-    ctx.env.vars.insert(
-        "GIT_CONFIG_NOSYSTEM".to_owned(),
-        "1".to_owned(),
-    );
     ctx.env
         .vars
-        .insert("GIT_CONFIG_GLOBAL".to_owned(), config.to_string_lossy().into_owned());
+        .insert("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned());
+    ctx.env.vars.insert(
+        "GIT_CONFIG_GLOBAL".to_owned(),
+        config.to_string_lossy().into_owned(),
+    );
     let desc =
         b"url=https://cred-test.invalid/x\nprotocol=https\nhost=cred-test.invalid\n\n".to_vec();
     ctx.env.stdin = Some(desc.clone());
@@ -3652,26 +3652,29 @@ fn cherry_pick_skip_drops_stopped_pick_cleanly() {
     run(verbs_stage::add, &mut ctx, &["a.txt", "p1.txt"]).expect("add");
     run(verbs_history::commit, &mut ctx, &["-m", "pick P1"]).expect("commit");
     lane_commit(&mut ctx, &root, "p2.txt", b"p2\n", "pick P2");
-    let p1 = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["side~1"]).expect("p1"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
-    let p2 = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("p2"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let p1 = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["side~1"]).expect("p1"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
+    let p2 = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("p2"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "a.txt", b"main a\n", "main side");
-    run(verbs_history::cherry_pick, &mut ctx, &[p1.as_str(), p2.as_str()])
-        .expect_err("conflict");
+    run(
+        verbs_history::cherry_pick,
+        &mut ctx,
+        &[p1.as_str(), p2.as_str()],
+    )
+    .expect_err("conflict");
     assert_eq!(index_stages(&mut ctx, "a.txt"), vec![1, 2, 3]);
     assert_eq!(index_stages(&mut ctx, "p1.txt"), vec![0]);
     run(verbs_history::cherry_pick, &mut ctx, &["--skip"]).expect("skip");
-    assert_eq!(std::fs::read(root.join("a.txt")).expect("read"), b"main a\n");
+    assert_eq!(
+        std::fs::read(root.join("a.txt")).expect("read"),
+        b"main a\n"
+    );
     assert_eq!(std::fs::read(root.join("p2.txt")).expect("read"), b"p2\n");
     assert!(!root.join("p1.txt").exists());
     assert!(index_stages(&mut ctx, "p1.txt").is_empty());
@@ -3697,22 +3700,26 @@ fn cherry_pick_continue_concludes_after_resolve() {
     lane_commit(&mut ctx, &root, "f.txt", b"a\nX\nc\n", "side change");
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "f.txt", b"a\nY\nc\n", "main change");
-    let oid = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("oid"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let oid = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("oid"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
     run(verbs_history::cherry_pick, &mut ctx, &[oid.as_str()]).expect_err("conflict");
     std::fs::write(root.join("f.txt"), b"a\nZ\nc\n").expect("resolve");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     run(verbs_history::cherry_pick, &mut ctx, &["--continue"]).expect("continue");
-    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"a\nZ\nc\n");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"a\nZ\nc\n"
+    );
     let store = ctx.store().expect("store");
     let head = super::state::head_oid(store).expect("head");
-    let message =
-        String::from_utf8_lossy(super::state::commit_record(store, head).expect("record").message())
-            .into_owned();
+    let message = String::from_utf8_lossy(
+        super::state::commit_record(store, head)
+            .expect("record")
+            .message(),
+    )
+    .into_owned();
     assert_eq!(message, "side change\n");
     assert!(
         super::state::pseudo_read(store, "CHERRY_PICK_HEAD")
@@ -3730,15 +3737,16 @@ fn cherry_pick_abort_restores_pre_pick_state() {
     lane_commit(&mut ctx, &root, "f.txt", b"a\nX\nc\n", "side change");
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "f.txt", b"a\nY\nc\n", "main change");
-    let oid = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("oid"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let oid = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("oid"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
     run(verbs_history::cherry_pick, &mut ctx, &[oid.as_str()]).expect_err("conflict");
     run(verbs_history::cherry_pick, &mut ctx, &["--abort"]).expect("abort");
-    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"a\nY\nc\n");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"a\nY\nc\n"
+    );
     assert_eq!(index_stages(&mut ctx, "f.txt"), vec![0]);
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -3749,25 +3757,24 @@ fn rebase_conflict_abort_restores_branch() {
     let mut ctx = repo_ctx(&root, env);
     run(verbs_branch::checkout, &mut ctx, &["-b", "side"]).expect("checkout -b");
     lane_commit(&mut ctx, &root, "base.txt", b"side\n", "side work");
-    let orig = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("orig"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let orig = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("orig"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     lane_commit(&mut ctx, &root, "base.txt", b"main\n", "main work");
     run(verbs_branch::checkout, &mut ctx, &["side"]).expect("checkout side");
     run(verbs_history::rebase, &mut ctx, &["main"]).expect_err("conflict");
     run(verbs_history::rebase, &mut ctx, &["--abort"]).expect("abort");
-    let tip = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("tip"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let tip = String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["side"]).expect("tip"))
+        .expect("utf8")
+        .trim()
+        .to_owned();
     assert_eq!(tip, orig);
-    assert_eq!(std::fs::read(root.join("base.txt")).expect("read"), b"side\n");
+    assert_eq!(
+        std::fs::read(root.join("base.txt")).expect("read"),
+        b"side\n"
+    );
     assert_eq!(index_stages(&mut ctx, "base.txt"), vec![0]);
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -3795,8 +3802,14 @@ fn rebase_conflict_continue_replays() {
         String::from_utf8_lossy(&out).contains("Successfully rebased"),
         "got {out:?}"
     );
-    assert_eq!(std::fs::read(root.join("other.txt")).expect("read"), b"both\n");
-    assert_eq!(std::fs::read(root.join("base.txt")).expect("read"), b"side\n");
+    assert_eq!(
+        std::fs::read(root.join("other.txt")).expect("read"),
+        b"both\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("base.txt")).expect("read"),
+        b"side\n"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -3806,16 +3819,18 @@ fn revert_conflict_abort_restores() {
     let mut ctx = repo_ctx(&root, env);
     lane_commit(&mut ctx, &root, "f.txt", b"one\ntwo\n", "add two");
     lane_commit(&mut ctx, &root, "f.txt", b"one\nTWO\n", "change two");
-    let middle = String::from_utf8(
-        run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("middle"),
-    )
-    .expect("utf8")
-    .trim()
-    .to_owned();
+    let middle =
+        String::from_utf8(run(verbs_history::rev_parse, &mut ctx, &["HEAD~1"]).expect("middle"))
+            .expect("utf8")
+            .trim()
+            .to_owned();
     run(verbs_history::revert, &mut ctx, &[middle.as_str()]).expect_err("conflict");
     assert_eq!(index_stages(&mut ctx, "f.txt"), vec![1, 2, 3]);
     run(verbs_history::revert, &mut ctx, &["--abort"]).expect("abort");
-    assert_eq!(std::fs::read(root.join("f.txt")).expect("read"), b"one\nTWO\n");
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).expect("read"),
+        b"one\nTWO\n"
+    );
     assert_eq!(index_stages(&mut ctx, "f.txt"), vec![0]);
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -3829,7 +3844,10 @@ fn merge_fast_forward_keeps_untracked() {
     run(verbs_branch::checkout, &mut ctx, &["main"]).expect("checkout main");
     std::fs::write(root.join("untracked.txt"), b"keep me\n").expect("untracked");
     let out = run(verbs_history::merge, &mut ctx, &["feature"]).expect("merge");
-    assert!(String::from_utf8_lossy(&out).contains("Fast-forward"), "got {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out).contains("Fast-forward"),
+        "got {out:?}"
+    );
     assert!(root.join("next.txt").exists());
     assert_eq!(
         std::fs::read(root.join("untracked.txt")).expect("read"),

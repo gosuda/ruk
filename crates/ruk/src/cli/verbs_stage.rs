@@ -859,9 +859,14 @@ pub(crate) fn status_plan_with_mode(
     // Worktree renames pair only under `-M`: the default plan keeps the
     // oracle's delete-plus-untracked output.
     let renames_unstaged = match mode {
-        super::rename::RenameMode::Similar(threshold) => {
-            pair_unstaged_renames(store, &index_merged, &blobs, &mut unstaged, &mut untracked, threshold)?
-        }
+        super::rename::RenameMode::Similar(threshold) => pair_unstaged_renames(
+            store,
+            &index_merged,
+            &blobs,
+            &mut unstaged,
+            &mut untracked,
+            threshold,
+        )?,
         super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => Vec::new(),
     };
     let mut unmerged_paths_sorted: Vec<Vec<u8>> = unmerged.into_keys().collect();
@@ -1400,9 +1405,7 @@ pub(crate) fn render_long(store: &Store, branch: &str, plan: &StatusPlan) -> Vec
                 String::from_utf8_lossy(old),
                 String::from_utf8_lossy(new)
             );
-            section.extend_from_slice(
-                &format!("\t{:11} {}\n", "renamed:", display).into_bytes(),
-            );
+            section.extend_from_slice(&format!("\t{:11} {}\n", "renamed:", display).into_bytes());
         }
         sections.push(section);
     }

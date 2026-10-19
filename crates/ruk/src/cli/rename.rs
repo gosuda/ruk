@@ -202,10 +202,7 @@ pub(crate) fn pair_renames(
             } else {
                 (add.size, del.size)
             };
-            if big > 0
-                && small * 100 < usize::from(threshold) * big
-                && big - small > SIZE_SLACK
-            {
+            if big > 0 && small * 100 < usize::from(threshold) * big && big - small > SIZE_SLACK {
                 continue;
             }
             order.push((oi, ni, same_basename(&del.path, &add.path)));
@@ -336,7 +333,11 @@ mod tests {
         let env = test_env(&base);
         let mut ctx = repo_ctx(&root, env.clone());
         run(super::super::verbs_stage::add, &mut ctx, &[file]);
-        run(super::super::verbs_history::commit, &mut ctx, &["-m", "seed"]);
+        run(
+            super::super::verbs_history::commit,
+            &mut ctx,
+            &["-m", "seed"],
+        );
         (root, env)
     }
 
@@ -379,8 +380,7 @@ mod tests {
         let (_, mode) = split_rename_args(&["--no-renames".to_owned()]).expect("parse");
         assert_eq!(mode, RenameMode::Disabled);
         let (kept, mode) =
-            split_rename_args(&["-M".to_owned(), "--".to_owned(), "-M".to_owned()])
-                .expect("parse");
+            split_rename_args(&["-M".to_owned(), "--".to_owned(), "-M".to_owned()]).expect("parse");
         assert_eq!(mode, RenameMode::Similar(50));
         assert_eq!(kept, vec!["--".to_owned(), "-M".to_owned()]);
         let (_, mode) =
@@ -420,7 +420,11 @@ mod tests {
         run(super::super::verbs_stage::mv, &mut ctx, &["a.txt", "b.txt"]);
         std::fs::write(root.join("b.txt"), TEN_EDIT).expect("edit");
         run(super::super::verbs_stage::add, &mut ctx, &["b.txt"]);
-        let out = run(super::super::verbs_history::diff, &mut ctx, &["--cached", "-M"]);
+        let out = run(
+            super::super::verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-M"],
+        );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("similarity index 90%"), "got:\n{text}");
         assert!(text.contains("rename from a.txt"), "got:\n{text}");
@@ -431,10 +435,7 @@ mod tests {
             &mut ctx,
             &["--cached", "-M", "--name-status"],
         );
-        assert_eq!(
-            String::from_utf8(out).expect("utf8"),
-            "R90\ta.txt\tb.txt\n"
-        );
+        assert_eq!(String::from_utf8(out).expect("utf8"), "R90\ta.txt\tb.txt\n");
         let out = run(
             super::super::verbs_history::diff,
             &mut ctx,
@@ -452,7 +453,11 @@ mod tests {
         run(super::super::verbs_stage::mv, &mut ctx, &["a.txt", "b.txt"]);
         std::fs::write(root.join("b.txt"), TEN_EDIT).expect("edit");
         run(super::super::verbs_stage::add, &mut ctx, &["b.txt"]);
-        for args in [&["--cached"][..], &["--cached", "-M0"], &["--cached", "--no-renames"]] {
+        for args in [
+            &["--cached"][..],
+            &["--cached", "-M0"],
+            &["--cached", "--no-renames"],
+        ] {
             let out = run(super::super::verbs_history::diff, &mut ctx, args);
             let text = String::from_utf8(out).expect("utf8");
             assert!(!text.contains("rename from"), "got:\n{text}");
@@ -467,7 +472,11 @@ mod tests {
             .into_bytes();
         std::fs::write(root.join("b.txt"), &heavy).expect("rewrite");
         run(super::super::verbs_stage::add, &mut ctx, &["b.txt"]);
-        let out = run(super::super::verbs_history::diff, &mut ctx, &["--cached", "-M"]);
+        let out = run(
+            super::super::verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-M"],
+        );
         let text = String::from_utf8(out).expect("utf8");
         assert!(!text.contains("rename from"), "got:\n{text}");
         let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
@@ -478,7 +487,11 @@ mod tests {
         let (root, env) = seeded("diffpure", "a.txt", TEN);
         let mut ctx = ctx_for(&root, &env);
         run(super::super::verbs_stage::mv, &mut ctx, &["a.txt", "b.txt"]);
-        let out = run(super::super::verbs_history::diff, &mut ctx, &["--cached", "-M"]);
+        let out = run(
+            super::super::verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-M"],
+        );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("similarity index 100%"), "got:\n{text}");
         assert!(!text.contains("@@"), "got:\n{text}");
@@ -493,7 +506,11 @@ mod tests {
         let (root, env) = seeded("statmv", "a.txt", TEN);
         let mut ctx = ctx_for(&root, &env);
         run(super::super::verbs_stage::mv, &mut ctx, &["a.txt", "b.txt"]);
-        let out = run(super::super::verbs_stage::status, &mut ctx, &["--porcelain"]);
+        let out = run(
+            super::super::verbs_stage::status,
+            &mut ctx,
+            &["--porcelain"],
+        );
         assert_eq!(String::from_utf8(out).expect("utf8"), "R  a.txt -> b.txt\n");
         let out = run(super::super::verbs_stage::status, &mut ctx, &[]);
         let text = String::from_utf8(out).expect("utf8");
@@ -505,11 +522,19 @@ mod tests {
         std::fs::rename(root.join("a.txt"), root.join("b.txt")).expect("move");
         std::fs::write(root.join("b.txt"), TEN_EDIT).expect("edit");
         let mut ctx = ctx_for(&root, &env);
-        let out = run(super::super::verbs_stage::status, &mut ctx, &["--porcelain"]);
+        let out = run(
+            super::super::verbs_stage::status,
+            &mut ctx,
+            &["--porcelain"],
+        );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains(" D a.txt"), "got:\n{text}");
         assert!(text.contains("?? b.txt"), "got:\n{text}");
-        let out = run(super::super::verbs_stage::status, &mut ctx, &["--porcelain", "-M"]);
+        let out = run(
+            super::super::verbs_stage::status,
+            &mut ctx,
+            &["--porcelain", "-M"],
+        );
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             " R a.txt -> b.txt\n",
@@ -523,23 +548,34 @@ mod tests {
 
     #[test]
     fn merge_tracks_rename_plus_edit() {
-        let (root, env) = seeded(
-            "mergerename",
-            "f.txt",
-            b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n",
-        );
+        let (root, env) = seeded("mergerename", "f.txt", b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
         let mut ctx = ctx_for(&root, &env);
-        run(super::super::verbs_branch::checkout, &mut ctx, &["-b", "side"]);
+        run(
+            super::super::verbs_branch::checkout,
+            &mut ctx,
+            &["-b", "side"],
+        );
         run(super::super::verbs_stage::mv, &mut ctx, &["f.txt", "g.txt"]);
-        std::fs::write(root.join("g.txt"), b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9extra\n")
-            .expect("edit g");
+        std::fs::write(
+            root.join("g.txt"),
+            b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9extra\n",
+        )
+        .expect("edit g");
         run(super::super::verbs_stage::add, &mut ctx, &["g.txt"]);
-        run(super::super::verbs_history::commit, &mut ctx, &["-m", "rename"]);
+        run(
+            super::super::verbs_history::commit,
+            &mut ctx,
+            &["-m", "rename"],
+        );
         run(super::super::verbs_branch::checkout, &mut ctx, &["main"]);
         std::fs::write(root.join("f.txt"), b"l1\nl2EDIT\nl3\nl4\nl5\nl6\nl7\nl8\n")
             .expect("edit f");
         run(super::super::verbs_stage::add, &mut ctx, &["f.txt"]);
-        run(super::super::verbs_history::commit, &mut ctx, &["-m", "edit"]);
+        run(
+            super::super::verbs_history::commit,
+            &mut ctx,
+            &["-m", "edit"],
+        );
         run(super::super::verbs_history::merge, &mut ctx, &["side"]);
         assert!(!root.join("f.txt").exists(), "old path survives");
         assert_eq!(

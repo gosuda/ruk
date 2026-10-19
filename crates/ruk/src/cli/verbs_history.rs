@@ -3220,16 +3220,10 @@ fn plan_merge_trees(
     let mut redirect_old: HashMap<Vec<u8>, (Vec<u8>, bool)> = HashMap::new();
     let mut redirect_new: HashMap<Vec<u8>, (Vec<u8>, bool)> = HashMap::new();
     for (old, new, _) in &theirs_ren {
-        if ours_ren.iter().any(|(other, _, _)| other == old)
-            || dir_prefixes.contains(new)
-        {
+        if ours_ren.iter().any(|(other, _, _)| other == old) || dir_prefixes.contains(new) {
             continue;
         }
-        match (
-            base_map.get(old),
-            ours_map.get(old),
-            ours_map.get(new),
-        ) {
+        match (base_map.get(old), ours_map.get(old), ours_map.get(new)) {
             (Some(base_side), Some(ours_side), None) if ours_side != base_side => {
                 redirect_old.insert(old.clone(), (new.clone(), true));
                 redirect_new.insert(new.clone(), (old.clone(), true));
@@ -3244,11 +3238,7 @@ fn plan_merge_trees(
         {
             continue;
         }
-        match (
-            base_map.get(old),
-            theirs_map.get(old),
-            theirs_map.get(new),
-        ) {
+        match (base_map.get(old), theirs_map.get(old), theirs_map.get(new)) {
             (Some(base_side), Some(theirs_side), None) if theirs_side != base_side => {
                 redirect_old.insert(old.clone(), (new.clone(), false));
                 redirect_new.insert(new.clone(), (old.clone(), false));
@@ -3695,10 +3685,9 @@ fn guard_lane_worktree(
         // by the apply step, so the index must match the ours head there.
         // Untracked files and staged extras on untouched paths never enter
         // the plan and are never inspected.
-        let head_side: Option<(FileMode, Oid)> =
-            ours_map.get(path).and_then(|(mode, oid)| {
-                mode.as_index_mode().ok().map(|file| (file, *oid))
-            });
+        let head_side: Option<(FileMode, Oid)> = ours_map
+            .get(path)
+            .and_then(|(mode, oid)| mode.as_index_mode().ok().map(|file| (file, *oid)));
         // Gitlinks carry commit ids the worktree cannot materialize, so both
         // checks below are meaningless for them; every other path must show
         // an index that matches the ours head.
@@ -5373,10 +5362,10 @@ fn unified_pair(
     context: Option<usize>,
 ) -> Result<(Vec<u8>, usize, usize), GitError> {
     let new_name = String::from_utf8_lossy(&pair.path);
-    let old_name = pair.old_path.as_ref().map_or_else(
-        || new_name.clone(),
-        |old| String::from_utf8_lossy(old),
-    );
+    let old_name = pair
+        .old_path
+        .as_ref()
+        .map_or_else(|| new_name.clone(), |old| String::from_utf8_lossy(old));
     let mut out = format!("diff --git a/{old_name} b/{new_name}\n").into_bytes();
     let old_mode = pair.old.map(|(mode, _)| mode);
     let new_mode = pair.new.map(|(mode, _)| mode);
