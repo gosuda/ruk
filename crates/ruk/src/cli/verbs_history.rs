@@ -7996,19 +7996,20 @@ fn render_raw(hunks: &[CountedHunk]) -> Vec<u8> {
             .unwrap_or_else(|| "0000000".to_owned());
         let status = hunk_status(hunk);
         let status_text = match hunk.score {
-            Some(score) if status == 'R' || status == 'C' => format!("{status}{score}"),
+            Some(score) if status == 'R' || status == 'C' => format!("{status}{score:03}"),
             _ => status.to_string(),
         };
         out.extend_from_slice(
             format!(":{old_mode} {new_mode} {old_sha} {new_sha} {status_text}\t").as_bytes(),
         );
-        out.extend_from_slice(String::from_utf8_lossy(&hunk.path).as_bytes());
+        // Renames and copies print the old path first, as in the oracle.
         if status == 'R' || status == 'C' {
             if let Some(old) = &hunk.old_pair_path {
-                out.push(b'\t');
                 out.extend_from_slice(String::from_utf8_lossy(old).as_bytes());
+                out.push(b'\t');
             }
         }
+        out.extend_from_slice(String::from_utf8_lossy(&hunk.path).as_bytes());
         out.push(b'\n');
     }
     out

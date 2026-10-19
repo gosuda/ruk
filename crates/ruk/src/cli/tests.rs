@@ -6827,3 +6827,43 @@ fn wave_j_reset_keep_and_intent() {
     assert!(err.to_string().contains("interactive"), "got {err:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn wave_j_diff_raw_rename_old_first() {
+    let mut body = Vec::new();
+    for i in 1..=10 {
+        body.extend_from_slice(format!("L{i:02}\n").as_bytes());
+    }
+    let (root, env) = seeded_repo("wavej-diff-rawrename", "f.txt", &body);
+    let mut ctx = repo_ctx(&root, env);
+    // Rename with one changed line: similarity 90, exercising the padded
+    // `R090` status and the old-first path order.
+    let mut moved = Vec::new();
+    for i in 1..=10 {
+        if i == 5 {
+            moved.extend_from_slice(b"CHANGED05\n");
+        } else {
+            moved.extend_from_slice(format!("L{i:02}\n").as_bytes());
+        }
+    }
+    std::fs::write(root.join("r.txt"), &moved).expect("copy");
+    run(verbs_stage::rm, &mut ctx, &["f.txt"]).expect("rm");
+    run(verbs_stage::add, &mut ctx, &["r.txt"]).expect("add");
+    let raw = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &["--cached", "-M", "--raw"]).expect("raw"),
+    )
+    .expect("utf8");
+    assert!(raw.contains("\tR090\tf.txt\tr.txt\n"), "got {raw:?}");
+    let status = String::from_utf8(
+        run(
+            verbs_history::diff,
+            &mut ctx,
+            &["--cached", "-M", "--name-status"],
+        )
+        .expect("status"),
+    )
+    .expect("utf8");
+    assert!(status.contains("R090\tf.txt\tr.txt\n"), "got {status:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+
+}
