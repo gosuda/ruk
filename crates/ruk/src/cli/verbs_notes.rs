@@ -77,6 +77,31 @@ fn notes_ref_name(ctx: &Ctx, opts: &Collected) -> Result<RefName, GitError> {
     })
 }
 
+/// Reads one note body for `log --show-notes`: `name` is `None` for the
+/// default ref, `Some` short-or-full ref otherwise. A missing ref or a
+/// missing entry is `None`, never an error; a ref pointing at a non-commit
+/// is corrupt, the same rule [`load_notes`] enforces.
+pub(crate) fn note_for_commit(
+    store: &Store,
+    kind: HashKind,
+    name: Option<&str>,
+    target: &Oid,
+) -> Result<Option<Vec<u8>>, GitError> {
+    let full = match name {
+        None => DEFAULT_NOTES_REF.to_owned(),
+        Some(raw) if raw.starts_with("refs/") => raw.to_owned(),
+        Some(raw) => format!("refs/notes/{raw}"),
+    };
+    let name = RefName::new(full).map_err(|err| GitError::Invalid {
+        detail: format!("bad notes ref: {err}"),
+    })?;
+    let head = load_notes(store, kind, &name)?;
+    match head.entries.get(&target.to_hex()) {
+        None => Ok(None),
+        Some(blob) => read_object_bytes(store, *blob).map(|(_, body)| Some(body)),
+    }
+}
+
 /// Resolves a non-notes ref the same short-or-full way (`merge` source).
 fn other_notes_ref_name(text: &str) -> Result<RefName, GitError> {
     let full = if text.starts_with("refs/") {

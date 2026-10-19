@@ -8,7 +8,7 @@
 //! | `rebase` | range replay over the lane | implemented (`<upstream>` and `--onto`, `--continue`/`--skip`/`--abort`; drops merge commits, no branch switching) |
 //! | `cherry-pick` | per-commit replay over the lane | implemented (`-n`, `-m`, `-x`, `--continue`/`--skip`/`--abort`, `CHERRY_PICK_HEAD`) |
 //! | `revert` | inverse replay over the lane | implemented (`-n`, `-m`, `--continue`/`--skip`/`--abort`, `REVERT_HEAD`) |
-//! | `log` | commit ancestry walk | implemented (oneline, format/pretty, ranges, paths, stat/patch, filters, decorate, graph) |
+//! | `log` | commit ancestry walk | implemented (oneline, format/pretty incl. full/fuller/email/raw, ranges, paths, stat/patch/summary/shortstat/numstat/dirstat, filters incl. follow/pickaxe/merges, first-parent, left-right/cherry-pick, topo/date order, date shapes, abbrev, notes, decorate, source, simplify-by-decoration, branch/tag/remote/exclude tips, boundary, graph) |
 //! | `show` | commit read + tree diff, or blob bytes | implemented (format/pretty, stat/patch, `rev:path` blob form) |
 //! | `diff` | tree/index/worktree compare + line differ | implemented (`--cached`/`--staged`, ranges, stat/patch, `-U`, name-status, paths) |
 //! | `merge-base` | breadth-first paint-down | implemented (`--is-ancestor`, `-a`/`--all`) |
@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ruk_core::commit::CommitRecord;
-use ruk_core::conflict::Signature;
+use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::error::CoreError;
 use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
@@ -35,6 +35,7 @@ use ruk_core::merge::composed::route::{MergeOutcome, merge_file};
 use ruk_core::merge::syntax::grammar::{Cancel, GrammarRegistry, dispatch};
 use ruk_core::merge::syntax::registry_providers;
 use ruk_core::ops::{EditRequest, NewRequest, edit as ops_edit, new as ops_new};
+use regex::bytes::Regex;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::ObjectKind as MergeLaneObjectKind;
 use ruk_core::store::Store as MergeLaneStore;
@@ -43,11 +44,12 @@ use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
 use super::state::{
-    IdentityRole, SequencerState, commit_record, head_oid, identity, is_ancestor, list_refs,
-    load_or_default, merge_base as state_merge_base, merged_rows, now_seconds, pseudo_delete,
+    IdentityRole, SequencerState, WalkQueue, commit_record, head_oid, identity, is_ancestor,
+    list_refs, load_or_default, merge_base as state_merge_base, merged_rows, now_seconds,
+    pseudo_delete,
     pseudo_read, pseudo_read_oid, pseudo_write, read_path_rows, read_ref, replace_redirect,
     resolve_rev, scan_index, sequencer_delete, sequencer_read, sequencer_write, walk_history,
-    workspace_mutation,
+    walk_record, workspace_mutation,
 };
 use super::tree::{
     TreeMode, WorktreeEntry, build_index_tree, commit_tree_oid, flatten_tree, peel_to_tree,
@@ -973,31 +975,16 @@ fn format_git_date(stamp: i64, offset: ruk_core::conflict::TzOffset) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let hhmm = i64::from(offset.hhmm());
-    let shift = (hhmm / 100) * 3_600 + (hhmm % 100) * 60;
-    let local = stamp + if offset.is_negative() { -shift } else { shift };
-    let days = local.div_euclid(86_400);
-    let clock = local.rem_euclid(86_400);
-    let civil = days + 719_468;
-    let era = if civil >= 0 { civil } else { civil - 146_096 } / 146_097;
-    let doe = civil - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let full_year = if month <= 2 { year + 1 } else { year };
-    let weekday = usize::try_from(days.rem_euclid(7)).expect("weekday remainder fits in seven");
-    let month_index = usize::try_from(month - 1).expect("parsed month 1..=12 gives index 0..=11");
+    let civil = civil_of(stamp, offset);
     format!(
-        "{} {} {} {:02}:{:02}:{:02} {full_year} {offset}",
-        WEEKDAYS[weekday],
-        MONTHS[month_index],
-        day,
-        clock / 3_600,
-        (clock % 3_600) / 60,
-        clock % 60,
+        "{} {} {} {:02}:{:02}:{:02} {} {offset}",
+        WEEKDAYS[civil.weekday],
+        MONTHS[civil.month_index],
+        civil.day,
+        civil.hour,
+        civil.minute,
+        civil.second,
+        civil.year,
     )
 }
 
@@ -1024,6 +1011,12 @@ enum FormatField {
     CommitterDate,
     /// `%d`: decorations like ` (HEAD -> main)`, empty when none.
     Decoration,
+    /// `%P`: parent oids, space-separated.
+    Parents,
+    /// `%T`: the commit's tree oid.
+    Tree,
+    /// `%S`: the `--source` ref name, empty when none.
+    Source,
     /// `%n`: newline.
     Newline,
     /// `%%`: a literal percent.
@@ -1043,7 +1036,7 @@ enum FormatPart {
 fn parse_log_format(text: &str) -> Result<Vec<FormatPart>, GitError> {
     let unknown = |letter: char| GitError::Invalid {
         detail: format!(
-            "unknown placeholder %{letter} (supported: %H %h %s %an %ae %ad %cn %ce %cd %d %% %n)"
+            "unknown placeholder %{letter} (supported: %H %h %s %an %ae %ad %cn %ce %cd %d %P %T %S %% %n)"
         ),
     };
     let bytes = text.as_bytes();
@@ -1062,6 +1055,9 @@ fn parse_log_format(text: &str) -> Result<Vec<FormatPart>, GitError> {
             Some(b'h') => FormatField::ShortOid,
             Some(b's') => FormatField::Subject,
             Some(b'd') => FormatField::Decoration,
+            Some(b'P') => FormatField::Parents,
+            Some(b'T') => FormatField::Tree,
+            Some(b'S') => FormatField::Source,
             Some(b'n') => FormatField::Newline,
             Some(b'%') => FormatField::Percent,
             Some(b'a') => match bytes.get(index + 1) {
@@ -1140,13 +1136,192 @@ fn parse_pretty_arg(text: &str) -> Result<Option<Vec<FormatPart>>, GitError> {
     }
 }
 
+/// How `--date` renders `%ad`/`%cd` and the `Date:` header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DateMode {
+    /// `Sun Oct 18 05:50:17 2026 +0900`, in the ident's own offset.
+    Default,
+    /// `3 days ago` against the invocation time.
+    Relative,
+    /// `2026-10-18`.
+    Short,
+    /// `2026-10-18 05:50:17 +0900`.
+    Iso,
+    /// `<epoch> <±HHMM>`.
+    Raw,
+    /// `<epoch>`.
+    Unix,
+}
+
+/// Parses `--date=<fmt>`. `local` and `format:...` need timezone conversion
+/// and strftime shaping this tool does not implement, so they fail
+/// `Unsupported` loudly instead of rendering a neighboring format.
+fn parse_date_mode(text: &str) -> Result<DateMode, GitError> {
+    match text {
+        "default" => Ok(DateMode::Default),
+        "relative" => Ok(DateMode::Relative),
+        "short" => Ok(DateMode::Short),
+        "iso" | "iso-strict" => Ok(DateMode::Iso),
+        "raw" => Ok(DateMode::Raw),
+        "unix" => Ok(DateMode::Unix),
+        "local" | "rfc" | "rfc2822" | "email" => Err(GitError::Unsupported {
+            command: format!("--date={text} is not supported"),
+        }),
+        _ if text.starts_with("format:") => Err(GitError::Unsupported {
+            command: "--date=format:... is not supported".to_owned(),
+        }),
+        _ => Err(GitError::Invalid {
+            detail: format!(
+                "bad --date {text:?}: want default|relative|short|iso|raw|unix"
+            ),
+        }),
+    }
+}
+
+/// One civil date in the ident's own offset, backing every `--date` shape.
+struct CivilDate {
+    /// Full year.
+    year: i64,
+    /// Month 1..=12.
+    month: i64,
+    /// Day 1..=31.
+    day: i64,
+    /// Hour, minute, second.
+    hour: i64,
+    /// Minute.
+    minute: i64,
+    /// Second.
+    second: i64,
+    /// Weekday index into the git `Thu..Wed` table.
+    weekday: usize,
+    /// Month index 0..=11.
+    month_index: usize,
+}
+
+/// Splits a timestamp into civil fields in the ident's own offset, the same
+/// arithmetic [`format_git_date`] prints.
+fn civil_of(stamp: i64, offset: TzOffset) -> CivilDate {
+    let hhmm = i64::from(offset.hhmm());
+    let shift = (hhmm / 100) * 3_600 + (hhmm % 100) * 60;
+    let local = stamp + if offset.is_negative() { -shift } else { shift };
+    let days = local.div_euclid(86_400);
+    let clock = local.rem_euclid(86_400);
+    let civil = days + 719_468;
+    let era = if civil >= 0 { civil } else { civil - 146_096 } / 146_097;
+    let doe = civil - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let full_year = if month <= 2 { year + 1 } else { year };
+    let weekday = usize::try_from(days.rem_euclid(7)).expect("weekday remainder fits in seven");
+    let month_index =
+        usize::try_from(month - 1).expect("parsed month 1..=12 gives index 0..=11");
+    CivilDate {
+        year: full_year,
+        month,
+        day,
+        hour: clock / 3_600,
+        minute: (clock % 3_600) / 60,
+        second: clock % 60,
+        weekday,
+        month_index,
+    }
+}
+
+/// Renders `2 hours ago` style relative dates against `now`, with git's
+/// unit ladder (seconds, minutes, hours, days, weeks, months, years).
+fn relative_date(now: i64, stamp: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 3_600;
+    const DAY: i64 = 86_400;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    let diff = now.saturating_sub(stamp).max(0);
+    let (count, unit) = if diff < MINUTE {
+        (diff, "second")
+    } else if diff < HOUR {
+        (diff / MINUTE, "minute")
+    } else if diff < DAY {
+        (diff / HOUR, "hour")
+    } else if diff < WEEK {
+        (diff / DAY, "day")
+    } else if diff < 5 * WEEK {
+        (diff / WEEK, "week")
+    } else if diff < YEAR {
+        (diff / MONTH, "month")
+    } else {
+        (diff / YEAR, "year")
+    };
+    if count == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{count} {unit}s ago")
+    }
+}
+
+/// Renders one ident timestamp in a `--date` shape.
+fn render_date(stamp: i64, offset: TzOffset, mode: DateMode, now: i64) -> String {
+    match mode {
+        DateMode::Default => format_git_date(stamp, offset),
+        DateMode::Relative => relative_date(now, stamp),
+        DateMode::Short => {
+            let civil = civil_of(stamp, offset);
+            format!("{:04}-{:02}-{:02}", civil.year, civil.month, civil.day)
+        }
+        DateMode::Iso => {
+            let civil = civil_of(stamp, offset);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {offset}",
+                civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second,
+            )
+        }
+        DateMode::Raw => format!("{stamp} {offset}"),
+        DateMode::Unix => format!("{stamp}"),
+    }
+}
+
+/// Named `--pretty` shapes beyond the default header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrettyKind {
+    /// `short`/`medium`: the default header.
+    Default,
+    /// `Author:` plus `Commit:` identity lines.
+    Full,
+    /// `Full` plus `AuthorDate:`/`CommitDate:` lines.
+    Fuller,
+    /// Mbox headers plus subject and body.
+    Email,
+    /// Raw `tree`/`parent`/`author`/`committer` header plus message.
+    Raw,
+}
+
+/// Strips an optional `format:`/`tformat:` prefix, which both `--pretty`
+/// and `--format` accept around a placeholder string.
+fn strip_format_prefix(text: &str) -> &str {
+    text.strip_prefix("format:")
+        .or_else(|| text.strip_prefix("tformat:"))
+        .unwrap_or(text)
+}
+
+/// Shortens one object id to `len` hex chars (saturating at the full hex).
+fn short_hex_len(oid: &Oid, len: usize) -> String {
+    oid.to_hex().chars().take(len.max(1)).collect()
+}
+
 /// Renders parsed format parts for one commit. `decoration` is the `%d`
-/// text including its leading space, or empty when undecorated.
+/// text including its leading space, or empty when undecorated; `source`
+/// is the `--source` ref name (`%S`), empty when none.
 fn render_log_format(
     parts: &[FormatPart],
+    line: &CommitLine,
     oid: &Oid,
     record: &CommitRecord,
     decoration: &str,
+    source: &str,
 ) -> Result<Vec<u8>, GitError> {
     let broken = |role: &str| GitError::Corrupt {
         detail: format!("bad {role} ident"),
@@ -1159,7 +1334,9 @@ fn render_log_format(
             FormatPart::Text(bytes) => out.extend_from_slice(bytes),
             FormatPart::Field(field) => match field {
                 FormatField::FullOid => out.extend_from_slice(oid.to_hex().as_bytes()),
-                FormatField::ShortOid => out.extend_from_slice(short_hex(oid).as_bytes()),
+                FormatField::ShortOid => {
+                    out.extend_from_slice(short_hex_len(oid, line.abbrev_len).as_bytes());
+                }
                 FormatField::Subject => {
                     out.extend_from_slice(first_subject_line(record.message()).as_bytes());
                 }
@@ -1167,17 +1344,31 @@ fn render_log_format(
                 FormatField::AuthorEmail => out.extend_from_slice(author.email.as_bytes()),
                 FormatField::AuthorDate => {
                     out.extend_from_slice(
-                        format_git_date(author.timestamp, author.offset).as_bytes(),
+                        render_date(author.timestamp, author.offset, line.date, line.now)
+                            .as_bytes(),
                     );
                 }
                 FormatField::CommitterName => out.extend_from_slice(committer.name.as_bytes()),
                 FormatField::CommitterEmail => out.extend_from_slice(committer.email.as_bytes()),
                 FormatField::CommitterDate => {
                     out.extend_from_slice(
-                        format_git_date(committer.timestamp, committer.offset).as_bytes(),
+                        render_date(committer.timestamp, committer.offset, line.date, line.now)
+                            .as_bytes(),
                     );
                 }
                 FormatField::Decoration => out.extend_from_slice(decoration.as_bytes()),
+                FormatField::Parents => {
+                    let parents: Vec<String> = record
+                        .parents()
+                        .iter()
+                        .filter_map(|head| head.as_git().map(|oid| oid.to_hex()))
+                        .collect();
+                    out.extend_from_slice(parents.join(" ").as_bytes());
+                }
+                FormatField::Tree => {
+                    out.extend_from_slice(commit_tree_oid(record)?.to_hex().as_bytes());
+                }
+                FormatField::Source => out.extend_from_slice(source.as_bytes()),
                 FormatField::Newline => out.push(b'\n'),
                 FormatField::Percent => out.push(b'%'),
             },
@@ -1195,6 +1386,14 @@ struct CommitLine {
     format: Option<Vec<FormatPart>>,
     /// Shorten the header oid (`--abbrev-commit`).
     abbrev: bool,
+    /// Abbreviated oid width (`--abbrev=<n>`, default 7).
+    abbrev_len: usize,
+    /// Named `--pretty` shape beyond the default header.
+    pretty: PrettyKind,
+    /// `--date` shape for `%ad`/`%cd` and `Date:` lines.
+    date: DateMode,
+    /// Invocation time for relative dates.
+    now: i64,
 }
 
 /// Renders one commit's identity line for `log` and `show`.
@@ -1204,21 +1403,47 @@ fn render_commit_line(
     record: &CommitRecord,
     decoration: &str,
 ) -> Result<Vec<u8>, GitError> {
+    render_commit_line_full(line, oid, record, decoration, "")
+}
+
+/// Renders one commit's identity line with `--source` text: `source` is
+/// the reaching ref name, empty when `--source` is off or the tip is
+/// unnamed. Oneline form is `<short> <source> <subject>`; the header form
+/// appends the source after the oid, before decorations.
+fn render_commit_line_full(
+    line: &CommitLine,
+    oid: &Oid,
+    record: &CommitRecord,
+    decoration: &str,
+    source: &str,
+) -> Result<Vec<u8>, GitError> {
     if let Some(parts) = &line.format {
-        let mut out = render_log_format(parts, oid, record, decoration)?;
+        let mut out = render_log_format(parts, line, oid, record, decoration, source)?;
         out.push(b'\n');
         return Ok(out);
     }
     if line.oneline {
         let subject = first_subject_line(record.message());
-        return Ok(format!("{}{decoration} {subject}\n", short_hex(oid)).into_bytes());
+        let short = short_hex_len(oid, line.abbrev_len);
+        if source.is_empty() {
+            return Ok(format!("{short} {subject}\n").into_bytes());
+        }
+        return Ok(format!("{short} {source} {subject}\n").into_bytes());
+    }
+    if line.pretty != PrettyKind::Default {
+        return render_pretty_shape(line, oid, record, decoration);
     }
     let id = if line.abbrev {
-        short_hex(oid)
+        short_hex_len(oid, line.abbrev_len)
     } else {
         oid.to_hex()
     };
-    let mut out = format!("commit {id}{decoration}\n").into_bytes();
+    let source_text = if source.is_empty() {
+        String::new()
+    } else {
+        format!(" {source}")
+    };
+    let mut out = format!("commit {id}{source_text}{decoration}\n").into_bytes();
     let broken = |role: &str| GitError::Corrupt {
         detail: format!("bad {role} ident"),
     };
@@ -1231,14 +1456,155 @@ fn render_commit_line(
     out.extend_from_slice(
         format!(
             "Date:   {}\n",
-            format_git_date(author.timestamp, author.offset)
+            render_date(author.timestamp, author.offset, line.date, line.now)
         )
         .as_bytes(),
     );
     out.push(b'\n');
-    // Git's pretty printer chomps trailing newlines before indenting: the
-    // stored `one\n` renders as `    one\n`, not `    one\n    \n`.
-    let mut body = record.message();
+    out.extend_from_slice(&indented_message(record.message()));
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// Renders the `--pretty=full`/`fuller`/`email`/`raw` shapes: full adds the
+/// committer line, fuller adds both date lines, email renders mbox
+/// headers, and raw renders the stored header lines verbatim.
+fn render_pretty_shape(
+    line: &CommitLine,
+    oid: &Oid,
+    record: &CommitRecord,
+    decoration: &str,
+) -> Result<Vec<u8>, GitError> {
+    let broken = |role: &str| GitError::Corrupt {
+        detail: format!("bad {role} ident"),
+    };
+    let author = record.author().map_err(|_| broken("author"))?;
+    let committer = record.committer().map_err(|_| broken("committer"))?;
+    let id = if line.abbrev {
+        short_hex_len(oid, line.abbrev_len)
+    } else {
+        oid.to_hex()
+    };
+    let mut out = Vec::new();
+    match line.pretty {
+        PrettyKind::Default => {
+            out.extend_from_slice(format!("commit {id}{decoration}\n").as_bytes());
+            out.extend_from_slice(&indented_message(record.message()));
+            out.push(b'\n');
+            return Ok(out);
+        }
+        PrettyKind::Full => {
+            out.extend_from_slice(format!("commit {id}{decoration}\n").as_bytes());
+            push_ident(&mut out, "Author: ", &author);
+            push_ident(&mut out, "Commit: ", &committer);
+        }
+        PrettyKind::Fuller => {
+            out.extend_from_slice(format!("commit {id}{decoration}\n").as_bytes());
+            push_ident(&mut out, "Author:     ", &author);
+            out.extend_from_slice(
+                format!(
+                    "AuthorDate: {}\n",
+                    render_date(author.timestamp, author.offset, line.date, line.now)
+                )
+                .as_bytes(),
+            );
+            push_ident(&mut out, "Commit:     ", &committer);
+            out.extend_from_slice(
+                format!(
+                    "CommitDate: {}\n",
+                    render_date(committer.timestamp, committer.offset, line.date, line.now)
+                )
+                .as_bytes(),
+            );
+        }
+        PrettyKind::Email => {
+            let subject = first_subject_line(record.message());
+            out.extend_from_slice(
+                format!(
+                    "From {} {}\n",
+                    oid.to_hex(),
+                    format_git_date(author.timestamp, author.offset)
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(b"From: ");
+            out.extend_from_slice(author.name.as_bytes());
+            out.extend_from_slice(b" <");
+            out.extend_from_slice(author.email.as_bytes());
+            out.extend_from_slice(b">\n");
+            out.extend_from_slice(
+                format!(
+                    "Date: {}\n",
+                    render_date(author.timestamp, author.offset, line.date, line.now)
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(format!("Subject: [PATCH] {subject}\n").as_bytes());
+            out.push(b'\n');
+            out.extend_from_slice(&message_body(record.message()));
+            if !out.ends_with(b"\n") {
+                out.push(b'\n');
+            }
+            return Ok(out);
+        }
+        PrettyKind::Raw => {
+            out.extend_from_slice(format!("commit {}\n", oid.to_hex()).as_bytes());
+            out.extend_from_slice(
+                format!("tree {}\n", commit_tree_oid(record)?.to_hex()).as_bytes(),
+            );
+            for parent in record
+                .parents()
+                .iter()
+                .filter_map(|head| head.as_git().copied())
+            {
+                out.extend_from_slice(format!("parent {}\n", parent.to_hex()).as_bytes());
+            }
+            push_raw_ident(&mut out, "author", &author);
+            push_raw_ident(&mut out, "committer", &committer);
+            out.push(b'\n');
+            let mut message = record.message().to_vec();
+            if !message.ends_with(b"\n") {
+                message.push(b'\n');
+            }
+            out.extend_from_slice(&message);
+            return Ok(out);
+        }
+    }
+    out.push(b'\n');
+    out.extend_from_slice(&indented_message(record.message()));
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// Pushes one identity line behind its full label (`Author: ` or the
+/// padded `Author:     ` fuller shape).
+fn push_ident(out: &mut Vec<u8>, label: &str, ident: &Signature) {
+    out.extend_from_slice(label.as_bytes());
+    out.extend_from_slice(ident.name.as_bytes());
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(ident.email.as_bytes());
+    out.extend_from_slice(b">\n");
+}
+
+/// Pushes one raw `author <name> <email> <epoch> <±HHMM>` header line.
+fn push_raw_ident(out: &mut Vec<u8>, role: &str, ident: &Signature) {
+    out.extend_from_slice(
+        format!(
+            "{role} {} <{}> {} {}\n",
+            String::from_utf8_lossy(ident.name.as_bytes()),
+            String::from_utf8_lossy(ident.email.as_bytes()),
+            ident.timestamp,
+            ident.offset,
+        )
+        .as_bytes(),
+    );
+}
+
+/// Indents a message body four spaces the way the pretty printer does,
+/// chomping trailing newlines first so `one\n` renders as `    one\n`.
+fn indented_message(message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut body = message;
     while body.last() == Some(&b'\n') {
         body = &body[..body.len() - 1];
     }
@@ -1247,8 +1613,25 @@ fn render_commit_line(
         out.extend_from_slice(message_line);
         out.push(b'\n');
     }
-    out.push(b'\n');
-    Ok(out)
+    out
+}
+
+/// Takes the message after its subject line, dropping the blank separator,
+/// for `--pretty=email` bodies.
+fn message_body(message: &[u8]) -> Vec<u8> {
+    let mut lines = message.split(|byte| *byte == b'\n').peekable();
+    lines.next();
+    let rest: Vec<&[u8]> = lines.collect();
+    let mut start = 0;
+    while start < rest.len() && rest[start].is_empty() {
+        start += 1;
+    }
+    let mut out = Vec::new();
+    for line in &rest[start..] {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Builds the oid-to-decoration map from every ref, marking the checked-out
@@ -3912,6 +4295,22 @@ fn clear_lane_state(ctx: &Ctx, verb: &str, head_key: Option<&str>) -> Result<(),
 /// Oracle: `git/builtin/log.c` (`cmd_log`). Decorations stay off unless
 /// `--decorate` is given: git's `auto` default shows them only on a
 /// terminal, and this interpreter never renders to one.
+///
+/// Accepted history flags beyond the identity line: `--follow`, `-S`, `-G`,
+/// `--merges`/`--no-merges` (later `--no-merges` wins when both are given),
+/// `--first-parent`, `--left-right`/`--cherry-pick` (sides come from the
+/// first `A...B` range; without one every commit reads as right-side `>`),
+/// `--topo-order`, `--date-order` (the walk already pops newest
+/// committer-date first, so this is accepted as the default order),
+/// `--date=<fmt>`/`--relative-date`, `--abbrev[=<n>]`, `--summary`,
+/// `--shortstat`, `--numstat`, `--dirstat`, `--show-notes[=<ref>]`/
+/// `--no-notes`, `--decorate=<short|full|auto|no>`, `--source`,
+/// `--simplify-by-decoration`, `--branches[=<glob>]`/`--tags[=<glob>]`/
+/// `--remotes[=<glob>]`/`--exclude=<glob>`, and `--boundary`. A positional
+/// that names no revision falls back to a path when it exists in the
+/// worktree or the `HEAD` tree, the way the oracle DWIMs `log <path>`;
+/// otherwise it still fails as an unknown revision. `-n` stays
+/// `--max-count`, as in git: notes are `--show-notes` only.
 pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -4011,87 +4410,1101 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             short: Some('U'),
             takes_value: true,
         },
+        FlagSpec {
+            long: "follow",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "merges",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-merges",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "first-parent",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "left-right",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "cherry-pick",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "topo-order",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "date-order",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "date",
+            short: None,
+            takes_value: true,
+        },
+        FlagSpec {
+            long: "relative-date",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "summary",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "shortstat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "numstat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "dirstat",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "show-notes",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "no-notes",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "source",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "simplify-by-decoration",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "boundary",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "exclude",
+            short: None,
+            takes_value: true,
+        },
+        // Pickaxe `-S<string>`: commits changing the occurrence count.
+        FlagSpec {
+            long: "pickaxe",
+            short: Some('S'),
+            takes_value: true,
+        },
+        // Pickaxe `-G<regex>`: commits with a matching added/removed line.
+        FlagSpec {
+            long: "pickaxe-regex",
+            short: Some('G'),
+            takes_value: true,
+        },
     ];
     let (rev_args, path_args) = split_double_dash(args);
+    let rev_args = rewrite_format_colon(&rev_args);
     let (rev_args, decorate_mode) = extract_decorate_arg(&rev_args)?;
+    let (rev_args, abbrev_len) = extract_abbrev_arg(&rev_args)?;
+    let (rev_args, ref_filters) = extract_ref_filter_args(&rev_args)?;
+    let (rev_args, notes_ref) = extract_show_notes_arg(&rev_args)?;
     let (rev_args, rename_mode) = super::rename::split_rename_args(&rev_args)?;
     let opts = collect_expanded(&rewrite_dash_number(&rev_args), &specs)?;
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let limit = parse_max_count(&opts)?;
     let default_tip = head_oid(store).ok();
-    let (mut tips, exclude) = parse_log_revs(store, kind, &opts.positionals, default_tip)?;
-    if opts.is_set("all") {
-        tips.extend(all_ref_tips(store)?);
+    // DWIM positionals that name no revision into paths when they exist in
+    // the worktree or the `HEAD` tree; anything else stays a revision so
+    // typos still fail loudly in `parse_log_revs`.
+    let mut rev_positionals: Vec<String> = Vec::new();
+    let mut dwim_paths: Vec<Vec<u8>> = Vec::new();
+    for item in &opts.positionals {
+        if split_range(item).is_some() || item.starts_with('^') || item.ends_with("^!") {
+            rev_positionals.push(item.clone());
+            continue;
+        }
+        match try_resolve_rev(store, kind, item)? {
+            Some(_) => rev_positionals.push(item.clone()),
+            None => {
+                if dwim_path_exists(ctx, store, kind, item)? {
+                    dwim_paths.push(item.as_bytes().to_vec());
+                } else {
+                    rev_positionals.push(item.clone());
+                }
+            }
+        }
+    }
+    let (mut tips, exclude) = parse_log_revs(store, kind, &rev_positionals, default_tip)?;
+    let excludes = opts.all("exclude")?;
+    // Tip labels feed `--source` text and `--left-right` sides; the first
+    // symmetric range fixes left vs right.
+    let mut tip_names: HashMap<Oid, String> = HashMap::new();
+    for (oid, name) in log_ref_tips(store, opts.is_set("all"), &ref_filters, &excludes)? {
+        if !tips.contains(&oid) {
+            tips.push(oid);
+        }
+        tip_names.entry(oid).or_insert(name);
     }
     if tips.is_empty() {
         return Err(GitError::Invalid {
             detail: "usage: log [<options>] [<revision-range>] [[--] <path>...]".to_owned(),
         });
     }
+    let mut sym_sides: Option<(Oid, Oid)> = None;
+    for item in &rev_positionals {
+        if let Some(range) = split_range(item) {
+            let from = resolve_range_side(store, kind, &range.from)?;
+            let to = resolve_range_side(store, kind, &range.to)?;
+            tip_names.entry(from).or_insert_with(|| {
+                if range.from.is_empty() {
+                    "HEAD".to_owned()
+                } else {
+                    range.from.clone()
+                }
+            });
+            tip_names.entry(to).or_insert_with(|| {
+                if range.to.is_empty() {
+                    "HEAD".to_owned()
+                } else {
+                    range.to.clone()
+                }
+            });
+            if range.symmetric && sym_sides.is_none() {
+                sym_sides = Some((from, to));
+            }
+        } else if item.starts_with('^') {
+            // Excluded side: no label.
+        } else if let Some(base) = item.strip_suffix("^!") {
+            let oid = resolve_local(store, kind, base)?;
+            tip_names.entry(oid).or_insert(base.to_owned());
+        } else {
+            let oid = resolve_local(store, kind, item)?;
+            tip_names.entry(oid).or_insert(item.clone());
+        }
+    }
+    if rev_positionals.is_empty()
+        && let Some(tip) = default_tip
+    {
+        tip_names.entry(tip).or_insert("HEAD".to_owned());
+    }
     let since = parse_since_until(&opts, "since")?;
     let until = parse_since_until(&opts, "until")?;
     let author_want = opts.single("author")?;
-    let wants: Vec<Vec<u8>> = path_args
+    let mut wants: Vec<Vec<u8>> = path_args
         .iter()
         .map(|path| path.as_bytes().to_vec())
         .collect();
-    let line = commit_line_of(&opts)?;
+    wants.extend(dwim_paths);
+    let follow = opts.is_set("follow");
+    if follow {
+        wants.sort();
+        wants.dedup();
+        if wants.len() != 1 {
+            return Err(GitError::Invalid {
+                detail: "option --follow requires exactly one path".to_owned(),
+            });
+        }
+    }
+    let needle = opts.single("pickaxe")?;
+    if needle.as_deref() == Some("") {
+        return Err(GitError::Invalid {
+            detail: "option -S requires a non-empty string".to_owned(),
+        });
+    }
+    let pickaxe_regex = opts
+        .single("pickaxe-regex")?
+        .map(|pattern| {
+            Regex::new(&pattern).map_err(|_| GitError::Invalid {
+                detail: format!("bad -G regex {pattern:?}"),
+            })
+        })
+        .transpose()?;
+    let merges_only = opts.is_set("merges");
+    let no_merges = opts.is_set("no-merges");
+    let first_parent = opts.is_set("first-parent");
+    let left_right = opts.is_set("left-right");
+    let cherry_pick = opts.is_set("cherry-pick");
+    let topo_order = opts.is_set("topo-order");
+    let mut line = commit_line_of(&opts)?;
+    if let Some(len) = abbrev_len {
+        line.abbrev_len = len;
+        line.abbrev = true;
+    }
     let decorate = !opts.is_set("no-decorate")
         && (opts.is_set("decorate") || decorate_mode.as_deref().is_some_and(|mode| mode != "no"));
     let full_names = decorate_mode.as_deref() == Some("full");
-    let decorations = if decorate || line.format.is_some() {
+    let simplify = opts.is_set("simplify-by-decoration");
+    let decorations = if decorate || line.format.is_some() || simplify {
         decoration_map(store)?
     } else {
         HashMap::new()
     };
+    let extra_stats = opts.is_set("summary")
+        || opts.is_set("shortstat")
+        || opts.is_set("numstat")
+        || opts.is_set("dirstat");
     let show_diffs = !opts.is_set("quiet")
         && (opts.is_set("patch")
             || opts.is_set("stat")
             || opts.is_set("name-only")
-            || opts.is_set("name-status"));
-    let mut shown: Vec<(Oid, CommitRecord)> = Vec::new();
-    for (oid, record) in walk_history_excluding(store, &tips, &exclude, None)? {
+            || opts.is_set("name-status")
+            || extra_stats);
+    let show_notes = opts.is_set("show-notes") && !opts.is_set("no-notes");
+    let notes_default = notes_ref.flatten();
+    let follow_mode = match rename_mode {
+        super::rename::RenameMode::Similar(_) => rename_mode,
+        super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => {
+            super::rename::RenameMode::Similar(50)
+        }
+    };
+    let mut shown: Vec<ShownCommit> = Vec::new();
+    let mut follow_path: Option<Vec<u8>> = if follow { wants.first().cloned() } else { None };
+    for entry in walk_log(store, &tips, &exclude, first_parent)? {
+        let path_wants: &[Vec<u8>] = if follow { &[] } else { &wants };
         if !commit_passes_filters(
             store,
             kind,
-            &record,
+            &entry.record,
             since,
             until,
             author_want.as_deref(),
-            &wants,
+            path_wants,
         )? {
             continue;
         }
-        shown.push((oid, record));
-        if limit.is_some_and(|max| shown.len() >= max) {
-            break;
+        if merges_only || no_merges {
+            let parents: Vec<Oid> = entry
+                .record
+                .parents()
+                .iter()
+                .filter_map(|head| head.as_git().copied())
+                .collect();
+            if merges_only && parents.len() < 2 {
+                continue;
+            }
+            if no_merges && parents.len() > 1 {
+                continue;
+            }
         }
+        if (needle.is_some() || pickaxe_regex.is_some())
+            && !commit_passes_pickaxe(
+                ctx,
+                store,
+                &entry.record,
+                &wants,
+                needle.as_deref().map(str::as_bytes),
+                pickaxe_regex.as_ref(),
+            )?
+        {
+            continue;
+        }
+        if follow {
+            let Some(current) = follow_path.clone() else {
+                continue;
+            };
+            match follow_step(ctx, store, &entry.record, &current, follow_mode)? {
+                None => continue,
+                Some(next) => follow_path = Some(next),
+            }
+        }
+        let origin = entry.origin;
+        shown.push(ShownCommit {
+            oid: entry.oid,
+            record: entry.record,
+            origin,
+        });
+    }
+    if simplify {
+        shown.retain(|shown| decorations.contains_key(&shown.oid));
+    }
+    if cherry_pick
+        && let Some((left, right)) = sym_sides
+    {
+        shown = cherry_pick_filter(ctx, store, &shown, left, right)?;
+    }
+    if topo_order {
+        shown = topo_reorder(shown, &tips);
+    }
+    if let Some(max) = limit {
+        shown.truncate(max);
     }
     if opts.is_set("reverse") {
         shown.reverse();
     }
+    // Boundary commits render after the list in committer-date order (they
+    // flip along with `--reverse`), each prefixed with `-`.
+    let mut boundary: Vec<(i64, Oid, CommitRecord)> = Vec::new();
+    if opts.is_set("boundary") {
+        let mut seen_boundary = HashSet::new();
+        for oid in &exclude {
+            let oid = replace_redirect(store, *oid);
+            if !seen_boundary.insert(oid) {
+                continue;
+            }
+            let Ok(record) = commit_record(store, oid) else {
+                continue;
+            };
+            boundary.push((super::state::commit_stamp(&record), oid, record));
+        }
+        boundary.sort_by(|left, right| right.0.cmp(&left.0));
+    }
     let graph = opts.is_set("graph");
+    let source = opts.is_set("source");
     let mut out = Vec::new();
-    for (oid, record) in &shown {
-        let decoration = decoration_text(&decorations, oid, full_names);
-        let mut block = render_commit_line(&line, oid, record, &decoration)?;
+    for shown in &shown {
+        let decoration = decoration_text(&decorations, &shown.oid, full_names);
+        let source_text =
+            source.then(|| tip_names.get(&shown.origin).cloned().unwrap_or_default());
+        let mut block = render_commit_line_full(
+            &line,
+            &shown.oid,
+            &shown.record,
+            &decoration,
+            source_text.as_deref().unwrap_or(""),
+        )?;
+        if show_notes
+            && let Some(note) = super::verbs_notes::note_for_commit(
+                store,
+                kind,
+                notes_default.as_deref(),
+                &shown.oid,
+            )?
+        {
+            block.extend_from_slice(&render_note(&note));
+        }
         if show_diffs {
             block.extend_from_slice(&log_commit_diff(
                 ctx,
                 store,
-                oid,
-                record,
+                &shown.oid,
+                &shown.record,
                 &opts,
                 rename_mode,
             )?);
+            if extra_stats {
+                block.extend_from_slice(&log_commit_extra(
+                    ctx,
+                    store,
+                    &shown.oid,
+                    &shown.record,
+                    &opts,
+                )?);
+            }
+        }
+        if left_right {
+            let marker = match sym_sides {
+                Some((left, _)) if shown.origin == left => b'<',
+                _ => b'>',
+            };
+            block.insert(0, marker);
         }
         if graph {
             block = graph_block(&block);
         }
         out.extend_from_slice(&block);
     }
+    for (_, oid, record) in &boundary {
+        let decoration = decoration_text(&decorations, oid, full_names);
+        let mut block = render_commit_line_full(&line, oid, record, &decoration, "")?;
+        block.insert(0, b'-');
+        if graph {
+            block = graph_block(&block);
+        }
+        out.extend_from_slice(&block);
+    }
+    // Boundary rows stay trailing after `--reverse`: they were the excluded
+    // tail before the flip, not part of the reversed walk.
     Ok(out)
+}
+
+/// One walked commit plus the tip it was first reached from, backing
+/// `--source` text and `--left-right` sides.
+struct ShownCommit {
+    /// Commit oid.
+    oid: Oid,
+    /// Parsed commit record.
+    record: CommitRecord,
+    /// Tip whose walk first reached this commit.
+    origin: Oid,
+}
+
+/// One walk step for [`walk_log`]: the commit plus its reaching tip.
+struct LogWalkEntry {
+    /// Commit oid.
+    oid: Oid,
+    /// Parsed commit record.
+    record: CommitRecord,
+    /// Tip whose walk first reached this commit.
+    origin: Oid,
+}
+
+/// Rewrites `--format:<value>` to `--format=<value>` before collecting.
+/// The wave contract spells the flag `--format:%H ...`, so the colon form
+/// is accepted as an alias of the oracle's `--format=` spelling.
+fn rewrite_format_colon(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|arg| match arg.strip_prefix("--format:") {
+            Some(value) => format!("--format={value}"),
+            None => arg.clone(),
+        })
+        .collect()
+}
+
+/// Extracts `--abbrev`/`--abbrev=<n>` before collecting: the flag takes an
+/// Extracts `--abbrev`/`--abbrev=<n>` before collecting: the flag takes an
+/// optional value, which [`collect`] cannot spell. Both spellings imply
+/// `--abbrev-commit`; the returned length defaults to 7 for the bare form.
+fn extract_abbrev_arg(args: &[String]) -> Result<(Vec<String>, Option<usize>), GitError> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut len = None;
+    for arg in args {
+        if arg == "--abbrev" {
+            kept.push("--abbrev-commit".to_owned());
+            len = Some(7);
+        } else if let Some(value) = arg.strip_prefix("--abbrev=") {
+            let parsed: usize = value.parse().map_err(|_| GitError::Invalid {
+                detail: format!("bad --abbrev={value:?}: want a prefix length"),
+            })?;
+            if parsed == 0 {
+                return Err(GitError::Invalid {
+                    detail: format!("bad --abbrev={value:?}: want a prefix length"),
+                });
+            }
+            kept.push("--abbrev-commit".to_owned());
+            len = Some(parsed);
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    Ok((kept, len))
+}
+
+/// Which ref namespace a `--branches`/`--tags`/`--remotes` filter covers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefScope {
+    /// `refs/heads/`.
+    Branches,
+    /// `refs/tags/`.
+    Tags,
+    /// `refs/remotes/`.
+    Remotes,
+}
+
+/// One `--branches[=<glob>]`/`--tags[=<glob>]`/`--remotes[=<glob>]` filter.
+/// A bare flag means `*`, the way the oracle lists the whole namespace.
+struct RefFilter {
+    /// Namespace to scan.
+    scope: RefScope,
+    /// Shell glob over the short (prefix-stripped) ref name.
+    pattern: String,
+}
+
+/// Extracts ref-listing filters before collecting: each takes an optional
+/// glob, which [`collect`] cannot spell. Unknown `--branch...` lookalikes
+/// stay for `collect` to reject.
+fn extract_ref_filter_args(args: &[String]) -> Result<(Vec<String>, Vec<RefFilter>), GitError> {
+    fn split(name: &str, arg: &str) -> Option<Option<String>> {
+        let rest = arg.strip_prefix(name)?;
+        if rest.is_empty() {
+            Some(None)
+        } else {
+            rest.strip_prefix('=').map(str::to_owned).map(Some)
+        }
+    }
+    let mut kept = Vec::with_capacity(args.len());
+    let mut filters = Vec::new();
+    for arg in args {
+        if let Some(pattern) = split("--branches", arg) {
+            filters.push(RefFilter {
+                scope: RefScope::Branches,
+                pattern: pattern.unwrap_or_else(|| "*".to_owned()),
+            });
+        } else if let Some(pattern) = split("--tags", arg) {
+            filters.push(RefFilter {
+                scope: RefScope::Tags,
+                pattern: pattern.unwrap_or_else(|| "*".to_owned()),
+            });
+        } else if let Some(pattern) = split("--remotes", arg) {
+            filters.push(RefFilter {
+                scope: RefScope::Remotes,
+                pattern: pattern.unwrap_or_else(|| "*".to_owned()),
+            });
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    for filter in &filters {
+        if filter.pattern.is_empty() {
+            return Err(GitError::Invalid {
+                detail: "empty ref pattern: want a shell glob".to_owned(),
+            });
+        }
+    }
+    Ok((kept, filters))
+}
+
+/// Extracts `--show-notes[=<ref>]` before collecting: the flag takes an
+/// optional notes ref, which [`collect`] cannot spell. `None` means the
+/// flag is absent, `Some(None)` the bare form (default notes ref).
+fn extract_show_notes_arg(
+    args: &[String],
+) -> Result<(Vec<String>, Option<Option<String>>), GitError> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut notes: Option<Option<String>> = None;
+    for arg in args {
+        if arg == "--show-notes" {
+            kept.push(arg.clone());
+            notes = Some(None);
+        } else if let Some(value) = arg.strip_prefix("--show-notes=") {
+            kept.push("--show-notes".to_owned());
+            notes = Some(if value.is_empty() {
+                None
+            } else {
+                Some(value.to_owned())
+            });
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    Ok((kept, notes))
+}
+
+/// Matches a shell glob over ref names: `*` spans any run, `?` one byte,
+/// everything else literal.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star = Some(pi);
+            pi += 1;
+            mark = ti;
+        } else if let Some(saved) = star {
+            pi = saved + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+/// Collects commit tips from `--all` plus every ref-listing filter,
+/// skipping `--exclude` globs (matched against the full and short ref
+/// names) and non-commit targets, the way the oracle expands revisions.
+/// Each tip carries its short ref name for `--source`.
+fn log_ref_tips(
+    store: &Store,
+    all: bool,
+    filters: &[RefFilter],
+    excludes: &[String],
+) -> Result<Vec<(Oid, String)>, GitError> {
+    if !all && filters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (name, target) in list_refs(store)? {
+        let full = name.to_utf8().unwrap_or_default().to_owned();
+        let (scope, short) = if let Some(short) = full.strip_prefix("refs/heads/") {
+            (RefScope::Branches, short)
+        } else if let Some(short) = full.strip_prefix("refs/tags/") {
+            (RefScope::Tags, short)
+        } else if let Some(short) = full.strip_prefix("refs/remotes/") {
+            (RefScope::Remotes, short)
+        } else {
+            continue;
+        };
+        if !all
+            && !filters
+                .iter()
+                .any(|filter| filter.scope == scope && glob_match(&filter.pattern, short))
+        {
+            continue;
+        }
+        if excludes
+            .iter()
+            .any(|glob| glob_match(glob, &full) || glob_match(glob, short))
+        {
+            continue;
+        }
+        if let Some(oid) = resolve_ref_target(store, Some(target))? {
+            if commit_record(store, oid).is_ok() && seen.insert(oid) {
+                out.push((oid, short_ref_name(&full).to_owned()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reports whether a positional names a path for DWIM fallback: it exists
+/// in the worktree, or equals (or contains) a path in the `HEAD` tree.
+fn dwim_path_exists(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    item: &str,
+) -> Result<bool, GitError> {
+    if ctx.file_base.join(item).exists() {
+        return Ok(true);
+    }
+    let Ok(head) = head_oid(store) else {
+        return Ok(false);
+    };
+    let Ok(record) = commit_record(store, head) else {
+        return Ok(false);
+    };
+    let Ok(tree) = commit_tree_oid(&record) else {
+        return Ok(false);
+    };
+    let Ok(entries) = flatten_tree(store, kind, tree) else {
+        return Ok(false);
+    };
+    let want = item.as_bytes();
+    Ok(entries
+        .iter()
+        .any(|(path, _, _)| path_wanted(path, want) || path_wanted(want, path)))
+}
+
+/// Walks `tips` in `git log` order (newest committer-date first, discovery
+/// order breaking ties) while skipping `exclude` and everything reachable
+/// from it, mirroring [`walk_history_excluding`]. When `first_parent` is
+/// set only the first parent is followed out of each merge. Every entry
+/// records the tip whose walk first reached it (first reach wins), backing
+/// `--source` and `--left-right`.
+fn walk_log(
+    store: &Store,
+    tips: &[Oid],
+    exclude: &[Oid],
+    first_parent: bool,
+) -> Result<Vec<LogWalkEntry>, GitError> {
+    use ruk_core::records::Records;
+    let records = Records::new(store);
+    let mut seen: HashSet<Oid> = HashSet::new();
+    let mut stack: Vec<Oid> = exclude.to_vec();
+    while let Some(oid) = stack.pop() {
+        let oid = replace_redirect(store, oid);
+        if !seen.insert(oid) {
+            continue;
+        }
+        let Ok(record) = walk_record(store, &records, oid) else {
+            continue;
+        };
+        for parent in record.parents() {
+            if let Some(parent_oid) = parent.as_git().copied() {
+                stack.push(parent_oid);
+            }
+        }
+    }
+    let mut queue = WalkQueue::new();
+    for oid in &seen {
+        queue.mark_seen(*oid);
+    }
+    let mut origins: HashMap<Oid, Oid> = HashMap::new();
+    for tip in tips {
+        origins.entry(*tip).or_insert(*tip);
+        queue.enqueue(store, &records, *tip)?;
+    }
+    let mut out = Vec::new();
+    while let Some((oid, record)) = queue.pop() {
+        let origin = origins.get(&oid).copied().unwrap_or(oid);
+        let parents: Vec<Oid> = record
+            .parents()
+            .iter()
+            .filter_map(|head| head.as_git().copied())
+            .collect();
+        let first: &[Oid] = match parents.first() {
+            Some(one) => std::slice::from_ref(one),
+            None => &[],
+        };
+        let next: &[Oid] = if first_parent { first } else { &parents };
+        for parent in next {
+            origins.entry(*parent).or_insert(origin);
+            queue.enqueue(store, &records, *parent)?;
+        }
+        out.push(LogWalkEntry {
+            oid,
+            record,
+            origin,
+        });
+    }
+    Ok(out)
+}
+
+/// Advances `--follow` one commit back: reports whether the commit touches
+/// `current`, plus the path to keep tracking (the pre-rename path when the
+/// commit renames it away). Rename pairing runs at 50% similarity when the
+/// caller's mode would pair nothing, the way the oracle implies rename
+/// detection for `--follow`.
+fn follow_step(
+    ctx: &Ctx,
+    store: &Store,
+    record: &CommitRecord,
+    current: &[u8],
+    mode: super::rename::RenameMode,
+) -> Result<Option<Vec<u8>>, GitError> {
+    let tree = commit_tree_oid(record)?;
+    let mut parent_tree = None;
+    if let Some(parent) = record
+        .parents()
+        .iter()
+        .filter_map(|head| head.as_git().copied())
+        .next()
+    {
+        parent_tree = Some(commit_tree_oid(&commit_record(store, parent)?)?);
+    }
+    let mut pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
+    let effective = match mode {
+        super::rename::RenameMode::Similar(_) => mode,
+        super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => {
+            super::rename::RenameMode::Similar(50)
+        }
+    };
+    apply_pair_renames(ctx, &mut pairs, effective)?;
+    for pair in &pairs {
+        if pair.path == current {
+            if let Some(old) = &pair.old_path {
+                if old != current {
+                    return Ok(Some(old.clone()));
+                }
+            }
+            return Ok(Some(current.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
+/// Counts non-empty needle occurrences in one blob body.
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// Reports whether a commit passes the pickaxe filters against its first
+/// parent: `-S` keeps commits changing the needle's occurrence count across
+/// the diff, `-G` keeps commits with an added/removed line matching the
+/// regex (binary sides are skipped for `-G`, counted raw for `-S`, as in
+/// git). Non-empty `wants` limits both to matching paths.
+fn commit_passes_pickaxe(
+    ctx: &Ctx,
+    store: &Store,
+    record: &CommitRecord,
+    wants: &[Vec<u8>],
+    needle: Option<&[u8]>,
+    pattern: Option<&Regex>,
+) -> Result<bool, GitError> {
+    let tree = commit_tree_oid(record)?;
+    let mut parent_tree = None;
+    if let Some(parent) = record
+        .parents()
+        .iter()
+        .filter_map(|head| head.as_git().copied())
+        .next()
+    {
+        parent_tree = Some(commit_tree_oid(&commit_record(store, parent)?)?);
+    }
+    for pair in &tree_pairs(ctx, parent_tree, Some(tree))? {
+        if !wants.is_empty() && !wants.iter().any(|want| path_wanted(&pair.path, want)) {
+            continue;
+        }
+        let (old_body, new_body) = pair_bodies(ctx, pair)?;
+        if let Some(needle) = needle {
+            let old_count =
+                count_occurrences(old_body.as_deref().unwrap_or_default(), needle);
+            let new_count =
+                count_occurrences(new_body.as_deref().unwrap_or_default(), needle);
+            if old_count != new_count {
+                return Ok(true);
+            }
+            continue;
+        }
+        if let Some(regex) = pattern {
+            let old = old_body.unwrap_or_default();
+            let new = new_body.unwrap_or_default();
+            if old.contains(&0) || new.contains(&0) {
+                continue;
+            }
+            let old_lines = split_lines(&old);
+            let new_lines = split_lines(&new);
+            for op in lcs_script(&old_lines, &new_lines) {
+                let changed = match op {
+                    DiffOp::Delete(line) | DiffOp::Insert(line) => line,
+                    DiffOp::Keep(_) => continue,
+                };
+                if regex.is_match(changed) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Fingerprints one commit's first-parent change for `--cherry-pick`: the
+/// sorted multiset of added/removed lines (binary sides contribute their
+/// path, the way a patch-id still distinguishes them), joined on NUL.
+fn patch_fingerprint(
+    ctx: &Ctx,
+    store: &Store,
+    record: &CommitRecord,
+) -> Result<Vec<u8>, GitError> {
+    let tree = commit_tree_oid(record)?;
+    let mut parent_tree = None;
+    if let Some(parent) = record
+        .parents()
+        .iter()
+        .filter_map(|head| head.as_git().copied())
+        .next()
+    {
+        parent_tree = Some(commit_tree_oid(&commit_record(store, parent)?)?);
+    }
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    for pair in &tree_pairs(ctx, parent_tree, Some(tree))? {
+        let (old_body, new_body) = pair_bodies(ctx, pair)?;
+        let old = old_body.unwrap_or_default();
+        let new = new_body.unwrap_or_default();
+        if old.contains(&0) || new.contains(&0) {
+            lines.push(pair.path.clone());
+            continue;
+        }
+        let old_lines = split_lines(&old);
+        let new_lines = split_lines(&new);
+        for op in lcs_script(&old_lines, &new_lines) {
+            match op {
+                DiffOp::Delete(line) | DiffOp::Insert(line) => lines.push(line.to_vec()),
+                DiffOp::Keep(_) => {}
+            }
+        }
+    }
+    lines.sort();
+    let mut out = Vec::new();
+    for line in &lines {
+        out.extend_from_slice(line);
+        out.push(0);
+    }
+    Ok(out)
+}
+
+/// Drops `--cherry-pick` commits for one `A...B` range: a commit whose
+/// change fingerprint also occurs on the other side is omitted on both
+/// sides, as in git. Commits reached via any other tip are always kept.
+fn cherry_pick_filter(
+    ctx: &Ctx,
+    store: &Store,
+    shown: &[ShownCommit],
+    left: Oid,
+    right: Oid,
+) -> Result<Vec<ShownCommit>, GitError> {
+    let mut prints: Vec<Vec<u8>> = Vec::with_capacity(shown.len());
+    for shown in shown {
+        prints.push(patch_fingerprint(ctx, store, &shown.record)?);
+    }
+    let mut left_counts: HashMap<&Vec<u8>, usize> = HashMap::new();
+    let mut right_counts: HashMap<&Vec<u8>, usize> = HashMap::new();
+    for (shown, print) in shown.iter().zip(prints.iter()) {
+        if shown.origin == left {
+            *left_counts.entry(print).or_default() += 1;
+        } else if shown.origin == right {
+            *right_counts.entry(print).or_default() += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(shown.len());
+    for (shown, print) in shown.into_iter().zip(prints.iter()) {
+        let duplicate = if shown.origin == left {
+            right_counts.contains_key(print)
+        } else if shown.origin == right {
+            left_counts.contains_key(print)
+        } else {
+            false
+        };
+        if !duplicate {
+            out.push(ShownCommit {
+                oid: shown.oid,
+                record: shown.record.clone(),
+                origin: shown.origin,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reorders walked commits into `--topo-order`: children before parents,
+/// with each branch kept contiguous. Iterative pre-order depth-first search
+/// from the tips (first parent first); commits unreachable from the tips
+/// cannot occur from [`walk_log`] and sweep last in oid order.
+fn topo_reorder(shown: Vec<ShownCommit>, tips: &[Oid]) -> Vec<ShownCommit> {
+    let mut slots: HashMap<Oid, ShownCommit> =
+        shown.into_iter().map(|shown| (shown.oid, shown)).collect();
+    let mut visited: HashSet<Oid> = HashSet::new();
+    let mut out = Vec::with_capacity(slots.len());
+    let mut stack: Vec<Oid> = Vec::new();
+    for tip in tips.iter().rev() {
+        if slots.contains_key(tip) {
+            stack.push(*tip);
+        }
+    }
+    while let Some(oid) = stack.pop() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        let Some(entry) = slots.remove(&oid) else {
+            continue;
+        };
+        let parents: Vec<Oid> = entry
+            .record
+            .parents()
+            .iter()
+            .filter_map(|head| head.as_git().copied())
+            .collect();
+        for parent in parents.iter().rev() {
+            if slots.contains_key(parent) {
+                stack.push(*parent);
+            }
+        }
+        out.push(entry);
+    }
+    if !slots.is_empty() {
+        let mut rest: Vec<Oid> = slots.keys().copied().collect();
+        rest.sort();
+        for oid in rest {
+            if visited.insert(oid) {
+                out.push(slots.remove(&oid).expect("leftover topo slot"));
+            }
+        }
+    }
+    out
+}
+
+/// Renders one commit's first-parent change in the extra stat shapes:
+/// `--summary` mode lines, `--numstat` added/deleted/path rows, `--shortstat`
+/// one-line totals, and `--dirstat` per-directory percentages. `--stat`
+/// itself still renders through the shared pair renderer in
+/// [`log_commit_diff`] so its bytes never depend on which extra shapes are
+/// also requested.
+fn log_commit_extra(
+    ctx: &Ctx,
+    store: &Store,
+    oid: &Oid,
+    record: &CommitRecord,
+    opts: &super::Collected,
+) -> Result<Vec<u8>, GitError> {
+    let tree = commit_tree_oid(record)?;
+    let mut parent_tree = None;
+    if let Some(parent) = commit_parents(store, *oid)?.first() {
+        parent_tree = Some(commit_tree_oid(&commit_record(store, *parent)?)?);
+    }
+    let changes = tree_file_changes(ctx, parent_tree, tree)?;
+    let mut out = Vec::new();
+    if opts.is_set("summary") {
+        out.extend_from_slice(&render_mode_lines(&changes));
+    }
+    if opts.is_set("numstat") {
+        out.extend_from_slice(&render_numstat(&changes));
+    }
+    if opts.is_set("shortstat") {
+        let (added, removed) = stat_totals(&changes);
+        out.extend_from_slice(&stat_summary(changes.len(), added, removed));
+    }
+    if opts.is_set("dirstat") {
+        out.extend_from_slice(&render_dirstat(&changes));
+    }
+    Ok(out)
+}
+
+/// Renders `--numstat` rows: `added<TAB>deleted<TAB>path`, `-` counts for
+/// binaries, `old => new` for renames, in display-path order.
+fn render_numstat(changes: &[FileChange]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for change in changes {
+        let name = stat_name(change);
+        if change.binary {
+            out.extend_from_slice(format!("-\t-\t{name}\n").as_bytes());
+        } else {
+            out.extend_from_slice(format!("{}\t{}\t{name}\n", change.added, change.removed).as_bytes());
+        }
+    }
+    out
+}
+
+/// Renders `--dirstat` rows: changed lines per top-level directory as a
+/// percentage of the commit's changed lines, hottest first. Root-level
+/// files group under their own name.
+fn render_dirstat(changes: &[FileChange]) -> Vec<u8> {
+    let mut per_dir: HashMap<String, usize> = HashMap::new();
+    let mut total = 0;
+    for change in changes {
+        let lines = change.added + change.removed;
+        total += lines;
+        let path = String::from_utf8_lossy(&display_path(change)).into_owned();
+        let dir = match path.find('/') {
+            Some(index) => format!("{}/", &path[..index]),
+            None => path,
+        };
+        *per_dir.entry(dir).or_default() += lines;
+    }
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut rows: Vec<(String, usize)> = per_dir.into_iter().collect();
+    rows.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut out = Vec::new();
+    for (dir, lines) in &rows {
+        let percent = 100.0 * *lines as f64 / total as f64;
+        out.extend_from_slice(format!("{percent:5.1}%  {dir}\n").as_bytes());
+    }
+    out
+}
+
+/// Renders one note for `--show-notes` the way the oracle appends it after
+/// the message: a `Notes:` header with the body indented four spaces.
+fn render_note(note: &[u8]) -> Vec<u8> {
+    let mut out = b"Notes:\n".to_vec();
+    let mut text = note;
+    while text.last() == Some(&b'\n') {
+        text = &text[..text.len() - 1];
+    }
+    for line in text.split(|byte| *byte == b'\n') {
+        out.extend_from_slice(b"    ");
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    out
 }
 
 /// Parses `--max-count` once for the verbs that limit history output.
@@ -4113,28 +5526,44 @@ fn parse_since_until(opts: &super::Collected, name: &str) -> Result<Option<i64>,
 }
 
 /// Builds the shared identity-line rendering for `log` and `show` from
-/// `--oneline`/`--pretty`/`--format`/`--abbrev-commit`.
+/// `--oneline`/`--pretty`/`--format`/`--abbrev-commit`, plus the
+/// log-only `--date`/`--relative-date` shapes (`show` never declares those
+/// flags, so it always renders the default shape).
 fn commit_line_of(opts: &super::Collected) -> Result<CommitLine, GitError> {
     let mut oneline = opts.is_set("oneline");
+    let mut pretty = PrettyKind::Default;
     let mut format = match opts.single("format")? {
-        Some(text) => Some(parse_log_format(&text)?),
+        Some(text) => Some(parse_log_format(strip_format_prefix(&text))?),
         None => None,
     };
     if format.is_none() {
         if let Some(text) = opts.single("pretty")? {
-            if text == "oneline" {
-                oneline = true;
-            } else if ["short", "medium", "full", "fuller"].contains(&text.as_str()) {
-                oneline = false;
-            } else {
-                format = parse_pretty_arg(&text)?;
+            match text.as_str() {
+                "oneline" => oneline = true,
+                "short" | "medium" => oneline = false,
+                "full" => pretty = PrettyKind::Full,
+                "fuller" => pretty = PrettyKind::Fuller,
+                "email" => pretty = PrettyKind::Email,
+                "raw" => pretty = PrettyKind::Raw,
+                _ => format = parse_pretty_arg(&text)?,
             }
         }
+    }
+    let mut date = match opts.single("date")? {
+        Some(text) => parse_date_mode(&text)?,
+        None => DateMode::Default,
+    };
+    if date == DateMode::Default && opts.is_set("relative-date") {
+        date = DateMode::Relative;
     }
     Ok(CommitLine {
         oneline,
         format,
         abbrev: opts.is_set("abbrev-commit"),
+        abbrev_len: 7,
+        pretty,
+        date,
+        now: now_seconds()?,
     })
 }
 
@@ -4177,6 +5606,9 @@ fn commit_passes_filters(
 
 /// Renders one log commit's change against its first parent, reusing the
 /// shared pair renderer so `--stat`/`-p` spellings match `diff` and `show`.
+/// When only the extra stat shapes (`--summary`/`--shortstat`/`--numstat`/
+/// `--dirstat`) are requested, no patch prints: those render separately in
+/// [`log_commit_extra`].
 fn log_commit_diff(
     ctx: &Ctx,
     store: &Store,
@@ -4185,6 +5617,17 @@ fn log_commit_diff(
     opts: &super::Collected,
     rename_mode: super::rename::RenameMode,
 ) -> Result<Vec<u8>, GitError> {
+    let extra_only = (opts.is_set("summary")
+        || opts.is_set("shortstat")
+        || opts.is_set("numstat")
+        || opts.is_set("dirstat"))
+        && !(opts.is_set("patch")
+            || opts.is_set("stat")
+            || opts.is_set("name-only")
+            || opts.is_set("name-status"));
+    if extra_only {
+        return Ok(Vec::new());
+    }
     let tree = commit_tree_oid(record)?;
     let mut parent_tree = None;
     if let Some(parent) = commit_parents(store, *oid)?.first() {
