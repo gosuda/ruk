@@ -6043,15 +6043,18 @@ fn log_date_shapes_and_abbrev() {
         &["--format=%ad", "--date=short", "-n", "1"],
     )
     .expect("date short");
-    let out = run(
+    let strict_out = run(
         verbs_history::log,
         &mut ctx,
         &["--format=%ad", "--date=iso-strict", "-n", "1"],
     )
     .expect("date iso-strict");
-    let text = String::from_utf8_lossy(&out).trim().to_owned();
-    assert!(text.contains('T'), "got {text}");
-    assert!(text.contains('+') || text.contains('-'), "got {text}");
+    let strict_text = String::from_utf8_lossy(&strict_out).trim().to_owned();
+    assert!(strict_text.contains('T'), "got {strict_text}");
+    assert!(
+        strict_text.contains('+') || strict_text.contains('-'),
+        "got {strict_text}"
+    );
     let text = String::from_utf8_lossy(&out).trim().to_owned();
     assert_eq!(text.len(), 10, "got {text}");
     assert_eq!(text.as_bytes()[4], b'-', "got {text}");
