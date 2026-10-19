@@ -7422,3 +7422,21 @@ fn wave_j_status_verbose_column_renames() {
     assert!(!text.contains("diff --git a/f.txt b/g.txt\n"), "no pair: {text}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
+
+#[test]
+fn wave_j_switch_merge_guard() {
+    let (root, env) = seeded_repo("wavej-mergeguard", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    run(verbs_branch::branch, &mut ctx, &["side"]).expect("branch");
+    run(verbs_branch::checkout, &mut ctx, &["side"]).expect("checkout side");
+    std::fs::write(root.join("f.txt"), b"side\n").expect("modify");
+    run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
+    run(verbs_history::commit, &mut ctx, &["-m", "side work"]).expect("commit");
+    run(verbs_branch::checkout, &mut ctx, &["main"]).expect("back");
+    std::fs::write(root.join("f.txt"), b"dirty\n").expect("dirty");
+    let err = run(verbs_branch::switch, &mut ctx, &["-m", "side"]).expect_err("merge refuses");
+    assert!(err.to_string().contains("overwritten"), "got {err:?}");
+    run(verbs_branch::reset, &mut ctx, &["--hard", "HEAD"]).expect("clean");
+    run(verbs_branch::switch, &mut ctx, &["-m", "side"]).expect("merge clean");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}

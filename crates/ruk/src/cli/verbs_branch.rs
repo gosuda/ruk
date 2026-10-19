@@ -312,10 +312,18 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         return copy_branch(ctx, &opts);
     }
     if opts.is_set("edit-description") {
-        return Err(GitError::Unsupported {
-            command: "branch --edit-description needs an editor, which this store does not run"
-                .to_owned(),
-        });
+        if opts.is_set("delete")
+            || opts.is_set("force-delete")
+            || opts.is_set("move")
+            || opts.is_set("force-move")
+            || opts.is_set("copy")
+            || opts.is_set("force-copy")
+        {
+            return Err(GitError::Invalid {
+                detail: "cannot combine --edit-description with another action".to_owned(),
+            });
+        }
+        return edit_branch_description(ctx, &opts);
     }
     if opts.is_set("track") && opts.is_set("no-track") {
         return Err(GitError::Invalid {
@@ -547,6 +555,103 @@ fn unset_branch_upstream(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, 
     if config_read(store, &merge_key)?.is_some() {
         config_unset(store, &merge_key)?;
     }
+    Ok(Vec::new())
+}
+
+static EDIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Resolves the editor the way `var GIT_EDITOR` does: `GIT_EDITOR`, then
+/// `core.editor`, then `VISUAL`, then `EDITOR`.
+fn resolve_editor(ctx: &Ctx) -> Option<String> {
+    ctx.env
+        .get("GIT_EDITOR")
+        .map(str::to_owned)
+        .or_else(|| ctx.config_get("core.editor"))
+        .or_else(|| ctx.env.get("VISUAL").map(str::to_owned))
+        .or_else(|| ctx.env.get("EDITOR").map(str::to_owned))
+}
+
+/// Edits `initial` in the configured editor, returning the saved bytes.
+///
+/// Headless callers (tests, the IPC daemon) never reach the spawn: without
+/// a terminal on stdin the verb fails exactly where the oracle fails
+/// instead of hanging. A missing editor or a failing editor is an `Invalid`
+/// configuration error, not an unimplemented path.
+fn run_editor(ctx: &Ctx, initial: &[u8], suffix: &str) -> Result<Vec<u8>, GitError> {
+    let editor = resolve_editor(ctx).ok_or_else(|| GitError::Invalid {
+        detail: "no editor configured (set GIT_EDITOR or core.editor)".to_owned(),
+    })?;
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(GitError::Invalid {
+            detail: "cannot run an interactive editor without a terminal".to_owned(),
+        });
+    }
+    let nonce = EDIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!(
+        "ruk-edit-{}-{}{suffix}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::write(&path, initial).map_err(|err| GitError::Io {
+        detail: format!("writing {}: {err}", path.display()),
+    })?;
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("false");
+    let status = std::process::Command::new(program)
+        .args(parts.collect::<Vec<_>>())
+        .arg(&path)
+        .status()
+        .map_err(|err| GitError::Io {
+            detail: format!("starting editor {editor:?}: {err}"),
+        })?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return Err(GitError::Invalid {
+            detail: format!("editor {editor:?} exited with {status}"),
+        });
+    }
+    let edited = std::fs::read(&path).map_err(|err| GitError::Io {
+        detail: format!("reading {}: {err}", path.display()),
+    })?;
+    let _ = std::fs::remove_file(&path);
+    Ok(edited)
+}
+
+/// Edits a branch's `branch.<name>.description` in the configured editor.
+///
+/// Oracle: `git/builtin/branch.c` (`edit_branch_description`). With no
+/// positional the current branch is edited; the branch must exist.
+fn edit_branch_description(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let short = match opts.positionals.as_slice() {
+        [] => current_branch_name(store)?
+            .and_then(|full| {
+                full.strip_prefix("refs/heads/")
+                    .map(str::to_owned)
+                    .or(Some(full))
+            })
+            .ok_or_else(|| GitError::Invalid {
+                detail: "not on a branch".to_owned(),
+            })?,
+        [name] => name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(name)
+            .to_owned(),
+        _ => {
+            return Err(GitError::Invalid {
+                detail: "usage: branch --edit-description [<branch>]".to_owned(),
+            });
+        }
+    };
+    if super::state::read_ref(store, &branch_name(&short)?)?.is_none() {
+        return Err(GitError::NotFound {
+            detail: format!("branch {short:?} does not exist"),
+        });
+    }
+    let key = format!("branch.{short}.description");
+    let initial = config_read(store, &key)?.unwrap_or_default();
+    let edited = run_editor(ctx, initial.as_bytes(), ".md")?;
+    config_write(store, &key, &String::from_utf8_lossy(&edited))?;
     Ok(Vec::new())
 }
 
@@ -1515,6 +1620,12 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
     if opts.is_set("track") {
         return checkout_new_branch_tracked(ctx, &opts);
     }
+    if opts.is_set("merge")
+        && (opts.single("branch")?.is_some() || opts.single("force-branch")?.is_some())
+    {
+        let start = opts.positionals.first().map(String::as_str);
+        switch_merge_guard(ctx, guard_tree_for(ctx, start)?)?;
+    }
     if let Some(name) = opts.single("branch")? {
         let start = opts.positionals.first().map(String::as_str);
         let out = checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?;
@@ -1588,6 +1699,8 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             }
             // `--guess` is the default: a lone name matching one
             // remote-tracking branch creates it locally, like `switch`.
+            // With `--merge` the guessed target is guarded inside
+            // `switch_guessing`; a local branch is guarded here.
             if !opts.is_set("no-guess") {
                 let store = ctx.store()?;
                 if branch_name(rev).is_ok()
@@ -1600,7 +1713,18 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
                         true,
                         opts.is_set("quiet"),
                         !opts.is_set("no-track"),
+                        opts.is_set("merge"),
                     );
+                }
+            }
+            if opts.is_set("merge") {
+                if let Ok(name) = branch_name(rev) {
+                    let store = ctx.store()?;
+                    if let Some(target) = super::state::read_ref(store, &name)? {
+                        if let Some(tip) = peel_direct(&target) {
+                            switch_merge_guard(ctx, tree_for_tip(ctx, tip)?)?;
+                        }
+                    }
                 }
             }
             switch_to_rev(ctx, rev, opts.is_set("quiet"))
@@ -1869,6 +1993,19 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     let worktree_only = opts.is_set("worktree") && !opts.is_set("staged");
     if let Some(stage) = conflict_stage {
         return checkout_conflict_paths(ctx, tree_paths, stage, staged_only, worktree_only);
+    }
+    // `-m` on clean paths is vacuous: the restore below already carries
+    // local state. Unmerged paths need real conflict recreation.
+    if opts.is_set("merge") {
+        for wanted in tree_paths {
+            let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
+            let rows = read_path_rows(store, kind, &path)?;
+            if rows.iter().any(|(stage, _, _)| *stage != Stage::Zero) {
+                return Err(GitError::Unsupported {
+                    command: "checkout -m with unmerged paths needs the merge lane".to_owned(),
+                });
+            }
+        }
     }
     // Tree entries carry their own modes; index entries already hold
     // `FileMode`. The index map is built lazily: tree-sourced restores
@@ -2151,15 +2288,22 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         }
         return switch_orphan(ctx, &orphan, opts.is_set("quiet"));
     }
+    // `--merge` refuses clobbering local work before any ref or file moves;
+    // clean trees take the normal switch, whose result matches a true merge.
+    if opts.is_set("merge")
+        && (opts.single("create")?.is_some() || opts.single("force-create")?.is_some())
+    {
+        let start = opts.positionals.first().map(String::as_str);
+        switch_merge_guard(ctx, guard_tree_for(ctx, start)?)?;
+    }
     if let Some(name) = opts.single("create")? {
         let start = opts.positionals.first().map(String::as_str);
         let out = checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?;
-        if opts.is_set("track")
-            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
-        {
+        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
-                    detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
+                    detail: "cannot set up tracking information; starting point is HEAD"
+                        .to_owned(),
                 });
             };
             record_tracking(ctx.store()?, &name, start)?;
@@ -2169,12 +2313,11 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     if let Some(name) = opts.single("force-create")? {
         let start = opts.positionals.first().map(String::as_str);
         let out = checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"))?;
-        if opts.is_set("track")
-            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
-        {
+        if opts.is_set("track") || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track")) {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
-                    detail: "cannot set up tracking information; starting point is HEAD".to_owned(),
+                    detail: "cannot set up tracking information; starting point is HEAD"
+                        .to_owned(),
                 });
             };
             record_tracking(ctx.store()?, &name, start)?;
@@ -2195,17 +2338,19 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             if opts.is_set("detach") {
                 let store = ctx.store()?;
                 let tip = resolve_rev(store, ctx.kind()?, branch)?;
+                if opts.is_set("merge") {
+                    let tree = peel_to_tree(store, ctx.kind()?, tip)?;
+                    switch_merge_guard(ctx, tree)?;
+                }
                 return detach_at(ctx, tip);
             }
-            // `--merge` keeps the current behavior: worktree updates already
-            // carry local changes across the switch, and `--conflict` was
-            // validated above for that merge.
             switch_guessing(
                 ctx,
                 branch,
                 !opts.is_set("no-guess"),
                 opts.is_set("quiet"),
                 !opts.is_set("no-track"),
+                opts.is_set("merge"),
             )
         }
         _ => Err(GitError::Invalid {
@@ -2248,6 +2393,15 @@ fn switch_orphan(ctx: &mut Ctx, name: &str, quiet: bool) -> Result<Vec<u8>, GitE
     Ok(Vec::new())
 }
 
+/// Resolves one commit oid to its tree for switch guards.
+fn tree_for_tip(ctx: &Ctx, tip: Oid) -> Result<Oid, GitError> {
+    let store = ctx.store()?;
+    match super::state::commit_record(store, tip) {
+        Ok(record) => commit_tree_oid(&record),
+        Err(_) => peel_to_tree(store, ctx.kind()?, tip),
+    }
+}
+
 /// Switches to a branch, guessing a remote-tracking start when missing,
 /// reporting the switch on stderr like the oracle.
 fn switch_guessing(
@@ -2256,11 +2410,19 @@ fn switch_guessing(
     guess: bool,
     quiet: bool,
     track: bool,
+    merge: bool,
 ) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     if let Ok(name) = branch_name(branch) {
         if super::state::read_ref(store, &name)?.is_some() {
+            if merge {
+                let tip = super::state::read_ref(store, &name)?
+                    .and_then(|target| peel_direct(&target));
+                if let Some(tip) = tip {
+                    switch_merge_guard(ctx, tree_for_tip(ctx, tip)?)?;
+                }
+            }
             switch_head_to(ctx, HeadRef::Symbolic(name))?;
             if !quiet {
                 ctx.emit_stderr(format!("Switched to branch '{branch}'\n").as_bytes());
@@ -2275,6 +2437,9 @@ fn switch_guessing(
                 RefTarget::Symbolic(_) => None,
             });
             if let Some(target) = target {
+                if merge {
+                    switch_merge_guard(ctx, tree_for_tip(ctx, target)?)?;
+                }
                 create_branch(store, kind, branch, target)?;
                 if track {
                     let remote = tracked.to_utf8().unwrap_or_default().to_owned();
@@ -2644,39 +2809,17 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
     Ok(())
 }
 
-/// Resets `HEAD` and the index to `target` while keeping local changes:
-/// paths differing between old and new trees with staged or worktree edits
-/// refuse before anything moves; otherwise only differing paths touch the
-/// worktree so unrelated edits stay.
-fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> {
-    let store = ctx.store()?;
-    let kind = ctx.kind()?;
-    let old_tip = head_oid(store)?;
-    let old_record = super::state::commit_record(store, old_tip)?;
-    let old_tree = commit_tree_oid(&old_record)?;
-    let new_record = super::state::commit_record(store, target)?;
-    let new_tree = commit_tree_oid(&new_record)?;
-    let mut old_map = std::collections::BTreeMap::new();
-    for (path, mode, oid) in flatten_tree(store, kind, old_tree)? {
-        old_map.insert(path, (mode, oid));
-    }
-    let mut new_map = std::collections::BTreeMap::new();
-    for (path, mode, oid) in flatten_tree(store, kind, new_tree)? {
-        new_map.insert(path, (mode, oid));
-    }
-    let mut union: Vec<Vec<u8>> = old_map.keys().cloned().collect();
-    for path in new_map.keys() {
-        if !union.contains(path) {
-            union.push(path.clone());
-        }
-    }
-    let mut differing: Vec<Vec<u8>> = Vec::new();
-    for path in &union {
-        if old_map.get(path) != new_map.get(path) {
-            differing.push(path.clone());
-        }
-    }
-    // Stage check: staged rows on differing paths must match the old tree.
+/// Names every differing path whose staged rows or worktree bytes diverge
+/// from the old tree: staged deletions/additions, non-zero stages, and
+/// edited or newly present worktree files. Callers refuse these instead of
+/// clobbering local work.
+fn merge_blocked_paths(
+    ctx: &Ctx,
+    store: &Store,
+    kind: HashKind,
+    old_map: &std::collections::BTreeMap<Vec<u8>, (TreeMode, Oid)>,
+    differing: &[Vec<u8>],
+) -> Result<Vec<String>, GitError> {
     let rows = scan_index(store, kind)?;
     let mut staged_by_path: std::collections::BTreeMap<Vec<u8>, Vec<(Stage, IndexEntry)>> =
         std::collections::BTreeMap::new();
@@ -2687,7 +2830,7 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
             .push((*stage, entry.clone()));
     }
     let mut blocked: Vec<String> = Vec::new();
-    for path in &differing {
+    for path in differing {
         let clean_staged = match (old_map.get(path), staged_by_path.get(path)) {
             (Some((mode, oid)), Some(stages)) => {
                 stages.len() == 1
@@ -2723,6 +2866,97 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
             }
         }
     }
+    Ok(blocked)
+}
+
+/// Guards a merging branch switch (`switch -m`, `checkout -m <rev>`): paths
+/// differing between the current `HEAD` tree and `new_tree` that carry
+/// staged or worktree edits refuse before anything moves. Clean trees pass
+/// through to the normal switch, whose result then matches a true merge.
+fn switch_merge_guard(ctx: &Ctx, new_tree: Oid) -> Result<(), GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let old_map = match head_oid(store) {
+        Ok(tip) => {
+            let record = super::state::commit_record(store, tip)?;
+            let old_tree = commit_tree_oid(&record)?;
+            let mut map = std::collections::BTreeMap::new();
+            for (path, mode, oid) in flatten_tree(store, kind, old_tree)? {
+                map.insert(path, (mode, oid));
+            }
+            map
+        }
+        // Unborn `HEAD` has no old blobs: every new path is differing.
+        Err(_) => std::collections::BTreeMap::new(),
+    };
+    let mut new_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, new_tree)? {
+        new_map.insert(path, (mode, oid));
+    }
+    let mut differing: Vec<Vec<u8>> = Vec::new();
+    for path in old_map.keys().chain(new_map.keys()) {
+        if old_map.get(path) != new_map.get(path) && !differing.contains(path) {
+            differing.push(path.clone());
+        }
+    }
+    let mut blocked = merge_blocked_paths(ctx, store, kind, &old_map, &differing)?;
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    blocked.sort();
+    Err(GitError::Invalid {
+        detail: format!(
+            "local changes would be overwritten by switch: {}",
+            blocked.join(", ")
+        ),
+    })
+}
+
+/// Resolves a start point to its tree for merge-guard purposes, peeling
+/// non-commit targets the way path restores do.
+fn guard_tree_for(ctx: &Ctx, rev: Option<&str>) -> Result<Oid, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let oid = resolve_branch_target(store, kind, rev)?;
+    match super::state::commit_record(store, oid) {
+        Ok(record) => commit_tree_oid(&record),
+        Err(_) => peel_to_tree(store, kind, oid),
+    }
+}
+
+/// Resets `HEAD` and the index to `target` while keeping local changes:
+/// paths differing between old and new trees with staged or worktree edits
+/// refuse before anything moves; otherwise only differing paths touch the
+/// worktree so unrelated edits stay.
+fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> {
+    let store = ctx.store()?;
+    let kind = ctx.kind()?;
+    let old_tip = head_oid(store)?;
+    let old_record = super::state::commit_record(store, old_tip)?;
+    let old_tree = commit_tree_oid(&old_record)?;
+    let new_record = super::state::commit_record(store, target)?;
+    let new_tree = commit_tree_oid(&new_record)?;
+    let mut old_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, old_tree)? {
+        old_map.insert(path, (mode, oid));
+    }
+    let mut new_map = std::collections::BTreeMap::new();
+    for (path, mode, oid) in flatten_tree(store, kind, new_tree)? {
+        new_map.insert(path, (mode, oid));
+    }
+    let mut union: Vec<Vec<u8>> = old_map.keys().cloned().collect();
+    for path in new_map.keys() {
+        if !union.contains(path) {
+            union.push(path.clone());
+        }
+    }
+    let mut differing: Vec<Vec<u8>> = Vec::new();
+    for path in &union {
+        if old_map.get(path) != new_map.get(path) {
+            differing.push(path.clone());
+        }
+    }
+    let mut blocked = merge_blocked_paths(ctx, store, kind, &old_map, &differing)?;
     if !blocked.is_empty() {
         blocked.sort();
         return Err(GitError::Invalid {
@@ -4393,9 +4627,9 @@ pub(crate) fn tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         }
         return Ok(out);
     }
-    if opts.is_set("edit") {
-        return Err(GitError::Unsupported {
-            command: "tag --edit needs an editor, which this store does not run".to_owned(),
+    if opts.is_set("edit") && opts.is_set("list") {
+        return Err(GitError::Invalid {
+            detail: "cannot combine --edit and --list".to_owned(),
         });
     }
     if let Some(mode) = opts.single("cleanup")? {
@@ -4775,6 +5009,7 @@ fn create_tag(
     let pointed = if opts.is_set("annotate")
         || opts.single("message")?.is_some()
         || opts.single("file")?.is_some()
+        || opts.is_set("edit")
     {
         let raw = match opts.single("message")? {
             Some(text) => text.into_bytes(),
@@ -4787,6 +5022,19 @@ fn create_tag(
                 }
                 None => format!("tag {name}\n").into_bytes(),
             },
+        };
+        // `-e` opens the message above in the editor; an empty result
+        // aborts the tag the way the oracle refuses empty messages.
+        let raw = if opts.is_set("edit") {
+            let edited = run_editor(ctx, &raw, ".md")?;
+            if edited.iter().all(|byte| byte.is_ascii_whitespace()) {
+                return Err(GitError::Invalid {
+                    detail: "empty tag message".to_owned(),
+                });
+            }
+            edited
+        } else {
+            raw
         };
         let message = apply_tag_cleanup(&raw, &cleanup);
         let (object_kind, _) = read_object_bytes(store, oid)?;
