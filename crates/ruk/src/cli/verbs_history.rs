@@ -4,10 +4,10 @@
 //! | verb | backing | status |
 //! | --- | --- | --- |
 //! | `commit` | tree build + `ops::new`/`ops::edit` + branch move | implemented (multi `-m`, `-a`, `--amend`, `--allow-empty`, `-q`, `-C`/`-c`, `--author`, `--date`, `--dry-run`, `--no-verify` no-op) |
-//! | `merge` | ancestor check + fast-forward | implemented (fast-forward only; content merge is `Unsupported`) |
-//! | `rebase` | no-op detection | partial (up-to-date succeeds; replay is `Unsupported`) |
-//! | `cherry-pick` | revision resolution | partial (sequencer readers real; content application is `Unsupported`; parses `-n`, `-m`, `-e`, `-x`, `--skip`) |
-//! | `revert` | revision resolution | partial (same shape as `cherry-pick`; parses `-n`, `-m`, `-e`, `--skip`) |
+//! | `merge` | fast-forward fast-path + three-way lane | implemented (syntax lane first, bounded text fallback; `--no-ff`, `--ff-only`, `--continue`/`--abort`/`--quit`, `MERGE_HEAD` + stages 1/2/3 on conflict) |
+//! | `rebase` | range replay over the lane | implemented (`<upstream>` and `--onto`, `--continue`/`--skip`/`--abort`; drops merge commits, no branch switching) |
+//! | `cherry-pick` | per-commit replay over the lane | implemented (`-n`, `-m`, `-x`, `--continue`/`--skip`/`--abort`, `CHERRY_PICK_HEAD`) |
+//! | `revert` | inverse replay over the lane | implemented (`-n`, `-m`, `--continue`/`--skip`/`--abort`, `REVERT_HEAD`) |
 //! | `log` | commit ancestry walk | implemented (oneline, format/pretty, ranges, paths, stat/patch, filters, decorate, graph) |
 //! | `show` | commit read + tree diff, or blob bytes | implemented (format/pretty, stat/patch, `rev:path` blob form) |
 //! | `diff` | tree/index/worktree compare + line differ | implemented (`--cached`/`--staged`, ranges, stat/patch, `-U`, name-status, paths) |
@@ -145,6 +145,24 @@ pub(crate) fn commit(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         refresh_tracked(ctx)?;
     }
     let rows = scan_index(store, kind)?;
+    // An explicit `commit` over a conflicted merge concludes it the way the
+    // oracle does: two parents and the pending merge message.
+    if pseudo_read_oid(store, "MERGE_HEAD")?.is_some() {
+        if opts.is_set("amend") {
+            return Err(GitError::Invalid {
+                detail: "cannot amend while merging".to_owned(),
+            });
+        }
+        let message = if opts.is_set("message")
+            || opts.is_set("reuse-message")
+            || opts.is_set("reedit-message")
+        {
+            Some(commit_message(&opts, store, kind)?)
+        } else {
+            None
+        };
+        return conclude_merge(ctx, message);
+    }
     let tree = build_index_tree(store, kind, &merged_rows(&rows))?;
     let message = commit_message(&opts, store, kind)?;
     let author_text = opts.single("author")?;
@@ -1776,9 +1794,12 @@ pub(crate) fn merge_fast_forward(
     }
 }
 
-/// Reapplies commits on another base. Only the trivial case completes.
+/// Reapplies commits on another base, one three-way replay per commit.
 ///
-/// Oracle: `git/builtin/rebase.c`.
+/// Oracle: `git/builtin/rebase.c`. Supports `rebase <upstream>` and
+/// `rebase --onto <new> <upstream>`; switching branches mid-rebase stays
+/// `Unsupported`, and merge commits in the replayed range are dropped the
+/// way the oracle drops them without `--rebase-merges`.
 pub(crate) fn rebase(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let specs = [
         FlagSpec {
@@ -1797,6 +1818,11 @@ pub(crate) fn rebase(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             takes_value: false,
         },
         FlagSpec {
+            long: "skip",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
             long: "onto",
             short: None,
             takes_value: true,
@@ -1804,31 +1830,161 @@ pub(crate) fn rebase(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     ];
     let opts = collect(args, &specs)?;
     ctx.require_worktree()?;
-    if opts.is_set("abort") || opts.is_set("quit") {
-        return no_sequencer("rebase", "abort");
+    if opts.is_set("abort") {
+        return pick_abort(ctx, "rebase", None);
+    }
+    if opts.is_set("quit") {
+        return pick_quit(ctx, "rebase", None);
     }
     if opts.is_set("continue") {
-        return no_sequencer("rebase", "continue");
+        return rebase_continue(ctx);
+    }
+    if opts.is_set("skip") {
+        return rebase_skip(ctx);
     }
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    let onto = match opts.single("onto")? {
-        Some(rev) => resolve_rev(store, kind, &rev)?,
+    let (onto, upstream) = match opts.single("onto")? {
+        Some(rev) => {
+            let onto = resolve_rev(store, kind, &rev)?;
+            let upstream = match opts.positionals.first() {
+                Some(rev) => resolve_rev(store, kind, rev)?,
+                None => {
+                    return Err(GitError::Invalid {
+                        detail: "usage: rebase --onto <newbase> <upstream>".to_owned(),
+                    });
+                }
+            };
+            if opts.positionals.len() > 1 {
+                return Err(GitError::Unsupported {
+                    command: "rebase with a branch to check out".to_owned(),
+                });
+            }
+            (onto, upstream)
+        }
         None => {
-            let rev = opts.positionals.first().ok_or_else(|| GitError::Invalid {
-                detail: "usage: rebase <upstream>".to_owned(),
-            })?;
-            resolve_rev(store, kind, rev)?
+            if opts.positionals.len() != 1 {
+                return Err(GitError::Invalid {
+                    detail: "usage: rebase <upstream>".to_owned(),
+                });
+            }
+            let upstream = resolve_rev(store, kind, &opts.positionals[0])?;
+            (upstream, upstream)
         }
     };
     let current = head_oid(store)?;
+    let label = branch_label_of(ctx)?;
     if current == onto {
-        let label = branch_label_of(ctx)?;
         return Ok(format!("Current branch {label} is up to date.\n").into_bytes());
     }
-    Err(GitError::Unsupported {
-        command: "rebase replay needs the merge lane".to_owned(),
-    })
+    let range = rev_range(store, current, upstream)?;
+    if range.is_empty() {
+        return Ok(format!("Current branch {label} is up to date.\n").into_bytes());
+    }
+    // A rebase moves the branch even before replaying, so it needs a
+    // pristine index; staged changes would be silently re-homed otherwise.
+    let rows = require_clean_index(store, kind)?;
+    let index_tree = build_index_tree(store, kind, &merged_rows(&rows))?;
+    let current_tree = commit_tree_oid(&commit_record(store, current)?)?;
+    if index_tree != current_tree {
+        return Err(GitError::Invalid {
+            detail: "cannot rebase: Your index contains uncommitted changes.".to_owned(),
+        });
+    }
+    if is_ancestor(store, current, onto)? {
+        super::verbs_branch::move_branch_to(ctx, onto)?;
+        take_tree_state(ctx, current_tree, commit_tree_oid(&commit_record(store, onto)?)?)?;
+        return Ok(format!("Successfully rebased and updated {label}.\n").into_bytes());
+    }
+    snapshot_abort_index(ctx, "rebase")?;
+    pseudo_write(store, "ORIG_HEAD", current.to_hex().into_bytes())?;
+    super::verbs_branch::move_branch_to(ctx, onto)?;
+    take_tree_state(ctx, current_tree, commit_tree_oid(&commit_record(store, onto)?)?)?;
+    let mut todos = Vec::with_capacity(range.len());
+    for oid in &range {
+        let parents = commit_parents(store, *oid)?;
+        if parents.len() > 1 {
+            continue;
+        }
+        let record = commit_record(store, *oid)?;
+        todos.push(PickTodo {
+            oid: oid.to_hex(),
+            base: parents.first().map_or_else(String::new, |parent| parent.to_hex()),
+            theirs: oid.to_hex(),
+            message: String::from_utf8_lossy(record.message()).into_owned(),
+            label: short_hex(oid),
+        });
+    }
+    let orig_hex = current.to_hex();
+    let mut out = apply_pick_todos(ctx, "rebase", None, &orig_hex, todos, false)?;
+    let done = format!("Successfully rebased and updated {label}.\n").into_bytes();
+    out.extend_from_slice(&done);
+    Ok(out)
+}
+
+/// Lists `head..exclude` oldest-first: reachable from `head`, unreachable
+/// from `exclude`, parents before children.
+fn rev_range(store: &MergeLaneStore, head: Oid, exclude: Oid) -> Result<Vec<Oid>, GitError> {
+    let from_head = walk_history(store, &[head], None)?;
+    let excluded: HashSet<Oid> = walk_history(store, &[exclude], None)?
+        .into_iter()
+        .map(|(oid, _)| oid)
+        .collect();
+    let mut keep = HashSet::new();
+    let mut parents: HashMap<Oid, Vec<Oid>> = HashMap::new();
+    for (oid, record) in &from_head {
+        if excluded.contains(oid) {
+            continue;
+        }
+        keep.insert(*oid);
+        let mut list = Vec::new();
+        for parent in record.parents() {
+            if let Some(parent_oid) = parent.as_git().copied() {
+                list.push(parent_oid);
+            }
+        }
+        parents.insert(*oid, list);
+    }
+    let mut order = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![(head, false)];
+    while let Some((oid, expanded)) = stack.pop() {
+        if expanded {
+            order.push(oid);
+            continue;
+        }
+        if !keep.contains(&oid) || !visited.insert(oid) {
+            continue;
+        }
+        stack.push((oid, true));
+        if let Some(list) = parents.get(&oid) {
+            for parent in list {
+                stack.push((*parent, false));
+            }
+        }
+    }
+    Ok(order)
+}
+
+/// Resumes a stopped rebase replay from the resolved index.
+fn rebase_continue(ctx: &mut Ctx) -> Result<Vec<u8>, GitError> {
+    let mut out = pick_continue(ctx, "rebase", None)?;
+    let label = branch_label_of(ctx)?;
+    out.extend_from_slice(format!("Successfully rebased and updated {label}.\n").as_bytes());
+    Ok(out)
+}
+
+/// Skips the stopped rebase pick and replays the rest of the range.
+fn rebase_skip(ctx: &mut Ctx) -> Result<Vec<u8>, GitError> {
+    let mut out = pick_skip(ctx, "rebase", None)?;
+    // Skipping the last pick finishes the rebase without further output
+    // from the lane; the success line still applies when state cleared.
+    let store = ctx.store()?;
+    if sequencer_read(store, "rebase")?.is_none() {
+        let label = branch_label_of(ctx)?;
+        out.extend_from_slice(format!("Successfully rebased and updated {label}.\n").as_bytes());
+    }
+    Ok(out)
 }
 
 /// Builds pick todos for `cherry-pick`: each commit replays parent→commit.
@@ -1952,10 +2108,10 @@ fn apply_pick_todos(
             })?;
             commit_tree_oid(&commit_record(store, base_oid)?)?
         };
-        let picked = Oid::from_hex(&todo.oid).map_err(|_| GitError::Corrupt {
+        let theirs_oid = Oid::from_hex(&todo.theirs).map_err(|_| GitError::Corrupt {
             detail: format!("sequencer todo for {verb} does not decode"),
         })?;
-        let theirs_tree = commit_tree_oid(&commit_record(store, picked)?)?;
+        let theirs_tree = commit_tree_oid(&commit_record(store, theirs_oid)?)?;
         let rows = require_clean_index(store, kind)?;
         let plan = plan_merge_trees(ctx, base_tree, head_tree, theirs_tree, "HEAD", &todo.label)?;
         let head_map = lane_tree_map(store, kind, head_tree)?;
@@ -2927,7 +3083,12 @@ fn resolve_path(
             })
         }
         (Some(_), None, None) => Ok(PathResolution::Deleted),
-        (Some(_), Some(ours_side), None) => {
+        (Some(base_side), Some(ours_side), None) => {
+            // Theirs deleted: clean when ours is untouched, a modify/delete
+            // conflict otherwise.
+            if base_side == ours_side {
+                return Ok(PathResolution::Deleted);
+            }
             auto_merged.push(shown);
             let (_, oid) = side_file_mode(ours_side)?;
             Ok(PathResolution::Conflict {
@@ -2935,7 +3096,12 @@ fn resolve_path(
                 worktree: Some(lane_blob(store, &mut scope.blobs, oid)?),
             })
         }
-        (Some(_), None, Some(theirs_side)) => {
+        (Some(base_side), None, Some(theirs_side)) => {
+            // Ours deleted: clean when theirs is untouched, a
+            // modify/delete conflict otherwise.
+            if base_side == theirs_side {
+                return Ok(PathResolution::Deleted);
+            }
             auto_merged.push(shown);
             let (_, oid) = side_file_mode(theirs_side)?;
             Ok(PathResolution::Conflict {

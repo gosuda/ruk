@@ -47,9 +47,9 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | cat-file | implemented | `-p`, `-t`, `-s`, `-e` over the bounded object reader; `--batch-check [--batch-all-objects]` lists `<oid> <type> <size>` from the store census |
 | check-ref-format | implemented | `RefName` validation; `--print`, `--branch` |
 | checkout | implemented | branch switch, detach, `-b`/`-B`, path restore |
-| cherry-pick | partial | revisions resolve; `--abort`/`--quit`/`--continue` report absent sequencer state; application needs the merge lane |
+| cherry-pick | implemented | per-commit three-way replay (syntax lane, text fallback); `-n`, `-m`, `-x`; `--continue`/`--skip`/`--abort` over `CHERRY_PICK_HEAD` + todo state |
 | clone | implemented | local paths only; branches, tags, remote-tracking refs, `HEAD` branch, fetch refspec config; network sources are `Offline` |
-| commit | implemented | `-m` (required, no editor), `-a`, `--amend` via `ops::edit`; empty tree-matching commits refuse |
+| commit | implemented | `-m` (required, no editor), `-a`, `--amend` via `ops::edit`; empty tree-matching commits refuse; concludes `MERGE_HEAD` merges with two parents |
 | commit-tree | implemented | canonical payload, parents verified as stored commits |
 | config | implemented | `--local` scope only; `--global`/`--system`/`--worktree` are `Unsupported` |
 | count-objects | implemented | `<n> objects, <bytes>` from the store census, no payload I/O |
@@ -67,7 +67,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | ls-files | implemented | `-s`, `-u`, `--others`, `--error-unmatch` |
 | ls-remote | implemented | local, `ssh://`, `git://`, smart-http |
 | ls-tree | implemented | `-r`, `--name-only`; gitlinks report as commits |
-| merge | implemented | fast-forward only; anything needing content resolution is `Unsupported` and writes no state |
+| merge | implemented | fast-forward fast-path; three-way content merge via the syntax lane (bounded text fallback); `--no-ff`, `--ff-only`; conflicts leave stages 1/2/3, `MERGE_HEAD`/`ORIG_HEAD`, sequencer state with `--continue`/`--abort`/`--quit` |
 | merge-base | implemented | pairwise paint-down; `--is-ancestor` exits 1 when false |
 | migrate | implemented | exact import of a real `.git` (loose, packs, refs, `HEAD`); `--force` replaces an existing `.ruk`; no checkout/config/hooks |
 | mktree | implemented | canonical sort, mode/type agreement checks |
@@ -75,14 +75,14 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | pack-objects | implemented | self-contained pack v2 to `<base>.pack` or `--stdout`; stdin-only input (exact oids, or rev-list args with `--revs`, plus `--all`); `--thin` needs `--stdout` and stays full without receiver haves; `--no-thin`, `--delta-base-offset`/`--no-delta-base-offset` inert |
 | pull | implemented | local paths only; fetch plus fast-forward merge |
 | push | implemented | local, `ssh://`, `git://`, and smart/dumb-http; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
-| rebase | partial | up-to-date succeeds; `--abort`/`--quit`/`--continue` report absent state; replay needs the merge lane |
+| rebase | implemented | `<upstream>` and `--onto <new> <upstream>` replay over the merge lane; `--continue`/`--skip`/`--abort`; drops merge commits; no branch switching |
 | receive-pack | implemented | serves pushes over stdin/stdout via `ruk receive-pack <dir>` and the `git-receive-pack` argv0 name; v0 wire |
 | remote | implemented | backed by `remote.<name>.*` config records |
 | reset | implemented | `--soft`, `--mixed` (default), `--hard` with worktree sync, path form |
 | restore | implemented | `--staged`/`--worktree` (default worktree), `--source` |
 | rev-list | implemented | `--count`, `-n`/`--max-count` |
 | rev-parse | implemented | `HEAD`/refs/oids/`~n`/`^n` plus `--git-dir`, `--show-toplevel`, `--is-inside-work-tree`, `--abbrev-ref`, `--short` |
-| revert | partial | same shape as `cherry-pick` |
+| revert | implemented | inverse three-way replay per commit; `-n`, `-m`; `--continue`/`--skip`/`--abort` over `REVERT_HEAD` + todo state |
 | rm | implemented | `--cached`, `-r`; unknown paths fail |
 | show | implemented | `--oneline`, `-s`, `--stat`, `--name-only`, parent diff |
 | show-ref | implemented | `--head`, `--verify`, `--tags`, `--heads`, patterns |
