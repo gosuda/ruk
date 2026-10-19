@@ -30,6 +30,8 @@
 //! - [`fetch`]: fetch negotiation, verification, publication, prefetch.
 //! - [`push`]: send-pack client, report-status, push plans.
 //! - [`serve`]: the `upload-pack`/`receive-pack` server halves (protocol v0).
+//! - [`serve_v2`]: the `upload-pack` server half over protocol v2
+//!   (`ls-refs`/`fetch`), selected through `GIT_PROTOCOL`.
 //! - [`proc_receive`]: AGit `refs/for/` diversion to the `proc-receive` hook.
 //! - [`dumb`]: dumb-HTTP `info/refs` text and loose objects.
 //! - [`archive`]: the `upload-archive` server half (streaming tar).
@@ -61,6 +63,7 @@ pub mod proto_v2;
 pub mod push;
 pub mod refadv;
 pub mod serve;
+pub mod serve_v2;
 pub mod session;
 pub mod smart_http;
 
