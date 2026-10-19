@@ -212,11 +212,14 @@ pub(crate) fn run_fetch(
         Target::Net(endpoint) => match endpoint {
             Endpoint::Http { url, .. } => {
                 let base = ruk_git::transport::smart_http::normalize_base(&url)?;
-                // Protocol v2 first: one `Git-Protocol` probe, then refs
-                // from `ls-refs`. `None` is a v0 (or dumb-http) server,
-                // which the v0 discovery below owns.
-                match ruk_git::transport::smart_http::discover_v2_caps(&base, dest_kind)? {
-                    Some(caps) => {
+                // Highest protocol first: one `Git-Protocol` GET parses
+                // v2 caps or the v0 document; only dumb-http falls through.
+                match ruk_git::transport::smart_http::discover_versioned(
+                    &base,
+                    ruk_git::transport::smart_http::SmartService::UploadPack,
+                    dest_kind,
+                ) {
+                    Ok(ruk_git::transport::smart_http::VersionedDiscovery::V2(caps)) => {
                         let refs = ruk_git::transport::smart_http::ls_refs_v2(
                             &base,
                             &caps,
@@ -227,22 +230,16 @@ pub(crate) fn run_fetch(
                         let advertised = net::to_local_refs(refs)?;
                         (FetchSource::HttpV2 { base, caps }, advertised)
                     }
-                    None => match ruk_git::transport::smart_http::discover(
-                        &base,
-                        ruk_git::transport::smart_http::SmartService::UploadPack,
-                        dest_kind,
-                    ) {
-                        Ok(adv) => {
-                            let advertised = net::to_local_refs(adv.refs.clone())?;
-                            (FetchSource::Http { base, adv }, advertised)
-                        }
-                        Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
-                            let adv = ruk_git::transport::dumb_http::discover(&base, dest_kind)?;
-                            let advertised = net::to_local_refs(adv.refs.clone())?;
-                            (FetchSource::DumbHttp { base }, advertised)
-                        }
-                        Err(err) => return Err(err),
-                    },
+                    Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => {
+                        let advertised = net::to_local_refs(adv.refs.clone())?;
+                        (FetchSource::Http { base, adv }, advertised)
+                    }
+                    Err(err) if ruk_git::transport::dumb_http::is_dumb_gap(&err) => {
+                        let adv = ruk_git::transport::dumb_http::discover(&base, dest_kind)?;
+                        let advertised = net::to_local_refs(adv.refs.clone())?;
+                        (FetchSource::DumbHttp { base }, advertised)
+                    }
+                    Err(err) => return Err(err),
                 }
             }
             _ => {
@@ -3039,28 +3036,27 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             advertise(&src)?
         }
         Target::Net(endpoint) => {
-            // Over v2, ls-remote is ls-refs: one `Git-Protocol` probe,
-            // then the refs RPC. Anything else keeps the v0 discovery.
+            // Over v2, ls-remote is ls-refs: one `Git-Protocol` GET
+            // parses caps or the v0 refs, with no second round trip.
             let refs = match &endpoint {
                 Endpoint::Http { url, .. } => {
                     let base =
                         ruk_git::transport::smart_http::normalize_base(url)?;
-                    match ruk_git::transport::smart_http::discover_v2_caps(
+                    match ruk_git::transport::smart_http::discover_versioned(
                         &base,
+                        ruk_git::transport::smart_http::SmartService::UploadPack,
                         ctx.kind()?,
                     )? {
-                        Some(caps) => ruk_git::transport::smart_http::ls_refs_v2(
-                            &base,
-                            &caps,
-                            ctx.kind()?,
-                            &[],
-                            &Interrupt::none(),
-                        )?,
-                        None => net::discover_endpoint(
-                            &endpoint,
-                            Service::UploadPack,
-                            ctx.kind()?,
-                        )?,
+                        ruk_git::transport::smart_http::VersionedDiscovery::V2(caps) => {
+                            ruk_git::transport::smart_http::ls_refs_v2(
+                                &base,
+                                &caps,
+                                ctx.kind()?,
+                                &[],
+                                &Interrupt::none(),
+                            )?
+                        }
+                        ruk_git::transport::smart_http::VersionedDiscovery::V0(adv) => adv.refs,
                     }
                 }
                 _ => net::discover_endpoint(&endpoint, Service::UploadPack, ctx.kind()?)?,
