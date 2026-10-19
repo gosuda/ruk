@@ -52,7 +52,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | commit | implemented | `-m` (required, no editor), `-a`, `--amend` via `ops::edit`; empty tree-matching commits refuse |
 | commit-tree | implemented | canonical payload, parents verified as stored commits |
 | config | implemented | `--local` scope only; `--global`/`--system`/`--worktree` are `Unsupported` |
-| count-objects | unsupported | unimplemented; the store census (`Store::iter_objects`) exists but no verb reports it |
+| count-objects | implemented | `<n> objects, <bytes>` from the store census, no payload I/O |
 | diff | implemented | worktree/index/`HEAD`/revision compares, `--cached`, `--stat`, `--name-only`, paths; hunks from a bounded LCS differ with labeled omissions |
 | fetch | implemented | local paths only; refspec globs, force flags, fast-forward checks, tags, depth passthrough, `FETCH_HEAD`; `--lfs` pulls LFS payloads for fetched tips (mirror parity) |
 | for-each-ref | implemented | `%(refname)`, `%(objectname)`, `%(objecttype)`; other fields are `Invalid` |
@@ -74,7 +74,7 @@ including `--exec-path` and `--namespace`, is `Unsupported`.
 | mv | implemented | all stages renamed, worktree file renamed; `-f` allows overwrite |
 | pack-objects | unsupported | declared absent for this slice |
 | pull | implemented | local paths only; fetch plus fast-forward merge |
-| push | implemented | local paths only; persisted push plan, per-ref outcomes, non-fast-forward rejected without force |
+| push | implemented | local paths only; persisted push plan, per-ref outcomes, non-fast-forward rejected without force; `--lfs` uploads the outgoing range's verified payloads via the batch API (mirror parity) |
 | rebase | partial | up-to-date succeeds; `--abort`/`--quit`/`--continue` report absent state; replay needs the merge lane |
 | receive-pack | unsupported | `ruk-git` holds the client half; serving pushes is absent |
 | remote | implemented | backed by `remote.<name>.*` config records |
