@@ -27,10 +27,14 @@
 //! `http.<url>.extraHeader` stays a named gap: no config parser for it
 //! exists.
 //!
+//! Fetch tries protocol v2 first ([`discover_v2_caps`] plus the
+//! [`ls_refs_v2`]/[`fetch_pack_v2`] command RPCs in
+//! [`crate::transport::proto_v2`]) and falls back to the v0 document
+//! below when the server answers one.
+//!
 //! Named gaps beside this module: dumb-http (a server answering
 //! `info/refs` without the smart advertisement document; fetch falls back
-//! to [`crate::transport::dumb_http`]), protocol v2 over HTTP (needs the
-//! `Git-Protocol` header plus command RPCs), `git-upload-archive` over
+//! to [`crate::transport::dumb_http`]), `git-upload-archive` over
 //! HTTP (the client lives in [`fetch_archive`] but no archive-reading
 //! verb consumes it), and POST redirects (smart RPC endpoints never emit
 //! them; a 3xx names its `Location` in the error).
@@ -56,7 +60,8 @@ use super::net;
 use super::pack::IngestLimits;
 use super::pktline::{self, PktReader};
 use super::push::{self, PushPlanRecord, PushWireRequest, RefOutcome};
-use super::refadv::{self, Advertisement, Initial};
+use super::proto_v2;
+use super::refadv::{self, Advertisement, AdvertisedRef, Capabilities, Initial};
 use crate::{GitError, parse_oid_for};
 
 /// Which smart service one RPC round trip speaks.
@@ -213,12 +218,14 @@ fn check_status(url: &str, status: u16) -> Result<(), GitError> {
 
 /// Discovers one smart-http endpoint's refs: GETs the advertisement and
 /// parses it with the shared v0 grammar. A response without the smart
-/// content type is dumb-http, the remaining HTTP gap.
+/// content type is dumb-http, the remaining HTTP gap. Callers that speak
+/// v2 probe with [`discover_v2_caps`] first and only reach this fallback
+/// on v0 servers.
 ///
 /// # Errors
 /// Transport failures from the HTTP client, [`GitError::Unsupported`] for
-/// dumb-http servers and protocol v2 over HTTP, grammar failures from the
-/// advertisement parse.
+/// dumb-http servers and for v2 advertisements arriving without the
+/// `Git-Protocol` probe, grammar failures from the advertisement parse.
 pub fn discover(
     base: &str,
     service: SmartService,
@@ -236,10 +243,185 @@ pub fn discover(
     match refadv::read_initial(&mut pkt, kind)? {
         Initial::Refs(adv) => Ok(adv),
         Initial::V2(_) => Err(GitError::Unsupported {
-            command: "protocol v2 over smart-http (Git-Protocol header plus command RPCs are out of scope)"
+            command: "protocol v2 without the Git-Protocol header: probe with discover_v2_caps first"
                 .to_owned(),
         }),
     }
+}
+
+/// Probes one smart-http endpoint for protocol v2: GETs the advertisement
+/// with `Git-Protocol: version=2` (`gitprotocol-v2.adoc`, "HTTP
+/// Transport"). A v2 server answers its capability advertisement;
+/// anything else (a v0 advertisement from a server that ignored the
+/// header, or a non-smart content type from a dumb-http server) is
+/// `Ok(None)`, and the caller falls back to [`discover`], which owns the
+/// v0 parse and the dumb-http refusal.
+///
+/// # Errors
+/// Transport failures from the HTTP client and grammar failures from the
+/// advertisement parse.
+pub fn discover_v2_caps(
+    base: &str,
+    kind: HashKind,
+) -> Result<Option<Capabilities>, GitError> {
+    let url = refs_url(base, SmartService::UploadPack);
+    let owned = live_headers(
+        &url,
+        &[
+            ("Accept", "*/*"),
+            (
+                proto_v2::GIT_PROTOCOL_HEADER,
+                proto_v2::GIT_PROTOCOL_V2_VALUE,
+            ),
+        ],
+    );
+    let mut body = Vec::new();
+    let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
+    check_status(&url, status)?;
+    if http::header(&reply, "content-type") != Some(SmartService::UploadPack.advertisement_type().as_str())
+    {
+        return Ok(None);
+    }
+    let mut pkt = PktReader::new(Cursor::new(body), Interrupt::none());
+    match refadv::read_initial(&mut pkt, kind)? {
+        Initial::V2(caps) => Ok(Some(caps)),
+        Initial::Refs(_) => Ok(None),
+    }
+}
+
+/// Reads one smart-http endpoint's refs over protocol v2: POSTs
+/// `command=ls-refs` and parses the response. `caps` is the
+/// [`discover_v2_caps`] probe for this base.
+///
+/// # Errors
+/// Transport failures from the HTTP client and grammar failures from the
+/// `ls-refs` parse.
+pub fn ls_refs_v2(
+    base: &str,
+    caps: &Capabilities,
+    kind: HashKind,
+    prefixes: &[&[u8]],
+    interrupt: &Interrupt,
+) -> Result<Vec<AdvertisedRef>, GitError> {
+    let body = proto_v2::ls_refs_request(
+        caps,
+        kind,
+        &proto_v2::LsRefsCommand::advertisement(
+            prefixes.iter().map(|prefix| prefix.to_vec()).collect(),
+        ),
+    )?;
+    let url = rpc_url(base, SmartService::UploadPack);
+    let request_type = SmartService::UploadPack.request_type();
+    let result_type = SmartService::UploadPack.result_type();
+    let owned = live_headers(
+        &url,
+        &[
+            ("Content-Type", request_type.as_str()),
+            ("Accept", result_type.as_str()),
+            (
+                proto_v2::GIT_PROTOCOL_HEADER,
+                proto_v2::GIT_PROTOCOL_V2_VALUE,
+            ),
+        ],
+    );
+    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
+    check_status(&url, status)?;
+    if http::header(&reply, "content-type") != Some(result_type.as_str()) {
+        return Err(GitError::Corrupt {
+            detail: format!("{url}: ls-refs RPC answered a non-pack content type"),
+        });
+    }
+    let mut pkt = PktReader::new(reader, interrupt.clone());
+    refadv::read_ls_refs(&mut pkt, kind)
+}
+
+/// Fetches one pack over smart-http with protocol v2: POSTs
+/// `command=fetch` and ingests the sectioned response, returning the
+/// staging without publishing anything. Capability gating and fallback
+/// warnings match the stateful v2 client; `caps` is the
+/// [`discover_v2_caps`] probe for this base. `list_refs` needs no arm
+/// here: refs arrive through [`ls_refs_v2`], a separate RPC, before the
+/// fetch POST.
+///
+/// # Errors
+/// Grammar failures are [`GitError::Corrupt`]; see
+/// [`super::pack::ingest_pack`] for pack errors.
+pub fn fetch_pack_v2(
+    base: &str,
+    caps: &Capabilities,
+    store: &Store,
+    req: &FetchWireRequest,
+    limits: IngestLimits,
+    interrupt: &Interrupt,
+) -> Result<ReceivedPack, GitError> {
+    if req.wants.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "fetch needs at least one want".to_owned(),
+        });
+    }
+    let kind = store.hash_kind();
+    let mut warnings = Vec::new();
+    let filter = match req.filter {
+        Some(filter) if caps.feature("fetch", "filter") => Some(filter),
+        Some(filter) => {
+            warnings.push(format!(
+                "server lacks filter; fetched full objects instead of {}",
+                filter.spec()
+            ));
+            None
+        }
+        None => None,
+    };
+    let depth = match req.depth {
+        Some(depth) if caps.feature("fetch", "shallow") => Some(depth),
+        Some(_) => {
+            warnings.push("server lacks shallow; fetched complete history".to_owned());
+            None
+        }
+        None => None,
+    };
+    let cmd = proto_v2::FetchCommand {
+        wants: &req.wants,
+        haves: &req.haves,
+        shallows: &req.shallow,
+        depth,
+        filter,
+        thin_pack: caps.feature("fetch", "thin-pack"),
+        ofs_delta: caps.feature("fetch", "ofs-delta"),
+        sideband_all: caps.feature("fetch", "sideband-all"),
+    };
+    let body = proto_v2::fetch_request(caps, kind, &cmd)?;
+    let url = rpc_url(base, SmartService::UploadPack);
+    let request_type = SmartService::UploadPack.request_type();
+    let result_type = SmartService::UploadPack.result_type();
+    let owned = live_headers(
+        &url,
+        &[
+            ("Content-Type", request_type.as_str()),
+            ("Accept", result_type.as_str()),
+            (
+                proto_v2::GIT_PROTOCOL_HEADER,
+                proto_v2::GIT_PROTOCOL_V2_VALUE,
+            ),
+        ],
+    );
+    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
+    check_status(&url, status)?;
+    if http::header(&reply, "content-type") != Some(result_type.as_str()) {
+        return Err(GitError::Corrupt {
+            detail: format!("{url}: fetch RPC answered a non-pack content type"),
+        });
+    }
+    let mut pkt = PktReader::new(reader, interrupt.clone());
+    let sections = proto_v2::read_fetch_response(&mut pkt, kind, store, limits, interrupt)?;
+    Ok(ReceivedPack {
+        staged: sections.staged,
+        shallow: sections.shallow,
+        unshallow: sections.unshallow,
+        warnings,
+        progress: sections.progress,
+        refs: Vec::new(),
+    })
 }
 
 /// Exact equality with `NAK`, mirroring the stateful fetch client.
@@ -1117,6 +1299,225 @@ mod tests {
                 .windows(FOUR.len() + 6)
                 .any(|w| w.starts_with(b"want ") && &w[5..5 + FOUR.len()] == FOUR.as_bytes()),
             "no want line in {:?}",
+            post.body.escape_ascii().to_string()
+        );
+        assert!(post.body.windows(5).any(|w| w == b"done\n"), "no done line");
+        assert!(post.body.ends_with(b"0000"), "no closing flush");
+    }
+
+    #[test]
+    fn v2_discovery_lists_refs_through_ls_refs() {
+        use super::super::proto_v2;
+
+        let kind = HashKind::Sha1;
+        let mut caps = Capabilities::default();
+        caps.push_entry(b"agent=git/2.50");
+        caps.push_entry(b"ls-refs=unborn");
+        caps.push_entry(b"fetch=shallow filter sideband-all");
+        caps.push_entry(b"object-format=sha1");
+        let caps_body = proto_v2::encode_capability_advertisement(&caps).expect("caps");
+        let mut ls_body = Vec::new();
+        pktline::encode_data(
+            &mut ls_body,
+            format!("{FOUR} HEAD symref-target:refs/heads/main\n").as_bytes(),
+        )
+        .expect("frame");
+        pktline::encode_data(
+            &mut ls_body,
+            format!("{FOUR} refs/heads/main\n").as_bytes(),
+        )
+        .expect("frame");
+        pktline::encode_flush(&mut ls_body);
+        let (base, server) = fake_smart_server(vec![
+            (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    SmartService::UploadPack.advertisement_type(),
+                )],
+                caps_body,
+                false,
+            ),
+            (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    SmartService::UploadPack.result_type(),
+                )],
+                ls_body,
+                false,
+            ),
+        ]);
+        let probed = discover_v2_caps(&base, kind)
+            .expect("probe")
+            .expect("v2");
+        assert!(probed.feature("fetch", "filter"));
+        let refs = ls_refs_v2(&base, &probed, kind, &[], &Interrupt::none()).expect("ls-refs");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs[0].symref_target.as_deref(),
+            Some(b"refs/heads/main".as_slice())
+        );
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .head
+                .starts_with("GET /a.git/info/refs?service=git-upload-pack"),
+            "{:?}",
+            requests[0].head
+        );
+        assert!(
+            requests[0].head.contains("Git-Protocol: version=2"),
+            "{:?}",
+            requests[0].head
+        );
+        assert!(
+            requests[1]
+                .head
+                .starts_with("POST /a.git/git-upload-pack HTTP/1.1\r\n"),
+            "{:?}",
+            requests[1].head
+        );
+        assert!(
+            requests[1].head.contains("Git-Protocol: version=2"),
+            "{:?}",
+            requests[1].head
+        );
+        assert!(
+            requests[1]
+                .body
+                .windows(b"command=ls-refs\n".len())
+                .any(|w| w == b"command=ls-refs\n"),
+            "no ls-refs command in {:?}",
+            requests[1].body.escape_ascii().to_string()
+        );
+    }
+
+    #[test]
+    fn v2_probe_yields_to_v0_servers() {
+        // A server that ignores `Git-Protocol` answers v0: the probe
+        // reports `None` and the plain `discover` fallback parses it.
+        let body = advertisement_bytes(
+            FOUR,
+            "multi_ack_detailed side-band-64k thin-pack ofs-delta object-format=sha1",
+        );
+        let (base, server) = fake_smart_server(vec![
+            (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    SmartService::UploadPack.advertisement_type(),
+                )],
+                body.clone(),
+                false,
+            ),
+            (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    SmartService::UploadPack.advertisement_type(),
+                )],
+                body,
+                false,
+            ),
+        ]);
+        assert!(
+            discover_v2_caps(&base, HashKind::Sha1)
+                .expect("probe")
+                .is_none(),
+            "v0 is not v2"
+        );
+        let adv = discover(&base, SmartService::UploadPack, HashKind::Sha1).expect("fallback");
+        assert_eq!(adv.refs.len(), 2);
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].head.contains("Git-Protocol: version=2"),
+            "{:?}",
+            requests[0].head
+        );
+        assert!(
+            !requests[1].head.contains("Git-Protocol"),
+            "fallback drops the probe header: {:?}",
+            requests[1].head
+        );
+    }
+
+    #[test]
+    fn v2_fetch_ingests_a_canned_pack() {
+        use super::super::fetch::verify_closure;
+        use super::super::session::test_support::test_store;
+
+        let kind = HashKind::Sha1;
+        let pack = include_bytes!("fixtures/basic.pack").to_vec();
+        let mut caps = Capabilities::default();
+        caps.push_entry(b"ls-refs=unborn");
+        caps.push_entry(b"fetch=shallow filter sideband-all");
+        caps.push_entry(b"object-format=sha1");
+        let mut result = Vec::new();
+        pktline::encode_data(&mut result, b"packfile\n").expect("section");
+        result.extend_from_slice(&sideband_frame(&pack));
+        result.extend_from_slice(b"0000");
+        // Chunked like the v0 fetch test: pkt-line must decode framing
+        // first and never parse chunk-size text.
+        let (base, server) = fake_smart_server(vec![(
+            200,
+            vec![(
+                "Content-Type".to_owned(),
+                SmartService::UploadPack.result_type(),
+            )],
+            result,
+            true,
+        )]);
+        let dest = test_store(kind);
+        let req = FetchWireRequest {
+            wants: vec![oid(FOUR)],
+            haves: Vec::new(),
+            filter: None,
+            depth: None,
+            shallow: Vec::new(),
+            list_refs: false,
+            ref_prefixes: Vec::new(),
+        };
+        let received = fetch_pack_v2(
+            &base,
+            &caps,
+            &dest,
+            &req,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("fetch");
+        verify_closure(
+            &dest,
+            &received.staged,
+            &[oid(FOUR)],
+            None,
+            &[],
+            &Interrupt::none(),
+        )
+        .expect("closure");
+        assert!(received.shallow.is_empty());
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        let post = &requests[0];
+        assert!(
+            post.head
+                .starts_with("POST /a.git/git-upload-pack HTTP/1.1\r\n"),
+            "{:?}",
+            post.head
+        );
+        assert!(
+            post.head.contains("Git-Protocol: version=2"),
+            "{:?}",
+            post.head
+        );
+        assert!(
+            post.body
+                .windows(b"command=fetch\n".len())
+                .any(|w| w == b"command=fetch\n"),
+            "no fetch command in {:?}",
             post.body.escape_ascii().to_string()
         );
         assert!(post.body.windows(5).any(|w| w == b"done\n"), "no done line");
