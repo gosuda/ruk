@@ -1800,8 +1800,8 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     }
     let conflict_stage = opts
         .is_set("ours")
-        .then_some(Stage::Two)
-        .or(opts.is_set("theirs").then_some(Stage::Three));
+        .then_some(Stage::Ours)
+        .or(opts.is_set("theirs").then_some(Stage::Theirs));
     let explicit_source = opts.single("source")?;
     // With an explicit `--source` every positional is a path; otherwise a
     // leading revision followed by paths selects the tree, as before.
@@ -1837,22 +1837,15 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     if let Some(stage) = conflict_stage {
         return checkout_conflict_paths(ctx, tree_paths, stage, staged_only, worktree_only);
     }
-    let entries: std::collections::BTreeMap<Vec<u8>, Oid> = match source_tree {
-        Some(tree) => {
-            let mut map = std::collections::BTreeMap::new();
-            for (path, _, oid) in flatten_tree(store, kind, tree)? {
-                map.insert(path, oid);
-            }
-            map
+    // Tree entries carry their own modes; index entries already hold
+    // `FileMode`. Both maps are built once, outside the path loop.
+    let mut tree_entries = std::collections::BTreeMap::new();
+    if let Some(tree) = source_tree {
+        for (path, mode, oid) in flatten_tree(store, kind, tree)? {
+            tree_entries.insert(path, (mode, oid));
         }
-        None => {
-            let mut map = std::collections::BTreeMap::new();
-            for (path, (_, oid)) in index_entry_map(ctx)? {
-                map.insert(path, oid);
-            }
-            map
-        }
-    };
+    }
+    let index_entries = index_entry_map(ctx)?;
     // From a tree the oracle refreshes both index and worktree; from the
     // index only the worktree. Explicit `--staged`/`--worktree` narrow it.
     let update_index = source_tree.is_some() && !worktree_only || staged_only;
@@ -1862,23 +1855,34 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     let mut worktree_writes: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
     for wanted in tree_paths {
         let path = super::verbs_stage::repo_path_of(ctx, wanted.as_bytes())?;
-        let oid = entries
-            .get(path.as_bytes())
-            .ok_or_else(|| GitError::NotFound {
-                detail: format!("pathspec did not match: {wanted:?}"),
-            })?;
-        let (_, body) = read_object_bytes(store, *oid)?;
+        let (mode, oid) = match tree_entries.get(path.as_bytes()) {
+            Some((mode, oid)) => (
+                mode.as_index_mode()
+                    .map_err(|err| GitError::from(CoreError::from(err)))?,
+                *oid,
+            ),
+            None if source_tree.is_some() => {
+                return Err(GitError::NotFound {
+                    detail: format!("pathspec did not match: {wanted:?}"),
+                });
+            }
+            None => {
+                let (mode, oid) = index_entries.get(path.as_bytes()).ok_or_else(|| {
+                    GitError::NotFound {
+                        detail: format!("pathspec did not match: {wanted:?}"),
+                    }
+                })?;
+                (*mode, *oid)
+            }
+        };
+        let (_, body) = read_object_bytes(store, oid)?;
         if update_worktree {
             let full = super::tree::join_base(&ctx.file_base, path.as_bytes())?;
             worktree_writes.push((full, body.clone()));
         }
         if update_index {
             let before = read_path_rows(store, kind, &path)?;
-            let mode = index_entry_map(ctx)?
-                .get(path.as_bytes())
-                .map(|(mode, _)| *mode)
-                .unwrap_or(ruk_core::index::FileMode::Regular);
-            let entry = IndexEntry::new(*oid, mode.as_index_mode()?, None, IndexFlags::default())
+            let entry = IndexEntry::new(oid, mode, None, IndexFlags::default())
                 .map_err(|err| GitError::from(CoreError::from(err)))?;
             mutations.extend(path_row_mutations(&path, &before, &[(Stage::Zero, entry)])?);
         }
