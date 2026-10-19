@@ -123,29 +123,39 @@ struct CredentialHelperRow {
 /// and `GIT_CONFIG_GLOBAL` override their paths. Missing or unreadable files
 /// are skipped by the caller, never an error.
 fn config_paths() -> Vec<PathBuf> {
+    config_paths_in(&std::env::vars().collect())
+}
+
+/// The [`config_paths`] file list resolved against an explicit environment
+/// map instead of the process one, so callers carrying their own
+/// environment (like the bare `credential` verb with its captured `CliEnv`)
+/// stay hermetic under test. Semantics match [`config_paths`] exactly:
+/// presence (even empty) of `GIT_CONFIG_NOSYSTEM` drops the system file.
+fn config_paths_in(vars: &HashMap<String, String>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push_once = |path: PathBuf| {
         if !out.contains(&path) {
             out.push(path);
         }
     };
-    if std::env::var_os("GIT_CONFIG_NOSYSTEM").is_none() {
-        let system = std::env::var_os("GIT_CONFIG_SYSTEM")
+    if !vars.contains_key("GIT_CONFIG_NOSYSTEM") {
+        let system = vars
+            .get("GIT_CONFIG_SYSTEM")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
         push_once(system);
     }
-    if let Some(global) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+    if let Some(global) = vars.get("GIT_CONFIG_GLOBAL") {
         if !global.is_empty() {
             push_once(PathBuf::from(global));
         }
         return out;
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = vars.get("HOME").map(PathBuf::from) else {
         return out;
     };
     push_once(home.join(".gitconfig"));
-    match std::env::var_os("XDG_CONFIG_HOME") {
+    match vars.get("XDG_CONFIG_HOME") {
         Some(xdg) if !xdg.is_empty() => push_once(PathBuf::from(xdg).join("git/config")),
         _ => push_once(home.join(".config/git/config")),
     }
@@ -385,8 +395,17 @@ pub fn http_extra_header_rows() -> Vec<http::ExtraHeaderRow> {
 /// Reads every config file and resolves the runnable helper chain for `url`.
 /// Unreadable files, oversized files and non-UTF-8 files are skipped.
 fn helper_commands(url: &str) -> Vec<(String, Vec<String>)> {
+    helper_commands_in(url, &std::env::vars().collect())
+}
+
+/// The [`helper_commands`] chain resolved against an explicit environment
+/// map, so environment-carrying callers stay hermetic under test.
+fn helper_commands_in(
+    url: &str,
+    vars: &HashMap<String, String>,
+) -> Vec<(String, Vec<String>)> {
     let mut entries = Vec::new();
-    for path in config_paths() {
+    for path in config_paths_in(vars) {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
@@ -598,9 +617,19 @@ pub fn credential_scope_url(desc: &[(String, String)]) -> Option<String> {
 /// scoped pattern fails a prefix match against the empty URL).
 #[must_use]
 pub fn helper_chain_for(desc: &[(String, String)]) -> Vec<(String, Vec<String>)> {
+    helper_chain_for_in(desc, &std::env::vars().collect())
+}
+
+/// The [`helper_chain_for`] chain resolved against an explicit environment
+/// map, so environment-carrying callers stay hermetic under test.
+#[must_use]
+pub fn helper_chain_for_in(
+    desc: &[(String, String)],
+    vars: &HashMap<String, String>,
+) -> Vec<(String, Vec<String>)> {
     match credential_scope_url(desc) {
-        Some(url) => helper_commands(&url),
-        None => helper_commands(""),
+        Some(url) => helper_commands_in(&url, vars),
+        None => helper_commands_in("", vars),
     }
 }
 
@@ -662,10 +691,14 @@ pub fn credential_store_op_desc_with(
 }
 
 /// Fills a parsed description through the live config plus live helper
-/// processes. Empty when no external helper is configured or none answers.
+/// processes, with config files resolved against `vars`. Empty when no
+/// external helper is configured or none answers.
 #[must_use]
-pub fn credential_fill_desc(desc: &[(String, String)]) -> Option<Vec<(String, String)>> {
-    let helpers = helper_chain_for(desc);
+pub fn credential_fill_desc(
+    desc: &[(String, String)],
+    vars: &HashMap<String, String>,
+) -> Option<Vec<(String, String)>> {
+    let helpers = helper_chain_for_in(desc, vars);
     if helpers.is_empty() {
         return None;
     }
@@ -673,17 +706,18 @@ pub fn credential_fill_desc(desc: &[(String, String)]) -> Option<Vec<(String, St
 }
 
 /// Approves a parsed description through the live helpers (`store` across
-/// the whole chain). Helper failures are silent: there is nothing to
-/// report back to a `store` caller.
-pub fn credential_approve_desc(desc: &[(String, String)]) {
-    let helpers = helper_chain_for(desc);
+/// the whole chain, config files resolved against `vars`). Helper failures
+/// are silent: there is nothing to report back to a `store` caller.
+pub fn credential_approve_desc(desc: &[(String, String)], vars: &HashMap<String, String>) {
+    let helpers = helper_chain_for_in(desc, vars);
     credential_store_op_desc_with(desc, "store", &helpers, run_helper_op);
 }
 
 /// Rejects a parsed description through the live helpers (`erase` across
-/// the whole chain), silent like its `store` sibling.
-pub fn credential_reject_desc(desc: &[(String, String)]) {
-    let helpers = helper_chain_for(desc);
+/// the whole chain, config files resolved against `vars`), silent like its
+/// `store` sibling.
+pub fn credential_reject_desc(desc: &[(String, String)], vars: &HashMap<String, String>) {
+    let helpers = helper_chain_for_in(desc, vars);
     credential_store_op_desc_with(desc, "erase", &helpers, run_helper_op);
 }
 
@@ -1005,6 +1039,29 @@ mod tests {
         assert!(
             started.elapsed() < HELPER_TIMEOUT + Duration::from_secs(5),
             "helper overran its budget"
+        );
+    }
+
+    #[test]
+    fn config_paths_honor_explicit_environments() {
+        let env = vars(&[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/tmp/cred-test-global"),
+        ]);
+        assert_eq!(
+            config_paths_in(&env),
+            vec![PathBuf::from("/tmp/cred-test-global")]
+        );
+        // An empty global still pins discovery to it, skipping home files.
+        let env = vars(&[("GIT_CONFIG_GLOBAL", "")]);
+        assert_eq!(config_paths_in(&env), vec![PathBuf::from("/etc/gitconfig")]);
+        let env = vars(&[("GIT_CONFIG_NOSYSTEM", "1"), ("HOME", "/tmp/cred-test-home")]);
+        assert_eq!(
+            config_paths_in(&env),
+            vec![
+                PathBuf::from("/tmp/cred-test-home/.gitconfig"),
+                PathBuf::from("/tmp/cred-test-home/.config/git/config"),
+            ]
         );
     }
 
