@@ -77,29 +77,29 @@ fn notes_ref_name(ctx: &Ctx, opts: &Collected) -> Result<RefName, GitError> {
     })
 }
 
-/// Reads one note body for `log --show-notes`: `name` is `None` for the
-/// default ref, `Some` short-or-full ref otherwise. A missing ref or a
-/// missing entry is `None`, never an error; a ref pointing at a non-commit
-/// is corrupt, the same rule [`load_notes`] enforces.
-pub(crate) fn note_for_commit(
+/// Loads the notes map once for `log --show-notes`: target hex to note
+/// blob, behind a caller-resolved ref name (short names read as
+/// `refs/notes/<name>`, `refs/` names whole; the caller applies the
+/// `GIT_NOTES_REF`/`core.notesRef`/default chain). A missing ref is an
+/// empty map; a ref pointing at a non-commit is corrupt, the same rules
+/// [`load_notes`] enforces.
+pub(crate) fn notes_entries(
     store: &Store,
     kind: HashKind,
-    name: Option<&str>,
-    target: &Oid,
-) -> Result<Option<Vec<u8>>, GitError> {
-    let full = match name {
-        None => DEFAULT_NOTES_REF.to_owned(),
-        Some(raw) if raw.starts_with("refs/") => raw.to_owned(),
-        Some(raw) => format!("refs/notes/{raw}"),
+    refname: &str,
+) -> Result<Vec<(String, Oid)>, GitError> {
+    let full = if refname.starts_with("refs/") {
+        refname.to_owned()
+    } else {
+        format!("refs/notes/{refname}")
     };
     let name = RefName::new(full).map_err(|err| GitError::Invalid {
         detail: format!("bad notes ref: {err}"),
     })?;
-    let head = load_notes(store, kind, &name)?;
-    match head.entries.get(&target.to_hex()) {
-        None => Ok(None),
-        Some(blob) => read_object_bytes(store, *blob).map(|(_, body)| Some(body)),
-    }
+    Ok(load_notes(store, kind, &name)?
+        .entries
+        .into_iter()
+        .collect())
 }
 
 /// Resolves a non-notes ref the same short-or-full way (`merge` source).

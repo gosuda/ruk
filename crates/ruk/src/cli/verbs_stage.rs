@@ -750,12 +750,13 @@ enum AheadBehind {
     Off,
 }
 
-/// Parses one `-u<mode>`/`--untracked-files[=<mode>]` value: `no`,
-/// `normal` (also the bare form), or `all`.
+/// Parses one `-u<mode>`/`--untracked-files[=<mode>]` value. The oracle's
+/// `defval` is `all`, so a bare `-u` lists every file; `normal` (collapse)
+/// is only the default when the flag is absent.
 fn parse_untracked_mode(value: Option<&str>) -> Result<UntrackedMode, GitError> {
     match value {
-        None | Some("normal") => Ok(UntrackedMode::Normal),
-        Some("all") => Ok(UntrackedMode::All),
+        None | Some("all") => Ok(UntrackedMode::All),
+        Some("normal") => Ok(UntrackedMode::Normal),
         Some("no") => Ok(UntrackedMode::No),
         Some(other) => Err(GitError::Invalid {
             detail: format!("bad --untracked-files={other:?}: want no|normal|all"),
@@ -812,7 +813,12 @@ fn split_status_args(
         } else if arg == "--long" {
             formats.push(StatusFormat::Long);
         } else if arg == "--untracked-files" || arg == "-u" {
-            untracked.push(UntrackedMode::Normal);
+            untracked.push(UntrackedMode::All);
+        } else if arg == "-vv" {
+            // The shared collector rejects grouped shorts, so the one
+            // documented group spells out to two verbose hits here.
+            kept.push("-v".to_owned());
+            kept.push("-v".to_owned());
         } else if let Some(value) = arg.strip_prefix("--untracked-files=") {
             untracked.push(parse_untracked_mode(Some(value))?);
         } else if let Some(rest) = arg.strip_prefix("-u") {
@@ -922,7 +928,7 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     let plan = status_plan_with_mode(ctx, store, kind, rename_mode, untracked_mode)?;
     match format {
         StatusFormat::Porcelain(PorcelainVersion::V2) => {
-            let ignored = shown_ignored(&plan, &opts);
+            let ignored = opts.is_set("ignored").then(|| plan.ignored.clone());
             let input = V2Input {
                 plan: &plan,
                 show_branch: opts.is_set("branch"),
@@ -938,7 +944,7 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 .is_set("branch")
                 .then(|| porcelain_v1_branch(ctx, store, ahead_behind))
                 .transpose()?;
-            let ignored = shown_ignored(&plan, &opts);
+            let ignored = opts.is_set("ignored").then(|| plan.ignored.clone());
             Ok(render_porcelain(
                 &plan,
                 branch.as_deref(),
@@ -958,11 +964,35 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
             } else {
                 0
             };
-            let ignored = shown_ignored(&plan, &opts);
+            let ignored = opts.is_set("ignored").then(|| plan.ignored.clone());
             let branch = long_branch_label(store)?;
-            let mut out =
-                render_long_full(store, &branch, &plan, tracking, stash, ignored.as_deref());
-            for diff in [staged_diff, unstaged_diff].into_iter().flatten() {
+            let mut out = render_long_full(
+                store,
+                &branch,
+                &plan,
+                tracking.as_deref(),
+                stash,
+                ignored.as_deref(),
+            );
+            // `-vv` heads each diff the way the oracle does; a single `-v`
+            // appends the bare staged diff. Prefixes stay the diff lane's
+            // `a/`/`b/` (the oracle uses `c/`/`i/`/`w/` here).
+            if verbose >= 2 {
+                if let Some(diff) = staged_diff {
+                    if !diff.is_empty() {
+                        out.extend_from_slice(b"Changes to be committed:\n");
+                        out.extend_from_slice(&diff);
+                    }
+                }
+                if let Some(diff) = unstaged_diff {
+                    if !diff.is_empty() {
+                        out.extend_from_slice(
+                            b"--------------------------------------------------\nChanges not staged for commit:\n",
+                        );
+                        out.extend_from_slice(&diff);
+                    }
+                }
+            } else if let Some(diff) = staged_diff {
                 if !diff.is_empty() {
                     if out.last() != Some(&b'\n') {
                         out.push(b'\n');
@@ -975,13 +1005,8 @@ pub(crate) fn status(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
     }
 }
 
-/// Borrows the computed ignored list when `--ignored` was given, so the
-/// flag stays at the call site instead of forking a helper.
-fn shown_ignored(plan: &StatusPlan, opts: &super::Collected) -> Option<Vec<Vec<u8>>> {
-    opts.is_set("ignored").then(|| plan.ignored.clone())
-}
-
-/// One computed status: staged, unstaged, unmerged, and untracked paths.
+/// One computed status: staged, unstaged, unmerged, untracked, and ignored
+/// paths.
 pub(crate) struct StatusPlan {
     /// `(path, staged code, index/head identity)` in path order. The
     /// identity backs exact-rename pairing; `None` for modified/unmerged.
@@ -1558,12 +1583,10 @@ fn render_porcelain(
         }
         match rename_new.get(path) {
             Some(old) => {
-                let line = format!(
-                    "R{unstaged_code} {} -> {}",
-                    String::from_utf8_lossy(old),
-                    String::from_utf8_lossy(path)
+                lines.insert(
+                    (*path).clone(),
+                    v1_rename_line(&format!("R{unstaged_code}"), path, old, eol),
                 );
-                lines.insert((*path).clone(), line.into_bytes());
             }
             None => {
                 let line = format!(
@@ -1578,24 +1601,19 @@ fn render_porcelain(
         if lines.contains_key(*new) {
             continue;
         }
-        let line = format!(
-            "R  {} -> {}",
-            String::from_utf8_lossy(old),
-            String::from_utf8_lossy(new)
-        );
-        lines.insert((*new).clone(), line.into_bytes());
+        lines.insert((*new).clone(), v1_rename_line("R  ", new, old, eol));
     }
     for (old, new, _) in &plan.renames_unstaged {
-        let line = format!(
-            " R {} -> {}",
-            String::from_utf8_lossy(old),
-            String::from_utf8_lossy(new)
-        );
-        lines.insert(new.clone(), line.into_bytes());
+        lines.insert(new.clone(), v1_rename_line(" R ", new, old, eol));
     }
+    // `-z` rename records self-terminate (`XY new\0old\0`); every other
+    // line still takes the entry terminator. A path can never end in NUL,
+    // so the terminator test is exact.
     for line in lines.into_values() {
         out.extend_from_slice(&line);
-        out.push(eol);
+        if line.last() != Some(&b'\0') {
+            out.push(eol);
+        }
     }
     for path in &plan.unmerged {
         if !staged_map.contains_key(&path) {
@@ -1617,6 +1635,24 @@ fn render_porcelain(
         }
     }
     out
+}
+
+/// Renders one v1 rename line: `XY old -> new` normally, but
+/// `XY new\0old\0` (self-terminated, raw paths) under `-z`, the way the
+/// oracle reverses and NUL-splits rename records without C-quoting.
+fn v1_rename_line(key: &str, new: &[u8], old: &[u8], eol: u8) -> Vec<u8> {
+    let mut line = format!("{key} ").into_bytes();
+    if eol == b'\0' {
+        line.extend_from_slice(new);
+        line.push(b'\0');
+        line.extend_from_slice(old);
+        line.push(b'\0');
+    } else {
+        line.extend_from_slice(String::from_utf8_lossy(old).as_bytes());
+        line.extend_from_slice(b" -> ");
+        line.extend_from_slice(String::from_utf8_lossy(new).as_bytes());
+    }
+    line
 }
 
 /// Pushes one `eol`-terminated header line.
@@ -2081,7 +2117,7 @@ pub(crate) fn render_long_full(
     store: &Store,
     branch: &str,
     plan: &StatusPlan,
-    tracking: Option<String>,
+    tracking: Option<&str>,
     stash: usize,
     ignored: Option<&[Vec<u8>]>,
 ) -> Vec<u8> {

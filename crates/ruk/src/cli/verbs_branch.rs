@@ -358,26 +358,36 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 let target = resolve_branch_target(store, ctx.kind()?, None)?;
                 force_branch(store, ctx.kind()?, name, target)?;
                 if opts.is_set("create-reflog") {
-                    maybe_create_reflog(
+                    let skipped = maybe_create_reflog(
                         ctx,
                         &refname,
                         before,
                         target,
                         "branch: Created from HEAD".to_owned(),
                     )?;
+                    if skipped {
+                        ctx.emit_stderr(
+                            b"warning: no identity configured; skipping reflog creation\n",
+                        );
+                    }
                 }
                 return Ok(Vec::new());
             }
             let target = resolve_branch_target(store, ctx.kind()?, None)?;
             create_branch(store, ctx.kind()?, name, target)?;
             if opts.is_set("create-reflog") {
-                maybe_create_reflog(
+                let skipped = maybe_create_reflog(
                     ctx,
                     &refname,
                     None,
                     target,
                     "branch: Created from HEAD".to_owned(),
                 )?;
+                if skipped {
+                    ctx.emit_stderr(
+                        b"warning: no identity configured; skipping reflog creation\n",
+                    );
+                }
             }
             Ok(Vec::new())
         }
@@ -395,17 +405,24 @@ pub(crate) fn branch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                 refuse_checked_out_branch(store, name)?;
             }
             force_branch(store, ctx.kind()?, name, target)?;
-            if opts.is_set("create-reflog") {
+            let skipped = if opts.is_set("create-reflog") {
                 maybe_create_reflog(
                     ctx,
                     &refname,
                     before,
                     target,
                     format!("branch: Created from {start}"),
-                )?;
-            }
+                )?
+            } else {
+                false
+            };
             if opts.is_set("track") {
                 record_tracking(store, name, start)?;
+            }
+            if skipped {
+                ctx.emit_stderr(
+                    b"warning: no identity configured; skipping reflog creation\n",
+                );
             }
             Ok(Vec::new())
         }
@@ -534,18 +551,19 @@ fn unset_branch_upstream(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, 
 }
 
 /// Writes a reflog creation entry for a new branch when `--create-reflog`
-/// is given. Without configured identity there is no committer to record,
-/// so creation still succeeds and the reflog materializes on the first
-/// logged update instead of failing the branch.
+/// is given. Returns whether the write was skipped: without configured
+/// identity there is no committer to record, so the caller names the skip
+/// on stderr itself (this helper only holds `&Ctx`, keeping `Store`
+/// borrows alive across the call).
 fn maybe_create_reflog(
     ctx: &Ctx,
     name: &RefName,
     before: Option<RefTarget>,
     oid: Oid,
     message: String,
-) -> Result<(), GitError> {
+) -> Result<bool, GitError> {
     if super::state::identity(ctx, super::state::IdentityRole::Committer).is_err() {
-        return Ok(());
+        return Ok(true);
     }
     append_reflog(
         ctx,
@@ -555,14 +573,15 @@ fn maybe_create_reflog(
             after: Some(RefTarget::Direct(oid)),
         }],
         Some(message),
-    )
+    )?;
+    Ok(false)
 }
 
 /// Copies a branch ref, the way `git branch -c/-C` duplicates the ref and
 /// its upstream config.
 ///
 /// Oracle: `git/builtin/branch.c` (`copy_branch`).
-fn copy_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
+fn copy_branch(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let (old, new) = match opts.positionals.as_slice() {
@@ -620,17 +639,6 @@ fn copy_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
             },
         }],
     )?;
-    if opts.is_set("create-reflog") {
-        if let Some(oid) = copied_oid {
-            maybe_create_reflog(
-                ctx,
-                &new_name,
-                before,
-                oid,
-                format!("branch: Copied from {old}"),
-            )?;
-        }
-    }
     // Copy the upstream config the way the oracle copies the branch config.
     let old_short = old
         .strip_prefix("refs/heads/")
@@ -644,6 +652,22 @@ fn copy_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> 
         let from = format!("branch.{old_short}.{key}");
         if let Some(value) = config_read(store, &from)? {
             config_write(store, &format!("branch.{new_short}.{key}"), &value)?;
+        }
+    }
+    if opts.is_set("create-reflog") {
+        if let Some(oid) = copied_oid {
+            let skipped = maybe_create_reflog(
+                ctx,
+                &new_name,
+                before,
+                oid,
+                format!("branch: Copied from {old}"),
+            )?;
+            if skipped {
+                ctx.emit_stderr(
+                    b"warning: no identity configured; skipping reflog creation\n",
+                );
+            }
         }
     }
     Ok(Vec::new())
@@ -1832,20 +1856,32 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
             detail: "checkout needs paths".to_owned(),
         });
     }
+    // `--staged` without a tree restores the index from `HEAD`, not from
+    // itself: without this the index write below would copy rows onto
+    // themselves and change nothing.
+    let source_tree = match (source_tree, conflict_stage) {
+        (None, None) if opts.is_set("staged") => Some(head_tree_committed(ctx)?),
+        (tree, _) => tree,
+    };
     let staged_only = opts.is_set("staged") && !opts.is_set("worktree");
     let worktree_only = opts.is_set("worktree") && !opts.is_set("staged");
     if let Some(stage) = conflict_stage {
         return checkout_conflict_paths(ctx, tree_paths, stage, staged_only, worktree_only);
     }
     // Tree entries carry their own modes; index entries already hold
-    // `FileMode`. Both maps are built once, outside the path loop.
+    // `FileMode`. The index map is built lazily: tree-sourced restores
+    // never read it.
     let mut tree_entries = std::collections::BTreeMap::new();
     if let Some(tree) = source_tree {
         for (path, mode, oid) in flatten_tree(store, kind, tree)? {
             tree_entries.insert(path, (mode, oid));
         }
     }
-    let index_entries = index_entry_map(ctx)?;
+    let index_entries = if source_tree.is_some() {
+        std::collections::BTreeMap::new()
+    } else {
+        index_entry_map(ctx)?
+    };
     // From a tree the oracle refreshes both index and worktree; from the
     // index only the worktree. Explicit `--staged`/`--worktree` narrow it.
     let update_index = source_tree.is_some() && !worktree_only || staged_only;

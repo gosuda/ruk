@@ -508,29 +508,32 @@ fn parse_fixup_flag(value: &str) -> (FixupKind, &str) {
 /// Message cleanup modes for `--cleanup` (and `commit.cleanup`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CleanupMode {
-    /// Trim, drop `#` comments, collapse blanks (the default).
+    /// Trim, drop `#` comments, collapse blanks.
     Strip,
-    /// Trim and collapse blanks, keep comments.
+    /// Trim and collapse blanks, keep comments (the no-editor default:
+    /// without an editor every default/`whitespace`/`scissors` spelling
+    /// resolves to `SPACE`, which never cuts or drops comments).
     Whitespace,
     /// No cleanup at all.
     Verbatim,
-    /// Cut at the scissors marker, then clean like `whitespace`.
-    Scissors,
 }
 
-/// Reads the cleanup mode from `--cleanup` (falling back to
-/// `commit.cleanup`, then `strip`), refusing unknown modes.
+/// Reads the cleanup mode the way the oracle resolves it with no editor:
+/// `--cleanup` wins over `commit.cleanup`, and `default`/absent,
+/// `whitespace`, and `scissors` all mean `whitespace` (the oracle maps
+/// them to `SPACE` when `use_editor` is false, so no scissors cut runs).
 fn cleanup_mode_of(ctx: &Ctx, opts: &super::Collected) -> Result<CleanupMode, GitError> {
     let flag = opts.single("cleanup")?;
     let raw = match flag.as_deref() {
-        Some("default") | None => ctx.config_get("commit.cleanup"),
         Some(mode) => Some(mode.to_owned()),
+        None => ctx.config_get("commit.cleanup"),
     };
     match raw.as_deref() {
-        None | Some("strip") | Some("default") => Ok(CleanupMode::Strip),
-        Some("whitespace") => Ok(CleanupMode::Whitespace),
+        None | Some("default") | Some("whitespace") | Some("scissors") => {
+            Ok(CleanupMode::Whitespace)
+        }
         Some("verbatim") => Ok(CleanupMode::Verbatim),
-        Some("scissors") => Ok(CleanupMode::Scissors),
+        Some("strip") => Ok(CleanupMode::Strip),
         Some(other) => Err(GitError::Invalid {
             detail: format!(
                 "bad --cleanup {other:?}: want strip|whitespace|verbatim|scissors|default"
@@ -539,28 +542,15 @@ fn cleanup_mode_of(ctx: &Ctx, opts: &super::Collected) -> Result<CleanupMode, Gi
     }
 }
 
-/// Reports whether one line is the scissors cut marker: `-- >8 --` with an
-/// optional `#` comment prefix, the way the oracle cuts the template.
-fn is_scissors_line(line: &str) -> bool {
-    let body = line.strip_prefix('#').unwrap_or(line);
-    let body = body.strip_prefix(' ').unwrap_or(body);
-    body == "-- >8 --"
-}
-
-/// Applies one cleanup mode: `strip` also drops `#` comment lines and
-/// `scissors` cuts at the marker first; every cleaning mode strips
-/// trailing whitespace, drops leading/trailing blank lines, collapses
-/// blank runs, and ends a non-empty message with one newline.
+/// Applies one cleanup mode: `strip` also drops `#` comment lines; every
+/// cleaning mode strips trailing whitespace, drops leading/trailing blank
+/// lines, collapses blank runs, and ends a non-empty message with one
+/// newline.
 fn apply_cleanup(text: &str, mode: CleanupMode) -> String {
     if mode == CleanupMode::Verbatim {
         return text.to_owned();
     }
-    let mut lines: Vec<&str> = text.lines().collect();
-    if mode == CleanupMode::Scissors {
-        if let Some(cut) = lines.iter().position(|line| is_scissors_line(line)) {
-            lines.truncate(cut);
-        }
-    }
+    let lines: Vec<&str> = text.lines().collect();
     let mut kept: Vec<String> = Vec::with_capacity(lines.len());
     for line in lines {
         if mode == CleanupMode::Strip && line.starts_with('#') {
@@ -1333,11 +1323,13 @@ fn diff_no_index(
         new: Some((new_mode, new_oid)),
         new_bytes: Some(new_bytes),
         old_bytes: Some(old_bytes),
+        old_display: Some(display(old_text)),
         similarity: None,
         is_copy: false,
     };
     write_output_file(ctx, &opts, render_pairs(ctx, std::slice::from_ref(&pair), &opts)?)
 }
+
 /// Resolves one revision with the spellings [`resolve_rev`] lacks: `@` for
 /// `HEAD` (plus `@~`/`@^` suffixes) and `<rev>:<path>` / `:<path>` blob
 /// paths. Reflog `@{...}` fails closed with a clear message.
@@ -1854,6 +1846,8 @@ enum DateMode {
     Short,
     /// `2026-10-18 05:50:17 +0900`.
     Iso,
+    /// Strict ISO 8601: `2026-10-18T05:50:17+09:00`.
+    IsoStrict,
     /// `<epoch> <±HHMM>`.
     Raw,
     /// `<epoch>`.
@@ -1868,7 +1862,8 @@ fn parse_date_mode(text: &str) -> Result<DateMode, GitError> {
         "default" => Ok(DateMode::Default),
         "relative" => Ok(DateMode::Relative),
         "short" => Ok(DateMode::Short),
-        "iso" | "iso-strict" => Ok(DateMode::Iso),
+        "iso" => Ok(DateMode::Iso),
+        "iso-strict" => Ok(DateMode::IsoStrict),
         "raw" => Ok(DateMode::Raw),
         "unix" => Ok(DateMode::Unix),
         "local" | "rfc" | "rfc2822" | "email" => Err(GitError::Unsupported {
@@ -1984,6 +1979,22 @@ fn render_date(stamp: i64, offset: TzOffset, mode: DateMode, now: i64) -> String
             format!(
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {offset}",
                 civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second,
+            )
+        }
+        DateMode::IsoStrict => {
+            let civil = civil_of(stamp, offset);
+            let mag = offset.hhmm();
+            let sign = if offset.is_negative() { "-" } else { "+" };
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
+                civil.year,
+                civil.month,
+                civil.day,
+                civil.hour,
+                civil.minute,
+                civil.second,
+                mag / 100,
+                mag % 100,
             )
         }
         DateMode::Raw => format!("{stamp} {offset}"),
@@ -5247,7 +5258,6 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         },
     ];
     let (rev_args, path_args) = split_double_dash(args);
-    let rev_args = rewrite_format_colon(&rev_args);
     let (rev_args, decorate_mode) = extract_decorate_arg(&rev_args)?;
     let (rev_args, abbrev_len) = extract_abbrev_arg(&rev_args)?;
     let (rev_args, ref_filters) = extract_ref_filter_args(&rev_args)?;
@@ -5412,15 +5422,24 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     } else {
         None
     };
+    // The notes tree flattens once when any commit may print a note;
+    // per-commit rendering then reads only annotated blobs.
+    let notes_map: HashMap<String, Oid> = match &notes_refname {
+        Some(refname) => super::verbs_notes::notes_entries(store, kind, refname)?
+            .into_iter()
+            .collect(),
+        None => HashMap::new(),
+    };
     let follow_mode = match rename_mode {
         super::rename::RenameMode::Similar(_) => rename_mode,
         super::rename::RenameMode::Disabled | super::rename::RenameMode::ExactOnly => {
             super::rename::RenameMode::Similar(50)
         }
     };
+    let (walked, excluded) = walk_log(store, &tips, &exclude, first_parent)?;
     let mut shown: Vec<ShownCommit> = Vec::new();
     let mut follow_path: Option<Vec<u8>> = if follow { wants.first().cloned() } else { None };
-    for entry in walk_log(store, &tips, &exclude, first_parent)? {
+    for mut entry in walked {
         let path_wants: &[Vec<u8>] = if follow { &[] } else { &wants };
         if !commit_passes_filters(
             store,
@@ -5465,15 +5484,13 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             };
             match follow_step(ctx, store, &entry.record, &current, follow_mode)? {
                 None => continue,
-                Some(next) => follow_path = Some(next),
+                Some(next) => {
+                    entry.follow_paths = Some((current, next.clone()));
+                    follow_path = Some(next);
+                }
             }
         }
-        let origin = entry.origin;
-        shown.push(ShownCommit {
-            oid: entry.oid,
-            record: entry.record,
-            origin,
-        });
+        shown.push(entry);
     }
     if simplify {
         shown.retain(|shown| decorations.contains_key(&shown.oid));
@@ -5492,20 +5509,26 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     if opts.is_set("reverse") {
         shown.reverse();
     }
-    // Boundary commits render after the list in committer-date order (they
-    // flip along with `--reverse`), each prefixed with `-`.
+    // Boundary commits render after the list in committer-date order, each
+    // prefixed with `-`: only excluded commits that parent a shown commit
+    // qualify, so a disjoint `^rev` prints no boundary rows, as in git.
     let mut boundary: Vec<(i64, Oid, CommitRecord)> = Vec::new();
     if opts.is_set("boundary") {
         let mut seen_boundary = HashSet::new();
-        for oid in &exclude {
-            let oid = replace_redirect(store, *oid);
-            if !seen_boundary.insert(oid) {
-                continue;
+        for shown in &shown {
+            for parent in shown
+                .record
+                .parents()
+                .iter()
+                .filter_map(|head| head.as_git().copied())
+            {
+                let parent = replace_redirect(store, parent);
+                if excluded.contains(&parent) && seen_boundary.insert(parent) {
+                    if let Ok(record) = commit_record(store, parent) {
+                        boundary.push((super::state::commit_stamp(&record), parent, record));
+                    }
+                }
             }
-            let Ok(record) = commit_record(store, oid) else {
-                continue;
-            };
-            boundary.push((super::state::commit_stamp(&record), oid, record));
         }
         boundary.sort_by(|left, right| right.0.cmp(&left.0));
     }
@@ -5523,24 +5546,30 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             &decoration,
             source_text.as_deref().unwrap_or(""),
         )?;
-        if show_notes
-            && let Some(note) = super::verbs_notes::note_for_commit(
-                store,
-                kind,
-                notes_refname.as_deref(),
-                &shown.oid,
-            )?
-        {
-            block.extend_from_slice(&render_note(&note));
+        if show_notes {
+            if let Some(blob) = notes_map.get(&shown.oid.to_hex()) {
+                let (_, body) = read_object_bytes(store, *blob)?;
+                block.extend_from_slice(&render_note(&body));
+            }
         }
         if show_diffs {
+            // Pathspecs bound each commit's diff; `--follow` tracks the
+            // before/after paths at this commit instead.
+            let owned;
+            let diff_wants: &[Vec<u8>] = match &shown.follow_paths {
+                Some((before, after)) => {
+                    owned = vec![before.clone(), after.clone()];
+                    &owned
+                }
+                None => &wants,
+            };
             block.extend_from_slice(&log_commit_diff(
                 ctx,
                 store,
-                &shown.oid,
-                &shown.record,
+                shown,
                 &opts,
                 rename_mode,
+                diff_wants,
             )?);
             if extra_stats {
                 block.extend_from_slice(&log_commit_extra(
@@ -5549,6 +5578,7 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
                     &shown.oid,
                     &shown.record,
                     &opts,
+                    diff_wants,
                 )?);
             }
         }
@@ -5590,31 +5620,12 @@ struct ShownCommit {
     record: CommitRecord,
     /// Tip whose walk first reached this commit.
     origin: Oid,
+    /// `--follow` display paths at this commit: the tracked path before
+    /// and after this step (equal without a rename), bounding the diff
+    /// output the way the pathspec does. `None` outside `--follow`.
+    follow_paths: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-/// One walk step for [`walk_log`]: the commit plus its reaching tip.
-struct LogWalkEntry {
-    /// Commit oid.
-    oid: Oid,
-    /// Parsed commit record.
-    record: CommitRecord,
-    /// Tip whose walk first reached this commit.
-    origin: Oid,
-}
-
-/// Rewrites `--format:<value>` to `--format=<value>` before collecting.
-/// The wave contract spells the flag `--format:%H ...`, so the colon form
-/// is accepted as an alias of the oracle's `--format=` spelling.
-fn rewrite_format_colon(args: &[String]) -> Vec<String> {
-    args.iter()
-        .map(|arg| match arg.strip_prefix("--format:") {
-            Some(value) => format!("--format={value}"),
-            None => arg.clone(),
-        })
-        .collect()
-}
-
-/// Extracts `--abbrev`/`--abbrev=<n>` before collecting: the flag takes an
 /// Extracts `--abbrev`/`--abbrev=<n>` before collecting: the flag takes an
 /// optional value, which [`collect`] cannot spell. Both spellings imply
 /// `--abbrev-commit`; the returned length defaults to 7 for the bare form.
@@ -5843,20 +5854,21 @@ fn dwim_path_exists(
 /// from it, mirroring [`walk_history_excluding`]. When `first_parent` is
 /// set only the first parent is followed out of each merge. Every entry
 /// records the tip whose walk first reached it (first reach wins), backing
-/// `--source` and `--left-right`.
+/// `--source` and `--left-right`. The returned closure holds every oid
+/// hidden by the exclusion, backing `--boundary` adjacency checks.
 fn walk_log(
     store: &Store,
     tips: &[Oid],
     exclude: &[Oid],
     first_parent: bool,
-) -> Result<Vec<LogWalkEntry>, GitError> {
+) -> Result<(Vec<ShownCommit>, HashSet<Oid>), GitError> {
     use ruk_core::records::Records;
     let records = Records::new(store);
-    let mut seen: HashSet<Oid> = HashSet::new();
+    let mut excluded: HashSet<Oid> = HashSet::new();
     let mut stack: Vec<Oid> = exclude.to_vec();
     while let Some(oid) = stack.pop() {
         let oid = replace_redirect(store, oid);
-        if !seen.insert(oid) {
+        if !excluded.insert(oid) {
             continue;
         }
         let Ok(record) = walk_record(store, &records, oid) else {
@@ -5869,7 +5881,7 @@ fn walk_log(
         }
     }
     let mut queue = WalkQueue::new();
-    for oid in &seen {
+    for oid in &excluded {
         queue.mark_seen(*oid);
     }
     let mut origins: HashMap<Oid, Oid> = HashMap::new();
@@ -5894,13 +5906,14 @@ fn walk_log(
             origins.entry(*parent).or_insert(origin);
             queue.enqueue(store, &records, *parent)?;
         }
-        out.push(LogWalkEntry {
+        out.push(ShownCommit {
             oid,
             record,
             origin,
+            follow_paths: None,
         });
     }
-    Ok(out)
+    Ok((out, excluded))
 }
 
 /// Advances `--follow` one commit back: reports whether the commit touches
@@ -6099,57 +6112,123 @@ fn cherry_pick_filter(
                 oid: shown.oid,
                 record: shown.record.clone(),
                 origin: shown.origin,
+                follow_paths: shown.follow_paths.clone(),
             });
         }
     }
     Ok(out)
 }
 
-/// Reorders walked commits into `--topo-order`: children before parents,
-/// with each branch kept contiguous. Iterative pre-order depth-first search
-/// from the tips (first parent first); commits unreachable from the tips
-/// cannot occur from [`walk_log`] and sweep last in oid order.
+/// Reorders walked commits into `--topo-order`: no parent prints before
+/// all of its children, with each branch kept contiguous. Kahn's algorithm
+/// over the shown set: a commit turns ready once every child in the set
+/// has printed, and ready commits pop LIFO (first parent first) so
+/// second-parent histories still render as one block. A plain depth-first
+/// search cannot gate this way: it emits a shared root before the second
+/// parent's own child.
 fn topo_reorder(shown: Vec<ShownCommit>, tips: &[Oid]) -> Vec<ShownCommit> {
     let mut slots: HashMap<Oid, ShownCommit> =
         shown.into_iter().map(|shown| (shown.oid, shown)).collect();
-    let mut visited: HashSet<Oid> = HashSet::new();
+    // In-set parents of each shown commit; children invert that map.
+    let mut parents: HashMap<Oid, Vec<Oid>> = HashMap::new();
+    for (oid, entry) in &slots {
+        parents.insert(
+            *oid,
+            entry
+                .record
+                .parents()
+                .iter()
+                .filter_map(|head| head.as_git().copied())
+                .filter(|parent| slots.contains_key(parent))
+                .collect(),
+        );
+    }
+    // Unprinted in-set children per commit; zero means ready.
+    let mut pending: HashMap<Oid, usize> = HashMap::new();
+    for oid in slots.keys() {
+        pending.insert(*oid, 0);
+    }
+    for olds in parents.values() {
+        for parent in olds {
+            if let Some(count) = pending.get_mut(parent) {
+                *count += 1;
+            }
+        }
+    }
     let mut out = Vec::with_capacity(slots.len());
+    let mut emitted: HashSet<Oid> = HashSet::new();
+    let mut queued: HashSet<Oid> = HashSet::new();
     let mut stack: Vec<Oid> = Vec::new();
+    // Seed childless commits besides the tips deterministically first, so
+    // the tips still pop first and print first.
+    let mut extra: Vec<Oid> = slots
+        .keys()
+        .filter(|oid| pending.get(*oid).copied().unwrap_or(usize::MAX) == 0)
+        .filter(|oid| !tips.contains(oid))
+        .copied()
+        .collect();
+    extra.sort();
+    for oid in extra.into_iter().rev() {
+        if queued.insert(oid) {
+            stack.push(oid);
+        }
+    }
     for tip in tips.iter().rev() {
-        if slots.contains_key(tip) {
+        if slots.contains_key(tip)
+            && pending.get(tip).copied().unwrap_or(usize::MAX) == 0
+            && queued.insert(*tip)
+        {
             stack.push(*tip);
         }
     }
     while let Some(oid) = stack.pop() {
-        if !visited.insert(oid) {
+        if !emitted.insert(oid) {
             continue;
         }
         let Some(entry) = slots.remove(&oid) else {
             continue;
         };
-        let parents: Vec<Oid> = entry
-            .record
-            .parents()
-            .iter()
-            .filter_map(|head| head.as_git().copied())
-            .collect();
-        for parent in parents.iter().rev() {
-            if slots.contains_key(parent) {
-                stack.push(*parent);
-            }
-        }
+        release_parents(&parents, &mut pending, &mut queued, &mut stack, &oid);
         out.push(entry);
     }
+    // Finite DAGs always drain; leftovers sweep in oid order so output
+    // stays deterministic no matter what.
     if !slots.is_empty() {
         let mut rest: Vec<Oid> = slots.keys().copied().collect();
         rest.sort();
         for oid in rest {
-            if visited.insert(oid) {
-                out.push(slots.remove(&oid).expect("leftover topo slot"));
+            if emitted.insert(oid) {
+                if let Some(entry) = slots.remove(&oid) {
+                    out.push(entry);
+                }
             }
         }
     }
     out
+}
+
+/// Releases one printed commit's in-set parents: each parent loses one
+/// unprinted child, turning ready (pushed last-parent-first so the first
+/// parent pops first) once none remain.
+fn release_parents(
+    parents: &HashMap<Oid, Vec<Oid>>,
+    pending: &mut HashMap<Oid, usize>,
+    queued: &mut HashSet<Oid>,
+    stack: &mut Vec<Oid>,
+    oid: &Oid,
+) {
+    let Some(olds) = parents.get(oid) else {
+        return;
+    };
+    for parent in olds.iter().rev() {
+        let Some(count) = pending.get_mut(parent) else {
+            continue;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 && queued.insert(*parent) {
+            stack.push(*parent);
+        }
+    }
 }
 
 /// Renders one commit's first-parent change in the extra stat shapes:
@@ -6164,13 +6243,17 @@ fn log_commit_extra(
     oid: &Oid,
     record: &CommitRecord,
     opts: &super::Collected,
+    wants: &[Vec<u8>],
 ) -> Result<Vec<u8>, GitError> {
     let tree = commit_tree_oid(record)?;
     let mut parent_tree = None;
     if let Some(parent) = commit_parents(store, *oid)?.first() {
         parent_tree = Some(commit_tree_oid(&commit_record(store, *parent)?)?);
     }
-    let changes = tree_file_changes(ctx, parent_tree, tree)?;
+    let mut changes = tree_file_changes(ctx, parent_tree, tree)?;
+    if !wants.is_empty() {
+        changes.retain(|change| change_matches(change, wants));
+    }
     let mut out = Vec::new();
     if opts.is_set("summary") {
         out.extend_from_slice(&render_mode_lines(&changes));
@@ -6374,18 +6457,44 @@ fn commit_passes_filters(
     Ok(true)
 }
 
+/// Reports whether one compared path touches a pathspec, for path-limited
+/// `log` diffs. Rename pairs match on either side, so `-- <old>` still
+/// shows the rename that moved it away.
+fn pair_matches(pair: &TreePair, wants: &[Vec<u8>]) -> bool {
+    wants.iter().any(|want| {
+        path_wanted(&pair.path, want)
+            || pair
+                .old_path
+                .as_ref()
+                .is_some_and(|old| path_wanted(old, want))
+    })
+}
+
+/// Reports whether one file change touches a pathspec, checking both
+/// sides of renames the way [`pair_matches`] does for pairs.
+fn change_matches(change: &FileChange, wants: &[Vec<u8>]) -> bool {
+    change
+        .old
+        .as_ref()
+        .map(|(path, _, _)| path)
+        .into_iter()
+        .chain(change.new.as_ref().map(|(path, _, _)| path))
+        .any(|path| wants.iter().any(|want| path_wanted(path, want)))
+}
+
 /// Renders one log commit's change against its first parent, reusing the
 /// shared pair renderer so `--stat`/`-p` spellings match `diff` and `show`.
 /// When only the extra stat shapes (`--summary`/`--shortstat`/`--numstat`/
 /// `--dirstat`) are requested, no patch prints: those render separately in
-/// [`log_commit_extra`].
+/// [`log_commit_extra`]. Non-empty `wants` limits both to matching paths,
+/// the way the oracle's pathspec bounds per-commit diffs.
 fn log_commit_diff(
     ctx: &Ctx,
     store: &Store,
-    oid: &Oid,
-    record: &CommitRecord,
+    shown: &ShownCommit,
     opts: &super::Collected,
     rename_mode: super::rename::RenameMode,
+    wants: &[Vec<u8>],
 ) -> Result<Vec<u8>, GitError> {
     let extra_only = (opts.is_set("summary")
         || opts.is_set("shortstat")
@@ -6398,13 +6507,16 @@ fn log_commit_diff(
     if extra_only {
         return Ok(Vec::new());
     }
-    let tree = commit_tree_oid(record)?;
+    let tree = commit_tree_oid(&shown.record)?;
     let mut parent_tree = None;
-    if let Some(parent) = commit_parents(store, *oid)?.first() {
+    if let Some(parent) = commit_parents(store, shown.oid)?.first() {
         parent_tree = Some(commit_tree_oid(&commit_record(store, *parent)?)?);
     }
     let mut pairs = tree_pairs(ctx, parent_tree, Some(tree))?;
     apply_pair_renames(ctx, &mut pairs, rename_mode)?;
+    if !wants.is_empty() {
+        pairs.retain(|pair| pair_matches(pair, wants));
+    }
     render_pairs(ctx, &pairs, opts)
 }
 
@@ -7011,6 +7123,9 @@ struct TreePair {
     /// Old-side bytes when the content has no stored object (`--no-index`
     /// file compares). Overrides the object read keyed by `old`'s oid.
     old_bytes: Option<Vec<u8>>,
+    /// Old-side display path for `--no-index` (two unlike operands are
+    /// not a rename, so `old_path` must stay empty for status purposes).
+    old_display: Option<Vec<u8>>,
     /// Rename similarity score, set by the pairing pass.
     similarity: Option<u8>,
     /// Copy flag, set by the `-C`/`--find-copies` pass next to `old_path`
@@ -7056,6 +7171,7 @@ fn tree_pairs(ctx: &Ctx, old: Option<Oid>, new: Option<Oid>) -> Result<Vec<TreeP
             new_bytes: None,
             similarity: None,
             old_bytes: None,
+            old_display: None,
             is_copy: false,
         });
     }
@@ -7096,6 +7212,7 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                     new_bytes: Some(bytes),
                     similarity: None,
                     old_bytes: None,
+                    old_display: None,
                     is_copy: false,
                 });
             }
@@ -7113,6 +7230,7 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
                         new_bytes: Some(bytes),
                         similarity: None,
                         old_bytes: None,
+                        old_display: None,
                         is_copy: false,
                     });
                 }
@@ -7128,6 +7246,7 @@ fn worktree_pairs(ctx: &Ctx) -> Result<Vec<TreePair>, GitError> {
             new_bytes: None,
             similarity: None,
             old_bytes: None,
+            old_display: None,
             is_copy: false,
         });
     }
@@ -7205,6 +7324,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                     new_bytes: Some(bytes),
                     similarity: None,
                     old_bytes: None,
+                    old_display: None,
                     is_copy: false,
                 });
             }
@@ -7222,6 +7342,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
                         new_bytes: Some(bytes),
                         similarity: None,
                         old_bytes: None,
+                        old_display: None,
                         is_copy: false,
                     });
                 }
@@ -7237,6 +7358,7 @@ fn rev_worktree_pairs(ctx: &Ctx, rev: &str) -> Result<Vec<TreePair>, GitError> {
             new_bytes: None,
             similarity: None,
             old_bytes: None,
+            old_display: None,
             is_copy: false,
         });
     }
@@ -7298,6 +7420,7 @@ fn tree_pairs_index(
             new_bytes: None,
             similarity: None,
             old_bytes: None,
+            old_display: None,
             is_copy: false,
         });
     }
@@ -7463,6 +7586,8 @@ struct CountedHunk {
     new: Option<(TreeMode, Oid)>,
     /// Old path for renames and copies.
     old_pair_path: Option<Vec<u8>>,
+    /// Old-side display override (`--no-index` first operand).
+    disp_old: Option<Vec<u8>>,
     /// Rename/copy similarity score, when paired.
     score: Option<u8>,
     /// True for `-C` copy pairs (source stays in place).
@@ -7918,8 +8043,10 @@ fn render_pairs(
                 continue;
             }
             let status = pair_status(pair);
+            // `--no-index` reports the first operand, as in the oracle.
+            let shown = pair.old_display.as_ref().unwrap_or(&pair.path);
             out.extend_from_slice(
-                format!("{status}\t{}\n", String::from_utf8_lossy(&pair.path)).as_bytes(),
+                format!("{status}\t{}\n", String::from_utf8_lossy(shown)).as_bytes(),
             );
         }
         return Ok(out);
@@ -7939,6 +8066,7 @@ fn render_pairs(
             old: pair.old,
             new: pair.new,
             old_pair_path: pair.old_path.clone(),
+            disp_old: pair.old_display.clone(),
             score: pair.similarity,
             is_copy: pair.is_copy,
         });
@@ -8403,12 +8531,17 @@ fn render_raw(hunks: &[CountedHunk]) -> Vec<u8> {
         out.extend_from_slice(
             format!(":{old_mode} {new_mode} {old_sha} {new_sha} {status_text}\t").as_bytes(),
         );
-        // Renames and copies print the old path first, as in the oracle.
+        // Renames and copies print the old path first, as in the oracle;
+        // `--no-index` prints its first operand instead of the new path.
         if status == 'R' || status == 'C' {
             if let Some(old) = &hunk.old_pair_path {
                 out.extend_from_slice(String::from_utf8_lossy(old).as_bytes());
                 out.push(b'\t');
             }
+        } else if let Some(old) = &hunk.disp_old {
+            out.extend_from_slice(String::from_utf8_lossy(old).as_bytes());
+            out.push(b'\n');
+            continue;
         }
         out.extend_from_slice(String::from_utf8_lossy(&hunk.path).as_bytes());
         out.push(b'\n');
@@ -8524,10 +8657,17 @@ fn unified_pair(
     render: &PairRender,
 ) -> Result<(Vec<u8>, usize, usize, bool, (usize, usize)), GitError> {
     let new_name = String::from_utf8_lossy(&pair.path);
+    // `--no-index` names its own old side; renames use the old path.
     let old_name = pair
-        .old_path
-        .as_ref()
-        .map_or_else(|| new_name.clone(), |old| String::from_utf8_lossy(old));
+        .old_display
+        .as_deref()
+        .map(String::from_utf8_lossy)
+        .or_else(|| {
+            pair.old_path
+                .as_ref()
+                .map(|old| String::from_utf8_lossy(old))
+        })
+        .unwrap_or_else(|| new_name.clone());
     let src = String::from_utf8_lossy(&render.src);
     let dst = String::from_utf8_lossy(&render.dst);
     let mut out = format!("diff --git {src}{old_name} {dst}{new_name}\n").into_bytes();
@@ -8763,7 +8903,7 @@ fn ws_key(line: &[u8], ws: WsFold, eol: bool) -> Vec<u8> {
     if ws == WsFold::AllSpace {
         return line
             .iter()
-            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+            .filter(|&&b| !matches!(b, b' ' | b'\t' | b'\r'))
             .copied()
             .collect();
     }
@@ -8779,14 +8919,14 @@ fn ws_key(line: &[u8], ws: WsFold, eol: bool) -> Vec<u8> {
     }
     let mut key = Vec::with_capacity(line.len());
     let mut in_run = false;
-    for byte in line {
+    for &byte in line {
         if matches!(byte, b' ' | b'\t') {
             if !in_run {
                 key.push(b' ');
                 in_run = true;
             }
         } else {
-            key.push(*byte);
+            key.push(byte);
             in_run = false;
         }
     }
@@ -8796,7 +8936,7 @@ fn ws_key(line: &[u8], ws: WsFold, eol: bool) -> Vec<u8> {
 /// Reports whether a line is blank for `--ignore-blank-lines`: empty or
 /// only `[ \t\r]`.
 fn is_blank_line(line: &[u8]) -> bool {
-    line.iter().all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+    line.iter().all(|&byte| matches!(byte, b' ' | b'\t' | b'\r'))
 }
 
 /// Splits an op-change mask into windows with `radius` context lines,
