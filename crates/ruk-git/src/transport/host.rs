@@ -187,13 +187,12 @@ pub fn truncate_reason(reason: &str) -> String {
     reason[..end].to_owned()
 }
 
-/// Whether a review ref sits under the review namespace.
+/// Whether a review ref sits under the review namespace: the bare
+/// namespace itself is not a divert target, only paths below it.
 #[must_use]
 pub fn is_review_ref(name: &str) -> bool {
-    name == REVIEW_REF_PREFIX
-        || name
-            .strip_prefix(REVIEW_REF_PREFIX)
-            .is_some_and(|rest| rest.starts_with('/'))
+    name.strip_prefix(REVIEW_REF_PREFIX)
+        .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
 }
 
 /// The hosted callback policy: every verdict arrives over hook frames.
@@ -483,6 +482,16 @@ impl ReceivePolicy for HostPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_ref_needs_a_path_below_the_namespace() {
+        assert!(!is_review_ref("refs/changes"));
+        assert!(!is_review_ref("refs/changes/"));
+        assert!(is_review_ref("refs/changes/1"));
+        assert!(is_review_ref("refs/changes/1/patchset/2"));
+        assert!(!is_review_ref("refs/changesx/1"));
+        assert!(!is_review_ref("refs/heads/main"));
+    }
 
     #[test]
     fn hook_call_without_truncation_flag_defaults_false() {
