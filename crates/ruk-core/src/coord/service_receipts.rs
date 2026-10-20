@@ -227,6 +227,35 @@ mod tests {
     }
 
     #[test]
+    fn service_receipts_isolate_repositories() {
+        let (_dir, store) = temp_store("repo-isolation");
+        store_service_receipt(
+            &store,
+            1000,
+            b"/srv/ruk/alpha",
+            "req-1",
+            &receipt("aaa", 10),
+        )
+        .expect("store alpha");
+        store_service_receipt(&store, 1000, b"/srv/ruk/beta", "req-1", &receipt("bbb", 10))
+            .expect("store beta");
+        let (first, _) = lookup_service_receipt(&store, 1000, b"/srv/ruk/alpha", "req-1")
+            .expect("lookup")
+            .expect("alpha row exists");
+        let (second, _) = lookup_service_receipt(&store, 1000, b"/srv/ruk/beta", "req-1")
+            .expect("lookup")
+            .expect("beta row exists");
+        assert_eq!(first.digest, "aaa");
+        assert_eq!(second.digest, "bbb");
+        assert!(
+            lookup_service_receipt(&store, 1000, b"/srv/ruk/gamma", "req-1")
+                .expect("lookup")
+                .is_none(),
+            "an unknown repository misses"
+        );
+    }
+
+    #[test]
     fn service_receipts_survive_reopen() {
         let (dir, store) = temp_store("reopen");
         let repo = b"/srv/ruk/repo";
