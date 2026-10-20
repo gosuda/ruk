@@ -555,6 +555,45 @@ impl<T> Page<T> {
     }
 }
 
+/// A revision naming one commit: either a ref resolved at read time or a
+/// literal object id. Reads that accept revisions (tree, compare, archive,
+/// blame) take this shape instead of free-form strings.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitRev {
+    Ref(RefName),
+    Commit(Oid),
+}
+
+/// One stateless keyset page: rows plus the opaque position to resume
+/// after. Unlike [`Page`], the cursor binds no 30-second lease: the caller
+/// passes `next_after` back as the next request's `after`, so forge reads
+/// never hold lease state for pagination.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KeysetPage<T> {
+    pub items: Vec<T>,
+    /// The last returned key, hex-encoded; absent when the listing is
+    /// exhausted.
+    #[serde(default)]
+    pub next_after: Option<ByteString>,
+}
+
+impl<T> KeysetPage<T> {
+    /// Builds a page.
+    ///
+    /// # Errors
+    /// `E_LIMIT` when `items` exceeds [`MAX_PAGE_SIZE`].
+    pub fn new(items: Vec<T>, next_after: Option<ByteString>) -> Result<Self, CoreError> {
+        if items.len() > MAX_PAGE_SIZE {
+            return Err(limit_exceeded(format!(
+                "a keyset page holds at most {MAX_PAGE_SIZE} rows, got {}",
+                items.len()
+            )));
+        }
+        Ok(Self { items, next_after })
+    }
+}
+
 /// A bounded excerpt of a collection too large to return whole: at most
 /// [`MAX_PAGE_SIZE`] items, the true total, and whether anything was left out.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2595,8 +2634,11 @@ macro_rules! no_invariants {
     };
 }
 
+impl<T> Validate for KeysetPage<T> {}
+
 no_invariants!(
     SchemaArgs,
+    CommitRev,
     SessionResumeArgs,
     WsScopeArgs,
     WsTakeArgs,
@@ -4056,6 +4098,74 @@ mod tests {
                 "limit {limit}"
             );
         }
+    }
+
+    #[test]
+    fn commit_rev_uses_single_key_ref_or_commit_objects() {
+        let by_ref = CommitRev::Ref(name("refs/heads/main"));
+        let wire = sonic_rs::to_value(&by_ref).expect("json");
+        assert_eq!(wire, json!({"ref": "refs/heads/main"}));
+        let back: CommitRev = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, by_ref);
+
+        let by_id = CommitRev::Commit(oid(9));
+        let wire = sonic_rs::to_value(&by_id).expect("json");
+        assert_eq!(wire, json!({"commit": "09".repeat(20)}));
+        let back: CommitRev = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, by_id);
+
+        assert!(sonic_rs::from_str::<CommitRev>("{\"REF\": \"refs/heads/main\"}").is_err());
+        assert!(by_ref.validate().is_ok());
+        assert!(by_id.validate().is_ok());
+    }
+
+    #[test]
+    fn keyset_pages_are_stateless_and_bounded() {
+        let page = KeysetPage::new(vec![1_u32, 2], Some(ByteString::from("ff00"))).expect("page");
+        assert_eq!(page.next_after, Some(ByteString::from("ff00")));
+        let wire = sonic_rs::to_value(&page).expect("json");
+        assert_eq!(wire, json!({"items": [1, 2], "next_after": "ff00"}));
+        let back: KeysetPage<u32> = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, page);
+
+        let terminal = KeysetPage::new(vec![1_u32], None).expect("terminal");
+        let wire = sonic_rs::to_value(&terminal).expect("json");
+        assert_eq!(wire["next_after"], json!(null));
+        assert!(terminal.validate().is_ok());
+
+        let over = (0..=MAX_PAGE_SIZE).collect::<Vec<_>>();
+        assert_eq!(
+            KeysetPage::new(over, None).expect_err("cap").code,
+            ErrorCode::ELimit
+        );
+    }
+
+    #[test]
+    fn shared_scalars_keep_their_wire_contracts() {
+        let utf8 = ByteString::from("refs/heads/main");
+        assert_eq!(
+            sonic_rs::to_value(&utf8).expect("json"),
+            json!("refs/heads/main")
+        );
+        let raw = ByteString::new(vec![0xff, 0xfe]);
+        assert_eq!(
+            sonic_rs::to_value(&raw).expect("json"),
+            json!({"hex": "fffe"})
+        );
+        let back: ByteString = sonic_rs::from_value(&json!({"hex": "fffe"})).expect("parse");
+        assert_eq!(back, raw);
+
+        let direct = RefTarget::Direct(oid(3));
+        assert_eq!(
+            sonic_rs::to_value(&direct).expect("json"),
+            json!({"direct": "03".repeat(20)})
+        );
+        let symbolic = RefTarget::Symbolic(name("refs/heads/main"));
+        assert_eq!(
+            sonic_rs::to_value(&symbolic).expect("json"),
+            json!({"symbolic": "refs/heads/main"})
+        );
+        assert!(sonic_rs::from_str::<RefTarget>("{\"Direct\": \"00\"}").is_err());
     }
 
     #[test]
