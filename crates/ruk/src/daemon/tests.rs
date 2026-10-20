@@ -1848,6 +1848,73 @@ async fn host_unauthorized_ref_refused_before_callback() {
 }
 
 #[tokio::test]
+async fn hosted_atomic_push_refuses_before_pre_receive() {
+    let root = temp_root("host-atomic");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let session = open_push_session(&mut driver, &store_repo, &["refs/heads/**"]).await;
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\0report-status atomic\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-atomic-1"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 5, &body).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    let mut saw_hook = false;
+    let mut stdout = Vec::new();
+    let exit = loop {
+        let frame = driver.recv().await;
+        match frame.kind {
+            FrameKind::HookCall => saw_hook = true,
+            FrameKind::Stdout => stdout.extend_from_slice(&frame.payload),
+            FrameKind::Exit => {
+                break ipc::decode_control::<CommandExitReport>(&frame.payload)
+                    .expect("exit decodes");
+            }
+            FrameKind::Error => panic!("atomic refusal stays in-band"),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    };
+    assert!(!saw_hook, "no callback fires for an atomic push");
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(
+        text.contains("ng refs/heads/scratch atomic pushes are not supported"),
+        "got {text:?}"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn post_receive_failure_never_fails_push() {
     let root = temp_root("host-postfail");
     let repo_dir = root.join("repo");

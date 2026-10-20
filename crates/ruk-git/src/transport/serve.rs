@@ -795,7 +795,16 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         pack_bytes,
     };
     let mut alternates: Vec<(usize, AlternateRef)> = Vec::new();
-    let verdicts = policy.pre_receive(&batch);
+    let verdicts = if atomic {
+        for (index, _) in &live {
+            if results[*index].is_none() {
+                results[*index] = Some(Err("atomic pushes are not supported".to_owned()));
+            }
+        }
+        Vec::new()
+    } else {
+        policy.pre_receive(&batch)
+    };
     // A whole-push refusal drops the staging unpublished and returns
     // before promotion, mirroring the historical `pre-receive` early
     // return: refused objects must never enter the store.
@@ -1566,6 +1575,44 @@ mod tests {
             vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
         );
         assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+    }
+
+    #[test]
+    fn receive_refuses_atomic_without_hooks() {
+        let kind = HashKind::Sha1;
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+        let mut input = command(
+            kind.zero_oid(),
+            oid(FOUR),
+            b"refs/heads/main",
+            Some("report-status atomic"),
+        );
+        input.extend_from_slice(b"0000");
+        input.extend_from_slice(&pack);
+
+        let mut out = Vec::new();
+        serve_receive_pack_with(
+            &input[..],
+            &mut out,
+            &dest,
+            kind,
+            &head(),
+            &Interrupt::none(),
+            &NoPolicy,
+            LfsMode::Deny,
+            ReceiveLimits::default(),
+        )
+        .expect("atomic refusal stays in-band");
+        let lines = report_lines(&out);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"unpack ok");
+        assert!(
+            lines[1].starts_with(b"ng refs/heads/main atomic pushes are not supported"),
+            "got {lines:?}"
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), None);
     }
 
     #[test]
