@@ -42,6 +42,7 @@ use ruk_core::protocol::{
 };
 use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
 use ruk_core::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
+use ruk_git::transport::host::{HookCall, HookPhase, HookRefVerdict, HookReply, HookVerdict};
 
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
@@ -280,6 +281,81 @@ impl Driver {
         (stdout, exit)
     }
 
+    /// Sends one raw frame with an explicit kind byte, for retired kinds
+    /// no enum variant names.
+    async fn send_raw(&mut self, kind: u8, stream_id: u64, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt as _;
+        let total = u32::try_from(ipc::FRAME_HEADER_BYTES + payload.len()).expect("frame fits");
+        let mut bytes = total.to_be_bytes().to_vec();
+        bytes.push(kind);
+        bytes.extend_from_slice(&stream_id.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        self.conn.write_all(&bytes).await.expect("send raw frame");
+    }
+
+    /// Reads one frame, returning stream errors to the caller.
+    async fn try_recv(&mut self) -> Result<ipc::Frame, CoreError> {
+        ipc::read_frame(&mut self.conn, frame_deadline()).await
+    }
+
+    /// Runs one hosted receive-pack open to its terminal report,
+    /// answering every hook callback with `answer` (`None` skips the
+    /// reply, for timeout paths): `Accepted`, the request body, one
+    /// `HookCall` per callback round, then `Stdout` until `Exit`.
+    async fn run_git_hosted(
+        &mut self,
+        stream_id: u64,
+        payload: &[u8],
+        body: &[Vec<u8>],
+        answer: impl Fn(&HookCall) -> Option<HookReply>,
+    ) -> (Vec<u8>, CommandExitReport) {
+        self.send(FrameKind::Open, stream_id, payload).await;
+        let accepted = self.recv().await;
+        assert_eq!(accepted.kind, FrameKind::Accepted);
+        assert_eq!(accepted.stream_id, stream_id);
+        for chunk in body {
+            self.send(FrameKind::Stdin, stream_id, chunk).await;
+        }
+        if !body.is_empty() {
+            for _ in 0..body.len() {
+                let grant = self.recv().await;
+                assert_eq!(grant.kind, FrameKind::WindowUpdate);
+                assert_eq!(grant.stream_id, stream_id);
+            }
+            self.send(FrameKind::StdinEof, stream_id, &[]).await;
+        }
+        let mut stdout = Vec::new();
+        loop {
+            let frame = self.recv().await;
+            assert_eq!(
+                frame.stream_id, stream_id,
+                "unexpected stream {}",
+                frame.stream_id
+            );
+            match frame.kind {
+                FrameKind::HookCall => {
+                    let call: HookCall =
+                        ipc::decode_control(&frame.payload).expect("hook call decodes");
+                    if let Some(reply) = answer(&call) {
+                        let bytes = ipc::encode_control(&reply).expect("hook reply encodes");
+                        self.send(FrameKind::HookReply, stream_id, &bytes).await;
+                    }
+                }
+                FrameKind::Stdout => stdout.extend_from_slice(&frame.payload),
+                FrameKind::Exit => {
+                    let report: CommandExitReport =
+                        ipc::decode_control(&frame.payload).expect("exit decodes");
+                    return (stdout, report);
+                }
+                FrameKind::Error => panic!(
+                    "stream {stream_id} refused: {}",
+                    String::from_utf8_lossy(&frame.payload)
+                ),
+                other => panic!("unexpected frame {other:?} on stream {stream_id}"),
+            }
+        }
+    }
+
     /// Opens one git-service stream expecting refusal: an `Error` then a
     /// nonzero `Exit`.
     async fn expect_git_refused(
@@ -418,6 +494,75 @@ fn spawn_pair(root: &Path) -> (Driver, tokio::task::JoinHandle<Result<(), super:
     spawn_pair_with_window(root, INITIAL_STREAM_WINDOW_BYTES)
 }
 
+/// Spawns a daemon pair keeping its registry, so hosted tests can tune
+/// the hook deadline and read the store through the live coordinator.
+fn spawn_hosted(
+    root: &Path,
+    hook_timeout_ms: u64,
+) -> (
+    Driver,
+    Arc<Registry>,
+    tokio::task::JoinHandle<Result<(), super::Error>>,
+) {
+    let registry = Arc::new(Registry::new(vec![root.to_path_buf()]).expect("registry"));
+    registry.set_runtime(tokio::runtime::Handle::current());
+    registry.set_hook_timeout(Duration::from_millis(hook_timeout_ms));
+    let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+    let uid = client.peer_cred().expect("socket pair credentials").uid();
+    let refs = ConnectionRefs {
+        registry: Arc::clone(&registry),
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport executor"),
+        window_bytes: INITIAL_STREAM_WINDOW_BYTES,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: vec![uid],
+    };
+    let task = tokio::spawn(async move { serve_connection(server, refs).await });
+    (Driver { conn: client }, registry, task)
+}
+
+/// Answers one hook callback by accepting every command.
+fn accept_all(call: &HookCall) -> Option<HookReply> {
+    Some(HookReply {
+        reject_all: false,
+        reason: None,
+        verdicts: call
+            .commands
+            .iter()
+            .map(|command| HookRefVerdict {
+                name: command.name.clone(),
+                verdict: HookVerdict::Accept,
+            })
+            .collect(),
+    })
+}
+
+/// Opens one session carrying exactly these `push_refs` patterns.
+async fn open_push_session(driver: &mut Driver, store_repo: &str, patterns: &[&str]) -> String {
+    let mut list = String::from("[");
+    for (index, pattern) in patterns.iter().enumerate() {
+        if index > 0 {
+            list.push(',');
+        }
+        list.push('"');
+        list.push_str(pattern);
+        list.push('"');
+    }
+    list.push(']');
+    let args_json = format!(r#"{{"claims": {{}}, "capabilities": {{"push_refs": {list}}}}}"#);
+    let payload = Driver::typed_open(
+        store_repo,
+        "session.open",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        None,
+    );
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    opened.session.to_string()
+}
+
 /// Spawns `serve_connection` on a socket pair with one stream window size,
 /// so credit tests can force the daemon to wait for grants.
 fn spawn_pair_with_window(
@@ -433,6 +578,7 @@ fn spawn_pair_with_window(
     let refs = ConnectionRefs {
         registry,
         executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport executor"),
         window_bytes,
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
@@ -771,6 +917,10 @@ async fn git_service_delete_only_receive_pack_round_trip() {
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(1, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
 
     let zero = "0".repeat(40);
     let mut request = pkt(format!(
@@ -783,17 +933,19 @@ async fn git_service_delete_only_receive_pack_round_trip() {
         "receive-pack",
         &store_repo,
         false,
-        Some("sess-1"),
+        Some(&session),
         Some("req-del-1"),
     );
-    let (stdout, exit) = driver.run_git(1, &payload, &[request]).await;
+    let (stdout, exit) = driver
+        .run_git_hosted(3, &payload, &[request], accept_all)
+        .await;
     assert_eq!(exit.exit_code, 0);
     assert_eq!(exit.invocation_id, "req-del-1");
     let text = String::from_utf8(stdout).expect("report is text");
     assert!(text.contains("unpack ok"), "report lands: {text}");
 
     let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
-    let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
+    let (stdout, exit) = driver.run_git(5, &advert, &[]).await;
     assert_eq!(exit.exit_code, 0);
     let refs = parse_advertised_refs(&stdout, "upload-pack");
     assert!(
@@ -1101,6 +1253,7 @@ async fn events_increase_strictly_across_lane_and_receive() {
     let refs = ConnectionRefs {
         registry: Arc::clone(&registry),
         executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport executor"),
         window_bytes: INITIAL_STREAM_WINDOW_BYTES,
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
@@ -1146,10 +1299,12 @@ async fn events_increase_strictly_across_lane_and_receive() {
         "receive-pack",
         &store_repo,
         false,
-        Some("sess-1"),
+        Some(&session),
         Some("req-del-1"),
     );
-    let (_, exit) = driver.run_git(7, &payload, &[request]).await;
+    let (_, exit) = driver
+        .run_git_hosted(7, &payload, &[request], accept_all)
+        .await;
     assert_eq!(exit.exit_code, 0);
 
     let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
@@ -1193,6 +1348,10 @@ async fn service_receipt_replays_stored_report() {
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
 
     let zero = "0".repeat(40);
     let mut body = pkt(format!(
@@ -1206,20 +1365,24 @@ async fn service_receipt_replays_stored_report() {
         "receive-pack",
         &store_repo,
         false,
-        Some("sess-1"),
+        Some(&session),
         Some("req-replay-1"),
     );
-    let (first_out, first_exit) = driver.run_git(3, &payload, &[body.clone()]).await;
+    let (first_out, first_exit) = driver
+        .run_git_hosted(5, &payload, &[body.clone()], accept_all)
+        .await;
     assert_eq!(first_exit.exit_code, 0);
 
     let payload = git_open_payload(
         "receive-pack",
         &store_repo,
         false,
-        Some("sess-1"),
+        Some(&session),
         Some("req-replay-1"),
     );
-    let (second_out, second_exit) = driver.run_git(5, &payload, &[body]).await;
+    let (second_out, second_exit) = driver
+        .run_git_hosted(7, &payload, &[body], accept_all)
+        .await;
     assert_eq!(second_exit.exit_code, 0);
     assert_eq!(
         second_out, first_out,
@@ -1243,9 +1406,14 @@ async fn service_receipt_digest_mismatch_is_reused_error() {
         .expect("utf8 store repo")
         .to_string();
     let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
 
     let zero = "0".repeat(40);
     let hex = commit.to_hex();
@@ -1258,17 +1426,19 @@ async fn service_receipt_digest_mismatch_is_reused_error() {
         "receive-pack",
         &store_repo,
         false,
-        Some("sess-1"),
+        Some(&session),
         Some("req-reuse-1"),
     );
-    let (_, exit) = driver.run_git(3, &payload, &[delete]).await;
+    let (_, exit) = driver
+        .run_git_hosted(5, &payload, &[delete], accept_all)
+        .await;
     assert_eq!(exit.exit_code, 0);
 
     let payload = git_open_payload(
         "receive-pack",
         &store_repo,
         false,
-        Some("sess-1"),
+        Some(&session),
         Some("req-reuse-1"),
     );
     driver.send(FrameKind::Open, 5, &payload).await;
@@ -1284,6 +1454,729 @@ async fn service_receipt_digest_mismatch_is_reused_error() {
     assert_eq!(report.code, ErrorCode::ERequestReused);
     let exit_frame = driver.recv().await;
     assert_eq!(exit_frame.kind, FrameKind::Exit);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn host_pre_receive_per_ref_accept_reject() {
+    let root = temp_root("host-accept");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let hex = commit.to_hex();
+    let mut body = pkt(format!("{hex} {zero} refs/heads/main\n").as_bytes());
+    body.extend_from_slice(pkt(format!("{hex} {zero} refs/heads/scratch\n").as_bytes()).as_slice());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-host-1"),
+    );
+    let answer = |call: &HookCall| {
+        Some(HookReply {
+            reject_all: false,
+            reason: None,
+            verdicts: call
+                .commands
+                .iter()
+                .map(|command| HookRefVerdict {
+                    name: command.name.clone(),
+                    verdict: if command.name == "refs/heads/main" {
+                        HookVerdict::Accept
+                    } else {
+                        HookVerdict::Reject {
+                            reason: "nope".to_owned(),
+                        }
+                    },
+                })
+                .collect(),
+        })
+    };
+    let (out, exit) = driver.run_git_hosted(5, &payload, &[body], answer).await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("ok refs/heads/main"), "got {text:?}");
+    assert!(text.contains("ng refs/heads/scratch nope"), "got {text:?}");
+    assert_eq!(
+        exit.operation_ids,
+        vec!["3".to_owned()],
+        "only the landed delete names an operation"
+    );
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let main = coordinator
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/heads/main")
+        .expect("read main");
+    let scratch = coordinator
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/heads/scratch")
+        .expect("read scratch");
+    assert!(main.is_none(), "accepted delete landed");
+    assert!(scratch.is_some(), "refused delete stayed");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn host_divert_writes_review_ref_only() {
+    let root = temp_root("host-divert");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let four = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!("{zero} {four} refs/for/main\n").as_bytes());
+    body.extend_from_slice(&flush());
+    body.extend_from_slice(include_bytes!(
+        "../../../ruk-git/src/transport/fixtures/basic.pack"
+    ));
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-divert-1"),
+    );
+    let answer = |call: &HookCall| {
+        if call.phase == HookPhase::PostReceive {
+            return accept_all(call);
+        }
+        Some(HookReply {
+            reject_all: false,
+            reason: None,
+            verdicts: vec![HookRefVerdict {
+                name: "refs/for/main".to_owned(),
+                verdict: HookVerdict::Divert {
+                    review_ref: "refs/changes/1/head".to_owned(),
+                },
+            }],
+        })
+    };
+    let (out, exit) = driver.run_git_hosted(5, &payload, &[body], answer).await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("ok refs/for/main"), "got {text:?}");
+    assert_eq!(exit.operation_ids.len(), 1);
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let literal = coordinator
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/for/main")
+        .expect("read literal");
+    assert!(literal.is_none(), "no literal refs/for ref lands");
+    let review = coordinator
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/changes/1/head")
+        .expect("read review");
+    assert!(review.is_some(), "the review ref lands through CAS");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn host_reply_missing_ref_means_reject_all() {
+    let root = temp_root("host-missing");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let hex = commit.to_hex();
+    let mut body = pkt(format!("{hex} {zero} refs/heads/main\n").as_bytes());
+    body.extend_from_slice(pkt(format!("{hex} {zero} refs/heads/scratch\n").as_bytes()).as_slice());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-missing-1"),
+    );
+    let answer = |call: &HookCall| {
+        Some(HookReply {
+            reject_all: false,
+            reason: None,
+            verdicts: call
+                .commands
+                .iter()
+                .filter(|command| command.name == "refs/heads/main")
+                .map(|command| HookRefVerdict {
+                    name: command.name.clone(),
+                    verdict: HookVerdict::Accept,
+                })
+                .collect(),
+        })
+    };
+    let (out, exit) = driver.run_git_hosted(5, &payload, &[body], answer).await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ng refs/heads/main hook left ref"),
+        "got {text:?}"
+    );
+    assert!(
+        text.contains("ng refs/heads/scratch hook left ref"),
+        "got {text:?}"
+    );
+    assert!(exit.operation_ids.is_empty());
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    for name in [
+        b"refs/heads/main".as_slice(),
+        b"refs/heads/scratch".as_slice(),
+    ] {
+        let kept = coordinator
+            .store()
+            .fact(ruk_core::store::FactTable::Refs, name)
+            .expect("read ref");
+        assert!(kept.is_some(), "nothing lands on a partial reply");
+    }
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn host_timeout_rejects_all_fail_closed() {
+    let root = temp_root("host-timeout");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 300);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/main\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-timeout-1"),
+    );
+    let (out, exit) = driver.run_git_hosted(5, &payload, &[body], |_| None).await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ng refs/heads/main hook deadline elapsed"),
+        "got {text:?}"
+    );
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let kept = coordinator
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/heads/main")
+        .expect("read ref");
+    assert!(kept.is_some(), "a timed-out push publishes nothing");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn host_unauthorized_ref_refused_before_callback() {
+    let root = temp_root("host-unauth");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let session = open_push_session(&mut driver, &store_repo, &["refs/heads/other/**"]).await;
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/main\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-unauth-1"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 5, &body).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    let mut saw_hook = false;
+    let mut stdout = Vec::new();
+    let exit = loop {
+        let frame = driver.recv().await;
+        match frame.kind {
+            FrameKind::HookCall => saw_hook = true,
+            FrameKind::Stdout => stdout.extend_from_slice(&frame.payload),
+            FrameKind::Exit => {
+                break ipc::decode_control::<CommandExitReport>(&frame.payload)
+                    .expect("exit decodes");
+            }
+            FrameKind::Error => panic!("stream refused"),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    };
+    assert!(!saw_hook, "no callback fires without push authority");
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(
+        text.contains("ng refs/heads/main no push_refs capability"),
+        "got {text:?}"
+    );
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let kept = coordinator
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/heads/main")
+        .expect("read ref");
+    assert!(kept.is_some(), "an unauthorized push publishes nothing");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn post_receive_failure_never_fails_push() {
+    let root = temp_root("host-postfail");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 300);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-postfail-1"),
+    );
+    let answer = |call: &HookCall| {
+        if call.phase == HookPhase::PreReceive {
+            accept_all(call)
+        } else {
+            None
+        }
+    };
+    let (out, exit) = driver.run_git_hosted(5, &payload, &[body], answer).await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("ok refs/heads/scratch"), "got {text:?}");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn receive_replay_same_digest_no_second_publish() {
+    let root = temp_root("host-replay");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-host-replay-1"),
+    );
+    let (first_out, first_exit) = driver
+        .run_git_hosted(5, &payload, &[body.clone()], accept_all)
+        .await;
+    assert_eq!(first_exit.exit_code, 0);
+
+    let events_before = {
+        let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+        coordinator
+            .store()
+            .fact_page(
+                ruk_core::store::FactTable::Events,
+                None,
+                ruk_core::store::FactPageBudget::new(100, usize::MAX),
+            )
+            .expect("read events")
+            .rows
+            .len()
+    };
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-host-replay-1"),
+    );
+    let (second_out, second_exit) = driver
+        .run_git_hosted(7, &payload, &[body], accept_all)
+        .await;
+    assert_eq!(second_exit.exit_code, 0);
+    assert_eq!(second_out, first_out);
+    let events_after = {
+        let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+        coordinator
+            .store()
+            .fact_page(
+                ruk_core::store::FactTable::Events,
+                None,
+                ruk_core::store::FactPageBudget::new(100, usize::MAX),
+            )
+            .expect("read events")
+            .rows
+            .len()
+    };
+    assert_eq!(
+        events_after, events_before,
+        "the replay publishes no second event"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn receive_digest_mismatch_refused() {
+    let root = temp_root("host-mismatch");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let four = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+    let zero = "0".repeat(40);
+    let mut create = pkt(format!("{zero} {four} refs/heads/packed\n").as_bytes());
+    create.extend_from_slice(&flush());
+    create.extend_from_slice(include_bytes!(
+        "../../../ruk-git/src/transport/fixtures/basic.pack"
+    ));
+    let mut delete = pkt(format!("{four} {zero} refs/heads/packed\n").as_bytes());
+    delete.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-host-mm-1"),
+    );
+    let (_, exit) = driver
+        .run_git_hosted(5, &payload, &[create], accept_all)
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-host-mm-1"),
+    );
+    driver.send(FrameKind::Open, 7, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 7, &delete).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 7, &[]).await;
+    let err_frame = driver.recv().await;
+    assert_eq!(err_frame.kind, FrameKind::Error);
+    let report: ErrorReply = ipc::decode_control(&err_frame.payload).expect("error decodes");
+    assert_eq!(report.code, ErrorCode::ERequestReused);
+    let exit_frame = driver.recv().await;
+    assert_eq!(exit_frame.kind, FrameKind::Exit);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn receive_ref_already_at_new_on_replay_is_ok() {
+    let root = temp_root("host-already");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-already-1"),
+    );
+    let (_, exit) = driver
+        .run_git_hosted(5, &payload, &[body.clone()], accept_all)
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    // Same commands under a fresh request id re-execute against a ref
+    // that already sits at the desired tip: tolerated as `ok`, not a
+    // stale conflict.
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-already-2"),
+    );
+    let (out, exit) = driver
+        .run_git_hosted(7, &payload, &[body], accept_all)
+        .await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ok refs/heads/scratch"),
+        "already-at-new must report ok, got {text:?}"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn frame_kind_9_rejected_on_any_stream() {
+    let root = temp_root("kind-nine");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = git_open_payload("upload-pack", &store_repo, true, None, None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    // Drain the advertisement round first: only the retired kind may
+    // kill the connection below, not in-flight traffic.
+    loop {
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, 1);
+        if frame.kind == FrameKind::Exit {
+            break;
+        }
+    }
+    driver.send_raw(9, 1, b"retired").await;
+    let refused = driver.try_recv().await;
+    assert!(
+        refused.is_err(),
+        "a retired frame kind tears the connection down, got {refused:?}"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn socket_round_trip_push_reports_operations() {
+    let root = temp_root("host-roundtrip");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-roundtrip-1"),
+    );
+    let (out, exit) = driver
+        .run_git_hosted(5, &payload, &[body], accept_all)
+        .await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("ok refs/heads/scratch"), "got {text:?}");
+    assert_eq!(
+        exit.operation_ids,
+        vec!["2".to_owned()],
+        "the exit report names the landed delete event"
+    );
 
     drop(driver);
     task.abort();

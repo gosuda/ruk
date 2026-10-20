@@ -1085,6 +1085,46 @@ fn walk_oplog_page(
 }
 
 impl HostedCoordinator {
+    /// Reads one session's push capabilities for git-service
+    /// authorization. Requires active authority and holder identity like
+    /// [`HostedCoordinator::check_session`], then returns the cloned
+    /// capability set so the receive path can flag each command without
+    /// holding session state.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ECancelled`] when `cancel` or shutdown fired.
+    /// - [`ErrorCode::EForbidden`] on unknown session, expired authority,
+    ///   or a caller principal that is not the session holder.
+    pub async fn git_push_capabilities(
+        &self,
+        caller: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+    ) -> Result<Capabilities, CoreError> {
+        cancel.check()?;
+        self.shutdown.check()?;
+        let policy = self.policies.load()?;
+        let idle = policy.session_idle();
+        let times = self.clock.sample()?;
+        let live = self
+            .sessions
+            .get_or_load(&self.store, session, idle, times)?
+            .ok_or_else(|| CoreError::new(ErrorCode::EForbidden, "unknown session"))?;
+        if live.current_authority(&times) != Authority::Active {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "session lacks active authority",
+            ));
+        }
+        if live.row().principal != *caller {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "caller is not the session holder",
+            ));
+        }
+        Ok(live.row().capabilities.clone())
+    }
+
     /// Verifies one session for a caller before unauthenticated work.
     ///
     /// Loads the session, requires active authority, and requires the

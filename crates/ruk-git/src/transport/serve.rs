@@ -47,7 +47,9 @@ use std::io::{Read, Write};
 
 use ruk_core::LfsMode;
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::refdata::{RefName, RefTarget};
+use ruk_core::refdata::{RefName, RefRead, RefTarget};
+use ruk_core::refs::StoreRefs;
+use ruk_core::store::types::ObjectKind;
 use ruk_core::store::{EventContext, EventSource, FactMutation, Store};
 
 use super::fetch::{commit_record_facts, verify_closure};
@@ -473,7 +475,8 @@ pub fn serve_receive_pack<R: Read, W: Write>(
     interrupt: &Interrupt,
     lfs: LfsMode,
 ) -> Result<(), GitError> {
-    serve_receive_pack_with(reader, writer, store, kind, head, interrupt, &NoPolicy, lfs)
+    serve_receive_pack_with(reader, writer, store, kind, head, interrupt, &NoPolicy, lfs)?;
+    Ok(())
 }
 
 /// Builds the capability line one `receive-pack` advertisement carries.
@@ -543,6 +546,9 @@ pub fn git_service_digest(service: &str, commands: &[Vec<u8>], limits: &[u8]) ->
 /// and never fails the push. Refusals complete the protocol with `unpack
 /// ok` plus `ng` lines and return `Ok`, exactly like CAS rejections.
 ///
+/// Returns the landed event sequences in outcome order, identifying this
+/// push's operations for the caller's exit report.
+///
 /// # Errors
 /// [`GitError::Corrupt`] for grammar violations, [`GitError::ObjectFormat`]
 /// for store/kind mismatch or foreign OIDs, plus ingest, verification,
@@ -560,7 +566,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     interrupt: &Interrupt,
     policy: &dyn ReceivePolicy,
     lfs: LfsMode,
-) -> Result<(), GitError> {
+) -> Result<Vec<u64>, GitError> {
     if store.hash_kind() != kind {
         return Err(GitError::ObjectFormat {
             detail: "serving store uses another object format".to_owned(),
@@ -596,7 +602,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         commands.push(parse_command(&line, kind)?);
     }
     if commands.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Push options follow the commands flush and precede the pack, exactly
     // like the oracle's `read_push_options` before `unpack_with_sideband`.
@@ -721,6 +727,31 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             live,
         })
         .collect();
+    // Push facts for the callback: staged object bytes plus the new
+    // commit tips (staged commits first, then command tips already in
+    // the store), deduplicated.
+    let mut pack_bytes: u64 = 0;
+    let mut seen_commits: HashSet<Oid> = HashSet::new();
+    let mut new_commits: Vec<Oid> = Vec::new();
+    if let Some(staged_pack) = staged.as_ref() {
+        for oid in staged_pack.oids() {
+            if let Some((obj_kind, payload)) = staged_pack.payload(*oid) {
+                pack_bytes = pack_bytes.saturating_add(payload.len() as u64);
+                if obj_kind == ObjectKind::Commit && seen_commits.insert(*oid) {
+                    new_commits.push(*oid);
+                }
+            }
+        }
+    }
+    for cmd in &commands {
+        if cmd.new != zero
+            && seen_commits.insert(cmd.new)
+            && let Ok(object) = store.read(cmd.new)
+            && object.kind == ObjectKind::Commit
+        {
+            new_commits.push(cmd.new);
+        }
+    }
     let batch = ReceiveBatch {
         commands: &policy_commands,
         push_options: &push_options,
@@ -729,6 +760,8 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         kind,
         atomic,
         interrupt,
+        new_commits,
+        pack_bytes,
     };
     let mut alternates: Vec<(usize, AlternateRef)> = Vec::new();
     let verdicts = policy.pre_receive(&batch);
@@ -743,8 +776,9 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             results[*index] = Some(Err(reason.clone()));
         }
         send_report(&mut writer, None, &report_rows(&commands, &results))?;
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut divert_writes: Vec<(usize, PushUpdate)> = Vec::new();
     for (command_index, verdict) in verdicts.into_iter().enumerate() {
         if results[command_index].is_some() {
             continue;
@@ -753,9 +787,47 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             RefVerdict::Accept => {}
             RefVerdict::Reject { reason } => results[command_index] = Some(Err(reason)),
             RefVerdict::RejectPush { reason } => results[command_index] = Some(Err(reason)),
-            RefVerdict::Divert { alternate } => {
-                alternates.push((command_index, alternate));
+            RefVerdict::Divert {
+                alternate,
+                write_through_cas,
+            } => {
+                alternates.push((command_index, alternate.clone()));
                 results[command_index] = Some(Ok(()));
+                if write_through_cas {
+                    // Hosted diverts land through the same CAS below:
+                    // expect the review ref's current tip (or absence).
+                    let cmd = &commands[command_index];
+                    match RefName::new(alternate.refname.clone()) {
+                        Ok(name) => match StoreRefs::new(store).get(&name) {
+                            Ok(tip) => {
+                                let old = match tip {
+                                    Some(RefTarget::Direct(oid)) => oid,
+                                    _ => kind.zero_oid(),
+                                };
+                                divert_writes.push((
+                                    command_index,
+                                    PushUpdate {
+                                        name: alternate.refname.clone(),
+                                        old,
+                                        new: cmd.new,
+                                    },
+                                ));
+                            }
+                            Err(err) => {
+                                results[command_index] = Some(Err(format!(
+                                    "review ref unreadable: {}",
+                                    sanitize(&err.to_string())
+                                )));
+                                alternates.retain(|(i, _)| *i != command_index);
+                            }
+                        },
+                        Err(_) => {
+                            results[command_index] =
+                                Some(Err("review ref name is malformed".to_owned()));
+                            alternates.retain(|(i, _)| *i != command_index);
+                        }
+                    }
+                }
             }
         }
     }
@@ -779,15 +851,17 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     // Only hook-surviving refs reach the CAS path; hook verdicts already
     // recorded above are never overwritten. Fall-through refs rejoined the
     // undecided set with their `update` verdict recorded, so they apply
-    // through the same path as ordinary refs.
+    // through the same path as ordinary refs. Landed refs contribute
+    // their event sequences, which identify this push's operations.
     let survivors: Vec<&PushUpdate> = live
         .iter()
         .filter(|(index, _)| results[*index].is_none())
         .map(|(_, update)| update)
         .collect();
+    let mut operation_ids: Vec<u64> = Vec::new();
     if !atomic && !survivors.is_empty() {
         match apply_refs(store, kind, &survivors, false) {
-            Ok(outcomes) => {
+            Ok((outcomes, ref_events)) => {
                 for outcome in &outcomes {
                     if let Some((index, _)) =
                         live.iter().find(|(_, update)| update.name == outcome.name)
@@ -796,6 +870,12 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
                             RefResult::Ok => Ok(()),
                             RefResult::Rejected { reason } => Err(reason.clone()),
                         });
+                        if matches!(outcome.result, RefResult::Ok)
+                            && let Some(event) =
+                                ref_events.iter().find(|event| event.name == outcome.name)
+                        {
+                            operation_ids.push(event.seq);
+                        }
                     }
                 }
             }
@@ -803,6 +883,51 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
                 let reason = sanitize(&err.to_string());
                 for result in results.iter_mut().filter(|result| result.is_none()) {
                     *result = Some(Err(format!("ref update failed: {reason}")));
+                }
+                for (command_index, _) in &divert_writes {
+                    results[*command_index] = Some(Err(format!("ref update failed: {reason}")));
+                    alternates.retain(|(i, _)| i != command_index);
+                }
+                send_report(&mut writer, None, &report_rows(&commands, &results))?;
+                return Err(err);
+            }
+        }
+    }
+    // Hosted diverts write their review refs through the same CAS: the
+    // provisional `ok` above confirms only after the review ref lands.
+    if !divert_writes.is_empty() {
+        let updates: Vec<&PushUpdate> = divert_writes.iter().map(|(_, update)| update).collect();
+        match apply_refs(store, kind, &updates, false) {
+            Ok((outcomes, ref_events)) => {
+                for outcome in &outcomes {
+                    if let Some(position) = divert_writes
+                        .iter()
+                        .position(|(_, update)| update.name == outcome.name)
+                    {
+                        let (command_index, _) = &divert_writes[position];
+                        let command_index = *command_index;
+                        match &outcome.result {
+                            RefResult::Ok => {
+                                if let Some(event) =
+                                    ref_events.iter().find(|event| event.name == outcome.name)
+                                {
+                                    operation_ids.push(event.seq);
+                                }
+                            }
+                            RefResult::Rejected { reason } => {
+                                results[command_index] = Some(Err(reason.clone()));
+                                alternates.retain(|(i, _)| *i != command_index);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let reason = sanitize(&err.to_string());
+                for (command_index, _) in &divert_writes {
+                    results[*command_index] =
+                        Some(Err(format!("review ref update failed: {reason}")));
+                    alternates.retain(|(i, _)| i != command_index);
                 }
                 send_report(&mut writer, None, &report_rows(&commands, &results))?;
                 return Err(err);
@@ -839,7 +964,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         });
     }
     send_report(&mut writer, None, &report_rows(&commands, &results))?;
-    Ok(())
+    Ok(operation_ids)
 }
 
 /// Collects per-ref verdicts in command order; every command has one by the
@@ -897,7 +1022,8 @@ pub fn serve_command<R: Read, W: Write>(
             interrupt,
             policy,
             LfsMode::Deny,
-        ),
+        )
+        .map(|_| ()),
         "upload-archive" => {
             super::archive::serve_upload_archive(reader, writer, store, kind, head, interrupt)
         }
@@ -1253,15 +1379,54 @@ mod tests {
     }
 
     #[test]
-    fn receive_rejects_a_moved_ref() {
+    fn receive_tolerates_ref_already_at_new() {
         let kind = HashKind::Sha1;
         let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
         let dest = server_store();
-        // The client saw THREE but the server is at FOUR: the CAS fails.
+        // The client saw THREE but the server is at FOUR, which is also
+        // the desired tip: replay tolerance reports `ok` without
+        // publishing, instead of failing the stale expectation.
         let pack = push_pack(&src, kind, oid(THREE), oid(FOUR), b"refs/heads/main");
         let mut input = command(
             oid(THREE),
             oid(FOUR),
+            b"refs/heads/main",
+            Some("report-status"),
+        );
+        input.extend_from_slice(b"0000");
+        input.extend_from_slice(&pack);
+
+        let mut out = Vec::new();
+        serve_receive_pack(
+            &input[..],
+            &mut out,
+            &dest,
+            kind,
+            &head(),
+            &Interrupt::none(),
+            LfsMode::Deny,
+        )
+        .expect("serve reports outcomes in-band");
+        let lines = report_lines(&out);
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
+    }
+
+    #[test]
+    fn receive_rejects_a_moved_ref() {
+        let kind = HashKind::Sha1;
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = server_store();
+        // The client saw THREE and wants FIVE, but the server is at FOUR:
+        // the tip matches neither the expectation nor the desire, so the
+        // CAS still refuses.
+        let pack = push_pack(&src, kind, oid(THREE), oid(FOUR), b"refs/heads/main");
+        let mut input = command(
+            oid(THREE),
+            oid(THREE),
             b"refs/heads/main",
             Some("report-status"),
         );
@@ -1738,6 +1903,72 @@ printf '0000'
         assert!(
             !seen.lines().any(|line| line.starts_with("HOME=")),
             "inherited variables leak into hooks: {seen:?}"
+        );
+    }
+
+    /// The script policy pins hook outputs byte for byte: `pre-receive`
+    /// observes both commands, one `update` refusal names its exact
+    /// decline line, and `post-receive` observes only the landed ref.
+    #[test]
+    fn script_policy_matches_existing_hook_outputs() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let pre_marker = repo.join("pre-lines");
+        let post_marker = repo.join("post-lines");
+        write_hook(
+            &repo,
+            "pre-receive",
+            &format!("cat > \"{}\"\n", pre_marker.display()),
+        );
+        write_hook(
+            &repo,
+            "post-receive",
+            &format!("cat > \"{}\"\n", post_marker.display()),
+        );
+        // Only refs/heads/b gets an update refusal: gate the hook on
+        // its first argument.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = repo.join("hooks").join("update");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nif [ \"$1\" = \"refs/heads/b\" ]; then echo keep-out >&2; exit 1; fi\nexit 0\n",
+            )
+            .expect("gate update hook");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("hook executable");
+        }
+        let hooks = ReceiveHooks::for_repo(repo);
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[
+                (kind.zero_oid(), oid(FOUR), b"refs/heads/main"),
+                (kind.zero_oid(), oid(FOUR), b"refs/heads/b"),
+            ],
+            &pack,
+            &ScriptPolicy::new(hooks),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                b"unpack ok".to_vec(),
+                b"ok refs/heads/main".to_vec(),
+                b"ng refs/heads/b update hook declined: keep-out".to_vec(),
+            ]
+        );
+        let seen_pre = std::fs::read_to_string(&pre_marker).expect("pre-receive ran");
+        assert!(seen_pre.contains("refs/heads/main"), "got {seen_pre:?}");
+        assert!(seen_pre.contains("refs/heads/b"), "got {seen_pre:?}");
+        let seen_post = std::fs::read_to_string(&post_marker).expect("post-receive ran");
+        assert!(seen_post.contains("refs/heads/main"), "got {seen_post:?}");
+        assert!(
+            !seen_post.contains("refs/heads/b"),
+            "refused ref leaked to post: {seen_post:?}"
         );
     }
 

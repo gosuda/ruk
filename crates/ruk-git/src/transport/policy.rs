@@ -57,6 +57,10 @@ pub enum RefVerdict {
     Divert {
         /// The review ref the hook reported creating.
         alternate: AlternateRef,
+        /// Whether the serve path must write the review ref through
+        /// the CAS path (`true`) or the hook already wrote it
+        /// (`false`, script `proc-receive` behavior).
+        write_through_cas: bool,
     },
 }
 
@@ -79,6 +83,11 @@ pub struct ReceiveBatch<'a> {
     /// Cancellation source, forwarded to the hook conversation only;
     /// the serve path owns the coarse checks around the policy call.
     pub interrupt: &'a Interrupt,
+    /// New commit tips introduced by the push, in command order then
+    /// staged order, deduplicated.
+    pub new_commits: Vec<Oid>,
+    /// Staged object payload bytes (zero for delete-only pushes).
+    pub pack_bytes: u64,
 }
 
 /// Everything a policy needs to observe one landing.
@@ -250,7 +259,10 @@ impl ReceivePolicy for ScriptPolicy {
                 match outcome {
                     ProcVerdict::Accepted { alternate } => {
                         verdicts[*index] = Some(match alternate {
-                            Some(alternate) => RefVerdict::Divert { alternate },
+                            Some(alternate) => RefVerdict::Divert {
+                                alternate,
+                                write_through_cas: false,
+                            },
                             None => RefVerdict::Accept,
                         });
                     }

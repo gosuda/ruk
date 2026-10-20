@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,10 @@ pub(crate) struct Registry {
     retention_interval_ms: AtomicU64,
     /// Seconds pruning event rows on each sweep.
     event_retention_seconds: AtomicU64,
+    /// Milliseconds a hosted hook callback waits before failing closed.
+    hook_timeout_ms: AtomicU64,
+    /// Cap of ref commands accepted per hosted push batch.
+    hook_max_commands: AtomicUsize,
 }
 
 impl fmt::Debug for Registry {
@@ -110,6 +114,8 @@ impl Registry {
             runtime: Mutex::new(None),
             retention_interval_ms: AtomicU64::new(super::DEFAULT_RETENTION_INTERVAL_MS),
             event_retention_seconds: AtomicU64::new(super::DEFAULT_EVENT_RETENTION_SECONDS),
+            hook_timeout_ms: AtomicU64::new(super::DEFAULT_HOOK_TIMEOUT_MS),
+            hook_max_commands: AtomicUsize::new(super::MAX_HOOK_MAX_COMMANDS),
         })
     }
 
@@ -143,6 +149,35 @@ impl Registry {
     pub(crate) fn set_event_retention_seconds(&self, seconds: u64) {
         self.event_retention_seconds
             .store(seconds, Ordering::Relaxed);
+    }
+
+    /// Sets the hosted hook callback deadline.
+    ///
+    /// `serve` calls this once from the daemon configuration before
+    /// serving; each hosted push waits this long for hook verdicts
+    /// before failing closed.
+    pub(crate) fn set_hook_timeout(&self, timeout: Duration) {
+        self.hook_timeout_ms.store(
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Reads the hosted hook callback deadline.
+    pub(crate) fn hook_timeout(&self) -> Duration {
+        Duration::from_millis(self.hook_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// Sets the cap of ref commands accepted per hosted push batch.
+    ///
+    /// `serve` calls this once from the daemon configuration before serving.
+    pub(crate) fn set_hook_max_commands(&self, max: usize) {
+        self.hook_max_commands.store(max, Ordering::Relaxed);
+    }
+
+    /// Reads the cap of ref commands accepted per hosted push batch.
+    pub(crate) fn hook_max_commands(&self) -> usize {
+        self.hook_max_commands.load(Ordering::Relaxed)
     }
 
     /// Resolves `requested` to a canonical path beneath a configured root,

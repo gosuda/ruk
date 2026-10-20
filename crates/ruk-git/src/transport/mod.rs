@@ -51,6 +51,7 @@ pub mod dumb;
 pub mod dumb_http;
 pub mod fetch;
 pub mod hooks;
+pub mod host;
 pub mod http;
 pub mod lfs;
 pub mod mirror;

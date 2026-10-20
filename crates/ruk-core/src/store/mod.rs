@@ -79,7 +79,7 @@ pub use stream::{ChunkDecision, StreamMeta};
 pub use types::{
     EVENT_HEAD_KEY, Encoding, EventContext, EventHeadRow, EventSource, FactExpectation,
     FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject, Publication, ReadObject,
-    SegmentManifest, StoreEvent, StoreFormat,
+    RefEvent, SegmentManifest, StoreEvent, StoreFormat,
 };
 
 use crate::change::StoreId;
@@ -935,6 +935,7 @@ impl Store {
             return Ok(Publication {
                 objects: Vec::new(),
                 generation: self.observe(self.meta.generation())?,
+                ref_events: Vec::new(),
             });
         }
         let attribution = vec![(source, context.clone()); facts.len()];
@@ -960,6 +961,7 @@ impl Store {
             return Ok(Publication {
                 objects: Vec::new(),
                 generation: self.observe(self.meta.generation())?,
+                ref_events: Vec::new(),
             });
         }
         if contexts.len() != facts.len() {
@@ -992,7 +994,7 @@ impl Store {
         &self,
         facts: &[FactMutation],
         attribution: &[(EventSource, EventContext)],
-    ) -> Result<Vec<FactMutation>, StoreError> {
+    ) -> Result<(Vec<FactMutation>, Vec<RefEvent>), StoreError> {
         let mut ref_facts = Vec::new();
         for (fact, attr) in facts.iter().zip(attribution.iter()) {
             if fact.table == FactTable::Refs {
@@ -1000,11 +1002,12 @@ impl Store {
             }
         }
         if ref_facts.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let (mut head, oldest, head_raw) = self.read_event_head()?;
         let at = Self::unix_millis()?;
         let mut out = Vec::with_capacity(ref_facts.len() + 1);
+        let mut ref_events = Vec::with_capacity(ref_facts.len());
         for (fact, (source, context)) in ref_facts {
             head = head
                 .checked_add(1)
@@ -1028,6 +1031,10 @@ impl Store {
                 expected: FactExpectation::Absent,
                 value: Some(encode("event", &event)?),
             });
+            ref_events.push(RefEvent {
+                name: fact.key.clone(),
+                seq: head,
+            });
         }
         let row = EventHeadRow { head, oldest };
         out.push(FactMutation {
@@ -1036,7 +1043,7 @@ impl Store {
             expected: head_raw.map_or(FactExpectation::Absent, FactExpectation::Value),
             value: Some(encode("event head", &row)?),
         });
-        Ok(out)
+        Ok((out, ref_events))
     }
 
     /// Reads the event horizon: the last assigned sequence, the oldest
@@ -1161,12 +1168,13 @@ impl Store {
             drop(probe_txn);
             let pending = self.persist_pending(&probe_plan)?;
             let txn = self.observe(self.meta.begin_publication(facts))?;
-            let event_facts = self.observe(self.emit_ref_events(facts, attribution))?;
+            let (event_facts, ref_events) =
+                self.observe(self.emit_ref_events(facts, attribution))?;
             self.observe(txn.apply_more(&event_facts))?;
             let plan = self.observe(self.plan(&txn, objects))?;
-            Ok::<_, StoreError>((pending, txn, plan))
+            Ok::<_, StoreError>((pending, txn, plan, ref_events))
         })();
-        let (pending, txn, plan) = match staged {
+        let (pending, txn, plan, ref_events) = match staged {
             Ok(prepared) => prepared,
             Err(err) => {
                 // Committed corruption met before the first append still
@@ -1206,7 +1214,10 @@ impl Store {
             );
         }
         match self.write_and_commit(writer, txn, plan, profile, pending) {
-            Ok(publication) => Ok(publication),
+            Ok(mut publication) => {
+                publication.ref_events = ref_events;
+                Ok(publication)
+            }
             Err(err) => {
                 writer.closed = Some(format!(
                     "publication failed after durable work began; reopen the store to run recovery ({err})"
@@ -1499,6 +1510,7 @@ impl Store {
         Ok(Publication {
             objects: order,
             generation,
+            ref_events: Vec::new(),
         })
     }
 }

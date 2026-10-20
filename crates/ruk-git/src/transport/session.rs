@@ -29,7 +29,7 @@ use ruk_core::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
 use ruk_core::refs::{StoreRefs, page_refs, prepare_checked_transaction};
-use ruk_core::store::types::{ObjectKind, Publication};
+use ruk_core::store::types::{ObjectKind, Publication, RefEvent};
 use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 
 use super::fetch::observation_mutations;
@@ -785,11 +785,26 @@ fn local_push_inner(
             &EventContext::default(),
         )?;
     }
-    let mut report = apply_refs(dest, kind, &live, req.atomic)?;
+    let (mut report, _) = apply_refs(dest, kind, &live, req.atomic)?;
     report.extend(outcomes);
     plan.finalize(report.clone())?;
     persist_plan(dest, plan, kind, plan_encoding(dest, plan)?)?;
     Ok(report)
+}
+
+/// Whether `dest` already holds `update.new`: replay tolerance for
+/// retries that arrive after their refs landed. A delete whose ref is
+/// already absent and a set whose tip already matches both report `Ok`
+/// without publishing, so no new event records a non-move.
+fn already_at_new(dest: &Store, kind: HashKind, update: &PushUpdate) -> bool {
+    let Ok(name) = RefName::new(update.name.clone()) else {
+        return false;
+    };
+    match StoreRefs::new(dest).get(&name) {
+        Ok(Some(RefTarget::Direct(oid))) => oid == update.new,
+        Ok(_) => update.new == kind.zero_oid(),
+        Err(_) => false,
+    }
 }
 
 /// Applies ref updates to `dest`: one checked transaction for atomic
@@ -804,7 +819,7 @@ pub(crate) fn apply_refs(
     kind: HashKind,
     live: &[&PushUpdate],
     atomic: bool,
-) -> Result<Vec<RefOutcome>, GitError> {
+) -> Result<(Vec<RefOutcome>, Vec<RefEvent>), GitError> {
     let zero = kind.zero_oid();
     let to_update = |update: &PushUpdate| -> Result<RefUpdate, GitError> {
         let name = RefName::new(update.name.clone()).map_err(|err| GitError::Invalid {
@@ -837,26 +852,45 @@ pub(crate) fn apply_refs(
             EventSource::ReceivePack,
             &EventContext::default(),
         ) {
-            Ok(_) => Ok(live
-                .iter()
-                .map(|u| RefOutcome {
-                    name: u.name.clone(),
-                    result: RefResult::Ok,
-                })
-                .collect()),
-            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => Ok(live
-                .iter()
-                .map(|u| RefOutcome {
-                    name: u.name.clone(),
-                    result: RefResult::Rejected {
-                        reason: "destination ref moved during apply".to_owned(),
-                    },
-                })
-                .collect()),
+            Ok(publication) => Ok((
+                live.iter()
+                    .map(|u| RefOutcome {
+                        name: u.name.clone(),
+                        result: RefResult::Ok,
+                    })
+                    .collect(),
+                publication.ref_events,
+            )),
+            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
+                if live.iter().all(|u| already_at_new(dest, kind, u)) {
+                    Ok((
+                        live.iter()
+                            .map(|u| RefOutcome {
+                                name: u.name.clone(),
+                                result: RefResult::Ok,
+                            })
+                            .collect(),
+                        Vec::new(),
+                    ))
+                } else {
+                    Ok((
+                        live.iter()
+                            .map(|u| RefOutcome {
+                                name: u.name.clone(),
+                                result: RefResult::Rejected {
+                                    reason: "destination ref moved during apply".to_owned(),
+                                },
+                            })
+                            .collect(),
+                        Vec::new(),
+                    ))
+                }
+            }
             Err(err) => Err(err.into()),
         }
     } else {
         let mut outcomes = Vec::with_capacity(live.len());
+        let mut ref_events = Vec::new();
         for update in live {
             let transaction =
                 RefTransaction::new(kind, vec![to_update(update)?]).map_err(map_ref_error)?;
@@ -868,17 +902,30 @@ pub(crate) fn apply_refs(
                         EventSource::ReceivePack,
                         &EventContext::default(),
                     ) {
-                        Ok(_) => RefResult::Ok,
+                        Ok(publication) => {
+                            ref_events.extend(publication.ref_events);
+                            RefResult::Ok
+                        }
                         Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
-                            RefResult::Rejected {
-                                reason: "destination ref moved during apply".to_owned(),
+                            if already_at_new(dest, kind, update) {
+                                RefResult::Ok
+                            } else {
+                                RefResult::Rejected {
+                                    reason: "destination ref moved during apply".to_owned(),
+                                }
                             }
                         }
                         Err(err) => return Err(err.into()),
                     },
-                    Err(GitError::Stale { .. }) => RefResult::Rejected {
-                        reason: "destination ref moved".to_owned(),
-                    },
+                    Err(GitError::Stale { .. }) => {
+                        if already_at_new(dest, kind, update) {
+                            RefResult::Ok
+                        } else {
+                            RefResult::Rejected {
+                                reason: "destination ref moved".to_owned(),
+                            }
+                        }
+                    }
                     Err(err) => return Err(err),
                 };
             outcomes.push(RefOutcome {
@@ -886,7 +933,7 @@ pub(crate) fn apply_refs(
                 result: outcome,
             });
         }
-        Ok(outcomes)
+        Ok((outcomes, ref_events))
     }
 }
 

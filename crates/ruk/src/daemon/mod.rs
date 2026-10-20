@@ -43,6 +43,7 @@ use ruk_core::protocol::{
     SessionResumeArgs, decode_json,
 };
 use ruk_core::refdata::RefName;
+use ruk_git::transport::host::{HookCall, HookReply, HostPolicy, hook_bridge};
 
 /// Default concurrent connections of one daemon process.
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 128;
@@ -992,6 +993,8 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
         let registry = Arc::new(Registry::new(config.repo_roots.clone())?);
         registry.set_retention_interval(config.retention_interval);
         registry.set_event_retention_seconds(config.event_retention_seconds);
+        registry.set_hook_timeout(config.hook_timeout);
+        registry.set_hook_max_commands(config.hook_max_commands);
         let executor = BoundedExecutor::new(config.blocking_pool_size)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -1012,6 +1015,10 @@ struct ConnectionRefs {
     registry: Arc<Registry>,
     /// The shared blocking pool.
     executor: BoundedExecutor,
+    /// The separate bulkhead for long-running transport streams: hosted
+    /// hook callbacks can block a thread up to the hook deadline, so
+    /// pushes never starve typed invocations.
+    transport: BoundedExecutor,
     /// The starting credit window of each stream direction.
     window_bytes: u64,
     /// The stream-zero handshake deadline.
@@ -1035,9 +1042,11 @@ async fn serve_async(
         return Err(Error::Io(err));
     }
     let listener = tokio::net::UnixListener::bind(&config.socket_path)?;
+    let transport = BoundedExecutor::new(config.transport_permits)?;
     let refs = ConnectionRefs {
         registry,
         executor,
+        transport,
         window_bytes: config.stream_window_bytes,
         handshake_timeout: config.handshake_timeout,
         frame_timeout: config.frame_timeout,
@@ -1310,7 +1319,7 @@ async fn route_stream_frame(
             spawn_stream(writer, frame, streams, done, generation, refs, peer);
             Ok(false)
         }
-        ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof => {
+        ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof | ipc::FrameKind::HookReply => {
             if let Some((tx, _)) = streams.get(&stream_id)
                 && tx.send(frame).await.is_err()
             {
@@ -1367,7 +1376,6 @@ async fn route_stream_frame(
         | ipc::FrameKind::Stdout
         | ipc::FrameKind::Stderr
         | ipc::FrameKind::HookCall
-        | ipc::FrameKind::HookReply
         | ipc::FrameKind::Exit
         | ipc::FrameKind::Error => {
             let sink = StreamSink {
@@ -1794,6 +1802,27 @@ async fn serve_git_service(
             return;
         }
     }
+    if req.service == GIT_SERVICE_RECEIVE_PACK && !req.advertise {
+        serve_hosted_receive(HostedReceive {
+            input,
+            sink,
+            credits: &mut credits,
+            cancel_guard: &cancel_guard,
+            token,
+            refs,
+            coordinator,
+            peer_uid,
+            repository,
+            session_id: req.session_id.clone().unwrap_or_default(),
+            request_id,
+            invocation,
+            digest,
+            commands,
+            stdin: stdin_bytes,
+        })
+        .await;
+        return;
+    }
     let run_coordinator = Arc::clone(&coordinator);
     let outcome = refs
         .executor
@@ -1857,6 +1886,232 @@ async fn serve_git_service(
         TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
     }
     let report = CommandExitReport::success(&invocation, 0);
+    let exit_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+}
+
+/// One hosted receive-pack round: everything the hook exchange needs.
+/// The sync serve runs on the transport bulkhead while the pump relays
+/// hook frames on the stream task; both halves meet here.
+struct HostedReceive<'a> {
+    input: &'a mut mpsc::Receiver<ipc::Frame>,
+    sink: &'a StreamSink,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    token: Cancel,
+    refs: &'a ConnectionRefs,
+    coordinator: Arc<HostedCoordinator>,
+    peer_uid: u32,
+    repository: Vec<u8>,
+    session_id: String,
+    request_id: String,
+    invocation: String,
+    digest: String,
+    commands: Vec<Vec<u8>>,
+    stdin: Vec<u8>,
+}
+
+/// Relays one hook exchange: sends the callback, awaits its reply under
+/// the call's own deadline, and fails closed to a whole-push refusal on
+/// timeout, stream close, cancellation, or a malformed reply.
+#[cfg(unix)]
+async fn pump_one_exchange(
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    sink: &StreamSink,
+    call: &HookCall,
+) -> HookReply {
+    let bytes = match ipc::encode_control(call) {
+        Ok(bytes) => bytes,
+        Err(_) => return HookReply::reject_all("hook call unencodable"),
+    };
+    if send_frame(sink, ipc::FrameKind::HookCall, &bytes)
+        .await
+        .is_err()
+    {
+        return HookReply::reject_all("hook stream closed");
+    }
+    let deadline = Duration::from_millis(call.deadline_ms);
+    tokio::time::timeout(deadline, async {
+        loop {
+            match input.recv().await {
+                Some(frame) if frame.kind == ipc::FrameKind::HookReply => {
+                    return ipc::decode_control::<HookReply>(&frame.payload)
+                        .unwrap_or_else(|_| HookReply::reject_all("hook reply malformed"));
+                }
+                Some(frame) if frame.kind == ipc::FrameKind::Cancel => {
+                    return HookReply::reject_all("push cancelled");
+                }
+                Some(_) => continue,
+                None => return HookReply::reject_all("hook stream closed"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| HookReply::reject_all("hook deadline elapsed"))
+}
+
+/// Serves one hosted receive-pack round through hook callbacks: session
+/// capabilities authorize each command, the sync serve judges through a
+/// [`HostPolicy`] on the transport bulkhead while this task pumps hook
+/// frames, and the stored receipt plus the exit report close the round.
+#[cfg(unix)]
+async fn serve_hosted_receive(h: HostedReceive<'_>) {
+    let HostedReceive {
+        input,
+        sink,
+        credits,
+        cancel_guard,
+        token,
+        refs,
+        coordinator,
+        peer_uid,
+        repository,
+        session_id,
+        request_id,
+        invocation,
+        digest,
+        commands,
+        stdin,
+    } = h;
+    if commands.len() > refs.registry.hook_max_commands() {
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::ELimit,
+                format!(
+                    "push carries {} commands, more than the {} allowed",
+                    commands.len(),
+                    refs.registry.hook_max_commands()
+                ),
+            )),
+        )
+        .await;
+        return;
+    }
+    let principal = Principal::from_peer_uid(peer_uid);
+    let session = match session_id.parse::<SessionId>() {
+        Ok(session) => session,
+        Err(_) => {
+            let _ = send_error_exit(
+                sink,
+                &Error::Core(CoreError::new(ErrorCode::EInvalid, "malformed session id")),
+            )
+            .await;
+            return;
+        }
+    };
+    let capabilities = match coordinator
+        .git_push_capabilities(&principal, session, &token)
+        .await
+    {
+        Ok(capabilities) => capabilities,
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
+            return;
+        }
+    };
+    let (client, mut server) = hook_bridge();
+    let deadline = refs.registry.hook_timeout();
+    let policy = Arc::new(HostPolicy::new(capabilities, deadline, client));
+    let lfs = ruk_core::mode_for_store(coordinator.store().root());
+    let serve_policy = Arc::clone(&policy);
+    let serve_coordinator = Arc::clone(&coordinator);
+    let serve = refs.transport.run(move || {
+        let store = serve_coordinator.store();
+        let kind = store.hash_kind();
+        let head = crate::cli::verbs_transport::serve_head(store)?;
+        let interrupt = ruk_git::transport::Interrupt::none();
+        let mut out = Vec::new();
+        let seqs = ruk_git::transport::serve::serve_receive_pack_with(
+            &stdin[..],
+            &mut out,
+            store,
+            kind,
+            &head,
+            &interrupt,
+            &*serve_policy,
+            lfs,
+        )?;
+        Ok::<_, CoreError>((out, seqs))
+    });
+    drop(policy);
+    tokio::pin!(serve);
+    let outcome: Result<(Vec<u8>, Vec<u64>), CoreError> = loop {
+        tokio::select! {
+            done = &mut serve => {
+                break match done {
+                    Ok(inner) => inner,
+                    Err(err) => Err(err),
+                };
+            }
+            exchange = server.recv() => {
+                let Some(exchange) = exchange else {
+                    // The policy is gone, so the serve task owns the
+                    // outcome now; await it directly.
+                    break match serve.await {
+                        Ok(inner) => inner,
+                        Err(err) => Err(err),
+                    };
+                };
+                let reply = pump_one_exchange(input, sink, &exchange.call).await;
+                let _ = exchange.reply.send(reply);
+            }
+        }
+    };
+    let (out, seqs) = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
+            return;
+        }
+    };
+    let out = match strip_advertisement(out) {
+        Ok(out) => out,
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
+            return;
+        }
+    };
+    let locator = ReceiptLocator {
+        peer_uid,
+        repository,
+        request_id: request_id.clone(),
+        digest: digest.clone(),
+    };
+    match store_git_outcome(refs, &coordinator, &locator, &Ok(out.clone())).await {
+        Ok(None) => {}
+        Ok(Some(stored)) => {
+            let ids = ReplayIds {
+                invocation: &invocation,
+                request_id: &request_id,
+                digest: &digest,
+            };
+            dispatch_stored_receipt(input, sink, credits, cancel_guard, ids, &stored).await;
+            return;
+        }
+        Err(store_err) => {
+            let _ = send_error_exit(sink, &store_err).await;
+            return;
+        }
+    }
+    if token.check().is_err() {
+        let report = CommandExitReport::cancelled(&invocation);
+        let exit_bytes = match ipc::encode_control(&report) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+        return;
+    }
+    match write_typed_chunks(sink, input, credits, cancel_guard, &out).await {
+        TypedWriteFate::Done => {}
+        TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
+    }
+    let mut report = CommandExitReport::success(&invocation, 0);
+    report.operation_ids = seqs.iter().map(|seq| seq.to_string()).collect();
     let exit_bytes = match ipc::encode_control(&report) {
         Ok(bytes) => bytes,
         Err(_) => return,

@@ -218,6 +218,16 @@ pub struct ReadObject {
     pub depth: u8,
 }
 
+/// One ref event this publication emitted, locating the operation the
+/// batch performed on its ref.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefEvent {
+    /// The ref whose mutation the event records.
+    pub name: Vec<u8>,
+    /// The event sequence assigned under the writer lock.
+    pub seq: u64,
+}
+
 /// Durable outcome of one publication.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Publication {
@@ -226,6 +236,8 @@ pub struct Publication {
     pub objects: Vec<Oid>,
     /// Metadata generation that committed this batch.
     pub generation: u64,
+    /// One entry per `Refs` fact the batch carried, in fact order.
+    pub ref_events: Vec<RefEvent>,
 }
 
 /// The approved mutable fact tables. Closed: a new table arrives only with

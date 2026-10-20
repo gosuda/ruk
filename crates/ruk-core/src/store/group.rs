@@ -39,8 +39,8 @@ use crate::error::ErrorCode;
 use crate::ids::Oid;
 
 use super::{
-    EventContext, EventSource, FactMutation, FactTable, PreparedObject, Publication, Store,
-    StoreError, WriterState,
+    EventContext, EventSource, FactMutation, FactTable, PreparedObject, Publication, RefEvent,
+    Store, StoreError, WriterState,
 };
 
 /// Environment variable naming the linger window in milliseconds.
@@ -308,9 +308,20 @@ impl Store {
                 .collect();
             match self.publish_locked(writer, &objects, &facts, &attribution) {
                 Ok(publication) => {
-                    return group
+                    // Event seqs align with the flattened Refs facts in
+                    // order, so each member takes the prefix matching its
+                    // own Refs fact count.
+                    let mut ref_events = publication.ref_events;
+                    let outcomes: Vec<Outcome> = group
                         .iter()
                         .map(|submission| {
+                            let take = submission
+                                .facts
+                                .iter()
+                                .filter(|fact| fact.table == FactTable::Refs)
+                                .count()
+                                .min(ref_events.len());
+                            let member_events: Vec<RefEvent> = ref_events.drain(..take).collect();
                             Ok(Publication {
                                 objects: submission
                                     .objects
@@ -318,9 +329,15 @@ impl Store {
                                     .map(PreparedObject::oid)
                                     .collect(),
                                 generation: publication.generation,
+                                ref_events: member_events,
                             })
                         })
                         .collect();
+                    debug_assert!(
+                        ref_events.is_empty(),
+                        "event seqs must align with the flattened Refs facts"
+                    );
+                    return outcomes;
                 }
                 Err(err) if writer.closed.is_some() || self.quarantine() => {
                     return group.iter().map(|_| Err(err.replica())).collect();
