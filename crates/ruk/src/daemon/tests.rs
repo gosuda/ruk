@@ -635,6 +635,7 @@ fn invalid_new_config_values_name_the_key() {
         ("hook_max_commands", "hook_max_commands = 4097\n"),
         ("default_branch", "default_branch = \"main\"\n"),
         ("event_retention_seconds", "event_retention_seconds = 0\n"),
+        ("search_pool_size", "search_pool_size = 0\n"),
     ];
     for (key, extra) in cases {
         let err =
@@ -648,6 +649,8 @@ fn invalid_new_config_values_name_the_key() {
             "error for {key} must name it: {err}"
         );
     }
+    DaemonConfig::from_toml(&config_doc("search_pool_size = 1\n"))
+        .expect("one search permit starts");
 }
 
 #[test]
@@ -2125,6 +2128,47 @@ async fn frame_kind_9_rejected_on_any_stream() {
         refused.is_err(),
         "a retired frame kind tears the connection down, got {refused:?}"
     );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn hook_frames_misplaced_on_git_stdin_are_refused() {
+    let root = temp_root("hook-misplaced");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    for (stream_id, kind) in [(1u64, FrameKind::HookCall), (3u64, FrameKind::HookReply)] {
+        let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+        driver.send(FrameKind::Open, stream_id, &payload).await;
+        let accepted = driver.recv().await;
+        assert_eq!(accepted.kind, FrameKind::Accepted);
+        assert_eq!(accepted.stream_id, stream_id);
+        driver.send(kind, stream_id, b"misplaced").await;
+        let err_frame = driver.recv().await;
+        assert_eq!(err_frame.kind, FrameKind::Error);
+        assert_eq!(err_frame.stream_id, stream_id);
+        let report: ErrorReply = ipc::decode_control(&err_frame.payload).expect("error decodes");
+        assert_eq!(report.code, ErrorCode::EInvalid);
+        assert_eq!(report.message, "frame kind is misplaced on this stream");
+        let exit_frame = driver.recv().await;
+        assert_eq!(exit_frame.kind, FrameKind::Exit);
+        assert_eq!(exit_frame.stream_id, stream_id);
+        let exit: ExitReport = ipc::decode_control(&exit_frame.payload).expect("exit decodes");
+        assert_eq!(exit.status, 1);
+        assert_eq!(exit.outcome, "Failed");
+    }
 
     drop(driver);
     task.abort();

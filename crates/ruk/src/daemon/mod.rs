@@ -506,6 +506,11 @@ impl DaemonConfig {
                 "transport_permits must hold at least one permit",
             )));
         }
+        if self.search_pool_size == 0 {
+            return Err(Error::Config(String::from(
+                "search_pool_size must hold at least one permit",
+            )));
+        }
         if self.hook_timeout.is_zero() {
             return Err(Error::Config(String::from(
                 "hook_timeout_ms must be nonzero",
@@ -1386,7 +1391,7 @@ async fn route_stream_frame(
                 &sink,
                 &Error::Core(CoreError::new(
                     ErrorCode::EInvalid,
-                    "daemon never receives this frame kind from a client",
+                    "frame kind is misplaced on this stream",
                 )),
             )
             .await?;
@@ -2228,7 +2233,7 @@ async fn collect_git_stdin(
             | ipc::FrameKind::Error => {
                 return GitStdinFate::Rejected(CoreError::new(
                     ErrorCode::EInvalid,
-                    "daemon never receives this frame kind from a client",
+                    "frame kind is misplaced on this stream",
                 ));
             }
         }
@@ -2445,7 +2450,7 @@ async fn wait_outbound_credit(
             | ipc::FrameKind::Error => {
                 return CreditFate::Rejected(CoreError::new(
                     ErrorCode::EInvalid,
-                    "daemon never receives this frame kind from a client",
+                    "frame kind is misplaced on this stream",
                 ));
             }
         }
@@ -2559,7 +2564,7 @@ async fn typed_stream(
                     _ => {
                         refused = Some(CoreError::new(
                             ErrorCode::EInvalid,
-                            "daemon never receives this frame kind from a client",
+                            "frame kind is misplaced on this stream",
                         ));
                     }
                 }

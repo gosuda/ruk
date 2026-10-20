@@ -25,6 +25,10 @@ Entries describe implemented, unreleased functionality.
 ### Changed
 
 - **Breaking:** renamed `ruk forgejo serve` to `ruk serve`. No alias or shim remains.
+- **Breaking:** unknown daemon config keys now refuse startup. Every key in the daemon config must be known.
+- **Breaking:** an empty `allowed_uids` now refuses hosted startup and denies every peer. At least one authorized peer uid is required.
+- **Breaking:** `merge-notices` and `outcome-lookup` are no longer advertised. Frame kind 9 stays retired and is refused, and kinds 12 and 13 carry hook calls and replies.
+- **Breaking:** IPC error frames now carry the full error reply with hints. A nonzero exit reports `Failed` instead of `Completed`.
 - Migrated authored JSON parsing and serialization to `sonic-rs`; `serde` and `schemars` remain in use.
 - Limited CLI conflict input, protocol envelope decoding, and `protocol::decode_json` to 128 open arrays or objects. Deeper input returns `E_INVALID`. Bounded parsing adds stack space when needed; existing CLI and control-frame byte limits are unchanged.
 - Normalized parsed `-0` and `-0.0` to positive zero.
