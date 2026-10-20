@@ -2067,6 +2067,7 @@ async fn pump_one_exchange(
     call: &HookCall,
     cancel: &CancelHandle,
     flag: &AtomicBool,
+    credits: &mut ipc::StreamCredits,
 ) -> HookReply {
     let bytes = match ipc::encode_control(call) {
         Ok(bytes) => bytes,
@@ -2093,6 +2094,21 @@ async fn pump_one_exchange(
                     cancel.cancel();
                     flag.store(true, Ordering::SeqCst);
                     return HookReply::reject_all("push cancelled");
+                }
+                Some(frame) if frame.kind == ipc::FrameKind::WindowUpdate => {
+                    // Grants arriving mid-exchange apply at once: the
+                    // output writer needs them after the serve
+                    // completes, and dropping them would stall it on
+                    // credit the client believes it already granted.
+                    let credit = match ipc::decode_control::<WindowCredit>(&frame.payload) {
+                        Ok(credit) => credit,
+                        Err(_) => {
+                            return HookReply::reject_all("hook credit malformed");
+                        }
+                    };
+                    if route_credit(credits, sink.stream_id, &credit).is_err() {
+                        return HookReply::reject_all("hook credit refused");
+                    }
                 }
                 Some(_) => continue,
                 None => return HookReply::reject_all("hook stream closed"),
@@ -2249,9 +2265,15 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
                         Err(err) => Err(err),
                     };
                 };
-                let reply =
-                    pump_one_exchange(input, sink, &exchange.call, cancel_guard, &cancel_flag)
-                        .await;
+                let reply = pump_one_exchange(
+                    input,
+                    sink,
+                    &exchange.call,
+                    cancel_guard,
+                    &cancel_flag,
+                    credits,
+                )
+                .await;
                 let _ = exchange.reply.send(reply);
             }
         }
@@ -2309,7 +2331,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     // report delivery, so a slow or absent answer never delays the
     // push itself; its reply never touches the landed push.
     if let Some(call) = post_policy.take_post_receive() {
-        let _ = pump_one_exchange(input, sink, &call, cancel_guard, &cancel_flag).await;
+        let _ = pump_one_exchange(input, sink, &call, cancel_guard, &cancel_flag, credits).await;
     }
     let mut report = CommandExitReport::success(&invocation, 0);
     report.operation_ids = seqs.iter().map(|seq| seq.to_string()).collect();

@@ -1284,9 +1284,18 @@ async fn hook_wait_cancel_trips_the_sync_flag() {
         })
         .await
         .expect("cancel buffers");
+    let mut credits = super::ipc::StreamCredits::new(0);
+    credits.open_stream(1);
     let reply = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pump_one_exchange(&mut input_rx, &sink, &call, &cancel_guard, &flag),
+        super::pump_one_exchange(
+            &mut input_rx,
+            &sink,
+            &call,
+            &cancel_guard,
+            &flag,
+            &mut credits,
+        ),
     )
     .await
     .expect("cancel ends the hook wait");
@@ -1296,6 +1305,81 @@ async fn hook_wait_cancel_trips_the_sync_flag() {
         flag.load(Ordering::SeqCst),
         "hook-wait cancel trips the sync flag"
     );
+}
+
+/// A `WindowUpdate` frame during a hook wait applies to the stream
+/// credits instead of dropping, so the report writer never stalls on
+/// credit the client already granted.
+#[tokio::test]
+async fn hook_wait_applies_window_update_to_credits() {
+    use ruk_core::coord::cancellation;
+    use std::sync::atomic::AtomicBool;
+    let (cancel_guard, _) = cancellation();
+    let flag = AtomicBool::new(false);
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(256);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+    let sink = super::StreamSink {
+        writer: writer_tx,
+        stream_id: 1,
+    };
+    let mut credits = super::ipc::StreamCredits::new(512);
+    credits.open_stream(1);
+    credits
+        .consume_outbound(1, 512)
+        .expect("drained window stalls without the grant");
+    assert!(credits.consume_outbound(1, 1).is_err());
+    let call = HookCall {
+        phase: HookPhase::PreReceive,
+        commands: Vec::new(),
+        push_options: Vec::new(),
+        new_commits: Vec::new(),
+        pack_bytes: 0,
+        deadline_ms: 5_000,
+    };
+    let grant = super::WindowCredit {
+        credit_bytes: 256,
+        direction: "stdout".to_string(),
+    };
+    let grant_bytes = super::ipc::encode_control(&grant).expect("grant encodes");
+    input_tx
+        .send(ipc::Frame {
+            kind: FrameKind::WindowUpdate,
+            stream_id: 1,
+            payload: grant_bytes,
+        })
+        .await
+        .expect("grant buffers");
+    let reply = super::HookReply {
+        reject_all: false,
+        reason: None,
+        verdicts: Vec::new(),
+    };
+    let reply_bytes = ipc::encode_control(&reply).expect("reply encodes");
+    input_tx
+        .send(ipc::Frame {
+            kind: FrameKind::HookReply,
+            stream_id: 1,
+            payload: reply_bytes,
+        })
+        .await
+        .expect("reply buffers");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pump_one_exchange(
+            &mut input_rx,
+            &sink,
+            &call,
+            &cancel_guard,
+            &flag,
+            &mut credits,
+        ),
+    )
+    .await
+    .expect("grant plus reply ends the hook wait");
+    assert!(!reply.reject_all);
+    credits
+        .consume_outbound(1, 256)
+        .expect("the granted credit applies");
 }
 
 #[tokio::test]
