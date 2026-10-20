@@ -1420,9 +1420,9 @@ mod tests {
         let kind = HashKind::Sha1;
         let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
         let dest = server_store();
-        // The client saw THREE and wants FIVE, but the server is at FOUR:
-        // the tip matches neither the expectation nor the desire, so the
-        // CAS still refuses.
+        // The client saw THREE and re-sets THREE, but the server already
+        // moved to FOUR: the tip matches neither the expectation nor the
+        // desire, so the CAS still refuses.
         let pack = push_pack(&src, kind, oid(THREE), oid(FOUR), b"refs/heads/main");
         let mut input = command(
             oid(THREE),

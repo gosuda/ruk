@@ -1298,7 +1298,11 @@ impl RetentionReport {
     /// True when the pass deleted nothing durable and expired no leases.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.receipts_deleted == 0 && self.sessions_deleted == 0 && self.leases_expired == 0
+        self.receipts_deleted == 0
+            && self.sessions_deleted == 0
+            && self.events_deleted == 0
+            && self.service_receipts_deleted == 0
+            && self.leases_expired == 0
     }
 }
 
@@ -3183,5 +3187,37 @@ mod tests {
 
         coord.shutdown();
         runner.abort();
+    }
+
+    #[test]
+    fn retention_report_is_empty_counts_every_swept_table() {
+        assert!(RetentionReport::default().is_empty());
+        for report in [
+            RetentionReport {
+                receipts_deleted: 1,
+                ..RetentionReport::default()
+            },
+            RetentionReport {
+                sessions_deleted: 1,
+                ..RetentionReport::default()
+            },
+            RetentionReport {
+                events_deleted: 1,
+                ..RetentionReport::default()
+            },
+            RetentionReport {
+                service_receipts_deleted: 1,
+                ..RetentionReport::default()
+            },
+            RetentionReport {
+                leases_expired: 1,
+                ..RetentionReport::default()
+            },
+        ] {
+            assert!(
+                !report.is_empty(),
+                "a pass that deleted or expired anything is not empty: {report:?}"
+            );
+        }
     }
 }
