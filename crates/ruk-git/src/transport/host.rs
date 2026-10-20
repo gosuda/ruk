@@ -52,6 +52,10 @@ pub struct HookCall {
     pub push_options: Vec<String>,
     /// New commit tips introduced by the push, as hex.
     pub new_commits: Vec<String>,
+    /// True when `new_commits` holds only the first entries of a longer
+    /// list. Absent on older frames, which never truncated.
+    #[serde(default)]
+    pub new_commits_truncated: bool,
     /// Staged object payload bytes.
     pub pack_bytes: u64,
     /// Milliseconds the pump waits for the reply before failing closed.
@@ -212,6 +216,7 @@ struct PreState {
     commands: Vec<StoredCommand>,
     verdicts: Vec<RefVerdict>,
     new_commits: Vec<String>,
+    new_commits_truncated: bool,
     pack_bytes: u64,
     push_options: Vec<String>,
 }
@@ -223,6 +228,7 @@ struct PendingPost {
     commands: Vec<HookCommand>,
     push_options: Vec<String>,
     new_commits: Vec<String>,
+    new_commits_truncated: bool,
     pack_bytes: u64,
 }
 
@@ -272,6 +278,7 @@ impl HostPolicy {
             commands: pending.commands,
             push_options: pending.push_options,
             new_commits: pending.new_commits,
+            new_commits_truncated: pending.new_commits_truncated,
             pack_bytes: pending.pack_bytes,
             deadline_ms: self.deadline_ms,
         })
@@ -417,6 +424,7 @@ impl ReceivePolicy for HostPolicy {
                 .collect(),
             push_options: batch.push_options.to_vec(),
             new_commits: batch.new_commits.iter().map(|oid| oid.to_hex()).collect(),
+            new_commits_truncated: batch.new_commits_truncated,
             pack_bytes: batch.pack_bytes,
             deadline_ms: self.deadline_ms,
         };
@@ -426,6 +434,7 @@ impl ReceivePolicy for HostPolicy {
             commands: stored,
             verdicts: verdicts.clone(),
             new_commits: batch.new_commits.iter().map(|oid| oid.to_hex()).collect(),
+            new_commits_truncated: batch.new_commits_truncated,
             pack_bytes: batch.pack_bytes,
             push_options: batch.push_options.to_vec(),
         });
@@ -465,7 +474,22 @@ impl ReceivePolicy for HostPolicy {
             commands: landed_commands,
             push_options: state.push_options,
             new_commits: state.new_commits,
+            new_commits_truncated: state.new_commits_truncated,
             pack_bytes: state.pack_bytes,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_call_without_truncation_flag_defaults_false() {
+        let call: HookCall = sonic_rs::from_str(
+            r#"{"phase":"pre_receive","commands":[],"push_options":[],"new_commits":[],"pack_bytes":0,"deadline_ms":1}"#,
+        )
+        .expect("old frame decodes");
+        assert!(!call.new_commits_truncated);
     }
 }

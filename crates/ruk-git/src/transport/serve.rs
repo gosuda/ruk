@@ -783,6 +783,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             new_commits.push(cmd.new);
         }
     }
+    let (new_commits, new_commits_truncated) = truncate_hook_commits(new_commits);
     let batch = ReceiveBatch {
         commands: &policy_commands,
         push_options: &push_options,
@@ -792,6 +793,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         atomic,
         interrupt,
         new_commits,
+        new_commits_truncated,
         pack_bytes,
     };
     let mut alternates: Vec<(usize, AlternateRef)> = Vec::new();
@@ -1009,6 +1011,23 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     Ok(operation_ids)
 }
 
+/// Cap of commit tips listed on one hook call: the first entries travel
+/// with the truncation flag instead of refusing past ~390k commits, when
+/// the HookCall would pass the 16 MiB control bound. The hook judges
+/// tips; full history stays readable from the store.
+pub(crate) const MAX_HOOK_NEW_COMMITS: usize = 1024;
+
+/// Keeps the first entries of a hook commit list with a truncation flag.
+fn truncate_hook_commits(commits: Vec<Oid>) -> (Vec<Oid>, bool) {
+    if commits.len() > MAX_HOOK_NEW_COMMITS {
+        let mut commits = commits;
+        commits.truncate(MAX_HOOK_NEW_COMMITS);
+        (commits, true)
+    } else {
+        (commits, false)
+    }
+}
+
 /// Collects per-ref verdicts in command order; every command has one by the
 /// time any report sends.
 fn report_rows(
@@ -1093,6 +1112,24 @@ mod tests {
 
     fn oid(hex: &str) -> Oid {
         Oid::from_hex(hex).expect("hex")
+    }
+
+    #[test]
+    fn hook_commit_list_truncates_past_1024() {
+        let commits: Vec<Oid> = (0..MAX_HOOK_NEW_COMMITS)
+            .map(|n| oid(&format!("{n:040x}")))
+            .collect();
+        let (kept, truncated) = truncate_hook_commits(commits);
+        assert_eq!(kept.len(), MAX_HOOK_NEW_COMMITS);
+        assert!(!truncated);
+
+        let commits: Vec<Oid> = (0..=MAX_HOOK_NEW_COMMITS)
+            .map(|n| oid(&format!("{n:040x}")))
+            .collect();
+        assert_eq!(commits.len(), MAX_HOOK_NEW_COMMITS + 1);
+        let (kept, truncated) = truncate_hook_commits(commits);
+        assert_eq!(kept.len(), MAX_HOOK_NEW_COMMITS);
+        assert!(truncated);
     }
 
     fn head() -> HeadAdvertisement {

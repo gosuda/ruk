@@ -86,6 +86,9 @@ pub struct ReceiveBatch<'a> {
     /// New commit tips introduced by the push, in command order then
     /// staged order, deduplicated.
     pub new_commits: Vec<Oid>,
+    /// True when `new_commits` holds only the first entries of a longer
+    /// list (see `MAX_HOOK_NEW_COMMITS`).
+    pub new_commits_truncated: bool,
     /// Staged object payload bytes (zero for delete-only pushes).
     pub pack_bytes: u64,
 }

@@ -1273,6 +1273,7 @@ async fn hook_wait_cancel_trips_the_sync_flag() {
         commands: Vec::new(),
         push_options: Vec::new(),
         new_commits: Vec::new(),
+        new_commits_truncated: false,
         pack_bytes: 0,
         deadline_ms: 5_000,
     };
@@ -1333,6 +1334,7 @@ async fn hook_wait_applies_window_update_to_credits() {
         commands: Vec::new(),
         push_options: Vec::new(),
         new_commits: Vec::new(),
+        new_commits_truncated: false,
         pack_bytes: 0,
         deadline_ms: 5_000,
     };
