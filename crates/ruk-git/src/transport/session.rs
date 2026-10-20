@@ -792,21 +792,6 @@ fn local_push_inner(
     Ok(report)
 }
 
-/// Whether `dest` already holds `update.new`: replay tolerance for
-/// retries that arrive after their refs landed. A delete whose ref is
-/// already absent and a set whose tip already matches both report `Ok`
-/// without publishing, so no new event records a non-move.
-fn already_at_new(dest: &Store, kind: HashKind, update: &PushUpdate) -> bool {
-    let Ok(name) = RefName::new(update.name.clone()) else {
-        return false;
-    };
-    match StoreRefs::new(dest).get(&name) {
-        Ok(Some(RefTarget::Direct(oid))) => oid == update.new,
-        Ok(_) => update.new == kind.zero_oid(),
-        Err(_) => false,
-    }
-}
-
 /// Applies ref updates to `dest`: one checked transaction for atomic
 /// pushes, per-ref transactions otherwise. CAS failures become per-ref
 /// rejections.
@@ -866,31 +851,17 @@ pub(crate) fn apply_refs(
                     .collect(),
                 publication.ref_events,
             )),
-            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
-                if live.iter().all(|u| already_at_new(dest, kind, u)) {
-                    Ok((
-                        live.iter()
-                            .map(|u| RefOutcome {
-                                name: u.name.clone(),
-                                result: RefResult::Ok,
-                            })
-                            .collect(),
-                        Vec::new(),
-                    ))
-                } else {
-                    Ok((
-                        live.iter()
-                            .map(|u| RefOutcome {
-                                name: u.name.clone(),
-                                result: RefResult::Rejected {
-                                    reason: "destination ref moved during apply".to_owned(),
-                                },
-                            })
-                            .collect(),
-                        Vec::new(),
-                    ))
-                }
-            }
+            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => Ok((
+                live.iter()
+                    .map(|u| RefOutcome {
+                        name: u.name.clone(),
+                        result: RefResult::Rejected {
+                            reason: "destination ref moved during apply".to_owned(),
+                        },
+                    })
+                    .collect(),
+                Vec::new(),
+            )),
             Err(err) => Err(err.into()),
         }
     } else {
@@ -912,25 +883,15 @@ pub(crate) fn apply_refs(
                             RefResult::Ok
                         }
                         Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
-                            if already_at_new(dest, kind, update) {
-                                RefResult::Ok
-                            } else {
-                                RefResult::Rejected {
-                                    reason: "destination ref moved during apply".to_owned(),
-                                }
+                            RefResult::Rejected {
+                                reason: "destination ref moved during apply".to_owned(),
                             }
                         }
                         Err(err) => return Err(err.into()),
                     },
-                    Err(GitError::Stale { .. }) => {
-                        if already_at_new(dest, kind, update) {
-                            RefResult::Ok
-                        } else {
-                            RefResult::Rejected {
-                                reason: "destination ref moved".to_owned(),
-                            }
-                        }
-                    }
+                    Err(GitError::Stale { .. }) => RefResult::Rejected {
+                        reason: "destination ref moved".to_owned(),
+                    },
                     Err(err) => return Err(err),
                 };
             outcomes.push(RefOutcome {

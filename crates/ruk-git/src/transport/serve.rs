@@ -1600,13 +1600,15 @@ mod tests {
     }
 
     #[test]
-    fn receive_tolerates_ref_already_at_new() {
+    fn receive_stale_old_reports_ng_like_stock() {
         let kind = HashKind::Sha1;
         let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
         let dest = server_store();
         // The client saw THREE but the server is at FOUR, which is also
-        // the desired tip: replay tolerance reports `ok` without
-        // publishing, instead of failing the stale expectation.
+        // the desired tip: stock receive-pack still answers `ng` for the
+        // stale expectation. Only an exact receipt replay (same request
+        // id, same digest) returns the stored report; that path never
+        // reaches `apply_refs`.
         let pack = push_pack(&src, kind, oid(THREE), oid(FOUR), b"refs/heads/main");
         let mut input = command(
             oid(THREE),
@@ -1629,9 +1631,12 @@ mod tests {
         )
         .expect("serve reports outcomes in-band");
         let lines = report_lines(&out);
-        assert_eq!(
-            lines,
-            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"unpack ok".to_vec());
+        assert!(
+            lines[1].starts_with(b"ng refs/heads/main "),
+            "stale old must report ng, got {:?}",
+            String::from_utf8_lossy(&lines[1])
         );
         assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
     }

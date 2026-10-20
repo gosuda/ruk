@@ -2563,7 +2563,7 @@ async fn receive_digest_mismatch_refused() {
 }
 
 #[tokio::test]
-async fn receive_ref_already_at_new_on_replay_is_ok() {
+async fn receive_ref_stale_old_without_receipt_is_rejected() {
     let root = temp_root("host-already");
     let repo_dir = root.join("repo");
     std::fs::create_dir_all(&repo_dir).expect("repo dir");
@@ -2604,8 +2604,9 @@ async fn receive_ref_already_at_new_on_replay_is_ok() {
     assert_eq!(exit.exit_code, 0);
 
     // Same commands under a fresh request id re-execute against a ref
-    // that already sits at the desired tip: tolerated as `ok`, not a
-    // stale conflict.
+    // that already sits at the desired tip: stock refusal, not `ok`.
+    // Tolerance lives only in the exact receipt replay (same request id,
+    // same digest), which returns the stored report before the serve.
     let payload = git_open_payload(
         "receive-pack",
         &store_repo,
@@ -2619,8 +2620,8 @@ async fn receive_ref_already_at_new_on_replay_is_ok() {
     assert_eq!(exit.exit_code, 0);
     let text = String::from_utf8_lossy(&out);
     assert!(
-        text.contains("ok refs/heads/scratch"),
-        "already-at-new must report ok, got {text:?}"
+        text.contains("ng refs/heads/scratch destination ref moved"),
+        "fresh stale push must report ng, got {text:?}"
     );
 
     drop(driver);
