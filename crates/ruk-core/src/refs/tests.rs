@@ -789,3 +789,17 @@ fn test_byte_exact_reflog_recovery_and_bounded_continuation() {
     let err = prepare_append_reflog(store, &huge_key, &huge_record).unwrap_err();
     assert_eq!(err.code, ErrorCode::ELimit);
 }
+
+#[test]
+fn released_tag_marker_round_trips_through_postcard() {
+    use crate::protocol::Timestamp;
+    let marker = ReleasedTagMarker {
+        owner_release_id: "rel-1".to_string(),
+        target_oid: Oid::from_bytes(&[0x11; 20]).expect("tag target"),
+        frozen_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+    };
+    let bytes = crate::store::encode("released_tags", &marker).expect("encode marker");
+    let decoded: ReleasedTagMarker =
+        crate::store::decode("released_tags", &bytes).expect("decode marker");
+    assert_eq!(decoded, marker);
+}

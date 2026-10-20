@@ -9,6 +9,7 @@ use crate::error::{CoreError, CoreModelError, ErrorCode};
 use crate::ids::{HashKind, Oid};
 use crate::index::reject_null_oid;
 use crate::merge::Merge;
+use crate::protocol::Timestamp;
 use crate::refdata::{
     RefChange, RefError, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
@@ -651,6 +652,20 @@ pub fn page_reflogs(
     }
 
     Ok(ReflogPage { entries, more })
+}
+
+/// One frozen release tag: the `ReleasedTags` row at key
+/// `refs/tags/<name>`, written when its release publishes and removed on
+/// delete, discard, compensation, or repair. The freeze gate (a later row)
+/// refuses every tag mutation path while a live marker exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleasedTagMarker {
+    /// The release that owns the freeze.
+    pub owner_release_id: String,
+    /// The tag target the freeze pins.
+    pub target_oid: Oid,
+    /// Wall time the freeze was written.
+    pub frozen_at: Timestamp,
 }
 
 /// Every object id named by any reflog record in the store, old and new.

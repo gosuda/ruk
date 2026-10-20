@@ -75,6 +75,11 @@ pub(crate) fn tracked(table: FactTable) -> bool {
         FactTable::Promisor => false,
         FactTable::Shallow => false,
         FactTable::LfsObjects => false,
+        FactTable::Events => false,
+        FactTable::EventHead => false,
+        FactTable::ServiceReceipts => false,
+        FactTable::RepoMeta => false,
+        FactTable::ReleasedTags => false,
     }
 }
 
@@ -861,7 +866,12 @@ mod tests {
                 | FactTable::Reflogs
                 | FactTable::Promisor
                 | FactTable::Shallow
-                | FactTable::LfsObjects => {
+                | FactTable::LfsObjects
+                | FactTable::Events
+                | FactTable::EventHead
+                | FactTable::ServiceReceipts
+                | FactTable::RepoMeta
+                | FactTable::ReleasedTags => {
                     assert!(!is_tracked, "expected {table:?} to be untracked");
                 }
             }

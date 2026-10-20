@@ -86,7 +86,12 @@ impl TrackedTable {
             | FactTable::Promisor
             | FactTable::Shallow
             | FactTable::Pins
-            | FactTable::LfsObjects => None,
+            | FactTable::LfsObjects
+            | FactTable::Events
+            | FactTable::EventHead
+            | FactTable::ServiceReceipts
+            | FactTable::RepoMeta
+            | FactTable::ReleasedTags => None,
         }
     }
 }

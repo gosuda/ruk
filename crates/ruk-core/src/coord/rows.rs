@@ -1216,6 +1216,22 @@ mod tests {
     ];
 
     #[test]
+    fn persisted_table_names_survive_the_census_revision() {
+        for table in FactTable::ALL {
+            assert_eq!(
+                fact_table_from_name(table.table_name()),
+                Some(table),
+                "{table:?} round-trips through its persisted name"
+            );
+        }
+        assert_eq!(
+            fact_table_from_name("released_tags"),
+            Some(FactTable::ReleasedTags)
+        );
+        assert_eq!(fact_table_from_name("not_a_table"), None);
+    }
+
+    #[test]
     fn golden_byte_vectors_v1_compatibility() {
         let (_temp, store) = test_store("golden-v1");
 

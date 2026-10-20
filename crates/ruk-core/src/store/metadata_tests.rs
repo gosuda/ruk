@@ -33,7 +33,7 @@ const RAW_VERIFIED: TableDefinition<'static, (), u64> = TableDefinition::new("ve
 
 /// The census of the core contract, spelled independently of the code under
 /// test: every table a store must contain, and no other.
-const CENSUS: [&str; 32] = [
+const CENSUS: [&str; 37] = [
     "objects",
     "commits",
     "changes",
@@ -66,6 +66,11 @@ const CENSUS: [&str; 32] = [
     "reflogs",
     "lfs_objects",
     "pending_reservations",
+    "events",
+    "event_head",
+    "service_receipts",
+    "repo_meta",
+    "released_tags",
 ];
 
 fn every_fact_table() -> Vec<FactTable> {
@@ -97,6 +102,11 @@ fn every_fact_table() -> Vec<FactTable> {
         FactTable::Shallow,
         FactTable::Pins,
         FactTable::LfsObjects,
+        FactTable::Events,
+        FactTable::EventHead,
+        FactTable::ServiceReceipts,
+        FactTable::RepoMeta,
+        FactTable::ReleasedTags,
     ];
     // A new variant fails to compile here until it is listed above.
     for table in &all {
@@ -127,7 +137,12 @@ fn every_fact_table() -> Vec<FactTable> {
             | FactTable::Promisor
             | FactTable::Shallow
             | FactTable::Pins
-            | FactTable::LfsObjects => {}
+            | FactTable::LfsObjects
+            | FactTable::Events
+            | FactTable::EventHead
+            | FactTable::ServiceReceipts
+            | FactTable::RepoMeta
+            | FactTable::ReleasedTags => {}
         }
     }
     all
@@ -449,7 +464,7 @@ fn create_initializes_the_complete_census_and_generation_zero() {
 
     let reopened = reopen(&dir);
     let tables = every_fact_table();
-    assert_eq!(tables.len(), 27);
+    assert_eq!(tables.len(), 32);
     assert_eq!(tables, FactTable::ALL.to_vec(), "FactTable::ALL drifted");
     for table in tables {
         assert!(CENSUS.contains(&table.table_name()), "{table:?}");
@@ -614,6 +629,77 @@ fn open_accepts_a_store_predating_the_verified_generation_table_as_unverified() 
     assert_eq!(
         meta.verified_generation().expect("verified generation"),
         Some(7)
+    );
+}
+
+#[test]
+fn open_predating_the_events_census_creates_new_tables_empty() {
+    const NEW_TABLES: [&str; 5] = [
+        "events",
+        "event_head",
+        "service_receipts",
+        "repo_meta",
+        "released_tags",
+    ];
+    let dir = TestDir::new("open-old-census");
+    drop(create(&dir));
+    {
+        let db = Database::open(dir.meta_path()).expect("raw open");
+        let txn = db.begin_write().expect("raw write");
+        for name in NEW_TABLES {
+            let table: TableDefinition<'static, &'static [u8], &'static [u8]> =
+                TableDefinition::new(name);
+            assert!(
+                txn.delete_table(table).expect("delete table"),
+                "the census created {name}"
+            );
+        }
+        txn.commit().expect("raw commit");
+    }
+    let meta = reopen(&dir);
+    for table in [
+        FactTable::Events,
+        FactTable::EventHead,
+        FactTable::ServiceReceipts,
+        FactTable::RepoMeta,
+        FactTable::ReleasedTags,
+    ] {
+        assert_eq!(
+            read_fact(&meta, table, b"refs/tags/v1"),
+            None,
+            "no backfill: {table:?} opens empty"
+        );
+    }
+    publish(
+        &meta,
+        &[put(FactTable::ReleasedTags, b"refs/tags/v1", b"marker")],
+    );
+    assert_eq!(
+        read_fact(&meta, FactTable::ReleasedTags, b"refs/tags/v1"),
+        Some(b"marker".to_vec())
+    );
+    publish(
+        &meta,
+        &[put(
+            FactTable::Events,
+            b"\x00\x00\x00\x00\x00\x00\x00\x01",
+            b"e",
+        )],
+    );
+    assert_eq!(
+        read_fact(
+            &meta,
+            FactTable::Events,
+            b"\x00\x00\x00\x00\x00\x00\x00\x01"
+        ),
+        Some(b"e".to_vec())
+    );
+    drop(meta);
+    let reopened = reopen(&dir);
+    assert_eq!(
+        read_fact(&reopened, FactTable::ReleasedTags, b"refs/tags/v1"),
+        Some(b"marker".to_vec()),
+        "created-empty tables persist across reopen"
     );
 }
 

@@ -106,18 +106,25 @@ pub const fn disposition(table: FactTable) -> Disposition {
         | FactTable::ImportedChanges
         | FactTable::ChangeHistory
         | FactTable::Commits => Lost(L::ChangeMetadata),
-        FactTable::Ops | FactTable::OpHead => Lost(L::OperationLog),
+        FactTable::Ops | FactTable::OpHead | FactTable::Events | FactTable::EventHead => {
+            Lost(L::OperationLog)
+        }
         FactTable::Workspaces
         | FactTable::WsIndex
         | FactTable::WsStatus
         | FactTable::WsDirs
         | FactTable::WsApply => Lost(L::Workspaces),
         FactTable::Claims => Lost(L::Claims),
-        FactTable::Receipts | FactTable::Sessions | FactTable::Leases => Lost(L::Coordination),
+        FactTable::Receipts
+        | FactTable::Sessions
+        | FactTable::Leases
+        | FactTable::ServiceReceipts
+        | FactTable::RepoMeta => Lost(L::Coordination),
         FactTable::Attestations => Lost(L::Attestations),
-        FactTable::PushPlans | FactTable::LandPlans | FactTable::PublishedHeads => {
-            Lost(L::Publication)
-        }
+        FactTable::PushPlans
+        | FactTable::LandPlans
+        | FactTable::PublishedHeads
+        | FactTable::ReleasedTags => Lost(L::Publication),
         FactTable::Pins => Lost(L::RetentionPins),
         FactTable::Promisor => Lost(L::Promisor),
         FactTable::LfsObjects => Lost(L::LfsObjects),

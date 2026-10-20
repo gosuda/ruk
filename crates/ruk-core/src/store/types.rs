@@ -264,11 +264,16 @@ pub enum FactTable {
     Shallow,
     Pins,
     LfsObjects,
+    Events,
+    EventHead,
+    ServiceReceipts,
+    RepoMeta,
+    ReleasedTags,
 }
 
 impl FactTable {
     /// Every table, in schema order.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 32] = [
         Self::Refs,
         Self::RefConflicts,
         Self::RemoteObservations,
@@ -296,6 +301,11 @@ impl FactTable {
         Self::Shallow,
         Self::Pins,
         Self::LfsObjects,
+        Self::Events,
+        Self::EventHead,
+        Self::ServiceReceipts,
+        Self::RepoMeta,
+        Self::ReleasedTags,
     ];
 
     /// The exact on-disk table name from the core census.
@@ -329,6 +339,11 @@ impl FactTable {
             Self::Shallow => "shallow",
             Self::Pins => "pins",
             Self::LfsObjects => "lfs_objects",
+            Self::Events => "events",
+            Self::EventHead => "event_head",
+            Self::ServiceReceipts => "service_receipts",
+            Self::RepoMeta => "repo_meta",
+            Self::ReleasedTags => "released_tags",
         }
     }
 }

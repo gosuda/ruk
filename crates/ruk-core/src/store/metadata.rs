@@ -1071,14 +1071,24 @@ fn apply_fact(txn: &WriteTransaction, fact: &FactMutation) -> Result<(), StoreEr
     Ok(())
 }
 
-/// Creates the `lfs_objects` and `pending_reservations` tables when the
-/// database predates those schema revisions, so an older store opens with
-/// the new tables empty instead of refusing. Every other census table keeps
-/// its existing meaning: a missing one is still damage, never silently
-/// recreated — recreating `objects` would orphan segment bytes behind
-/// vanished locators and turn damage into silent missing-object reads. A
-/// write transaction's `open_table` creates the table only when absent;
-/// existing tables and rows are untouched.
+/// Tables a schema revision may introduce into an older store: absence
+/// means the file predates the revision, so the table is created empty
+/// instead of refusing. Every other census table keeps its existing
+/// meaning: a missing one is still damage, never silently recreated —
+/// recreating `objects` would orphan segment bytes behind vanished
+/// locators and turn damage into silent missing-object reads. A write
+/// transaction's `open_table` creates the table only when absent; existing
+/// tables and rows are untouched.
+const REVISION_TABLES: [&str; 7] = [
+    "lfs_objects",
+    "pending_reservations",
+    "events",
+    "event_head",
+    "service_receipts",
+    "repo_meta",
+    "released_tags",
+];
+
 fn ensure_census(db: &Database) -> Result<(), StoreError> {
     // Fast path: the revision tables exist on every store written since
     // their introduction, so probe with a read transaction and only take
@@ -1093,7 +1103,7 @@ fn ensure_census(db: &Database) -> Result<(), StoreError> {
             .map_err(storage)?
             .map(|handle| handle.name().to_owned())
             .collect();
-        [FactTable::LfsObjects.table_name(), PENDING.name()]
+        REVISION_TABLES
             .into_iter()
             .filter(|want| !names.iter().any(|name| name == want))
             .map(str::to_owned)
@@ -1105,11 +1115,17 @@ fn ensure_census(db: &Database) -> Result<(), StoreError> {
     let mut txn = db.begin_write().map_err(txn_error)?;
     txn.set_durability(Durability::Immediate)?;
     for name in &missing {
-        if name == FactTable::LfsObjects.table_name() {
-            txn.open_table(fact_definition(FactTable::LfsObjects))
-                .map_err(table_error)?;
-        } else {
+        if name == PENDING.name() {
             txn.open_table(PENDING).map_err(table_error)?;
+        } else {
+            let table = FactTable::ALL
+                .into_iter()
+                .find(|table| table.table_name() == name)
+                .ok_or_else(|| {
+                    StoreError::Version(format!("metadata database holds unknown table {name}"))
+                })?;
+            txn.open_table(fact_definition(table))
+                .map_err(table_error)?;
         }
     }
     txn.commit()?;
