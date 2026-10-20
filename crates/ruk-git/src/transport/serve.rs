@@ -1077,7 +1077,9 @@ pub fn serve_command<R: Read, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::super::hooks::ReceiveHooks;
-    use super::super::policy::{NoPolicy, ScriptPolicy};
+    use super::super::policy::{
+        LandedRefs, NoPolicy, ReceiveBatch, ReceivePolicy, RefVerdict, ScriptPolicy,
+    };
     use super::super::refadv::{Initial, read_initial};
     use super::super::session::test_support::{store_with_pack, test_store};
     use super::*;
@@ -1577,6 +1579,33 @@ mod tests {
         assert_eq!(ref_oid(&dest, b"refs/heads/main"), Some(oid(FOUR)));
     }
 
+    /// Accepts every command, atomic included: the serve-level atomic
+    /// refusal must fire before any policy verdict, so this test fails
+    /// on code that leaves the refusal to the policies (both shipped
+    /// policies refuse atomic themselves, which would mask a missing
+    /// serve-level rule).
+    struct AcceptAtomic {
+        pre_receive_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReceivePolicy for AcceptAtomic {
+        fn needs_quarantine(&self) -> bool {
+            false
+        }
+
+        fn quarantine_parent(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+
+        fn pre_receive(&self, batch: &ReceiveBatch<'_>) -> Vec<RefVerdict> {
+            self.pre_receive_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            batch.commands.iter().map(|_| RefVerdict::Accept).collect()
+        }
+
+        fn post_receive(&self, _landed: &LandedRefs<'_>) {}
+    }
+
     #[test]
     fn receive_refuses_atomic_without_hooks() {
         let kind = HashKind::Sha1;
@@ -1592,6 +1621,9 @@ mod tests {
         input.extend_from_slice(b"0000");
         input.extend_from_slice(&pack);
 
+        let policy = AcceptAtomic {
+            pre_receive_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
         let mut out = Vec::new();
         serve_receive_pack_with(
             &input[..],
@@ -1600,11 +1632,18 @@ mod tests {
             kind,
             &head(),
             &Interrupt::none(),
-            &NoPolicy,
+            &policy,
             LfsMode::Deny,
             ReceiveLimits::default(),
         )
         .expect("atomic refusal stays in-band");
+        assert_eq!(
+            policy
+                .pre_receive_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the serve-level refusal runs before any policy verdict"
+        );
         let lines = report_lines(&out);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], b"unpack ok");

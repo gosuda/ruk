@@ -1862,9 +1862,15 @@ async fn hosted_atomic_push_refuses_before_pre_receive() {
     let commit = seed_commit(&repo_dir);
     seed_ref(&repo_dir, "refs/heads/scratch", commit);
 
-    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
     handshake(&mut driver).await;
     let session = open_push_session(&mut driver, &store_repo, &["refs/heads/**"]).await;
+
+    let (_, _, before) = registry.open(&store_repo).expect("open coordinator");
+    let before_ref = before
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/heads/scratch")
+        .expect("read ref before the push");
 
     let zero = "0".repeat(40);
     let mut body = pkt(format!(
@@ -1909,6 +1915,13 @@ async fn hosted_atomic_push_refuses_before_pre_receive() {
         text.contains("ng refs/heads/scratch atomic pushes are not supported"),
         "got {text:?}"
     );
+
+    let (_, _, after) = registry.open(&store_repo).expect("open coordinator");
+    let after_ref = after
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/heads/scratch")
+        .expect("read ref after the push");
+    assert_eq!(after_ref, before_ref, "a refused atomic push moves no ref");
 
     drop(driver);
     task.abort();
