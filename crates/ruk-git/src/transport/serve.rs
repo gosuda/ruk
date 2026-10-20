@@ -186,6 +186,37 @@ fn parse_want(line: &[u8], kind: HashKind) -> Result<Want, GitError> {
     })
 }
 
+/// Builds the capability line one `upload-pack` advertisement carries.
+fn upload_caps(kind: HashKind, head: &HeadAdvertisement) -> String {
+    let mut caps = format!(
+        "multi_ack ofs-delta object-format={} agent={}",
+        object_format_value(kind),
+        AGENT
+    );
+    if let Some(target) = head.symref.as_deref() {
+        caps.push_str(&format!(" symref=HEAD:{}", String::from_utf8_lossy(target)));
+    }
+    caps
+}
+
+/// Writes only the `upload-pack` ref advertisement: the discovery half of
+/// a stateless git-service request.
+///
+/// # Errors
+/// [`GitError::ObjectFormat`] for store/kind mismatch, plus store failures.
+pub fn advertise_upload_pack(
+    store: &Store,
+    kind: HashKind,
+    head: &HeadAdvertisement,
+) -> Result<Vec<u8>, GitError> {
+    if store.hash_kind() != kind {
+        return Err(GitError::ObjectFormat {
+            detail: "serving store uses another object format".to_owned(),
+        });
+    }
+    advertisement(store, kind, head, &upload_caps(kind, head))
+}
+
 /// Serves one `upload-pack` session: writes the advertisement, negotiates
 /// wants/haves, and emits a self-contained pack.
 ///
@@ -209,15 +240,10 @@ pub fn serve_upload_pack<R: Read, W: Write>(
             detail: "serving store uses another object format".to_owned(),
         });
     }
-    let mut caps = format!(
-        "multi_ack ofs-delta object-format={} agent={}",
-        object_format_value(kind),
-        AGENT
-    );
-    if let Some(target) = head.symref.as_deref() {
-        caps.push_str(&format!(" symref=HEAD:{}", String::from_utf8_lossy(target)));
-    }
-    send(&mut writer, &advertisement(store, kind, head, &caps)?)?;
+    send(
+        &mut writer,
+        &advertisement(store, kind, head, &upload_caps(kind, head))?,
+    )?;
 
     let mut pkt = PktReader::new(reader, interrupt.clone());
     let mut wants = Vec::new();
@@ -536,6 +562,58 @@ pub fn serve_receive_pack<R: Read, W: Write>(
     )
 }
 
+/// Builds the capability line one `receive-pack` advertisement carries.
+fn receive_caps(kind: HashKind) -> String {
+    format!(
+        "report-status delete-refs ofs-delta push-options object-format={} agent={}",
+        object_format_value(kind),
+        AGENT
+    )
+}
+
+/// Writes only the `receive-pack` ref advertisement: the discovery half of
+/// a stateless git-service request.
+///
+/// # Errors
+/// [`GitError::ObjectFormat`] for store/kind mismatch, plus store failures.
+pub fn advertise_receive_pack(
+    store: &Store,
+    kind: HashKind,
+    head: &HeadAdvertisement,
+) -> Result<Vec<u8>, GitError> {
+    if store.hash_kind() != kind {
+        return Err(GitError::ObjectFormat {
+            detail: "serving store uses another object format".to_owned(),
+        });
+    }
+    advertisement(store, kind, head, &receive_caps(kind))
+}
+
+/// Computes the daemon-side digest of one git-service request: SHA-256 over
+/// a domain tag, the service name, the parsed command lines, and the
+/// canonical effective limits. Client values never feed it.
+#[must_use]
+pub fn git_service_digest(service: &str, commands: &[Vec<u8>], limits: &[u8]) -> String {
+    let mut hasher = gix_hash::hasher(HashKind::Sha256.gix());
+    hasher.update(b"ruk-git-service-v1\0");
+    hasher.update(service.as_bytes());
+    hasher.update(b"\0");
+    for command in commands {
+        hasher.update(command);
+        hasher.update(b"\0");
+    }
+    hasher.update(limits);
+    let digest = hasher
+        .try_finalize()
+        .expect("SHA-256 has no collision refusal");
+    let mut hex = String::with_capacity(digest.as_bytes().len() * 2);
+    for byte in digest.as_bytes() {
+        hex.push(char::from_digit(u32::from(byte >> 4), 16).expect("hex digit"));
+        hex.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("hex digit"));
+    }
+    hex
+}
+
 /// Serves one `receive-pack` session with quarantine staging and hook
 /// phases (see [`super::hooks`]): the pack stages unpublished, hooks
 /// observe it through the quarantine directory, staged objects publish
@@ -574,12 +652,10 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             detail: "serving store uses another object format".to_owned(),
         });
     }
-    let caps = format!(
-        "report-status delete-refs ofs-delta push-options object-format={} agent={}",
-        object_format_value(kind),
-        AGENT
-    );
-    send(&mut writer, &advertisement(store, kind, head, &caps)?)?;
+    send(
+        &mut writer,
+        &advertisement(store, kind, head, &receive_caps(kind))?,
+    )?;
 
     let mut pkt = PktReader::new(reader, interrupt.clone());
     let mut commands: Vec<Command> = Vec::new();

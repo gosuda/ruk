@@ -1,9 +1,9 @@
-//! Command-stream serving tests driving the daemon wire.
+//! Git-service and typed-invocation tests driving the daemon wire.
 //!
 //! The tests speak the daemon's field names over a socket pair
-//! (`protocol_major` without `protocol_minor`, `argv`/`dir`/`env` opens,
-//! `outcome-lookup` on stream zero) so a field rename or shape drift fails
-//! here instead of against a live peer.
+//! (`protocol_major` without `protocol_minor`, git-service envelope opens,
+//! typed invocation opens) so a field rename or shape drift fails here
+//! instead of against a live peer.
 
 #![cfg(unix)]
 
@@ -14,12 +14,14 @@ use std::time::Duration;
 
 use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
 use super::{
-    BoundedExecutor, CommandAccepted, CommandExitReport, ConnectionRefs, ControlReply,
+    BoundedExecutor, CommandAccepted, CommandExitReport, CommandOpen, ConnectionRefs, ExitReport,
+    GitLimits, InvocationAccepted, InvocationOpen, Registry, SessionOpened, serve_connection,
+};
+use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
     DEFAULT_EVENT_RETENTION_SECONDS, DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS,
     DEFAULT_RETENTION_INTERVAL_MS, DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE,
-    DEFAULT_TRANSPORT_PERMITS, DaemonConfig, ExitReport, InvocationAccepted, InvocationOpen,
-    OutcomeLedger, Registry, SessionOpened, serve_connection,
+    DEFAULT_TRANSPORT_PERMITS, DaemonConfig,
 };
 use ruk_core::bytes::ByteString;
 use ruk_core::change::{LeaseId, OperationId, PlanId, RequestId, SessionId, StoreId};
@@ -38,7 +40,7 @@ use ruk_core::protocol::{
     SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
     TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
-use ruk_core::refdata::{RefExpect, RefName, RefTarget};
+use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
 use ruk_core::store::{ObjectKind, PreparationBudget, Store};
 
 /// Hands out unique temp directory names across parallel tests.
@@ -97,42 +99,70 @@ fn frame_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + Duration::from_secs(15)
 }
 
-/// Renders a JSON string literal for hand-built wire documents.
-fn jstr(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 2);
-    out.push('"');
-    for ch in raw.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+/// Builds one git-service envelope open document.
+fn git_open_payload(
+    service: &str,
+    repository: &str,
+    advertise: bool,
+    session_id: Option<&str>,
+    request_id: Option<&str>,
+) -> Vec<u8> {
+    let open = CommandOpen {
+        service: service.to_string(),
+        repository: repository.to_string(),
+        session_id: session_id.map(str::to_string),
+        request_id: request_id.map(str::to_string),
+        git_protocol: String::new(),
+        advertise,
+        stdout_credit: 262_144,
+        limits: GitLimits::default(),
+    };
+    sonic_rs::to_string(&open)
+        .expect("git-service open encodes")
+        .into_bytes()
+}
+
+/// Encodes one pkt-line data frame.
+fn pkt(payload: &[u8]) -> Vec<u8> {
+    let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+    out.extend_from_slice(payload);
     out
 }
 
-/// Builds one `RukOpenRequest` document with the Go backend's field names.
-fn command_open_payload(
-    request_id: &str,
-    argv: &str,
-    dir: &str,
-    repository: &str,
-    digest: &str,
-) -> Vec<u8> {
-    format!(
-        "{{\"session_id\":\"test-svc\",\"repository\":{},\"request_id\":{},\"argv\":{},\"dir\":{},\"env\":[],\"command_digest\":{},\"stdout_credit\":262144,\"stderr_credit\":262144}}",
-        jstr(repository),
-        jstr(request_id),
-        argv,
-        jstr(dir),
-        jstr(digest),
+/// Encodes one pkt-line flush.
+fn flush() -> Vec<u8> {
+    b"0000".to_vec()
+}
+
+/// Creates a store under the repository the way `init` does, so tests
+/// seed without the deleted argv path.
+fn seed_store(repo: &str) {
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    Store::create(
+        &Path::new(repo).join(".ruk"),
+        ruk_core::ids::HashKind::Sha1,
+        budget,
     )
-    .into_bytes()
+    .expect("create store");
+}
+
+/// Points `name` at `oid` in the store under `repo_dir`.
+fn seed_ref(repo_dir: &Path, name: &str, oid: Oid) {
+    use ruk_core::refdata::{RefChange, RefExpect, RefTarget, RefTransaction, RefUpdate};
+    use ruk_core::refs::prepare_checked_transaction;
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let update = RefUpdate {
+        name: RefName::new(name.to_string()).expect("ref name"),
+        expected: RefExpect::Absent,
+        change: RefChange::Set(RefTarget::Direct(oid)),
+    };
+    let transaction =
+        RefTransaction::new(store.hash_kind(), vec![update]).expect("ref transaction");
+    let prepared = prepare_checked_transaction(&store, &transaction).expect("prepare ref");
+    store
+        .publish(Vec::new(), &prepared.into_mutations())
+        .expect("publish ref");
 }
 
 /// One test driver end of a socket pair.
@@ -184,49 +214,45 @@ impl Driver {
         }
     }
 
-    /// Runs one command open to its terminal report, checking acceptance.
-    async fn run_command(
+    /// Runs one git-service open to its terminal report: `Accepted`, the
+    /// request body in one or more `Stdin` frames plus `StdinEof` (or
+    /// nothing for `advertise` opens), then `Stdout` until `Exit`.
+    async fn run_git(
         &mut self,
         stream_id: u64,
-        request_id: &str,
-        argv: &str,
-        dir: &str,
-        repository: &str,
-        digest: &str,
-    ) -> (Vec<u8>, Vec<u8>, CommandExitReport) {
-        self.send(
-            FrameKind::Open,
-            stream_id,
-            &command_open_payload(request_id, argv, dir, repository, digest),
-        )
-        .await;
+        payload: &[u8],
+        body: &[Vec<u8>],
+    ) -> (Vec<u8>, CommandExitReport) {
+        self.send(FrameKind::Open, stream_id, payload).await;
         let accepted = self.recv().await;
         assert_eq!(accepted.kind, FrameKind::Accepted);
+        assert_eq!(accepted.stream_id, stream_id);
         let reply: CommandAccepted =
             ipc::decode_control(&accepted.payload).expect("accepted decodes");
         assert_eq!(reply.stream_id, stream_id);
         assert!(reply.stdin_credit > 0, "daemon grants stdin credit");
-        assert_eq!(reply.invocation_id, request_id);
-        self.send(FrameKind::StdinEof, stream_id, &[]).await;
-        self.recv_exit(stream_id).await
+        for chunk in body {
+            self.send(FrameKind::Stdin, stream_id, chunk).await;
+        }
+        if !body.is_empty() {
+            for _ in 0..body.len() {
+                let grant = self.recv().await;
+                assert_eq!(grant.kind, FrameKind::WindowUpdate);
+                assert_eq!(grant.stream_id, stream_id);
+            }
+            self.send(FrameKind::StdinEof, stream_id, &[]).await;
+        }
+        let (stdout, _, exit) = self.recv_exit(stream_id).await;
+        (stdout, exit)
     }
 
-    /// Asks stream zero for one invocation outcome.
-    async fn lookup(&mut self, invocation_id: &str) -> ControlReply {
-        let query = format!(
-            "{{\"type\":\"outcome-lookup\",\"invocation_id\":{}}}",
-            jstr(invocation_id)
-        );
-        self.send(FrameKind::Open, CONTROL_STREAM_ID, query.as_bytes())
-            .await;
-        let reply = self.recv().await;
-        assert_eq!(reply.kind, FrameKind::Accepted);
-        assert_eq!(reply.stream_id, CONTROL_STREAM_ID);
-        ipc::decode_control(&reply.payload).expect("control reply decodes")
-    }
-
-    /// Opens one command expecting refusal: an `Error` then a nonzero `Exit`.
-    async fn expect_refused(&mut self, stream_id: u64, payload: &[u8]) -> (ErrorReply, ExitReport) {
+    /// Opens one git-service stream expecting refusal: an `Error` then a
+    /// nonzero `Exit`.
+    async fn expect_git_refused(
+        &mut self,
+        stream_id: u64,
+        payload: &[u8],
+    ) -> (ErrorReply, ExitReport) {
         self.send(FrameKind::Open, stream_id, payload).await;
         let err_frame = self.recv().await;
         assert_eq!(err_frame.kind, FrameKind::Error);
@@ -360,7 +386,6 @@ fn spawn_pair_with_window(
     let refs = ConnectionRefs {
         registry,
         executor: BoundedExecutor::new(4).expect("executor"),
-        outcomes: Arc::new(std::sync::Mutex::new(OutcomeLedger::default())),
         window_bytes,
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
@@ -509,265 +534,328 @@ fn handshake_hello_without_minor_decodes() {
 }
 
 #[tokio::test]
-async fn command_stream_serves_go_wire() {
-    let root = temp_root("cmd");
+async fn git_service_advertise_matches_oracle_refs() {
+    let root = temp_root("advertise");
     let repo_dir = root.join("repo");
     std::fs::create_dir_all(&repo_dir).expect("repo dir");
     let repo = repo_dir.to_str().expect("utf8 repo").to_string();
-
-    let (mut driver, task) = spawn_pair(&root);
-    handshake(&mut driver).await;
-
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-1",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-1",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
-    assert_eq!(exit.invocation_id, "req-init-1");
-    assert!(!exit.cancelled);
-    assert_eq!(exit.outcome, "Completed");
-    assert!(
-        repo_dir.join(".ruk").is_dir(),
-        "argv init creates the store under the daemon root"
-    );
-
-    let (stdout, _, exit) = driver
-        .run_command(
-            3,
-            "req-rev-1",
-            r#"["rev-parse","--is-inside-work-tree"]"#,
-            &repo,
-            &repo,
-            "digest-rev-1",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
-    assert_eq!(stdout, b"true\n");
-
-    let reply = driver.lookup("req-rev-1").await;
-    assert!(reply.found);
-    let recorded = reply.exit.expect("recorded exit");
-    assert_eq!(recorded.exit_code, 0);
-    assert_eq!(recorded.invocation_id, "req-rev-1");
-
-    let reply = driver.lookup("req-unknown").await;
-    assert!(!reply.found);
-    assert!(reply.exit.is_none());
-
-    let payload = command_open_payload(
-        "req-rev-1",
-        r#"["rev-parse"]"#,
-        &repo,
-        &repo,
-        "other-digest",
-    );
-    let (report, exit) = driver.expect_refused(5, &payload).await;
-    assert_eq!(report.code.as_str(), "E_INVALID");
-    assert!(report.hints.is_empty());
-    assert!(report.fixes.is_empty());
-    assert_eq!(report.detail, None);
-    assert_eq!(exit.status, 1);
-    assert_eq!(exit.outcome, "Failed");
-
-    let (_, _, replayed) = driver
-        .run_command(
-            7,
-            "req-rev-1",
-            r#"["rev-parse","--is-inside-work-tree"]"#,
-            &repo,
-            &repo,
-            "digest-rev-1",
-        )
-        .await;
-    assert_eq!(replayed.exit_code, 0);
-    assert_eq!(replayed.invocation_id, "req-rev-1");
-
-    let outside = std::env::temp_dir()
-        .to_str()
-        .expect("utf8 temp")
-        .to_string();
-    let payload = command_open_payload("req-bad-dir", r#"["rev-parse"]"#, &outside, &outside, "d");
-    let (report, exit) = driver.expect_refused(9, &payload).await;
-    assert_eq!(report.code.as_str(), "E_FORBIDDEN");
-    assert_eq!(exit.status, 1);
-    assert_eq!(exit.outcome, "Failed");
-
-    let other_dir = root.join("other");
-    std::fs::create_dir_all(&other_dir).expect("other dir");
-    let other = other_dir.to_str().expect("utf8 other").to_string();
-    let payload = command_open_payload("req-mismatch", r#"["rev-parse"]"#, &repo, &other, "d");
-    let (report, exit) = driver.expect_refused(11, &payload).await;
-    assert_eq!(report.code.as_str(), "E_FORBIDDEN");
-    assert_eq!(exit.status, 1);
-    assert_eq!(exit.outcome, "Failed");
-
-    drop(driver);
-    task.abort();
-}
-
-#[tokio::test]
-async fn command_stream_pipes_stdin_with_credit_grants() {
-    let root = temp_root("stdin");
-    let repo_dir = root.join("repo");
-    std::fs::create_dir_all(&repo_dir).expect("repo dir");
-    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
-
-    let (mut driver, task) = spawn_pair(&root);
-    handshake(&mut driver).await;
-
-    let payload = command_open_payload(
-        "req-stdin-1",
-        r#"["hash-object","--stdin"]"#,
-        &repo,
-        &repo,
-        "digest-stdin-1",
-    );
-    driver.send(FrameKind::Open, 1, &payload).await;
-    let accepted = driver.recv().await;
-    assert_eq!(accepted.kind, FrameKind::Accepted);
-
-    driver.send(FrameKind::Stdin, 1, b"hello\n").await;
-    let grant = driver.recv().await;
-    assert_eq!(grant.kind, FrameKind::WindowUpdate);
-    assert_eq!(grant.stream_id, 1);
-    let grant_text = String::from_utf8(grant.payload).expect("grant is JSON");
-    assert!(
-        grant_text.contains("\"bytes\":6"),
-        "grant uses the Go backend's field names: {grant_text}"
-    );
-    driver.send(FrameKind::StdinEof, 1, &[]).await;
-
-    let (stdout, _, exit) = driver.recv_exit(1).await;
-    assert_eq!(exit.exit_code, 0);
-    assert_eq!(exit.invocation_id, "req-stdin-1");
-    assert_eq!(stdout.len(), 41, "one hex id plus newline");
-    assert_eq!(&stdout[40..], b"\n");
-
-    drop(driver);
-    task.abort();
-}
-
-#[tokio::test]
-async fn command_stream_cancel_reports_cancelled() {
-    let root = temp_root("cancel");
-    let repo_dir = root.join("repo");
-    std::fs::create_dir_all(&repo_dir).expect("repo dir");
-    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
-
-    let (mut driver, task) = spawn_pair(&root);
-    handshake(&mut driver).await;
-
-    let payload = command_open_payload(
-        "req-cancel-1",
-        r#"["rev-parse","--is-inside-work-tree"]"#,
-        &repo,
-        &repo,
-        "digest-cancel-1",
-    );
-    driver.send(FrameKind::Open, 1, &payload).await;
-    let accepted = driver.recv().await;
-    assert_eq!(accepted.kind, FrameKind::Accepted);
-    driver.send(FrameKind::Cancel, 1, &[]).await;
-
-    let (_, _, exit) = driver.recv_exit(1).await;
-    assert_eq!(exit.exit_code, 130);
-    assert!(exit.cancelled);
-    assert_eq!(exit.outcome, "CancelledBeforeCommit");
-    assert_eq!(exit.invocation_id, "req-cancel-1");
-
-    let reply = driver.lookup("req-cancel-1").await;
-    assert!(reply.found);
-    let recorded = reply.exit.expect("recorded exit");
-    assert!(recorded.cancelled);
-
-    drop(driver);
-    task.abort();
-}
-
-#[tokio::test]
-async fn streams_progress_while_sibling_waits_for_stdin() {
-    let root = temp_root("concurrent");
-    let repo_dir = root.join("repo");
-    std::fs::create_dir_all(&repo_dir).expect("repo dir");
-    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
-
-    let (mut driver, task) = spawn_pair(&root);
-    handshake(&mut driver).await;
-
-    let (_, _, exit) = driver
-        .run_command(
-            5,
-            "req-init-1",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-1",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
-
-    let payload = command_open_payload(
-        "req-wait-1",
-        r#"["hash-object","--stdin"]"#,
-        &repo,
-        &repo,
-        "digest-wait-1",
-    );
-    driver.send(FrameKind::Open, 1, &payload).await;
-    let accepted = driver.recv().await;
-    assert_eq!(accepted.kind, FrameKind::Accepted);
-    assert_eq!(accepted.stream_id, 1);
-
+    seed_store(&repo);
     let store_repo = repo_dir
         .join(".ruk")
         .to_str()
         .expect("utf8 store repo")
         .to_string();
-    let typed = Driver::typed_open(&store_repo, "schema", None, None, None);
-    let (schema, exit) = driver.run_typed(3, &typed).await;
-    assert_eq!(exit.status, 0);
-    assert!(
-        !schema.is_empty(),
-        "schema answers while stream 1 waits for stdin"
-    );
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
 
-    driver.send(FrameKind::Stdin, 1, b"hello\n").await;
-    let grant = driver.recv().await;
-    assert_eq!(grant.kind, FrameKind::WindowUpdate);
-    assert_eq!(grant.stream_id, 1);
-    driver.send(FrameKind::StdinEof, 1, &[]).await;
-    let (stdout, _, exit) = driver.recv_exit(1).await;
-    assert_eq!(exit.exit_code, 0);
-    assert_eq!(exit.invocation_id, "req-wait-1");
-    assert_eq!(stdout.len(), 41, "one hex id plus newline");
+    let oracle = {
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+        ruk_core::refs::StoreRefs::new(&store)
+            .get(&RefName::new("refs/heads/main".to_string()).expect("ref name"))
+            .expect("oracle reads the ref")
+            .expect("ref exists")
+    };
+    assert_eq!(oracle, ruk_core::refdata::RefTarget::Direct(commit));
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    for service in ["upload-pack", "receive-pack"] {
+        let ids = service == "receive-pack";
+        let payload = git_open_payload(
+            service,
+            &store_repo,
+            true,
+            ids.then_some("sess-adv"),
+            ids.then_some("req-adv"),
+        );
+        let stream_id = if service == "upload-pack" { 1 } else { 3 };
+        let (stdout, exit) = driver.run_git(stream_id, &payload, &[]).await;
+        assert_eq!(exit.exit_code, 0, "{service} advertise exits zero");
+        assert_eq!(exit.outcome, "Completed");
+
+        let refs = parse_advertised_refs(&stdout, service);
+        assert_eq!(
+            refs.len(),
+            1,
+            "{service} advertises exactly the seeded ref: {refs:?}"
+        );
+        assert_eq!(refs[0].0, "refs/heads/main");
+        assert_eq!(
+            refs[0].1, commit,
+            "{service} advertisement names the oracle oid"
+        );
+    }
 
     drop(driver);
     task.abort();
 }
 
 #[tokio::test]
-async fn per_stream_cancel_leaves_sibling_streams_live() {
-    let root = temp_root("cancel-sibling");
+async fn git_service_request_matches_oracle_objects() {
+    let root = temp_root("request");
     let repo_dir = root.join("repo");
     std::fs::create_dir_all(&repo_dir).expect("repo dir");
     let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let mut request = pkt(format!("want {}\n", commit.to_hex()).as_bytes());
+    request.extend_from_slice(&flush());
+    request.extend_from_slice(&pkt(b"done\n"));
+
+    let expected = {
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+        let kind = store.hash_kind();
+        let head = crate::cli::verbs_transport::serve_head(&store).expect("serve head");
+        let mut oracle = Vec::new();
+        ruk_git::transport::serve::serve_upload_pack(
+            &request[..],
+            &mut oracle,
+            &store,
+            kind,
+            &head,
+            &ruk_git::transport::Interrupt::none(),
+        )
+        .expect("oracle serves the same request");
+        let split = find_flush(&oracle).expect("oracle output carries its advertisement");
+        oracle[split..].to_vec()
+    };
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = command_open_payload(
-        "req-cancel-1",
-        r#"["rev-parse","--is-inside-work-tree"]"#,
-        &repo,
-        &repo,
-        "digest-cancel-1",
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let (stdout, exit) = driver.run_git(1, &payload, &[request]).await;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.outcome, "Completed");
+    assert!(
+        stdout.starts_with(b"PACK"),
+        "stateless responses carry no advertisement prefix"
     );
+    assert_eq!(
+        stdout, expected,
+        "the daemon answers exactly the serve half past the advertisement"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_service_refused() {
+    let root = temp_root("unknown-service");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("piano", &store_repo, false, None, None);
+    let (report, exit) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+    assert!(report.message.contains("piano"));
+    assert_eq!(exit.status, 1);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_receive_pack_needs_session_and_request() {
+    let root = temp_root("receive-ids");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("receive-pack", &store_repo, false, None, Some("req-1"));
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+
+    let payload = git_open_payload("receive-pack", &store_repo, false, Some("sess-1"), None);
+    let (report, _) = driver.expect_git_refused(3, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_delete_only_receive_pack_round_trip() {
+    let root = temp_root("receive-delete");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let zero = "0".repeat(40);
+    let mut request = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    request.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some("sess-1"),
+        Some("req-del-1"),
+    );
+    let (stdout, exit) = driver.run_git(1, &payload, &[request]).await;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.invocation_id, "req-del-1");
+    let text = String::from_utf8(stdout).expect("report is text");
+    assert!(text.contains("unpack ok"), "report lands: {text}");
+
+    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
+    assert_eq!(exit.exit_code, 0);
+    let refs = parse_advertised_refs(&stdout, "upload-pack");
+    assert!(
+        !refs.iter().any(|row| row.0 == "refs/heads/scratch"),
+        "the delete landed: {refs:?}"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_streams_progress_while_sibling_waits() {
+    let root = temp_root("git-concurrent");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+
+    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
+    assert_eq!(
+        exit.exit_code, 0,
+        "advertise completes while stream 1 waits"
+    );
+    assert!(!stdout.is_empty());
+
+    let mut request = pkt(format!("want {}\n", commit.to_hex()).as_bytes());
+    request.extend_from_slice(&flush());
+    request.extend_from_slice(&pkt(b"done\n"));
+    driver.send(FrameKind::Stdin, 1, &request).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 1, &[]).await;
+    let (pack, _, exit) = driver.recv_exit(1).await;
+    assert_eq!(exit.exit_code, 0);
+    assert!(pack.starts_with(b"PACK"));
+
+    drop(driver);
+    task.abort();
+}
+
+/// Parses one ref advertisement into `(name, oid)` rows, skipping the
+/// `HEAD` line and the capability tail of the first row.
+fn parse_advertised_refs(output: &[u8], service: &str) -> Vec<(String, Oid)> {
+    let mut refs = Vec::new();
+    let mut rest = output;
+    while rest.len() >= 4 {
+        let len = usize::from_str_radix(
+            std::str::from_utf8(&rest[..4]).expect("pkt-line length is hex"),
+            16,
+        )
+        .expect("pkt-line length parses");
+        if len == 0 {
+            break;
+        }
+        assert!(len >= 4 && rest.len() >= len, "truncated advertisement");
+        let mut line = &rest[4..len];
+        if let Some(nul) = line.iter().position(|b| *b == 0) {
+            line = &line[..nul];
+        }
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let mut parts = line.split(|b| *b == b' ');
+        let oid_hex = std::str::from_utf8(parts.next().expect("oid")).expect("oid is text");
+        let name = std::str::from_utf8(parts.next().expect("name")).expect("name is text");
+        if name != "HEAD" {
+            let oid = Oid::from_hex(oid_hex).expect("advertised oid parses");
+            refs.push((name.to_string(), oid));
+        }
+        rest = &rest[len..];
+    }
+    assert!(
+        !rest.is_empty() || !refs.is_empty(),
+        "{service} advertisement parses to at least the seeded ref"
+    );
+    refs
+}
+
+#[tokio::test]
+async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
+    let root = temp_root("git-cancel");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -778,18 +866,10 @@ async fn per_stream_cancel_leaves_sibling_streams_live() {
     assert!(exit.cancelled);
     assert_eq!(exit.outcome, "CancelledBeforeCommit");
 
-    let (_, _, exit) = driver
-        .run_command(
-            3,
-            "req-after-1",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-after-1",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
-    assert_eq!(exit.outcome, "Completed");
+    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
+    assert_eq!(exit.exit_code, 0, "a sibling stream survives the cancel");
+    assert!(!stdout.is_empty());
 
     drop(driver);
     task.abort();
@@ -805,17 +885,7 @@ async fn typed_reply_waits_for_outbound_credit() {
     let (mut driver, task) = spawn_pair_with_window(&root, 1024);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-1",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-1",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -867,6 +937,24 @@ async fn typed_reply_waits_for_outbound_credit() {
     task.abort();
 }
 
+/// Finds the end of the advertisement prefix: the first flush packet.
+fn find_flush(output: &[u8]) -> Option<usize> {
+    let mut rest = output;
+    let mut offset = 0;
+    while rest.len() >= 4 {
+        let len = usize::from_str_radix(std::str::from_utf8(&rest[..4]).ok()?, 16).ok()?;
+        if len == 0 {
+            return Some(offset + 4);
+        }
+        if len < 4 || rest.len() < len {
+            return None;
+        }
+        rest = &rest[len..];
+        offset += len;
+    }
+    None
+}
+
 #[test]
 fn error_frame_carries_full_reply_and_reads_old_payloads() {
     let reply = ErrorReply::from_core(
@@ -898,42 +986,6 @@ fn error_frame_carries_full_reply_and_reads_old_payloads() {
     assert_eq!(legacy.detail, None);
 }
 
-#[tokio::test]
-async fn command_stream_failure_reports_failed_outcome() {
-    let root = temp_root("failed");
-    let repo_dir = root.join("repo");
-    std::fs::create_dir_all(&repo_dir).expect("repo dir");
-    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
-
-    let (mut driver, task) = spawn_pair(&root);
-    handshake(&mut driver).await;
-
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-fail-1",
-            r#"["no-such-verb"]"#,
-            &repo,
-            &repo,
-            "digest-fail-1",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 1);
-    assert!(!exit.cancelled);
-    assert_eq!(exit.outcome, "Failed");
-    assert_eq!(exit.invocation_id, "req-fail-1");
-
-    let reply = driver.lookup("req-fail-1").await;
-    assert!(reply.found);
-    let recorded = reply.exit.expect("recorded exit");
-    assert_eq!(recorded.outcome, "Failed");
-    assert_eq!(recorded.exit_code, 1);
-    assert!(!recorded.cancelled);
-
-    drop(driver);
-    task.abort();
-}
-
 /// Decodes typed stdout as a success [`ReplyEnvelope`].
 fn typed_success(stdout: &[u8]) -> ReplyEnvelope {
     let envelope: ReplyEnvelope = ipc::decode_control(stdout).expect("reply envelope decodes");
@@ -953,17 +1005,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     // Typed invocations name the store directory itself, where the format
     // file lives — not the worktree root around it.
@@ -1224,17 +1266,7 @@ async fn typed_dispatch_serves_annotated_tag_set() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1318,17 +1350,7 @@ async fn typed_oplog_continuation_pages_through_its_lease() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-oplog-pages",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-oplog-pages",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1428,17 +1450,7 @@ async fn typed_new_mints_change_with_session_identity() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-new",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-new",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1540,17 +1552,7 @@ async fn typed_new_without_identity_is_invalid() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-new-bare",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-new-bare",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1611,17 +1613,7 @@ async fn typed_claim_acquire_and_release_round_trip() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-claim",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-claim",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1719,17 +1711,7 @@ async fn typed_ws_new_creates_workspace() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-wsnew",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-wsnew",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1812,17 +1794,7 @@ async fn typed_describe_rewrites_message() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-describe",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-describe",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1930,17 +1902,7 @@ async fn typed_split_of_unstored_change_refuses_not_found() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-split",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-split",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -1997,17 +1959,7 @@ async fn typed_edit_checks_out_change() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-edit",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-edit",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -2132,17 +2084,7 @@ async fn typed_snapshot_refusal_names_job_split() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-snapshot",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-snapshot",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -2225,17 +2167,7 @@ async fn typed_fetch_refusal_names_transport_job() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-fetch",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-fetch",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")
@@ -2288,17 +2220,7 @@ async fn typed_land_execute_refusal_names_plan() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let (_, _, exit) = driver
-        .run_command(
-            1,
-            "req-init-typed-land-execute",
-            r#"["init"]"#,
-            &repo,
-            &repo,
-            "digest-init-typed-land-execute",
-        )
-        .await;
-    assert_eq!(exit.exit_code, 0);
+    seed_store(&repo);
 
     let store_repo = repo_dir
         .join(".ruk")

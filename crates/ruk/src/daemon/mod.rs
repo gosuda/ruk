@@ -16,10 +16,10 @@ pub(crate) mod registry;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -599,8 +599,7 @@ pub(crate) struct InvocationOpen {
     /// The raw JSON document of the method arguments, if any.
     #[serde(default)]
     pub args_json: Option<String>,
-    /// The session reads and mutations run under, if any. Go command
-    /// streams never send it; typed clients do.
+    /// The session reads and mutations run under, if any.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -647,13 +646,6 @@ pub(crate) struct ExitReport {
     pub completed_at: u64,
 }
 
-/// Cap of outcome records held per daemon process; older invocations evict
-/// first so reconnect lookups stay bounded.
-const MAX_OUTCOME_RECORDS: usize = 10_000;
-
-/// Cap of stdin bytes collected for one command stream.
-const MAX_COMMAND_STDIN_BYTES: usize = 256 * 1024 * 1024;
-
 /// Outcome of a command that ran to its terminal report.
 const OUTCOME_COMPLETED: &str = "Completed";
 
@@ -699,38 +691,157 @@ struct StreamSink {
     stream_id: u64,
 }
 
-/// The `Open` payload of one argv-style command stream, mirroring the Go
-/// backend's `RukOpenRequest`. `argv` holds command args without `argv[0]`
-/// (for example `["rev-parse", "--git-dir"]`); the daemon prepends its own
-/// program name before running the interpreter.
+/// Default cap of total pack bytes accepted on one git-service stream.
+const DEFAULT_MAX_PACK_BYTES: u64 = 1 << 31;
+
+/// Default cap of objects accepted on one git-service stream.
+const DEFAULT_MAX_OBJECTS: u64 = 5_000_000;
+
+/// Default cap of one decompressed object on a git-service stream.
+const DEFAULT_MAX_OBJECT_BYTES: u64 = 512 << 20;
+
+/// Default cap of delta-chain depth followed on a git-service stream.
+const DEFAULT_MAX_DELTA_DEPTH: u64 = 128;
+
+/// Default cap of stdin bytes collected on one git-service stream.
+const DEFAULT_MAX_STDIN_BYTES: u64 = 256 << 20;
+
+/// Default cap of push options accepted on one git-service stream.
+const DEFAULT_MAX_PUSH_OPTIONS: u64 = 256;
+
+/// Per-stream ingest quotas of one git-service envelope. Absent fields take
+/// the daemon defaults; the daemon-side digest covers the effective values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CommandOpen {
-    /// The service session; accepted and ignored, reserved for the
-    /// day the service session becomes a coordinator session.
-    pub session_id: String,
-    /// The authorized repository path, canonicalized under the roots.
-    pub repository: String,
-    /// The idempotency key: reconnects replaying it observe the recorded
-    /// terminal report instead of running the command twice.
-    pub request_id: String,
-    /// Command args without `argv[0]`.
-    pub argv: Vec<String>,
-    /// Working directory the command starts in.
-    pub dir: String,
-    /// Environment as `KEY=value` entries; the command sees only these.
-    pub env: Vec<String>,
-    /// Digest over argv, directory, and environment: a reused request id
-    /// with a different digest is refused, never executed.
-    pub command_digest: String,
-    /// Initial outbound credit for stdout, added to the default window.
-    pub stdout_credit: u64,
-    /// Initial outbound credit for stderr, added to the default window.
-    pub stderr_credit: u64,
+pub(crate) struct GitLimits {
+    /// Largest total pack bytes accepted.
+    #[serde(default = "default_max_pack_bytes")]
+    pub max_pack_bytes: u64,
+    /// Largest object count accepted.
+    #[serde(default = "default_max_objects")]
+    pub max_objects: u64,
+    /// Largest single decompressed object accepted.
+    #[serde(default = "default_max_object_bytes")]
+    pub max_object_bytes: u64,
+    /// Deepest delta chain followed before refusing.
+    #[serde(default = "default_max_delta_depth")]
+    pub max_delta_depth: u64,
+    /// Largest stdin byte count collected before refusing.
+    #[serde(default = "default_max_stdin_bytes")]
+    pub max_stdin_bytes: u64,
+    /// Largest push-option count accepted.
+    #[serde(default = "default_max_push_options")]
+    pub max_push_options: u64,
 }
 
-/// The `Accepted` payload answering one command `Open`, mirroring the Go
-/// backend's `RukAcceptedReply`. `stdin_credit` carries the inbound window
-/// granted; it is always positive.
+/// The default cap of total pack bytes accepted on one git-service stream.
+fn default_max_pack_bytes() -> u64 {
+    DEFAULT_MAX_PACK_BYTES
+}
+
+/// The default cap of objects accepted on one git-service stream.
+fn default_max_objects() -> u64 {
+    DEFAULT_MAX_OBJECTS
+}
+
+/// The default cap of one decompressed object on a git-service stream.
+fn default_max_object_bytes() -> u64 {
+    DEFAULT_MAX_OBJECT_BYTES
+}
+
+/// The default cap of delta-chain depth followed on a git-service stream.
+fn default_max_delta_depth() -> u64 {
+    DEFAULT_MAX_DELTA_DEPTH
+}
+
+/// The default cap of stdin bytes collected on one git-service stream.
+fn default_max_stdin_bytes() -> u64 {
+    DEFAULT_MAX_STDIN_BYTES
+}
+
+/// The default cap of push options accepted on one git-service stream.
+fn default_max_push_options() -> u64 {
+    DEFAULT_MAX_PUSH_OPTIONS
+}
+
+impl Default for GitLimits {
+    fn default() -> Self {
+        Self {
+            max_pack_bytes: default_max_pack_bytes(),
+            max_objects: default_max_objects(),
+            max_object_bytes: default_max_object_bytes(),
+            max_delta_depth: default_max_delta_depth(),
+            max_stdin_bytes: default_max_stdin_bytes(),
+            max_push_options: default_max_push_options(),
+        }
+    }
+}
+
+impl GitLimits {
+    /// Encodes the effective limits canonically for the daemon-side digest.
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "max_pack_bytes={};max_objects={};max_object_bytes={};max_delta_depth={};max_stdin_bytes={};max_push_options={}",
+            self.max_pack_bytes,
+            self.max_objects,
+            self.max_object_bytes,
+            self.max_delta_depth,
+            self.max_stdin_bytes,
+            self.max_push_options,
+        )
+        .into_bytes()
+    }
+}
+
+/// The `receive-pack` git service name.
+const GIT_SERVICE_RECEIVE_PACK: &str = "receive-pack";
+
+/// The `upload-pack` git service name.
+const GIT_SERVICE_UPLOAD_PACK: &str = "upload-pack";
+
+/// The `upload-archive` git service name.
+const GIT_SERVICE_UPLOAD_ARCHIVE: &str = "upload-archive";
+
+/// True for the three git services the envelope carries.
+fn is_git_service(service: &str) -> bool {
+    matches!(
+        service,
+        GIT_SERVICE_RECEIVE_PACK | GIT_SERVICE_UPLOAD_PACK | GIT_SERVICE_UPLOAD_ARCHIVE
+    )
+}
+
+/// The `Open` payload of one git-service stream: `receive-pack`,
+/// `upload-pack`, or `upload-archive` against one repository. An
+/// `advertise` open writes the ref advertisement and ends; any other open
+/// reads one request round and writes one response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CommandOpen {
+    /// The git service: `receive-pack`, `upload-pack`, or `upload-archive`.
+    pub service: String,
+    /// Absolute repository path or opaque handle from a previous open.
+    pub repository: String,
+    /// The service session; required for `receive-pack`.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The idempotency key; required for `receive-pack`.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// The negotiated git protocol (`version=2` selects the v2 serve half).
+    #[serde(default)]
+    pub git_protocol: String,
+    /// True answers only the ref advertisement and ends.
+    #[serde(default)]
+    pub advertise: bool,
+    /// Initial outbound credit for stdout, added to the default window.
+    #[serde(default)]
+    pub stdout_credit: u64,
+    /// Per-stream ingest quotas; absent fields take daemon defaults.
+    #[serde(default)]
+    pub limits: GitLimits,
+}
+
+/// The `Accepted` payload answering one git-service `Open`.
+/// `stdin_credit` carries the inbound window granted; it is always
+/// positive.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CommandAccepted {
     /// The accepted stream identifier.
@@ -741,8 +852,7 @@ pub(crate) struct CommandAccepted {
     pub invocation_id: String,
 }
 
-/// The `Exit` payload ending one command stream, mirroring the Go
-/// backend's `RukExitReport`.
+/// The `Exit` payload ending one git-service stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CommandExitReport {
     /// The native process exit status: zero on success.
@@ -772,23 +882,6 @@ impl CommandExitReport {
         }
     }
 
-    /// Builds the terminal report of a failed command.
-    fn failure(invocation: &str) -> Self {
-        Self::failure_with_code(invocation, 1)
-    }
-
-    /// Builds the terminal report of a command that exited with `code`.
-    fn failure_with_code(invocation: &str, code: u8) -> Self {
-        Self {
-            exit_code: i32::from(code),
-            signal: String::new(),
-            cancelled: false,
-            outcome: OUTCOME_FAILED.to_string(),
-            operation_ids: Vec::new(),
-            invocation_id: invocation.to_string(),
-        }
-    }
-
     /// Builds the terminal report of a cancelled command.
     fn cancelled(invocation: &str) -> Self {
         Self {
@@ -802,32 +895,6 @@ impl CommandExitReport {
     }
 }
 
-/// One stream-zero typed control query, mirroring the Go backend's
-/// `RukControlRequest`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ControlRequest {
-    /// The query type; the daemon answers `outcome-lookup`.
-    #[serde(rename = "type")]
-    pub type_: String,
-    /// The invocation identity to look up.
-    pub invocation_id: String,
-}
-
-/// The answer to one control query, mirroring the Go backend's
-/// `RukControlReply`. It travels on an `Accepted` frame with no terminal
-/// `Exit`: the connection stays open for further streams.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ControlReply {
-    /// The query type echoed back.
-    #[serde(rename = "type")]
-    pub type_: String,
-    /// True when the ledger holds the invocation's terminal report.
-    pub found: bool,
-    /// The recorded terminal report; absent when `found` is false.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit: Option<CommandExitReport>,
-}
-
 /// One daemon-to-client stdin credit grant. The field names match the Go
 /// backend's `RukWindowUpdate` exactly (`bytes`, not the daemon's
 /// `credit_bytes`), so the client's credit window observes the grant.
@@ -837,84 +904,6 @@ struct StdinGrant {
     direction: String,
     /// The credit bytes granted.
     bytes: u64,
-}
-
-/// The ledger state of one invocation identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum OutcomeState {
-    /// The first open is still running; reconnects wait or fail loudly.
-    Running {
-        /// The digest the running command opened with.
-        digest: String,
-    },
-    /// The terminal report; replays observe it without re-running.
-    Done(CommandExitReport),
-}
-
-/// One ledger row: the digest that claimed the identity plus its state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct OutcomeEntry {
-    /// The digest of the command holding this identity.
-    digest: String,
-    /// Running or terminal.
-    state: OutcomeState,
-}
-
-/// The process-wide outcome ledger behind reconnect lookups.
-///
-/// Every connection task shares one ledger through [`ConnectionRefs`], so
-/// an outcome lookup arriving on a fresh connection observes commands that
-/// ran on any other connection of this process.
-#[derive(Debug, Default)]
-struct OutcomeLedger {
-    /// Invocation identity to its row.
-    records: HashMap<String, OutcomeEntry>,
-    /// Insertion order for oldest-first eviction; may hold stale names of
-    /// removed rows, which eviction skips.
-    order: VecDeque<String>,
-}
-
-impl OutcomeLedger {
-    /// Claims `id` for a fresh command, evicting oldest-first past the cap.
-    fn insert_running(&mut self, id: &str, digest: &str) {
-        while self.records.len() >= MAX_OUTCOME_RECORDS {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.records.remove(&oldest);
-        }
-        self.order.push_back(id.to_string());
-        self.records.insert(
-            id.to_string(),
-            OutcomeEntry {
-                digest: digest.to_string(),
-                state: OutcomeState::Running {
-                    digest: digest.to_string(),
-                },
-            },
-        );
-    }
-
-    /// Records the terminal report of `id`, keeping its digest.
-    fn complete(&mut self, id: &str, report: CommandExitReport) {
-        if let Some(entry) = self.records.get_mut(id) {
-            entry.state = OutcomeState::Done(report);
-            return;
-        }
-        self.order.push_back(id.to_string());
-        self.records.insert(
-            id.to_string(),
-            OutcomeEntry {
-                digest: String::new(),
-                state: OutcomeState::Done(report),
-            },
-        );
-    }
-
-    /// Forgets `id` without a terminal report, so a retry may run fresh.
-    fn remove(&mut self, id: &str) {
-        self.records.remove(id);
-    }
 }
 
 /// The `session.open` answer: the durable session identity plus the secret
@@ -1007,13 +996,6 @@ struct ConnectionRefs {
     registry: Arc<Registry>,
     /// The shared blocking pool.
     executor: BoundedExecutor,
-    /// The process-wide outcome ledger. Every connection task shares one
-    /// ledger (linearizable through one mutex, held only for map
-    /// probes), so an outcome lookup on a fresh connection observes
-    /// commands that ran on any other connection. Consumers stay
-    /// idempotent: a replayed request id observes the recorded terminal
-    /// report instead of running the command twice.
-    outcomes: Arc<Mutex<OutcomeLedger>>,
     /// The starting credit window of each stream direction.
     window_bytes: u64,
     /// The stream-zero handshake deadline.
@@ -1040,7 +1022,6 @@ async fn serve_async(
     let refs = ConnectionRefs {
         registry,
         executor,
-        outcomes: Arc::new(Mutex::new(OutcomeLedger::default())),
         window_bytes: config.stream_window_bytes,
         handshake_timeout: config.handshake_timeout,
         frame_timeout: config.frame_timeout,
@@ -1150,7 +1131,7 @@ async fn serve_connection(
             }
         }
         if frame.stream_id == ipc::CONTROL_STREAM_ID {
-            if handle_control_frame(&writer_tx, &frame, &mut streams, &refs).await? {
+            if handle_control_frame(&writer_tx, &frame, &mut streams).await? {
                 return Ok(());
             }
             continue;
@@ -1205,7 +1186,6 @@ async fn handle_control_frame(
     writer: &mpsc::Sender<OutboundFrame>,
     frame: &ipc::Frame,
     streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
-    refs: &ConnectionRefs,
 ) -> Result<bool, Error> {
     match frame.kind {
         ipc::FrameKind::Cancel => {
@@ -1227,7 +1207,14 @@ async fn handle_control_frame(
             Ok(false)
         }
         ipc::FrameKind::Exit | ipc::FrameKind::Error => Ok(true),
-        ipc::FrameKind::Open => answer_control_open(writer, frame, refs).await,
+        ipc::FrameKind::Open => {
+            let err = CoreError::new(
+                ErrorCode::EInvalid,
+                "stream-zero carries only the handshake",
+            );
+            write_control_error(writer, &err).await?;
+            Ok(false)
+        }
         ipc::FrameKind::Accepted
         | ipc::FrameKind::Stdin
         | ipc::FrameKind::StdinEof
@@ -1273,56 +1260,6 @@ async fn send_raw(
         .map_err(|_| Error::Core(CoreError::new(ErrorCode::EIo, "connection writer is gone")))
 }
 
-/// Answers one stream-zero `Open` control query without ending the
-/// connection: `outcome-lookup` reads the shared ledger and replies on an
-/// `Accepted` frame, anything else gets an `Error` frame.
-#[cfg(unix)]
-async fn answer_control_open(
-    writer: &mpsc::Sender<OutboundFrame>,
-    frame: &ipc::Frame,
-    refs: &ConnectionRefs,
-) -> Result<bool, Error> {
-    let query: ControlRequest = match ipc::decode_control(&frame.payload) {
-        Ok(query) => query,
-        Err(err) => {
-            write_control_error(writer, &err).await?;
-            return Ok(false);
-        }
-    };
-    if query.type_ != "outcome-lookup" {
-        let err = CoreError::new(
-            ErrorCode::EInvalid,
-            format!("unknown control query `{}`", query.type_),
-        );
-        write_control_error(writer, &err).await?;
-        return Ok(false);
-    }
-    let reply = {
-        let ledger = lock_outcomes(refs)?;
-        let exit = ledger
-            .records
-            .get(&query.invocation_id)
-            .and_then(|entry| match &entry.state {
-                OutcomeState::Done(report) => Some(report.clone()),
-                OutcomeState::Running { .. } => None,
-            });
-        ControlReply {
-            type_: query.type_.clone(),
-            found: exit.is_some(),
-            exit,
-        }
-    };
-    let bytes = ipc::encode_control(&reply)?;
-    send_raw(
-        writer,
-        ipc::FrameKind::Accepted,
-        ipc::CONTROL_STREAM_ID,
-        &bytes,
-    )
-    .await?;
-    Ok(false)
-}
-
 /// Writes one stream-zero `Error` frame for a rejected control query.
 #[cfg(unix)]
 async fn write_control_error(
@@ -1339,17 +1276,6 @@ async fn write_control_error(
     )
     .await?;
     Ok(())
-}
-
-/// Locks the shared outcome ledger for one brief probe.
-#[cfg(unix)]
-fn lock_outcomes(refs: &ConnectionRefs) -> Result<std::sync::MutexGuard<'_, OutcomeLedger>, Error> {
-    refs.outcomes.lock().map_err(|_| {
-        Error::Core(CoreError::new(
-            ErrorCode::EIo,
-            "outcome ledger lock is poisoned",
-        ))
-    })
 }
 
 #[cfg(unix)]
@@ -1488,7 +1414,7 @@ async fn serve_stream(
     peer: ipc::PeerIdentity,
 ) {
     if let Ok(command) = ipc::decode_control::<CommandOpen>(&open_payload) {
-        command_stream(&mut input, sink, command, refs).await;
+        serve_git_service(&mut input, sink, command, refs).await;
         return;
     }
     let open: InvocationOpen = match ipc::decode_control(&open_payload) {
@@ -1501,186 +1427,99 @@ async fn serve_stream(
     typed_stream(&mut input, sink, &open, refs, peer).await;
 }
 
-/// The claim of one invocation identity against the shared ledger.
+/// Serves one git-service stream to its terminal frame: an `advertise`
+/// open writes the ref advertisement and ends, any other open reads one
+/// request round and writes one response. No digest, environment, or
+/// working directory travels the wire: the digest is computed daemon-side
+/// over the parsed commands and the effective limits.
 #[cfg(unix)]
-enum RequestSlot {
-    /// Fresh identity, claimed as running by this open.
-    Run,
-    /// Terminal report recorded: replay it without running.
-    Replay(CommandExitReport),
-    /// Another connection is running this identity now.
-    Busy,
-    /// The identity is taken by a different command digest.
-    DigestMismatch,
-}
-
-/// Claims one invocation identity: fresh ids become `Run`, terminal ids
-/// replay, live ids and digest conflicts refuse. The ledger lock is held
-/// only for this probe, never across an await.
-#[cfg(unix)]
-fn claim_request_slot(
-    refs: &ConnectionRefs,
-    request_id: &str,
-    command_digest: &str,
-) -> Result<RequestSlot, Error> {
-    let mut ledger = lock_outcomes(refs)?;
-    let Some(entry) = ledger.records.get(request_id) else {
-        ledger.insert_running(request_id, command_digest);
-        return Ok(RequestSlot::Run);
-    };
-    if entry.digest != command_digest {
-        return Ok(RequestSlot::DigestMismatch);
-    }
-    match &entry.state {
-        OutcomeState::Running { .. } => Ok(RequestSlot::Busy),
-        OutcomeState::Done(report) => Ok(RequestSlot::Replay(report.clone())),
-    }
-}
-
-/// The mutable serving state of one stream task, threaded through command
-/// handling so every helper takes a narrow slice of it.
-#[cfg(unix)]
-struct CommandServing<'a> {
-    /// Frames arriving for this stream from the connection reader.
-    input: &'a mut mpsc::Receiver<ipc::Frame>,
-    /// The write end answering for this stream.
-    sink: &'a StreamSink,
-    /// Directional credit windows of this stream.
-    credits: &'a mut ipc::StreamCredits,
-    /// Shared registry, executor, ledger, and timeouts.
-    refs: &'a ConnectionRefs,
-    /// The cancellation owner of this stream; a `Cancel` frame triggers it
-    /// so cancellation reaches the running invocation.
-    cancel: &'a CancelHandle,
-    /// The cancellation observer of this stream, checked at the phase
-    /// boundaries of synchronous work that cannot observe the channel.
-    token: &'a Cancel,
-}
-
-/// One validated command ready to collect stdin and run.
-#[cfg(unix)]
-struct ReadyCommand {
-    /// The invocation identity claiming the ledger row.
-    invocation: String,
-    /// Command args without `argv[0]`.
-    argv: Vec<String>,
-    /// The hermetic variable map the command runs with.
-    vars: HashMap<String, String>,
-    /// The canonical working directory under the roots.
-    cwd: PathBuf,
-}
-
-/// Serves one argv-style command stream to its terminal frame, on its own
-/// task. Sibling streams progress concurrently: the connection reader
-/// keeps routing their frames while this stream collects stdin, runs the
-/// interpreter on the blocking pool, and streams output.
-#[cfg(unix)]
-async fn command_stream(
+async fn serve_git_service(
     input: &mut mpsc::Receiver<ipc::Frame>,
     sink: &StreamSink,
     req: CommandOpen,
     refs: &ConnectionRefs,
 ) {
-    let CommandOpen {
-        session_id: _,
-        repository,
-        request_id: invocation,
-        argv,
-        dir,
-        env,
-        command_digest,
-        stdout_credit,
-        stderr_credit,
-    } = req;
     let stream_id = sink.stream_id;
     let mut credits = ipc::StreamCredits::new(refs.window_bytes);
     credits.open_stream(stream_id);
     let (cancel_guard, token) = cancellation();
-    let mut serving = CommandServing {
-        input,
-        sink,
-        credits: &mut credits,
-        refs,
-        cancel: &cancel_guard,
-        token: &token,
-    };
-    if invocation.is_empty() {
-        let _ = refuse_unclaimed(
-            &mut serving,
-            CoreError::new(ErrorCode::EInvalid, "command open carries no request id"),
+    if !is_git_service(&req.service) {
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::EInvalid,
+                format!("unknown git service `{}`", req.service),
+            )),
         )
         .await;
         return;
     }
-    match claim_request_slot(serving.refs, &invocation, &command_digest) {
-        Ok(RequestSlot::Run) => {}
-        Ok(RequestSlot::Replay(report)) => {
-            replay_command(&mut serving, &invocation, &report).await;
-            return;
-        }
-        Ok(RequestSlot::Busy) => {
-            let _ = refuse_unclaimed(
-                &mut serving,
-                CoreError::new(
-                    ErrorCode::EInvalid,
-                    "invocation is still in progress on another stream",
-                ),
-            )
-            .await;
-            return;
-        }
-        Ok(RequestSlot::DigestMismatch) => {
-            let _ = refuse_unclaimed(
-                &mut serving,
-                CoreError::new(
-                    ErrorCode::EInvalid,
-                    "request id is taken by a different command digest",
-                ),
-            )
-            .await;
+    if req.service == GIT_SERVICE_RECEIVE_PACK
+        && (req.session_id.as_deref().unwrap_or("").is_empty()
+            || req.request_id.as_deref().unwrap_or("").is_empty())
+    {
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::EInvalid,
+                "receive-pack needs its session and request ids",
+            )),
+        )
+        .await;
+        return;
+    }
+    if req.advertise && req.service == GIT_SERVICE_UPLOAD_ARCHIVE {
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::EInvalid,
+                "upload-archive has no ref advertisement",
+            )),
+        )
+        .await;
+        return;
+    }
+    let repo_ref = req.repository.clone();
+    let registry = Arc::clone(&refs.registry);
+    let opened = refs
+        .executor
+        .run(move || registry.open(&repo_ref))
+        .await
+        .map_err(Error::Core);
+    let (_, _, coordinator) = match opened {
+        Ok(Ok(triple)) => triple,
+        Ok(Err(err)) | Err(Error::Core(err)) => {
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
             return;
         }
         Err(err) => {
-            let _ = send_error_exit(serving.sink, &err).await;
-            return;
-        }
-    }
-    let validated = {
-        let registry = Arc::clone(&serving.refs.registry);
-        serving
-            .refs
-            .executor
-            .run(move || validate_command_fs(&registry, &repository, &dir, &env))
-            .await
-    };
-    let (canonical_dir, vars) = match validated {
-        Ok(Ok(valid)) => valid,
-        Ok(Err(err)) | Err(err) => {
-            let _ = refuse_command(&mut serving, &invocation, err).await;
+            let _ = send_error_exit(sink, &err).await;
             return;
         }
     };
+    let accepted_id = req.request_id.clone().unwrap_or_default();
     let accepted = CommandAccepted {
         stream_id,
-        stdin_credit: serving.refs.window_bytes,
-        invocation_id: invocation.clone(),
+        stdin_credit: refs.window_bytes,
+        invocation_id: accepted_id,
     };
     let accepted_bytes = match ipc::encode_control(&accepted) {
         Ok(bytes) => bytes,
         Err(err) => {
-            let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
             return;
         }
     };
-    if serving
-        .credits
-        .grant_outbound(stream_id, stdout_credit.saturating_add(stderr_credit))
+    if credits
+        .grant_outbound(stream_id, req.stdout_credit)
         .is_err()
     {
-        let _ = refuse_command(
-            &mut serving,
-            &invocation,
-            CoreError::new(ErrorCode::EInvalid, "command stream is not tracked"),
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::EInvalid,
+                "git-service stream is not tracked",
+            )),
         )
         .await;
         return;
@@ -1689,279 +1528,328 @@ async fn command_stream(
         .await
         .is_err()
     {
-        forget_command(&serving, &invocation);
         return;
     }
-    let ready = ReadyCommand {
-        invocation,
-        argv,
-        vars,
-        cwd: canonical_dir,
-    };
-    serve_ready_command(&mut serving, ready).await;
-}
-
-/// Collects stdin, runs the interpreter on the blocking pool, and streams
-/// the captured output to the terminal frame. Cancellation is observed in
-/// the stdin and output loops and at the phase boundaries around the
-/// blocking run; a synchronous CLI verb itself runs to completion.
-#[cfg(unix)]
-async fn serve_ready_command(serving: &mut CommandServing<'_>, ready: ReadyCommand) {
-    let ReadyCommand {
-        invocation,
-        argv,
-        vars,
-        cwd,
-    } = ready;
-    let stdin_bytes = match collect_command_stdin(serving).await {
-        CollectFate::Ready(bytes) => bytes,
-        CollectFate::Cancelled => {
-            cancel_command(serving, &invocation).await;
-            return;
-        }
-        CollectFate::InputClosed => {
-            forget_command(serving, &invocation);
-            return;
-        }
-        CollectFate::Rejected(err) => {
-            let _ = refuse_command(serving, &invocation, err).await;
-            return;
+    let stdin_bytes = if req.advertise {
+        Vec::new()
+    } else {
+        match collect_git_stdin(input, sink, &mut credits, &req.limits).await {
+            GitStdinFate::Ready(bytes) => bytes,
+            GitStdinFate::Cancelled => {
+                let report = CommandExitReport::cancelled(&accepted.invocation_id);
+                let exit_bytes = match ipc::encode_control(&report) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return,
+                };
+                let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+                return;
+            }
+            GitStdinFate::Gone => {
+                return;
+            }
+            GitStdinFate::Rejected(err) => {
+                let _ = send_error_exit(sink, &Error::Core(err)).await;
+                return;
+            }
         }
     };
-    if serving.token.check().is_err() {
-        cancel_command(serving, &invocation).await;
+    if token.check().is_err() {
+        let report = CommandExitReport::cancelled(&accepted.invocation_id);
+        let exit_bytes = match ipc::encode_control(&report) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
         return;
     }
-    let mut full_argv = Vec::with_capacity(argv.len() + 1);
-    full_argv.push("git".to_string());
-    full_argv.extend(argv);
-    let outcome = serving
-        .refs
+    let commands = parse_git_commands(&stdin_bytes);
+    let digest = ruk_git::transport::serve::git_service_digest(
+        &req.service,
+        &commands,
+        &req.limits.encode(),
+    );
+    let invocation = req
+        .request_id
+        .clone()
+        .unwrap_or_else(|| format!("digest-{digest}"));
+    let outcome = refs
         .executor
         .run(move || {
-            crate::cli::run_captured(
-                full_argv,
-                crate::cli::CliEnv {
-                    vars,
-                    cwd,
-                    stdin: Some(stdin_bytes),
-                },
+            run_git_service(
+                &coordinator,
+                &req.service,
+                &req.git_protocol,
+                req.advertise,
+                stdin_bytes,
             )
         })
         .await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
+    let output = match outcome {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
+            return;
+        }
         Err(err) => {
-            let _ = refuse_command(serving, &invocation, err).await;
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
             return;
         }
     };
-    if serving.token.check().is_err() {
-        cancel_command(serving, &invocation).await;
+    if token.check().is_err() {
+        let report = CommandExitReport::cancelled(&invocation);
+        let exit_bytes = match ipc::encode_control(&report) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
         return;
     }
-    let report = if outcome.code == 0 {
-        CommandExitReport::success(&invocation, 0)
-    } else {
-        CommandExitReport::failure_with_code(&invocation, outcome.code)
-    };
-    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
-        ledger.complete(&invocation, report.clone());
+    match write_typed_chunks(sink, input, &mut credits, &cancel_guard, &output).await {
+        TypedWriteFate::Done => {}
+        TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
     }
-    for (kind, bytes) in [
-        (ipc::FrameKind::Stdout, outcome.stdout),
-        (ipc::FrameKind::Stderr, outcome.stderr),
-    ] {
-        match write_cmd_data(serving, kind, &bytes).await {
-            WriteFate::Done => {}
-            WriteFate::Cancelled => {
-                cancel_command(serving, &invocation).await;
-                return;
-            }
-            WriteFate::InputClosed => {
-                return;
-            }
-            WriteFate::Rejected(err) => {
-                let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
-                return;
-            }
-        }
-    }
+    let report = CommandExitReport::success(&invocation, 0);
     let exit_bytes = match ipc::encode_control(&report) {
         Ok(bytes) => bytes,
         Err(_) => return,
     };
-    let _ = send_frame(serving.sink, ipc::FrameKind::Exit, &exit_bytes).await;
+    let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
 }
 
-/// Forgets one stream whose input closed before any terminal report: the
-/// connection is dead, so a retry must run fresh instead of observing a
-/// stale running row.
+/// The end of one git-service stdin collection.
 #[cfg(unix)]
-fn forget_command(serving: &CommandServing<'_>, invocation: &str) {
-    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
-        ledger.remove(invocation);
-    }
+enum GitStdinFate {
+    /// `StdinEof` arrived with the collected bytes; `advertise` opens carry
+    /// no body and finish empty without waiting for it.
+    Ready(Vec<u8>),
+    /// A `Cancel` frame arrived for this stream.
+    Cancelled,
+    /// The connection reader or writer is gone.
+    Gone,
+    /// A protocol violation or an over-limit body; the caller already
+    /// refused the stream.
+    Rejected(CoreError),
 }
 
-/// Replays one recorded terminal report: `Accepted` with the invocation
-/// identity, then the recorded `Exit`, without running the command again.
+/// Collects one request round for a git-service stream, bounded by the
+/// envelope's `max_stdin_bytes`. An `advertise` open carries no body and
+/// returns empty at once. Inbound bytes are credit-checked with a sliding
+/// grant back per chunk, so bodies larger than one window keep flowing.
 #[cfg(unix)]
-async fn replay_command(
-    serving: &mut CommandServing<'_>,
-    invocation: &str,
-    report: &CommandExitReport,
-) {
-    let accepted = CommandAccepted {
-        stream_id: serving.sink.stream_id,
-        stdin_credit: serving.refs.window_bytes,
-        invocation_id: invocation.to_string(),
-    };
-    let accepted_bytes = match ipc::encode_control(&accepted) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    if send_frame(serving.sink, ipc::FrameKind::Accepted, &accepted_bytes)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let exit_bytes = match ipc::encode_control(report) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    let _ = send_frame(serving.sink, ipc::FrameKind::Exit, &exit_bytes).await;
-}
-
-/// Records the failure of a claimed `invocation` and reports it as `Error`
-/// plus the legacy terminal frame, so a later outcome lookup observes the
-/// failure instead of uncertainty.
-#[cfg(unix)]
-async fn refuse_command(serving: &mut CommandServing<'_>, invocation: &str, err: CoreError) {
-    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
-        ledger.complete(invocation, CommandExitReport::failure(invocation));
-    }
-    let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
-}
-
-/// Reports a refusal without touching the ledger: the identity is empty or
-/// belongs to another command, so recording a failure would poison a row
-/// this open never claimed.
-#[cfg(unix)]
-async fn refuse_unclaimed(serving: &mut CommandServing<'_>, err: CoreError) {
-    let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
-}
-
-/// Ends one cancelled command with its terminal report.
-#[cfg(unix)]
-async fn cancel_command(serving: &mut CommandServing<'_>, invocation: &str) {
-    let report = CommandExitReport::cancelled(invocation);
-    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
-        ledger.complete(invocation, report.clone());
-    }
-    let exit_bytes = match ipc::encode_control(&report) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    let _ = send_frame(serving.sink, ipc::FrameKind::Exit, &exit_bytes).await;
-}
-
-/// Validates one command open against the filesystem, on the blocking
-/// pool: resolves `dir` (and `repository` when it names another path)
-/// under the configured roots and parses `env` into the hermetic variable
-/// map the command runs with. The command inherits nothing from the
-/// daemon's own environment.
-#[cfg(unix)]
-fn validate_command_fs(
-    registry: &Registry,
-    repository: &str,
-    dir: &str,
-    env: &[String],
-) -> Result<(PathBuf, HashMap<String, String>), CoreError> {
-    let canonical = registry.resolve(Path::new(dir))?;
-    if !repository.is_empty() && repository != dir {
-        let repo_path = registry.resolve(Path::new(repository))?;
-        if repo_path != canonical {
-            return Err(CoreError::new(
-                ErrorCode::EForbidden,
-                "command repository and directory disagree",
+async fn collect_git_stdin(
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    sink: &StreamSink,
+    credits: &mut ipc::StreamCredits,
+    limits: &GitLimits,
+) -> GitStdinFate {
+    let stream_id = sink.stream_id;
+    let mut stdin_bytes: Vec<u8> = Vec::new();
+    loop {
+        let Some(frame) = input.recv().await else {
+            return GitStdinFate::Gone;
+        };
+        if frame.stream_id != stream_id {
+            return GitStdinFate::Rejected(CoreError::new(
+                ErrorCode::EInvalid,
+                "stream received a frame of another stream",
             ));
         }
+        match frame.kind {
+            ipc::FrameKind::Stdin => {
+                let grown = (stdin_bytes.len() as u64).saturating_add(frame.payload.len() as u64);
+                if grown > limits.max_stdin_bytes {
+                    return GitStdinFate::Rejected(CoreError::new(
+                        ErrorCode::ELimit,
+                        "request body exceeds its bound",
+                    ));
+                }
+                let width = match u64::try_from(frame.payload.len()) {
+                    Ok(width) => width,
+                    Err(_) => {
+                        return GitStdinFate::Rejected(CoreError::new(
+                            ErrorCode::ELimit,
+                            "stdin chunk exceeds its bound",
+                        ));
+                    }
+                };
+                if credits.consume_inbound(stream_id, width).is_err() {
+                    return GitStdinFate::Rejected(CoreError::new(
+                        ErrorCode::ELimit,
+                        "stream credit window is exhausted",
+                    ));
+                }
+                stdin_bytes.extend_from_slice(&frame.payload);
+                if credits.grant_inbound(stream_id, width).is_err() {
+                    return GitStdinFate::Rejected(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "git-service stream is not tracked",
+                    ));
+                }
+                let grant = StdinGrant {
+                    direction: "stdin".to_string(),
+                    bytes: width,
+                };
+                let grant_bytes = match ipc::encode_control(&grant) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return GitStdinFate::Gone,
+                };
+                if send_frame(sink, ipc::FrameKind::WindowUpdate, &grant_bytes)
+                    .await
+                    .is_err()
+                {
+                    return GitStdinFate::Gone;
+                }
+            }
+            ipc::FrameKind::StdinEof => return GitStdinFate::Ready(stdin_bytes),
+            ipc::FrameKind::Cancel => return GitStdinFate::Cancelled,
+            ipc::FrameKind::WindowUpdate => {
+                let credit: WindowCredit = match ipc::decode_control(&frame.payload) {
+                    Ok(credit) => credit,
+                    Err(err) => {
+                        let _ = send_error_exit(sink, &Error::Core(err.clone())).await;
+                        return GitStdinFate::Rejected(err);
+                    }
+                };
+                if let Err(err) = route_credit(credits, stream_id, &credit) {
+                    let _ = send_error_exit(sink, &Error::Core(err.clone())).await;
+                    return GitStdinFate::Rejected(err);
+                }
+            }
+            ipc::FrameKind::Open
+            | ipc::FrameKind::Accepted
+            | ipc::FrameKind::Stdout
+            | ipc::FrameKind::Stderr
+            | ipc::FrameKind::HookCall
+            | ipc::FrameKind::HookReply
+            | ipc::FrameKind::Exit
+            | ipc::FrameKind::Error => {
+                return GitStdinFate::Rejected(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "daemon never receives this frame kind from a client",
+                ));
+            }
+        }
     }
-    let mut vars = HashMap::with_capacity(env.len());
-    for entry in env {
-        let (key, value) = entry.split_once('=').ok_or_else(|| {
-            CoreError::new(ErrorCode::EInvalid, "command environment must be KEY=value")
-        })?;
-        if key.is_empty() {
+}
+
+/// Parses the command lines of one request body: the data lines before the
+/// first flush. Malformed tails stop the parse; the serve half refuses the
+/// request itself.
+#[cfg(unix)]
+fn parse_git_commands(body: &[u8]) -> Vec<Vec<u8>> {
+    use ruk_git::transport::pktline::{Packet, decode_frame};
+    let mut commands = Vec::new();
+    let mut rest = body;
+    while let Ok(Some((packet, consumed))) = decode_frame(rest) {
+        rest = &rest[consumed..];
+        match packet {
+            Packet::Data(_) => {
+                if let Some(line) = packet.line() {
+                    commands.push(line.to_vec());
+                }
+            }
+            Packet::Flush | Packet::Delimiter | Packet::ResponseEnd => break,
+        }
+    }
+    commands
+}
+
+/// Runs one git-service round on the blocking pool: advertisement only for
+/// `advertise` opens, one full serve round otherwise.
+///
+/// # Errors
+/// The serve half's typed failure.
+#[cfg(unix)]
+fn run_git_service(
+    coordinator: &std::sync::Arc<ruk_core::coord::HostedCoordinator>,
+    service: &str,
+    git_protocol: &str,
+    advertise: bool,
+    stdin: Vec<u8>,
+) -> Result<Vec<u8>, CoreError> {
+    use ruk_git::transport::serve::{
+        advertise_receive_pack, advertise_upload_pack, serve_receive_pack, serve_upload_pack,
+    };
+    use ruk_git::transport::serve_v2::{git_protocol_requests_v2, serve_upload_pack_v2};
+    let store = coordinator.store();
+    let kind = store.hash_kind();
+    let head = crate::cli::verbs_transport::serve_head(store)?;
+    let interrupt = ruk_git::transport::Interrupt::none();
+    if advertise {
+        return match service {
+            GIT_SERVICE_RECEIVE_PACK => Ok(advertise_receive_pack(store, kind, &head)?),
+            GIT_SERVICE_UPLOAD_PACK => Ok(advertise_upload_pack(store, kind, &head)?),
+            _ => Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "upload-archive has no ref advertisement",
+            )),
+        };
+    }
+    let mut out = Vec::new();
+    match service {
+        GIT_SERVICE_RECEIVE_PACK => {
+            let lfs = ruk_core::mode_for_store(store.root());
+            serve_receive_pack(&stdin[..], &mut out, store, kind, &head, &interrupt, lfs)?;
+            out = strip_advertisement(out)?;
+        }
+        GIT_SERVICE_UPLOAD_PACK => {
+            if git_protocol_requests_v2(Some(git_protocol)) {
+                serve_upload_pack_v2(&stdin[..], &mut out, store, kind, &head, &interrupt)?;
+            } else {
+                serve_upload_pack(&stdin[..], &mut out, store, kind, &head, &interrupt)?;
+            }
+            out = strip_advertisement(out)?;
+        }
+        GIT_SERVICE_UPLOAD_ARCHIVE => {
+            ruk_git::transport::archive::serve_upload_archive(
+                &stdin[..],
+                &mut out,
+                store,
+                kind,
+                &head,
+                &interrupt,
+            )?;
+        }
+        _ => {
             return Err(CoreError::new(
                 ErrorCode::EInvalid,
-                "command environment names an empty variable",
+                format!("unknown git service `{service}`"),
             ));
         }
-        vars.insert(key.to_string(), value.to_string());
     }
-    for key in ["GIT_DIR", "GIT_WORK_TREE"] {
-        if let Some(value) = vars.get(key) {
-            check_env_path_under_roots(registry, &canonical, value)?;
-        }
-    }
-    Ok((canonical, vars))
+    Ok(out)
 }
 
-/// Confines one `GIT_DIR`/`GIT_WORK_TREE` value beneath the roots.
-/// Absolute values resolve through the registry; relative values join the
-/// command directory first. A missing path falls back to a lexical prefix
-/// check so a not-yet-created directory cannot smuggle an escape.
+/// Splits one full serve round into its advertisement prefix and its
+/// response: a stateless request already discovered refs through an
+/// `advertise` open, so only the bytes past the first flush travel back.
+/// Archive rounds carry no advertisement and never pass through here.
+///
+/// # Errors
+/// `E_INVALID` when no flush packet opens the response.
 #[cfg(unix)]
-fn check_env_path_under_roots(
-    registry: &Registry,
-    base: &Path,
-    value: &str,
-) -> Result<(), CoreError> {
-    let raw = Path::new(value);
-    let candidate = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        base.join(raw)
-    };
-    match registry.resolve(&candidate) {
-        Ok(_) => Ok(()),
-        Err(err) if err.code == ErrorCode::ENotFound => {
-            let normalized = normalize_lexical(&candidate);
-            let inside = registry
-                .roots()
-                .iter()
-                .any(|root| normalized.starts_with(root));
-            if inside {
-                Ok(())
-            } else {
-                Err(CoreError::new(
-                    ErrorCode::EForbidden,
-                    "command path escapes the configured roots",
-                ))
-            }
+fn strip_advertisement(output: Vec<u8>) -> Result<Vec<u8>, CoreError> {
+    let mut offset = 0;
+    while offset + 4 <= output.len() {
+        let len = usize::from_str_radix(
+            std::str::from_utf8(&output[offset..offset + 4]).map_err(|_| {
+                CoreError::new(ErrorCode::EInvalid, "serve round is not pkt-line framed")
+            })?,
+            16,
+        )
+        .map_err(|_| CoreError::new(ErrorCode::EInvalid, "serve round is not pkt-line framed"))?;
+        if len == 0 {
+            return Ok(output[offset + 4..].to_vec());
         }
-        Err(err) => Err(err),
-    }
-}
-
-/// Collapses `.` and `..` lexically, without touching the filesystem.
-#[cfg(unix)]
-fn normalize_lexical(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            _ => out.push(component.as_os_str()),
+        if len < 4 || offset + len > output.len() {
+            break;
         }
+        offset += len;
     }
-    out
+    Err(CoreError::new(
+        ErrorCode::EInvalid,
+        "serve round carries no advertisement prefix",
+    ))
 }
 
 /// Routes one client credit grant to the inbound or outbound window of its
@@ -1987,178 +1875,6 @@ fn route_credit(
     ))
 }
 
-/// The end of one stdin collection loop.
-#[cfg(unix)]
-enum CollectFate {
-    /// `StdinEof` arrived with the collected bytes.
-    Ready(Vec<u8>),
-    /// A `Cancel` frame arrived for this stream.
-    Cancelled,
-    /// The connection reader is gone; the caller forgets the claim.
-    InputClosed,
-    /// A protocol violation; the caller records a failure and refuses.
-    Rejected(CoreError),
-}
-
-/// Absorbs one stdin chunk under the inbound window and the stream cap,
-/// returning the width the daemon grants back to the client.
-///
-/// # Errors
-/// `E_LIMIT` past the stream cap or the inbound window.
-#[cfg(unix)]
-fn absorb_stdin_chunk(
-    credits: &mut ipc::StreamCredits,
-    stream_id: u64,
-    stdin_bytes: &mut Vec<u8>,
-    payload: &[u8],
-) -> Result<u64, CoreError> {
-    let width = u64::try_from(payload.len())
-        .map_err(|_| CoreError::new(ErrorCode::ELimit, "stdin chunk exceeds its bound"))?;
-    if stdin_bytes.len().saturating_add(payload.len()) > MAX_COMMAND_STDIN_BYTES {
-        return Err(CoreError::new(
-            ErrorCode::ELimit,
-            "command stdin exceeds its bound",
-        ));
-    }
-    credits.consume_inbound(stream_id, width)?;
-    stdin_bytes.extend_from_slice(payload);
-    credits.grant_inbound(stream_id, width)?;
-    Ok(width)
-}
-
-/// Collects stdin for one command stream from its input channel. `Stdin`
-/// chunks are credit-checked and acknowledged with a `stdin` grant each,
-/// so a client larger than one window keeps flowing. A `Cancel` frame
-/// triggers the stream token and ends the collection cancelled.
-#[cfg(unix)]
-async fn collect_command_stdin(serving: &mut CommandServing<'_>) -> CollectFate {
-    let stream_id = serving.sink.stream_id;
-    let mut stdin_bytes: Vec<u8> = Vec::new();
-    loop {
-        let Some(frame) = serving.input.recv().await else {
-            return CollectFate::InputClosed;
-        };
-        if frame.stream_id != stream_id {
-            return CollectFate::Rejected(CoreError::new(
-                ErrorCode::EInvalid,
-                "stream received a frame of another stream",
-            ));
-        }
-        match frame.kind {
-            ipc::FrameKind::Stdin => {
-                match absorb_stdin_chunk(
-                    serving.credits,
-                    stream_id,
-                    &mut stdin_bytes,
-                    &frame.payload,
-                ) {
-                    Ok(width) => {
-                        let grant = StdinGrant {
-                            direction: "stdin".to_string(),
-                            bytes: width,
-                        };
-                        let grant_bytes = match ipc::encode_control(&grant) {
-                            Ok(bytes) => bytes,
-                            Err(_) => return CollectFate::InputClosed,
-                        };
-                        if send_frame(serving.sink, ipc::FrameKind::WindowUpdate, &grant_bytes)
-                            .await
-                            .is_err()
-                        {
-                            return CollectFate::InputClosed;
-                        }
-                    }
-                    Err(err) => return CollectFate::Rejected(err),
-                }
-            }
-            ipc::FrameKind::StdinEof => return CollectFate::Ready(stdin_bytes),
-            ipc::FrameKind::Cancel => {
-                serving.cancel.cancel();
-                return CollectFate::Cancelled;
-            }
-            ipc::FrameKind::WindowUpdate => {
-                let credit: WindowCredit = match ipc::decode_control(&frame.payload) {
-                    Ok(credit) => credit,
-                    Err(err) => return CollectFate::Rejected(err),
-                };
-                if let Err(err) = route_credit(serving.credits, stream_id, &credit) {
-                    return CollectFate::Rejected(err);
-                }
-            }
-            ipc::FrameKind::Open
-            | ipc::FrameKind::Accepted
-            | ipc::FrameKind::Stdout
-            | ipc::FrameKind::Stderr
-            | ipc::FrameKind::HookCall
-            | ipc::FrameKind::HookReply
-            | ipc::FrameKind::Exit
-            | ipc::FrameKind::Error => {
-                return CollectFate::Rejected(CoreError::new(
-                    ErrorCode::EInvalid,
-                    "daemon never receives this frame kind from a client",
-                ));
-            }
-        }
-    }
-}
-
-/// The end of one output write loop.
-#[cfg(unix)]
-enum WriteFate {
-    /// Every byte reached the writer task.
-    Done,
-    /// A `Cancel` frame arrived for this stream.
-    Cancelled,
-    /// The connection reader or writer is gone.
-    InputClosed,
-    /// A protocol violation; the caller ends the stream.
-    Rejected(CoreError),
-}
-
-/// Writes one output direction in window-sized chunks. When the outbound
-/// window exhausts, the loop reads the stream channel until the client
-/// grants more credit, so outputs larger than the initial window still
-/// complete as long as the client keeps granting per chunk, the way the
-/// Go backend does.
-#[cfg(unix)]
-async fn write_cmd_data(
-    serving: &mut CommandServing<'_>,
-    kind: ipc::FrameKind,
-    bytes: &[u8],
-) -> WriteFate {
-    let stream_id = serving.sink.stream_id;
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let end = (offset + ipc::MAX_DATA_CHUNK_BYTES).min(bytes.len());
-        let width = match u64::try_from(end - offset) {
-            Ok(width) => width,
-            Err(_) => {
-                return WriteFate::Rejected(CoreError::new(
-                    ErrorCode::ELimit,
-                    "data chunk exceeds its bound",
-                ));
-            }
-        };
-        if serving.credits.consume_outbound(stream_id, width).is_ok() {
-            if send_frame(serving.sink, kind, &bytes[offset..end])
-                .await
-                .is_err()
-            {
-                return WriteFate::InputClosed;
-            }
-            offset = end;
-            continue;
-        }
-        match await_outbound_credit(serving).await {
-            CreditFate::Granted => {}
-            CreditFate::Cancelled => return WriteFate::Cancelled,
-            CreditFate::InputClosed => return WriteFate::InputClosed,
-            CreditFate::Rejected(err) => return WriteFate::Rejected(err),
-        }
-    }
-    WriteFate::Done
-}
-
 /// The end of one credit wait.
 #[cfg(unix)]
 enum CreditFate {
@@ -2172,21 +1888,8 @@ enum CreditFate {
     Rejected(CoreError),
 }
 
-/// Reads the stream channel until the client grants outbound credit.
-/// Late stdin endings are ignored.
-#[cfg(unix)]
-async fn await_outbound_credit(serving: &mut CommandServing<'_>) -> CreditFate {
-    wait_outbound_credit(
-        serving.input,
-        serving.sink.stream_id,
-        serving.credits,
-        serving.cancel,
-    )
-    .await
-}
-
 /// Reads one stream channel until its client grants outbound credit,
-/// shared by command output and typed replies. Late stdin endings are
+/// shared by git-service output and typed replies. Late stdin endings are
 /// ignored; a `Cancel` frame triggers the stream token.
 #[cfg(unix)]
 async fn wait_outbound_credit(

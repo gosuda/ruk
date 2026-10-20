@@ -120,12 +120,6 @@ impl Registry {
         }
     }
 
-    /// Returns the canonicalized repository roots.
-    #[must_use]
-    pub(crate) fn roots(&self) -> Vec<PathBuf> {
-        self.roots.clone()
-    }
-
     /// Sets the interval between per-coordinator retention sweeps.
     ///
     /// `serve` calls this once from the daemon configuration before serving;

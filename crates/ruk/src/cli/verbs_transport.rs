@@ -1904,7 +1904,7 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
 /// link, as every other reader does. A dangling, cyclic, or over-deep chain
 /// advertises the zero OID. A store read failure is not unborn: it propagates,
 /// so a corrupt store never serves a false HEAD.
-fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
+pub(crate) fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
     let (workspace, _) = load_or_default(store)?;
     match workspace.head.resolve(&StoreRefs::new(store)) {
         Ok(ruk_core::workspace::ResolvedHead::Detached(oid)) => {
