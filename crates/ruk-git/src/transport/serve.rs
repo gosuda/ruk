@@ -25,9 +25,9 @@
 //!   pushes, mirroring the oracle's `delete_only` gate), verifies the
 //!   closure, stages the objects in quarantine (see [`super::hooks`]),
 //!   runs the `pre-receive`/`update` phases, publishes objects plus commit
-//!   rows only when those pass, diverts `refs/for/` and `refs/pull/`
-//!   commands to the `proc-receive` hook (see [`super::proc_receive`]),
-//!   and applies surviving refs through the shared
+//!   rows only when those pass, diverts `refs/for/` commands to the
+//!   `proc-receive` hook under the configured prefixes (see
+//!   [`super::proc_receive`]), and applies surviving refs through the shared
 //!   [`apply_refs`](super::session::apply_refs) CAS path, reporting
 //!   per-ref `ok`/`ng` lines, before the `post-receive` phase. `atomic`
 //!   and `push-cert` are not advertised; an `atomic` request that arrives
@@ -565,8 +565,9 @@ impl Default for ReceiveLimits {
 /// Serves one `receive-pack` session with quarantine staging and hook
 /// phases (see [`super::hooks`]): the pack stages unpublished, hooks
 /// observe it through the quarantine directory, staged objects publish
-/// only after the refusing phases pass, `refs/for/` and `refs/pull/`
-/// commands divert to the `proc-receive` hook (see
+/// only after the refusing phases pass, `refs/for/` commands divert to
+/// the `proc-receive` hook under the configured prefixes (default
+/// `["refs/for"]`, so `refs/pull/` lands as a plain ref; see
 /// [`super::proc_receive`]), surviving refs apply through the shared CAS
 /// path, and `post-receive` runs after refs land.
 ///
@@ -1119,6 +1120,15 @@ mod tests {
 
     fn oid(hex: &str) -> Oid {
         Oid::from_hex(hex).expect("hex")
+    }
+
+    #[test]
+    fn default_divert_prefixes_are_refs_for_only() {
+        assert_eq!(
+            ReceiveHooks::disabled().proc_receive_prefixes(),
+            &["refs/for".to_owned()],
+            "the documented default diverts refs/for only; refs/pull lands plain"
+        );
     }
 
     #[test]
