@@ -18,9 +18,11 @@ mod tests;
 
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
@@ -28,6 +30,9 @@ use tokio::sync::mpsc;
 pub(crate) use executor::BoundedExecutor;
 pub(crate) use registry::Registry;
 use ruk_core::change::{RequestId, SessionId};
+use ruk_core::coord::service_receipts::{
+    SERVICE_RECEIPT_VERSION, ServiceReceipt, lookup_service_receipt, store_service_receipt,
+};
 use ruk_core::coord::{
     Cancel, CancelHandle, DEFAULT_EVENT_RETENTION_SECONDS, HostedCoordinator, Principal,
     cancellation,
@@ -1425,7 +1430,7 @@ async fn serve_stream(
     peer: ipc::PeerIdentity,
 ) {
     if let Ok(command) = ipc::decode_control::<CommandOpen>(&open_payload) {
-        serve_git_service(&mut input, sink, command, refs).await;
+        serve_git_service(&mut input, sink, command, refs, peer.uid).await;
         return;
     }
     let open: InvocationOpen = match ipc::decode_control(&open_payload) {
@@ -1436,6 +1441,169 @@ async fn serve_stream(
         }
     };
     typed_stream(&mut input, sink, &open, refs, peer).await;
+}
+
+/// Identifiers locating one git-service round for replay dispatch.
+#[derive(Clone, Copy)]
+struct ReplayIds<'a> {
+    invocation: &'a str,
+    request_id: &'a str,
+    digest: &'a str,
+}
+
+/// Sends one stored receipt as if the run just completed it: the recorded
+/// output bytes plus the recorded exit, or the recorded error.
+#[cfg(unix)]
+async fn send_stored_outcome(
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    sink: &StreamSink,
+    credits: &mut ipc::StreamCredits,
+    cancel_guard: &CancelHandle,
+    invocation: &str,
+    receipt: &ServiceReceipt,
+) {
+    if receipt.error_code.is_some() || receipt.error_message.is_some() {
+        let code = receipt
+            .error_code
+            .as_deref()
+            .unwrap_or("E_IO")
+            .parse::<ErrorCode>()
+            .unwrap_or(ErrorCode::ECorrupt);
+        let message = receipt.error_message.clone().unwrap_or_default();
+        let _ = send_error_exit(sink, &Error::Core(CoreError::new(code, message))).await;
+        return;
+    }
+    let code = u8::try_from(receipt.exit_code).unwrap_or(1);
+    match write_typed_chunks(sink, input, credits, cancel_guard, &receipt.output).await {
+        TypedWriteFate::Done => {}
+        TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
+    }
+    let report = CommandExitReport::success(invocation, code);
+    let exit_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+}
+
+/// Dispatches one stored receipt against the current digest: same digest
+/// replays, a different digest is `E_REQUEST_REUSED`, an unknown version
+/// is corrupt and refuses rather than overwriting a newer row.
+#[cfg(unix)]
+async fn dispatch_stored_receipt(
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    sink: &StreamSink,
+    credits: &mut ipc::StreamCredits,
+    cancel_guard: &CancelHandle,
+    ids: ReplayIds<'_>,
+    receipt: &ServiceReceipt,
+) {
+    if receipt.version != SERVICE_RECEIPT_VERSION {
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::ECorrupt,
+                format!(
+                    "stored receipt for request `{}` has unknown version {}",
+                    ids.request_id, receipt.version
+                ),
+            )),
+        )
+        .await;
+    } else if receipt.digest == ids.digest {
+        send_stored_outcome(input, sink, credits, cancel_guard, ids.invocation, receipt).await;
+    } else {
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::ERequestReused,
+                format!(
+                    "request `{}` was already used with a different digest",
+                    ids.request_id
+                ),
+            )),
+        )
+        .await;
+    }
+}
+
+/// Locates one service receipt: the key (peer, repository, request id)
+/// plus the digest the current round computed.
+struct ReceiptLocator {
+    peer_uid: u32,
+    repository: Vec<u8>,
+    request_id: String,
+    digest: String,
+}
+
+/// Persists one completed git-service outcome as a service receipt.
+/// Returns the winner's receipt when a concurrent same-request execution
+/// won the absence race, so the caller replays instead of publishing twice.
+#[cfg(unix)]
+async fn store_git_outcome(
+    refs: &ConnectionRefs,
+    coordinator: &Arc<HostedCoordinator>,
+    locator: &ReceiptLocator,
+    outcome: &Result<Vec<u8>, CoreError>,
+) -> Result<Option<ServiceReceipt>, Error> {
+    let (exit_code, output, error_code, error_message) = match outcome {
+        Ok(output) => (0, output.clone(), None, None),
+        Err(err) => (
+            -1,
+            Vec::new(),
+            Some(err.code.to_string()),
+            Some(err.message.clone()),
+        ),
+    };
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let at = u64::try_from(at).unwrap_or(0);
+    let receipt = ServiceReceipt {
+        version: SERVICE_RECEIPT_VERSION,
+        digest: locator.digest.clone(),
+        exit_code,
+        output,
+        error_code,
+        error_message,
+        at,
+    };
+    let writer = Arc::clone(coordinator);
+    let repository = locator.repository.clone();
+    let request_id = locator.request_id.clone();
+    let peer_uid = locator.peer_uid;
+    let stored = refs
+        .executor
+        .run(move || {
+            store_service_receipt(writer.store(), peer_uid, &repository, &request_id, &receipt)
+        })
+        .await
+        .map_err(Error::Core)?;
+    match stored {
+        Ok(()) => Ok(None),
+        Err(ruk_core::store::StoreError::StaleFact { .. }) => {
+            let reader = Arc::clone(coordinator);
+            let repository = locator.repository.clone();
+            let request_id = locator.request_id.clone();
+            let found = refs
+                .executor
+                .run(move || {
+                    lookup_service_receipt(reader.store(), peer_uid, &repository, &request_id)
+                })
+                .await
+                .map_err(Error::Core)?
+                .map_err(Error::Core)?;
+            match found {
+                Some((receipt, _)) => Ok(Some(receipt)),
+                None => Err(Error::Core(CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "a concurrent receipt vanished mid-replay",
+                ))),
+            }
+        }
+        Err(err) => Err(Error::Core(CoreError::new(err.code(), err.to_string()))),
+    }
 }
 
 /// Serves one git-service stream to its terminal frame: an `advertise`
@@ -1449,6 +1617,7 @@ async fn serve_git_service(
     sink: &StreamSink,
     req: CommandOpen,
     refs: &ConnectionRefs,
+    peer_uid: u32,
 ) {
     let stream_id = sink.stream_id;
     let mut credits = ipc::StreamCredits::new(refs.window_bytes);
@@ -1497,7 +1666,7 @@ async fn serve_git_service(
         .run(move || registry.open(&repo_ref))
         .await
         .map_err(Error::Core);
-    let (_, _, coordinator) = match opened {
+    let (_, canonical, coordinator) = match opened {
         Ok(Ok(triple)) => triple,
         Ok(Err(err)) | Err(Error::Core(err)) => {
             let _ = send_error_exit(sink, &Error::Core(err)).await;
@@ -1583,11 +1752,54 @@ async fn serve_git_service(
         .request_id
         .clone()
         .unwrap_or_else(|| format!("digest-{digest}"));
+    // Receipts cover mutating receive-pack rounds only: advertisement and
+    // upload output changes as refs move, so replaying a stored read
+    // would serve stale refs.
+    let receipted = req.service == GIT_SERVICE_RECEIVE_PACK && !req.advertise;
+    let request_id = req.request_id.clone().unwrap_or_default();
+    let repository = canonical.as_os_str().as_bytes().to_vec();
+    if receipted {
+        let lookup_coordinator = Arc::clone(&coordinator);
+        let lookup_repository = repository.clone();
+        let lookup_request = request_id.clone();
+        let found = refs
+            .executor
+            .run(move || {
+                lookup_service_receipt(
+                    lookup_coordinator.store(),
+                    peer_uid,
+                    &lookup_repository,
+                    &lookup_request,
+                )
+            })
+            .await;
+        let found = match found {
+            Ok(Ok(found)) => found,
+            Ok(Err(err)) => {
+                let _ = send_error_exit(sink, &Error::Core(err)).await;
+                return;
+            }
+            Err(err) => {
+                let _ = send_error_exit(sink, &Error::Core(err)).await;
+                return;
+            }
+        };
+        if let Some((receipt, _)) = found {
+            let ids = ReplayIds {
+                invocation: &invocation,
+                request_id: &request_id,
+                digest: &digest,
+            };
+            dispatch_stored_receipt(input, sink, &mut credits, &cancel_guard, ids, &receipt).await;
+            return;
+        }
+    }
+    let run_coordinator = Arc::clone(&coordinator);
     let outcome = refs
         .executor
         .run(move || {
             run_git_service(
-                &coordinator,
+                &run_coordinator,
                 &req.service,
                 &req.git_protocol,
                 req.advertise,
@@ -1595,6 +1807,31 @@ async fn serve_git_service(
             )
         })
         .await;
+    if receipted && let Ok(inner) = &outcome {
+        let locator = ReceiptLocator {
+            peer_uid,
+            repository: repository.clone(),
+            request_id: request_id.clone(),
+            digest: digest.clone(),
+        };
+        match store_git_outcome(refs, &coordinator, &locator, inner).await {
+            Ok(None) => {}
+            Ok(Some(stored)) => {
+                let ids = ReplayIds {
+                    invocation: &invocation,
+                    request_id: &request_id,
+                    digest: &digest,
+                };
+                dispatch_stored_receipt(input, sink, &mut credits, &cancel_guard, ids, &stored)
+                    .await;
+                return;
+            }
+            Err(store_err) => {
+                let _ = send_error_exit(sink, &store_err).await;
+                return;
+            }
+        }
+    }
     let output = match outcome {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => {

@@ -58,6 +58,7 @@ use super::rows::{
     CoordinatorHead, OP_HEAD_KEY, RECEIPT_HORIZON, SessionRow, decode_head, decode_session,
     session_key,
 };
+use super::service_receipts::{SERVICE_RECEIPT_RETENTION_SECONDS, sweep_service_receipts_page};
 use super::session::{Authority, ResumeOutcome, SessionTable, prepare_open};
 use crate::ByteString;
 use crate::attestation::Checkpoint;
@@ -164,6 +165,10 @@ pub struct HostedCoordinator {
     leases: Arc<LeaseRegistry>,
     page_guards: Mutex<HashMap<LeaseId, (OwnerGuard, StdInstant)>>,
     event_retention_seconds: AtomicU64,
+    /// Resume key for the service-receipt sweep rotation. In memory
+    /// only: a restart re-scans from the first key, which delays but
+    /// never breaks convergence, and no head-schema change is needed.
+    receipt_sweep_cursor: Mutex<Option<Vec<u8>>>,
 }
 
 impl core::fmt::Debug for HostedCoordinator {
@@ -224,6 +229,7 @@ impl HostedCoordinator {
             leases,
             page_guards: Mutex::new(HashMap::new()),
             event_retention_seconds: AtomicU64::new(DEFAULT_EVENT_RETENTION_SECONDS),
+            receipt_sweep_cursor: Mutex::new(None),
         })
     }
 
@@ -1242,6 +1248,10 @@ pub struct RetentionReport {
     pub leases_examined: usize,
     /// Expired read leases dropped in this pass.
     pub leases_expired: usize,
+    /// Service receipt rows scanned in this pass.
+    pub service_receipts_examined: usize,
+    /// Expired service receipt rows deleted through the lane in this pass.
+    pub service_receipts_deleted: usize,
 }
 
 impl RetentionReport {
@@ -1295,6 +1305,25 @@ impl HostedCoordinator {
         // owner guards retires the slots without touching any fact table.
         self.leases.sweep_expiry()?;
         let (leases_examined, leases_expired) = self.prune_expired_read_leases(current.mono)?;
+        let receipt_cutoff_millis = u64::try_from(
+            current
+                .wall
+                .duration_since(jiff::Timestamp::UNIX_EPOCH)
+                .as_millis(),
+        )
+        .map_err(|_| CoreError::new(ErrorCode::ELimit, "retention clock millis overflow u64"))?
+        .saturating_sub(SERVICE_RECEIPT_RETENTION_SECONDS.saturating_mul(1_000));
+        let receipt_after = self
+            .receipt_sweep_cursor
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "receipt sweep cursor is poisoned"))?
+            .clone();
+        let receipt_sweep = sweep_service_receipts_page(
+            &self.store,
+            receipt_cutoff_millis,
+            Store::SWEEP_EVENTS_PAGE_ROWS,
+            receipt_after.as_deref(),
+        )?;
         let horizon = self.event_retention_seconds.load(Ordering::Relaxed);
         let cutoff = current.wall.duration_since(jiff::Timestamp::UNIX_EPOCH);
         let cutoff_millis = u64::try_from(cutoff.as_millis()).map_err(|_| {
@@ -1304,6 +1333,15 @@ impl HostedCoordinator {
         let event_deletions = self
             .store
             .sweep_events_page(cutoff_millis, Store::SWEEP_EVENTS_PAGE_ROWS)?;
+        fn advance_receipt_cursor(
+            coordinator: &HostedCoordinator,
+            next_after: Option<Vec<u8>>,
+        ) -> Result<(), CoreError> {
+            *coordinator.receipt_sweep_cursor.lock().map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "receipt sweep cursor is poisoned")
+            })? = next_after;
+            Ok(())
+        }
         let report = RetentionReport {
             receipts_examined: receipts_page.examined_rows,
             receipts_deleted: receipts_page.deletions.len(),
@@ -1312,18 +1350,23 @@ impl HostedCoordinator {
             events_deleted: event_deletions.len(),
             leases_examined,
             leases_expired,
+            service_receipts_examined: receipt_sweep.examined,
+            service_receipts_deleted: receipt_sweep.deletions.len(),
         };
         // Lease expiry never publishes: it frees in-memory guards only. The
         // lane commit runs only when durable receipts/sessions/events need it.
         let durable_empty = report.receipts_deleted == 0
             && report.sessions_deleted == 0
-            && report.events_deleted == 0;
+            && report.events_deleted == 0
+            && report.service_receipts_deleted == 0;
         if durable_empty && sessions_page.cursors == loaded.sweep {
+            advance_receipt_cursor(self, receipt_sweep.next_after)?;
             return Ok(report);
         }
         let mut facts = receipts_page.deletions;
         facts.extend(sessions_page.deletions);
         facts.extend(event_deletions);
+        facts.extend(receipt_sweep.deletions);
         let mut payload_bytes: usize = 0;
         for fact in &facts {
             payload_bytes = payload_bytes.saturating_add(fact.key.len());
@@ -1339,6 +1382,7 @@ impl HostedCoordinator {
             Some(admitted),
         )?;
         self.lane.submit_internal(candidate).await?;
+        advance_receipt_cursor(self, receipt_sweep.next_after)?;
         Ok(report)
     }
 

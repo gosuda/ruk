@@ -23,6 +23,7 @@ pub use prepare::prepare_mutation;
 mod receipt;
 mod retention;
 mod rows;
+pub mod service_receipts;
 mod session;
 mod transport;
 mod undo;

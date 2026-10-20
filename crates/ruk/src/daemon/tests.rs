@@ -1177,6 +1177,119 @@ async fn events_increase_strictly_across_lane_and_receive() {
 }
 
 #[tokio::test]
+async fn service_receipt_replays_stored_report() {
+    let root = temp_root("receipt-replay");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some("sess-1"),
+        Some("req-replay-1"),
+    );
+    let (first_out, first_exit) = driver.run_git(3, &payload, &[body.clone()]).await;
+    assert_eq!(first_exit.exit_code, 0);
+
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some("sess-1"),
+        Some("req-replay-1"),
+    );
+    let (second_out, second_exit) = driver.run_git(5, &payload, &[body]).await;
+    assert_eq!(second_exit.exit_code, 0);
+    assert_eq!(
+        second_out, first_out,
+        "the replay resends the stored report instead of re-executing"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn service_receipt_digest_mismatch_is_reused_error() {
+    let root = temp_root("receipt-reuse");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let zero = "0".repeat(40);
+    let hex = commit.to_hex();
+    let mut delete = pkt(format!("{hex} {zero} refs/heads/scratch\n").as_bytes());
+    delete.extend_from_slice(&flush());
+    let mut other = pkt(format!("{zero} {hex} refs/heads/other\n").as_bytes());
+    other.extend_from_slice(&flush());
+
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some("sess-1"),
+        Some("req-reuse-1"),
+    );
+    let (_, exit) = driver.run_git(3, &payload, &[delete]).await;
+    assert_eq!(exit.exit_code, 0);
+
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some("sess-1"),
+        Some("req-reuse-1"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 5, &other).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    let err_frame = driver.recv().await;
+    assert_eq!(err_frame.kind, FrameKind::Error);
+    let report: ErrorReply = ipc::decode_control(&err_frame.payload).expect("error decodes");
+    assert_eq!(report.code, ErrorCode::ERequestReused);
+    let exit_frame = driver.recv().await;
+    assert_eq!(exit_frame.kind, FrameKind::Exit);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn typed_reply_waits_for_outbound_credit() {
     let root = temp_root("credit-wait");
     let repo_dir = root.join("repo");
