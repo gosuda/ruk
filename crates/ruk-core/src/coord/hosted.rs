@@ -58,7 +58,7 @@ use super::rows::{
     CoordinatorHead, OP_HEAD_KEY, RECEIPT_HORIZON, SessionRow, decode_head, decode_session,
     session_key,
 };
-use super::service_receipts::{SERVICE_RECEIPT_RETENTION_SECONDS, sweep_service_receipts_page};
+use super::service_receipts::sweep_service_receipts_page;
 use super::session::{Authority, ResumeOutcome, SessionTable, prepare_open};
 use crate::ByteString;
 use crate::MAX_CONTROL_FRAME_BYTES;
@@ -1498,6 +1498,7 @@ impl HostedCoordinator {
         // owner guards retires the slots without touching any fact table.
         self.leases.sweep_expiry()?;
         let (leases_examined, leases_expired) = self.prune_expired_read_leases(current.mono)?;
+        let horizon = self.event_retention_seconds.load(Ordering::Relaxed);
         let receipt_cutoff_millis = u64::try_from(
             current
                 .wall
@@ -1505,7 +1506,7 @@ impl HostedCoordinator {
                 .as_millis(),
         )
         .map_err(|_| CoreError::new(ErrorCode::ELimit, "retention clock millis overflow u64"))?
-        .saturating_sub(SERVICE_RECEIPT_RETENTION_SECONDS.saturating_mul(1_000));
+        .saturating_sub(horizon.saturating_mul(1_000));
         let receipt_after = self
             .receipt_sweep_cursor
             .lock()
@@ -1517,7 +1518,6 @@ impl HostedCoordinator {
             Store::SWEEP_EVENTS_PAGE_ROWS,
             receipt_after.as_deref(),
         )?;
-        let horizon = self.event_retention_seconds.load(Ordering::Relaxed);
         let cutoff = current.wall.duration_since(jiff::Timestamp::UNIX_EPOCH);
         let cutoff_millis = u64::try_from(cutoff.as_millis()).map_err(|_| {
             CoreError::new(ErrorCode::ELimit, "retention clock millis overflow u64")
@@ -1697,6 +1697,9 @@ mod tests {
     use crate::coord::claims::{ClaimClock, seal_acquire};
     use crate::coord::receipt;
     use crate::coord::rows::{ReceiptRow, Retained, SweepCursors, Usage, encode, receipt_key};
+    use crate::coord::service_receipts::{
+        SERVICE_RECEIPT_VERSION, ServiceReceipt, lookup_service_receipt, store_service_receipt,
+    };
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::index::RepoPath;
@@ -2483,6 +2486,50 @@ mod tests {
             "ledger must return to empty after the sweep deletion"
         );
 
+        coord.shutdown();
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_prunes_service_receipts_at_configured_horizon() {
+        let (_temp, coord, _) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        // One hour old: older than the 60-second test horizon, younger
+        // than the seven-day default the sweep used before, so the test
+        // fails on code that ignores the configured horizon.
+        let now_millis = u64::try_from(
+            jiff::Timestamp::now()
+                .duration_since(jiff::Timestamp::UNIX_EPOCH)
+                .as_millis(),
+        )
+        .expect("wall millis fit u64");
+        let receipt = ServiceReceipt {
+            version: SERVICE_RECEIPT_VERSION,
+            digest: "digest".to_string(),
+            exit_code: 0,
+            output: Vec::new(),
+            error_code: None,
+            error_message: None,
+            at: now_millis - 3_600_000,
+        };
+        store_service_receipt(coord.store(), 1000, b"/repo", "req-old", &receipt)
+            .expect("seed service receipt");
+        coord.set_event_retention_seconds(60);
+        let report = coord
+            .retention_sweep(&cancel)
+            .await
+            .expect("sweep prunes at the configured horizon");
+        assert_eq!(report.service_receipts_examined, 1);
+        assert_eq!(report.service_receipts_deleted, 1);
+        assert!(
+            lookup_service_receipt(coord.store(), 1000, b"/repo", "req-old")
+                .expect("read receipt")
+                .is_none(),
+            "the aged receipt row must delete"
+        );
         coord.shutdown();
         runner.abort();
     }

@@ -6,8 +6,8 @@
 //! re-executing: same digest returns the stored outcome, a different
 //! digest is refused as `E_REQUEST_REUSED` (M8: the keying must include
 //! uid and repository, or a cross-tenant replay returns another tenant's report).
-//! Rows older than [`SERVICE_RECEIPT_RETENTION_SECONDS`] prune through
-//! the shared retention sweep.
+//! Rows older than the coordinator's configured event retention horizon
+//! prune through the shared retention sweep.
 
 use crate::error::CoreError;
 use crate::store::{
@@ -18,10 +18,6 @@ use crate::store::{
 /// revision, so version 1 is the only version on disk; the field keeps
 /// the row forward-compatible.
 pub const SERVICE_RECEIPT_VERSION: u32 = 1;
-
-/// Receipt retention: seven days, swept by the shared retention pass
-/// alongside (but counted separately from) the event horizon.
-pub const SERVICE_RECEIPT_RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// One completed receive-pack execution, replayable by request id.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
