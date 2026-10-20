@@ -979,8 +979,13 @@ mod tests {
         };
         let registry = Registry::new(vec![root.clone()]).expect("scratch root registers");
         let target = victim.join(".ruk");
+        // Attempt-bounded, not fixed-count: under suite load opens are
+        // slower and flips land mid-open more often, so a fixed 200
+        // iterations can observe zero successes without any regression.
         let mut oks = 0u32;
-        for _ in 0..200 {
+        let mut attempts = 0u32;
+        while oks < 25 && attempts < 5000 {
+            attempts += 1;
             let pinned = match registry.resolve_pinned(&target) {
                 Ok(pinned) => pinned,
                 Err(_) => continue,
