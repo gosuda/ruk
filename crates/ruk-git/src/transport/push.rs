@@ -30,7 +30,7 @@ use std::io::{Read, Write};
 use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::types::ObjectKind;
-use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
+use ruk_core::store::{EventContext, EventSource, FactExpectation, FactMutation, FactTable, Store};
 
 use super::pack::{PackEntry, object_links, write_pack, write_thin_pack};
 use super::pktline::{self, Packet, PktReader, SidebandReader, send};
@@ -517,7 +517,12 @@ pub(crate) fn persist(
     previous: Option<Vec<u8>>,
 ) -> Result<(), GitError> {
     let mutation = plan.persist_mutation(kind, previous)?;
-    store.publish(Vec::new(), &[mutation])?;
+    store.publish(
+        Vec::new(),
+        &[mutation],
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )?;
     Ok(())
 }
 
@@ -529,7 +534,12 @@ pub(crate) fn persist_best_effort(store: &Store, plan: &PushPlanRecord, kind: Ha
         .ok()
         .flatten();
     if let Ok(mutation) = plan.persist_mutation(kind, current) {
-        let _ = store.publish(Vec::new(), &[mutation]);
+        let _ = store.publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        );
     }
 }
 

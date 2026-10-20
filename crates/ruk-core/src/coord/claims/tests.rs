@@ -11,7 +11,7 @@ use crate::protocol::{
     ClaimHolderFilter, ClaimListArgs, EditAction, Mutation, PageCursor, QueryDigest, Request,
     WriteArgs, WriteEdit,
 };
-use crate::store::PreparationBudget;
+use crate::store::{EventContext, EventSource, PreparationBudget};
 use crate::{ByteString, OperationId, RequestId, StoreId, WorkspaceId};
 
 struct Root(PathBuf);
@@ -67,7 +67,12 @@ impl Fixture {
         )
         .expect("acquire");
         self.store
-            .publish(Vec::new(), &change.facts)
+            .publish(
+                Vec::new(),
+                &change.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish claim");
         change.record
     }
@@ -199,7 +204,12 @@ fn concurrent_acquisitions_under_the_writer_lane_cannot_both_succeed() {
                 Ok(change) => {
                     fixture
                         .store
-                        .publish(Vec::new(), &change.facts)
+                        .publish(
+                            Vec::new(),
+                            &change.facts,
+                            EventSource::LocalPush,
+                            &EventContext::default(),
+                        )
                         .expect("first publication");
                     Ok(())
                 }
@@ -219,7 +229,12 @@ fn concurrent_acquisitions_under_the_writer_lane_cannot_both_succeed() {
                 Ok(change) => {
                     fixture
                         .store
-                        .publish(Vec::new(), &change.facts)
+                        .publish(
+                            Vec::new(),
+                            &change.facts,
+                            EventSource::LocalPush,
+                            &EventContext::default(),
+                        )
                         .expect("second publication");
                     Ok(())
                 }
@@ -267,7 +282,12 @@ fn release_rejects_another_holder_and_removes_every_index_atomically() {
         seal_release(&fixture.store, &fixture.claims, holder(1), claim(1)).expect("release");
     fixture
         .store
-        .publish(Vec::new(), &release.facts)
+        .publish(
+            Vec::new(),
+            &release.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish release");
     for key in row_keys(&release.record).expect("keys") {
         assert!(
@@ -308,7 +328,12 @@ fn exact_expiry_and_persisted_clock_prevent_rollback_revival() {
         .expect("exact expiration");
     fixture
         .store
-        .publish(Vec::new(), &check.facts)
+        .publish(
+            Vec::new(),
+            &check.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("persist permitted mutation's clock");
     let restarted = ClaimClock::open(&fixture.store, Clock::injected(old_wall, Instant::now()))
         .expect("restart clock");
@@ -408,6 +433,8 @@ fn orphaned_path_index_quarantines_instead_of_allowing_a_write() {
                 expected: FactExpectation::Absent,
                 value: Some(Vec::new()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("insert damaged index");
     assert_eq!(
@@ -458,10 +485,17 @@ fn stale_expired_cleanup_cannot_remove_a_replaced_record() {
                 expected: FactExpectation::Value(old),
                 value: Some(replacement),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("replace under lane");
     assert!(matches!(
-        fixture.store.publish(Vec::new(), &cleanup.facts),
+        fixture.store.publish(
+            Vec::new(),
+            &cleanup.facts,
+            EventSource::LocalPush,
+            &EventContext::default()
+        ),
         Err(StoreError::StaleFact { .. })
     ));
     assert_eq!(
@@ -585,7 +619,12 @@ fn seal_envelope_settles_on_publish_and_aborts_on_drop() {
     assert!(record.is_some());
     fixture
         .store
-        .publish(Vec::new(), &facts)
+        .publish(
+            Vec::new(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish seal");
     assert_eq!(
         write_error(seal_write(
@@ -640,7 +679,12 @@ fn seal_envelope_settles_on_publish_and_aborts_on_drop() {
     let (facts, _, _) = released.settle();
     fixture
         .store
-        .publish(Vec::new(), &facts)
+        .publish(
+            Vec::new(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish release");
     seal_write(&fixture.store, &fixture.claims, holder(2), &[path("src/a")])
         .expect("released write");
@@ -680,7 +724,12 @@ fn mutation_seal_covers_declared_write_paths() {
     let (facts, _, _) = envelope.settle();
     fixture
         .store
-        .publish(Vec::new(), &facts)
+        .publish(
+            Vec::new(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish fence");
 }
 

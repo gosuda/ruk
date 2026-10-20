@@ -48,7 +48,7 @@ use std::io::{Read, Write};
 use ruk_core::LfsMode;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
-use ruk_core::store::{FactMutation, Store};
+use ruk_core::store::{EventContext, EventSource, FactMutation, Store};
 
 use super::fetch::{commit_record_facts, verify_closure};
 use super::hooks::{Quarantine, ReceiveHooks, run_hook, stage_quarantine};
@@ -836,7 +836,12 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     // quarantine directory regardless of per-ref outcomes, and unreferenced
     // objects simply stay unreachable.
     if let Some(pack) = staged
-        && let Err(err) = store.publish(pack.into_objects(), &facts)
+        && let Err(err) = store.publish(
+            pack.into_objects(),
+            &facts,
+            EventSource::ReceivePack,
+            &EventContext::default(),
+        )
     {
         let err = GitError::from(err);
         let reason = sanitize(&err.to_string());
@@ -1027,7 +1032,12 @@ mod tests {
         let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
         let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
         store
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish ref");
     }
 
@@ -1440,8 +1450,13 @@ mod tests {
             )
             .expect("commit");
         let tip = commit_prepared.oid();
-        src.publish(vec![blob, tree_prepared, commit_prepared], &[])
-            .expect("publish pointer commit");
+        src.publish(
+            vec![blob, tree_prepared, commit_prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish pointer commit");
         tip
     }
 

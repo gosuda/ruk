@@ -22,7 +22,7 @@ use super::metadata::{FactPageBudget, Metadata, PublicationTxn};
 use super::types::{
     FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, SegmentManifest,
 };
-use super::{PreparationBudget, Store};
+use super::{EventContext, EventSource, PreparationBudget, Store};
 use crate::ids::{HashKind, Oid};
 
 const RAW_OBJECTS: TableDefinition<'static, &'static [u8], &'static [u8]> =
@@ -1860,7 +1860,14 @@ fn fact_page_refuses_when_store_is_quarantined() {
         FactExpectation::Absent,
         some(b"hash1"),
     )];
-    store.publish(vec![], &facts).expect("publish fact");
+    store
+        .publish(
+            vec![],
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish fact");
 
     // Verify healthy fact_page works through Store.
     let page = store

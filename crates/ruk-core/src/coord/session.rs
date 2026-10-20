@@ -943,8 +943,8 @@ mod tests {
     use crate::coord::rows::encode;
     use crate::ids::HashKind;
     use crate::protocol::Timestamp;
-    use crate::store::PreparationBudget;
     use crate::store::types::{FactExpectation, FactMutation};
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1145,6 +1145,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .unwrap();
 
@@ -1426,6 +1428,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .unwrap();
 

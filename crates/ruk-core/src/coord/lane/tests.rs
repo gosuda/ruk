@@ -41,7 +41,7 @@ use crate::protocol::{
 };
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
 use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject};
-use crate::store::{PreparationBudget, Store, StoreError};
+use crate::store::{EventContext, EventSource, PreparationBudget, Store, StoreError};
 use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState};
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -523,6 +523,8 @@ fn test_4_stale_same_workspace_rejection_and_epoch_first_fencing() {
                 expected: FactExpectation::Absent,
                 value: Some(encoded_ws),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .unwrap();
 

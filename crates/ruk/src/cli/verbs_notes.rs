@@ -35,7 +35,7 @@ use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::records::Records;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{ObjectKind, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, Store};
 use ruk_git::GitError;
 
 use super::state::{
@@ -256,7 +256,12 @@ fn store_notes_commit(store: &Store, payload: Vec<u8>) -> Result<Oid, GitError> 
         .map_err(GitError::from)?;
     let done = batch.finish().map_err(GitError::from)?;
     store
-        .publish(done.prepared_objects, &done.mutations)
+        .publish(
+            done.prepared_objects,
+            &done.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(oid)
 }

@@ -784,7 +784,7 @@ mod tests {
 
     use crate::error::ErrorCode;
     use crate::ids::HashKind;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -988,7 +988,14 @@ mod tests {
         assert_eq!(ops.last(), Some(OperationId(1)));
 
         // Publish to real store
-        store.publish(Vec::new(), &recorded.1).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &recorded.1,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         // Read header
         let header = read_header(&store, OperationId(1))
@@ -1052,7 +1059,14 @@ mod tests {
         // fragments count must be exactly 2
         assert_eq!(mutations.len(), 3); // header + part 1 + part 2
 
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let header = read_header(&store, id)
             .expect("read header")
@@ -1116,7 +1130,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader.next_delta().expect_err("unknown table must fail");
@@ -1176,7 +1197,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader.next_delta().expect_err("untracked table must fail");
@@ -1226,7 +1254,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader
@@ -1280,7 +1315,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader
@@ -1331,7 +1373,14 @@ mod tests {
                 value: Some(part1),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader.next_delta().expect_err("missing part must fail");
@@ -1392,7 +1441,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let d = reader.next_delta().expect("read delta 1").expect("present");
@@ -1463,7 +1519,14 @@ mod tests {
                 value: Some(vec![1, 2, 3, 4]),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let d = reader.next_delta().expect("read delta 1").expect("present");
@@ -1526,7 +1589,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader

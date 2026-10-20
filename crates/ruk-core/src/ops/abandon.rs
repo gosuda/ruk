@@ -18,7 +18,7 @@ use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::change_key;
 use crate::records::types::{ChangeEntry, ChangeState};
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// One request to abandon commit heads.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -52,7 +52,12 @@ pub struct AbandonResult {
 pub fn abandon(store: &Store, request: AbandonRequest) -> Result<AbandonResult, CoreError> {
     let prepared = prepare_abandon(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -217,7 +222,12 @@ mod tests {
                 .expect("prepare tree");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish tree");
             oid
         }

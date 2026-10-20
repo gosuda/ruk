@@ -505,7 +505,7 @@ mod tests {
     use crate::ids::HashKind;
     use crate::merge::Merge;
     use crate::records::Records;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     fn sample_signature(name: &str, stamp: i64) -> Signature {
         Signature {
@@ -571,7 +571,12 @@ mod tests {
 
         let batch = preparer.finish().expect("finish batch");
         store
-            .publish(batch.prepared_objects, &batch.mutations)
+            .publish(
+                batch.prepared_objects,
+                &batch.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("atomic publish");
 
         let rec_1 = records

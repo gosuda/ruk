@@ -70,7 +70,8 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
 use ruk_core::refs::{ReflogKey, StoreRefs, page_reflogs};
 use ruk_core::store::{
-    FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store,
+    EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable,
+    ObjectKind, Store,
 };
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
@@ -672,6 +673,8 @@ fn delete_reflog_key(store: &Store, key: &ReflogKey) -> Result<(), GitError> {
                 expected: FactExpectation::Value(raw),
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -3038,7 +3041,12 @@ pub(crate) fn unpack_objects(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, 
     }
     let facts = ruk_git::transport::fetch::commit_record_facts(store, &staged)?;
     store
-        .publish(staged.into_objects(), &facts)
+        .publish(
+            staged.into_objects(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(line(
         format!("stdin: ok ({count} objects unpacked)").into_bytes(),

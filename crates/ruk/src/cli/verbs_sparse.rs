@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 
 use ruk_core::ids::Oid;
 use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage};
-use ruk_core::store::Store;
+use ruk_core::store::{EventContext, EventSource, Store};
 use ruk_git::GitError;
 
 use super::state::{
@@ -287,7 +287,12 @@ fn apply_patterns(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
             .map_err(core_invalid)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     sync_sparse_worktree(ctx, &writes)?;
@@ -326,7 +331,12 @@ fn clear_skip_flags(ctx: &Ctx) -> Result<(), GitError> {
         .map_err(core_invalid)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }

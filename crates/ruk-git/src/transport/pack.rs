@@ -34,6 +34,8 @@ use gix_pack::data::entry::Header as PackHeader;
 use gix_pack::data::input::{BytesToEntriesIter, EntryDataMode, Mode};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::types::ObjectKind;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 use ruk_core::store::{PreparedObject, Store};
 
 use super::{Interrupt, stage_object};
@@ -1397,7 +1399,14 @@ mod tests {
         .expect("history ingests");
         let mut objects = staged.into_objects();
         objects.extend(staged_basic.into_objects());
-        let publication = store.publish(objects, &[]).expect("bases publish");
+        let publication = store
+            .publish(
+                objects,
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("bases publish");
         assert!(!publication.objects.is_empty());
         let thin = include_bytes!("fixtures/thin.pack");
         let staged = ingest_pack(
@@ -1461,7 +1470,14 @@ mod tests {
         let prepared = store
             .prepare(ObjectKind::Blob, base.len() as u64, &base[..], None)
             .expect("stage base");
-        store.publish(vec![prepared], &[]).expect("publish base");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let staged = ingest_pack(
             &pack[..],
             HashKind::Sha1,

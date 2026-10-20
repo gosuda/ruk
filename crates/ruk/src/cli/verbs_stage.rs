@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ruk_core::ids::HashKind;
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage, StatData};
-use ruk_core::store::Store;
+use ruk_core::store::{EventContext, EventSource, Store};
 use ruk_git::GitError;
 
 use super::state::{
@@ -104,7 +104,14 @@ pub(crate) fn add(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(Vec::new())
 }
 
@@ -330,7 +337,12 @@ pub(crate) fn mv(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
         })?;
     }
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     std::fs::rename(&src_file, &dst_file).map_err(|err| GitError::Io {
         detail: format!("renaming {}: {err}", src_file.display()),
@@ -403,7 +415,12 @@ pub(crate) fn rm(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     if !opts.is_set("cached") {
         for file in files {
@@ -562,7 +579,14 @@ pub(crate) fn update_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(Vec::new())
 }
 

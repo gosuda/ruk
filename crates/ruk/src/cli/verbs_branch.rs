@@ -31,7 +31,7 @@ use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::refs::{ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog};
-use ruk_core::store::{FactMutation, Store};
+use ruk_core::store::{EventContext, EventSource, FactMutation, Store};
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
@@ -1413,7 +1413,12 @@ fn rename_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
         let next = workspace.move_head(workspace.stamp, HeadRef::Symbolic(new_name))?;
         let mutation = workspace_mutation(raw.as_deref(), &next)?;
         store
-            .publish(Vec::new(), &[mutation])
+            .publish(
+                Vec::new(),
+                &[mutation],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(Vec::new())
@@ -1790,7 +1795,12 @@ fn checkout_orphan(
     }
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     if start.is_some() {
         sync_worktree_to_index(ctx)?;
@@ -2005,7 +2015,12 @@ fn switch_head_to(ctx: &mut Ctx, head: HeadRef) -> Result<Vec<u8>, GitError> {
     let mut mutations = reset_index_to(store, kind, tree)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     sync_worktree_to_index(ctx)?;
     emit_post_checkout(ctx, kind, old)?;
@@ -2075,7 +2090,12 @@ fn switch_head_to_merging(ctx: &mut Ctx, head: HeadRef) -> Result<Vec<u8>, GitEr
     }
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     for path in &differing {
         match new_map.get(path) {
@@ -2295,7 +2315,12 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         mutations.push(super::state::index_stamp_mutation()?);
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     for (full, body) in worktree_writes {
@@ -2364,7 +2389,12 @@ fn checkout_conflict_paths(
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         mutations.push(super::state::index_stamp_mutation()?);
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     for (full, body) in worktree_writes {
@@ -2654,7 +2684,12 @@ fn switch_orphan(ctx: &mut Ctx, name: &str, quiet: bool) -> Result<Vec<u8>, GitE
     let mut mutations = reset_index_to(store, kind, empty)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     sync_worktree_to_index(ctx)?;
     let switch_zero = kind.zero_oid().to_hex();
@@ -2895,7 +2930,12 @@ fn restore_staged(ctx: &Ctx, opts: &super::Collected, tree: Oid) -> Result<(), G
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3158,7 +3198,12 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3342,7 +3387,12 @@ fn reset_tree_intent(ctx: &Ctx, tree: Oid) -> Result<(), GitError> {
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3425,7 +3475,12 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
     index_mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     index_mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &index_mutations)
+        .publish(
+            Vec::new(),
+            &index_mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     // Scoped worktree sync: only differing paths are rewritten.
     for path in &differing {
@@ -3518,7 +3573,12 @@ pub(crate) fn move_branch_to(ctx: &Ctx, target: Oid) -> Result<(), GitError> {
             let next = workspace.move_head(workspace.stamp, HeadRef::Detached(target))?;
             let mutation = workspace_mutation(raw.as_deref(), &next)?;
             store
-                .publish(Vec::new(), &[mutation])
+                .publish(
+                    Vec::new(),
+                    &[mutation],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .map_err(GitError::from)?;
             Ok(())
         }
@@ -3534,7 +3594,12 @@ pub(crate) fn reset_index_tree(ctx: &Ctx, tree: Oid) -> Result<(), GitError> {
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3967,7 +4032,12 @@ fn append_reflog(
         mutations.push(prepare_append_reflog(store, &key, &record).map_err(GitError::from)?);
     }
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -4159,7 +4229,12 @@ fn write_symbolic(ctx: &Ctx, name: &str, target: &str) -> Result<Vec<u8>, GitErr
         let next = workspace.move_head(workspace.stamp, HeadRef::Symbolic(target_name))?;
         let mutation = workspace_mutation(raw.as_deref(), &next)?;
         store
-            .publish(Vec::new(), &[mutation])
+            .publish(
+                Vec::new(),
+                &[mutation],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
         return Ok(Vec::new());
     }
@@ -5853,7 +5928,9 @@ fn stash_push(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     let index_tree = build_index_tree(store, kind, &merged_rows(&rows))?;
     let (worktree_rows, blobs) = worktree_overlay_rows(ctx, store, kind, &rows)?;
     if !blobs.is_empty() {
-        store.publish(blobs, &[]).map_err(GitError::from)?;
+        store
+            .publish(blobs, &[], EventSource::LocalPush, &EventContext::default())
+            .map_err(GitError::from)?;
     }
     let worktree_tree = build_index_tree(store, kind, &worktree_rows)?;
     if index_tree == head_tree && worktree_tree == head_tree {
@@ -6633,7 +6710,12 @@ fn restore_stash_index(
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }

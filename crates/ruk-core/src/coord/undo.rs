@@ -331,7 +331,7 @@ mod tests {
     use crate::ids::{HashKind, Oid};
     use crate::protocol::Timestamp;
     use crate::refdata::RefTarget;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     struct Fixture {
         root: std::path::PathBuf,
@@ -373,7 +373,12 @@ mod tests {
             let mut facts = changes.to_vec();
             facts.extend(mutations);
             self.store
-                .publish(Vec::new(), &facts)
+                .publish(
+                    Vec::new(),
+                    &facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish operation and its state");
             id
         }
@@ -436,7 +441,12 @@ mod tests {
         let deleted = ref_target(1);
         fixture
             .store
-            .publish(Vec::new(), &[ref_set(b"refs/heads/a", &deleted)])
+            .publish(
+                Vec::new(),
+                &[ref_set(b"refs/heads/a", &deleted)],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("seed the ref the operation deletes");
         let id = fixture.record(
             Method::BookmarkDelete,
@@ -449,7 +459,12 @@ mod tests {
         );
         fixture
             .store
-            .publish(Vec::new(), &[ref_set(b"refs/heads/a/b", &ref_target(2))])
+            .publish(
+                Vec::new(),
+                &[ref_set(b"refs/heads/a/b", &ref_target(2))],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("a sibling ref lands");
         let err = prepare_undo(&fixture.store, id).expect_err("directory/file clash refuses");
         assert_eq!(err.code, ErrorCode::EInvalid);
@@ -485,7 +500,12 @@ mod tests {
         };
         fixture
             .store
-            .publish(Vec::new(), &[moved])
+            .publish(
+                Vec::new(),
+                &[moved],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("a later write lands");
         let err = prepare_undo(&fixture.store, id).expect_err("the key has moved");
         assert_eq!(err.code, ErrorCode::EUndoConflict);

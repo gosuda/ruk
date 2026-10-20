@@ -19,9 +19,9 @@ use super::{
 };
 use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
-    DEFAULT_EVENT_RETENTION_SECONDS, DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS,
-    DEFAULT_RETENTION_INTERVAL_MS, DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE,
-    DEFAULT_TRANSPORT_PERMITS, DaemonConfig,
+    DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_RETENTION_INTERVAL_MS,
+    DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE, DEFAULT_TRANSPORT_PERMITS,
+    DaemonConfig,
 };
 use ruk_core::bytes::ByteString;
 use ruk_core::change::{LeaseId, OperationId, PlanId, RequestId, SessionId, StoreId};
@@ -41,7 +41,7 @@ use ruk_core::protocol::{
     TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
-use ruk_core::store::{ObjectKind, PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
 
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
@@ -56,7 +56,14 @@ fn seed_commit(repo_dir: &Path) -> Oid {
         .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
         .expect("prepare empty tree");
     let tree_oid = tree.oid();
-    store.publish(vec![tree], &[]).expect("publish empty tree");
+    store
+        .publish(
+            vec![tree],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish empty tree");
     let signature = Signature {
         name: ByteString::from("Tag"),
         email: ByteString::from("tag@example.invalid"),
@@ -79,7 +86,12 @@ fn seed_commit(repo_dir: &Path) -> Oid {
     .expect("prepare seed commit");
     let oid = prepared.output.oid.expect("seed commit is a Git commit");
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish seed commit");
     oid
 }
@@ -178,7 +190,12 @@ fn seed_ref(repo_dir: &Path, name: &str, oid: Oid) {
         RefTransaction::new(store.hash_kind(), vec![update]).expect("ref transaction");
     let prepared = prepare_checked_transaction(&store, &transaction).expect("prepare ref");
     store
-        .publish(Vec::new(), &prepared.into_mutations())
+        .publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish ref");
 }
 
@@ -530,7 +547,10 @@ fn minimal_config_document_yields_new_defaults() {
     );
     assert_eq!(cfg.hook_max_commands, DEFAULT_HOOK_MAX_COMMANDS);
     assert_eq!(cfg.default_branch, DEFAULT_DEFAULT_BRANCH);
-    assert_eq!(cfg.event_retention_seconds, DEFAULT_EVENT_RETENTION_SECONDS);
+    assert_eq!(
+        cfg.event_retention_seconds,
+        ruk_core::coord::DEFAULT_EVENT_RETENTION_SECONDS
+    );
     assert_eq!(cfg.archive_max_bytes(), DEFAULT_ARCHIVE_MAX_BYTES);
     assert_eq!(cfg.compare_max_commits(), DEFAULT_COMPARE_MAX_COMMITS);
     assert_eq!(cfg.search_max_scan_bytes(), DEFAULT_SEARCH_MAX_SCAN_BYTES);
@@ -1053,6 +1073,103 @@ async fn git_service_advertise_routes_by_protocol() {
     assert!(
         v2_text.contains("ls-refs"),
         "v2 advertisement carries v2 capabilities: {v2_text}"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn events_increase_strictly_across_lane_and_receive() {
+    let root = temp_root("events-order");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let registry = Arc::new(Registry::new(vec![root.to_path_buf()]).expect("registry"));
+    registry.set_runtime(tokio::runtime::Handle::current());
+    let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+    let uid = client.peer_cred().expect("socket pair credentials").uid();
+    let refs = ConnectionRefs {
+        registry: Arc::clone(&registry),
+        executor: BoundedExecutor::new(4).expect("executor"),
+        window_bytes: INITIAL_STREAM_WINDOW_BYTES,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: vec![uid],
+    };
+    let task = tokio::spawn(async move { serve_connection(server, refs).await });
+    let mut driver = Driver { conn: client };
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let tag_args = TagSetArgs {
+        name: RefName::new("refs/tags/v1").expect("tag name"),
+        target: commit,
+        annotation: None,
+        expected: RefExpect::Absent,
+    };
+    let args_json = sonic_rs::to_string(&tag_args).expect("tag args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "tag.set",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let envelope = typed_success(&stdout);
+    assert!(
+        matches!(envelope.body, ReplyBody::Success(Reply::TagSet(_))),
+        "lane mutation lands"
+    );
+
+    let zero = "0".repeat(40);
+    let mut request = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    request.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some("sess-1"),
+        Some("req-del-1"),
+    );
+    let (_, exit) = driver.run_git(7, &payload, &[request]).await;
+    assert_eq!(exit.exit_code, 0);
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let page = coordinator
+        .store()
+        .fact_page(
+            ruk_core::store::FactTable::Events,
+            None,
+            ruk_core::store::FactPageBudget::new(100, usize::MAX),
+        )
+        .expect("read events");
+    let seqs: Vec<u64> = page
+        .rows
+        .iter()
+        .map(|row| u64::from_be_bytes(row.key.as_slice().try_into().expect("8-byte event key")))
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3],
+        "the seeded ref, the lane tag, and the receive delete share one strict sequence"
     );
 
     drop(driver);

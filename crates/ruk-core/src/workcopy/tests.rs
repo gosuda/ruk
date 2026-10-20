@@ -22,7 +22,8 @@ use crate::heads::Head;
 use crate::ids::{HashKind, Oid};
 use crate::index::{FileMode, RepoPath, StatData, StatTime};
 use crate::store::{
-    FactExpectation, FactMutation, FactTable, ObjectKind, PreparationBudget, Store, StoreError,
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, ObjectKind,
+    PreparationBudget, Store, StoreError,
 };
 use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState};
 use crate::{ErrorCode, WorkspaceId};
@@ -90,7 +91,14 @@ impl Fixture {
             .prepare(ObjectKind::Tree, 0, &[][..], None)
             .expect("prepare empty tree");
         let empty_tree = empty.oid();
-        store.publish(vec![empty], &[]).expect("publish empty tree");
+        store
+            .publish(
+                vec![empty],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish empty tree");
         let change = ChangeId::generate();
         let head = Head::Git { oid: empty_tree };
         let state = WorkspaceState::Native(NativeWorkspace::new(change, head, scope));
@@ -143,14 +151,24 @@ impl Fixture {
         match self.snapshot(base, watch) {
             SnapshotOutcome::NoChange { cache } => {
                 self.store
-                    .publish(Vec::new(), &cache)
+                    .publish(
+                        Vec::new(),
+                        &cache,
+                        EventSource::LocalPush,
+                        &EventContext::default(),
+                    )
                     .expect("publish cache");
                 base
             }
             SnapshotOutcome::Changed(prepared) => {
                 let tree = prepared.descriptor.tree;
                 self.store
-                    .publish(prepared.objects, &prepared.facts)
+                    .publish(
+                        prepared.objects,
+                        &prepared.facts,
+                        EventSource::LocalPush,
+                        &EventContext::default(),
+                    )
                     .expect("publish snapshot");
                 tree
             }
@@ -392,7 +410,12 @@ fn first_snapshot_crawls_and_never_records_the_internal_directory() {
     let tree = prepared.descriptor.tree;
     fixture
         .store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish");
     let files = fixture.files(tree);
     assert_eq!(
@@ -502,7 +525,12 @@ fn rebuild_touches_only_dirty_ancestors_and_reuses_untouched_subtrees() {
     let next = prepared.descriptor.tree;
     fixture
         .store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish");
     assert_eq!(fixture.subtree(next, "y"), y_before);
     assert_eq!(
@@ -543,6 +571,8 @@ fn an_open_journal_blocks_snapshot_and_status_reports_it() {
                 expected: FactExpectation::Absent,
                 value: Some(b"journal".to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("open journal");
     let error = snapshot(&fixture.store, &fixture.input(fixture.empty_tree, None))
@@ -571,11 +601,18 @@ fn a_journal_opened_after_the_check_fails_the_snapshot_publication() {
                 expected: FactExpectation::Absent,
                 value: Some(b"journal".to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("open journal");
     let error = fixture
         .store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect_err("the guard must fence the journal");
     assert!(matches!(
         error,
@@ -653,6 +690,8 @@ fn explicit_write_hashes_bytes_the_stat_cache_would_trust() {
                 expected: FactExpectation::Value(bytes),
                 value: Some(encode_row("row", &forged).expect("encode")),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("forge row");
     assert!(
@@ -682,7 +721,12 @@ fn explicit_write_hashes_bytes_the_stat_cache_would_trust() {
     let next = prepared.descriptor.tree;
     fixture
         .store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish write");
     assert_eq!(fixture.files(next)["f"], fixture.blob(b"AFTER!\n"));
 
@@ -772,7 +816,12 @@ fn snapshot_skips_ignored_untracked_files_but_write_includes_them() {
     let tree = prepared.descriptor.tree;
     fixture
         .store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish");
     assert_eq!(fixture.files(tree).len(), 1);
 

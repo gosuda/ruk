@@ -26,7 +26,7 @@ use std::collections::HashSet;
 
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{ObjectKind, PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
 use ruk_git::transport::Interrupt;
@@ -512,7 +512,12 @@ pub(crate) fn clone_bundle(
     let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(head_name), Scope::Full);
     let mutation = workspace_mutation(None, &workspace)?;
     dst_store
-        .publish(Vec::new(), &[mutation])
+        .publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     config_write(&dst_store, &format!("remote.{origin}.url"), src)?;
     config_write(
@@ -633,7 +638,12 @@ fn ingest_bundle_pack(
 fn publish_staged(store: &Store, staged: StagedPack) -> Result<(), GitError> {
     let facts = ruk_git::transport::fetch::commit_record_facts(store, &staged)?;
     store
-        .publish(staged.into_objects(), &facts)
+        .publish(
+            staged.into_objects(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }

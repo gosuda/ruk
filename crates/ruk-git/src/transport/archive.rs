@@ -59,6 +59,8 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::RefTarget;
 use ruk_core::store::types::ObjectKind;
 use ruk_core::store::{ChunkDecision, Store};
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 
 use super::pack::object_links;
 use super::pktline::{Packet, PktReader, encode_data, encode_flush, send};
@@ -889,7 +891,14 @@ mod tests {
         let len = u64::try_from(bytes.len()).expect("fixture fits");
         let prepared = store.prepare(kind, len, bytes, None).expect("prepare");
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
         oid
     }
 
@@ -902,7 +911,12 @@ mod tests {
         let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
         let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
         store
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish ref");
     }
 

@@ -31,6 +31,7 @@ use crate::protocol::{
 };
 use crate::refs::StoreRefs;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
+use crate::store::{EventContext, EventSource};
 use crate::store::{Store, StoreError};
 
 /// Coalesced duplicate reply channels keyed by `(session, request)`.
@@ -84,6 +85,16 @@ struct ActiveMutation {
     candidate: Box<MutationCandidate>,
     reply_tx: Option<oneshot::Sender<Result<Reply, CoreError>>>,
     allocated_op: Option<OperationId>,
+}
+
+/// The event context of one candidate's rows: the candidate's session,
+/// idempotency key, and allocated operation.
+fn candidate_attribution(m: &ActiveMutation) -> EventContext {
+    EventContext {
+        operation: m.allocated_op,
+        request_id: Some(m.candidate.request_id.to_string()),
+        session: Some(m.candidate.session.id()),
+    }
 }
 
 /// One active internal candidate being committed in the current batch.
@@ -320,6 +331,7 @@ pub(crate) fn commit_batch(
     let mut ops = CheckedOperationId::new(initial_last_op.map_or(0, |id| id.0), u64::MAX);
     let mut parent_op = initial_last_op;
     let mut all_facts: Vec<FactMutation> = Vec::new();
+    let mut all_contexts: Vec<EventContext> = Vec::new();
 
     for m in &mut active_mutations {
         let meta = OpMeta {
@@ -333,8 +345,12 @@ pub(crate) fn commit_batch(
         let op_record = oplog::record(&mut ops, parent_op, meta, &m.candidate.facts)?;
         if let Some((op_id, op_mutations)) = op_record {
             parent_op = Some(op_id);
-            all_facts.extend(op_mutations);
             m.allocated_op = Some(op_id);
+            all_contexts.extend(std::iter::repeat_n(
+                candidate_attribution(m),
+                op_mutations.len(),
+            ));
+            all_facts.extend(op_mutations);
         }
     }
 
@@ -369,15 +385,22 @@ pub(crate) fn commit_batch(
             expected: FactExpectation::Absent,
             value: Some(encoded_receipt),
         });
+        all_contexts.push(EventContext::default());
     }
 
     // 6. Collect domain mutations and internal transaction mutations.
     for m in &active_mutations {
+        let attr = candidate_attribution(m);
+        all_contexts.extend(std::iter::repeat_n(attr, m.candidate.facts.len()));
         all_facts.extend(m.candidate.facts.iter().cloned());
     }
 
     let mut internal_updated_sessions: HashMap<SessionId, Arc<SessionRow>> = HashMap::new();
     for internal in &valid_internals {
+        all_contexts.extend(std::iter::repeat_n(
+            EventContext::default(),
+            internal.facts.len(),
+        ));
         all_facts.extend(internal.facts.iter().cloned());
         match &internal.payload {
             InternalPayload::SessionOpen { id, row, .. } => {
@@ -388,6 +411,7 @@ pub(crate) fn commit_batch(
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 });
+                all_contexts.push(EventContext::default());
                 internal_updated_sessions.insert(*id, Arc::clone(row));
             }
             InternalPayload::SessionExpireLatch { id, row, .. } => {
@@ -400,6 +424,7 @@ pub(crate) fn commit_batch(
                     expected,
                     value: Some(encoded),
                 });
+                all_contexts.push(EventContext::default());
                 internal_updated_sessions.insert(*id, Arc::clone(row));
             }
             InternalPayload::Sweep { cursors } => {
@@ -448,6 +473,7 @@ pub(crate) fn commit_batch(
                 expected: FactExpectation::Value(old_bytes),
                 value: Some(encoded),
             });
+            all_contexts.push(EventContext::default());
             updated_session_rows.insert(session_id, Arc::new(row));
         }
     }
@@ -462,6 +488,7 @@ pub(crate) fn commit_batch(
         expected: current_head_bytes.map_or(FactExpectation::Absent, FactExpectation::Value),
         value: Some(encoded_head),
     });
+    all_contexts.push(EventContext::default());
 
     // 9. Final cancellation check immediately before irreversible store publish.
     cancel.check()?;
@@ -472,7 +499,8 @@ pub(crate) fn commit_batch(
         all_objects.append(&mut m.candidate.objects);
     }
 
-    let publish_result = store.publish(all_objects, &all_facts);
+    let publish_result =
+        store.publish_detailed(all_objects, &all_facts, EventSource::Lane, &all_contexts);
     if let Err(store_err) = publish_result {
         let failure_kind = classify_store_error(&store_err);
         let core_err = CoreError::from(store_err);

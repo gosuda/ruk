@@ -57,6 +57,8 @@ pub(crate) struct Registry {
     runtime: Mutex<Option<tokio::runtime::Handle>>,
     /// Milliseconds between per-coordinator retention sweeps; zero disables them.
     retention_interval_ms: AtomicU64,
+    /// Seconds pruning event rows on each sweep.
+    event_retention_seconds: AtomicU64,
 }
 
 impl fmt::Debug for Registry {
@@ -107,6 +109,7 @@ impl Registry {
             next_handle: AtomicU64::new(1),
             runtime: Mutex::new(None),
             retention_interval_ms: AtomicU64::new(super::DEFAULT_RETENTION_INTERVAL_MS),
+            event_retention_seconds: AtomicU64::new(super::DEFAULT_EVENT_RETENTION_SECONDS),
         })
     }
 
@@ -131,6 +134,15 @@ impl Registry {
             u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    /// Sets the horizon pruning event rows, in seconds.
+    ///
+    /// `serve` calls this once from the daemon configuration before serving;
+    /// each coordinator opened afterwards sweeps events to this horizon.
+    pub(crate) fn set_event_retention_seconds(&self, seconds: u64) {
+        self.event_retention_seconds
+            .store(seconds, Ordering::Relaxed);
     }
 
     /// Resolves `requested` to a canonical path beneath a configured root,
@@ -258,6 +270,8 @@ impl Registry {
             canonical.to_path_buf(),
         )?);
         let runner = coordinator.spawn_on(&runtime)?;
+        coordinator
+            .set_event_retention_seconds(self.event_retention_seconds.load(Ordering::Relaxed));
         spawn_retention(&runtime, &coordinator, self.retention_interval_ms());
         entry.coordinator = Some(Arc::clone(&coordinator));
         entry.runner = Some(runner);

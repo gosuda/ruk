@@ -41,7 +41,8 @@ use std::collections::{BTreeMap, HashMap};
 use ruk_core::ids::Oid;
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::store::{
-    FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store,
+    EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable,
+    ObjectKind, Store,
 };
 use ruk_git::GitError;
 use serde::{Deserialize, Serialize};
@@ -1026,7 +1027,12 @@ fn read_tree_empty(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     if opts.is_set("u") {
         ctx.require_worktree()?;
@@ -1133,7 +1139,12 @@ fn read_tree_merge(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     if opts.is_set("u") {
         ctx.require_worktree()?;
@@ -1753,7 +1764,14 @@ fn rerere_replay(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
         let mut all = mutations;
         all.push(workspace_mutation(raw.as_deref(), &next)?);
-        store.publish(Vec::new(), &all).map_err(GitError::from)?;
+        store
+            .publish(
+                Vec::new(),
+                &all,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .map_err(GitError::from)?;
         out.extend_from_slice(
             format!(
                 "Resolved '{}' using previous resolution.\n",
@@ -1935,7 +1953,12 @@ fn rerere_forget(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(Vec::new())
@@ -1972,7 +1995,12 @@ fn rerere_clear(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError>
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(Vec::new())
@@ -2009,7 +2037,12 @@ fn rerere_gc(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(line(
@@ -2083,6 +2116,8 @@ fn rerere_write(ctx: &Ctx, id: &str, record: &RerereRecord) -> Result<(), GitErr
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -2135,6 +2170,8 @@ fn rerere_mark_active(ctx: &Ctx, path: &[u8], id: &str) -> Result<(), GitError> 
                 expected: FactExpectation::Any,
                 value: Some(id.as_bytes().to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -2154,6 +2191,8 @@ fn rerere_unmark_active(ctx: &Ctx, path: &[u8]) -> Result<(), GitError> {
                 expected: FactExpectation::Any,
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())

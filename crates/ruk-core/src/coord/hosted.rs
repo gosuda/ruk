@@ -20,7 +20,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 use std::time::Instant as StdInstant;
 
@@ -138,6 +141,9 @@ impl PreparedMutation {
     }
 }
 
+/// Default horizon keeping event rows, in seconds (seven days).
+pub const DEFAULT_EVENT_RETENTION_SECONDS: u64 = 604_800;
+
 /// One repository's hosted coordinator.
 ///
 /// Owns the store handle, live session table, policy source, admission
@@ -157,6 +163,7 @@ pub struct HostedCoordinator {
     shutdown: Cancel,
     leases: Arc<LeaseRegistry>,
     page_guards: Mutex<HashMap<LeaseId, (OwnerGuard, StdInstant)>>,
+    event_retention_seconds: AtomicU64,
 }
 
 impl core::fmt::Debug for HostedCoordinator {
@@ -216,7 +223,14 @@ impl HostedCoordinator {
             shutdown,
             leases,
             page_guards: Mutex::new(HashMap::new()),
+            event_retention_seconds: AtomicU64::new(DEFAULT_EVENT_RETENTION_SECONDS),
         })
+    }
+
+    /// Sets the horizon pruning event rows, in seconds.
+    pub fn set_event_retention_seconds(&self, seconds: u64) {
+        self.event_retention_seconds
+            .store(seconds, Ordering::Relaxed);
     }
 
     /// Returns the owned store for request preparation reads.
@@ -1222,6 +1236,8 @@ pub struct RetentionReport {
     pub sessions_examined: usize,
     /// Expired session rows deleted through the lane in this pass.
     pub sessions_deleted: usize,
+    /// Expired event rows deleted through the lane in this pass.
+    pub events_deleted: usize,
     /// Live read leases inspected for expiry in this pass.
     pub leases_examined: usize,
     /// Expired read leases dropped in this pass.
@@ -1279,22 +1295,35 @@ impl HostedCoordinator {
         // owner guards retires the slots without touching any fact table.
         self.leases.sweep_expiry()?;
         let (leases_examined, leases_expired) = self.prune_expired_read_leases(current.mono)?;
+        let horizon = self.event_retention_seconds.load(Ordering::Relaxed);
+        let cutoff = current.wall.duration_since(jiff::Timestamp::UNIX_EPOCH);
+        let cutoff_millis = u64::try_from(cutoff.as_millis()).map_err(|_| {
+            CoreError::new(ErrorCode::ELimit, "retention clock millis overflow u64")
+        })?;
+        let cutoff_millis = cutoff_millis.saturating_sub(horizon.saturating_mul(1_000));
+        let event_deletions = self
+            .store
+            .sweep_events_page(cutoff_millis, Store::SWEEP_EVENTS_PAGE_ROWS)?;
         let report = RetentionReport {
             receipts_examined: receipts_page.examined_rows,
             receipts_deleted: receipts_page.deletions.len(),
             sessions_examined: sessions_page.examined_rows,
             sessions_deleted: sessions_page.deletions.len(),
+            events_deleted: event_deletions.len(),
             leases_examined,
             leases_expired,
         };
         // Lease expiry never publishes: it frees in-memory guards only. The
-        // lane commit runs only when durable receipts/sessions need it.
-        let durable_empty = report.receipts_deleted == 0 && report.sessions_deleted == 0;
+        // lane commit runs only when durable receipts/sessions/events need it.
+        let durable_empty = report.receipts_deleted == 0
+            && report.sessions_deleted == 0
+            && report.events_deleted == 0;
         if durable_empty && sessions_page.cursors == loaded.sweep {
             return Ok(report);
         }
         let mut facts = receipts_page.deletions;
         facts.extend(sessions_page.deletions);
+        facts.extend(event_deletions);
         let mut payload_bytes: usize = 0;
         for fact in &facts {
             payload_bytes = payload_bytes.saturating_add(fact.key.len());
@@ -1424,7 +1453,7 @@ mod tests {
     use crate::store::PreparationBudget;
     use crate::store::types::FactExpectation;
     use crate::store::types::{FactMutation, FactTable};
-    use crate::store::{ObjectKind, Store};
+    use crate::store::{EventContext, EventSource, ObjectKind, Store};
 
     static SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1528,6 +1557,8 @@ mod tests {
                     expected: crate::store::types::FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish receipt");
         let checkpoint = |_: Progress| Ok::<(), CoreError>(());
@@ -1806,6 +1837,8 @@ mod tests {
                         value: Some(encoded_head),
                     },
                 ],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("seed expired session and ledger");
 
@@ -1874,7 +1907,12 @@ mod tests {
             let oid = prepared.oid();
             coord
                 .store()
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish blob");
             blobs.push((oid, bytes));
         }
@@ -2016,7 +2054,12 @@ mod tests {
             .expect("acquire claim");
             coord
                 .store()
-                .publish(Vec::new(), &change.facts)
+                .publish(
+                    Vec::new(),
+                    &change.facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish claim");
         }
     }
@@ -2049,7 +2092,14 @@ mod tests {
             .prepare(ObjectKind::Commit, length, body, None)
             .expect("prepare commit");
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish commit");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish commit");
         oid
     }
 
@@ -2074,7 +2124,12 @@ mod tests {
             if !prepared.mutations.is_empty() {
                 coord
                     .store()
-                    .publish(Vec::new(), &prepared.mutations)
+                    .publish(
+                        Vec::new(),
+                        &prepared.mutations,
+                        EventSource::LocalPush,
+                        &EventContext::default(),
+                    )
                     .expect("publish attestation");
             }
         }
@@ -2792,7 +2847,12 @@ mod tests {
         let tree_oid = tree.oid();
         coord
             .store()
-            .publish(vec![tree], &[])
+            .publish(
+                vec![tree],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish lane tree");
 
         // Sessions open sequentially up front so the storm is pure
@@ -2914,7 +2974,12 @@ mod tests {
         let tree_oid = tree.oid();
         coord
             .store()
-            .publish(vec![tree], &[])
+            .publish(
+                vec![tree],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish lane tree");
 
         // One seed commit with no ref move; every branch starts unborn and

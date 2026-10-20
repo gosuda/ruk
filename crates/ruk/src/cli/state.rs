@@ -33,7 +33,8 @@ use ruk_core::refdata::{
 };
 use ruk_core::refs::{StoreRefs, page_refs, prepare_checked_transaction};
 use ruk_core::store::{
-    FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store,
+    EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable,
+    ObjectKind, Store,
 };
 pub(crate) use ruk_core::workspace::ResolvedHead;
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
@@ -460,7 +461,12 @@ pub(crate) fn refresh_stats_after_write(
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -549,6 +555,8 @@ pub(crate) fn config_write(store: &Store, name: &str, value: &str) -> Result<(),
                 expected,
                 value: Some(value.as_bytes().to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -572,6 +580,8 @@ pub(crate) fn config_unset(store: &Store, name: &str) -> Result<(), GitError> {
                 expected: FactExpectation::Value(raw),
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -641,6 +651,8 @@ pub(crate) fn sequencer_write(
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -659,6 +671,8 @@ pub(crate) fn sequencer_delete(store: &Store, verb: &str) -> Result<(), GitError
                 expected: FactExpectation::Any,
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -691,6 +705,8 @@ pub(crate) fn pseudo_write(store: &Store, name: &str, value: Vec<u8>) -> Result<
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -707,6 +723,8 @@ pub(crate) fn pseudo_delete(store: &Store, name: &str) -> Result<(), GitError> {
                 expected: FactExpectation::Any,
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -757,6 +775,8 @@ pub(crate) fn stash_write(store: &Store, slot: u64, entry: &StashSlot) -> Result
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -779,6 +799,8 @@ pub(crate) fn stash_drop(store: &Store, slot: u64) -> Result<(), GitError> {
                 expected: FactExpectation::Value(raw),
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -838,6 +860,8 @@ fn counter_alloc(store: &Store, key: &[u8]) -> Result<u64, GitError> {
                 expected,
                 value: Some(next.to_le_bytes().to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(current)
@@ -876,7 +900,12 @@ pub(crate) fn apply_refs(
         .map(|prepared| prepared.update.clone())
         .collect();
     store
-        .publish(Vec::new(), &prepared.into_mutations())
+        .publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(updates_back
         .into_iter()

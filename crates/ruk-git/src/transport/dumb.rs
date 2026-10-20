@@ -31,8 +31,9 @@ use flate2::write::ZlibEncoder;
 use ruk_core::ids::Oid;
 use ruk_core::refdata::RefName;
 use ruk_core::refs::StoreRefs;
-use ruk_core::store::ObjectKind;
-use ruk_core::store::Store;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
+use ruk_core::store::{ObjectKind, Store};
 
 use super::pack::{IngestLimits, object_links};
 use super::read_object;
@@ -244,7 +245,14 @@ pub fn dumb_object(store: &Store, oid_or_path: &str, out: &mut dyn Write) -> Res
 pub(crate) fn stage_for_test(store: &Store, kind: ObjectKind, bytes: &[u8]) -> Oid {
     let prepared = stage_object(store, kind, bytes, None).expect("stage");
     let oid = prepared.oid();
-    store.publish(vec![prepared], &[]).expect("publish");
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
     oid
 }
 
@@ -279,7 +287,12 @@ mod tests {
         let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
         let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
         store
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish ref");
     }
 

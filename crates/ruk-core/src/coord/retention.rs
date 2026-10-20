@@ -596,7 +596,7 @@ mod tests {
     use crate::protocol::{
         BoundedList, MutationOutcome, ReceiptRef, Reply, RequestDigest, WsTakeReply,
     };
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
     use crate::workspace::{NativeWorkspace, Scope, WorkspaceState};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -961,6 +961,8 @@ mod tests {
                         value: Some(enc_exp2.clone()),
                     },
                 ],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish test receipts");
 
@@ -1072,6 +1074,8 @@ mod tests {
                         value: Some(enc4.clone()),
                     },
                 ],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish sessions");
 
@@ -1135,6 +1139,8 @@ mod tests {
                         value: Some(enc2.clone()),
                     },
                 ],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish 2 receipts");
 
@@ -1185,6 +1191,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(vec![0xff, 0xfe, 0xfd]),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -1209,6 +1217,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(vec![1, 2, 3]),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -1236,6 +1246,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(vec![1, 2, 3]),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 

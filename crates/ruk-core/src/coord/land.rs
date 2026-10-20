@@ -61,7 +61,7 @@ use crate::refdata::{
 };
 use crate::refs::{StoreRefs, prepare_checked_transaction};
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
-use crate::store::{Store, decode, encode};
+use crate::store::{EventContext, EventSource, Store, decode, encode};
 
 /// How long a land plan stays executable after creation.
 pub(super) const LAND_PLAN_TTL: SignedDuration = SignedDuration::from_hours(1);
@@ -330,7 +330,12 @@ pub(super) fn land_prepare(
     checkpoint: &Checkpoint<'_>,
 ) -> Result<LandPlan, CoreError> {
     let (plan, mutation) = prepare_land_plan(store, request, checkpoint)?;
-    store.publish(Vec::new(), &[mutation])?;
+    store.publish(
+        Vec::new(),
+        &[mutation],
+        EventSource::Land,
+        &EventContext::default(),
+    )?;
     Ok(plan)
 }
 
@@ -430,7 +435,12 @@ pub(super) fn land_execute(
         expected: FactExpectation::Value(stored_bytes),
         value: None,
     });
-    store.publish(Vec::new(), &mutations)?;
+    store.publish(
+        Vec::new(),
+        &mutations,
+        EventSource::Land,
+        &EventContext::default(),
+    )?;
     Ok(LandOutcome {
         plan: plan.plan,
         target: plan.target.clone(),

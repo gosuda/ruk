@@ -603,7 +603,10 @@ fn test_graph_installed_file_reopen() {
 fn measure_object_and_row_work() {
     use std::time::Instant;
 
-    use crate::store::{FactMutation, FactPageBudget, FactTable, PreparationBudget, Store};
+    use crate::store::{
+        EventContext, EventSource, FactMutation, FactPageBudget, FactTable, PreparationBudget,
+        Store,
+    };
 
     let kind = HashKind::Sha1;
     let budget = Arc::new(ByteBudget::new(256 * 1024 * 1024));
@@ -743,7 +746,14 @@ fn measure_object_and_row_work() {
             value: Some(b"target".to_vec()),
         });
     }
-    store.publish(Vec::new(), &facts).expect("publish refs");
+    store
+        .publish(
+            Vec::new(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish refs");
     println!(
         "MEASURE ref_publish rows=10000 ms={}",
         t.elapsed().as_millis()
@@ -791,7 +801,14 @@ fn measure_object_and_row_work() {
                 .expect("prepare"),
         );
     }
-    store.publish(prepared, &[]).expect("publish blobs");
+    store
+        .publish(
+            prepared,
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish blobs");
     println!(
         "MEASURE blob_publish objects=1000 ms={}",
         t.elapsed().as_millis()

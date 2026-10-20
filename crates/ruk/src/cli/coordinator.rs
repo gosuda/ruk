@@ -34,7 +34,7 @@ use ruk_core::ops::{
 };
 use ruk_core::protocol::{GitCommitArgs, GitCommitRefUpdate, Mutation, NewReply, Reply, Request};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
@@ -309,7 +309,12 @@ fn direct_stash(ctx: &mut Ctx, request: NewRequest) -> Result<Oid, GitError> {
     };
     if missing {
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(oid)
@@ -637,7 +642,12 @@ fn advance_head_to(
             let next = workspace.move_head(workspace.stamp, HeadRef::Detached(new_oid))?;
             let mutation = state::workspace_mutation(raw.as_deref(), &next)?;
             store
-                .publish(Vec::new(), &[mutation])
+                .publish(
+                    Vec::new(),
+                    &[mutation],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .map_err(GitError::from)?;
             Ok(())
         }

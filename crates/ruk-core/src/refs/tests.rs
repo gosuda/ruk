@@ -11,7 +11,9 @@ use crate::conflict::{Signature, TzOffset};
 use crate::ids::{HashKind, Oid};
 use crate::merge::Merge;
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use crate::store::{FactExpectation, FactMutation, FactTable, PreparationBudget, Store};
+use crate::store::{
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, PreparationBudget, Store,
+};
 
 struct TestStore {
     root: PathBuf,
@@ -38,7 +40,12 @@ impl TestStore {
 
     fn publish_mutations(&self, facts: &[FactMutation]) {
         self.store
-            .publish(Vec::new(), facts)
+            .publish(
+                Vec::new(),
+                facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish test mutations");
     }
 }

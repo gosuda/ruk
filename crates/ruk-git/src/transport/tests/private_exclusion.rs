@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::store::{ObjectKind, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, Store};
 
 use crate::transport::Interrupt;
 use crate::transport::fetch::{
@@ -15,7 +15,14 @@ fn put(store: &Store, kind: ObjectKind, bytes: &[u8]) -> Oid {
     let len = u64::try_from(bytes.len()).expect("fixture fits");
     let prepared = store.prepare(kind, len, bytes, None).expect("prepare");
     let oid = prepared.oid();
-    store.publish(vec![prepared], &[]).expect("publish");
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
     oid
 }
 
@@ -176,6 +183,8 @@ fn promised_tips_leave_haves() {
         .publish(
             Vec::new(),
             &promisor_facts(b"origin", Filter::BlobNone, &[chains.private_tip]).expect("facts"),
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("promise");
     let haves = collect_haves_filtered(

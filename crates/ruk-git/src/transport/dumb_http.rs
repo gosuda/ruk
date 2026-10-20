@@ -36,6 +36,8 @@ use std::io::Read;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::Store;
 use ruk_core::store::types::ObjectKind;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 
 use super::credentials;
 use super::fetch::{FetchWireRequest, ReceivedPack};
@@ -818,7 +820,12 @@ mod tests {
         )
         .expect("prepare");
         server
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish");
 
         // One discovery GET, one pack-list GET, then one GET per closure
@@ -887,7 +894,12 @@ mod tests {
         )
         .expect("prepare");
         server
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish");
 
         // Dumb servers negotiate nothing: the filter and depth requests

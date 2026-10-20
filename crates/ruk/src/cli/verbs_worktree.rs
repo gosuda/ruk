@@ -23,7 +23,9 @@ use std::path::{Component, Path, PathBuf};
 
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Store};
+use ruk_core::store::{
+    EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable, Store,
+};
 use ruk_core::workspace::{HeadRef, ResolvedHead};
 use ruk_git::GitError;
 use serde::{Deserialize, Serialize};
@@ -249,6 +251,8 @@ fn add(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
                 expected: FactExpectation::Absent,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
 
@@ -485,6 +489,8 @@ fn remove(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
                 expected: FactExpectation::Value(raw),
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(Vec::new())
@@ -520,6 +526,8 @@ fn prune(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
                     expected: FactExpectation::Value(raw),
                     value: None,
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .map_err(GitError::from)?;
     }

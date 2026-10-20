@@ -31,6 +31,7 @@ use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage, StatData};
 use ruk_core::ops::NewRequest;
+use ruk_core::store::{EventContext, EventSource};
 use ruk_git::GitError;
 
 use super::state::{
@@ -1913,7 +1914,14 @@ fn execute_apply(ctx: &Ctx, plans: &[ApplyPlan], target: ApplyTarget) -> Result<
             .map_err(to_core_invalid)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         mutations.push(super::state::index_stamp_mutation()?);
-        store.publish(objects, &mutations).map_err(GitError::from)?;
+        store
+            .publish(
+                objects,
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .map_err(GitError::from)?;
     }
     if target != ApplyTarget::IndexOnly {
         for plan in plans {
@@ -2560,7 +2568,14 @@ fn am_apply_message(
         .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
     let tree = build_index_tree(store, kind, &merged_rows(&staged))?;
     let committer = identity(ctx, IdentityRole::Committer)?;
@@ -2805,7 +2820,14 @@ fn am_continue(
         .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(workspace_raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
     let tree = build_index_tree(store, kind, &merged_rows(&staged))?;
     let committer = identity(ctx, IdentityRole::Committer)?;

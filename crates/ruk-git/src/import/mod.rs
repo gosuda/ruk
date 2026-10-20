@@ -44,7 +44,8 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::records::ImportBatch;
 use ruk_core::refdata::RefTarget;
 use ruk_core::store::{
-    FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject, Publication, Store,
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, ObjectKind,
+    PreparedObject, Publication, Store,
 };
 
 use crate::GitError;
@@ -150,7 +151,14 @@ impl PublishSink for DirectPublish<'_> {
         objects: Vec<PreparedObject>,
         facts: Vec<FactMutation>,
     ) -> Result<Publication, GitError> {
-        self.0.publish(objects, &facts).map_err(GitError::from)
+        self.0
+            .publish(
+                objects,
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .map_err(GitError::from)
     }
 }
 

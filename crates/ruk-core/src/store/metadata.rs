@@ -842,6 +842,21 @@ impl fmt::Debug for PublicationTxn {
 }
 
 impl PublicationTxn {
+    /// Applies further fact mutations to this open transaction: the event
+    /// rows and head bump the store appends to a publication carrying ref
+    /// mutations, atomically with the batch they describe.
+    ///
+    /// # Errors
+    /// [`StoreError::StaleFact`] on expectation mismatch, [`StoreError::Invalid`]
+    /// on duplicate keys, storage failures otherwise.
+    pub(crate) fn apply_more(&self, facts: &[FactMutation]) -> Result<(), StoreError> {
+        reject_duplicate_facts(facts)?;
+        for fact in facts {
+            apply_fact(&self.txn, fact)?;
+        }
+        Ok(())
+    }
+
     /// The locator for `oid` as of this transaction.
     pub(crate) fn get_object(&self, oid: &Oid) -> Result<Option<ObjectLocation>, StoreError> {
         lookup_object(&self.txn.open_table(OBJECTS).map_err(table_error)?, oid)

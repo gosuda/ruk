@@ -77,8 +77,9 @@ pub(crate) use metadata::{decode, encode};
 pub use spool::{BudgetLimits, PreparationBudget, Spool};
 pub use stream::{ChunkDecision, StreamMeta};
 pub use types::{
-    Encoding, FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
-    Publication, ReadObject, SegmentManifest, StoreFormat,
+    EVENT_HEAD_KEY, Encoding, EventContext, EventHeadRow, EventSource, FactExpectation,
+    FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject, Publication, ReadObject,
+    SegmentManifest, StoreEvent, StoreFormat,
 };
 
 use crate::change::StoreId;
@@ -926,6 +927,8 @@ impl Store {
         &self,
         objects: Vec<PreparedObject>,
         facts: &[FactMutation],
+        source: EventSource,
+        context: &EventContext,
     ) -> Result<Publication, StoreError> {
         self.refuse_if_quarantined()?;
         if objects.is_empty() && facts.is_empty() {
@@ -934,20 +937,210 @@ impl Store {
                 generation: self.observe(self.meta.generation())?,
             });
         }
-        let outcome = self.publish_grouped(objects, facts);
+        let attribution = vec![(source, context.clone()); facts.len()];
+        let outcome = self.publish_grouped(objects, facts, attribution);
         if outcome.is_ok() {
             self.io.publications.fetch_add(1, Ordering::Relaxed);
         }
         outcome
     }
 
+    /// Commits one publication with one source and per-fact contexts: the
+    /// lane's multi-candidate batches attribute each fact to its own
+    /// candidate. `contexts` aligns 1:1 with `facts`.
+    pub(crate) fn publish_detailed(
+        &self,
+        objects: Vec<PreparedObject>,
+        facts: &[FactMutation],
+        source: EventSource,
+        contexts: &[EventContext],
+    ) -> Result<Publication, StoreError> {
+        self.refuse_if_quarantined()?;
+        if objects.is_empty() && facts.is_empty() {
+            return Ok(Publication {
+                objects: Vec::new(),
+                generation: self.observe(self.meta.generation())?,
+            });
+        }
+        if contexts.len() != facts.len() {
+            return Err(StoreError::Invalid(
+                "event attribution must align 1:1 with facts".to_owned(),
+            ));
+        }
+        let attribution: Vec<(EventSource, EventContext)> = contexts
+            .iter()
+            .map(|context| (source, context.clone()))
+            .collect();
+        let outcome = self.publish_grouped(objects, facts, attribution);
+        if outcome.is_ok() {
+            self.io.publications.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Largest events rows one retention sweep prunes per call. Sweeps run
+    /// periodically, so a backlog drains over rounds instead of one giant
+    /// transaction.
+    pub(crate) const SWEEP_EVENTS_PAGE_ROWS: usize = 10_000;
+
+    /// Builds the event rows plus head bump for one publication: one event
+    /// per `FactTable::Refs` mutation, sequenced past the stored head, with
+    /// `oldest` carried forward. Empty when the batch moves no refs. The
+    /// writer lock is held, so sequences stay strictly increasing across
+    /// lane and receive-pack publications.
+    fn emit_ref_events(
+        &self,
+        facts: &[FactMutation],
+        attribution: &[(EventSource, EventContext)],
+    ) -> Result<Vec<FactMutation>, StoreError> {
+        let mut ref_facts = Vec::new();
+        for (fact, attr) in facts.iter().zip(attribution.iter()) {
+            if fact.table == FactTable::Refs {
+                ref_facts.push((fact, attr));
+            }
+        }
+        if ref_facts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (mut head, oldest, head_raw) = self.read_event_head()?;
+        let at = Self::unix_millis()?;
+        let mut out = Vec::with_capacity(ref_facts.len() + 1);
+        for (fact, (source, context)) in ref_facts {
+            head = head
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Capacity("event sequence exhausted".to_owned()))?;
+            let event = StoreEvent {
+                name: fact.key.clone(),
+                old: match &fact.expected {
+                    FactExpectation::Value(before) => Some(before.clone()),
+                    _ => None,
+                },
+                new: fact.value.clone(),
+                at,
+                source: *source,
+                operation: context.operation,
+                request_id: context.request_id.clone(),
+                session: context.session,
+            };
+            out.push(FactMutation {
+                table: FactTable::Events,
+                key: head.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &event)?),
+            });
+        }
+        let row = EventHeadRow { head, oldest };
+        out.push(FactMutation {
+            table: FactTable::EventHead,
+            key: EVENT_HEAD_KEY.to_vec(),
+            expected: head_raw.map_or(FactExpectation::Absent, FactExpectation::Value),
+            value: Some(encode("event head", &row)?),
+        });
+        Ok(out)
+    }
+
+    /// Reads the event horizon: the last assigned sequence, the oldest
+    /// retained sequence, and the raw head row for CAS updates. Absent rows
+    /// mean no event ever committed.
+    fn read_event_head(&self) -> Result<(u64, u64, Option<Vec<u8>>), StoreError> {
+        match self.fact(FactTable::EventHead, EVENT_HEAD_KEY)? {
+            None => Ok((0, 1, None)),
+            Some(raw) => {
+                let row: EventHeadRow = decode("event head", &raw)?;
+                Ok((row.head, row.oldest, Some(raw)))
+            }
+        }
+    }
+
+    /// Builds deletion facts pruning `Events` rows older than
+    /// `cutoff_millis`, keeping the head row's `oldest` current. Reads at
+    /// most one oldest-first page per call; later sweeps drain the rest.
+    /// Empty when nothing is old enough.
+    pub(crate) fn sweep_events_page(
+        &self,
+        cutoff_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<FactMutation>, StoreError> {
+        let page = self.fact_page(
+            FactTable::Events,
+            None,
+            FactPageBudget::new(limit, usize::MAX),
+        )?;
+        if page.rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (head, oldest, head_raw) = self.read_event_head()?;
+        let mut out = Vec::new();
+        let mut kept: Option<u64> = None;
+        for row in &page.rows {
+            let event: StoreEvent = decode("event", &row.value)?;
+            if event.at < cutoff_millis {
+                out.push(FactMutation {
+                    table: FactTable::Events,
+                    key: row.key.clone(),
+                    expected: FactExpectation::Value(row.value.clone()),
+                    value: None,
+                });
+            } else if kept.is_none() {
+                kept = Some(Self::seq_from_event_key(&row.key)?);
+            }
+        }
+        if out.is_empty() {
+            return Ok(Vec::new());
+        }
+        let new_oldest = match (kept, page.more) {
+            (Some(seq), _) => oldest.max(seq),
+            (None, false) => head.saturating_add(1),
+            (None, true) => oldest,
+        };
+        if new_oldest != oldest || head_raw.is_none() {
+            let row = EventHeadRow {
+                head,
+                oldest: new_oldest,
+            };
+            out.push(FactMutation {
+                table: FactTable::EventHead,
+                key: EVENT_HEAD_KEY.to_vec(),
+                expected: head_raw.map_or(FactExpectation::Absent, FactExpectation::Value),
+                value: Some(encode("event head", &row)?),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Decodes one big-endian event sequence key.
+    ///
+    /// # Errors
+    /// `Invalid` for a short key.
+    fn seq_from_event_key(key: &[u8]) -> Result<u64, StoreError> {
+        let bytes: [u8; 8] = key
+            .try_into()
+            .map_err(|_| StoreError::Invalid("event key is not an 8-byte sequence".to_owned()))?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    /// Unix millis of the system clock, for event timestamps.
+    ///
+    /// # Errors
+    /// `E_IO` when the clock predates the epoch.
+    fn unix_millis() -> Result<u64, StoreError> {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| StoreError::Io(std::io::Error::other("clock predates the epoch")))?;
+        u64::try_from(elapsed.as_millis())
+            .map_err(|_| StoreError::Io(std::io::Error::other("clock millis overflow u64")))
+    }
+
     /// Commits one publication with the writer held: the probe, the pending
-    /// reservation, the real transaction, then append and commit.
+    /// reservation, the real transaction, the ref events, then append and
+    /// commit. Ref events and the head bump join the real transaction, so a
+    /// batch and its events commit atomically under the writer lock.
     fn publish_locked(
         &self,
         writer: &mut WriterState,
         objects: &[&PreparedObject],
         facts: &[FactMutation],
+        attribution: &[(EventSource, EventContext)],
     ) -> Result<Publication, StoreError> {
         // A read may have latched quarantine while this call waited for the
         // writer; nothing commits on a store already known to be corrupt.
@@ -968,6 +1161,8 @@ impl Store {
             drop(probe_txn);
             let pending = self.persist_pending(&probe_plan)?;
             let txn = self.observe(self.meta.begin_publication(facts))?;
+            let event_facts = self.observe(self.emit_ref_events(facts, attribution))?;
+            self.observe(txn.apply_more(&event_facts))?;
             let plan = self.observe(self.plan(&txn, objects))?;
             Ok::<_, StoreError>((pending, txn, plan))
         })();
@@ -1916,7 +2111,12 @@ mod tests {
             Some(healthy_oid.as_bytes()),
         )];
         store
-            .publish(vec![healthy, victim], &main)
+            .publish(
+                vec![healthy, victim],
+                &main,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish committed objects");
         let mut changed = victim_bytes.clone();
         changed[16_000..16_008].copy_from_slice(b"EDITED!!");
@@ -2011,11 +2211,32 @@ mod tests {
             FactExpectation::Absent,
             Some(b"v"),
         )];
-        assert_refused("fact-only publish", store.publish(vec![], &facts));
-        assert_refused("empty publish", store.publish(vec![], &[]));
+        assert_refused(
+            "fact-only publish",
+            store.publish(
+                vec![],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ),
+        );
+        assert_refused(
+            "empty publish",
+            store.publish(
+                vec![],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ),
+        );
         assert_refused(
             "unrelated object publish",
-            store.publish(vec![spare], &facts),
+            store.publish(
+                vec![spare],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ),
         );
     }
 
@@ -2036,7 +2257,14 @@ mod tests {
                 FactExpectation::Absent,
                 Some(oid.as_bytes()),
             )];
-            let published = store.publish(vec![prepared], &facts).expect("publish");
+            let published = store
+                .publish(
+                    vec![prepared],
+                    &facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish");
             assert_eq!(published.objects, vec![oid]);
             assert_eq!(published.generation, 1);
             drop(store);
@@ -2147,7 +2375,12 @@ mod tests {
             let winner = store.store_id();
             let payload = pseudo(2000, 61);
             let oid = store
-                .publish(vec![blob(&store, &payload)], &[])
+                .publish(
+                    vec![blob(&store, &payload)],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("the winner's store publishes")
                 .objects[0];
             drop(store);
@@ -2208,7 +2441,12 @@ mod tests {
             let healthy = create(&temp, HashKind::Sha1);
             let payload = pseudo(2000, 62);
             let oid = healthy
-                .publish(vec![blob(&healthy, &payload)], &[])
+                .publish(
+                    vec![blob(&healthy, &payload)],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish")
                 .objects[0];
             drop(healthy);
@@ -2313,13 +2551,23 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let payload = pseudo(3000, 2);
         let first = store
-            .publish(vec![blob(&store, &payload)], &[])
+            .publish(
+                vec![blob(&store, &payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("first publish");
         let before = std::fs::metadata(segment_file(&temp, 0))
             .expect("segment")
             .len();
         let again = store
-            .publish(vec![blob(&store, &payload)], &[])
+            .publish(
+                vec![blob(&store, &payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("duplicate publish");
         assert_eq!(again.objects, first.objects);
         assert_eq!(again.generation, first.generation);
@@ -2337,7 +2585,12 @@ mod tests {
         let target = create(&sha256, HashKind::Sha256);
         let foreign = blob(&source, b"foreign width");
         let err = target
-            .publish(vec![foreign], &[])
+            .publish(
+                vec![foreign],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("width mismatch");
         assert!(matches!(err, StoreError::ObjectFormat(_)), "{err:?}");
     }
@@ -2351,7 +2604,14 @@ mod tests {
         let base_bytes = pseudo(32 * 1024, 3);
         let base = blob(&source, &base_bytes);
         let base_oid = base.oid();
-        source.publish(vec![base], &[]).expect("publish base");
+        source
+            .publish(
+                vec![base],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let mut changed = base_bytes.clone();
         changed[16_000..16_008].copy_from_slice(b"EDITED!!");
         let delta = source
@@ -2370,7 +2630,12 @@ mod tests {
             Some(b"v"),
         )];
         let err = target
-            .publish(vec![delta], &facts)
+            .publish(
+                vec![delta],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("dangling base");
         assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
         assert_eq!(
@@ -2382,7 +2647,12 @@ mod tests {
             .count();
         assert_eq!(entries, 0, "validation must precede any segment creation");
         target
-            .publish(vec![], &facts)
+            .publish(
+                vec![],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("writer stays open after a validation failure");
     }
 
@@ -2393,7 +2663,14 @@ mod tests {
         let base_bytes = pseudo(32 * 1024, 4);
         let base = blob(&store, &base_bytes);
         let base_oid = base.oid();
-        store.publish(vec![base], &[]).expect("publish base");
+        store
+            .publish(
+                vec![base],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let mut changed = base_bytes.clone();
         changed[100..108].copy_from_slice(b"CHANGED!");
         let delta = store
@@ -2407,7 +2684,14 @@ mod tests {
         assert_eq!(delta.encoding(), Encoding::Delta);
         assert_eq!(delta.depth(), 1);
         let delta_oid = delta.oid();
-        store.publish(vec![delta], &[]).expect("publish delta");
+        store
+            .publish(
+                vec![delta],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish delta");
         drop(store);
 
         let store = reopen(&temp);
@@ -2437,9 +2721,21 @@ mod tests {
             FactExpectation::Absent,
             Some(b"one"),
         )];
-        store.publish(vec![], &set).expect("first set");
+        store
+            .publish(
+                vec![],
+                &set,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("first set");
         let err = store
-            .publish(vec![], &set)
+            .publish(
+                vec![],
+                &set,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("claim already present");
         assert!(matches!(err, StoreError::StaleFact { .. }), "{err:?}");
 
@@ -2447,7 +2743,14 @@ mod tests {
             mutation(FactTable::Claims, b"dup", FactExpectation::Any, Some(b"a")),
             mutation(FactTable::Claims, b"dup", FactExpectation::Any, Some(b"b")),
         ];
-        let err = store.publish(vec![], &twice).expect_err("duplicate key");
+        let err = store
+            .publish(
+                vec![],
+                &twice,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect_err("duplicate key");
         assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
         assert_eq!(store.fact(FactTable::Claims, b"dup").expect("fact"), None);
         assert_eq!(
@@ -2460,7 +2763,14 @@ mod tests {
             FactExpectation::Value(b"one".to_vec()),
             None,
         )];
-        store.publish(vec![], &remove).expect("conditional remove");
+        store
+            .publish(
+                vec![],
+                &remove,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("conditional remove");
         assert_eq!(store.fact(FactTable::Claims, b"claim").expect("fact"), None);
     }
 
@@ -2474,7 +2784,12 @@ mod tests {
         let prepared = blob(&store, &payload);
         let oid = prepared.oid();
         store
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish past orphan");
         assert_eq!(
             std::fs::read(&orphan).expect("orphan"),
@@ -2498,7 +2813,12 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let first = pseudo(2000, 6);
         let first_oid = store
-            .publish(vec![blob(&store, &first)], &[])
+            .publish(
+                vec![blob(&store, &first)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("first")
             .objects[0];
         drop(store);
@@ -2506,7 +2826,12 @@ mod tests {
         let store = reopen(&temp);
         let second = pseudo(2000, 7);
         let second_oid = store
-            .publish(vec![blob(&store, &second)], &[])
+            .publish(
+                vec![blob(&store, &second)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("second")
             .objects[0];
         assert!(!segment_file(&temp, 1).exists());
@@ -2523,7 +2848,12 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let first = pseudo(2000, 60);
         let first_oid = store
-            .publish(vec![blob(&store, &first)], &[])
+            .publish(
+                vec![blob(&store, &first)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("first")
             .objects[0];
         store.close().expect("close");
@@ -2534,7 +2864,12 @@ mod tests {
         // opens and fail the next recovery.
         let refused = pseudo(2000, 61);
         let err = store
-            .publish(vec![blob(&store, &refused)], &[])
+            .publish(
+                vec![blob(&store, &refused)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("publish after close is refused");
         assert!(
             matches!(err, StoreError::WriterClosed(_)),
@@ -2549,7 +2884,12 @@ mod tests {
         assert_eq!(read_all(&store, first_oid), first);
         let second = pseudo(2000, 62);
         let second_oid = store
-            .publish(vec![blob(&store, &second)], &[])
+            .publish(
+                vec![blob(&store, &second)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("post-reopen publish resumes the open segment")
             .objects[0];
         assert!(!segment_file(&temp, 1).exists());
@@ -2566,7 +2906,12 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let payload = pseudo(2000, 8);
         let oid = store
-            .publish(vec![blob(&store, &payload)], &[])
+            .publish(
+                vec![blob(&store, &payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish")
             .objects[0];
         drop(store);
@@ -2584,7 +2929,12 @@ mod tests {
         assert_eq!(read_all(&store, oid), payload);
         let more = pseudo(500, 9);
         let more_oid = store
-            .publish(vec![blob(&store, &more)], &[])
+            .publish(
+                vec![blob(&store, &more)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish after truncation")
             .objects[0];
         assert_eq!(read_all(&store, more_oid), more);
@@ -2612,7 +2962,12 @@ mod tests {
                     )
                 })
                 .collect();
-            oids.extend(store.publish(batch, &[]).expect("publish").objects);
+            oids.extend(
+                store
+                    .publish(batch, &[], EventSource::LocalPush, &EventContext::default())
+                    .expect("publish")
+                    .objects,
+            );
         }
         assert_eq!(oids.len(), OBJECTS);
         drop(store);
@@ -2638,7 +2993,12 @@ mod tests {
         let temp = TempRoot::new("short");
         let store = create(&temp, HashKind::Sha1);
         store
-            .publish(vec![blob(&store, &pseudo(2000, 10))], &[])
+            .publish(
+                vec![blob(&store, &pseudo(2000, 10))],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish");
         drop(store);
         let path = segment_file(&temp, 0);
@@ -2661,7 +3021,14 @@ mod tests {
         let payload = pseudo(2000, 11);
         let prepared = blob(&store, &payload);
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let path = segment_file(&temp, 0);
         let mut bytes = std::fs::read(&path).expect("segment bytes");
@@ -2679,7 +3046,12 @@ mod tests {
             Some(b"v"),
         )];
         assert!(matches!(
-            store.publish(vec![], &facts),
+            store.publish(
+                vec![],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(
@@ -2710,7 +3082,12 @@ mod tests {
         });
 
         let err = store
-            .publish(vec![seeded.victim_again], &[])
+            .publish(
+                vec![seeded.victim_again],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("malformed locator");
         assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
         assert!(
@@ -2743,7 +3120,12 @@ mod tests {
         });
 
         let err = store
-            .publish(vec![seeded.delta_over_victim], &[])
+            .publish(
+                vec![seeded.delta_over_victim],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("malformed base locator");
         assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
         assert!(
@@ -2764,7 +3146,12 @@ mod tests {
         let store = reopen_over_damage(&temp, |meta| raw_put_segment(meta, 0, &[0xFF; 3]));
 
         let err = store
-            .publish(vec![seeded.unrelated], &[])
+            .publish(
+                vec![seeded.unrelated],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("manifest row of the segment being appended is malformed");
         assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
         assert!(
@@ -2799,9 +3186,21 @@ mod tests {
             FactExpectation::Absent,
             Some(b"one"),
         )];
-        store.publish(vec![], &claim).expect("first claim");
+        store
+            .publish(
+                vec![],
+                &claim,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("first claim");
         assert!(matches!(
-            store.publish(vec![], &claim),
+            store.publish(
+                vec![],
+                &claim,
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::StaleFact { .. })
         ));
         let twice = [
@@ -2809,18 +3208,35 @@ mod tests {
             mutation(FactTable::Claims, b"dup", FactExpectation::Any, Some(b"b")),
         ];
         assert!(matches!(
-            store.publish(vec![], &twice),
+            store.publish(
+                vec![],
+                &twice,
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::Invalid(_))
         ));
         assert!(matches!(
-            store.publish(vec![blob(&foreign, b"wide")], &[]),
+            store.publish(
+                vec![blob(&foreign, b"wide")],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::ObjectFormat(_))
         ));
 
         let base_bytes = pseudo(32 * 1024, 31);
         let base = blob(&source, &base_bytes);
         let base_oid = base.oid();
-        source.publish(vec![base], &[]).expect("publish base");
+        source
+            .publish(
+                vec![base],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let mut changed = base_bytes;
         changed[100..108].copy_from_slice(b"CHANGED!");
         let dangling = source
@@ -2833,7 +3249,12 @@ mod tests {
             .expect("prepare delta");
         assert_eq!(dangling.encoding(), Encoding::Delta);
         assert!(matches!(
-            store.publish(vec![dangling], &[]),
+            store.publish(
+                vec![dangling],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::Invalid(_))
         ));
 
@@ -2859,7 +3280,12 @@ mod tests {
         let prepared = blob(&store, &payload);
         let oid = prepared.oid();
         store
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("the store still serves");
         assert_eq!(read_all(&store, oid), payload);
     }
@@ -2929,7 +3355,12 @@ mod tests {
         let store =
             Store::create(&root, HashKind::Sha1, budget()).expect("create by relative root");
         let first = store
-            .publish(vec![blob(&store, &first_payload)], &[])
+            .publish(
+                vec![blob(&store, &first_payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish before the move")
             .objects[0];
         drop(store);
@@ -2940,7 +3371,12 @@ mod tests {
         assert_eq!(read_all(&store, first), first_payload);
         let later_payload = pseudo(2000, 42);
         let later = store
-            .publish(vec![blob(&store, &later_payload)], &[])
+            .publish(
+                vec![blob(&store, &later_payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish after the move")
             .objects[0];
         assert_eq!(read_all(&store, later), later_payload);
@@ -2956,7 +3392,12 @@ mod tests {
         let before = store.io_stats();
         for seed in 0..5 {
             store
-                .publish(vec![blob(&store, &pseudo(256, seed))], &[])
+                .publish(
+                    vec![blob(&store, &pseudo(256, seed))],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("sequential publish");
         }
         let after = store.io_stats();
@@ -2985,12 +3426,22 @@ mod tests {
         // Solo baseline on this store: no linger, one publication at a time.
         store.set_commit_linger(Duration::ZERO);
         store
-            .publish(vec![blob(&store, &pseudo(64, 9_999))], &[])
+            .publish(
+                vec![blob(&store, &pseudo(64, 9_999))],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("warm-up publish");
         let solo_before = store.io_stats();
         for seed in 0..SOLO {
             store
-                .publish(vec![blob(&store, &pseudo(512, 20_000 + seed))], &[])
+                .publish(
+                    vec![blob(&store, &pseudo(512, 20_000 + seed))],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("solo publish");
         }
         let solo = barriers(store.io_stats()) - barriers(solo_before);
@@ -3012,7 +3463,12 @@ mod tests {
                             Some(tip.as_bytes()),
                         );
                         let publication = store
-                            .publish(vec![blob(&store, &payload)], &[fact])
+                            .publish(
+                                vec![blob(&store, &payload)],
+                                &[fact],
+                                EventSource::LocalPush,
+                                &EventContext::default(),
+                            )
                             .expect("grouped publication commits");
                         assert_eq!(publication.objects, vec![expected]);
                     }
@@ -3080,7 +3536,12 @@ mod tests {
                             FactExpectation::Absent,
                             Some(&tip[..]),
                         );
-                        store.publish(vec![blob(&store, &payload)], &[fact])
+                        store.publish(
+                            vec![blob(&store, &payload)],
+                            &[fact],
+                            EventSource::LocalPush,
+                            &EventContext::default(),
+                        )
                     })
                 })
                 .collect();
@@ -3100,5 +3561,181 @@ mod tests {
                 "a losing claim must fail as stale, got: {loser}"
             );
         }
+    }
+
+    fn read_events(store: &Store) -> Vec<(u64, StoreEvent)> {
+        let page = store
+            .fact_page(
+                FactTable::Events,
+                None,
+                FactPageBudget::new(10_000, usize::MAX),
+            )
+            .expect("read events");
+        assert!(!page.more, "the test writes fewer rows than one page");
+        page.rows
+            .iter()
+            .map(|row| {
+                let seq =
+                    u64::from_be_bytes(row.key.as_slice().try_into().expect("8-byte event key"));
+                let event: StoreEvent = decode("event", &row.value).expect("decode event");
+                (seq, event)
+            })
+            .collect()
+    }
+
+    fn read_head(store: &Store) -> EventHeadRow {
+        let raw = store
+            .fact(FactTable::EventHead, EVENT_HEAD_KEY)
+            .expect("read head")
+            .expect("the head row exists once an event commits");
+        decode("event head", &raw).expect("decode head")
+    }
+
+    #[test]
+    fn events_survive_restart() {
+        let temp = TempRoot::new("events-restart");
+        let store = create(&temp, HashKind::Sha1);
+        let set = [mutation(
+            FactTable::Refs,
+            b"refs/heads/main",
+            FactExpectation::Absent,
+            Some(b"v1"),
+        )];
+        store
+            .publish(
+                Vec::new(),
+                &set,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("publish ref");
+        let before = read_events(&store);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].0, 1);
+        assert_eq!(before[0].1.name, b"refs/heads/main");
+        assert_eq!(before[0].1.old, None);
+        assert_eq!(before[0].1.new, Some(b"v1".to_vec()));
+        assert_eq!(read_head(&store), EventHeadRow { head: 1, oldest: 1 });
+        drop(store);
+        let store = reopen(&temp);
+        let after = read_events(&store);
+        assert_eq!(after, before, "events persist across reopen");
+        assert_eq!(read_head(&store), EventHeadRow { head: 1, oldest: 1 });
+    }
+
+    #[test]
+    fn events_increase_strictly_across_sources_with_attribution() {
+        use crate::change::{OperationId, SessionId};
+        let temp = TempRoot::new("events-order");
+        let store = create(&temp, HashKind::Sha1);
+        let lane_context = EventContext {
+            operation: Some(OperationId(7)),
+            request_id: Some("req-lane".to_string()),
+            session: Some(SessionId::from_bytes([3; 16])),
+        };
+        let lane = [mutation(
+            FactTable::Refs,
+            b"refs/heads/main",
+            FactExpectation::Absent,
+            Some(b"v1"),
+        )];
+        store
+            .publish(Vec::new(), &lane, EventSource::Lane, &lane_context)
+            .expect("publish lane batch");
+        let receive = [mutation(
+            FactTable::Refs,
+            b"refs/heads/scratch",
+            FactExpectation::Absent,
+            Some(b"v2"),
+        )];
+        store
+            .publish(
+                Vec::new(),
+                &receive,
+                EventSource::ReceivePack,
+                &EventContext::default(),
+            )
+            .expect("publish receive batch");
+        let events = read_events(&store);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, 1);
+        assert_eq!(events[1].0, 2);
+        assert_eq!(events[0].1.source, EventSource::Lane);
+        assert_eq!(events[1].1.source, EventSource::ReceivePack);
+        assert_eq!(events[0].1.operation, Some(OperationId(7)));
+        assert_eq!(events[0].1.request_id.as_deref(), Some("req-lane"));
+        assert_eq!(events[0].1.session, Some(SessionId::from_bytes([3; 16])));
+        assert_eq!(events[1].1.operation, None);
+        assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 1 });
+    }
+
+    #[test]
+    fn events_sweep_prunes_to_retention_keeping_oldest_current() {
+        let temp = TempRoot::new("events-sweep");
+        let store = create(&temp, HashKind::Sha1);
+        let old_event = StoreEvent {
+            name: b"refs/heads/old".to_vec(),
+            old: None,
+            new: Some(b"v1".to_vec()),
+            at: 1_000,
+            source: EventSource::Lane,
+            operation: None,
+            request_id: None,
+            session: None,
+        };
+        let new_event = StoreEvent {
+            name: b"refs/heads/new".to_vec(),
+            old: None,
+            new: Some(b"v2".to_vec()),
+            at: 9_000,
+            source: EventSource::ReceivePack,
+            operation: None,
+            request_id: None,
+            session: None,
+        };
+        let facts = [
+            FactMutation {
+                table: FactTable::Events,
+                key: 1_u64.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &old_event).expect("encode")),
+            },
+            FactMutation {
+                table: FactTable::Events,
+                key: 2_u64.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &new_event).expect("encode")),
+            },
+            FactMutation {
+                table: FactTable::EventHead,
+                key: EVENT_HEAD_KEY.to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(
+                    encode("event head", &EventHeadRow { head: 2, oldest: 1 }).expect("encode"),
+                ),
+            },
+        ];
+        store
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("seed events");
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        assert_eq!(deletions.len(), 2, "one event row plus the head bump");
+        store
+            .publish(
+                Vec::new(),
+                &deletions,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("publish sweep");
+        let remaining = read_events(&store);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 2);
+        assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 2 });
     }
 }

@@ -18,7 +18,7 @@ use crate::ops::{
 };
 use crate::records::{ChangeState, Records};
 use crate::store::types::ObjectKind;
-use crate::store::{PreparationBudget, Store};
+use crate::store::{EventContext, EventSource, PreparationBudget, Store};
 
 struct Fixture {
     root: std::path::PathBuf,
@@ -50,7 +50,12 @@ impl Fixture {
             .expect("prepare object");
         let oid = prepared.oid();
         self.store
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish object");
         oid
     }

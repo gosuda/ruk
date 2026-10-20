@@ -27,7 +27,7 @@ use crate::heads::Head;
 use crate::ids::{CommitKey, HashKind, Oid};
 use crate::merge::Merge;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
-use crate::store::{PreparationBudget, Store, StoreError};
+use crate::store::{EventContext, EventSource, PreparationBudget, Store, StoreError};
 
 struct TestFixture {
     root: std::path::PathBuf,
@@ -54,7 +54,12 @@ impl TestFixture {
 
     fn publish(&self, mutations: &[FactMutation]) {
         self.store
-            .publish(Vec::new(), mutations)
+            .publish(
+                Vec::new(),
+                mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish mutations");
     }
 }
@@ -125,7 +130,12 @@ fn test_exact_imported_byte_preservation() {
     // Publish to the store
     fixture
         .store()
-        .publish(vec![prepared.prepared_object], &prepared.mutations)
+        .publish(
+            vec![prepared.prepared_object],
+            &prepared.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish import");
 
     // Read back and assert verbatim byte preservation
@@ -284,7 +294,12 @@ fn test_divergence_vs_trusted_supersession() {
     let prep_1 = records.prepare_native_commit(input_1).expect("prep 1");
     fixture
         .store()
-        .publish(vec![prep_1.prepared_object], &prep_1.mutations)
+        .publish(
+            vec![prep_1.prepared_object],
+            &prep_1.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish 1");
 
     let entry_1 = records
@@ -309,7 +324,12 @@ fn test_divergence_vs_trusted_supersession() {
     let prep_2 = records.prepare_native_commit(input_2).expect("prep 2");
     fixture
         .store()
-        .publish(vec![prep_2.prepared_object], &prep_2.mutations)
+        .publish(
+            vec![prep_2.prepared_object],
+            &prep_2.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish 2");
 
     let entry_2 = records
@@ -342,7 +362,12 @@ fn test_divergence_vs_trusted_supersession() {
 
     fixture
         .store()
-        .publish(vec![prep_import.prepared_object], &prep_import.mutations)
+        .publish(
+            vec![prep_import.prepared_object],
+            &prep_import.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish import");
 
     let entry_3 = records
@@ -389,7 +414,12 @@ fn test_stable_absent_change_id_reimport() {
 
     fixture
         .store()
-        .publish(vec![prep_1.prepared_object], &prep_1.mutations)
+        .publish(
+            vec![prep_1.prepared_object],
+            &prep_1.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish 1");
 
     // Verify mapping in FactTable::ImportedChanges
@@ -477,7 +507,12 @@ fn test_wrong_expected_head_and_cas_failure() {
         expected: FactExpectation::Value(b"completely-wrong-bytes".to_vec()),
         value: Some(b"new-bytes".to_vec()),
     };
-    let result = fixture.store().publish(Vec::new(), &[stale_mutation]);
+    let result = fixture.store().publish(
+        Vec::new(),
+        &[stale_mutation],
+        EventSource::LocalPush,
+        &EventContext::default(),
+    );
     assert!(matches!(result, Err(StoreError::StaleFact { .. })));
 }
 

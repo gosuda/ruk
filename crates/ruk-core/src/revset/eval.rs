@@ -1518,7 +1518,7 @@ mod tests {
     use crate::records::keys::{change_key, head_key};
     use crate::records::types::{ChangeEntry, ChangeState};
     use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind};
-    use crate::store::{PreparationBudget, Store};
+    use crate::store::{EventContext, EventSource, PreparationBudget, Store};
     use ssh_key::private::Ed25519Keypair;
     use ssh_key::{HashAlg, LineEnding};
 
@@ -1545,7 +1545,12 @@ mod tests {
 
         fn publish_facts(&self, facts: &[FactMutation]) {
             self.store
-                .publish(Vec::new(), facts)
+                .publish(
+                    Vec::new(),
+                    facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish facts");
         }
 
@@ -1597,7 +1602,12 @@ mod tests {
                 .prepare(kind, bytes.len() as u64, std::io::Cursor::new(bytes), None)
                 .expect("prepare object");
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish object");
             oid
         }
@@ -2267,7 +2277,12 @@ mod tests {
         let oid = prepared.oid();
         scratch
             .store
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish commit");
 
         let private = ssh_key::PrivateKey::from(Ed25519Keypair::from_seed(&[0x11; 32]));
@@ -2294,7 +2309,12 @@ mod tests {
         let attestations = prepare_add(&scratch.store, &args, &open).expect("prepare attestation");
         scratch
             .store
-            .publish(Vec::new(), &attestations.mutations)
+            .publish(
+                Vec::new(),
+                &attestations.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish attestation");
 
         let review = AttestKind::new("review").expect("kind");

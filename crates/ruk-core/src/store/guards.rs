@@ -257,7 +257,8 @@ mod tests {
     use crate::store::metadata_tests::{raw_put_object, raw_put_segment};
     use crate::store::types::PreparedObject;
     use crate::store::{
-        BudgetLimits, MAX_DELTA_DEPTH, META_FILE, PreparationBudget, Store, StoreError, encode,
+        BudgetLimits, EventContext, EventSource, MAX_DELTA_DEPTH, META_FILE, PreparationBudget,
+        Store, StoreError, encode,
     };
 
     static TEST_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -489,7 +490,14 @@ mod tests {
         let data = b"payload to be read via captured snapshot";
         let blob = prep_blob(&store, data);
         let oid = blob.oid();
-        store.publish(vec![blob], &[]).expect("publish blob");
+        store
+            .publish(
+                vec![blob],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish blob");
 
         // Register guard and capture snapshot
         let guard = store.generation_registry().register();
@@ -538,7 +546,14 @@ mod tests {
         let data = b"payload preserved across retirement";
         let blob = prep_blob(&store, data);
         let oid = blob.oid();
-        store.publish(vec![blob], &[]).expect("publish blob");
+        store
+            .publish(
+                vec![blob],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish blob");
 
         // Capture snapshot while holding guard
         let guard = store.generation_registry().register();
@@ -605,7 +620,14 @@ mod tests {
 
         let data1 = b"object in segment 0";
         let blob1 = prep_blob(&store, data1);
-        store.publish(vec![blob1], &[]).expect("publish 1");
+        store
+            .publish(
+                vec![blob1],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish 1");
         // Published at generation 1
 
         // Reader registers at generation 1 (epoch 2)
@@ -615,7 +637,14 @@ mod tests {
         // Generation 2: publish another object
         let data2 = b"object in segment 1";
         let blob2 = prep_blob(&store, data2);
-        store.publish(vec![blob2], &[]).expect("publish 2");
+        store
+            .publish(
+                vec![blob2],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish 2");
         // Published at generation 2
 
         // Segment 0 is retired at generation 2.
@@ -636,10 +665,24 @@ mod tests {
         let store = test_store(&dir);
 
         let b1 = prep_blob(&store, b"gen 1 blob");
-        store.publish(vec![b1], &[]).expect("gen 1");
+        store
+            .publish(
+                vec![b1],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("gen 1");
 
         let b2 = prep_blob(&store, b"gen 2 blob");
-        store.publish(vec![b2], &[]).expect("gen 2");
+        store
+            .publish(
+                vec![b2],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("gen 2");
 
         // Segment retired at generation 2
         // A horde of new readers register at generation 2 -> all receive epoch 3
@@ -667,12 +710,26 @@ mod tests {
         let base_data = b"base payload";
         let base_blob = prep_blob(&store, base_data);
         let base_oid = base_blob.oid();
-        store.publish(vec![base_blob], &[]).expect("publish base");
+        store
+            .publish(
+                vec![base_blob],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
 
         let delta_data = b"delta payload";
         let delta_blob = prep_delta(&store, base_oid, delta_data);
         let _delta_oid = delta_blob.oid();
-        store.publish(vec![delta_blob], &[]).expect("publish delta");
+        store
+            .publish(
+                vec![delta_blob],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish delta");
 
         let meta_path = dir.meta_path();
         drop(store);

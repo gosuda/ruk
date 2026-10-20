@@ -20,7 +20,7 @@ use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::ids::HashKind;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::StoreRefs;
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
 use ruk_git::import::objects::source_hash_kind;
@@ -112,7 +112,12 @@ pub(crate) fn init(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(name), Scope::Full);
         let mutation = workspace_mutation(None, &workspace)?;
         store
-            .publish(Vec::new(), &[mutation])
+            .publish(
+                Vec::new(),
+                &[mutation],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     if opts.is_set("quiet") {
@@ -305,7 +310,12 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(head_name), Scope::Full);
     let mutation = workspace_mutation(None, &workspace)?;
     dst_store
-        .publish(Vec::new(), &[mutation])
+        .publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     config_write(&dst_store, &format!("remote.{origin}.url"), src)?;
     config_write(
@@ -442,7 +452,12 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
     let workspace = GitCompatWorkspace::new(head, Scope::Full);
     let mutation = workspace_mutation(None, &workspace)?;
     store
-        .publish(Vec::new(), &[mutation])
+        .publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     import_remote_config(&git_dir, &store)?;
     let lfs = if lfs_mode == LfsMode::Full {
@@ -538,7 +553,12 @@ fn ingest_lfs_sidecar(
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(Some((stored, skipped)))

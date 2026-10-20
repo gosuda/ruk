@@ -664,7 +664,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -715,7 +715,14 @@ mod tests {
             .prepare(ObjectKind::Blob, len_of(bytes), bytes, None)
             .expect("prepare blob");
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish blob");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish blob");
         oid
     }
 
@@ -808,7 +815,14 @@ mod tests {
                 "the similar target stores as a delta"
             );
             let target_oid = prepared.oid();
-            store.publish(vec![prepared], &[]).expect("publish delta");
+            store
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish delta");
             let (base_meta, base_streamed) = collect_stream(&store, base_oid);
             assert_complete_meta(&base_meta, base_oid, &base_bytes, 0);
             assert_eq!(base_streamed, base_bytes, "the base streams byte-exact");

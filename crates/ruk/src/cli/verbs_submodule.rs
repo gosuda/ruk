@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
 use ruk_git::transport::session::{LocalFetchRequest, advertise, local_fetch};
@@ -517,7 +517,14 @@ fn cmd_add(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>, 
     )?);
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     ctx.emit_stderr(format!("Cloning into {path_text:?}...\n").as_bytes());
     Ok(Vec::new())
 }
@@ -619,8 +626,13 @@ fn clone_local_into(
     })?;
     let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(head_name), Scope::Full);
     let mutation = workspace_mutation(None, &workspace)?;
-    dst.publish(Vec::new(), &[mutation])
-        .map_err(GitError::from)?;
+    dst.publish(
+        Vec::new(),
+        &[mutation],
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )
+    .map_err(GitError::from)?;
     config_write(&dst, "remote.origin.url", url)?;
     config_write(
         &dst,
@@ -652,7 +664,12 @@ fn checkout_child_inner(
         workspace.head = HeadRef::Detached(oid);
         let next = workspace.mutate_index(workspace.stamp)?;
         child
-            .publish(Vec::new(), &[workspace_mutation(raw.as_deref(), &next)?])
+            .publish(
+                Vec::new(),
+                &[workspace_mutation(raw.as_deref(), &next)?],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(())
@@ -801,7 +818,12 @@ fn write_flat_index(
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     child
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }

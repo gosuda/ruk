@@ -629,6 +629,7 @@ mod tests {
     use ruk_core::ids::HashKind;
     use ruk_core::ops::{DescribeRequest, NewRequest, NewResult};
     use ruk_core::protocol::{AttestListArgs, PageRequest, QueryArgs, RevsetText};
+    use ruk_core::store::{EventContext, EventSource};
 
     #[derive(Debug, serde::Serialize)]
     struct Envelope<P: serde::Serialize> {
@@ -743,7 +744,14 @@ mod tests {
             )
             .expect("prepare tree");
         let tree = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish tree");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tree");
         tree
     }
 

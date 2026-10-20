@@ -159,8 +159,8 @@ mod tests {
     use crate::protocol::{
         BoundedList, Method, MutationOutcome, ReceiptRef, Timestamp, WsTakeArgs, WsTakeReply,
     };
-    use crate::store::PreparationBudget;
     use crate::store::types::{FactExpectation, FactMutation};
+    use crate::store::{EventContext, EventSource, PreparationBudget};
     use crate::workspace::{NativeWorkspace, Scope, WorkspaceState};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -306,6 +306,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -358,6 +360,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -396,6 +400,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
         let wall = jiff::Timestamp::now();
@@ -447,6 +453,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -517,6 +525,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 

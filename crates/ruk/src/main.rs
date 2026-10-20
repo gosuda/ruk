@@ -359,6 +359,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruk_core::store::{EventContext, EventSource};
 
     #[test]
     fn forgejo_subcommand_is_rejected() {
@@ -419,7 +420,14 @@ mod tests {
             )
             .expect("prepare tree");
         let tree = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish tree");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tree");
         drop(store);
 
         let signature = Signature {

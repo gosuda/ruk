@@ -18,7 +18,7 @@ use crate::merge::Merge;
 use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// What to squash: an ordered linear chain of commits, a tree, and a message.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,7 +62,12 @@ pub struct SquashResult {
 pub fn squash(store: &Store, request: SquashRequest) -> Result<SquashResult, CoreError> {
     let prepared = prepare_squash(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -240,7 +245,12 @@ mod tests {
                 .expect("prepare object");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish object");
             oid
         }

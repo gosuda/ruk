@@ -29,7 +29,9 @@ use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::{StoreRefs, all_reflog_oids};
-use ruk_core::store::{FactExpectation, FactMutation, FactTable, ObjectKind, Store};
+use ruk_core::store::{
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, ObjectKind, Store,
+};
 use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
@@ -529,7 +531,12 @@ pub(crate) fn run_fetch(
         // Ref updates only: the objects published in phase one stay even
         // when every update below is a prune delete or a refusal left no
         // updates at all.
-        dest.publish(Vec::new(), &ref_mutations)?;
+        dest.publish(
+            Vec::new(),
+            &ref_mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
     }
     let mut out = lines.concat().into_bytes();
     out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
@@ -1118,6 +1125,8 @@ fn write_fetch_head(ctx: &Ctx, pairs: &[FetchedRef]) -> Result<Vec<u8>, GitError
                 expected,
                 value: Some(text.into_bytes()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(Vec::new())
@@ -3409,7 +3418,12 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     let mut out = String::from("{\"synced\": [");
@@ -3680,7 +3694,12 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
     )?;
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     for (hex, error) in &missing {

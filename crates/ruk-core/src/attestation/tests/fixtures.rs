@@ -24,7 +24,7 @@ use crate::ids::{HashKind, Oid};
 use crate::protocol::{
     AttestAddArgs, AttestSignature, AttestStatement, StatementDigest, Timestamp,
 };
-use crate::store::{ObjectKind, PreparationBudget, Store};
+use crate::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
 
 /// A store under a unique temporary root, removed when dropped.
 pub(super) struct TempStore {
@@ -71,7 +71,14 @@ fn publish_object(store: &Store, kind: ObjectKind, body: &[u8]) -> Oid {
         .prepare(kind, length, body, None)
         .expect("prepare object");
     let oid = prepared.oid();
-    store.publish(vec![prepared], &[]).expect("publish object");
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish object");
     oid
 }
 
@@ -79,7 +86,12 @@ fn publish_object(store: &Store, kind: ObjectKind, body: &[u8]) -> Oid {
 pub(super) fn apply(store: &Store, prepared: &PreparedAttestations) {
     if !prepared.mutations.is_empty() {
         store
-            .publish(Vec::new(), &prepared.mutations)
+            .publish(
+                Vec::new(),
+                &prepared.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish attestation rows");
     }
 }

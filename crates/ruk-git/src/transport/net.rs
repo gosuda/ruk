@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 use ruk_core::ids::HashKind;
 use ruk_core::refdata::{RefName, RefTarget};
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 
 use super::pktline::PktReader;
 use super::refadv::{self, AdvertisedRef, Initial};
@@ -1193,7 +1195,12 @@ mod tests {
         let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
         let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
         store
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish ref");
     }
 

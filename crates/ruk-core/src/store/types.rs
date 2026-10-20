@@ -16,7 +16,7 @@
 //! - [`FactTable`] enumerates every approved mutable fact table except the
 //!   publication-owned objects/segments/generation tables.
 
-use crate::change::StoreId;
+use crate::change::{OperationId, SessionId, StoreId};
 use crate::ids::{HashKind, Oid};
 use crate::store::spool::Spool;
 use serde::de::{self, Deserialize, Deserializer};
@@ -347,6 +347,67 @@ impl FactTable {
         }
     }
 }
+
+/// What published one batch of ref mutations: the lane, the receive-pack
+/// path, a local command, or a lifecycle importer. Recorded on every ref
+/// event; never an authorization input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EventSource {
+    ReceivePack,
+    Lane,
+    LocalPush,
+    Fork,
+    Import,
+    Land,
+}
+
+/// Per-event attribution for one publication: the lane fills every field,
+/// every other publisher leaves the ones it does not have empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventContext {
+    /// The lane operation that moved the ref, if any.
+    pub operation: Option<OperationId>,
+    /// The idempotency key that moved the ref, if any.
+    pub request_id: Option<String>,
+    /// The session that moved the ref, if any.
+    pub session: Option<SessionId>,
+}
+
+/// One ref event: the `Events` row at the big-endian sequence key, naming
+/// the ref mutation that committed under the writer lock.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoreEvent {
+    /// The mutated ref name.
+    pub name: Vec<u8>,
+    /// The ref target before the batch, absent for creates.
+    pub old: Option<Vec<u8>>,
+    /// The ref target after the batch, absent for deletes.
+    pub new: Option<Vec<u8>>,
+    /// Unix millis the batch committed.
+    pub at: u64,
+    /// What published the batch.
+    pub source: EventSource,
+    /// The lane operation that moved the ref, if any.
+    pub operation: Option<OperationId>,
+    /// The idempotency key that moved the ref, if any.
+    pub request_id: Option<String>,
+    /// The session that moved the ref, if any.
+    pub session: Option<SessionId>,
+}
+
+/// The `EventHead` row: the event sequence horizon. `head` is the last
+/// assigned sequence (zero with no events); `oldest` is the oldest
+/// retained sequence, or `head + 1` when retention pruned everything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventHeadRow {
+    /// The last assigned event sequence.
+    pub head: u64,
+    /// The oldest retained event sequence.
+    pub oldest: u64,
+}
+
+/// The `EventHead` row key.
+pub const EVENT_HEAD_KEY: &[u8] = b"head";
 
 /// Conditional application of one fact mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]

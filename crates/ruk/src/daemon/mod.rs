@@ -28,7 +28,10 @@ use tokio::sync::mpsc;
 pub(crate) use executor::BoundedExecutor;
 pub(crate) use registry::Registry;
 use ruk_core::change::{RequestId, SessionId};
-use ruk_core::coord::{Cancel, CancelHandle, HostedCoordinator, Principal, cancellation};
+use ruk_core::coord::{
+    Cancel, CancelHandle, DEFAULT_EVENT_RETENTION_SECONDS, HostedCoordinator, Principal,
+    cancellation,
+};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::protocol::{
     ErrorReply, Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request, SessionOpenArgs,
@@ -65,9 +68,6 @@ pub(crate) const MAX_HOOK_MAX_COMMANDS: usize = 4_096;
 
 /// Default branch recorded by `repo.init` and `repo.fork`.
 pub(crate) const DEFAULT_DEFAULT_BRANCH: &str = "refs/heads/main";
-
-/// Default event retention horizon in seconds (seven days).
-pub(crate) const DEFAULT_EVENT_RETENTION_SECONDS: u64 = 604_800;
 
 /// Default cap of archive bytes served per request (1 GiB).
 pub(crate) const DEFAULT_ARCHIVE_MAX_BYTES: u64 = 1_073_741_824;
@@ -986,6 +986,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
     {
         let registry = Arc::new(Registry::new(config.repo_roots.clone())?);
         registry.set_retention_interval(config.retention_interval);
+        registry.set_event_retention_seconds(config.event_retention_seconds);
         let executor = BoundedExecutor::new(config.blocking_pool_size)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)

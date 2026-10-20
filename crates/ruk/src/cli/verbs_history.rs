@@ -40,7 +40,7 @@ use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::ObjectKind as MergeLaneObjectKind;
 use ruk_core::store::Store as MergeLaneStore;
-use ruk_core::store::Store;
+use ruk_core::store::{EventContext, EventSource, Store};
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
@@ -524,7 +524,14 @@ fn refresh_tracked(ctx: &Ctx) -> Result<(), GitError> {
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(())
 }
 
@@ -1017,7 +1024,12 @@ fn advance_head_to(ctx: &Ctx, new_oid: Oid) -> Result<(), GitError> {
             let next = workspace.move_head(workspace.stamp, HeadRef::Detached(new_oid))?;
             let mutation = workspace_mutation(raw.as_deref(), &next)?;
             store
-                .publish(Vec::new(), &[mutation])
+                .publish(
+                    Vec::new(),
+                    &[mutation],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .map_err(GitError::from)?;
             Ok(())
         }
@@ -4876,7 +4888,12 @@ fn apply_merge_plan(ctx: &Ctx, plan: &MergePlan) -> Result<Vec<(Vec<u8>, IndexEn
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(prepared, &mutations)
+        .publish(
+            prepared,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     sync_lane_worktree(ctx, &writes)?;
     Ok(staged)
@@ -5233,7 +5250,12 @@ fn restore_abort_index(ctx: &Ctx, verb: &str) -> Result<(), GitError> {
     mutations.push(workspace_mutation(raw_ws.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     // Restoring the pre-operation worktree must not delete files the user
     // created meanwhile: filter removals to snapshot paths only when the

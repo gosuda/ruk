@@ -18,7 +18,7 @@ use crate::merge::Merge;
 use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// One commit to create.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,7 +77,12 @@ pub struct NewResult {
 pub fn new(store: &Store, request: NewRequest) -> Result<NewResult, CoreError> {
     let prepared = prepare_new(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }

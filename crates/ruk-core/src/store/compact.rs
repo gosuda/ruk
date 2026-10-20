@@ -753,7 +753,7 @@ mod tests {
     use super::*;
     use crate::ids::HashKind;
     use crate::store::types::ObjectKind;
-    use crate::store::{PreparationBudget, Store};
+    use crate::store::{EventContext, EventSource, PreparationBudget, Store};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -810,7 +810,14 @@ mod tests {
             .prepare(ObjectKind::Blob, len, bytes, None)
             .expect("prepare blob");
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish blob");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish blob");
         oid
     }
 

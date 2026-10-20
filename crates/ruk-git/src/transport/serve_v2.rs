@@ -41,6 +41,8 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::RefTarget;
 use ruk_core::store::Store;
 use ruk_core::store::types::ObjectKind;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 
 use super::pack::{PackEntry, write_pack};
 use super::pktline::{self, Packet, PktReader, encode_data, encode_flush, send};
@@ -689,7 +691,12 @@ mod tests {
         let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
         let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
         store
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish ref");
     }
 
@@ -885,7 +892,14 @@ mod tests {
             .prepare(ObjectKind::Tag, tag_len, tag_bytes.as_bytes(), None)
             .expect("prepare tag");
         let tag_oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish tag");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tag");
         set_ref(&store, kind, b"refs/tags/v1", tag_oid);
         let out = serve_session(&ls_refs_command(&[]), &store, kind);
         let mut pkt = past_advertisement(&out, kind);

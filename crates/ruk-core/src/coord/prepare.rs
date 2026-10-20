@@ -3735,7 +3735,7 @@ mod tests {
     use crate::records::keys::change_key;
     use crate::records::types::{ChangeEntry, ChangeState};
     use crate::refdata::RefName;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
     use crate::workcopy::journal_state::ws_apply_key;
     use crate::workspace::WorkspaceStamp;
 
@@ -3808,7 +3808,14 @@ mod tests {
             .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("prepare empty tree");
         let tree_oid = tree.oid();
-        store.publish(vec![tree], &[]).expect("publish empty tree");
+        store
+            .publish(
+                vec![tree],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish empty tree");
         let prepared = prepare_new(
             store,
             NewRequest {
@@ -3827,7 +3834,12 @@ mod tests {
         let change = prepared.output.change_id;
         let oid = prepared.output.oid.expect("seed commit is a Git commit");
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish seed commit");
         (head, change, oid)
     }
@@ -3919,6 +3931,8 @@ mod tests {
                     expected: crate::store::types::FactExpectation::Absent,
                     value: Some(crate::store::encode("ref target", &target).expect("encode ref")),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish fixture ref");
         let prepared = prepare_mutation(
@@ -4137,6 +4151,8 @@ mod tests {
                     expected: crate::store::types::FactExpectation::Absent,
                     value: Some(encode_change_entry(&entry).expect("encode change entry")),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish conflicted change");
         let err = prepare_mutation(
@@ -4343,7 +4359,12 @@ mod tests {
 
         // Once published, unpinning removes the fact against its bytes.
         store
-            .publish(Vec::new(), &prepared.facts)
+            .publish(
+                Vec::new(),
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish pin");
         let prepared = prepare_mutation(
             &store,
@@ -4394,7 +4415,12 @@ mod tests {
             .expect("prepare subject");
         let subject = subject_object.oid();
         store
-            .publish(vec![subject_object], &[])
+            .publish(
+                vec![subject_object],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish subject");
 
         let key =
@@ -4451,7 +4477,12 @@ mod tests {
 
         // Publishing once makes the repeat a duplicate that stages nothing.
         store
-            .publish(Vec::new(), &prepared.facts)
+            .publish(
+                Vec::new(),
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish attestation");
         let repeat = prepare_mutation_with(&ctx, request()).expect("duplicate prepares");
         assert!(repeat.facts.is_empty());
@@ -4535,7 +4566,12 @@ mod tests {
         assert!(prepared.workspace_fence.is_none());
         assert_eq!(prepared.facts.len(), 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish land plan");
         let stored = load_plan(&store, reply.plan)
             .expect("read plan")
@@ -4759,7 +4795,12 @@ mod tests {
 
         // The staged parts commit: the head resolves to a stored commit.
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish new");
         let read = store.read(empty_tree_oid(&store)).expect("read empty tree");
         assert_eq!(read.kind, ObjectKind::Tree);
@@ -4801,7 +4842,14 @@ mod tests {
             .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("stage lane tree");
         let tree_oid = tree.oid();
-        store.publish(vec![tree], &[]).expect("publish lane tree");
+        store
+            .publish(
+                vec![tree],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish lane tree");
         GitCommitArgs {
             tree: tree_oid,
             parents: vec![parent],
@@ -4842,7 +4890,12 @@ mod tests {
             .expect("lane commit has a git identity");
         assert!(prepared.ref_transaction.is_some());
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish lane commit");
         assert!(
             Records::new(&store)
@@ -4870,7 +4923,12 @@ mod tests {
         .expect("first git.commit prepares");
         assert!(first.ref_transaction.is_some());
         store
-            .publish(first.objects, &first.facts)
+            .publish(
+                first.objects,
+                &first.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish first lane commit");
         // The retry carries the original (now stale) expectation, but the
         // commit already landed and the ref already holds it, so preparation
@@ -4930,7 +4988,12 @@ mod tests {
         assert_eq!(identity.name, "Bea");
         assert_eq!(identity.source, IdentitySource::OperationOverride);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish child");
         let record = Records::new(&store)
             .get_commit(&reply.created.head)
@@ -5040,7 +5103,12 @@ mod tests {
         )
         .expect("ws.new prepares");
         store
-            .publish(ws.objects, &ws.facts)
+            .publish(
+                ws.objects,
+                &ws.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish workspace");
         let Reply::WsNew(ws_reply) = ws.reply else {
             panic!("ws.new must answer its own reply");
@@ -5078,7 +5146,12 @@ mod tests {
             .collect();
         assert_eq!(facts.len(), 1);
         store
-            .publish(switched.objects, &switched.facts)
+            .publish(
+                switched.objects,
+                &switched.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish switch");
 
         // A holder that is not the session loses the fence, not the call.
@@ -5209,7 +5282,12 @@ mod tests {
         )
         .expect("seal fixture claim");
         store
-            .publish(Vec::new(), &sealed.facts)
+            .publish(
+                Vec::new(),
+                &sealed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish fixture claim");
 
         // The legacy path serves releases: prediction is a read, and the
@@ -5297,7 +5375,12 @@ mod tests {
         );
         assert!(prepared.workspace_fence.is_none());
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish native workspace");
 
         // GitCompat creation is context-free: no identity, no clock.
@@ -5323,7 +5406,12 @@ mod tests {
         };
         assert!(reply.outcome.identity.is_none());
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish gitcompat workspace");
 
         // Native creation without an identity is invalid, even with a clock.
@@ -5410,7 +5498,12 @@ mod tests {
         )
         .expect("ws.new prepares");
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish workspace");
         let Reply::WsNew(reply) = prepared.reply else {
             panic!("ws.new must answer its own reply");
@@ -5461,7 +5554,12 @@ mod tests {
             crate::store::types::FactTable::Workspaces
         );
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish edit");
 
         // The row transition is context-free, so the legacy path serves it
@@ -5512,7 +5610,12 @@ mod tests {
         )
         .expect("gitcompat ws.new prepares");
         store
-            .publish(git.objects, &git.facts)
+            .publish(
+                git.objects,
+                &git.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish gitcompat workspace");
         let Reply::WsNew(git_reply) = git.reply else {
             panic!("ws.new must answer its own reply");
@@ -5626,7 +5729,12 @@ mod tests {
         assert_eq!(reply.state.scope(), &scope);
         assert_eq!(reply.state.stamp().sequence, before.sequence + 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish scope");
 
         let legacy = prepare_mutation(
@@ -5678,7 +5786,12 @@ mod tests {
         assert_eq!(reply.state.stamp().sequence, before.sequence);
         assert_eq!(reply.state.stamp().lease_epoch, before.lease_epoch + 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish take");
 
         // An unpinned take seizes from whoever holds the workspace and
@@ -5707,7 +5820,12 @@ mod tests {
             before.lease_epoch + 2
         );
         store
-            .publish(seized.objects, &seized.facts)
+            .publish(
+                seized.objects,
+                &seized.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish seize");
 
         // The displaced holder's stamp can never match again.
@@ -5754,7 +5872,12 @@ mod tests {
             panic!("ws.drop must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish drop");
         assert!(
             workspace::observe(&store, id).is_err(),
@@ -5822,6 +5945,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(vec![0x01]),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("stage open journal");
         let err =
@@ -5846,6 +5971,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(value),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish bare row");
         let err = prepare_mutation_with(
@@ -5938,6 +6065,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(vec![0x01]),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("stage open journal");
         let err = prepare_mutation(&store, session, request())
@@ -6036,7 +6165,12 @@ mod tests {
         let head = prepared.output.head;
         let change = prepared.output.change_id;
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish child commit");
         (head, change)
     }
@@ -6058,7 +6192,12 @@ mod tests {
             .expect("prepare marker tree");
         let oid = staged.oid();
         store
-            .publish(vec![staged], &[])
+            .publish(
+                vec![staged],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish marker tree");
         oid
     }
@@ -6136,7 +6275,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[1].old, bhead);
         assert_eq!(reply.rewrites.items[2].old, chead);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish describe");
         assert_eq!(commit_message(&store, &new_a), b"a rewritten");
         assert_eq!(commit_message(&store, &new_b), b"b");
@@ -6251,7 +6395,12 @@ mod tests {
             .collect();
         assert_eq!(change_facts.len(), 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish merged describe");
         assert_eq!(change_heads(&store, &achange).len(), 2);
         let _ = bhead;
@@ -6294,7 +6443,12 @@ mod tests {
         };
         assert_eq!(reply.rewrites.items.len(), 4);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish diamond describe");
         let merge_rewrite = reply
             .rewrites
@@ -6370,7 +6524,12 @@ mod tests {
         assert_eq!(reply.rewrites.items.len(), 2);
         assert_eq!(reply.rewrites.items[0].old, shead);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish rebase");
         let new_s = reply.rewrites.items[0].new;
         let new_d = reply.rewrites.items[1].new;
@@ -6408,7 +6567,12 @@ mod tests {
         };
         assert_eq!(reply.rewrites.items.len(), 2);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish revisions-only rebase");
         let new_d = reply.rewrites.items[1].new;
         assert_eq!(commit_parents(&store, &new_d), vec![phead]);
@@ -6580,18 +6744,39 @@ mod tests {
             .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("prepare empty tree");
         let mut root = empty.oid();
-        store.publish(vec![empty], &[]).expect("publish empty tree");
+        store
+            .publish(
+                vec![empty],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish empty tree");
         for (name, marker) in files {
             let blob_bytes = [*marker];
             let blob = store
                 .prepare(ObjectKind::Blob, 1, std::io::Cursor::new(blob_bytes), None)
                 .expect("prepare blob");
             let blob_oid = blob.oid();
-            store.publish(vec![blob], &[]).expect("publish blob");
+            store
+                .publish(
+                    vec![blob],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish blob");
             let path = RepoPath::new(name.as_bytes().to_vec()).expect("test path");
             let entry = Some((TreeMode::File(FileMode::Regular), blob_oid));
             let edit = set_entry(store, root, &path, entry).expect("set entry");
-            store.publish(edit.objects, &[]).expect("publish tree edit");
+            store
+                .publish(
+                    edit.objects,
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish tree edit");
             root = edit.root;
         }
         root
@@ -6620,7 +6805,12 @@ mod tests {
             .expect("prepare conflicted commit");
         let head = conflicted.head;
         store
-            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .publish(
+                vec![conflicted.prepared_object],
+                &conflicted.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted commit");
         let request = Request::Resolve(Box::new(WireMutation {
             request_id: request_id(),
@@ -6643,7 +6833,12 @@ mod tests {
             "the only path is resolved"
         );
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish resolve");
         let resolved = Records::new(&store)
             .get_commit(&reply.change.head)
@@ -6680,7 +6875,12 @@ mod tests {
             .expect("prepare conflicted commit");
         let head = conflicted.head;
         store
-            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .publish(
+                vec![conflicted.prepared_object],
+                &conflicted.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted commit");
         let prepared = prepare_mutation(
             &store,
@@ -6703,7 +6903,12 @@ mod tests {
             panic!("resolve must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish resolve");
         let resolved = Records::new(&store)
             .get_commit(&reply.change.head)
@@ -6739,7 +6944,12 @@ mod tests {
             .expect("prepare conflicted commit");
         let head = conflicted.head;
         store
-            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .publish(
+                vec![conflicted.prepared_object],
+                &conflicted.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted commit");
         let request = Request::Resolve(Box::new(WireMutation {
             request_id: request_id(),
@@ -6789,7 +6999,12 @@ mod tests {
             panic!("revert must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish revert");
         assert_ne!(reply.created.change, target_change, "a fresh change");
         let created = Records::new(&store)
@@ -6832,7 +7047,12 @@ mod tests {
             panic!("split must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish split");
         assert_eq!(
             reply.rewrites.items.len(),
@@ -6900,7 +7120,12 @@ mod tests {
             "the remainder keeps the source"
         );
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish squash");
         let new_destination = reply.rewrites.items[0].new;
         let new_source = reply.rewrites.items[1].new;
@@ -6977,7 +7202,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[0].old, dhead);
         assert_eq!(reply.abandoned.items, vec![schange]);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish squash");
         let new_dest = reply.rewrites.items[0].new;
         let new_child = reply.rewrites.items[1].new;
@@ -7070,7 +7300,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[0].old, dhead);
         assert_eq!(reply.abandoned.items, vec![tchange]);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish abandon");
         let new_child = reply.rewrites.items[0].new;
         assert!(commit_parents(&store, &new_child).is_empty());
@@ -7106,7 +7341,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[0].old, dhead);
         assert_eq!(reply.abandoned.items.len(), 2);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish nested abandon");
         let new_leaf = reply.rewrites.items[0].new;
         assert!(commit_parents(&store, &new_leaf).is_empty());
@@ -7187,7 +7427,12 @@ mod tests {
         )
         .expect("ws.new prepares");
         store
-            .publish(ws.objects, &ws.facts)
+            .publish(
+                ws.objects,
+                &ws.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish workspace");
         let Reply::WsNew(ws_reply) = ws.reply else {
             panic!("ws.new must answer its own reply");
@@ -7228,7 +7473,12 @@ mod tests {
             .collect();
         assert_eq!(workspace_facts.len(), 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish fenced describe");
 
         // Two bindings exceed the single lane fence.

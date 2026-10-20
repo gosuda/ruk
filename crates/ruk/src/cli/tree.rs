@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use ruk_core::conflict::Signature;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry};
-use ruk_core::store::{ObjectKind, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, Store};
 use ruk_git::GitError;
 use std::io::Read;
 
@@ -208,7 +208,14 @@ pub(crate) fn build_index_tree(
     }
     let mut published = Vec::new();
     let root = build_dir(store, kind, &by_dir, &[], &mut published)?;
-    store.publish(published, &[]).map_err(GitError::from)?;
+    store
+        .publish(
+            published,
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(root)
 }
 
@@ -372,7 +379,14 @@ pub(crate) fn store_object(
         .prepare(kind, body_len, std::io::Cursor::new(body), None)
         .map_err(GitError::from)?;
     let oid = prepared.oid();
-    store.publish(vec![prepared], &[]).map_err(GitError::from)?;
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(oid)
 }
 

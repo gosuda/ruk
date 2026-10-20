@@ -17,7 +17,7 @@ use crate::merge::Merge;
 use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// Header name carrying the native change ID.
 const CHANGE_ID_HEADER: &[u8] = b"change-id";
@@ -65,7 +65,12 @@ pub struct EditResult {
 pub fn edit(store: &Store, request: EditRequest) -> Result<EditResult, CoreError> {
     let prepared = prepare_edit(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -253,7 +258,12 @@ mod tests {
                 .expect("prepare tree");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish tree");
             oid
         }
