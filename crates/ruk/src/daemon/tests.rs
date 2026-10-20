@@ -15,7 +15,10 @@ use std::time::Duration;
 use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
 use super::{
     BoundedExecutor, CommandAccepted, CommandExitReport, ConnectionRefs, ControlReply,
-    DEFAULT_RETENTION_INTERVAL_MS, DaemonConfig, ErrorReport, ExitReport, InvocationAccepted,
+    DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
+    DEFAULT_EVENT_RETENTION_SECONDS, DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS,
+    DEFAULT_RETENTION_INTERVAL_MS, DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE,
+    DEFAULT_TRANSPORT_PERMITS, DaemonConfig, ErrorReport, ExitReport, InvocationAccepted,
     InvocationOpen, OutcomeLedger, Registry, SessionOpened, serve_connection,
 };
 use ruk_core::bytes::ByteString;
@@ -369,6 +372,87 @@ fn retention_interval_defaults_to_sixty_seconds_and_parses() {
         b"socket_path = \"/tmp/ruk-retention.sock\"\nrepo_roots = [\"/tmp\"]\nretention_interval_ms = 0\n";
     let parsed = DaemonConfig::from_toml(disabled).expect("zero disables sweeps");
     assert!(parsed.retention_interval().is_zero());
+}
+
+/// Renders one TOML document binding the scratch socket over `/tmp` plus `extra` keys.
+fn config_doc(extra: &str) -> Vec<u8> {
+    format!("socket_path = \"/tmp/ruk-r02.sock\"\nrepo_roots = [\"/tmp\"]\n{extra}").into_bytes()
+}
+
+#[test]
+fn unknown_config_key_fails_from_toml() {
+    let err = DaemonConfig::from_toml(&config_doc("no_such_key = 1\n"))
+        .expect_err("unknown key must fail");
+    assert!(
+        matches!(err, super::Error::Config(_)),
+        "unknown key must be a config error: {err}"
+    );
+}
+
+#[test]
+fn invalid_new_config_values_name_the_key() {
+    let cases = [
+        ("transport_permits", "transport_permits = 0\n"),
+        ("hook_timeout_ms", "hook_timeout_ms = 0\n"),
+        ("hook_max_commands", "hook_max_commands = 0\n"),
+        ("hook_max_commands", "hook_max_commands = 4097\n"),
+        ("default_branch", "default_branch = \"main\"\n"),
+        ("event_retention_seconds", "event_retention_seconds = 0\n"),
+    ];
+    for (key, extra) in cases {
+        let err =
+            DaemonConfig::from_toml(&config_doc(extra)).expect_err("{key} must fail validation");
+        assert!(
+            matches!(err, super::Error::Config(_)),
+            "{key} must be a config error: {err}"
+        );
+        assert!(
+            err.to_string().contains(key),
+            "error for {key} must name it: {err}"
+        );
+    }
+}
+
+#[test]
+fn hook_max_commands_accepts_only_1_through_4096() {
+    for valid in ["hook_max_commands = 1\n", "hook_max_commands = 4096\n"] {
+        DaemonConfig::from_toml(&config_doc(valid)).expect("boundary must parse");
+    }
+}
+
+#[test]
+fn minimal_config_document_yields_new_defaults() {
+    let cfg = DaemonConfig::from_toml(&config_doc("")).expect("minimal doc parses");
+    assert!(cfg.admin_uids().is_empty());
+    assert_eq!(cfg.transport_permits, DEFAULT_TRANSPORT_PERMITS);
+    assert_eq!(
+        cfg.hook_timeout,
+        Duration::from_millis(DEFAULT_HOOK_TIMEOUT_MS)
+    );
+    assert_eq!(cfg.hook_max_commands, DEFAULT_HOOK_MAX_COMMANDS);
+    assert_eq!(cfg.default_branch, DEFAULT_DEFAULT_BRANCH);
+    assert_eq!(cfg.event_retention_seconds, DEFAULT_EVENT_RETENTION_SECONDS);
+    assert_eq!(cfg.archive_max_bytes(), DEFAULT_ARCHIVE_MAX_BYTES);
+    assert_eq!(cfg.compare_max_commits(), DEFAULT_COMPARE_MAX_COMMITS);
+    assert_eq!(cfg.search_max_scan_bytes(), DEFAULT_SEARCH_MAX_SCAN_BYTES);
+    assert_eq!(cfg.search_pool_size(), DEFAULT_SEARCH_POOL_SIZE);
+    cfg.validate().expect("defaults validate");
+}
+
+#[test]
+fn explicit_new_config_values_parse() {
+    let extra = "admin_uids = [1000, 1001]\ntransport_permits = 4\nhook_timeout_ms = 2500\nhook_max_commands = 64\ndefault_branch = \"refs/heads/develop\"\nevent_retention_seconds = 3600\narchive_max_bytes = 1024\ncompare_max_commits = 512\nsearch_max_scan_bytes = 2048\nsearch_pool_size = 2\n";
+    let cfg = DaemonConfig::from_toml(&config_doc(extra)).expect("explicit values parse");
+    assert_eq!(cfg.admin_uids(), &[1000, 1001]);
+    assert_eq!(cfg.transport_permits, 4);
+    assert_eq!(cfg.hook_timeout, Duration::from_millis(2_500));
+    assert_eq!(cfg.hook_max_commands, 64);
+    assert_eq!(cfg.default_branch, "refs/heads/develop");
+    assert_eq!(cfg.event_retention_seconds, 3_600);
+    assert_eq!(cfg.archive_max_bytes(), 1_024);
+    assert_eq!(cfg.compare_max_commits(), 512);
+    assert_eq!(cfg.search_max_scan_bytes(), 2_048);
+    assert_eq!(cfg.search_pool_size(), 2);
 }
 
 #[test]

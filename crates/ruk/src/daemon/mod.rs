@@ -33,6 +33,7 @@ use ruk_core::protocol::{
     Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request, SessionOpenArgs,
     SessionResumeArgs, decode_json,
 };
+use ruk_core::refdata::RefName;
 
 /// Default concurrent connections of one daemon process.
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 128;
@@ -49,6 +50,36 @@ pub(crate) const DEFAULT_FRAME_TIMEOUT_MS: u64 = 60_000;
 /// Default interval between periodic retention sweeps in milliseconds.
 pub(crate) const DEFAULT_RETENTION_INTERVAL_MS: u64 = 60_000;
 
+/// Default bulkhead permits for long-running transport streams.
+pub(crate) const DEFAULT_TRANSPORT_PERMITS: usize = 8;
+
+/// Default pre-receive hook deadline in milliseconds.
+pub(crate) const DEFAULT_HOOK_TIMEOUT_MS: u64 = 10_000;
+
+/// Default cap of ref commands accepted per push batch.
+pub(crate) const DEFAULT_HOOK_MAX_COMMANDS: usize = 1_024;
+
+/// Ceiling of ref commands accepted per push batch.
+pub(crate) const MAX_HOOK_MAX_COMMANDS: usize = 4_096;
+
+/// Default branch recorded by `repo.init` and `repo.fork`.
+pub(crate) const DEFAULT_DEFAULT_BRANCH: &str = "refs/heads/main";
+
+/// Default event retention horizon in seconds (seven days).
+pub(crate) const DEFAULT_EVENT_RETENTION_SECONDS: u64 = 604_800;
+
+/// Default cap of archive bytes served per request (1 GiB).
+pub(crate) const DEFAULT_ARCHIVE_MAX_BYTES: u64 = 1_073_741_824;
+
+/// Default walk budget for `compare` reads.
+pub(crate) const DEFAULT_COMPARE_MAX_COMMITS: usize = 10_000;
+
+/// Default per-request scan budget for `search` (64 MiB).
+pub(crate) const DEFAULT_SEARCH_MAX_SCAN_BYTES: u64 = 67_108_864;
+
+/// Default permits of the search worker pool.
+pub(crate) const DEFAULT_SEARCH_POOL_SIZE: usize = 8;
+
 /// Configuration of one `ruk serve` process.
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonConfig {
@@ -58,10 +89,30 @@ pub(crate) struct DaemonConfig {
     repo_roots: Vec<PathBuf>,
     /// Allowed peer user identifiers; empty allows every local peer.
     allowed_uids: Vec<u32>,
+    /// Peer user identifiers allowed to call admin methods; empty disables them.
+    admin_uids: Vec<u32>,
     /// Concurrent connections before the daemon sheds accept.
     max_connections: usize,
     /// Blocking permits of the shared executor.
     blocking_pool_size: usize,
+    /// Permits of the separate bulkhead for long-running transport streams.
+    transport_permits: usize,
+    /// Pre-receive hook deadline; fail-closed on expiry.
+    hook_timeout: Duration,
+    /// Cap of ref commands accepted per push batch.
+    hook_max_commands: usize,
+    /// Branch recorded by `repo.init` and `repo.fork`.
+    default_branch: String,
+    /// Horizon keeping event rows; older rows are swept.
+    event_retention_seconds: u64,
+    /// Cap of archive bytes served per request.
+    archive_max_bytes: u64,
+    /// Walk budget for `compare` reads.
+    compare_max_commits: usize,
+    /// Per-request scan budget for `search`.
+    search_max_scan_bytes: u64,
+    /// Permits of the search worker pool.
+    search_pool_size: usize,
     /// Deadline for the stream-zero handshake of each connection.
     handshake_timeout: Duration,
     /// Deadline for each subsequent frame of a connection.
@@ -80,8 +131,18 @@ impl DaemonConfig {
             socket_path,
             repo_roots,
             allowed_uids: Vec::new(),
+            admin_uids: Vec::new(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             blocking_pool_size: DEFAULT_BLOCKING_POOL_SIZE,
+            transport_permits: DEFAULT_TRANSPORT_PERMITS,
+            hook_timeout: Duration::from_millis(DEFAULT_HOOK_TIMEOUT_MS),
+            hook_max_commands: DEFAULT_HOOK_MAX_COMMANDS,
+            default_branch: String::from(DEFAULT_DEFAULT_BRANCH),
+            event_retention_seconds: DEFAULT_EVENT_RETENTION_SECONDS,
+            archive_max_bytes: DEFAULT_ARCHIVE_MAX_BYTES,
+            compare_max_commits: DEFAULT_COMPARE_MAX_COMMITS,
+            search_max_scan_bytes: DEFAULT_SEARCH_MAX_SCAN_BYTES,
+            search_pool_size: DEFAULT_SEARCH_POOL_SIZE,
             handshake_timeout: Duration::from_millis(DEFAULT_HANDSHAKE_TIMEOUT_MS),
             frame_timeout: Duration::from_millis(DEFAULT_FRAME_TIMEOUT_MS),
             stream_window_bytes: ipc::INITIAL_STREAM_WINDOW_BYTES,
@@ -96,10 +157,80 @@ impl DaemonConfig {
         self
     }
 
+    /// Restricts admin methods to `uids`; empty disables them.
+    #[must_use]
+    pub(crate) fn with_admin_uids(mut self, uids: Vec<u32>) -> Self {
+        self.admin_uids = uids;
+        self
+    }
+
     /// Sets the concurrent connection bound.
     #[must_use]
     pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
+        self
+    }
+
+    /// Sets the permits of the separate bulkhead for long transport streams.
+    #[must_use]
+    pub(crate) fn with_transport_permits(mut self, permits: usize) -> Self {
+        self.transport_permits = permits;
+        self
+    }
+
+    /// Sets the pre-receive hook deadline.
+    #[must_use]
+    pub(crate) fn with_hook_timeout(mut self, timeout: Duration) -> Self {
+        self.hook_timeout = timeout;
+        self
+    }
+
+    /// Sets the cap of ref commands accepted per push batch.
+    #[must_use]
+    pub(crate) fn with_hook_max_commands(mut self, max_commands: usize) -> Self {
+        self.hook_max_commands = max_commands;
+        self
+    }
+
+    /// Sets the branch recorded by `repo.init` and `repo.fork`.
+    #[must_use]
+    pub(crate) fn with_default_branch(mut self, branch: String) -> Self {
+        self.default_branch = branch;
+        self
+    }
+
+    /// Sets the horizon keeping event rows.
+    #[must_use]
+    pub(crate) fn with_event_retention_seconds(mut self, seconds: u64) -> Self {
+        self.event_retention_seconds = seconds;
+        self
+    }
+
+    /// Sets the cap of archive bytes served per request.
+    #[must_use]
+    pub(crate) fn with_archive_max_bytes(mut self, bytes: u64) -> Self {
+        self.archive_max_bytes = bytes;
+        self
+    }
+
+    /// Sets the walk budget for `compare` reads.
+    #[must_use]
+    pub(crate) fn with_compare_max_commits(mut self, commits: usize) -> Self {
+        self.compare_max_commits = commits;
+        self
+    }
+
+    /// Sets the per-request scan budget for `search`.
+    #[must_use]
+    pub(crate) fn with_search_max_scan_bytes(mut self, bytes: u64) -> Self {
+        self.search_max_scan_bytes = bytes;
+        self
+    }
+
+    /// Sets the permits of the search worker pool.
+    #[must_use]
+    pub(crate) fn with_search_pool_size(mut self, pool_size: usize) -> Self {
+        self.search_pool_size = pool_size;
         self
     }
 
@@ -172,41 +303,126 @@ impl DaemonConfig {
         self.retention_interval
     }
 
+    /// Returns the peer identifiers allowed to call admin methods.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn admin_uids(&self) -> &[u32] {
+        &self.admin_uids
+    }
+
+    /// Returns the cap of archive bytes served per request.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn archive_max_bytes(&self) -> u64 {
+        self.archive_max_bytes
+    }
+
+    /// Returns the walk budget for `compare` reads.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn compare_max_commits(&self) -> usize {
+        self.compare_max_commits
+    }
+
+    /// Returns the per-request scan budget for `search`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn search_max_scan_bytes(&self) -> u64 {
+        self.search_max_scan_bytes
+    }
+
+    /// Returns the permits of the search worker pool.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
+    #[must_use]
+    pub(crate) fn search_pool_size(&self) -> usize {
+        self.search_pool_size
+    }
+
     /// Loads a TOML daemon configuration document.
     ///
     /// Keys: `socket_path`, `repo_roots` (required), `allowed_uids`,
-    /// `max_connections`, `blocking_pool_size`, `handshake_timeout_ms`,
-    /// `frame_timeout_ms`, `stream_window_bytes`, `retention_interval_ms`
-    /// (optional; zero disables periodic retention sweeps).
+    /// `admin_uids`, `max_connections`, `blocking_pool_size`,
+    /// `transport_permits`, `handshake_timeout_ms`, `frame_timeout_ms`,
+    /// `stream_window_bytes`, `retention_interval_ms` (optional; zero
+    /// disables periodic retention sweeps), `hook_timeout_ms`,
+    /// `hook_max_commands`, `default_branch`, `event_retention_seconds`,
+    /// `archive_max_bytes`, `compare_max_commits`, `search_max_scan_bytes`,
+    /// `search_pool_size`.
     ///
     /// # Errors
-    /// `Error::Config` on malformed TOML, missing required keys, or bounds
-    /// outside `validate`.
+    /// `Error::Config` on malformed TOML, missing required keys, unknown
+    /// keys, or bounds outside `validate`.
     pub(crate) fn from_toml(doc: &[u8]) -> Result<Self, Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Doc {
             socket_path: PathBuf,
             repo_roots: Vec<PathBuf>,
             #[serde(default)]
             allowed_uids: Vec<u32>,
+            #[serde(default)]
+            admin_uids: Vec<u32>,
             max_connections: Option<usize>,
             blocking_pool_size: Option<usize>,
+            transport_permits: Option<usize>,
             handshake_timeout_ms: Option<u64>,
             frame_timeout_ms: Option<u64>,
             stream_window_bytes: Option<u64>,
             retention_interval_ms: Option<u64>,
+            hook_timeout_ms: Option<u64>,
+            hook_max_commands: Option<usize>,
+            default_branch: Option<String>,
+            event_retention_seconds: Option<u64>,
+            archive_max_bytes: Option<u64>,
+            compare_max_commits: Option<usize>,
+            search_max_scan_bytes: Option<u64>,
+            search_pool_size: Option<usize>,
         }
         let text = std::str::from_utf8(doc)
             .map_err(|err| Error::Config(format!("config is not UTF-8: {err}")))?;
         let doc: Doc =
             toml::from_str(text).map_err(|err| Error::Config(format!("config TOML: {err}")))?;
-        let mut cfg =
-            Self::new(doc.socket_path, doc.repo_roots).with_allowed_uids(doc.allowed_uids);
+        let mut cfg = Self::new(doc.socket_path, doc.repo_roots)
+            .with_allowed_uids(doc.allowed_uids)
+            .with_admin_uids(doc.admin_uids);
         if let Some(v) = doc.max_connections {
             cfg = cfg.with_max_connections(v);
         }
         if let Some(v) = doc.blocking_pool_size {
             cfg = cfg.with_blocking_pool_size(v);
+        }
+        if let Some(v) = doc.transport_permits {
+            cfg = cfg.with_transport_permits(v);
         }
         if let Some(v) = doc.handshake_timeout_ms {
             cfg = cfg.with_handshake_timeout(Duration::from_millis(v));
@@ -219,6 +435,30 @@ impl DaemonConfig {
         }
         if let Some(v) = doc.retention_interval_ms {
             cfg = cfg.with_retention_interval(Duration::from_millis(v));
+        }
+        if let Some(v) = doc.hook_timeout_ms {
+            cfg = cfg.with_hook_timeout(Duration::from_millis(v));
+        }
+        if let Some(v) = doc.hook_max_commands {
+            cfg = cfg.with_hook_max_commands(v);
+        }
+        if let Some(v) = doc.default_branch {
+            cfg = cfg.with_default_branch(v);
+        }
+        if let Some(v) = doc.event_retention_seconds {
+            cfg = cfg.with_event_retention_seconds(v);
+        }
+        if let Some(v) = doc.archive_max_bytes {
+            cfg = cfg.with_archive_max_bytes(v);
+        }
+        if let Some(v) = doc.compare_max_commits {
+            cfg = cfg.with_compare_max_commits(v);
+        }
+        if let Some(v) = doc.search_max_scan_bytes {
+            cfg = cfg.with_search_max_scan_bytes(v);
+        }
+        if let Some(v) = doc.search_pool_size {
+            cfg = cfg.with_search_pool_size(v);
         }
         cfg.validate()?;
         Ok(cfg)
@@ -246,6 +486,32 @@ impl DaemonConfig {
         if self.blocking_pool_size == 0 {
             return Err(Error::Config(String::from(
                 "blocking pool must hold at least one permit",
+            )));
+        }
+        if self.transport_permits == 0 {
+            return Err(Error::Config(String::from(
+                "transport_permits must hold at least one permit",
+            )));
+        }
+        if self.hook_timeout.is_zero() {
+            return Err(Error::Config(String::from(
+                "hook_timeout_ms must be nonzero",
+            )));
+        }
+        if self.hook_max_commands == 0 || self.hook_max_commands > MAX_HOOK_MAX_COMMANDS {
+            return Err(Error::Config(format!(
+                "hook_max_commands must be within 1..={MAX_HOOK_MAX_COMMANDS}"
+            )));
+        }
+        if RefName::new(self.default_branch.clone()).is_err() {
+            return Err(Error::Config(format!(
+                "default_branch is not a valid ref name: {}",
+                self.default_branch
+            )));
+        }
+        if self.event_retention_seconds == 0 {
+            return Err(Error::Config(String::from(
+                "event_retention_seconds must be nonzero",
             )));
         }
         if self.handshake_timeout.is_zero() || self.frame_timeout.is_zero() {
