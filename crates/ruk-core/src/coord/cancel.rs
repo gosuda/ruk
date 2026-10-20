@@ -79,7 +79,7 @@ impl Cancel {
     ///
     /// If the channel is already cancelled prior to this call, returns immediately.
     /// Channel closure is treated as cancellation and unblocks without spinning or panicking.
-    pub(crate) async fn cancelled(&mut self) {
+    pub async fn cancelled(&mut self) {
         if self.is_cancelled() {
             return;
         }
@@ -90,7 +90,7 @@ impl Cancel {
     ///
     /// Cancellation drops the future. The caller must discard partially read
     /// streams and keep blocking-work ownership inside the blocking closure.
-    pub(crate) async fn until<F: Future>(&self, work: F) -> Result<F::Output, CoreError> {
+    pub async fn until<F: Future>(&self, work: F) -> Result<F::Output, CoreError> {
         let mut observer = self.clone();
         let mut cancelled = pin!(observer.cancelled());
         let mut work = pin!(work);

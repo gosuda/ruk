@@ -1150,6 +1150,151 @@ async fn reader_never_blocks_on_a_full_stream() {
     assert_eq!(delivered.stream_id, 9);
 }
 
+/// A tripped cancel flag aborts the blocking serve instead of running
+/// it to completion: the daemon threads its per-stream flag into the
+/// sync serve, which polls it at every pack stage.
+#[tokio::test]
+async fn run_git_service_honors_a_tripped_cancel_flag() {
+    use std::sync::atomic::AtomicBool;
+    let root = temp_root("git-cancel-flag");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    registry.set_runtime(tokio::runtime::Handle::current());
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let mut stdin = pkt(format!("want {}\n", commit.to_hex()).as_bytes());
+    stdin.extend_from_slice(&flush());
+    stdin.extend_from_slice(&pkt(b"done\n"));
+    stdin.extend_from_slice(&flush());
+
+    let live = Arc::new(AtomicBool::new(false));
+    super::run_git_service(&coordinator, "upload-pack", "", false, stdin.clone(), live)
+        .expect("an untripped flag serves the pack");
+    let tripped = Arc::new(AtomicBool::new(true));
+    let err = super::run_git_service(&coordinator, "upload-pack", "", false, stdin, tripped)
+        .expect_err("a tripped flag aborts the serve");
+    assert_eq!(
+        err.code,
+        ErrorCode::ECancelled,
+        "abort reports cancel, got {err:?}"
+    );
+}
+
+/// A `Cancel` frame ends a parked blocking wait at once: the helper
+/// stops awaiting (freeing the bulkhead permit), trips the sync flag,
+/// and reports the cancelled exit.
+#[tokio::test]
+async fn git_round_cancel_stops_a_parked_serve() {
+    use super::{GitRound, await_git_round};
+    use ruk_core::coord::cancellation;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (cancel_guard, token) = cancellation();
+    let flag = Arc::new(AtomicBool::new(false));
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+    let mut credits = ipc::StreamCredits::new(INITIAL_STREAM_WINDOW_BYTES);
+    let sink = super::StreamSink {
+        writer: writer_tx,
+        stream_id: 1,
+    };
+    let parked = std::future::pending::<Result<Vec<u8>, CoreError>>();
+    input_tx
+        .send(ipc::Frame {
+            kind: FrameKind::Cancel,
+            stream_id: 1,
+            payload: Vec::new(),
+        })
+        .await
+        .expect("cancel buffers");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        await_git_round(
+            GitRound {
+                input: &mut input_rx,
+                sink: &sink,
+                credits: &mut credits,
+                cancel_guard: &cancel_guard,
+                cancel_flag: Arc::clone(&flag),
+                token: token.clone(),
+                stream_id: 1,
+                invocation: "inv-cancel-1",
+            },
+            parked,
+        ),
+    )
+    .await
+    .expect("cancel ends the wait");
+    assert!(
+        outcome.is_none(),
+        "a cancelled round reports nothing further"
+    );
+    assert!(
+        flag.load(Ordering::SeqCst),
+        "cancel trips the sync flag at once"
+    );
+    let exit = writer_rx.try_recv().expect("cancelled exit frame");
+    assert_eq!(exit.kind, FrameKind::Exit);
+    assert_eq!(exit.stream_id, 1);
+    let report: CommandExitReport = ipc::decode_control(&exit.payload).expect("exit decodes");
+    assert_eq!(report.exit_code, 130);
+    assert!(report.cancelled);
+}
+
+/// A `Cancel` frame during a hook wait refuses the push and trips the
+/// sync flag at once, so the blocking serve aborts instead of running
+/// to completion on its bulkhead slot.
+#[tokio::test]
+async fn hook_wait_cancel_trips_the_sync_flag() {
+    use ruk_core::coord::cancellation;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (cancel_guard, _) = cancellation();
+    let flag = Arc::new(AtomicBool::new(false));
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(256);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+    let sink = super::StreamSink {
+        writer: writer_tx,
+        stream_id: 1,
+    };
+    let call = HookCall {
+        phase: HookPhase::PreReceive,
+        commands: Vec::new(),
+        push_options: Vec::new(),
+        new_commits: Vec::new(),
+        pack_bytes: 0,
+        deadline_ms: 5_000,
+    };
+    input_tx
+        .send(ipc::Frame {
+            kind: FrameKind::Cancel,
+            stream_id: 1,
+            payload: Vec::new(),
+        })
+        .await
+        .expect("cancel buffers");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pump_one_exchange(&mut input_rx, &sink, &call, &cancel_guard, &flag),
+    )
+    .await
+    .expect("cancel ends the hook wait");
+    assert!(reply.reject_all);
+    assert_eq!(reply.reason.as_deref(), Some("push cancelled"));
+    assert!(
+        flag.load(Ordering::SeqCst),
+        "hook-wait cancel trips the sync flag"
+    );
+}
+
 #[tokio::test]
 async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
     let root = temp_root("git-cancel");

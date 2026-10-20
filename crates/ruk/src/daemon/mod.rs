@@ -22,6 +22,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1708,6 +1709,10 @@ async fn serve_git_service(
     let mut credits = ipc::StreamCredits::new(refs.window_bytes);
     credits.open_stream(stream_id);
     let (cancel_guard, token) = cancellation();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let _trip = TripOnDrop {
+        flag: Arc::clone(&cancel_flag),
+    };
     if !is_git_service(&req.service) {
         let _ = send_error_exit(
             sink,
@@ -1886,6 +1891,7 @@ async fn serve_git_service(
             credits: &mut credits,
             cancel_guard: &cancel_guard,
             token,
+            cancel_flag,
             refs,
             coordinator,
             peer_uid,
@@ -1902,18 +1908,34 @@ async fn serve_git_service(
         return;
     }
     let run_coordinator = Arc::clone(&coordinator);
-    let outcome = refs
-        .executor
-        .run(move || {
-            run_git_service(
-                &run_coordinator,
-                &req.service,
-                &req.git_protocol,
-                req.advertise,
-                stdin_bytes,
-            )
-        })
-        .await;
+    let run_flag = Arc::clone(&cancel_flag);
+    let run = refs.executor.run(move || {
+        run_git_service(
+            &run_coordinator,
+            &req.service,
+            &req.git_protocol,
+            req.advertise,
+            stdin_bytes,
+            run_flag,
+        )
+    });
+    let Some(outcome) = await_git_round(
+        GitRound {
+            input,
+            sink,
+            credits: &mut credits,
+            cancel_guard: &cancel_guard,
+            cancel_flag: Arc::clone(&cancel_flag),
+            token: token.clone(),
+            stream_id,
+            invocation: &invocation,
+        },
+        run,
+    )
+    .await
+    else {
+        return;
+    };
     if receipted && let Ok(inner) = &outcome {
         let locator = ReceiptLocator {
             peer_uid,
@@ -1971,6 +1993,23 @@ async fn serve_git_service(
     let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
 }
 
+/// Trips the sync [`Interrupt`] flag when its stream ends for any reason:
+/// explicit cancel, connection drop, or normal return. The flag trips
+/// synchronously at the observation point or here on the way out, so no
+/// detached watcher task outlives the stream and a detached blocking
+/// serve always observes the end at its next interrupt check.
+#[cfg(unix)]
+struct TripOnDrop {
+    flag: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl Drop for TripOnDrop {
+    fn drop(&mut self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+}
+
 /// One hosted receive-pack round: everything the hook exchange needs.
 /// The sync serve runs on the transport bulkhead while the pump relays
 /// hook frames on the stream task; both halves meet here.
@@ -1980,6 +2019,7 @@ struct HostedReceive<'a> {
     credits: &'a mut ipc::StreamCredits,
     cancel_guard: &'a CancelHandle,
     token: Cancel,
+    cancel_flag: Arc<AtomicBool>,
     refs: &'a ConnectionRefs,
     coordinator: Arc<HostedCoordinator>,
     peer_uid: u32,
@@ -2001,6 +2041,8 @@ async fn pump_one_exchange(
     input: &mut mpsc::Receiver<ipc::Frame>,
     sink: &StreamSink,
     call: &HookCall,
+    cancel: &CancelHandle,
+    flag: &AtomicBool,
 ) -> HookReply {
     let bytes = match ipc::encode_control(call) {
         Ok(bytes) => bytes,
@@ -2021,6 +2063,11 @@ async fn pump_one_exchange(
                         .unwrap_or_else(|_| HookReply::reject_all("hook reply malformed"));
                 }
                 Some(frame) if frame.kind == ipc::FrameKind::Cancel => {
+                    // Trip the sync flag at once: the blocking serve
+                    // aborts at its next interrupt check instead of
+                    // running to completion on its bulkhead slot.
+                    cancel.cancel();
+                    flag.store(true, Ordering::SeqCst);
                     return HookReply::reject_all("push cancelled");
                 }
                 Some(_) => continue,
@@ -2043,7 +2090,8 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
         sink,
         credits,
         cancel_guard,
-        token,
+        mut token,
+        cancel_flag,
         refs,
         coordinator,
         peer_uid,
@@ -2099,12 +2147,13 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     let lfs = ruk_core::mode_for_store(coordinator.store().root());
     let serve_policy = Arc::clone(&policy);
     let serve_coordinator = Arc::clone(&coordinator);
+    let serve_flag = Arc::clone(&cancel_flag);
     let serve_limits = limits;
     let serve = refs.transport.run(move || {
         let store = serve_coordinator.store();
         let kind = store.hash_kind();
         let head = crate::cli::verbs_transport::serve_head(store)?;
-        let interrupt = ruk_git::transport::Interrupt::none();
+        let interrupt = ruk_git::transport::Interrupt::none().with_cancel(serve_flag);
         let mut out = Vec::new();
         let seqs = ruk_git::transport::serve::serve_receive_pack_with(
             &stdin[..],
@@ -2121,6 +2170,9 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     });
     drop(policy);
     tokio::pin!(serve);
+    // The wait ends on cancel or connection drop at once: dropping the
+    // run future frees its bulkhead permit, and the tripped flag stops
+    // the detached blocking serve at its next interrupt check.
     let outcome: Result<(Vec<u8>, Vec<u64>), CoreError> = loop {
         tokio::select! {
             done = &mut serve => {
@@ -2128,6 +2180,40 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
                     Ok(inner) => inner,
                     Err(err) => Err(err),
                 };
+            }
+            _ = token.cancelled() => {
+                let report = CommandExitReport::cancelled(&invocation);
+                let exit_bytes = match ipc::encode_control(&report) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return,
+                };
+                let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+                return;
+            }
+            frame = input.recv() => {
+                let Some(frame) = frame else {
+                    return;
+                };
+                match frame.kind {
+                    ipc::FrameKind::Cancel => {
+                        cancel_guard.cancel();
+                        cancel_flag.store(true, Ordering::SeqCst);
+                    }
+                    ipc::FrameKind::WindowUpdate => {
+                        // Grants arriving mid-serve apply at once: the
+                        // output writer needs them after the serve
+                        // completes, and dropping them would stall it.
+                        match ipc::decode_control::<WindowCredit>(&frame.payload) {
+                            Ok(credit) => {
+                                if route_credit(credits, sink.stream_id, &credit).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    _ => {}
+                }
             }
             exchange = server.recv() => {
                 let Some(exchange) = exchange else {
@@ -2138,7 +2224,9 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
                         Err(err) => Err(err),
                     };
                 };
-                let reply = pump_one_exchange(input, sink, &exchange.call).await;
+                let reply =
+                    pump_one_exchange(input, sink, &exchange.call, cancel_guard, &cancel_flag)
+                        .await;
                 let _ = exchange.reply.send(reply);
             }
         }
@@ -2345,12 +2433,82 @@ fn parse_git_commands(body: &[u8]) -> Vec<Vec<u8>> {
 /// # Errors
 /// The serve half's typed failure.
 #[cfg(unix)]
+/// What [`await_git_round`] watches while one blocking git-service
+/// round runs: a `Cancel` frame trips the token and the sync flag at
+/// once, grants apply to the stream credits, and connection drop ends
+/// the wait.
+#[cfg(unix)]
+struct GitRound<'a> {
+    input: &'a mut mpsc::Receiver<ipc::Frame>,
+    sink: &'a StreamSink,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    cancel_flag: Arc<AtomicBool>,
+    token: Cancel,
+    stream_id: u64,
+    invocation: &'a str,
+}
+
+/// Awaits one blocking git-service round, watching for `Cancel` and
+/// connection drop: either stops the wait at once — dropping the run
+/// future frees its bulkhead permit — and reports the cancelled exit.
+/// The tripped sync flag stops the detached blocking serve at its next
+/// interrupt check.
+#[cfg(unix)]
+async fn await_git_round<T>(
+    mut round: GitRound<'_>,
+    run: impl Future<Output = Result<T, CoreError>>,
+) -> Option<Result<T, CoreError>> {
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            out = &mut run => return Some(out),
+            _ = round.token.cancelled() => {
+                let report = CommandExitReport::cancelled(round.invocation);
+                let exit_bytes = match ipc::encode_control(&report) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return None,
+                };
+                let _ = send_frame(round.sink, ipc::FrameKind::Exit, &exit_bytes).await;
+                return None;
+            }
+            frame = round.input.recv() => {
+                let frame = frame?;
+                match frame.kind {
+                    ipc::FrameKind::Cancel => {
+                        round.cancel_guard.cancel();
+                        round.cancel_flag.store(true, Ordering::SeqCst);
+                    }
+                    ipc::FrameKind::WindowUpdate => {
+                        match ipc::decode_control::<WindowCredit>(&frame.payload) {
+                            Ok(credit) => {
+                                if route_credit(
+                                    round.credits,
+                                    round.stream_id,
+                                    &credit,
+                                )
+                                .is_err()
+                                {
+                                    return None;
+                                }
+                            }
+                            Err(_) => return None,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 fn run_git_service(
     coordinator: &std::sync::Arc<ruk_core::coord::HostedCoordinator>,
     service: &str,
     git_protocol: &str,
     advertise: bool,
     stdin: Vec<u8>,
+    cancel_flag: Arc<AtomicBool>,
 ) -> Result<Vec<u8>, CoreError> {
     use ruk_git::transport::serve::{
         advertise_receive_pack, advertise_upload_pack, serve_receive_pack, serve_upload_pack,
@@ -2359,7 +2517,7 @@ fn run_git_service(
     let store = coordinator.store();
     let kind = store.hash_kind();
     let head = crate::cli::verbs_transport::serve_head(store)?;
-    let interrupt = ruk_git::transport::Interrupt::none();
+    let interrupt = ruk_git::transport::Interrupt::none().with_cancel(cancel_flag);
     if advertise {
         return match service {
             GIT_SERVICE_RECEIVE_PACK => Ok(advertise_receive_pack(store, kind, &head)?),
