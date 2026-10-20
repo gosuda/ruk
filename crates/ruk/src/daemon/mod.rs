@@ -87,7 +87,8 @@ pub(crate) struct DaemonConfig {
     socket_path: PathBuf,
     /// Repository roots; every open must land beneath one.
     repo_roots: Vec<PathBuf>,
-    /// Allowed peer user identifiers; empty allows every local peer.
+    /// Allowed peer user identifiers; must list at least one uid, and an
+    /// empty list denies every peer.
     allowed_uids: Vec<u32>,
     /// Peer user identifiers allowed to call admin methods; empty disables them.
     admin_uids: Vec<u32>,
@@ -370,7 +371,7 @@ impl DaemonConfig {
 
     /// Loads a TOML daemon configuration document.
     ///
-    /// Keys: `socket_path`, `repo_roots` (required), `allowed_uids`,
+    /// Keys: `socket_path`, `repo_roots`, `allowed_uids` (required),
     /// `admin_uids`, `max_connections`, `blocking_pool_size`,
     /// `transport_permits`, `handshake_timeout_ms`, `frame_timeout_ms`,
     /// `stream_window_bytes`, `retention_interval_ms` (optional; zero
@@ -467,8 +468,8 @@ impl DaemonConfig {
     /// Checks every bound the daemon depends on.
     ///
     /// # Errors
-    /// `Config` for an empty socket path, root set, connection bound,
-    /// blocking pool, deadline, or window.
+    /// `Config` for an empty socket path, root set, `allowed_uids`,
+    /// connection bound, blocking pool, deadline, or window.
     pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.socket_path.as_os_str().is_empty() {
             return Err(Error::Config(String::from("socket path must not be empty")));
@@ -476,6 +477,11 @@ impl DaemonConfig {
         if self.repo_roots.is_empty() {
             return Err(Error::Config(String::from(
                 "at least one repository root is required",
+            )));
+        }
+        if self.allowed_uids.is_empty() {
+            return Err(Error::Config(String::from(
+                "allowed_uids must list at least one authorized peer uid",
             )));
         }
         if self.max_connections == 0 {
@@ -978,7 +984,8 @@ struct ConnectionRefs {
     handshake_timeout: Duration,
     /// The per-frame deadline after the handshake.
     frame_timeout: Duration,
-    /// Allowed peer user identifiers; empty allows every local peer.
+    /// Allowed peer user identifiers; must list at least one uid, and an
+    /// empty list denies every peer.
     allowed_uids: Vec<u32>,
 }
 

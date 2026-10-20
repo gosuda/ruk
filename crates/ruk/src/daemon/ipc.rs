@@ -548,7 +548,7 @@ pub(crate) struct PeerIdentity {
 ///
 /// # Errors
 /// `E_IO` when peer credentials are unavailable, `E_FORBIDDEN` when the
-/// peer's user is outside `allowed_uids` (empty allows every local peer).
+/// peer's user is outside `allowed_uids` (an empty list denies every peer).
 #[cfg(unix)]
 pub(crate) fn authenticate_peer(
     stream: &tokio::net::UnixStream,
@@ -561,7 +561,7 @@ pub(crate) fn authenticate_peer(
         )
     })?;
     let uid = cred.uid();
-    if !allowed_uids.is_empty() && !allowed_uids.contains(&uid) {
+    if !allowed_uids.contains(&uid) {
         return Err(CoreError::new(
             ErrorCode::EForbidden,
             "Unix-socket peer user is not an authorized service identity",

@@ -338,6 +338,10 @@ async fn handshake(driver: &mut Driver) {
 fn spawn_pair(root: &Path) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
     let registry = Arc::new(Registry::new(vec![root.to_path_buf()]).expect("registry"));
     registry.set_runtime(tokio::runtime::Handle::current());
+    let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+    // The pair's peer is this process, so its uid is the uid the daemon
+    // observes for the driver end.
+    let uid = client.peer_cred().expect("socket pair credentials").uid();
     let refs = ConnectionRefs {
         registry,
         executor: BoundedExecutor::new(4).expect("executor"),
@@ -345,9 +349,8 @@ fn spawn_pair(root: &Path) -> (Driver, tokio::task::JoinHandle<Result<(), super:
         window_bytes: INITIAL_STREAM_WINDOW_BYTES,
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
-        allowed_uids: Vec::new(),
+        allowed_uids: vec![uid],
     };
-    let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
     let task = tokio::spawn(async move { serve_connection(server, refs).await });
     (Driver { conn: client }, task)
 }
@@ -364,19 +367,20 @@ fn retention_interval_defaults_to_sixty_seconds_and_parses() {
     );
     assert_eq!(cfg.retention_interval(), Duration::from_secs(60));
 
-    let doc = b"socket_path = \"/tmp/ruk-retention.sock\"\nrepo_roots = [\"/tmp\"]\nretention_interval_ms = 5000\n";
+    let doc = b"socket_path = \"/tmp/ruk-retention.sock\"\nrepo_roots = [\"/tmp\"]\nallowed_uids = [1000]\nretention_interval_ms = 5000\n";
     let parsed = DaemonConfig::from_toml(doc).expect("retention interval parses");
     assert_eq!(parsed.retention_interval(), Duration::from_millis(5_000));
 
     let disabled =
-        b"socket_path = \"/tmp/ruk-retention.sock\"\nrepo_roots = [\"/tmp\"]\nretention_interval_ms = 0\n";
+        b"socket_path = \"/tmp/ruk-retention.sock\"\nrepo_roots = [\"/tmp\"]\nallowed_uids = [1000]\nretention_interval_ms = 0\n";
     let parsed = DaemonConfig::from_toml(disabled).expect("zero disables sweeps");
     assert!(parsed.retention_interval().is_zero());
 }
 
 /// Renders one TOML document binding the scratch socket over `/tmp` plus `extra` keys.
 fn config_doc(extra: &str) -> Vec<u8> {
-    format!("socket_path = \"/tmp/ruk-r02.sock\"\nrepo_roots = [\"/tmp\"]\n{extra}").into_bytes()
+    format!("socket_path = \"/tmp/ruk-r02.sock\"\nrepo_roots = [\"/tmp\"]\nallowed_uids = [1000]\n{extra}")
+        .into_bytes()
 }
 
 #[test]
@@ -418,6 +422,31 @@ fn hook_max_commands_accepts_only_1_through_4096() {
     for valid in ["hook_max_commands = 1\n", "hook_max_commands = 4096\n"] {
         DaemonConfig::from_toml(&config_doc(valid)).expect("boundary must parse");
     }
+}
+
+#[test]
+fn empty_allowed_uids_refuses_start() {
+    let empty = DaemonConfig::new(
+        PathBuf::from("/tmp/ruk-r03.sock"),
+        vec![PathBuf::from("/tmp")],
+    );
+    let err = empty
+        .validate()
+        .expect_err("empty allowed_uids must refuse startup");
+    assert!(
+        matches!(err, super::Error::Config(_)),
+        "empty allowed_uids must be a config error: {err}"
+    );
+    assert!(
+        err.to_string().contains("allowed_uids"),
+        "refusal must name allowed_uids: {err}"
+    );
+    let one = DaemonConfig::new(
+        PathBuf::from("/tmp/ruk-r03.sock"),
+        vec![PathBuf::from("/tmp")],
+    )
+    .with_allowed_uids(vec![1000]);
+    one.validate().expect("one listed uid starts");
 }
 
 #[test]
