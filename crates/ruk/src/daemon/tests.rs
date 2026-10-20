@@ -1066,6 +1066,90 @@ fn parse_advertised_refs(output: &[u8], service: &str) -> Vec<(String, Oid)> {
     refs
 }
 
+/// A stream task that stopped draining must not stall the connection
+/// reader: the 33rd frame into a 32-slot channel refuses that stream
+/// instead of awaiting it, and a sibling frame still routes.
+#[tokio::test]
+async fn reader_never_blocks_on_a_full_stream() {
+    use super::{STREAM_CHANNEL_BOUND, route_stream_frame};
+    use std::collections::HashMap;
+    let root = temp_root("reader-overflow");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes: INITIAL_STREAM_WINDOW_BYTES,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+    };
+    let peer = ipc::PeerIdentity {
+        uid: 0,
+        gid: 0,
+        pid: None,
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let (done_tx, _done_rx) = tokio::sync::mpsc::channel(64);
+    let mut streams: HashMap<u64, (tokio::sync::mpsc::Sender<ipc::Frame>, u64)> = HashMap::new();
+    // Parked task: the receiver lives but never drains.
+    let (tx, _parked) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BOUND);
+    streams.insert(7, (tx.clone(), 1));
+    for _ in 0..STREAM_CHANNEL_BOUND {
+        tx.try_send(ipc::Frame {
+            kind: FrameKind::WindowUpdate,
+            stream_id: 7,
+            payload: Vec::new(),
+        })
+        .expect("fill the parked stream");
+    }
+    let overflow = ipc::Frame {
+        kind: FrameKind::WindowUpdate,
+        stream_id: 7,
+        payload: Vec::new(),
+    };
+    let routed = tokio::time::timeout(
+        Duration::from_secs(5),
+        route_stream_frame(&writer_tx, overflow, &mut streams, &done_tx, 1, &refs, peer),
+    )
+    .await
+    .expect("the reader never awaits a full stream");
+    assert!(!routed.expect("overflow routes without error"));
+    assert!(
+        !streams.contains_key(&7),
+        "the overflowed stream loses its routing entry"
+    );
+    let first = writer_rx.try_recv().expect("overflow error frame");
+    assert_eq!(first.kind, FrameKind::Error);
+    assert_eq!(first.stream_id, 7);
+    // A live sibling still receives its frame promptly after the refusal.
+    let (sib_tx, mut sib_rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BOUND);
+    streams.insert(9, (sib_tx, 1));
+    let sibling = ipc::Frame {
+        kind: FrameKind::Cancel,
+        stream_id: 9,
+        payload: Vec::new(),
+    };
+    let peer = ipc::PeerIdentity {
+        uid: 0,
+        gid: 0,
+        pid: None,
+    };
+    let sibling_routed = tokio::time::timeout(
+        Duration::from_secs(5),
+        route_stream_frame(&writer_tx, sibling, &mut streams, &done_tx, 1, &refs, peer),
+    )
+    .await
+    .expect("a sibling frame routes after the refusal");
+    assert!(!sibling_routed.expect("sibling routes without error"));
+    let delivered = tokio::time::timeout(Duration::from_secs(5), sib_rx.recv())
+        .await
+        .expect("sibling delivery never blocks")
+        .expect("sibling channel stays open");
+    assert_eq!(delivered.kind, FrameKind::Cancel);
+    assert_eq!(delivered.stream_id, 9);
+}
+
 #[tokio::test]
 async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
     let root = temp_root("git-cancel");

@@ -1236,15 +1236,28 @@ async fn handle_control_frame(
 ) -> Result<bool, Error> {
     match frame.kind {
         ipc::FrameKind::Cancel => {
+            // Fan out without awaiting: a stream task parked inside a
+            // blocking serve may hold its channel full, and awaiting one
+            // stream's send would stop the reader for every sibling,
+            // including their Cancel frames. A full channel declares its
+            // stream dead instead.
+            let mut overflowed = Vec::new();
             for (stream_id, (tx, _)) in streams.iter() {
                 let cancel = ipc::Frame {
                     kind: ipc::FrameKind::Cancel,
                     stream_id: *stream_id,
                     payload: Vec::new(),
                 };
-                if tx.send(cancel).await.is_err() {
-                    continue;
+                match tx.try_send(cancel) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => continue,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        overflowed.push(*stream_id);
+                    }
                 }
+            }
+            for stream_id in overflowed {
+                refuse_overflowed_stream(writer, streams, stream_id).await?;
             }
             Ok(true)
         }
@@ -1342,21 +1355,15 @@ async fn route_stream_frame(
             Ok(false)
         }
         ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof | ipc::FrameKind::HookReply => {
-            if let Some((tx, _)) = streams.get(&stream_id)
-                && tx.send(frame).await.is_err()
-            {
-                streams.remove(&stream_id);
-            }
+            route_frame_try_send(writer, streams, stream_id, frame).await?;
             Ok(false)
         }
-        ipc::FrameKind::WindowUpdate => match streams.get(&stream_id) {
-            Some((tx, _)) => {
-                if tx.send(frame).await.is_err() {
-                    streams.remove(&stream_id);
-                }
+        ipc::FrameKind::WindowUpdate => match streams.contains_key(&stream_id) {
+            true => {
+                route_frame_try_send(writer, streams, stream_id, frame).await?;
                 Ok(false)
             }
-            None => {
+            false => {
                 let sink = StreamSink {
                     writer: writer.clone(),
                     stream_id,
@@ -1372,14 +1379,12 @@ async fn route_stream_frame(
                 Ok(false)
             }
         },
-        ipc::FrameKind::Cancel => match streams.get(&stream_id) {
-            Some((tx, _)) => {
-                if tx.send(frame).await.is_err() {
-                    streams.remove(&stream_id);
-                }
+        ipc::FrameKind::Cancel => match streams.contains_key(&stream_id) {
+            true => {
+                route_frame_try_send(writer, streams, stream_id, frame).await?;
                 Ok(false)
             }
-            None => {
+            false => {
                 let sink = StreamSink {
                     writer: writer.clone(),
                     stream_id,
@@ -1415,6 +1420,56 @@ async fn route_stream_frame(
             Ok(false)
         }
     }
+}
+
+/// Routes one frame to its stream without awaiting: `try_send` keeps a
+/// parked stream task from stalling the connection reader. A closed
+/// channel drops its entry; a full one declares its stream dead with an
+/// overflow error exit, so the reader always returns to its socket.
+#[cfg(unix)]
+async fn route_frame_try_send(
+    writer: &mpsc::Sender<OutboundFrame>,
+    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    stream_id: u64,
+    frame: ipc::Frame,
+) -> Result<(), Error> {
+    let Some((tx, _)) = streams.get(&stream_id) else {
+        return Ok(());
+    };
+    match tx.try_send(frame) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            streams.remove(&stream_id);
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            refuse_overflowed_stream(writer, streams, stream_id).await
+        }
+    }
+}
+
+/// Ends an overflowed stream with an explicit error exit and drops its
+/// routing entry: the reader never waits for a task that stopped
+/// draining, and the client learns the stream died instead of hanging.
+#[cfg(unix)]
+async fn refuse_overflowed_stream(
+    writer: &mpsc::Sender<OutboundFrame>,
+    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    stream_id: u64,
+) -> Result<(), Error> {
+    streams.remove(&stream_id);
+    let sink = StreamSink {
+        writer: writer.clone(),
+        stream_id,
+    };
+    send_error_exit(
+        &sink,
+        &Error::Core(CoreError::new(
+            ErrorCode::ELimit,
+            "stream input overflowed its bound",
+        )),
+    )
+    .await
 }
 
 /// Spawns one task serving the stream of one `Open` frame. The reader
