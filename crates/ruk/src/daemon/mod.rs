@@ -1376,6 +1376,21 @@ async fn route_stream_frame(
     let stream_id = frame.stream_id;
     match frame.kind {
         ipc::FrameKind::Open => {
+            if streams.contains_key(&stream_id) {
+                let sink = StreamSink {
+                    writer: writer.clone(),
+                    stream_id,
+                };
+                send_error_exit(
+                    &sink,
+                    &Error::Core(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "duplicate open for a live stream",
+                    )),
+                )
+                .await?;
+                return Ok(false);
+            }
             spawn_stream(writer, frame, streams, done, generation, refs, peer);
             Ok(false)
         }

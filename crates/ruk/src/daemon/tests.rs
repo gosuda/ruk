@@ -2722,6 +2722,55 @@ async fn hosted_push_records_envelope_provenance_in_events() {
 }
 
 #[tokio::test]
+async fn duplicate_open_for_live_stream_is_refused() {
+    let root = temp_root("host-dup-open");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    // The first receive-pack open blocks waiting for stdin, so its entry
+    // stays live while the duplicate arrives.
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-dup-1"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 5);
+
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-dup-2"),
+    );
+    let (report, exit) = driver.expect_git_refused(5, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+    assert_eq!(exit.status, 1);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn frame_kind_9_rejected_on_any_stream() {
     let root = temp_root("kind-nine");
     let repo_dir = root.join("repo");
