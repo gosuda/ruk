@@ -57,6 +57,8 @@ use crate::index::RepoPath;
 use crate::merge::Merge;
 use crate::merge::composed::{MergeMode, MergeReport};
 use crate::refdata::{RefExpect, RefName, RefTarget};
+use crate::refs::RefEntry;
+use crate::store::types::EventSource;
 use crate::workspace::{HeadRef, Scope, WorkspaceStamp, WorkspaceState};
 
 /// Major protocol/schema version implemented by this build.
@@ -64,8 +66,12 @@ pub const SCHEMA_MAJOR: u32 = 1;
 
 /// Minor schema version within the current major; increments are additive.
 /// Minor 1 appends the `git.commit` lane method for per-repository commit
-/// batching; older readers refuse its frames as unknown methods.
-pub const SCHEMA_MINOR: u32 = 1;
+/// batching. Minor 2 appends the hosted forge methods (`repo.stat`,
+/// `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`,
+/// `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`,
+/// `claim.renew`, `policy.set`) and the `Admin` method kind; older readers
+/// refuse its frames as unknown methods.
+pub const SCHEMA_MINOR: u32 = 2;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -1177,6 +1183,9 @@ pub enum MethodKind {
     Read,
     /// Requires a session; carries a request id and a receipt.
     Mutation,
+    /// Dispatched before any coordinator call and gated by the daemon's
+    /// `admin_uids`; takes no session and no receipt.
+    Admin,
 }
 
 /// `schema`: the versioned schemas of the protocol.
@@ -2639,6 +2648,14 @@ impl<T> Validate for KeysetPage<T> {}
 no_invariants!(
     SchemaArgs,
     CommitRev,
+    RepoStatArgs,
+    TreeArgs,
+    RefsListArgs,
+    CompareArgs,
+    ArchiveArgs,
+    RemoteRefsArgs,
+    ClaimRenewArgs,
+    PolicySetArgs,
     SessionResumeArgs,
     WsScopeArgs,
     WsTakeArgs,
@@ -3090,6 +3107,353 @@ impl Validate for BlameArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Hosted forge methods (minor 2)
+// ---------------------------------------------------------------------------
+
+/// `repo.stat`: store identity, object format, default branch, and the
+/// event horizon. Served from the store head; counts no refs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoStatArgs {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoStatReply {
+    pub view: ViewInfo,
+    pub store_id: StoreId,
+    pub object_format: HashKind,
+    #[serde(default)]
+    pub default_branch: Option<RefName>,
+}
+
+/// `tree`: one directory listing with stateless keyset paging.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TreeArgs {
+    pub rev: CommitRev,
+    /// The directory to list; absent is the root.
+    #[serde(default)]
+    pub path: Option<RepoPath>,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+    /// Resume after this entry name; absent starts at the beginning.
+    #[serde(default)]
+    pub after: Option<ByteString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TreeReply {
+    pub view: ViewInfo,
+    pub entries: KeysetPage<TreeEntry>,
+}
+
+/// `refs.list`: ref names and targets with prefix and inclusive-start
+/// seek. Covers single-ref resolve, so no separate `ref.get` exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RefsListArgs {
+    /// Only names starting with these bytes; absent lists every ref.
+    #[serde(default)]
+    pub prefix: Option<ByteString>,
+    /// Resume after this name; absent starts at `prefix` (inclusive).
+    #[serde(default)]
+    pub after: Option<RefName>,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RefsListReply {
+    pub view: ViewInfo,
+    pub refs: KeysetPage<RefEntry>,
+    /// The event head the page was read under. Read before the page so it
+    /// never runs ahead of the events the page reflects.
+    pub as_of: u64,
+}
+
+/// `compare`: merge bases plus bounded ahead/behind counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompareArgs {
+    pub base: CommitRev,
+    pub head: CommitRev,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompareReply {
+    pub view: ViewInfo,
+    pub bases: Vec<Oid>,
+    pub ahead: u64,
+    pub behind: u64,
+    /// False when the walk exhausted its budget: counts are lower bounds.
+    pub exact: bool,
+}
+
+/// `search`: minimal contract; the dedicated search row defines budgets,
+/// pools, and lease cursors.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    pub pattern: String,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchHit {
+    pub path: RepoPath,
+    pub line: u64,
+    pub excerpt: ByteString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchReply {
+    pub view: ViewInfo,
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
+}
+
+/// The archive payloads the daemon streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveFormat {
+    Tar,
+    Zip,
+}
+
+/// `archive`: metadata for the streamed payload; bytes ride `Stdout`
+/// frames under the reply window, never the control frame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveArgs {
+    pub rev: CommitRev,
+    #[serde(default)]
+    pub format: Option<ArchiveFormat>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveReply {
+    pub view: ViewInfo,
+    pub commit: Oid,
+    pub format: ArchiveFormat,
+    pub content_type: String,
+}
+
+/// Longest `events.tail` wait: the only ref feed long-polls instead of
+/// holding a subscription.
+pub const MAX_TAIL_WAIT_MS: u32 = 30_000;
+
+/// `events.tail`: ref events strictly after `after`, long-polled. The
+/// only ref feed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventsTailArgs {
+    pub after: u64,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+    /// Long-poll milliseconds; absent returns immediately.
+    #[serde(default)]
+    pub wait_ms: Option<u32>,
+    /// Only events whose ref name starts with these bytes.
+    #[serde(default)]
+    pub prefix: Option<ByteString>,
+}
+
+/// One ref event carried by `events.tail`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TailedEvent {
+    pub seq: u64,
+    pub name: ByteString,
+    #[serde(default)]
+    pub old: Option<RefTarget>,
+    #[serde(default)]
+    pub new: Option<RefTarget>,
+    pub at: u64,
+    pub source: EventSource,
+    #[serde(default)]
+    pub operation: Option<OperationId>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub session: Option<SessionId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventsTailReply {
+    pub view: ViewInfo,
+    pub events: Vec<TailedEvent>,
+    /// The last assigned sequence at reply time.
+    pub head: u64,
+    /// The oldest retained sequence at reply time.
+    pub oldest: u64,
+    /// True when `after + 1` predates `oldest`: the caller missed events
+    /// and must resnapshot from `refs.list` with `as_of`.
+    pub expired: bool,
+}
+
+/// `remote.refs`: advertised refs of an explicit remote URL, never stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteRefsArgs {
+    pub url: RemoteUrl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteRefsReply {
+    pub view: ViewInfo,
+    pub refs: Vec<RefEntry>,
+}
+
+/// `claim.renew`: extends one held claim by a fresh lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimRenewArgs {
+    pub claim: ClaimId,
+    pub ttl: ClaimTtl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimRenewReply {
+    pub outcome: MutationOutcome,
+    pub claim: ClaimRecord,
+}
+
+/// `policy.set`: replaces the landing policy of the repository.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicySetArgs {
+    pub requirements: Vec<AttestRequirement>,
+    pub trusted_signers: Vec<SignerFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicySetReply {
+    pub outcome: MutationOutcome,
+    pub generation: u64,
+}
+
+/// `repo.init`: creates one repository store under a configured root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoInitArgs {
+    pub root: String,
+    pub path: String,
+    #[serde(default)]
+    pub object_format: Option<HashKind>,
+    #[serde(default)]
+    pub default_branch: Option<RefName>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoInitReply {
+    pub path: String,
+    pub store_id: StoreId,
+    pub object_format: HashKind,
+    pub default_branch: RefName,
+}
+
+/// `repo.delete`: tombstones one repository; a purge job removes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoDeleteArgs {
+    pub repo: String,
+    pub confirm_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoDeleteReply {
+    pub deleted_path: String,
+}
+
+/// `repo.rename`: moves one repository within its root; the store id is
+/// unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoRenameArgs {
+    pub repo: String,
+    pub new_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoRenameReply {
+    pub path: String,
+    pub previous_path: String,
+}
+
+/// Which refs a fork copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForkRefs {
+    All,
+    DefaultAndTags,
+    None,
+}
+
+/// `repo.fork`: copies one repository to a fresh store id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoForkArgs {
+    pub source: String,
+    pub path: String,
+    #[serde(default)]
+    pub refs: Option<ForkRefs>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoForkReply {
+    pub path: String,
+    pub store_id: StoreId,
+    pub refs_copied: u64,
+}
+
+fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
+    if text.is_empty() {
+        return Err(invalid(format!("{what} must not be empty")));
+    }
+    Ok(())
+}
+
+impl Validate for SearchArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        let bytes = self.pattern.len();
+        if bytes == 0 || bytes > 4096 {
+            return Err(invalid(format!(
+                "search pattern is 1..=4096 bytes, got {bytes}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for EventsTailArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        if let Some(wait_ms) = self.wait_ms
+            && wait_ms > MAX_TAIL_WAIT_MS
+        {
+            return Err(invalid(format!(
+                "tail wait is at most {MAX_TAIL_WAIT_MS} ms, got {wait_ms}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for RepoInitArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("init root", &self.root)?;
+        require_nonempty_text("init path", &self.path)
+    }
+}
+
+impl Validate for RepoDeleteArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("delete repo", &self.repo)?;
+        require_nonempty_text("delete confirm path", &self.confirm_path)
+    }
+}
+
+impl Validate for RepoRenameArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("rename repo", &self.repo)?;
+        require_nonempty_text("rename new path", &self.new_path)
+    }
+}
+
+impl Validate for RepoForkArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("fork source", &self.source)?;
+        require_nonempty_text("fork path", &self.path)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The method table
 // ---------------------------------------------------------------------------
 
@@ -3104,7 +3468,7 @@ enum SessionRule {
 impl MethodKind {
     const fn session_rule(self) -> SessionRule {
         match self {
-            Self::Anonymous => SessionRule::Optional,
+            Self::Anonymous | Self::Admin => SessionRule::Optional,
             Self::Bootstrap => SessionRule::Forbidden,
             Self::Read | Self::Mutation => SessionRule::Required,
         }
@@ -3116,6 +3480,10 @@ macro_rules! digest_args {
     (Mutation, $params:expr) => {
         Some(postcard::to_allocvec(&$params.args))
     };
+    (Admin, $params:expr) => {{
+        let _ = &$params;
+        None
+    }};
     ($kind:ident, $params:expr) => {{
         let _ = &$params;
         None
@@ -3127,6 +3495,10 @@ macro_rules! request_id_of {
     (Mutation, $params:expr) => {
         Some($params.request_id)
     };
+    (Admin, $params:expr) => {{
+        let _ = &$params;
+        None
+    }};
     ($kind:ident, $params:expr) => {{
         let _ = &$params;
         None
@@ -3150,6 +3522,10 @@ macro_rules! outcome_of {
         let _ = &$result;
         None
     }};
+    (Admin, $result:expr) => {{
+        let _ = &$result;
+        None
+    }};
 }
 
 /// Mutable access to the outcome of a mutation reply.
@@ -3166,6 +3542,10 @@ macro_rules! outcome_of_mut {
         None
     }};
     (Read, $result:expr) => {{
+        let _ = $result;
+        None
+    }};
+    (Admin, $result:expr) => {{
         let _ = $result;
         None
     }};
@@ -3385,6 +3765,20 @@ method_table! {
     Blame, "blame", Read, BlameArgs, BlameReply;
     Query, "query", Read, QueryArgs, QueryReply;
     GitCommit, "git.commit", Mutation, Mutation<GitCommitArgs>, NewReply;
+    RepoStat, "repo.stat", Read, RepoStatArgs, RepoStatReply;
+    Tree, "tree", Read, TreeArgs, TreeReply;
+    RefsList, "refs.list", Read, RefsListArgs, RefsListReply;
+    Compare, "compare", Read, CompareArgs, CompareReply;
+    Search, "search", Read, SearchArgs, SearchReply;
+    Archive, "archive", Read, ArchiveArgs, ArchiveReply;
+    EventsTail, "events.tail", Read, EventsTailArgs, EventsTailReply;
+    RepoInit, "repo.init", Admin, RepoInitArgs, RepoInitReply;
+    RepoDelete, "repo.delete", Admin, RepoDeleteArgs, RepoDeleteReply;
+    RepoRename, "repo.rename", Admin, RepoRenameArgs, RepoRenameReply;
+    RepoFork, "repo.fork", Admin, RepoForkArgs, RepoForkReply;
+    RemoteRefs, "remote.refs", Read, RemoteRefsArgs, RemoteRefsReply;
+    ClaimRenew, "claim.renew", Mutation, Mutation<ClaimRenewArgs>, ClaimRenewReply;
+    PolicySet, "policy.set", Mutation, Mutation<PolicySetArgs>, PolicySetReply;
 }
 
 // ---------------------------------------------------------------------------
@@ -4070,6 +4464,59 @@ mod tests {
         assert_eq!(fails(&to_frame(&value)), ErrorCode::EInvalid);
         assert_eq!(pin_request().request_id(), Some(request_id(1)));
         assert_eq!(log_request(PageRequest::default()).request_id(), None);
+    }
+
+    #[test]
+    fn admin_methods_take_no_session_and_no_receipt() {
+        for method in [
+            Method::RepoInit,
+            Method::RepoDelete,
+            Method::RepoRename,
+            Method::RepoFork,
+        ] {
+            assert_eq!(method.kind(), MethodKind::Admin);
+            assert!(!method.is_mutation());
+        }
+        let request = Request::RepoInit(Box::new(RepoInitArgs {
+            root: "default".to_string(),
+            path: "acme/hello".to_string(),
+            object_format: None,
+            default_branch: None,
+        }));
+        assert_eq!(request.request_id(), None);
+        assert_eq!(
+            request.digest_input_v1().expect("digestable"),
+            None,
+            "admin calls leave no digest for receipts"
+        );
+        let mut reply = Reply::RepoInit(Box::new(RepoInitReply {
+            path: "acme/hello".to_string(),
+            store_id: StoreId::generate(),
+            object_format: HashKind::Sha1,
+            default_branch: name("refs/heads/main"),
+        }));
+        assert_eq!(reply.outcome(), None);
+        assert!(reply.outcome_mut().is_none());
+
+        let bare = RequestEnvelope {
+            schema_version: SchemaVersion::current(),
+            session: None,
+            request,
+        };
+        assert!(bare.validate().is_ok());
+        let mut carried = bare.clone();
+        carried.session = Some(session());
+        assert!(carried.validate().is_ok());
+
+        let forbidden = Request::PolicySet(mutation(
+            1,
+            PolicySetArgs {
+                requirements: Vec::new(),
+                trusted_signers: Vec::new(),
+            },
+        ));
+        assert_eq!(forbidden.request_id(), Some(request_id(1)));
+        assert!(forbidden.digest_input_v1().expect("digestable").is_some());
     }
 
     // ----- paging and inline bounds ---------------------------------------
@@ -5504,7 +5951,7 @@ mod tests {
                 MethodKind::Read => {
                     assert!(result_fields.contains_key(&"view"), "{}", method.as_str());
                 }
-                MethodKind::Anonymous | MethodKind::Bootstrap => {}
+                MethodKind::Anonymous | MethodKind::Bootstrap | MethodKind::Admin => {}
             }
         }
     }
@@ -5600,6 +6047,20 @@ mod tests {
             "blame",
             "query",
             "git.commit",
+            "repo.stat",
+            "tree",
+            "refs.list",
+            "compare",
+            "search",
+            "archive",
+            "events.tail",
+            "repo.init",
+            "repo.delete",
+            "repo.rename",
+            "repo.fork",
+            "remote.refs",
+            "claim.renew",
+            "policy.set",
         ];
         for method in required {
             assert!(names.contains(method), "missing method {method}");

@@ -519,6 +519,7 @@ fn spawn_hosted(
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
         allowed_uids: vec![uid],
+        admin_uids: Vec::new(),
     };
     let task = tokio::spawn(async move { serve_connection(server, refs).await });
     (Driver { conn: client }, registry, task)
@@ -585,6 +586,7 @@ fn spawn_pair_with_window(
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
         allowed_uids: vec![uid],
+        admin_uids: Vec::new(),
     };
     let task = tokio::spawn(async move { serve_connection(server, refs).await });
     (Driver { conn: client }, task)
@@ -1083,6 +1085,7 @@ async fn reader_never_blocks_on_a_full_stream() {
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
         allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
     };
     let peer = ipc::PeerIdentity {
         uid: 0,
@@ -1514,6 +1517,7 @@ async fn events_increase_strictly_across_lane_and_receive() {
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
         allowed_uids: vec![uid],
+        admin_uids: Vec::new(),
     };
     let task = tokio::spawn(async move { serve_connection(server, refs).await });
     let mut driver = Driver { conn: client };
@@ -2697,6 +2701,7 @@ fn spawn_extra_driver(
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
         allowed_uids: vec![uid],
+        admin_uids: Vec::new(),
     };
     let task = tokio::spawn(async move { serve_connection(server, refs).await });
     (Driver { conn: client }, task)
@@ -4230,4 +4235,56 @@ async fn typed_land_execute_refusal_names_plan() {
 
     drop(driver);
     task.abort();
+}
+
+#[tokio::test]
+async fn admin_dispatch_gates_before_any_coordinator_call() {
+    use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
+
+    use super::{Caller, InvocationOpen, dispatch_method};
+
+    let root = temp_root("admin-dispatch");
+    seed_store(root.to_str().expect("utf8 root"));
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Arc::new(Store::open(&root.join(".ruk"), budget).expect("open store"));
+    let coordinator = Arc::new(
+        HostedCoordinator::open(
+            Arc::clone(&store),
+            Principal::from_peer_uid(1000),
+            root.clone(),
+        )
+        .expect("open coordinator"),
+    );
+    let open = InvocationOpen {
+        repo: String::new(),
+        method: "repo.init".to_string(),
+        request_id: None,
+        args_json: Some("{\"root\":\"default\",\"path\":\"acme/hello\"}".to_string()),
+        session_id: None,
+        on_behalf_of: None,
+    };
+    let (_handle, cancel) = cancellation();
+    let admin = Caller {
+        principal: &Principal::from_peer_uid(1000),
+        admin_uids: &[1000],
+    };
+    let err = dispatch_method(&coordinator, admin, &open, Method::RepoInit, None, &cancel)
+        .await
+        .expect_err("unserved admin refuses");
+    assert_eq!(err.code, ErrorCode::EHosted);
+    let outsider = Caller {
+        principal: &Principal::from_peer_uid(2000),
+        admin_uids: &[1000],
+    };
+    let err = dispatch_method(
+        &coordinator,
+        outsider,
+        &open,
+        Method::RepoInit,
+        None,
+        &cancel,
+    )
+    .await
+    .expect_err("non-admin refused");
+    assert_eq!(err.code, ErrorCode::EForbidden);
 }

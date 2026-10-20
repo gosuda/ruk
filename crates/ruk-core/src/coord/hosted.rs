@@ -1490,6 +1490,26 @@ fn read_gap(method: Method) -> &'static str {
         Method::Diff | Method::Show | Method::File | Method::Blame => {
             "diff, show, file, and blame need tree and object readers over resolved revisions with no pure producer on the coordinator"
         }
+        Method::RepoStat => {
+            "repo.stat needs the store id, object format, RepoMeta default branch, and event horizon from the store head"
+        }
+        Method::Tree => {
+            "tree needs a git-order directory reader over resolved revisions with stateless keyset paging"
+        }
+        Method::RefsList => {
+            "refs.list needs prefix and inclusive-start seek over the Refs table plus the events head for as_of"
+        }
+        Method::Compare => "compare needs a merge-base walk with bounded ahead and behind counts",
+        Method::Search => {
+            "search needs the core-owned search pool plus lease cursors over bounded parallel scans"
+        }
+        Method::Archive => "archive needs a streaming body writer under the reply credit window",
+        Method::EventsTail => {
+            "events.tail needs long-poll over the Events table with the expired signal tied to EventHead.oldest"
+        }
+        Method::RemoteRefs => {
+            "remote.refs needs an ls-refs round-trip against an explicit remote URL"
+        }
         _ => "only `op.log`, `claim.list`, and `attest.list` are served, with lease-bound paging",
     }
 }

@@ -363,7 +363,9 @@ impl FactTable {
 /// What published one batch of ref mutations: the lane, the receive-pack
 /// path, a local command, or a lifecycle importer. Recorded on every ref
 /// event; never an authorization input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub enum EventSource {
     ReceivePack,
     Lane,

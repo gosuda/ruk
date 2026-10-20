@@ -983,6 +983,26 @@ pub(crate) fn coord_call_site(method: Method) -> &'static str {
         ruk_core::protocol::MethodKind::Mutation => {
             "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, split, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, resolve, revert, undo, land.prepare mutations covered; the rest name their missing preparation)"
         }
+        ruk_core::protocol::MethodKind::Admin => {
+            "admin dispatch before any coordinator call, gated by admin_uids (no registry producer serves these methods yet)"
+        }
+    }
+}
+
+/// Who opened the invocation: the peer principal plus the daemon's admin
+/// list, which travel together for authorization.
+pub(crate) struct Caller<'a> {
+    pub principal: &'a Principal,
+    pub admin_uids: &'a [u32],
+}
+
+impl Caller<'_> {
+    /// True when the invocation peer may run admin methods.
+    fn is_admin(&self) -> bool {
+        match self.principal {
+            Principal::Unix(uid) => self.admin_uids.contains(uid),
+            _ => false,
+        }
     }
 }
 
@@ -1051,6 +1071,9 @@ struct ConnectionRefs {
     /// Allowed peer user identifiers; must list at least one uid, and an
     /// empty list denies every peer.
     allowed_uids: Vec<u32>,
+    /// Peer user identifiers that may run admin methods; empty disables
+    /// every admin method.
+    admin_uids: Vec<u32>,
 }
 
 #[cfg(unix)]
@@ -1074,6 +1097,7 @@ async fn serve_async(
         handshake_timeout: config.handshake_timeout,
         frame_timeout: config.frame_timeout,
         allowed_uids: config.allowed_uids.clone(),
+        admin_uids: config.admin_uids.clone(),
     };
     let connections = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
     let mut consecutive_accept_errors: u32 = 0;
@@ -2774,7 +2798,17 @@ async fn typed_stream(
             }
         },
     };
-    let dispatch = dispatch_method(&coordinator, &principal, open, method, session, &cancel);
+    let dispatch = dispatch_method(
+        &coordinator,
+        Caller {
+            principal: &principal,
+            admin_uids: &refs.admin_uids,
+        },
+        open,
+        method,
+        session,
+        &cancel,
+    );
     tokio::pin!(dispatch);
     let mut refused: Option<CoreError> = None;
     let result = loop {
@@ -2851,7 +2885,7 @@ async fn typed_stream(
 /// coordinator's own typed failures.
 pub(crate) async fn dispatch_method(
     coordinator: &Arc<HostedCoordinator>,
-    principal: &Principal,
+    caller: Caller<'_>,
     open: &InvocationOpen,
     method: Method,
     session: Option<SessionId>,
@@ -2876,12 +2910,12 @@ pub(crate) async fn dispatch_method(
                 ));
             };
             let (session, reconnect_secret) = coordinator
-                .open_session(principal, &open_args, cancel)
+                .open_session(caller.principal, &open_args, cancel)
                 .await?;
             ipc::encode_control(&SessionOpened {
                 session,
                 reconnect_secret,
-                principal: principal.to_string(),
+                principal: caller.principal.to_string(),
             })
         }
         Method::SessionResume => {
@@ -2901,7 +2935,7 @@ pub(crate) async fn dispatch_method(
                 ));
             };
             let reply = coordinator
-                .resume_session(principal, &resume_args, cancel)
+                .resume_session(caller.principal, &resume_args, cancel)
                 .await?;
             ipc::encode_control(&ReplyEnvelope::success(
                 None,
@@ -2911,19 +2945,31 @@ pub(crate) async fn dispatch_method(
         _ => {
             let request = decode_request_args(method, args_json, request_id)?;
             request.validate()?;
+            if method.kind() == ruk_core::protocol::MethodKind::Admin {
+                if !caller.is_admin() {
+                    return Err(CoreError::new(
+                        ErrorCode::EForbidden,
+                        format!("method `{}` needs an admin peer", method.as_str()),
+                    ));
+                }
+                return Err(method_error(
+                    method,
+                    "no dispatch path serves this method yet",
+                ));
+            }
             let Some(session) = session else {
                 return Err(refuse_sessionless(method, None));
             };
             match method.kind() {
                 ruk_core::protocol::MethodKind::Read => {
                     let reply = coordinator
-                        .read(principal, session, request, cancel)
+                        .read(caller.principal, session, request, cancel)
                         .await?;
                     ipc::encode_control(&ReplyEnvelope::success(None, reply))
                 }
                 ruk_core::protocol::MethodKind::Mutation => {
                     coordinator
-                        .check_session(principal, session, cancel)
+                        .check_session(caller.principal, session, cancel)
                         .await?;
                     // The attestation gate follows invocation cancellation:
                     // a cancelled call stops verification instead of
@@ -2943,7 +2989,7 @@ pub(crate) async fn dispatch_method(
                         ruk_core::coord::DispatchReady::Prepared(prepared) => {
                             let request_id = prepared.request_id;
                             let reply = coordinator
-                                .submit_prepared(principal, *prepared, cancel)
+                                .submit_prepared(caller.principal, *prepared, cancel)
                                 .await?;
                             ipc::encode_control(&ReplyEnvelope::success(Some(request_id), reply))
                         }
@@ -3072,6 +3118,20 @@ fn decode_request_args(
         Method::OpPrune => mutation_request(id, decode_args(text)?, Request::OpPrune),
         Method::Pin => mutation_request(id, decode_args(text)?, Request::Pin),
         Method::Unpin => mutation_request(id, decode_args(text)?, Request::Unpin),
+        Method::ClaimRenew => mutation_request(id, decode_args(text)?, Request::ClaimRenew),
+        Method::PolicySet => mutation_request(id, decode_args(text)?, Request::PolicySet),
+        Method::RepoStat => Ok(Request::RepoStat(Box::new(decode_args(text)?))),
+        Method::Tree => Ok(Request::Tree(Box::new(decode_args(text)?))),
+        Method::RefsList => Ok(Request::RefsList(Box::new(decode_args(text)?))),
+        Method::Compare => Ok(Request::Compare(Box::new(decode_args(text)?))),
+        Method::Search => Ok(Request::Search(Box::new(decode_args(text)?))),
+        Method::Archive => Ok(Request::Archive(Box::new(decode_args(text)?))),
+        Method::EventsTail => Ok(Request::EventsTail(Box::new(decode_args(text)?))),
+        Method::RemoteRefs => Ok(Request::RemoteRefs(Box::new(decode_args(text)?))),
+        Method::RepoInit => Ok(Request::RepoInit(Box::new(decode_args(text)?))),
+        Method::RepoDelete => Ok(Request::RepoDelete(Box::new(decode_args(text)?))),
+        Method::RepoRename => Ok(Request::RepoRename(Box::new(decode_args(text)?))),
+        Method::RepoFork => Ok(Request::RepoFork(Box::new(decode_args(text)?))),
         Method::ClaimList => Ok(Request::ClaimList(Box::new(decode_args(text)?))),
         Method::AttestList => Ok(Request::AttestList(Box::new(decode_args(text)?))),
         Method::OpLog => Ok(Request::OpLog(Box::new(decode_args(text)?))),

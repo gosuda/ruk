@@ -193,6 +193,10 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
         Method::LandPrepare | Method::LandExecute => {
             "landing consumes land plans and moves a remote outside the tracked tables"
         }
+        Method::PolicySet => "policy.set rewrites the landing policy outside the tracked tables",
+        Method::RepoInit | Method::RepoDelete | Method::RepoRename | Method::RepoFork => {
+            "repository lifecycle moves stores on disk outside the tracked tables"
+        }
         Method::Edit
         | Method::New
         | Method::WsNew
@@ -236,7 +240,16 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
         | Method::File
         | Method::Blame
         | Method::Query
-        | Method::GitCommit => return Ok(()),
+        | Method::GitCommit
+        | Method::ClaimRenew
+        | Method::RepoStat
+        | Method::Tree
+        | Method::RefsList
+        | Method::Compare
+        | Method::Search
+        | Method::Archive
+        | Method::EventsTail
+        | Method::RemoteRefs => return Ok(()),
     };
     Err(CoreError::new(
         ErrorCode::EUndoConflict,
