@@ -976,11 +976,13 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     }
     // `post-receive` over the landed refs, after refs are updated. Its
     // failure relays to server diagnostics and never fails the push:
-    // protocol v0's report has no sideband slot for it. Diverted commands
-    // the hook accepted arrive under their review ref: the hook performed
-    // the write itself, so the landed line names the hook-supplied refname
-    // (with the hook-supplied OIDs when present), not the original
-    // `refs/for/` name.
+    // protocol v0's report has no sideband slot for it. The hosted
+    // policy only stashes the callback here; the daemon pumps it after
+    // the receipt write and the report delivery, never before. Diverted
+    // commands the hook accepted arrive under their review ref: the hook
+    // performed the write itself, so the landed line names the
+    // hook-supplied refname (with the hook-supplied OIDs when present),
+    // not the original `refs/for/` name.
     let landed: String = live
         .iter()
         .filter(|(index, _)| matches!(results[*index], Some(Ok(()))))

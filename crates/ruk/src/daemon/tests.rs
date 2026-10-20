@@ -2213,6 +2213,115 @@ async fn post_receive_failure_never_fails_push() {
 }
 
 #[tokio::test]
+async fn post_receive_follows_report_delivery() {
+    let root = temp_root("host-postorder");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-postorder-1"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 5, &body).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+
+    let order = std::sync::Mutex::new(Vec::new());
+    let mut stdout = Vec::new();
+    let exit = loop {
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, 5);
+        match frame.kind {
+            FrameKind::HookCall => {
+                let call: HookCall =
+                    ipc::decode_control(&frame.payload).expect("hook call decodes");
+                let mark = match call.phase {
+                    HookPhase::PreReceive => "hook-pre",
+                    HookPhase::PostReceive => "hook-post",
+                };
+                order.lock().expect("order log").push(mark);
+                let reply = match call.phase {
+                    HookPhase::PreReceive => accept_all(&call).expect("pre-receive answered"),
+                    HookPhase::PostReceive => HookReply {
+                        reject_all: false,
+                        reason: None,
+                        verdicts: Vec::new(),
+                    },
+                };
+                let bytes = ipc::encode_control(&reply).expect("hook reply encodes");
+                driver.send(FrameKind::HookReply, 5, &bytes).await;
+            }
+            FrameKind::Stdout => {
+                if !frame.payload.is_empty() && stdout.is_empty() {
+                    order.lock().expect("order log").push("stdout");
+                }
+                stdout.extend_from_slice(&frame.payload);
+            }
+            FrameKind::Exit => {
+                order.lock().expect("order log").push("exit");
+                break ipc::decode_control::<CommandExitReport>(&frame.payload)
+                    .expect("exit decodes");
+            }
+            FrameKind::Error => panic!(
+                "stream refused: {}",
+                String::from_utf8_lossy(&frame.payload)
+            ),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    };
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&stdout);
+    assert!(text.contains("ok refs/heads/scratch"), "got {text:?}");
+    let log = order.lock().expect("order log");
+    let position = |mark: &str| log.iter().position(|entry| *entry == mark).expect(mark);
+    assert!(
+        position("hook-pre") < position("stdout"),
+        "pre-receive judges first: {log:?}"
+    );
+    assert!(
+        position("stdout") < position("hook-post"),
+        "report delivers before the advisory post-receive: {log:?}"
+    );
+    assert!(
+        position("hook-post") < position("exit"),
+        "post-receive precedes exit: {log:?}"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn receive_replay_same_digest_no_second_publish() {
     let root = temp_root("host-replay");
     let repo_dir = root.join("repo");

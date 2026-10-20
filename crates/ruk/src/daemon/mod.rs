@@ -2168,6 +2168,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     let (client, mut server) = hook_bridge();
     let deadline = refs.registry.hook_timeout();
     let policy = Arc::new(HostPolicy::new(capabilities, deadline, client));
+    let post_policy = Arc::clone(&policy);
     let lfs = ruk_core::mode_for_store(coordinator.store().root());
     let serve_policy = Arc::clone(&policy);
     let serve_coordinator = Arc::clone(&coordinator);
@@ -2303,6 +2304,12 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     match write_typed_chunks(sink, input, credits, cancel_guard, &out).await {
         TypedWriteFate::Done => {}
         TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
+    }
+    // The advisory post-receive runs after the receipt write and the
+    // report delivery, so a slow or absent answer never delays the
+    // push itself; its reply never touches the landed push.
+    if let Some(call) = post_policy.take_post_receive() {
+        let _ = pump_one_exchange(input, sink, &call, cancel_guard, &cancel_flag).await;
     }
     let mut report = CommandExitReport::success(&invocation, 0);
     report.operation_ids = seqs.iter().map(|seq| seq.to_string()).collect();

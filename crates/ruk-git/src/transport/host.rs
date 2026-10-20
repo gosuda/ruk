@@ -204,6 +204,7 @@ pub struct HostPolicy {
     deadline_ms: u64,
     client: HookClient,
     state: Mutex<Option<PreState>>,
+    pending: Mutex<Option<PendingPost>>,
 }
 
 #[derive(Debug)]
@@ -213,6 +214,16 @@ struct PreState {
     new_commits: Vec<String>,
     pack_bytes: u64,
     push_options: Vec<String>,
+}
+
+/// An advisory post-receive callback stashed by the serve and pumped
+/// by the daemon after the receipt write and the report delivery.
+#[derive(Debug)]
+struct PendingPost {
+    commands: Vec<HookCommand>,
+    push_options: Vec<String>,
+    new_commits: Vec<String>,
+    pack_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -236,6 +247,7 @@ impl HostPolicy {
             deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             client,
             state: Mutex::new(None),
+            pending: Mutex::new(None),
         }
     }
 
@@ -245,6 +257,24 @@ impl HostPolicy {
             .push_refs
             .iter()
             .any(|pattern| pattern.matches(name))
+    }
+
+    /// Takes the deferred advisory post-receive callback the serve
+    /// stashed, if any. The daemon pumps it after the receipt write
+    /// and the report delivery; its reply never touches the landed
+    /// push. On a replayed push nothing is taken, so the advisory
+    /// never fires twice for one landing.
+    #[must_use]
+    pub fn take_post_receive(&self) -> Option<HookCall> {
+        let pending = self.pending.lock().expect("hook pending lock").take()?;
+        Some(HookCall {
+            phase: HookPhase::PostReceive,
+            commands: pending.commands,
+            push_options: pending.push_options,
+            new_commits: pending.new_commits,
+            pack_bytes: pending.pack_bytes,
+            deadline_ms: self.deadline_ms,
+        })
     }
 
     /// Maps one callback reply onto per-command verdicts. Anything that
@@ -428,16 +458,14 @@ impl ReceivePolicy for HostPolicy {
         if landed_commands.is_empty() {
             return;
         }
-        let call = HookCall {
-            phase: HookPhase::PostReceive,
+        // Stashed, not exchanged: the daemon pumps the advisory
+        // callback after the receipt write and the report delivery,
+        // so a slow or absent answer never delays the push itself.
+        *self.pending.lock().expect("hook pending lock") = Some(PendingPost {
             commands: landed_commands,
             push_options: state.push_options,
             new_commits: state.new_commits,
             pack_bytes: state.pack_bytes,
-            deadline_ms: self.deadline_ms,
-        };
-        // Advisory: the reply is awaited (so the exchange completes)
-        // but its verdicts never touch the landed push.
-        let _ = self.client.exchange(call);
+        });
     }
 }
