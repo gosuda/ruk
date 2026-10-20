@@ -133,35 +133,57 @@ impl Registry {
         );
     }
 
-    /// Resolves `requested` to a canonical path beneath a configured root.
+    /// Resolves `requested` to a canonical path beneath a configured root,
+    /// refusing escapes and symlink components through `openat2`
+    /// containment (see `ruk_core::contained`).
     ///
     /// # Errors
     /// `E_NOT_FOUND` for a missing path, `E_IO` when the path is
-    /// inaccessible, `E_FORBIDDEN` outside the configured roots.
+    /// inaccessible, `E_FORBIDDEN` outside the configured roots or through
+    /// a symlink component.
     pub(crate) fn resolve(&self, requested: &Path) -> Result<PathBuf, CoreError> {
-        let canonical = match std::fs::canonicalize(requested) {
-            Ok(path) => path,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(CoreError::new(
-                    ErrorCode::ENotFound,
-                    "repository path is unknown",
-                ));
+        let mut refused: Option<CoreError> = None;
+        for root in &self.roots {
+            match ruk_core::contained::resolve_contained(root, requested) {
+                Ok(canonical) => return Ok(canonical),
+                Err(err) if err.code == ErrorCode::ENotFound => continue,
+                Err(err) => {
+                    refused = Some(err);
+                }
             }
-            Err(err) => {
-                return Err(CoreError::new(
-                    ErrorCode::EIo,
-                    format!("repository path is not accessible: {err}"),
-                ));
-            }
-        };
-        if self.roots.iter().any(|root| canonical.starts_with(root)) {
-            Ok(canonical)
-        } else {
-            Err(CoreError::new(
-                ErrorCode::EForbidden,
-                "repository path is outside the configured roots",
-            ))
         }
+        Err(refused
+            .unwrap_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository path is unknown")))
+    }
+
+    /// Resolves a not-yet-existing destination beneath a configured root:
+    /// the nearest existing ancestor is canonicalized and symlink
+    /// components below it are refused (see `ruk_core::contained`).
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` when no ancestor exists beneath a root, `E_FORBIDDEN`
+    /// for symlink components or paths outside the roots, `E_IO` when the
+    /// path is inaccessible.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no creator at this commit; wired in CS-R23/CS-R24 repo lifecycle rows"
+        )
+    )]
+    pub(crate) fn resolve_destination(&self, requested: &Path) -> Result<PathBuf, CoreError> {
+        let mut refused: Option<CoreError> = None;
+        for root in &self.roots {
+            match ruk_core::contained::resolve_new_destination(root, requested) {
+                Ok(destination) => return Ok(destination),
+                Err(err) if err.code == ErrorCode::ENotFound => continue,
+                Err(err) => {
+                    refused = Some(err);
+                }
+            }
+        }
+        Err(refused
+            .unwrap_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository path is unknown")))
     }
 
     /// Opens `repo_ref` by path or handle, returning its handle, path, and coordinator.
@@ -745,6 +767,130 @@ mod tests {
         assert_eq!(registry.retention_interval_ms(), 250);
         registry.set_retention_interval(Duration::ZERO);
         assert_eq!(registry.retention_interval_ms(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_components_are_refused() {
+        use std::os::unix::fs::symlink;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let target = root.join("repo-a");
+        let link = root.join("link");
+        symlink(&target, &link).expect("scratch symlink fits on disk");
+        assert!(
+            registry.resolve(&link).is_err(),
+            "a symlink resolves inside yet is refused"
+        );
+        assert!(
+            registry.resolve(&link.join("..").join("repo-a")).is_ok(),
+            "lexical dotdot collapses before containment"
+        );
+        let outside = std::env::temp_dir().join(format!(
+            "ruk-daemon-registry-outside-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).expect("outside dir fits on disk");
+        let evil = root.join("evil");
+        symlink(&outside, &evil).expect("scratch symlink fits on disk");
+        assert!(registry.resolve(&evil).is_err());
+        assert!(registry.resolve(&evil.join("x")).is_err());
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn dotdot_spellings_stay_contained() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let sub = root.join("repo-a").join("sub");
+        std::fs::create_dir_all(&sub).expect("scratch subdir fits on disk");
+        let resolved = registry
+            .resolve(&sub.join("..").join("."))
+            .expect("dotdot spelling resolves");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(root.join("repo-a")).expect("scratch repo exists")
+        );
+    }
+
+    #[test]
+    fn symlink_swap_never_resolves_outside() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = scratch_root();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).expect("scratch dir fits on disk");
+        std::fs::write(live.join("x"), b"inside").expect("scratch file fits on disk");
+        let outside =
+            std::env::temp_dir().join(format!("ruk-daemon-registry-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).expect("outside dir fits on disk");
+        std::fs::write(outside.join("x"), b"outside").expect("outside file fits on disk");
+        let registry =
+            Arc::new(Registry::new(vec![root.clone()]).expect("scratch root canonicalizes"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let swap = root.join("swap");
+        let worker = {
+            let swap = swap.clone();
+            let live = live.clone();
+            let outside = outside.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut to_live = false;
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&swap);
+                    to_live = !to_live;
+                    let target = if to_live { &live } else { &outside };
+                    let _ = symlink(target, &swap);
+                }
+            })
+        };
+        let canonical_root = std::fs::canonicalize(&root).expect("scratch root canonicalizes");
+        let target = root.join("swap").join("x");
+        for _ in 0..2000 {
+            if let Ok(resolved) = registry.resolve(&target) {
+                assert!(
+                    resolved.starts_with(&canonical_root),
+                    "resolution never escapes its root: {resolved:?}"
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.join().expect("swapper thread joins");
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn destination_beneath_missing_dirs_resolves() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let fresh = root.join("repo-a").join("new-child");
+        let resolved = registry
+            .resolve_destination(&fresh)
+            .expect("missing leaf resolves through its ancestor");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(root.join("repo-a"))
+                .expect("scratch repo exists")
+                .join("new-child")
+        );
+        assert!(registry.resolve(&fresh).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn destination_across_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let link = root.join("link");
+        symlink(root.join("repo-a"), &link).expect("scratch symlink fits on disk");
+        assert!(
+            registry
+                .resolve_destination(&link.join("new-child"))
+                .is_err()
+        );
     }
 
     #[test]

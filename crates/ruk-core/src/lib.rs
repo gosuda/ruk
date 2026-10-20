@@ -24,6 +24,7 @@ pub mod capability;
 pub mod change;
 pub mod commit;
 pub mod conflict;
+pub mod contained;
 pub mod coord;
 pub mod error;
 mod graph;
