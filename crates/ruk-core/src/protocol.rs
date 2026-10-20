@@ -2523,12 +2523,18 @@ pub enum ErrorDetail {
 }
 
 /// The error body of a failed request. Callers branch on `code`.
+///
+/// The daemon's IPC `Error` frame carries this body. The trailing fields
+/// default so a payload written before they existed still decodes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorReply {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(default)]
     pub hints: Vec<String>,
+    #[serde(default)]
     pub fixes: Vec<Fix>,
+    #[serde(default)]
     pub detail: Option<ErrorDetail>,
 }
 

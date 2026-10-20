@@ -68,7 +68,8 @@ pub(crate) enum FrameKind {
     Cancel = 8,
     /// Ends one invocation with a JSON [`super::ExitReport`].
     Exit = 10,
-    /// Reports one invocation failure with a JSON [`super::ErrorReport`].
+    /// Reports one invocation failure with a JSON `ErrorReply` document
+    /// (see `ruk_core::protocol`).
     Error = 11,
     /// Carries one hook invocation toward the hook host (control frame).
     HookCall = 12,

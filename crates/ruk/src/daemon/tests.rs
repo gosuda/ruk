@@ -18,23 +18,25 @@ use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
     DEFAULT_EVENT_RETENTION_SECONDS, DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS,
     DEFAULT_RETENTION_INTERVAL_MS, DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE,
-    DEFAULT_TRANSPORT_PERMITS, DaemonConfig, ErrorReport, ExitReport, InvocationAccepted,
-    InvocationOpen, OutcomeLedger, Registry, SessionOpened, serve_connection,
+    DEFAULT_TRANSPORT_PERMITS, DaemonConfig, ExitReport, InvocationAccepted, InvocationOpen,
+    OutcomeLedger, Registry, SessionOpened, serve_connection,
 };
 use ruk_core::bytes::ByteString;
 use ruk_core::change::{LeaseId, OperationId, PlanId, RequestId, SessionId, StoreId};
 use ruk_core::conflict::{Signature, TzOffset};
+use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::heads::Head;
 use ruk_core::ids::Oid;
 use ruk_core::index::RepoPath;
 use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
-    BookmarkSetArgs, BookmarkTarget, ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs,
-    ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs, IdentityClaim,
-    LandExecuteArgs, Method, NewArgs, OpLogArgs, PageCursor, PageLimit, PageRequest, PathSelection,
-    PinArgs, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope, SessionOpenArgs,
-    SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation, TagSetArgs,
-    WorkspaceBinding, WorkspaceInit, WsNewArgs,
+    BookmarkSetArgs, BookmarkTarget, BoundedList, ChangeRef, ClaimAcquireArgs, ClaimMode,
+    ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, ErrorDetail, ErrorReply, FetchArgs,
+    FetchFilter, FetchRefs, Fix, IdentityClaim, LandExecuteArgs, Method, NewArgs, OpLogArgs,
+    PageCursor, PageLimit, PageRequest, PathSelection, PinArgs, PushRefOutcome, PushRefStatus,
+    PushState, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope,
+    SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
+    TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefTarget};
 use ruk_core::store::{ObjectKind, PreparationBudget, Store};
@@ -224,20 +226,18 @@ impl Driver {
     }
 
     /// Opens one command expecting refusal: an `Error` then a nonzero `Exit`.
-    async fn expect_refused(
-        &mut self,
-        stream_id: u64,
-        payload: &[u8],
-    ) -> (ErrorReport, ExitReport) {
+    async fn expect_refused(&mut self, stream_id: u64, payload: &[u8]) -> (ErrorReply, ExitReport) {
         self.send(FrameKind::Open, stream_id, payload).await;
         let err_frame = self.recv().await;
         assert_eq!(err_frame.kind, FrameKind::Error);
         assert_eq!(err_frame.stream_id, stream_id);
-        let report: ErrorReport = ipc::decode_control(&err_frame.payload).expect("error decodes");
+        let report: ErrorReply = ipc::decode_control(&err_frame.payload).expect("error decodes");
         let exit_frame = self.recv().await;
         assert_eq!(exit_frame.kind, FrameKind::Exit);
         assert_eq!(exit_frame.stream_id, stream_id);
         let exit: ExitReport = ipc::decode_control(&exit_frame.payload).expect("exit decodes");
+        assert_eq!(exit.status, 1);
+        assert_eq!(exit.outcome, "Failed");
         (report, exit)
     }
 
@@ -302,19 +302,20 @@ impl Driver {
         &mut self,
         stream_id: u64,
         payload: &[u8],
-    ) -> (ErrorReport, ExitReport) {
+    ) -> (ErrorReply, ExitReport) {
         self.send(FrameKind::Open, stream_id, payload).await;
         let accepted = self.recv().await;
         assert_eq!(accepted.kind, FrameKind::Accepted);
         let err_frame = self.recv().await;
         assert_eq!(err_frame.kind, FrameKind::Error);
         assert_eq!(err_frame.stream_id, stream_id);
-        let report: ErrorReport = ipc::decode_control(&err_frame.payload).expect("error decodes");
+        let report: ErrorReply = ipc::decode_control(&err_frame.payload).expect("error decodes");
         let exit_frame = self.recv().await;
         assert_eq!(exit_frame.kind, FrameKind::Exit);
         assert_eq!(exit_frame.stream_id, stream_id);
         let exit: ExitReport = ipc::decode_control(&exit_frame.payload).expect("exit decodes");
         assert_eq!(exit.status, 1);
+        assert_eq!(exit.outcome, "Failed");
         (report, exit)
     }
 }
@@ -558,8 +559,12 @@ async fn command_stream_serves_go_wire() {
         "other-digest",
     );
     let (report, exit) = driver.expect_refused(5, &payload).await;
-    assert_eq!(report.code, "E_INVALID");
+    assert_eq!(report.code.as_str(), "E_INVALID");
+    assert!(report.hints.is_empty());
+    assert!(report.fixes.is_empty());
+    assert_eq!(report.detail, None);
     assert_eq!(exit.status, 1);
+    assert_eq!(exit.outcome, "Failed");
 
     let (_, _, replayed) = driver
         .run_command(
@@ -580,16 +585,18 @@ async fn command_stream_serves_go_wire() {
         .to_string();
     let payload = command_open_payload("req-bad-dir", r#"["rev-parse"]"#, &outside, &outside, "d");
     let (report, exit) = driver.expect_refused(9, &payload).await;
-    assert_eq!(report.code, "E_FORBIDDEN");
+    assert_eq!(report.code.as_str(), "E_FORBIDDEN");
     assert_eq!(exit.status, 1);
+    assert_eq!(exit.outcome, "Failed");
 
     let other_dir = root.join("other");
     std::fs::create_dir_all(&other_dir).expect("other dir");
     let other = other_dir.to_str().expect("utf8 other").to_string();
     let payload = command_open_payload("req-mismatch", r#"["rev-parse"]"#, &repo, &other, "d");
     let (report, exit) = driver.expect_refused(11, &payload).await;
-    assert_eq!(report.code, "E_FORBIDDEN");
+    assert_eq!(report.code.as_str(), "E_FORBIDDEN");
     assert_eq!(exit.status, 1);
+    assert_eq!(exit.outcome, "Failed");
 
     drop(driver);
     task.abort();
@@ -674,6 +681,73 @@ async fn command_stream_cancel_reports_cancelled() {
     task.abort();
 }
 
+#[test]
+fn error_frame_carries_full_reply_and_reads_old_payloads() {
+    let reply = ErrorReply::from_core(
+        &CoreError::new(ErrorCode::EStale, "stamp moved").with_hint("re-read"),
+    )
+    .with_fix(Fix::NewRequestId)
+    .with_detail(ErrorDetail::Push {
+        plan: PlanId::generate(),
+        state: PushState::Uncertain,
+        refs: BoundedList::complete(vec![PushRefOutcome {
+            remote_ref: RefName::new("refs/heads/main").expect("ref name"),
+            status: PushRefStatus::Uncertain,
+        }])
+        .expect("refs"),
+    });
+    let bytes = ipc::encode_control(&reply).expect("error encodes");
+    let decoded: ErrorReply = ipc::decode_control(&bytes).expect("error decodes");
+    assert_eq!(decoded, reply);
+    assert_eq!(decoded.hints, vec!["re-read".to_string()]);
+    assert_eq!(decoded.fixes, vec![Fix::NewRequestId]);
+    assert!(matches!(decoded.detail, Some(ErrorDetail::Push { .. })));
+
+    let old = br#"{"code":"E_INVALID","message":"bad"}"#;
+    let legacy: ErrorReply = ipc::decode_control(old).expect("old error decodes");
+    assert_eq!(legacy.code, ErrorCode::EInvalid);
+    assert_eq!(legacy.message, "bad");
+    assert!(legacy.hints.is_empty());
+    assert!(legacy.fixes.is_empty());
+    assert_eq!(legacy.detail, None);
+}
+
+#[tokio::test]
+async fn command_stream_failure_reports_failed_outcome() {
+    let root = temp_root("failed");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-fail-1",
+            r#"["no-such-verb"]"#,
+            &repo,
+            &repo,
+            "digest-fail-1",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 1);
+    assert!(!exit.cancelled);
+    assert_eq!(exit.outcome, "Failed");
+    assert_eq!(exit.invocation_id, "req-fail-1");
+
+    let reply = driver.lookup("req-fail-1").await;
+    assert!(reply.found);
+    let recorded = reply.exit.expect("recorded exit");
+    assert_eq!(recorded.outcome, "Failed");
+    assert_eq!(recorded.exit_code, 1);
+    assert!(!recorded.cancelled);
+
+    drop(driver);
+    task.abort();
+}
+
 /// Decodes typed stdout as a success [`ReplyEnvelope`].
 fn typed_success(stdout: &[u8]) -> ReplyEnvelope {
     let envelope: ReplyEnvelope = ipc::decode_control(stdout).expect("reply envelope decodes");
@@ -748,17 +822,17 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(&unknown),
     );
     let (report, _) = driver.expect_typed_refused(7, &payload).await;
-    assert_eq!(report.code, "E_FORBIDDEN");
+    assert_eq!(report.code.as_str(), "E_FORBIDDEN");
 
     // A missing session keeps the sessionless refusal.
     let payload = Driver::typed_open(&repo, "op.log", None, Some("{}".to_string()), None);
     let (report, _) = driver.expect_typed_refused(9, &payload).await;
-    assert_eq!(report.code, "E_INVALID");
+    assert_eq!(report.code.as_str(), "E_INVALID");
 
     // A malformed session id is invalid, never forbidden.
     let payload = Driver::typed_open(&repo, "op.log", None, Some("{}".to_string()), Some("nope"));
     let (report, _) = driver.expect_typed_refused(11, &payload).await;
-    assert_eq!(report.code, "E_INVALID");
+    assert_eq!(report.code.as_str(), "E_INVALID");
 
     // A covered mutation prepares, publishes, and names its request id.
     let tag_args = TagSetArgs {
@@ -884,7 +958,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(23, &payload).await;
-    assert_eq!(report.code, "E_HOSTED");
+    assert_eq!(report.code.as_str(), "E_HOSTED");
     assert!(
         report.message.contains("autosnapshot"),
         "unexpected message: {}",
@@ -915,7 +989,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(25, &payload).await;
-    assert_eq!(report.code, "E_INVALID");
+    assert_eq!(report.code.as_str(), "E_INVALID");
 
     // A covered mutation with an unsatisfiable precondition reports it:
     // `pin` prepares, but the fixture head was never stored.
@@ -933,7 +1007,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(27, &payload).await;
-    assert_eq!(report.code, "E_NOT_FOUND");
+    assert_eq!(report.code.as_str(), "E_NOT_FOUND");
 
     // The session check runs before preparation: an uncovered method with
     // an unknown session reports forbidden, never the missing preparation.
@@ -945,7 +1019,7 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(&SessionId::generate().to_string()),
     );
     let (report, _) = driver.expect_typed_refused(29, &payload).await;
-    assert_eq!(report.code, "E_FORBIDDEN");
+    assert_eq!(report.code.as_str(), "E_FORBIDDEN");
 
     drop(driver);
     task.abort();
@@ -1318,7 +1392,7 @@ async fn typed_new_without_identity_is_invalid() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(5, &payload).await;
-    assert_eq!(report.code, "E_INVALID");
+    assert_eq!(report.code.as_str(), "E_INVALID");
 
     // The refusal published nothing: the log stays empty.
     let payload = Driver::typed_open(
@@ -1713,7 +1787,7 @@ async fn typed_split_of_unstored_change_refuses_not_found() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(5, &payload).await;
-    assert_eq!(report.code, "E_NOT_FOUND");
+    assert_eq!(report.code.as_str(), "E_NOT_FOUND");
     assert!(
         report.message.contains("is not stored"),
         "split resolves its source before partitioning: {}",
@@ -1942,7 +2016,7 @@ async fn typed_snapshot_refusal_names_job_split() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(7, &payload).await;
-    assert_eq!(report.code, "E_HOSTED");
+    assert_eq!(report.code.as_str(), "E_HOSTED");
     assert!(
         report.message.contains("workcopy::snapshot"),
         "snapshot names its missing producer: {}",
@@ -2004,7 +2078,7 @@ async fn typed_fetch_refusal_names_transport_job() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(5, &payload).await;
-    assert_eq!(report.code, "E_HOSTED");
+    assert_eq!(report.code.as_str(), "E_HOSTED");
     assert!(
         report.message.contains("transport job"),
         "fetch names its missing job: {}",
@@ -2063,7 +2137,7 @@ async fn typed_land_execute_refusal_names_plan() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(5, &payload).await;
-    assert_eq!(report.code, "E_HOSTED");
+    assert_eq!(report.code.as_str(), "E_HOSTED");
     assert!(
         report.message.contains("load_plan"),
         "land.execute names its plan machinery: {}",

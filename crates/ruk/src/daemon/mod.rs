@@ -30,7 +30,7 @@ use ruk_core::change::{RequestId, SessionId};
 use ruk_core::coord::{Cancel, HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::protocol::{
-    Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request, SessionOpenArgs,
+    ErrorReply, Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request, SessionOpenArgs,
     SessionResumeArgs, decode_json,
 };
 use ruk_core::refdata::RefName;
@@ -639,19 +639,11 @@ pub(crate) struct ExitReport {
     pub status: i32,
     /// `OK` on success, else the closed error-code spelling of the failure.
     pub code: String,
-    /// The durable mutation outcome: `Completed` or `CancelledBeforeCommit`.
+    /// The durable mutation outcome: `Completed`, `Failed`, or
+    /// `CancelledBeforeCommit`.
     pub outcome: String,
     /// Unix seconds of completion, from the system clock.
     pub completed_at: u64,
-}
-
-/// The `Error` payload reporting one invocation failure.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ErrorReport {
-    /// The closed error-code spelling, never message text.
-    pub code: String,
-    /// The human diagnostic accompanying the code.
-    pub message: String,
 }
 
 /// Cap of outcome records held per daemon process; older invocations evict
@@ -663,6 +655,9 @@ const MAX_COMMAND_STDIN_BYTES: usize = 256 * 1024 * 1024;
 
 /// Outcome of a command that ran to its terminal report.
 const OUTCOME_COMPLETED: &str = "Completed";
+
+/// Outcome of a command that failed: a refusal, a teardown, or a nonzero exit.
+const OUTCOME_FAILED: &str = "Failed";
 
 /// Outcome of a command cancelled before (or during) its run.
 const OUTCOME_CANCELLED: &str = "CancelledBeforeCommit";
@@ -719,7 +714,7 @@ pub(crate) struct CommandExitReport {
     pub signal: String,
     /// True when cancellation ended the invocation.
     pub cancelled: bool,
-    /// The durable outcome: `Completed` or `CancelledBeforeCommit`.
+    /// The durable outcome: `Completed`, `Failed`, or `CancelledBeforeCommit`.
     pub outcome: String,
     /// Operation identities of the run; empty for CLI verbs.
     pub operation_ids: Vec<String>,
@@ -742,7 +737,19 @@ impl CommandExitReport {
 
     /// Builds the terminal report of a failed command.
     fn failure(invocation: &str) -> Self {
-        Self::success(invocation, 1)
+        Self::failure_with_code(invocation, 1)
+    }
+
+    /// Builds the terminal report of a command that exited with `code`.
+    fn failure_with_code(invocation: &str, code: u8) -> Self {
+        Self {
+            exit_code: i32::from(code),
+            signal: String::new(),
+            cancelled: false,
+            outcome: OUTCOME_FAILED.to_string(),
+            operation_ids: Vec::new(),
+            invocation_id: invocation.to_string(),
+        }
     }
 
     /// Builds the terminal report of a cancelled command.
@@ -1135,10 +1142,10 @@ async fn handle_control_frame(
         | ipc::FrameKind::Stderr
         | ipc::FrameKind::HookCall
         | ipc::FrameKind::HookReply => {
-            let report = ErrorReport {
-                code: ErrorCode::EInvalid.as_str().to_string(),
-                message: String::from("stream-zero carries only the handshake and control queries"),
-            };
+            let report = ErrorReply::from_core(&CoreError::new(
+                ErrorCode::EInvalid,
+                "stream-zero carries only the handshake and control queries",
+            ));
             let bytes = ipc::encode_control(&report)?;
             ipc::write_frame(
                 stream,
@@ -1212,10 +1219,7 @@ async fn write_control_error(
     err: &CoreError,
     deadline: tokio::time::Instant,
 ) -> Result<(), Error> {
-    let report = ErrorReport {
-        code: err.code.as_str().to_string(),
-        message: err.message.clone(),
-    };
+    let report = ErrorReply::from_core(err);
     let bytes = ipc::encode_control(&report)?;
     ipc::write_frame(
         stream,
@@ -1672,7 +1676,11 @@ async fn serve_ready_command(
             return Ok(false);
         }
     };
-    let report = CommandExitReport::success(&invocation, outcome.code);
+    let report = if outcome.code == 0 {
+        CommandExitReport::success(&invocation, 0)
+    } else {
+        CommandExitReport::failure_with_code(&invocation, outcome.code)
+    };
     lock_outcomes(serving.refs)?.complete(&invocation, report.clone());
     for (kind, bytes) in [
         (ipc::FrameKind::Stdout, outcome.stdout),
@@ -2708,27 +2716,29 @@ async fn send_error_exit(
     err: &Error,
     refs: &ConnectionRefs,
 ) -> Result<(), Error> {
-    let (code, message) = match err {
-        Error::Core(inner) => (inner.code.as_str().to_string(), inner.message.clone()),
+    let core = match err {
+        Error::Core(inner) => inner.clone(),
         Error::Config(detail) | Error::Unsupported(detail) => {
-            (ErrorCode::EInvalid.as_str().to_string(), detail.clone())
+            CoreError::new(ErrorCode::EInvalid, detail.clone())
         }
-        Error::Io(inner) => (ErrorCode::EIo.as_str().to_string(), inner.to_string()),
+        Error::Io(inner) => CoreError::new(ErrorCode::EIo, inner.to_string()),
     };
-    let status = if code == ErrorCode::ECancelled.as_str() {
-        130
-    } else {
-        1
-    };
-    let report = ErrorReport { code, message };
+    let cancelled = core.code == ErrorCode::ECancelled;
+    let status = if cancelled { 130 } else { 1 };
+    let report = ErrorReply::from_core(&core);
     let bytes = ipc::encode_control(&report)?;
     send_frame(stream, ipc::FrameKind::Error, stream_id, &bytes, refs).await?;
+    let outcome = if cancelled {
+        OUTCOME_CANCELLED
+    } else {
+        OUTCOME_FAILED
+    };
     send_exit(
         stream,
         stream_id,
         status,
-        &report.code,
-        "CancelledBeforeCommit",
+        report.code.as_str(),
+        outcome,
         refs,
     )
     .await
