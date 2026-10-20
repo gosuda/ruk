@@ -359,13 +359,49 @@ fn required_fails_without_coordinator() {
 }
 
 /// An idle server unlinks its socket and exits on its own.
+///
+/// The server runs as a child this test owns, so socket presence is
+/// established before the commit instead of after it. Polling for
+/// presence after the client exits races the idle TTL against client
+/// tail latency, which parallel load stretches past the TTL while the
+/// server has already served, unlinked, and exited cleanly.
 #[test]
 fn idle_server_unlinks_its_socket() {
     let repo = fresh_repo("idle");
-    let extra = &[("RUK_COORDINATOR_IDLE_MS", "200")];
-    let (code, _, stderr) = commit_empty(&repo, "idle commit", extra);
-    assert_eq!(code, 0, "idle commit failed: {stderr}");
     let sock = repo.join(".ruk").join("coordinator.sock");
+    let mut server = Command::new(ruk_bin())
+        .arg("git")
+        .arg("coordinator")
+        .arg(&repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("RUK_COORDINATOR_IDLE_MS", "200")
+        .spawn()
+        .expect("spawn coordinator server");
     wait_for(&sock, true, Duration::from_secs(10));
+    let (code, _, stderr) = commit_empty(&repo, "idle commit", &[]);
+    assert_eq!(code, 0, "idle commit failed: {stderr}");
+    let log = log_subjects(&repo);
+    assert!(log.contains("idle commit"), "missing commit:\n{log}");
     wait_for(&sock, false, Duration::from_secs(10));
+    assert_eq!(
+        stat_field(&repo, "committed"),
+        1,
+        "the commit went through the server"
+    );
+    let start = Instant::now();
+    loop {
+        match server.try_wait().expect("reap coordinator server") {
+            Some(status) => {
+                assert!(status.success(), "server exits cleanly: {status}");
+                break;
+            }
+            None => assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "server exits on its own"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
