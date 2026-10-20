@@ -1055,18 +1055,37 @@ fn reject_duplicate_facts(facts: &[FactMutation]) -> Result<(), StoreError> {
 /// Verifies one expectation against the transaction's own view and applies
 /// the mutation. The publisher holds the only write transaction, so what is
 /// verified here is what the commit applies to.
+///
+/// Record rows are content-addressed: when the stored bytes already equal
+/// the written bytes, the replay converged and the write is skipped. This
+/// covers only the record tables; claims, refs, and every other table keep
+/// strict expectations, so a genuinely moved value still refuses.
 fn apply_fact(txn: &WriteTransaction, fact: &FactMutation) -> Result<(), StoreError> {
+    use FactTable::{ChangeHistory, Changes, Commits, ImportedChanges};
     let mut table = txn
         .open_table(fact_definition(fact.table))
         .map_err(table_error)?;
+    let stored = table.get(fact.key.as_slice()).map_err(storage)?;
+    let converged = match (fact.value.as_ref(), stored.as_ref()) {
+        (Some(value), Some(current)) => {
+            matches!(
+                fact.table,
+                Commits | Changes | ImportedChanges | ChangeHistory
+            ) && current.value() == value.as_slice()
+        }
+        _ => false,
+    };
+    if converged {
+        return Ok(());
+    }
     let stale = match &fact.expected {
         FactExpectation::Any => false,
-        FactExpectation::Absent => table.get(fact.key.as_slice()).map_err(storage)?.is_some(),
-        FactExpectation::Value(want) => table
-            .get(fact.key.as_slice())
-            .map_err(storage)?
-            .is_none_or(|stored| stored.value() != want.as_slice()),
+        FactExpectation::Absent => stored.is_some(),
+        FactExpectation::Value(want) => stored
+            .as_ref()
+            .is_none_or(|current| current.value() != want.as_slice()),
     };
+    drop(stored);
     if stale {
         return Err(StoreError::StaleFact {
             table: fact.table.table_name(),

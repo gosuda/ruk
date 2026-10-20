@@ -1355,7 +1355,13 @@ mod tests {
     }
 
     fn limit_pack() -> (Vec<u8>, Oid, usize) {
-        let blob: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        limit_pack_with(0)
+    }
+
+    fn limit_pack_with(seed: u8) -> (Vec<u8>, Oid, usize) {
+        let blob: Vec<u8> = (0..1000)
+            .map(|i| ((i + usize::from(seed) * 131) % 251) as u8)
+            .collect();
         let blob_id = blob_oid(&blob);
         let (tree_bytes, tree_id) = tree_for_blob(b"f", blob_id);
         let (commit_bytes, commit_id) = commit_for_tree(tree_id);
@@ -2061,6 +2067,126 @@ mod tests {
                 "over-cap push refuses with Limit"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_identical_pushes_to_distinct_branches_all_land() {
+        let kind = HashKind::Sha1;
+        for count in [2usize, 4, 8] {
+            let dest = test_store(kind);
+            let (pack, commit, _) = limit_pack();
+            let dest_ref = &dest;
+            let pack_ref = &pack;
+            let outcomes: Vec<(Vec<u64>, Vec<Vec<u8>>)> = std::thread::scope(|scope| {
+                (0..count)
+                    .map(|branch| {
+                        scope.spawn(move || {
+                            let name = format!("refs/heads/dup-{branch}");
+                            let mut input = command(
+                                kind.zero_oid(),
+                                commit,
+                                name.as_bytes(),
+                                Some("report-status"),
+                            );
+                            input.extend_from_slice(b"0000");
+                            input.extend_from_slice(pack_ref);
+                            let mut out = Vec::new();
+                            let seqs = serve_receive_pack_with(
+                                &input[..],
+                                &mut out,
+                                dest_ref,
+                                kind,
+                                &head(),
+                                &Interrupt::none(),
+                                &NoPolicy,
+                                LfsMode::Deny,
+                                ReceiveLimits::default(),
+                            )
+                            .expect("identical push lands");
+                            (seqs, report_lines(&out))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().expect("push thread"))
+                    .collect()
+            });
+            assert_eq!(outcomes.len(), count);
+            for (seqs, lines) in &outcomes {
+                assert_eq!(seqs.len(), 1, "each push lands one ref event");
+                assert!(
+                    lines.iter().any(|line| line == b"unpack ok"),
+                    "got {lines:?}"
+                );
+                assert!(
+                    lines.iter().any(|line| line.starts_with(b"ok ")),
+                    "got {lines:?}"
+                );
+            }
+            for branch in 0..count {
+                let name = format!("refs/heads/dup-{branch}");
+                assert_eq!(
+                    ref_oid(&dest, name.as_bytes()),
+                    Some(commit),
+                    "every branch holds the one commit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_same_branch_race_refuses_exactly_one() {
+        let kind = HashKind::Sha1;
+        let dest = test_store(kind);
+        let (pack_a, commit_a, _) = limit_pack_with(1);
+        let (pack_b, commit_b, _) = limit_pack_with(2);
+        assert_ne!(commit_a, commit_b, "the racers carry distinct commits");
+        let dest_ref = &dest;
+        let push = |pack: &[u8], commit: Oid| {
+            let mut input = command(
+                kind.zero_oid(),
+                commit,
+                b"refs/heads/race",
+                Some("report-status"),
+            );
+            input.extend_from_slice(b"0000");
+            input.extend_from_slice(pack);
+            let mut out = Vec::new();
+            serve_receive_pack_with(
+                &input[..],
+                &mut out,
+                dest_ref,
+                kind,
+                &head(),
+                &Interrupt::none(),
+                &NoPolicy,
+                LfsMode::Deny,
+                ReceiveLimits::default(),
+            )
+            .expect("race serves in-band refusals");
+            report_lines(&out)
+        };
+        let (lines_a, lines_b) = std::thread::scope(|scope| {
+            let first = scope.spawn(move || push(&pack_a, commit_a));
+            let second = scope.spawn(move || push(&pack_b, commit_b));
+            (
+                first.join().expect("first racer"),
+                second.join().expect("second racer"),
+            )
+        });
+        let oks = [&lines_a, &lines_b]
+            .iter()
+            .filter(|lines| lines.iter().any(|line| line.starts_with(b"ok ")))
+            .count();
+        assert_eq!(
+            oks, 1,
+            "exactly one racer lands: {lines_a:?} vs {lines_b:?}"
+        );
+        let tip = ref_oid(&dest, b"refs/heads/race").expect("race lands a tip");
+        assert!(
+            tip == commit_a || tip == commit_b,
+            "the tip is one racer: {tip}"
+        );
     }
 
     fn serve_push_raw(

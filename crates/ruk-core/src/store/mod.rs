@@ -2713,6 +2713,56 @@ mod tests {
     }
 
     #[test]
+    fn identical_record_replay_converges_while_conflicts_stay_stale() {
+        let temp = TempRoot::new("record-replay");
+        let store = create(&temp, HashKind::Sha1);
+        for table in [
+            FactTable::Commits,
+            FactTable::Changes,
+            FactTable::ImportedChanges,
+            FactTable::ChangeHistory,
+        ] {
+            let first = [mutation(
+                table,
+                b"row",
+                FactExpectation::Absent,
+                Some(b"v1"),
+            )];
+            store
+                .publish(
+                    vec![],
+                    &first,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("first record write");
+            store
+                .publish(
+                    vec![],
+                    &first,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("identical record replay converges");
+            let changed = [mutation(
+                table,
+                b"row",
+                FactExpectation::Absent,
+                Some(b"v2"),
+            )];
+            let err = store
+                .publish(
+                    vec![],
+                    &changed,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect_err("a differing record still refuses");
+            assert!(matches!(err, StoreError::StaleFact { .. }), "{err:?}");
+        }
+    }
+
+    #[test]
     fn unknown_predecessor_is_not_found() {
         let temp = TempRoot::new("predecessor");
         let store = create(&temp, HashKind::Sha1);

@@ -44,6 +44,7 @@ use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
 use ruk_core::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
 use ruk_git::transport::host::{HookCall, HookPhase, HookRefVerdict, HookReply, HookVerdict};
 use ruk_git::transport::serve::ReceiveLimits;
+use ruk_git::transport::{Interrupt, pack as git_pack};
 
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
@@ -2324,6 +2325,221 @@ async fn git_envelope_push_option_quota_refuses_push() {
 
     drop(driver);
     task.abort();
+}
+
+fn hosted_blob_oid(data: &[u8]) -> Oid {
+    ruk_core::ids::HashKind::Sha1
+        .hash_git_object("blob", data)
+        .expect("blob hashes")
+}
+
+fn hosted_chain_pack(seed: u8) -> (Vec<u8>, Oid) {
+    let kind = ruk_core::ids::HashKind::Sha1;
+    let blob: Vec<u8> = (0..1000)
+        .map(|i| ((i + usize::from(seed) * 131) % 251) as u8)
+        .collect();
+    let blob_id = hosted_blob_oid(&blob);
+    let mut tree = b"100644 f\0".to_vec();
+    tree.extend_from_slice(blob_id.as_bytes());
+    let tree_id = kind.hash_git_object("tree", &tree).expect("tree hashes");
+    let commit = format!(
+        "tree {}\nauthor T <t@t.invalid> 0 +0000\ncommitter T <t@t.invalid> 0 +0000\n\nhosted\n",
+        tree_id.to_hex()
+    )
+    .into_bytes();
+    let commit_id = kind
+        .hash_git_object("commit", &commit)
+        .expect("commit hashes");
+    let entries = [
+        git_pack::PackEntry {
+            oid: commit_id,
+            kind: ObjectKind::Commit,
+            bytes: &commit,
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: tree_id,
+            kind: ObjectKind::Tree,
+            bytes: &tree,
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: blob_id,
+            kind: ObjectKind::Blob,
+            bytes: &blob,
+            base: None,
+        },
+    ];
+    let mut pack = Vec::new();
+    git_pack::write_pack(&mut pack, kind, &entries, &Interrupt::none()).expect("pack");
+    (pack, commit_id)
+}
+
+fn spawn_extra_driver(
+    registry: &Arc<Registry>,
+) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
+    let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+    let uid = client.peer_cred().expect("socket pair credentials").uid();
+    let refs = ConnectionRefs {
+        registry: Arc::clone(registry),
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport executor"),
+        window_bytes: INITIAL_STREAM_WINDOW_BYTES,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: vec![uid],
+    };
+    let task = tokio::spawn(async move { serve_connection(server, refs).await });
+    (Driver { conn: client }, task)
+}
+
+#[tokio::test]
+async fn concurrent_identical_hosted_pushes_all_land() {
+    for count in [2usize, 4, 8] {
+        let root = temp_root("hosted-dup-push");
+        let repo_dir = root.join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("repo dir");
+        let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+        seed_store(&repo);
+        let store_repo = repo_dir
+            .join(".ruk")
+            .to_str()
+            .expect("utf8 store repo")
+            .to_string();
+        let (pack, commit) = hosted_chain_pack(0);
+
+        let (mut first, registry, first_task) = spawn_hosted(&root, 10_000);
+        handshake(&mut first).await;
+        let mut drivers = vec![first];
+        let mut tasks = vec![first_task];
+        for _ in 1..count {
+            let (mut extra, task) = spawn_extra_driver(&registry);
+            handshake(&mut extra).await;
+            drivers.push(extra);
+            tasks.push(task);
+        }
+        let mut pushes = Vec::new();
+        for (index, mut driver) in drivers.into_iter().enumerate() {
+            let repo_clone = store_repo.clone();
+            let pack_clone = pack.clone();
+            let session = open_push_session(&mut driver, &store_repo, &["refs/heads/**"]).await;
+            pushes.push(tokio::spawn(async move {
+                let zero = "0".repeat(40);
+                let mut body = pkt(format!(
+                    "{zero} {commit} refs/heads/dup-{index}\n",
+                    commit = commit.to_hex()
+                )
+                .as_bytes());
+                body.extend_from_slice(&flush());
+                body.extend_from_slice(&pack_clone);
+                let payload = git_open_payload(
+                    "receive-pack",
+                    &repo_clone,
+                    false,
+                    Some(&session),
+                    Some(&format!("req-hosted-dup-{index}")),
+                );
+                let (out, exit) = driver
+                    .run_git_hosted(1, &payload, &[body], accept_all)
+                    .await;
+                (index, out, exit)
+            }));
+        }
+        for pushed in pushes {
+            let (index, out, exit) = pushed.await.expect("push task");
+            assert_eq!(exit.exit_code, 0, "hosted push {index} exits zero");
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                text.contains(&format!("ok refs/heads/dup-{index}")),
+                "hosted push {index} lands: {text:?}"
+            );
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn concurrent_hosted_race_on_one_branch_refuses_exactly_one() {
+    let root = temp_root("hosted-race");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (pack_a, commit_a) = hosted_chain_pack(1);
+    let (pack_b, commit_b) = hosted_chain_pack(2);
+    assert_ne!(commit_a, commit_b, "the racers carry distinct commits");
+
+    let (mut first, registry, first_task) = spawn_hosted(&root, 10_000);
+    handshake(&mut first).await;
+    let (mut second, second_task) = spawn_extra_driver(&registry);
+    handshake(&mut second).await;
+    let session_a = open_push_session(&mut first, &store_repo, &["refs/heads/**"]).await;
+    let session_b = open_push_session(&mut second, &store_repo, &["refs/heads/**"]).await;
+    let push = |mut driver: Driver,
+                repo: String,
+                session: String,
+                request: String,
+                pack: Vec<u8>,
+                commit: Oid| {
+        tokio::spawn(async move {
+            let zero = "0".repeat(40);
+            let mut body = pkt(format!(
+                "{zero} {commit} refs/heads/race\n",
+                commit = commit.to_hex()
+            )
+            .as_bytes());
+            body.extend_from_slice(&flush());
+            body.extend_from_slice(&pack);
+            let payload =
+                git_open_payload("receive-pack", &repo, false, Some(&session), Some(&request));
+            let (out, exit) = driver
+                .run_git_hosted(1, &payload, &[body], accept_all)
+                .await;
+            (out, exit)
+        })
+    };
+    let racer_a = push(
+        first,
+        store_repo.clone(),
+        session_a,
+        "req-hosted-race-a".to_owned(),
+        pack_a,
+        commit_a,
+    );
+    let racer_b = push(
+        second,
+        store_repo,
+        session_b,
+        "req-hosted-race-b".to_owned(),
+        pack_b,
+        commit_b,
+    );
+    let (out_a, exit_a) = racer_a.await.expect("first racer");
+    let (out_b, exit_b) = racer_b.await.expect("second racer");
+    assert_eq!(exit_a.exit_code, 0, "refusals stay in-band");
+    assert_eq!(exit_b.exit_code, 0, "refusals stay in-band");
+    let text_a = String::from_utf8_lossy(&out_a);
+    let text_b = String::from_utf8_lossy(&out_b);
+    let oks = [&text_a, &text_b]
+        .iter()
+        .filter(|text| text.contains("ok refs/heads/race"))
+        .count();
+    assert_eq!(oks, 1, "exactly one racer lands: {text_a:?} vs {text_b:?}");
+    assert!(
+        [&text_a, &text_b]
+            .iter()
+            .any(|text| text.contains("ng refs/heads/race")),
+        "the loser reports ng: {text_a:?} vs {text_b:?}"
+    );
+    first_task.abort();
+    second_task.abort();
 }
 
 #[tokio::test]
