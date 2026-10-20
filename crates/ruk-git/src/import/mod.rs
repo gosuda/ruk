@@ -155,7 +155,7 @@ impl PublishSink for DirectPublish<'_> {
             .publish(
                 objects,
                 &facts,
-                EventSource::LocalPush,
+                EventSource::Import,
                 &EventContext::default(),
             )
             .map_err(GitError::from)

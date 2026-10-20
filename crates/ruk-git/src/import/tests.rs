@@ -5,7 +5,8 @@
 use ruk_core::change::ChangeId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
-use ruk_core::store::{FactTable, ObjectKind, Store};
+use ruk_core::store::types::decode_store_event;
+use ruk_core::store::{EventSource, FactPageBudget, FactTable, ObjectKind, Store};
 
 use super::fixtures::{Fixture, IndexFormat, PackBody, PackObject, observation, read_object};
 use super::{DirectPublish, ImportProgress, ImportReport, PublishSink, import_repository};
@@ -496,6 +497,33 @@ fn missing_object_names_oid_and_referrer() {
         }
         other => panic!("unexpected {other:?}"),
     }
+}
+
+#[test]
+fn import_publishes_with_import_source() {
+    let (fixture, store, _) = loose_repo();
+    let progress = ImportProgress::new();
+    let mut sink = DirectPublish(&store);
+    let request = fixture.request(1, b"origin");
+    import_repository(&store, &request, &progress, &mut sink).expect("import");
+    let page = store
+        .fact_page(
+            FactTable::Events,
+            None,
+            FactPageBudget::new(100, usize::MAX),
+        )
+        .expect("read events");
+    let event = page
+        .rows
+        .iter()
+        .map(|row| decode_store_event(&row.value).expect("event decodes"))
+        .rfind(|event| event.name == b"refs/heads/main")
+        .expect("import emits the main event");
+    assert_eq!(
+        event.source,
+        EventSource::Import,
+        "import batches publish as Import, not LocalPush"
+    );
 }
 
 #[test]
