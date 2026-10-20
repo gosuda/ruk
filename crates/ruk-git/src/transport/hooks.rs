@@ -38,13 +38,15 @@
 //!   never fails the push (protocol v0's report has no sideband slot for
 //!   it, so the message goes to server logs instead of the client).
 //!
-//! A missing script is a pass. Hooks inherit the server's environment plus
-//! `GIT_QUARANTINE_PATH`, `GIT_OBJECT_DIRECTORY` (the quarantine
-//! `objects/` dir, so hook `git` commands transparently see staged
-//! objects), `GIT_DIR` (the repository directory), and
-//! `RUK_QUARANTINE_MANIFEST` (the manifest path). Hook stdout is discarded;
-//! hook stderr supplies the refusal message. Every hook runs under
-//! [`HOOK_TIMEOUT`]; expiry kills the hook and refuses fail-closed.
+//! A missing script is a pass. Hooks run hermetic: the inherited
+//! environment clears, leaving exactly `PATH=/usr/bin:/bin`, `GIT_DIR`
+//! (the repository directory), `GIT_QUARANTINE_PATH`,
+//! `GIT_OBJECT_DIRECTORY` (the quarantine `objects/` dir, so hook `git`
+//! commands transparently see staged objects), `RUK_QUARANTINE_MANIFEST`
+//! (the manifest path), and the negotiated `GIT_PUSH_OPTION_*` lines.
+//! Hook stdout is discarded; hook stderr supplies the refusal message.
+//! Every hook runs under [`HOOK_TIMEOUT`]; expiry kills the hook and
+//! refuses fail-closed.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -348,9 +350,12 @@ pub(crate) fn run_hook(
 ///
 /// One constructor so every phase (`pre-receive`, `update`,
 /// `post-receive`, `proc-receive`) exports identical variables.
-/// `GIT_PUSH_OPTION_COUNT` (plus `GIT_PUSH_OPTION_<i>`) is exported only
-/// when the client negotiated `push-options`, matching the oracle: an
-/// unnegotiated push exports neither the count nor any option.
+/// The environment is hermetic: everything inherited clears first,
+/// then exactly `PATH`, `GIT_DIR`, the quarantine inspection variables,
+/// and the negotiated push options are set. `GIT_PUSH_OPTION_COUNT`
+/// (plus `GIT_PUSH_OPTION_<i>`) is exported only when the client
+/// negotiated `push-options`, matching the oracle: an unnegotiated push
+/// exports neither the count nor any option.
 pub(crate) fn apply_hook_env(
     cmd: &mut Command,
     repo_dir: &Path,
@@ -358,6 +363,8 @@ pub(crate) fn apply_hook_env(
     push_options: &[String],
     negotiated: bool,
 ) {
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/bin");
     if let Some(q) = quarantine {
         cmd.env("GIT_QUARANTINE_PATH", q.dir());
         cmd.env("GIT_OBJECT_DIRECTORY", q.objects_dir());

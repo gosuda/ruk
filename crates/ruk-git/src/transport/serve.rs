@@ -1687,6 +1687,60 @@ printf '0000'
         assert_eq!(seen, expected, "pre-receive stdin skipped a command");
     }
 
+    /// Hooks run with a hermetic environment: the hook observes exactly
+    /// `PATH=/usr/bin:/bin`, `GIT_DIR`, and the quarantine inspection
+    /// variables, while inherited variables (like `HOME`, which the test
+    /// process always carries) never arrive.
+    #[test]
+    fn hooks_run_with_hermetic_env_allowlist() {
+        let kind = HashKind::Sha1;
+        let repo = hook_repo();
+        let env_marker = repo.join("hook-env");
+        write_hook(
+            &repo,
+            "pre-receive",
+            &format!("env | sort > \"{}\"\n", env_marker.display()),
+        );
+        let hooks = ReceiveHooks::for_repo(repo);
+        let src = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let dest = test_store(kind);
+        let pack = push_pack(&src, kind, kind.zero_oid(), oid(FOUR), b"refs/heads/main");
+
+        let lines = serve_push_with_hooks(
+            &dest,
+            kind,
+            &[(kind.zero_oid(), oid(FOUR), b"refs/heads/main")],
+            &pack,
+            &ScriptPolicy::new(hooks),
+        );
+        assert_eq!(
+            lines,
+            vec![b"unpack ok".to_vec(), b"ok refs/heads/main".to_vec(),]
+        );
+        let seen = std::fs::read_to_string(&env_marker).expect("hook dumped env");
+        assert!(
+            seen.lines().any(|line| line == "PATH=/usr/bin:/bin"),
+            "hook PATH is not the allowlist value: {seen:?}"
+        );
+        assert!(
+            seen.lines().any(|line| line.starts_with("GIT_DIR=")),
+            "hook missed GIT_DIR: {seen:?}"
+        );
+        assert!(
+            seen.lines()
+                .any(|line| line.starts_with("GIT_QUARANTINE_PATH=")),
+            "hook missed the quarantine path: {seen:?}"
+        );
+        assert!(
+            std::env::var_os("HOME").is_some(),
+            "the test needs an inherited HOME to prove the clear"
+        );
+        assert!(
+            !seen.lines().any(|line| line.starts_with("HOME=")),
+            "inherited variables leak into hooks: {seen:?}"
+        );
+    }
+
     /// `refs/pull/` pushes no longer divert to `proc-receive`: with the
     /// default prefixes only `refs/for/` diverts, so a `refs/pull/` ref
     /// lands as a plain ref through the CAS path while the hook never
