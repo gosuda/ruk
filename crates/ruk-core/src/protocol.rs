@@ -3417,7 +3417,7 @@ impl Validate for EventsTailArgs {
         if let Some(wait_ms) = self.wait_ms
             && wait_ms > MAX_TAIL_WAIT_MS
         {
-            return Err(invalid(format!(
+            return Err(limit_exceeded(format!(
                 "tail wait is at most {MAX_TAIL_WAIT_MS} ms, got {wait_ms}"
             )));
         }
@@ -4613,6 +4613,35 @@ mod tests {
             json!({"symbolic": "refs/heads/main"})
         );
         assert!(sonic_rs::from_str::<RefTarget>("{\"Direct\": \"00\"}").is_err());
+    }
+
+    #[test]
+    fn events_tail_bounds_reject_over_limit_and_wait() {
+        let args = EventsTailArgs {
+            after: 0,
+            limit: Some(PageLimit::new(1000).expect("max page")),
+            wait_ms: Some(MAX_TAIL_WAIT_MS),
+            prefix: None,
+        };
+        assert!(args.validate().is_ok());
+
+        let over_wait = EventsTailArgs {
+            wait_ms: Some(MAX_TAIL_WAIT_MS + 1),
+            ..args.clone()
+        };
+        assert_eq!(
+            invalid_code(over_wait.validate()),
+            ErrorCode::ELimit,
+            "wait past 30000 ms is refused, not clamped"
+        );
+
+        assert!(PageLimit::new(1001).is_err());
+        let over_limit: Result<EventsTailArgs, _> =
+            sonic_rs::from_str("{\"after\":0,\"limit\":1001}");
+        assert!(over_limit.is_err(), "limit 1001 never decodes");
+        let at_limit: EventsTailArgs =
+            sonic_rs::from_str("{\"after\":0,\"limit\":1000}").expect("limit 1000 decodes");
+        assert!(at_limit.validate().is_ok());
     }
 
     #[test]

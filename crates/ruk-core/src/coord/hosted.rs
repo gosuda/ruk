@@ -61,22 +61,24 @@ use super::rows::{
 use super::service_receipts::{SERVICE_RECEIPT_RETENTION_SECONDS, sweep_service_receipts_page};
 use super::session::{Authority, ResumeOutcome, SessionTable, prepare_open};
 use crate::ByteString;
+use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::attestation::Checkpoint;
 use crate::capability::{Capabilities, ReadAccess};
 use crate::change::{LeaseId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
     AttestListArgs, AttestListReply, ClaimHolderFilter, ClaimListArgs, ClaimListReply,
-    DEFAULT_PAGE_SIZE, KeysetPage, MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor,
-    PageLimit, QueryDigest, ReconnectSecret, RefsListArgs, RefsListReply, Reply, Request,
-    SessionAuthority, SessionOpenArgs, SessionResumeArgs, SessionResumeReply, Timestamp, ViewInfo,
+    DEFAULT_PAGE_SIZE, EventsTailArgs, EventsTailReply, KeysetPage, MAX_PAGE_SIZE, Method,
+    OpLogArgs, OpLogReply, Page, PageCursor, PageLimit, QueryDigest, ReconnectSecret, RefsListArgs,
+    RefsListReply, Reply, Request, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
+    SessionResumeReply, TailedEvent, Timestamp, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
 use crate::store::CompactionStats;
 use crate::store::FactPageBudget;
 use crate::store::Store;
-use crate::store::types::{FactMutation, FactTable, PreparedObject};
+use crate::store::types::{FactMutation, FactTable, PreparedObject, StoreEvent};
 use crate::workspace::WorkspaceStamp;
 
 /// What [`HostedCoordinator::prepare_for_dispatch`] returns: either the stored
@@ -670,6 +672,10 @@ impl HostedCoordinator {
                 let reply = self.read_refs_page(&args)?;
                 Ok(Reply::RefsList(Box::new(reply)))
             }
+            Request::EventsTail(args) => {
+                let reply = self.read_events_tail(&args, cancel).await?;
+                Ok(Reply::EventsTail(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -705,6 +711,118 @@ impl HostedCoordinator {
             refs: KeysetPage::new(page.entries, next_after)?,
             as_of: head,
         })
+    }
+
+    /// Serves one `events.tail` read: ref events strictly after `after`,
+    /// long-polled up to `wait_ms`. Reports `expired` when `after + 1`
+    /// predates the oldest retained sequence; the caller then resnapshots
+    /// from `refs.list` with `as_of`. The only ref feed. The poll holds
+    /// no lane and no writer lock: it sleeps between head checks, and a
+    /// repeated call replays the same rows, so delivery stays idempotent.
+    async fn read_events_tail(
+        &self,
+        args: &EventsTailArgs,
+        cancel: &Cancel,
+    ) -> Result<EventsTailReply, CoreError> {
+        let limit = args.limit.map_or(DEFAULT_PAGE_SIZE, PageLimit::get);
+        let wait_ms = u64::from(args.wait_ms.unwrap_or(0));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        // Where the scan stands inside this call. Past the first pass the
+        // scan resumes past everything already examined, so a waiting poll
+        // re-reads only new rows instead of the table from `after`.
+        let mut scanned = args.after;
+        loop {
+            cancel.check()?;
+            let (head, oldest) = self.store.event_head().map_err(CoreError::from)?;
+            if args.after.saturating_add(1) < oldest {
+                return Ok(EventsTailReply {
+                    view: current_view(&self.store)?,
+                    events: Vec::new(),
+                    head,
+                    oldest,
+                    expired: true,
+                });
+            }
+            let (events, end) = self.tail_page(scanned, limit, args.prefix.as_ref())?;
+            if !events.is_empty() || tokio::time::Instant::now() >= deadline {
+                return Ok(EventsTailReply {
+                    view: current_view(&self.store)?,
+                    events,
+                    head,
+                    oldest,
+                    expired: false,
+                });
+            }
+            scanned = end;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Scans forward from `after`, oldest first, collecting up to `limit`
+    /// events whose names fall under `prefix`, and returns them with the
+    /// last examined sequence. The scan pages internally to the end of
+    /// the table: a filtered page never hides matching rows past its
+    /// window, and the caller resumes from the last seen sequence, so no
+    /// event is missed or repeated.
+    fn tail_page(
+        &self,
+        after: u64,
+        limit: usize,
+        prefix: Option<&ByteString>,
+    ) -> Result<(Vec<TailedEvent>, u64), CoreError> {
+        let mut events = Vec::new();
+        let mut cursor = after;
+        loop {
+            let budget = FactPageBudget::new(limit, MAX_CONTROL_FRAME_BYTES);
+            let page = self
+                .store
+                .fact_page(FactTable::Events, Some(&cursor.to_be_bytes()), budget)
+                .map_err(CoreError::from)?;
+            if page.rows.is_empty() {
+                break;
+            }
+            for row in &page.rows {
+                if events.len() == limit {
+                    break;
+                }
+                cursor = u64::from_be_bytes(row.key.as_slice().try_into().map_err(|_| {
+                    CoreError::new(
+                        ErrorCode::ECorrupt,
+                        format!("event key is {} bytes, not a sequence", row.key.len()),
+                    )
+                })?);
+                let stored: StoreEvent =
+                    crate::store::decode("event", &row.value).map_err(CoreError::from)?;
+                if let Some(want) = prefix
+                    && !stored.name.starts_with(want.as_bytes())
+                {
+                    continue;
+                }
+                events.push(TailedEvent {
+                    seq: cursor,
+                    name: ByteString::from(stored.name),
+                    old: stored
+                        .old
+                        .map(|bytes| crate::store::decode("event old target", &bytes))
+                        .transpose()
+                        .map_err(CoreError::from)?,
+                    new: stored
+                        .new
+                        .map(|bytes| crate::store::decode("event new target", &bytes))
+                        .transpose()
+                        .map_err(CoreError::from)?,
+                    at: stored.at,
+                    source: stored.source,
+                    operation: stored.operation,
+                    request_id: stored.request_id,
+                    session: stored.session,
+                });
+            }
+            if events.len() == limit || !page.more {
+                break;
+            }
+        }
+        Ok((events, cursor))
     }
 
     /// Mints one interactive read lease and retains its owner guard.
@@ -1715,23 +1833,21 @@ mod tests {
         }
     }
 
-    fn seed_branch_refs(coord: &HostedCoordinator) {
+    fn seed_refs(coord: &HostedCoordinator, updates: &[(&str, u8)]) {
         use crate::refdata::{RefChange, RefExpect, RefTransaction, RefUpdate};
         use crate::refs::prepare_checked_transaction;
 
         let oid = |n: u8| Oid::from_hex(&format!("{n:02x}").repeat(20)).expect("oid");
-        let update = |name: &str, n: u8| RefUpdate {
-            name: RefName::new(name).expect("ref name"),
-            expected: RefExpect::Absent,
-            change: RefChange::Set(crate::refdata::RefTarget::Direct(oid(n))),
-        };
         let transaction = RefTransaction::new(
             HashKind::Sha1,
-            vec![
-                update("refs/heads/feat", 2),
-                update("refs/heads/main", 1),
-                update("refs/tags/v1", 3),
-            ],
+            updates
+                .iter()
+                .map(|(name, n)| RefUpdate {
+                    name: RefName::new(*name).expect("ref name"),
+                    expected: RefExpect::Absent,
+                    change: RefChange::Set(crate::refdata::RefTarget::Direct(oid(*n))),
+                })
+                .collect(),
         )
         .expect("ref transaction");
         let prepared =
@@ -1745,6 +1861,17 @@ mod tests {
                 &EventContext::default(),
             )
             .expect("publish refs");
+    }
+
+    fn seed_branch_refs(coord: &HostedCoordinator) {
+        seed_refs(
+            coord,
+            &[
+                ("refs/heads/feat", 2),
+                ("refs/heads/main", 1),
+                ("refs/tags/v1", 3),
+            ],
+        );
     }
 
     async fn refs_list(
@@ -1875,6 +2002,186 @@ mod tests {
             .await
             .expect_err("cursor outside the prefix is invalid");
         assert_eq!(err.code, ErrorCode::EInvalid);
+    }
+
+    async fn events_tail(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::EventsTailArgs,
+    ) -> crate::protocol::EventsTailReply {
+        let reply = coord
+            .read(owner, session, Request::EventsTail(Box::new(args)), cancel)
+            .await
+            .expect("events.tail serves");
+        let Reply::EventsTail(tail) = reply else {
+            panic!("events.tail must answer its own reply");
+        };
+        *tail
+    }
+
+    fn tail_query(
+        after: u64,
+        limit: Option<u32>,
+        wait_ms: Option<u32>,
+    ) -> crate::protocol::EventsTailArgs {
+        crate::protocol::EventsTailArgs {
+            after,
+            limit: limit.map(|rows| PageLimit::new(rows).expect("page limit")),
+            wait_ms,
+            prefix: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn events_tail_serves_after_with_head() {
+        use crate::refdata::RefTarget;
+
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        seed_branch_refs(&coord);
+
+        let tail = events_tail(&coord, &owner, session, &cancel, tail_query(0, None, None)).await;
+        assert_eq!(tail.head, 3);
+        assert_eq!(tail.oldest, 1);
+        assert!(!tail.expired);
+        let seqs: Vec<u64> = tail.events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
+        let names: Vec<Vec<u8>> = tail
+            .events
+            .iter()
+            .map(|event| event.name.as_bytes().to_vec())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                b"refs/heads/feat".to_vec(),
+                b"refs/heads/main".to_vec(),
+                b"refs/tags/v1".to_vec()
+            ]
+        );
+        for event in &tail.events {
+            assert_eq!(event.source, EventSource::ReceivePack);
+            assert!(event.old.is_none());
+            assert!(matches!(event.new, Some(RefTarget::Direct(_))));
+        }
+        let oid_main = Oid::from_hex(&"01".repeat(20)).expect("oid");
+        assert_eq!(tail.events[1].new, Some(RefTarget::Direct(oid_main)));
+
+        let tail = events_tail(&coord, &owner, session, &cancel, tail_query(2, None, None)).await;
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].seq, 3);
+        assert!(!tail.expired);
+
+        let tail = events_tail(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            crate::protocol::EventsTailArgs {
+                after: 0,
+                limit: None,
+                wait_ms: None,
+                prefix: Some(ByteString::from("refs/tags/")),
+            },
+        )
+        .await;
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].seq, 3);
+
+        let list = refs_list(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            crate::protocol::RefsListArgs {
+                prefix: None,
+                after: None,
+                limit: None,
+            },
+        )
+        .await;
+        assert_eq!(tail.view, list.view);
+        assert_eq!(list.as_of, tail.head);
+    }
+
+    #[tokio::test]
+    async fn events_tail_long_poll_wakes_on_publish() {
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        seed_branch_refs(&coord);
+
+        let tail_fut = events_tail(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            tail_query(3, None, Some(5000)),
+        );
+        let publish_fut = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            seed_refs(&coord, &[("refs/heads/next", 4)]);
+        };
+        let (tail, ()) = tokio::join!(tail_fut, publish_fut);
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].seq, 4);
+        assert_eq!(tail.events[0].name.as_bytes(), b"refs/heads/next");
+        assert!(!tail.expired);
+    }
+
+    #[tokio::test]
+    async fn events_tail_reports_expired_for_pruned_cursor() {
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        seed_branch_refs(&coord);
+
+        let deletions = coord
+            .store()
+            .sweep_events_page(u64::MAX, 1_000_000)
+            .expect("sweep every event");
+        assert!(!deletions.is_empty());
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &deletions,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("publish sweep");
+
+        let (head, oldest) = coord.store().event_head().expect("head");
+        assert_eq!((head, oldest), (3, 4));
+        let tail = events_tail(&coord, &owner, session, &cancel, tail_query(1, None, None)).await;
+        assert!(tail.expired);
+        assert!(tail.events.is_empty());
+        assert_eq!((tail.head, tail.oldest), (3, 4));
+
+        let tail = events_tail(&coord, &owner, session, &cancel, tail_query(3, None, None)).await;
+        assert!(!tail.expired);
+        assert!(tail.events.is_empty());
     }
 
     fn presented_cursor() -> PageCursor {
