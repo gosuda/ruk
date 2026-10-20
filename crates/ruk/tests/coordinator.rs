@@ -114,6 +114,28 @@ fn wait_for(path: &Path, present: bool, timeout: Duration) {
     assert_eq!(path.exists(), present, "wait for {}", path.display());
 }
 
+/// Waits until nothing listens on `sock`: a fixed sleep after SIGKILL
+/// flakes under suite load, and the socket path itself never vanishes,
+/// so only a refused connection proves death.
+#[cfg(unix)]
+fn wait_for_dead_socket(sock: &Path, timeout: Duration) {
+    use std::os::unix::net::UnixStream;
+    let start = Instant::now();
+    loop {
+        match UnixStream::connect(sock) {
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            _ => {
+                assert!(
+                    start.elapsed() < timeout,
+                    "coordinator socket never died: {}",
+                    sock.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 fn read_stats(repo: &Path) -> (u64, u64, u64, u64, u64) {
     (
         stat_field(repo, "publications"),
@@ -303,7 +325,7 @@ fn killed_coordinator_respawns() {
     // commit refuses the dead socket, a fresh server takes over the path,
     // and the commit lands exactly once.
     libc_kill(pid);
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for_dead_socket(&sock, Duration::from_secs(10));
     let (code, _, stderr) = commit_empty(&repo, "second commit", &[]);
     assert_eq!(code, 0, "commit after kill failed: {stderr}");
     let log = log_subjects(&repo);

@@ -18,6 +18,7 @@
 
 use crate::change::{OperationId, SessionId, StoreId};
 use crate::ids::{HashKind, Oid};
+use crate::refdata::RefTarget;
 use crate::store::spool::Spool;
 use serde::de::{self, Deserialize, Deserializer};
 
@@ -429,6 +430,12 @@ pub(crate) struct StoreEventV1 {
     pub operation: Option<OperationId>,
     pub request_id: Option<String>,
     pub session: Option<SessionId>,
+}
+
+/// Decodes one event ref-target cell: the postcard `RefTarget` stored in
+/// an event's `old`/`new` bytes.
+pub fn decode_event_target(raw: &[u8]) -> Result<RefTarget, crate::store::StoreError> {
+    crate::store::decode("event target", raw)
 }
 
 /// Decodes one `Events` row: the current shape first, then the

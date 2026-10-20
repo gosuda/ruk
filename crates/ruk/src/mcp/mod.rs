@@ -8,8 +8,9 @@
 //! Every tool schema reuses an existing serde type instead of defining a new
 //! input shape: the nine change operations decode the `ruk_core::ops`
 //! request types, `revset_eval` decodes `protocol::QueryArgs`,
-//! `refs_list` decodes `protocol::PageRequest`, and `attestation_query`
-//! decodes `protocol::AttestListArgs`. A mismatch is reported as an error,
+//! `refs_list` decodes `protocol::PageRequest`, `attestation_query`
+//! decodes `protocol::AttestListArgs`, and `events_tail` decodes
+//! `protocol::EventsTailArgs`. A mismatch is reported as an error,
 //! never shimmed into a nearby shape.
 //!
 //! # Local semantics
@@ -17,7 +18,7 @@
 //! Coordinator sessions live behind `pub(crate)` boundaries, so there is no
 //! session plumbing to call into. Every tool opens the store with
 //! `Store::open` exactly as the `New` and `Describe` CLI commands do and
-//! calls the `ruk_core::ops` API directly. Three tools degrade to documented
+//! calls the `ruk_core::ops` API directly. Four tools degrade to documented
 //! local semantics:
 //!
 //! * `revset_eval` validates its `QueryArgs` and then reports
@@ -30,6 +31,9 @@
 //!   allow-all checkpoint and returns the continuation as lowercase hex.
 //!   There is no session-bound paging and no `ViewInfo`, both of which need
 //!   the coordinator.
+//! * `events_tail` pages the `Events` table after a sequence with the same
+//!   expired signal the coordinator reports, but never waits: `wait_ms` is
+//!   forced to zero, and there is no `ViewInfo`.
 //!
 //! # Parent wiring
 //!
