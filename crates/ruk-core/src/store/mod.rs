@@ -44,6 +44,7 @@ pub mod durability;
 mod group;
 mod guards;
 mod metadata;
+pub(crate) mod pinned;
 mod prepare;
 mod recovery;
 mod segment;
@@ -87,6 +88,7 @@ use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
 use crate::physical::{AllocationError as PhysicalAllocationError, PhysicalReservation};
 use metadata::{Metadata, PublicationTxn};
+use pinned::{PinnedRoot, segment_rel};
 use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
 use segment::SegmentWriter;
 
@@ -172,6 +174,11 @@ pub struct Store {
     /// Read-only descriptors for committed segments, opened once per id and
     /// shared by every read through positional I/O. Dropped with the store.
     segment_fds: SegmentFileCache,
+    /// The held store-root directory. Every later segment-file open,
+    /// create, probe, unlink, and directory sync travels this descriptor
+    /// instead of the recorded path, so a symlink swapped into the path
+    /// after open cannot redirect them.
+    pin: PinnedRoot,
     /// Serializes whole compaction passes against each other. Publications
     /// never take it; the swap takes the writer lock beneath it.
     compaction_lock: Mutex<()>,
@@ -333,7 +340,7 @@ impl Store {
         sync_entries(root)?;
 
         let guards = Arc::new(GenerationRegistry::new(0));
-        Ok(Self::assemble(
+        let mut store = Self::assemble(
             root,
             format,
             meta,
@@ -343,7 +350,9 @@ impl Store {
                 next_segment_id: 0,
                 open: None,
             },
-        ))
+        );
+        store.pin = PinnedRoot::open(root)?;
+        Ok(store)
     }
 
     /// Opens an existing store after verifying all committed bytes.
@@ -438,6 +447,10 @@ impl Store {
         let root = root.as_path();
         let record_root = std::path::absolute(record_root)?;
         let record_root = record_root.as_path();
+        // Hold the opened directory before any file access: every later
+        // segment open travels this descriptor, so flips of the recorded
+        // path after this point cannot redirect them.
+        let pin = PinnedRoot::open(root)?;
         let (format, format_file) = read_format(root)?;
         let format_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
@@ -462,6 +475,7 @@ impl Store {
             budget: &budget,
             guards: &guards,
             files: &segment_fds,
+            pin: &pin,
         };
         let setup_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
@@ -489,6 +503,7 @@ impl Store {
         clock = ProfileClock::now(profiling);
         let mut store = Self::assemble(record_root, format, meta, budget, guards, recovered);
         store.segment_fds = segment_fds;
+        store.pin = pin;
         let assemble_ms = clock.elapsed_ms();
         if profiling {
             eprintln!(
@@ -523,6 +538,7 @@ impl Store {
             capacity: Mutex::new(CapacityLimits::unbounded()),
             guards,
             segment_fds: SegmentFileCache::default(),
+            pin: PinnedRoot::default(),
             writer: Mutex::new(WriterState {
                 active: None,
                 resume: recovered.open,
@@ -580,6 +596,7 @@ impl Store {
             budget: &self.budget,
             guards: &self.guards,
             files: &self.segment_fds,
+            pin: &self.pin,
         }
     }
 
@@ -1458,7 +1475,6 @@ impl Store {
             fresh,
             generation,
         } = plan;
-        let segments_dir = self.root.join(SEGMENTS_DIR);
         let mut batch = Batch::default();
         let total_start = ProfileClock::now(profile);
         let append_start = ProfileClock::now(profile);
@@ -1470,12 +1486,7 @@ impl Store {
         };
         for object in &fresh {
             append(
-                writer,
-                &mut batch,
-                &segments_dir,
-                object,
-                generation,
-                &mut probe,
+                writer, &mut batch, &self.pin, object, generation, &mut probe,
             )?;
             if profile {
                 append_bytes += segment::record_len_for(object.payload.len()).unwrap_or(0);
@@ -1502,7 +1513,7 @@ impl Store {
 
         let dir_start = ProfileClock::now(profile);
         if batch.new_entries {
-            sync_entries(&segments_dir)?;
+            self.pin.sync_segments_dir().map_err(StoreError::from)?;
             self.io.directory_syncs.fetch_add(1, Ordering::Relaxed);
         }
         let sync_dir_ms = dir_start.elapsed_ms();
@@ -1674,7 +1685,7 @@ impl AppendProbe {
 fn append(
     writer: &mut WriterState,
     batch: &mut Batch,
-    segments_dir: &Path,
+    pin: &PinnedRoot,
     object: &PreparedObject,
     generation: u64,
     probe: &mut AppendProbe,
@@ -1682,7 +1693,7 @@ fn append(
     let payload_len = object.payload.len();
     let record_len = segment::record_len_for(payload_len)?;
     let pick_start = probe.clock();
-    let active = active_segment(writer, batch, segments_dir, record_len)?;
+    let active = active_segment(writer, batch, pin, record_len)?;
     probe.pick_ms += pick_start.elapsed_ms();
     // Pre-publication reservation of exactly the range about to be
     // appended, on the still-open segment file. The receipt carries the
@@ -1751,11 +1762,11 @@ fn append(
 fn active_segment<'w>(
     writer: &'w mut WriterState,
     batch: &mut Batch,
-    segments_dir: &Path,
+    pin: &PinnedRoot,
     record_len: u64,
 ) -> Result<&'w mut ActiveSegment, StoreError> {
     if writer.active.is_none() {
-        let opened = open_segment(writer, batch, segments_dir)?;
+        let opened = open_segment(writer, batch, pin)?;
         writer.active = Some(opened);
     }
     let target = writer.target_bytes();
@@ -1764,7 +1775,7 @@ fn active_segment<'w>(
     });
     if overflows {
         seal_active(writer, batch)?;
-        let opened = open_segment(writer, batch, segments_dir)?;
+        let opened = open_segment(writer, batch, pin)?;
         writer.active = Some(opened);
     }
     writer
@@ -1825,11 +1836,12 @@ fn map_allocation_error(err: PhysicalAllocationError) -> StoreError {
 fn open_segment(
     writer: &mut WriterState,
     batch: &mut Batch,
-    segments_dir: &Path,
+    pin: &PinnedRoot,
 ) -> Result<ActiveSegment, StoreError> {
     if let Some(resume) = writer.resume.take() {
-        let path = segments_dir.join(segment::segment_file_name(resume.id));
-        let file = durability::open_existing(&path)?;
+        let file = pin
+            .open_read_write(&segment_rel(resume.id))
+            .map_err(StoreError::from)?;
         return Ok(ActiveSegment {
             id: resume.id,
             writer: SegmentWriter::resumed(file, resume.records_end, resume.records_crc)?,
@@ -1840,8 +1852,7 @@ fn open_segment(
         let next = id
             .checked_add(1)
             .ok_or_else(|| StoreError::Capacity("segment id space exhausted".to_owned()))?;
-        let path = segments_dir.join(segment::segment_file_name(id));
-        match durability::create_file_published(&path) {
+        match pin.create_new(&segment_rel(id)) {
             Ok(file) => {
                 writer.next_segment_id = next;
                 batch.new_entries = true;
@@ -1850,10 +1861,10 @@ fn open_segment(
                     writer: SegmentWriter::fresh(file)?,
                 });
             }
-            Err(StoreError::Io(err)) if err.kind() == io::ErrorKind::AlreadyExists => {
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 writer.next_segment_id = next;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(StoreError::from(err)),
         }
     }
 }
@@ -2205,6 +2216,7 @@ mod tests {
             let guards = Arc::new(GenerationRegistry::new(generation));
             shared.register_scratch(&root).expect("scratch accounting");
             let files = SegmentFileCache::default();
+            let pin = PinnedRoot::open(&root).expect("pin test store");
             let committed = Committed {
                 root: &root,
                 kind: format.kind,
@@ -2212,6 +2224,7 @@ mod tests {
                 budget: &shared,
                 guards: &guards,
                 files: &files,
+                pin: &pin,
             };
             recovery::run(&committed).expect("healthy store recovers")
         };

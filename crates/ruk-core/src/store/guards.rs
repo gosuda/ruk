@@ -519,6 +519,7 @@ mod tests {
 
         let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
         let files = crate::store::recovery::SegmentFileCache::default();
+        let pin = crate::store::pinned::PinnedRoot::open(&store_dir).expect("pin test store");
         let committed = crate::store::recovery::Committed {
             root: &store_dir,
             kind: HashKind::Sha1,
@@ -526,6 +527,7 @@ mod tests {
             budget: &budget,
             guards: &reg,
             files: &files,
+            pin: &pin,
         };
 
         // Decode using captured snapshot
@@ -588,6 +590,7 @@ mod tests {
 
         let meta = crate::store::Metadata::open(&meta_path).expect("open meta");
         let files = crate::store::recovery::SegmentFileCache::default();
+        let pin = crate::store::pinned::PinnedRoot::open(&store_dir).expect("pin test store");
         let committed = crate::store::recovery::Committed {
             root: &store_dir,
             kind: HashKind::Sha1,
@@ -595,6 +598,7 @@ mod tests {
             budget: &budget,
             guards: &reg,
             files: &files,
+            pin: &pin,
         };
 
         // Decode using captured snapshot: uses captured non-retired manifest!

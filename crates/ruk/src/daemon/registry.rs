@@ -907,59 +907,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn symlink_swap_never_resolves_outside() {
-        use std::os::unix::fs::symlink;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let root = scratch_root();
-        let live = root.join("live");
-        std::fs::create_dir_all(&live).expect("scratch dir fits on disk");
-        std::fs::write(live.join("x"), b"inside").expect("scratch file fits on disk");
-        let outside =
-            std::env::temp_dir().join(format!("ruk-daemon-registry-swap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&outside);
-        std::fs::create_dir_all(&outside).expect("outside dir fits on disk");
-        std::fs::write(outside.join("x"), b"outside").expect("outside file fits on disk");
-        let registry =
-            Arc::new(Registry::new(vec![root.clone()]).expect("scratch root canonicalizes"));
-        let stop = Arc::new(AtomicBool::new(false));
-        let swap = root.join("swap");
-        let worker = {
-            let swap = swap.clone();
-            let live = live.clone();
-            let outside = outside.clone();
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut to_live = false;
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = std::fs::remove_file(&swap);
-                    to_live = !to_live;
-                    let target = if to_live { &live } else { &outside };
-                    let _ = symlink(target, &swap);
-                }
-            })
-        };
-        let canonical_root = std::fs::canonicalize(&root).expect("scratch root canonicalizes");
-        let target = root.join("swap").join("x");
-        for _ in 0..2000 {
-            if let Ok(resolved) = registry.resolve(&target) {
-                assert!(
-                    resolved.starts_with(&canonical_root),
-                    "resolution never escapes its root: {resolved:?}"
-                );
-            }
-        }
-        stop.store(true, Ordering::Relaxed);
-        worker.join().expect("swapper thread joins");
-        let _ = std::fs::remove_dir_all(&outside);
-    }
-
+    /// A rename swap races resolve, open, and segment reads: the victim
+    /// directory alternates between the real store and a symlink to an
+    /// outside store. Every successful open must serve the inside store
+    /// id, and every segment read through it must return the inside
+    /// bytes: the recorded path may name the shadow after the pin, but
+    /// no store file access travels it. The loop asserts at least one
+    /// successful open so the test cannot pass vacuously.
     #[test]
     #[cfg(unix)]
-    fn symlink_swap_never_opens_outside_store() {
-        use ruk_core::ids::HashKind;
-        use ruk_core::store::{PreparationBudget, Store};
+    fn symlink_swap_never_resolves_outside() {
+        use ruk_core::ids::{HashKind, Oid};
+        use ruk_core::store::types::ObjectKind;
+        use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
+        use std::io::Read as _;
         use std::os::unix::fs::symlink;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -971,9 +932,29 @@ mod tests {
             std::fs::create_dir_all(dir.join(".ruk")).expect("scratch dir fits on disk");
         }
         let budget = || Arc::new(PreparationBudget::reference_defaults());
-        let inside = Store::create(&victim.join(".ruk"), HashKind::Sha1, budget())
-            .expect("inside store creates")
-            .store_id();
+        let sentinel: &[u8] = b"inside payload that the shadow never holds";
+        let (inside, oid): (ruk_core::change::StoreId, Oid) = {
+            let store = Store::create(&victim.join(".ruk"), HashKind::Sha1, budget())
+                .expect("inside store creates");
+            let prepared = store
+                .prepare(
+                    ObjectKind::Blob,
+                    sentinel.len() as u64,
+                    std::io::Cursor::new(sentinel.to_vec()),
+                    None,
+                )
+                .expect("sentinel prepares");
+            let oid = prepared.oid();
+            store
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("sentinel publishes");
+            (store.store_id(), oid)
+        };
         Store::create(&shadow.join(".ruk"), HashKind::Sha1, budget())
             .expect("outside store creates");
         let stop = Arc::new(AtomicBool::new(false));
@@ -1020,10 +1001,106 @@ mod tests {
                 inside,
                 "an open through the swap never serves the outside store"
             );
+            // Smoke-read the sentinel through the swap. Recovery warms
+            // the segment cache at open, so post-open reads rarely
+            // re-open here; the forced post-open swap in
+            // `store_open_pins_later_segment_access` is the read-path
+            // guard, and the unit tests pin the helpers.
+            let mut spool = store
+                .read(oid)
+                .expect("a segment read through the swap serves the pinned store")
+                .bytes;
+            let mut got = Vec::new();
+            spool.read_to_end(&mut got).expect("sentinel bytes read");
+            assert_eq!(
+                got, sentinel,
+                "a segment read through the swap never serves outside bytes"
+            );
         }
         assert!(oks > 0, "the race exercised at least one open");
         stop.store(true, Ordering::Relaxed);
         worker.join().expect("swapper thread joins");
+    }
+
+    /// A swap after `Store::open` cannot redirect later segment access:
+    /// with the victim directory renamed aside and replaced by a symlink
+    /// to an outside store, reads still serve the pinned bytes and writes
+    /// still land in the pinned directory.
+    #[test]
+    #[cfg(unix)]
+    fn store_open_pins_later_segment_access() {
+        use ruk_core::ids::HashKind;
+        use ruk_core::store::types::ObjectKind;
+        use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
+        use std::io::Read as _;
+        use std::sync::Arc;
+        let root = scratch_root();
+        let victim = root.join("victim");
+        let stashed = root.join("stashed");
+        let shadow = root.join("shadow");
+        for dir in [&victim, &shadow] {
+            std::fs::create_dir_all(dir.join(".ruk")).expect("scratch dir fits on disk");
+        }
+        let budget = || Arc::new(PreparationBudget::reference_defaults());
+        let publish = |store: &Store, bytes: &[u8]| {
+            let prepared = store
+                .prepare(
+                    ObjectKind::Blob,
+                    bytes.len() as u64,
+                    std::io::Cursor::new(bytes.to_vec()),
+                    None,
+                )
+                .expect("blob prepares");
+            let oid = prepared.oid();
+            store
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("blob publishes");
+            oid
+        };
+        let read_bytes = |store: &Store, oid: ruk_core::ids::Oid| {
+            let mut spool = store.read(oid).expect("pinned read serves bytes").bytes;
+            let mut got = Vec::new();
+            spool.read_to_end(&mut got).expect("bytes read");
+            got
+        };
+        let first: &[u8] = b"first payload";
+        let second: &[u8] = b"second payload after the swap";
+        Store::create(&shadow.join(".ruk"), HashKind::Sha1, budget())
+            .expect("outside store creates");
+        let first_oid = {
+            let store = Store::create(&victim.join(".ruk"), HashKind::Sha1, budget())
+                .expect("inside store creates");
+            publish(&store, first)
+        };
+        let store = Store::open(&victim.join(".ruk"), budget()).expect("reopen store");
+        std::fs::rename(&victim, &stashed).expect("move victim aside");
+        std::os::unix::fs::symlink(&shadow, &victim).expect("swap victim link");
+        assert_eq!(
+            read_bytes(&store, first_oid),
+            first,
+            "a read after the swap serves the pinned bytes"
+        );
+        let second_oid = publish(&store, second);
+        assert_eq!(
+            read_bytes(&store, second_oid),
+            second,
+            "a write after the swap lands in the pinned directory"
+        );
+        drop(store);
+        std::fs::remove_file(&victim).expect("remove victim link");
+        std::fs::rename(&stashed, &victim).expect("restore victim");
+        let reopened = Store::open(&victim.join(".ruk"), budget()).expect("reopen restored");
+        assert_eq!(read_bytes(&reopened, first_oid), first);
+        assert_eq!(
+            read_bytes(&reopened, second_oid),
+            second,
+            "the swapped write survived in the real directory"
+        );
     }
 
     #[test]
