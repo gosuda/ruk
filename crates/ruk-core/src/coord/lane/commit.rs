@@ -225,6 +225,7 @@ pub(crate) fn commit_batch(
                     m.candidate.session.id(),
                     &m.candidate.request,
                     prepared_claim,
+                    m.candidate.on_behalf_of.clone(),
                 )
                 .map(|envelope| {
                     let (facts, warnings, record) = envelope.settle();
@@ -326,6 +327,7 @@ pub(crate) fn commit_batch(
             method: m.candidate.request.method(),
             committed_at: times.timestamp(),
             undoes: undone_operation(&m.candidate.request),
+            on_behalf_of: m.candidate.on_behalf_of.clone(),
         };
 
         let op_record = oplog::record(&mut ops, parent_op, meta, &m.candidate.facts)?;

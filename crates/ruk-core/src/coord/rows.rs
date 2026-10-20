@@ -35,7 +35,7 @@ use crate::commit::ProvenanceClaims;
 use crate::coord::policy::Principal;
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
-    IdentityClaim, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp, Validate,
+    IdentityClaim, Method, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp, Validate,
 };
 use crate::store::types::FactTable;
 use crate::store::{Store, StoreError};
@@ -627,17 +627,36 @@ pub(crate) struct OpHeader {
     pub(crate) parts: u64,
 }
 
-/// Decodes and validates an operation header row from committed bytes.
+/// Pre-provenance operation entry: the [`OperationEntry`] shape before the
+/// trailing `on_behalf_of` field. Decode-only, for stores written before
+/// provenance existed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OperationEntryV0 {
+    id: OperationId,
+    parent: Option<OperationId>,
+    session: Option<SessionId>,
+    method: Method,
+    committed_at: Timestamp,
+    undoes: Option<OperationId>,
+}
+
+/// Pre-provenance operation header: the [`OpHeader`] shape before the
+/// trailing entry field. Decode-only, for stores written before provenance
+/// existed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OpHeaderV0 {
+    entry: OperationEntryV0,
+    deltas: u64,
+    stream_bytes: u64,
+    parts: u64,
+}
+
+/// Validates one decoded operation header row.
 ///
 /// # Errors
-/// `E_CORRUPT` and latches quarantine on byte corruption, operation ID mismatch,
+/// `E_CORRUPT` and latches quarantine on operation ID mismatch,
 /// non-positive delta count, non-positive stream size, or invalid parts count.
-pub(crate) fn decode_op_header(
-    store: &Store,
-    id: OperationId,
-    b: &[u8],
-) -> Result<OpHeader, CoreError> {
-    let header: OpHeader = decode(store, "op header", b)?;
+fn validate_op_header(store: &Store, id: OperationId, header: &OpHeader) -> Result<(), CoreError> {
     if header.entry.id != id {
         return corrupt(
             store,
@@ -669,6 +688,45 @@ pub(crate) fn decode_op_header(
             ),
         );
     }
+    Ok(())
+}
+
+/// Decodes and validates an operation header row from committed bytes.
+/// Rows written before provenance existed decode through the v0 shape with
+/// no provenance instead of latching quarantine.
+///
+/// # Errors
+/// `E_CORRUPT` and latches quarantine on byte corruption, operation ID mismatch,
+/// non-positive delta count, non-positive stream size, or invalid parts count.
+pub(crate) fn decode_op_header(
+    store: &Store,
+    id: OperationId,
+    b: &[u8],
+) -> Result<OpHeader, CoreError> {
+    let new_shape: Result<OpHeader, _> = crate::store::decode("op header", b);
+    if let Ok(header) = new_shape {
+        validate_op_header(store, id, &header)?;
+        return Ok(header);
+    }
+    let old: OpHeaderV0 = match crate::store::decode("op header", b) {
+        Ok(old) => old,
+        Err(_) => return corrupt(store, "op header", "malformed op header"),
+    };
+    let header = OpHeader {
+        entry: OperationEntry {
+            id: old.entry.id,
+            parent: old.entry.parent,
+            session: old.entry.session,
+            method: old.entry.method,
+            committed_at: old.entry.committed_at,
+            undoes: old.entry.undoes,
+            on_behalf_of: None,
+        },
+        deltas: old.deltas,
+        stream_bytes: old.stream_bytes,
+        parts: old.parts,
+    };
+    validate_op_header(store, id, &header)?;
     Ok(header)
 }
 
@@ -1105,6 +1163,7 @@ mod tests {
             method: Method::WsTake,
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
+            on_behalf_of: None,
         };
 
         // Zero deltas count rejected
@@ -1129,6 +1188,9 @@ mod tests {
     // Exact committed byte constants protecting v1 on-disk format compatibility.
     const GOLDEN_COORDINATOR_HEAD: &[u8] = &[0x00; 9];
     const GOLDEN_OP_HEADER: &[u8] = &[
+        1, 0, 1, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 0, 0, 0, 0, 1, 31, 1,
+    ];
+    const GOLDEN_OP_HEADER_V0: &[u8] = &[
         1, 0, 1, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 0, 0, 0, 1, 31, 1,
     ];
     const GOLDEN_OP_DELTA: &[u8] = &[
@@ -1172,6 +1234,7 @@ mod tests {
             method: Method::WsTake,
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
+            on_behalf_of: None,
         };
         let expected_header = OpHeader {
             entry: expected_entry,
@@ -1184,6 +1247,11 @@ mod tests {
         assert_eq!(decoded_header, expected_header);
         let header_bytes = encode("op header", &expected_header).expect("encode header");
         assert_eq!(header_bytes.as_slice(), GOLDEN_OP_HEADER);
+
+        let decoded_v0 = decode_op_header(&store, OperationId(1), GOLDEN_OP_HEADER_V0)
+            .expect("decode v0 header");
+        assert_eq!(decoded_v0, expected_header);
+        assert_eq!(decoded_v0.entry.on_behalf_of, None);
 
         let expected_delta = OpDelta {
             table: "workspaces".to_owned(),

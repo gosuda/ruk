@@ -1721,6 +1721,10 @@ pub struct ClaimRecord {
     pub paths: Vec<RepoPath>,
     pub mode: ClaimMode,
     pub expires_at: Timestamp,
+    /// Provenance the acquiring invocation declared; never an
+    /// authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2127,6 +2131,9 @@ pub struct OperationEntry {
     pub committed_at: Timestamp,
     /// The operation this one inverts, if it is an undo.
     pub undoes: Option<OperationId>,
+    /// Provenance the invoking call declared; never an authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -4886,6 +4893,7 @@ mod tests {
             paths: vec![path("src")],
             mode: ClaimMode::Advise,
             expires_at: timestamp("2026-10-17T13:00:00Z"),
+            on_behalf_of: None,
         };
         let release = Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: sample_outcome(),

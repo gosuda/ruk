@@ -1216,6 +1216,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 paths,
                 mode: ClaimMode::Enforce,
                 expires_at: Timestamp::new(jiff::Timestamp::now()),
+                on_behalf_of: None,
             },
         }));
         let (handle, cancel) = cancellation();

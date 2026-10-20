@@ -57,8 +57,15 @@ impl Fixture {
         paths: &[&str],
         mode: ClaimMode,
     ) -> ClaimRecord {
-        let change = seal_acquire(&self.store, &self.claims, holder, id, args(paths, mode))
-            .expect("acquire");
+        let change = seal_acquire(
+            &self.store,
+            &self.claims,
+            holder,
+            id,
+            args(paths, mode),
+            None,
+        )
+        .expect("acquire");
         self.store
             .publish(Vec::new(), &change.facts)
             .expect("publish claim");
@@ -187,6 +194,7 @@ fn concurrent_acquisitions_under_the_writer_lane_cannot_both_succeed() {
                 holder(1),
                 claim(1),
                 args(&["src"], ClaimMode::Enforce),
+                None,
             ) {
                 Ok(change) => {
                     fixture
@@ -206,6 +214,7 @@ fn concurrent_acquisitions_under_the_writer_lane_cannot_both_succeed() {
                 holder(2),
                 claim(2),
                 args(&["src/lib.rs"], ClaimMode::Enforce),
+                None,
             ) {
                 Ok(change) => {
                     fixture
@@ -567,6 +576,7 @@ fn seal_envelope_settles_on_publish_and_aborts_on_drop() {
             holder(1),
             claim(1),
             args(&["src"], ClaimMode::Enforce),
+            None,
         )
         .expect("seal acquire"),
     );
@@ -593,6 +603,7 @@ fn seal_envelope_settles_on_publish_and_aborts_on_drop() {
             holder(1),
             claim(9),
             args(&["aborted"], ClaimMode::Enforce),
+            None,
         )
         .expect("seal aborted"),
     );
@@ -611,6 +622,7 @@ fn seal_envelope_settles_on_publish_and_aborts_on_drop() {
             holder(1),
             claim(8),
             args(&["dropped"], ClaimMode::Enforce),
+            None,
         )
         .expect("seal dropped"),
     );
@@ -650,6 +662,7 @@ fn mutation_seal_covers_declared_write_paths() {
             holder(2),
             &write_request(&["src/lib.rs"]),
             None,
+            None,
         )
         .expect_err("blocked write")
         .code,
@@ -660,6 +673,7 @@ fn mutation_seal_covers_declared_write_paths() {
         &fixture.claims,
         holder(2),
         &write_request(&["docs/a"]),
+        None,
         None,
     )
     .expect("free write");
@@ -756,4 +770,31 @@ fn leased_claim_pages_refuse_stale_views() {
         ErrorCode::ELeaseLost
     );
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn version_one_claim_decodes_without_provenance() {
+    let fixture = Fixture::new();
+    let now = fixture.claims.now().expect("now");
+    let then = Timestamp::new(
+        now.instant()
+            .checked_add(jiff::SignedDuration::from_secs(60))
+            .expect("expiry"),
+    );
+    let old = super::ClaimRowV1 {
+        version: 1,
+        created: now,
+        record: super::ClaimRecordV1 {
+            claim: claim(7),
+            holder: holder(1),
+            paths: vec![path("v1")],
+            mode: ClaimMode::Enforce,
+            expires_at: then,
+        },
+    };
+    let raw = crate::store::encode("claim", &old).expect("encode v1 row");
+    let row = decode_claim(&fixture.store, &record_key(claim(7)), &raw).expect("v1 decodes");
+    assert_eq!(row.version, super::CLAIM_ROW_VERSION);
+    assert_eq!(row.record.claim, claim(7));
+    assert_eq!(row.record.on_behalf_of, None);
 }

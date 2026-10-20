@@ -174,6 +174,8 @@ pub(crate) struct PrepareContext<'a> {
     pub(crate) policy: Option<&'a Policy>,
     /// Progress gate for attestation verification; absent on the legacy path.
     pub(crate) checkpoint: Option<&'a Checkpoint<'a>>,
+    /// Provenance the invoking call declared; recorded, never authorized on.
+    pub(crate) on_behalf_of: Option<String>,
 }
 
 /// One method's lane parts: the precomputed reply, staged objects, exact
@@ -218,6 +220,7 @@ pub fn prepare_mutation(
         claim_clock: None,
         policy: None,
         checkpoint: None,
+        on_behalf_of: None,
     };
     prepare_mutation_with(&ctx, request)
 }
@@ -333,6 +336,7 @@ pub(crate) fn prepare_mutation_with(
         workspace_fence: parts.fence,
         ref_transaction: parts.transaction,
         ref_dependencies: parts.dependencies,
+        on_behalf_of: ctx.on_behalf_of.clone(),
     })
 }
 
@@ -1226,6 +1230,7 @@ fn claim_acquire_parts(
                 paths,
                 mode: args.mode,
                 expires_at,
+                on_behalf_of: ctx.on_behalf_of.clone(),
             },
         })),
         objects: Vec::new(),
@@ -3866,6 +3871,7 @@ mod tests {
             claim_clock: None,
             policy: None,
             checkpoint,
+            on_behalf_of: None,
         }
     }
 
@@ -5199,6 +5205,7 @@ mod tests {
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
             },
+            None,
         )
         .expect("seal fixture claim");
         store

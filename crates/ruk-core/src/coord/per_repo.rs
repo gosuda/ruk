@@ -569,11 +569,11 @@ impl Server {
         // and submit stay concurrent so the loser's retry gap stays small
         // enough for the group-commit sharing window.
         let (coord, session) = self.burst().await?;
-        let reply = match coord.prepare_for_dispatch(session, call.body.clone(), &allow)? {
+        let reply = match coord.prepare_for_dispatch(session, call.body.clone(), &allow, None)? {
             DispatchReady::Replay(reply) => reply,
             DispatchReady::Prepared(prepared) => {
                 coord
-                    .submit_prepared(&self.owner, prepared, &self.cancel)
+                    .submit_prepared(&self.owner, *prepared, &self.cancel)
                     .await?
             }
         };

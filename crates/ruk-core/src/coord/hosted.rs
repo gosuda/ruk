@@ -81,8 +81,9 @@ pub enum DispatchReady {
     /// The `(session, request_id)` committed before; serve the stored reply
     /// without preparing or publishing anything.
     Replay(Reply),
-    /// A new request, translated into lane parts for submission.
-    Prepared(PreparedMutation),
+    /// A new request, translated into lane parts for submission. Boxed: the
+    /// parts dwarf the replayed reply.
+    Prepared(Box<PreparedMutation>),
 }
 
 /// Caller-prepared parts of one mutation submission.
@@ -111,6 +112,9 @@ pub struct PreparedMutation {
     pub ref_transaction: Option<RefTransaction>,
     /// Ref names the transaction was validated against.
     pub ref_dependencies: Vec<RefName>,
+    /// Provenance the invoking call declared; recorded in the operation
+    /// entry and any sealed claim, never an authorization input.
+    pub on_behalf_of: Option<String>,
 }
 
 impl PreparedMutation {
@@ -263,6 +267,7 @@ impl HostedCoordinator {
         session: SessionId,
         request: Request,
         checkpoint: &Checkpoint<'_>,
+        on_behalf_of: Option<String>,
     ) -> Result<DispatchReady, CoreError> {
         let wall = self.clock.sample()?.wall;
         if let Some(reply) = receipt::replay_if_committed(&self.store, session, &request, wall)? {
@@ -282,8 +287,11 @@ impl HostedCoordinator {
             claim_clock: None,
             policy: None,
             checkpoint: Some(checkpoint),
+            on_behalf_of,
         };
-        prepare_mutation_with(&ctx, request).map(DispatchReady::Prepared)
+        prepare_mutation_with(&ctx, request)
+            .map(Box::new)
+            .map(DispatchReady::Prepared)
     }
 
     /// Spawns the publication lane runner on `handle`.
@@ -503,7 +511,8 @@ impl HostedCoordinator {
         let fence = prepared
             .workspace_fence
             .map(|(id, stamp)| WorkspaceFence::new(id, stamp));
-        let candidate = MutationCandidate::new(
+        let on_behalf_of = prepared.on_behalf_of.clone();
+        let mut candidate = MutationCandidate::new(
             live,
             bound.row().principal.clone(),
             prepared.request_id,
@@ -517,6 +526,7 @@ impl HostedCoordinator {
             cancel.clone(),
             Some(admitted),
         )?;
+        candidate.on_behalf_of = on_behalf_of;
         self.lane.submit_mutation(candidate).await
     }
 
@@ -1522,7 +1532,7 @@ mod tests {
             .expect("publish receipt");
         let checkpoint = |_: Progress| Ok::<(), CoreError>(());
         match coord
-            .prepare_for_dispatch(session, request, &checkpoint)
+            .prepare_for_dispatch(session, request, &checkpoint, None)
             .expect("dispatch serves the retry")
         {
             DispatchReady::Replay(replayed) => {
@@ -2001,6 +2011,7 @@ mod tests {
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
                 },
+                None,
             )
             .expect("acquire claim");
             coord
@@ -2725,13 +2736,13 @@ mod tests {
         }));
         let checkpoint = |_: Progress| Ok::<(), CoreError>(());
         let prepared = match coord
-            .prepare_for_dispatch(session, request, &checkpoint)
+            .prepare_for_dispatch(session, request, &checkpoint, None)
             .expect("prepare lane commit")
         {
             DispatchReady::Replay(reply) => {
                 panic!("distinct commits must not replay: {reply:?}")
             }
-            DispatchReady::Prepared(prepared) => prepared,
+            DispatchReady::Prepared(prepared) => *prepared,
         };
         let reply = coord
             .submit_prepared(owner, prepared, cancel)

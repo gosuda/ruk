@@ -108,6 +108,9 @@ pub(crate) struct MutationCandidate {
     pub(crate) cancel: Cancel,
     pub(crate) admitted: Option<Admitted>,
     pub(crate) prepared_bytes: u64,
+    /// Provenance the invoking call declared; recorded in the operation
+    /// entry and any sealed claim, never an authorization input.
+    pub(crate) on_behalf_of: Option<String>,
 }
 
 impl MutationCandidate {
@@ -194,6 +197,7 @@ impl MutationCandidate {
             cancel,
             admitted,
             prepared_bytes,
+            on_behalf_of: None,
         })
     }
 }

@@ -89,6 +89,7 @@ pub(crate) struct OpMeta {
     pub(crate) method: Method,
     pub(crate) committed_at: Timestamp,
     pub(crate) undoes: Option<OperationId>,
+    pub(crate) on_behalf_of: Option<String>,
 }
 
 /// Borrowed serialization view of a delta with postcard layout identical to [`OpDelta`].
@@ -290,6 +291,7 @@ pub(crate) fn record(
         method: meta.method,
         committed_at: meta.committed_at,
         undoes: meta.undoes,
+        on_behalf_of: meta.on_behalf_of,
     };
     let header = OpHeader {
         entry,
@@ -822,6 +824,7 @@ mod tests {
             method: Method::WsTake,
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
+            on_behalf_of: None,
         }
     }
 
@@ -1082,6 +1085,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1141,6 +1145,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1190,6 +1195,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1243,6 +1249,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1292,6 +1299,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1,
             stream_bytes: (OP_FRAGMENT_MAX_BYTES as u64) + 100,
@@ -1353,6 +1361,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1, // claims only 1 delta
             stream_bytes: stream.len() as u64,
@@ -1416,6 +1425,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1485,6 +1495,7 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,

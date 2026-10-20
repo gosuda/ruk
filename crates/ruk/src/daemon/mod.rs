@@ -589,7 +589,8 @@ impl From<std::io::Error> for Error {
 /// The `Open` payload: one invocation against one repository.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InvocationOpen {
-    /// Absolute repository path or opaque handle from a previous open.
+    /// Store directory path or opaque handle from a previous open: the
+    /// directory holding the store format file, not the worktree root.
     pub repo: String,
     /// The protocol method name, such as `status`.
     pub method: String,
@@ -602,6 +603,10 @@ pub(crate) struct InvocationOpen {
     /// The session reads and mutations run under, if any.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Provenance this invocation declares; recorded, never an
+    /// authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
 }
 
 /// The `Accepted` payload answering one `Open`.
@@ -817,7 +822,8 @@ fn is_git_service(service: &str) -> bool {
 pub(crate) struct CommandOpen {
     /// The git service: `receive-pack`, `upload-pack`, or `upload-archive`.
     pub service: String,
-    /// Absolute repository path or opaque handle from a previous open.
+    /// Store directory path or opaque handle from a previous open: the
+    /// directory holding the store format file, not the worktree root.
     pub repository: String,
     /// The service session; required for `receive-pack`.
     #[serde(default)]
@@ -837,6 +843,10 @@ pub(crate) struct CommandOpen {
     /// Per-stream ingest quotas; absent fields take daemon defaults.
     #[serde(default)]
     pub limits: GitLimits,
+    /// Provenance this invocation declares; recorded, never an
+    /// authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
 }
 
 /// The `Accepted` payload answering one git-service `Open`.
@@ -1778,7 +1788,15 @@ fn run_git_service(
     if advertise {
         return match service {
             GIT_SERVICE_RECEIVE_PACK => Ok(advertise_receive_pack(store, kind, &head)?),
-            GIT_SERVICE_UPLOAD_PACK => Ok(advertise_upload_pack(store, kind, &head)?),
+            GIT_SERVICE_UPLOAD_PACK => {
+                if git_protocol_requests_v2(Some(git_protocol)) {
+                    let mut out = Vec::new();
+                    serve_upload_pack_v2(&[][..], &mut out, store, kind, &head, &interrupt)?;
+                    Ok(out)
+                } else {
+                    Ok(advertise_upload_pack(store, kind, &head)?)
+                }
+            }
             _ => Err(CoreError::new(
                 ErrorCode::EInvalid,
                 "upload-archive has no ref advertisement",
@@ -2023,15 +2041,7 @@ async fn typed_stream(
             }
         },
     };
-    let dispatch = dispatch_method(
-        &coordinator,
-        &principal,
-        method,
-        open.args_json.as_deref(),
-        open.request_id.as_deref(),
-        session,
-        &cancel,
-    );
+    let dispatch = dispatch_method(&coordinator, &principal, open, method, session, &cancel);
     tokio::pin!(dispatch);
     let mut refused: Option<CoreError> = None;
     let result = loop {
@@ -2109,12 +2119,14 @@ async fn typed_stream(
 pub(crate) async fn dispatch_method(
     coordinator: &Arc<HostedCoordinator>,
     principal: &Principal,
+    open: &InvocationOpen,
     method: Method,
-    args_json: Option<&str>,
-    request_id: Option<&str>,
     session: Option<SessionId>,
     cancel: &Cancel,
 ) -> Result<Vec<u8>, CoreError> {
+    let args_json = open.args_json.as_deref();
+    let request_id = open.request_id.as_deref();
+    let on_behalf_of = open.on_behalf_of.clone();
     match method {
         Method::Schema => ipc::encode_control(&ruk_core::protocol::model_schema_json()),
         Method::SessionOpen => {
@@ -2185,7 +2197,12 @@ pub(crate) async fn dispatch_method(
                     // publishing rows it no longer waits for.
                     let checkpoint = |_: ruk_core::attestation::Progress| cancel.check();
                     let typed_id = request.request_id();
-                    let ready = coordinator.prepare_for_dispatch(session, request, &checkpoint)?;
+                    let ready = coordinator.prepare_for_dispatch(
+                        session,
+                        request,
+                        &checkpoint,
+                        on_behalf_of,
+                    )?;
                     match ready {
                         ruk_core::coord::DispatchReady::Replay(reply) => {
                             ipc::encode_control(&ReplyEnvelope::success(typed_id, reply))
@@ -2193,7 +2210,7 @@ pub(crate) async fn dispatch_method(
                         ruk_core::coord::DispatchReady::Prepared(prepared) => {
                             let request_id = prepared.request_id;
                             let reply = coordinator
-                                .submit_prepared(principal, prepared, cancel)
+                                .submit_prepared(principal, *prepared, cancel)
                                 .await?;
                             ipc::encode_control(&ReplyEnvelope::success(Some(request_id), reply))
                         }

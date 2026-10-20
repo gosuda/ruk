@@ -365,6 +365,7 @@ mod tests {
                 method,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             };
             let (id, mutations) = oplog::record(&mut ops, None, meta, changes)
                 .expect("record operation")

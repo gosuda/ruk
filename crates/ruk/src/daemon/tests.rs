@@ -107,15 +107,32 @@ fn git_open_payload(
     session_id: Option<&str>,
     request_id: Option<&str>,
 ) -> Vec<u8> {
+    git_open_payload_full(
+        service, repository, advertise, session_id, request_id, "", None,
+    )
+}
+
+/// Builds one git-service envelope open document with an explicit protocol
+/// and provenance.
+fn git_open_payload_full(
+    service: &str,
+    repository: &str,
+    advertise: bool,
+    session_id: Option<&str>,
+    request_id: Option<&str>,
+    git_protocol: &str,
+    on_behalf_of: Option<&str>,
+) -> Vec<u8> {
     let open = CommandOpen {
         service: service.to_string(),
         repository: repository.to_string(),
         session_id: session_id.map(str::to_string),
         request_id: request_id.map(str::to_string),
-        git_protocol: String::new(),
+        git_protocol: git_protocol.to_string(),
         advertise,
         stdout_credit: 262_144,
         limits: GitLimits::default(),
+        on_behalf_of: on_behalf_of.map(str::to_string),
     };
     sonic_rs::to_string(&open)
         .expect("git-service open encodes")
@@ -275,12 +292,25 @@ impl Driver {
         args_json: Option<String>,
         session_id: Option<&str>,
     ) -> Vec<u8> {
+        Self::typed_open_obo(repo, method, request_id, args_json, session_id, None)
+    }
+
+    /// Builds one typed invocation open document with provenance.
+    fn typed_open_obo(
+        repo: &str,
+        method: &str,
+        request_id: Option<&str>,
+        args_json: Option<String>,
+        session_id: Option<&str>,
+        on_behalf_of: Option<&str>,
+    ) -> Vec<u8> {
         let open = InvocationOpen {
             repo: repo.to_string(),
             method: method.to_string(),
             request_id: request_id.map(str::to_string),
             args_json,
             session_id: session_id.map(str::to_string),
+            on_behalf_of: on_behalf_of.map(str::to_string),
         };
         sonic_rs::to_string(&open)
             .expect("typed open encodes")
@@ -870,6 +900,160 @@ async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
     let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
     assert_eq!(exit.exit_code, 0, "a sibling stream survives the cancel");
     assert!(!stdout.is_empty());
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn provenance_records_on_behalf_of_and_ignores_it_for_auth() {
+    let root = temp_root("typed-obo");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    seed_store(&repo);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let target = seed_commit(&repo_dir);
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let plain: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let plain_session = plain.session.to_string();
+
+    let payload = Driver::typed_open_obo(
+        &store_repo,
+        "session.open",
+        None,
+        None,
+        None,
+        Some("agent-x"),
+    );
+    let (stdout, _) = driver.run_typed(5, &payload).await;
+    let declared: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    assert_eq!(
+        declared.principal, plain.principal,
+        "provenance never authorizes: the peer stays the principal"
+    );
+    let session = declared.session.to_string();
+
+    let acquire_args = ClaimAcquireArgs {
+        paths: vec![RepoPath::new("src").expect("test path")],
+        ttl: ClaimTtl::new(60).expect("ttl"),
+        mode: ClaimMode::Enforce,
+    };
+    let args_json = sonic_rs::to_string(&acquire_args).expect("acquire args encode");
+    let payload = Driver::typed_open_obo(
+        &store_repo,
+        "claim.acquire",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&session),
+        Some("agent-x"),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::ClaimAcquire(acquired)) = envelope.body else {
+        panic!("claim.acquire must answer its own reply");
+    };
+    assert_eq!(
+        acquired.claim.on_behalf_of.as_deref(),
+        Some("agent-x"),
+        "the sealed claim carries the declared provenance"
+    );
+
+    let tag_args = TagSetArgs {
+        name: RefName::new("refs/tags/v1").expect("tag name"),
+        target,
+        annotation: None,
+        expected: RefExpect::Absent,
+    };
+    let args_json = sonic_rs::to_string(&tag_args).expect("tag args encode");
+    let payload = Driver::typed_open_obo(
+        &store_repo,
+        "tag.set",
+        Some(&RequestId::generate().to_string()),
+        Some(args_json),
+        Some(&plain_session),
+        Some("agent-x"),
+    );
+    let (stdout, _) = driver.run_typed(9, &payload).await;
+    let envelope = typed_success(&stdout);
+    assert!(
+        matches!(envelope.body, ReplyBody::Success(Reply::TagSet(_))),
+        "tag.set lands"
+    );
+
+    let payload = Driver::typed_open(
+        &store_repo,
+        "op.log",
+        None,
+        Some("{}".to_string()),
+        Some(&plain_session),
+    );
+    let (stdout, _) = driver.run_typed(11, &payload).await;
+    let envelope = typed_success(&stdout);
+    let ReplyBody::Success(Reply::OpLog(log)) = envelope.body else {
+        panic!("op.log must answer its own reply");
+    };
+    assert_eq!(log.entries.items.len(), 1);
+    assert_eq!(
+        log.entries.items[0].on_behalf_of.as_deref(),
+        Some("agent-x"),
+        "the op.log entry carries the declared provenance"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_advertise_routes_by_protocol() {
+    let root = temp_root("advertise-v2");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let v0 = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let (v0_out, exit) = driver.run_git(1, &v0, &[]).await;
+    assert_eq!(exit.exit_code, 0);
+
+    let v2 = git_open_payload_full(
+        "upload-pack",
+        &store_repo,
+        true,
+        None,
+        None,
+        "version=2",
+        None,
+    );
+    let (v2_out, exit) = driver.run_git(3, &v2, &[]).await;
+    assert_eq!(exit.exit_code, 0);
+    assert_ne!(v0_out, v2_out, "v2 discovery answers its own capabilities");
+    let v2_text = String::from_utf8_lossy(&v2_out);
+    assert!(
+        v2_text.contains("ls-refs"),
+        "v2 advertisement carries v2 capabilities: {v2_text}"
+    );
 
     drop(driver);
     task.abort();

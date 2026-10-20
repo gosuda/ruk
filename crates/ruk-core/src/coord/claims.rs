@@ -24,6 +24,30 @@ struct ClaimRow {
     record: ClaimRecord,
 }
 
+/// Current claim row version: rows carry the acquiring invocation's
+/// provenance.
+const CLAIM_ROW_VERSION: u8 = 2;
+
+/// Pre-provenance claim record: the [`ClaimRecord`] shape before the
+/// trailing `on_behalf_of` field. Decode-only outside tests.
+#[derive(Serialize, Deserialize)]
+struct ClaimRecordV1 {
+    claim: ClaimId,
+    holder: SessionId,
+    paths: Vec<RepoPath>,
+    mode: ClaimMode,
+    expires_at: Timestamp,
+}
+
+/// Pre-provenance claim row: version 1 rows predate provenance.
+/// Decode-only outside tests, for stores written before provenance existed.
+#[derive(Serialize, Deserialize)]
+struct ClaimRowV1 {
+    version: u8,
+    created: Timestamp,
+    record: ClaimRecordV1,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ClockRow {
     version: u8,
@@ -146,6 +170,7 @@ pub(crate) fn seal_acquire(
     holder: SessionId,
     claim: ClaimId,
     args: ClaimAcquireArgs,
+    on_behalf_of: Option<String>,
 ) -> Result<ClaimChange, CoreError> {
     if holder == SessionId::nil() || claim == ClaimId::nil() {
         return Err(CoreError::new(
@@ -168,9 +193,10 @@ pub(crate) fn seal_acquire(
         paths,
         mode: args.mode,
         expires_at: Timestamp::new(expires),
+        on_behalf_of,
     };
     let row = ClaimRow {
-        version: 1,
+        version: CLAIM_ROW_VERSION,
         created: now,
         record,
     };
@@ -652,8 +678,32 @@ fn read_claim(store: &Store, claim: ClaimId) -> Result<Option<(Vec<u8>, ClaimRow
 }
 
 fn decode_claim(store: &Store, key: &[u8], raw: &[u8]) -> Result<ClaimRow, CoreError> {
-    let row: ClaimRow = store.observe(crate::store::decode("claim", raw))?;
-    if row.version != 1
+    let shaped: Result<ClaimRow, _> = crate::store::decode("claim", raw);
+    let row: ClaimRow = match shaped {
+        Ok(row) if row.version == CLAIM_ROW_VERSION => row,
+        _ => {
+            let old: ClaimRowV1 = match crate::store::decode("claim", raw) {
+                Ok(old) => old,
+                Err(_) => return Err(corrupt(store, "invalid claim record")),
+            };
+            if old.version != 1 {
+                return Err(corrupt(store, "invalid claim record"));
+            }
+            ClaimRow {
+                version: CLAIM_ROW_VERSION,
+                created: old.created,
+                record: ClaimRecord {
+                    claim: old.record.claim,
+                    holder: old.record.holder,
+                    paths: old.record.paths,
+                    mode: old.record.mode,
+                    expires_at: old.record.expires_at,
+                    on_behalf_of: None,
+                },
+            }
+        }
+    };
+    if row.version != CLAIM_ROW_VERSION
         || key != record_key(row.record.claim)
         || row.record.claim == ClaimId::nil()
         || row.record.holder == SessionId::nil()
@@ -807,8 +857,9 @@ impl ClaimSealEnvelope {
         holder: SessionId,
         claim: ClaimId,
         args: ClaimAcquireArgs,
+        on_behalf_of: Option<String>,
     ) -> Result<Self, CoreError> {
-        let change = seal_acquire(store, clock, holder, claim, args)?;
+        let change = seal_acquire(store, clock, holder, claim, args, on_behalf_of)?;
         Ok(Self {
             kind: ClaimSealKind::Acquire,
             facts: change.facts,
@@ -886,6 +937,7 @@ impl ClaimSealEnvelope {
         holder: SessionId,
         request: &crate::protocol::Request,
         prepared_claim: Option<ClaimId>,
+        on_behalf_of: Option<String>,
     ) -> Result<Self, CoreError> {
         match request {
             crate::protocol::Request::ClaimAcquire(inner) => Self::for_acquire(
@@ -894,6 +946,7 @@ impl ClaimSealEnvelope {
                 holder,
                 prepared_claim.unwrap_or_else(ClaimId::generate),
                 inner.args.clone(),
+                on_behalf_of,
             ),
             crate::protocol::Request::ClaimRelease(inner) => {
                 Self::for_release(store, clock, holder, inner.args.claim)
