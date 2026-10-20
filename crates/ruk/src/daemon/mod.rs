@@ -23,11 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::sync::mpsc;
 
 pub(crate) use executor::BoundedExecutor;
 pub(crate) use registry::Registry;
 use ruk_core::change::{RequestId, SessionId};
-use ruk_core::coord::{Cancel, HostedCoordinator, Principal, cancellation};
+use ruk_core::coord::{Cancel, CancelHandle, HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::protocol::{
     ErrorReply, Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request, SessionOpenArgs,
@@ -662,6 +663,42 @@ const OUTCOME_FAILED: &str = "Failed";
 /// Outcome of a command cancelled before (or during) its run.
 const OUTCOME_CANCELLED: &str = "CancelledBeforeCommit";
 
+/// Bound of frames buffered per stream between the connection reader and
+/// one stream task. The reader waits past it, so a stalled stream applies
+/// backpressure to socket reads instead of growing memory.
+const STREAM_CHANNEL_BOUND: usize = 32;
+
+/// Bound of frames buffered per connection between stream tasks and the
+/// single writer task owning the socket write half.
+const WRITER_CHANNEL_BOUND: usize = 256;
+
+/// Bound of stream-completion reports buffered per connection. A finished
+/// task drops its report past it; the reader unregisters the stream on the
+/// next frame, so the stream table stays bounded by live streams.
+const COMPLETION_CHANNEL_BOUND: usize = 64;
+
+/// One frame moving toward the socket write half, owned by the single
+/// connection-writer task.
+struct OutboundFrame {
+    /// The frame kind.
+    kind: ipc::FrameKind,
+    /// The stream the frame belongs to; zero is connection control.
+    stream_id: u64,
+    /// The frame payload: raw bytes for data kinds, JSON for control kinds.
+    payload: Vec<u8>,
+}
+
+/// The write end of one stream: its identity plus the channel to the
+/// connection-writer task. Every daemon-to-client frame of the stream
+/// travels through it; the writer task owns the socket write half alone.
+#[derive(Clone)]
+struct StreamSink {
+    /// The channel to the connection-writer task.
+    writer: mpsc::Sender<OutboundFrame>,
+    /// The stream this sink answers for.
+    stream_id: u64,
+}
+
 /// The `Open` payload of one argv-style command stream, mirroring the Go
 /// backend's `RukOpenRequest`. `argv` holds command args without `argv[0]`
 /// (for example `["rev-parse", "--git-dir"]`); the daemon prepends its own
@@ -963,14 +1000,6 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
     }
 }
 
-/// Per-stream state of one connection.
-struct StreamState {
-    /// Total `Stdin` bytes accepted on this stream.
-    stdin_bytes: usize,
-    /// True once `Cancel` arrived.
-    cancelled: bool,
-}
-
 /// Shared handles of one connection task.
 #[derive(Clone)]
 struct ConnectionRefs {
@@ -1094,37 +1123,101 @@ async fn serve_connection(
         deadline,
     )
     .await?;
-    let mut streams: HashMap<u64, StreamState> = HashMap::new();
-    let mut credits = ipc::StreamCredits::new(refs.window_bytes);
+    let (mut read_half, write_half) = stream.into_split();
+    let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_BOUND);
+    let writer_timeout = refs.frame_timeout;
+    tokio::spawn(async move {
+        connection_writer(writer_rx, write_half, writer_timeout).await;
+    });
+    let mut streams: HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)> = HashMap::new();
+    let mut generation: u64 = 0;
+    let (done_tx, mut done_rx) = mpsc::channel(COMPLETION_CHANNEL_BOUND);
     loop {
         let frame_deadline = tokio::time::Instant::now() + refs.frame_timeout;
-        let frame = ipc::read_frame(&mut stream, frame_deadline).await?;
-        if frame.stream_id == ipc::CONTROL_STREAM_ID {
-            if handle_control_frame(&mut stream, &frame, &mut streams, frame_deadline, &refs)
-                .await?
+        let frame = match ipc::read_frame(&mut read_half, frame_deadline).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                drop(streams);
+                drop(writer_tx);
+                return Err(Error::Core(err));
+            }
+        };
+        while let Ok((stream_id, stream_generation)) = done_rx.try_recv() {
+            if let std::collections::hash_map::Entry::Occupied(entry) = streams.entry(stream_id)
+                && entry.get().1 == stream_generation
             {
+                entry.remove();
+            }
+        }
+        if frame.stream_id == ipc::CONTROL_STREAM_ID {
+            if handle_control_frame(&writer_tx, &frame, &mut streams, &refs).await? {
                 return Ok(());
             }
             continue;
         }
-        if handle_stream_frame(&mut stream, frame, &mut streams, &mut credits, &refs, peer).await? {
+        if frame.kind == ipc::FrameKind::Open {
+            generation = generation.wrapping_add(1);
+        }
+        if route_stream_frame(
+            &writer_tx,
+            frame,
+            &mut streams,
+            &done_tx,
+            generation,
+            &refs,
+            peer,
+        )
+        .await?
+        {
             return Ok(());
+        }
+    }
+}
+
+/// Owns the socket write half of one connection: every stream task sends
+/// its frames here, and this task alone writes them. A write failure ends
+/// the task, which drops the channel and ends every stream task with it.
+#[cfg(unix)]
+async fn connection_writer(
+    mut input: mpsc::Receiver<OutboundFrame>,
+    mut half: tokio::net::unix::OwnedWriteHalf,
+    frame_timeout: Duration,
+) {
+    while let Some(frame) = input.recv().await {
+        let deadline = tokio::time::Instant::now() + frame_timeout;
+        if ipc::write_frame(
+            &mut half,
+            frame.kind,
+            frame.stream_id,
+            &frame.payload,
+            deadline,
+        )
+        .await
+        .is_err()
+        {
+            break;
         }
     }
 }
 
 #[cfg(unix)]
 async fn handle_control_frame(
-    stream: &mut tokio::net::UnixStream,
+    writer: &mpsc::Sender<OutboundFrame>,
     frame: &ipc::Frame,
-    streams: &mut HashMap<u64, StreamState>,
-    deadline: tokio::time::Instant,
+    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
     refs: &ConnectionRefs,
 ) -> Result<bool, Error> {
     match frame.kind {
         ipc::FrameKind::Cancel => {
-            for state in streams.values_mut() {
-                state.cancelled = true;
+            for (stream_id, (tx, _)) in streams.iter() {
+                let cancel = ipc::Frame {
+                    kind: ipc::FrameKind::Cancel,
+                    stream_id: *stream_id,
+                    payload: Vec::new(),
+                };
+                if tx.send(cancel).await.is_err() {
+                    continue;
+                }
             }
             Ok(true)
         }
@@ -1134,7 +1227,7 @@ async fn handle_control_frame(
             Ok(false)
         }
         ipc::FrameKind::Exit | ipc::FrameKind::Error => Ok(true),
-        ipc::FrameKind::Open => answer_control_open(stream, frame, deadline, refs).await,
+        ipc::FrameKind::Open => answer_control_open(writer, frame, refs).await,
         ipc::FrameKind::Accepted
         | ipc::FrameKind::Stdin
         | ipc::FrameKind::StdinEof
@@ -1147,12 +1240,11 @@ async fn handle_control_frame(
                 "stream-zero carries only the handshake and control queries",
             ));
             let bytes = ipc::encode_control(&report)?;
-            ipc::write_frame(
-                stream,
+            send_raw(
+                writer,
                 ipc::FrameKind::Error,
                 ipc::CONTROL_STREAM_ID,
                 &bytes,
-                deadline,
             )
             .await?;
             Ok(false)
@@ -1160,20 +1252,40 @@ async fn handle_control_frame(
     }
 }
 
+/// Queues one frame toward the connection-writer task, waiting past a full
+/// channel so a slow client applies backpressure instead of losing frames.
+///
+/// # Errors
+/// `E_IO` when the writer task is gone and the connection is dead.
+async fn send_raw(
+    writer: &mpsc::Sender<OutboundFrame>,
+    kind: ipc::FrameKind,
+    stream_id: u64,
+    payload: &[u8],
+) -> Result<(), Error> {
+    writer
+        .send(OutboundFrame {
+            kind,
+            stream_id,
+            payload: payload.to_vec(),
+        })
+        .await
+        .map_err(|_| Error::Core(CoreError::new(ErrorCode::EIo, "connection writer is gone")))
+}
+
 /// Answers one stream-zero `Open` control query without ending the
 /// connection: `outcome-lookup` reads the shared ledger and replies on an
 /// `Accepted` frame, anything else gets an `Error` frame.
 #[cfg(unix)]
 async fn answer_control_open(
-    stream: &mut tokio::net::UnixStream,
+    writer: &mpsc::Sender<OutboundFrame>,
     frame: &ipc::Frame,
-    deadline: tokio::time::Instant,
     refs: &ConnectionRefs,
 ) -> Result<bool, Error> {
     let query: ControlRequest = match ipc::decode_control(&frame.payload) {
         Ok(query) => query,
         Err(err) => {
-            write_control_error(stream, &err, deadline).await?;
+            write_control_error(writer, &err).await?;
             return Ok(false);
         }
     };
@@ -1182,7 +1294,7 @@ async fn answer_control_open(
             ErrorCode::EInvalid,
             format!("unknown control query `{}`", query.type_),
         );
-        write_control_error(stream, &err, deadline).await?;
+        write_control_error(writer, &err).await?;
         return Ok(false);
     }
     let reply = {
@@ -1201,12 +1313,11 @@ async fn answer_control_open(
         }
     };
     let bytes = ipc::encode_control(&reply)?;
-    ipc::write_frame(
-        stream,
+    send_raw(
+        writer,
         ipc::FrameKind::Accepted,
         ipc::CONTROL_STREAM_ID,
         &bytes,
-        deadline,
     )
     .await?;
     Ok(false)
@@ -1215,18 +1326,16 @@ async fn answer_control_open(
 /// Writes one stream-zero `Error` frame for a rejected control query.
 #[cfg(unix)]
 async fn write_control_error(
-    stream: &mut tokio::net::UnixStream,
+    writer: &mpsc::Sender<OutboundFrame>,
     err: &CoreError,
-    deadline: tokio::time::Instant,
 ) -> Result<(), Error> {
     let report = ErrorReply::from_core(err);
     let bytes = ipc::encode_control(&report)?;
-    ipc::write_frame(
-        stream,
+    send_raw(
+        writer,
         ipc::FrameKind::Error,
         ipc::CONTROL_STREAM_ID,
         &bytes,
-        deadline,
     )
     .await?;
     Ok(())
@@ -1244,65 +1353,74 @@ fn lock_outcomes(refs: &ConnectionRefs) -> Result<std::sync::MutexGuard<'_, Outc
 }
 
 #[cfg(unix)]
-async fn handle_stream_frame(
-    stream: &mut tokio::net::UnixStream,
+async fn route_stream_frame(
+    writer: &mpsc::Sender<OutboundFrame>,
     frame: ipc::Frame,
-    streams: &mut HashMap<u64, StreamState>,
-    credits: &mut ipc::StreamCredits,
+    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    done: &mpsc::Sender<(u64, u64)>,
+    generation: u64,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
 ) -> Result<bool, Error> {
+    let stream_id = frame.stream_id;
     match frame.kind {
-        ipc::FrameKind::Open => handle_open(stream, frame, streams, credits, refs, peer).await,
-        ipc::FrameKind::Stdin => {
-            let width = u64::try_from(frame.payload.len()).map_err(|_| {
-                Error::Core(CoreError::new(
-                    ErrorCode::ELimit,
-                    "stdin chunk exceeds its bound",
-                ))
-            })?;
-            if let Err(err) = credits.consume_inbound(frame.stream_id, width) {
-                send_error_exit(stream, frame.stream_id, &Error::from(err), refs).await?;
-                return Ok(false);
+        ipc::FrameKind::Open => {
+            spawn_stream(writer, frame, streams, done, generation, refs, peer);
+            Ok(false)
+        }
+        ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof => {
+            if let Some((tx, _)) = streams.get(&stream_id)
+                && tx.send(frame).await.is_err()
+            {
+                streams.remove(&stream_id);
             }
-            let state = streams.entry(frame.stream_id).or_insert(StreamState {
-                stdin_bytes: 0,
-                cancelled: false,
-            });
-            state.stdin_bytes += frame.payload.len();
-            if state.stdin_bytes > ipc::MAX_IPC_CONTROL_BYTES {
+            Ok(false)
+        }
+        ipc::FrameKind::WindowUpdate => match streams.get(&stream_id) {
+            Some((tx, _)) => {
+                if tx.send(frame).await.is_err() {
+                    streams.remove(&stream_id);
+                }
+                Ok(false)
+            }
+            None => {
+                let sink = StreamSink {
+                    writer: writer.clone(),
+                    stream_id,
+                };
                 send_error_exit(
-                    stream,
-                    frame.stream_id,
-                    &Error::Core(CoreError::new(ErrorCode::ELimit, "stdin exceeds its bound")),
-                    refs,
+                    &sink,
+                    &Error::Core(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "credit update names an unknown stream",
+                    )),
                 )
                 .await?;
-                credits.close_stream(frame.stream_id);
+                Ok(false)
             }
-            Ok(false)
-        }
-        ipc::FrameKind::StdinEof => Ok(false),
-        ipc::FrameKind::WindowUpdate => {
-            apply_window_update(stream, &frame, credits, refs).await?;
-            Ok(false)
-        }
-        ipc::FrameKind::Cancel => {
-            if let Some(state) = streams.get_mut(&frame.stream_id) {
-                state.cancelled = true;
+        },
+        ipc::FrameKind::Cancel => match streams.get(&stream_id) {
+            Some((tx, _)) => {
+                if tx.send(frame).await.is_err() {
+                    streams.remove(&stream_id);
+                }
+                Ok(false)
             }
-            credits.close_stream(frame.stream_id);
-            send_exit(
-                stream,
-                frame.stream_id,
-                130,
-                ErrorCode::ECancelled.as_str(),
-                "CancelledBeforeCommit",
-                refs,
-            )
-            .await?;
-            Ok(false)
-        }
+            None => {
+                let sink = StreamSink {
+                    writer: writer.clone(),
+                    stream_id,
+                };
+                send_exit(
+                    &sink,
+                    130,
+                    ErrorCode::ECancelled.as_str(),
+                    "CancelledBeforeCommit",
+                )
+                .await?;
+                Ok(false)
+            }
+        },
         ipc::FrameKind::Accepted
         | ipc::FrameKind::Stdout
         | ipc::FrameKind::Stderr
@@ -1310,14 +1428,16 @@ async fn handle_stream_frame(
         | ipc::FrameKind::HookReply
         | ipc::FrameKind::Exit
         | ipc::FrameKind::Error => {
+            let sink = StreamSink {
+                writer: writer.clone(),
+                stream_id,
+            };
             send_error_exit(
-                stream,
-                frame.stream_id,
+                &sink,
                 &Error::Core(CoreError::new(
                     ErrorCode::EInvalid,
                     "daemon never receives this frame kind from a client",
                 )),
-                refs,
             )
             .await?;
             Ok(false)
@@ -1325,98 +1445,60 @@ async fn handle_stream_frame(
     }
 }
 
-/// Routes one client credit grant to the inbound or outbound window of its
-/// stream, refusing unknown directions and unknown streams.
+/// Spawns one task serving the stream of one `Open` frame. The reader
+/// keeps only the task's input channel: every later frame of the stream
+/// routes through it, so a long invocation never blocks sibling streams
+/// and `Cancel` reaches a running invocation.
 #[cfg(unix)]
-async fn apply_window_update(
-    stream: &mut tokio::net::UnixStream,
-    frame: &ipc::Frame,
-    credits: &mut ipc::StreamCredits,
-    refs: &ConnectionRefs,
-) -> Result<(), Error> {
-    let credit: WindowCredit = ipc::decode_control(&frame.payload)?;
-    if route_credit(credits, frame.stream_id, &credit).is_ok() {
-        return Ok(());
-    }
-    if credit.direction.is_empty()
-        || credit.direction == "stdin"
-        || credit.direction == "stdout"
-        || credit.direction == "stderr"
-    {
-        return unknown_stream_credit(stream, frame.stream_id, refs).await;
-    }
-    send_error_exit(
-        stream,
-        frame.stream_id,
-        &Error::Core(CoreError::new(
-            ErrorCode::EInvalid,
-            "credit update names an unknown direction",
-        )),
-        refs,
-    )
-    .await
-}
-
-/// Reports a credit grant for a stream the daemon does not track.
-#[cfg(unix)]
-async fn unknown_stream_credit(
-    stream: &mut tokio::net::UnixStream,
-    stream_id: u64,
-    refs: &ConnectionRefs,
-) -> Result<(), Error> {
-    send_error_exit(
-        stream,
-        stream_id,
-        &Error::Core(CoreError::new(
-            ErrorCode::EInvalid,
-            "credit update names an unknown stream",
-        )),
-        refs,
-    )
-    .await
-}
-
-#[cfg(unix)]
-async fn handle_open(
-    stream: &mut tokio::net::UnixStream,
+fn spawn_stream(
+    writer: &mpsc::Sender<OutboundFrame>,
     frame: ipc::Frame,
-    streams: &mut HashMap<u64, StreamState>,
-    credits: &mut ipc::StreamCredits,
+    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    done: &mpsc::Sender<(u64, u64)>,
+    generation: u64,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
-) -> Result<bool, Error> {
+) {
     let stream_id = frame.stream_id;
-    if let Ok(command) = ipc::decode_control::<CommandOpen>(&frame.payload) {
-        streams.insert(
-            stream_id,
-            StreamState {
-                stdin_bytes: 0,
-                cancelled: false,
-            },
-        );
-        credits.open_stream(stream_id);
-        let close = command_inner(stream, stream_id, command, streams, credits, refs, peer).await?;
-        credits.close_stream(stream_id);
-        return Ok(close);
+    let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BOUND);
+    if let Some((old, _)) = streams.insert(stream_id, (tx, generation)) {
+        drop(old);
     }
-    let open: InvocationOpen = match ipc::decode_control(&frame.payload) {
+    let sink = StreamSink {
+        writer: writer.clone(),
+        stream_id,
+    };
+    let task_refs = refs.clone();
+    let task_done = done.clone();
+    tokio::spawn(async move {
+        serve_stream(rx, &sink, frame.payload, &task_refs, peer).await;
+        let _ = task_done.try_send((stream_id, generation));
+    });
+}
+
+/// Serves one stream to its terminal frame: an argv-style command stream
+/// or a typed invocation. Every error ends the stream with an `Error`
+/// plus its terminal frame; the connection stays open for other streams.
+#[cfg(unix)]
+async fn serve_stream(
+    mut input: mpsc::Receiver<ipc::Frame>,
+    sink: &StreamSink,
+    open_payload: Vec<u8>,
+    refs: &ConnectionRefs,
+    peer: ipc::PeerIdentity,
+) {
+    if let Ok(command) = ipc::decode_control::<CommandOpen>(&open_payload) {
+        command_stream(&mut input, sink, command, refs).await;
+        return;
+    }
+    let open: InvocationOpen = match ipc::decode_control(&open_payload) {
         Ok(open) => open,
         Err(err) => {
-            send_error_exit(stream, stream_id, &Error::Core(err), refs).await?;
-            return Ok(false);
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
+            return;
         }
     };
-    streams.insert(
-        stream_id,
-        StreamState {
-            stdin_bytes: 0,
-            cancelled: false,
-        },
-    );
-    credits.open_stream(stream_id);
-    let _ = open_inner(stream, stream_id, &open, credits, refs, peer).await;
-    credits.close_stream(stream_id);
-    Ok(false)
+    typed_stream(&mut input, sink, &open, refs, peer).await;
 }
 
 /// The claim of one invocation identity against the shared ledger.
@@ -1455,20 +1537,24 @@ fn claim_request_slot(
     }
 }
 
-/// The mutable serving state of one connection, threaded through command
+/// The mutable serving state of one stream task, threaded through command
 /// handling so every helper takes a narrow slice of it.
 #[cfg(unix)]
 struct CommandServing<'a> {
-    /// The connection socket; one command owns it while running inline.
-    stream: &'a mut tokio::net::UnixStream,
-    /// Per-stream bookkeeping of the connection.
-    streams: &'a mut HashMap<u64, StreamState>,
-    /// Directional credit windows of the connection.
+    /// Frames arriving for this stream from the connection reader.
+    input: &'a mut mpsc::Receiver<ipc::Frame>,
+    /// The write end answering for this stream.
+    sink: &'a StreamSink,
+    /// Directional credit windows of this stream.
     credits: &'a mut ipc::StreamCredits,
     /// Shared registry, executor, ledger, and timeouts.
     refs: &'a ConnectionRefs,
-    /// The authenticated peer of the connection.
-    peer: ipc::PeerIdentity,
+    /// The cancellation owner of this stream; a `Cancel` frame triggers it
+    /// so cancellation reaches the running invocation.
+    cancel: &'a CancelHandle,
+    /// The cancellation observer of this stream, checked at the phase
+    /// boundaries of synchronous work that cannot observe the channel.
+    token: &'a Cancel,
 }
 
 /// One validated command ready to collect stdin and run.
@@ -1484,25 +1570,17 @@ struct ReadyCommand {
     cwd: PathBuf,
 }
 
-/// Serves one argv-style command stream to its terminal frame, inline.
-///
-/// A long-running command blocks sibling streams on the same connection:
-/// `serve_connection` cannot read the next frame while this future owns
-/// the socket. That is the documented v1 limitation; frames for other
-/// streams arriving mid-command are buffered and replayed after the
-/// terminal frame instead of being dropped.
-///
-/// Returns true when the connection must close (stream-zero teardown).
+/// Serves one argv-style command stream to its terminal frame, on its own
+/// task. Sibling streams progress concurrently: the connection reader
+/// keeps routing their frames while this stream collects stdin, runs the
+/// interpreter on the blocking pool, and streams output.
 #[cfg(unix)]
-async fn command_inner(
-    stream: &mut tokio::net::UnixStream,
-    stream_id: u64,
+async fn command_stream(
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    sink: &StreamSink,
     req: CommandOpen,
-    streams: &mut HashMap<u64, StreamState>,
-    credits: &mut ipc::StreamCredits,
     refs: &ConnectionRefs,
-    peer: ipc::PeerIdentity,
-) -> Result<bool, Error> {
+) {
     let CommandOpen {
         session_id: _,
         repository,
@@ -1514,50 +1592,57 @@ async fn command_inner(
         stdout_credit,
         stderr_credit,
     } = req;
+    let stream_id = sink.stream_id;
+    let mut credits = ipc::StreamCredits::new(refs.window_bytes);
+    credits.open_stream(stream_id);
+    let (cancel_guard, token) = cancellation();
     let mut serving = CommandServing {
-        stream,
-        streams,
-        credits,
+        input,
+        sink,
+        credits: &mut credits,
         refs,
-        peer,
+        cancel: &cancel_guard,
+        token: &token,
     };
     if invocation.is_empty() {
-        refuse_unclaimed(
+        let _ = refuse_unclaimed(
             &mut serving,
-            stream_id,
             CoreError::new(ErrorCode::EInvalid, "command open carries no request id"),
         )
-        .await?;
-        return Ok(false);
+        .await;
+        return;
     }
-    match claim_request_slot(serving.refs, &invocation, &command_digest)? {
-        RequestSlot::Run => {}
-        RequestSlot::Replay(report) => {
-            return replay_command(&mut serving, stream_id, &invocation, &report).await;
+    match claim_request_slot(serving.refs, &invocation, &command_digest) {
+        Ok(RequestSlot::Run) => {}
+        Ok(RequestSlot::Replay(report)) => {
+            replay_command(&mut serving, &invocation, &report).await;
+            return;
         }
-        RequestSlot::Busy => {
-            refuse_unclaimed(
+        Ok(RequestSlot::Busy) => {
+            let _ = refuse_unclaimed(
                 &mut serving,
-                stream_id,
                 CoreError::new(
                     ErrorCode::EInvalid,
                     "invocation is still in progress on another stream",
                 ),
             )
-            .await?;
-            return Ok(false);
+            .await;
+            return;
         }
-        RequestSlot::DigestMismatch => {
-            refuse_unclaimed(
+        Ok(RequestSlot::DigestMismatch) => {
+            let _ = refuse_unclaimed(
                 &mut serving,
-                stream_id,
                 CoreError::new(
                     ErrorCode::EInvalid,
                     "request id is taken by a different command digest",
                 ),
             )
-            .await?;
-            return Ok(false);
+            .await;
+            return;
+        }
+        Err(err) => {
+            let _ = send_error_exit(serving.sink, &err).await;
+            return;
         }
     }
     let validated = {
@@ -1571,8 +1656,8 @@ async fn command_inner(
     let (canonical_dir, vars) = match validated {
         Ok(Ok(valid)) => valid,
         Ok(Err(err)) | Err(err) => {
-            refuse_command(&mut serving, stream_id, &invocation, err).await?;
-            return Ok(false);
+            let _ = refuse_command(&mut serving, &invocation, err).await;
+            return;
         }
     };
     let accepted = CommandAccepted {
@@ -1580,33 +1665,32 @@ async fn command_inner(
         stdin_credit: serving.refs.window_bytes,
         invocation_id: invocation.clone(),
     };
-    let accepted_bytes = ipc::encode_control(&accepted).map_err(Error::Core)?;
+    let accepted_bytes = match ipc::encode_control(&accepted) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
+            return;
+        }
+    };
     if serving
         .credits
         .grant_outbound(stream_id, stdout_credit.saturating_add(stderr_credit))
         .is_err()
     {
-        refuse_command(
+        let _ = refuse_command(
             &mut serving,
-            stream_id,
             &invocation,
             CoreError::new(ErrorCode::EInvalid, "command stream is not tracked"),
         )
-        .await?;
-        return Ok(false);
+        .await;
+        return;
     }
-    if send_frame(
-        serving.stream,
-        ipc::FrameKind::Accepted,
-        stream_id,
-        &accepted_bytes,
-        serving.refs,
-    )
-    .await
-    .is_err()
+    if send_frame(sink, ipc::FrameKind::Accepted, &accepted_bytes)
+        .await
+        .is_err()
     {
-        lock_outcomes(serving.refs)?.complete(&invocation, CommandExitReport::failure(&invocation));
-        return Ok(false);
+        forget_command(&serving, &invocation);
+        return;
     }
     let ready = ReadyCommand {
         invocation,
@@ -1614,44 +1698,40 @@ async fn command_inner(
         vars,
         cwd: canonical_dir,
     };
-    serve_ready_command(&mut serving, stream_id, ready).await
+    serve_ready_command(&mut serving, ready).await;
 }
 
 /// Collects stdin, runs the interpreter on the blocking pool, and streams
-/// the captured output to the terminal frame.
-///
-/// Returns true when the connection must close (stream-zero teardown).
+/// the captured output to the terminal frame. Cancellation is observed in
+/// the stdin and output loops and at the phase boundaries around the
+/// blocking run; a synchronous CLI verb itself runs to completion.
 #[cfg(unix)]
-async fn serve_ready_command(
-    serving: &mut CommandServing<'_>,
-    stream_id: u64,
-    ready: ReadyCommand,
-) -> Result<bool, Error> {
+async fn serve_ready_command(serving: &mut CommandServing<'_>, ready: ReadyCommand) {
     let ReadyCommand {
         invocation,
         argv,
         vars,
         cwd,
     } = ready;
-    let mut pending: Vec<ipc::Frame> = Vec::new();
-    let stdin_bytes = match collect_command_stdin(serving, stream_id, &mut pending).await {
-        Ok(CollectFate::Ready(bytes)) => bytes,
-        Ok(CollectFate::Cancelled { close_connection }) => {
-            return cancel_command(serving, stream_id, &invocation, pending, close_connection)
-                .await;
+    let stdin_bytes = match collect_command_stdin(serving).await {
+        CollectFate::Ready(bytes) => bytes,
+        CollectFate::Cancelled => {
+            cancel_command(serving, &invocation).await;
+            return;
         }
-        Ok(CollectFate::Teardown) => {
-            return teardown_command(serving, &invocation).await;
+        CollectFate::InputClosed => {
+            forget_command(serving, &invocation);
+            return;
         }
-        Ok(CollectFate::Rejected(err)) => {
-            refuse_command(serving, stream_id, &invocation, err).await?;
-            return Ok(false);
-        }
-        Err(err) => {
-            lock_outcomes(serving.refs)?.remove(&invocation);
-            return Err(err);
+        CollectFate::Rejected(err) => {
+            let _ = refuse_command(serving, &invocation, err).await;
+            return;
         }
     };
+    if serving.token.check().is_err() {
+        cancel_command(serving, &invocation).await;
+        return;
+    }
     let mut full_argv = Vec::with_capacity(argv.len() + 1);
     full_argv.push("git".to_string());
     full_argv.extend(argv);
@@ -1672,51 +1752,56 @@ async fn serve_ready_command(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
-            refuse_command(serving, stream_id, &invocation, err).await?;
-            return Ok(false);
+            let _ = refuse_command(serving, &invocation, err).await;
+            return;
         }
     };
+    if serving.token.check().is_err() {
+        cancel_command(serving, &invocation).await;
+        return;
+    }
     let report = if outcome.code == 0 {
         CommandExitReport::success(&invocation, 0)
     } else {
         CommandExitReport::failure_with_code(&invocation, outcome.code)
     };
-    lock_outcomes(serving.refs)?.complete(&invocation, report.clone());
+    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
+        ledger.complete(&invocation, report.clone());
+    }
     for (kind, bytes) in [
         (ipc::FrameKind::Stdout, outcome.stdout),
         (ipc::FrameKind::Stderr, outcome.stderr),
     ] {
-        match write_cmd_data(serving, stream_id, kind, &bytes, &mut pending).await? {
+        match write_cmd_data(serving, kind, &bytes).await {
             WriteFate::Done => {}
-            WriteFate::Cancelled { close_connection } => {
-                return cancel_command(serving, stream_id, &invocation, pending, close_connection)
-                    .await;
+            WriteFate::Cancelled => {
+                cancel_command(serving, &invocation).await;
+                return;
             }
-            WriteFate::Teardown => {
-                return teardown_command(serving, &invocation).await;
+            WriteFate::InputClosed => {
+                return;
+            }
+            WriteFate::Rejected(err) => {
+                let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
+                return;
             }
         }
     }
-    let exit_bytes = ipc::encode_control(&report).map_err(Error::Core)?;
-    send_frame(
-        serving.stream,
-        ipc::FrameKind::Exit,
-        stream_id,
-        &exit_bytes,
-        serving.refs,
-    )
-    .await?;
-    replay_pending(serving, pending).await
+    let exit_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(serving.sink, ipc::FrameKind::Exit, &exit_bytes).await;
 }
 
-/// Records a stream-zero teardown failure and closes the connection.
+/// Forgets one stream whose input closed before any terminal report: the
+/// connection is dead, so a retry must run fresh instead of observing a
+/// stale running row.
 #[cfg(unix)]
-async fn teardown_command(
-    serving: &mut CommandServing<'_>,
-    invocation: &str,
-) -> Result<bool, Error> {
-    lock_outcomes(serving.refs)?.complete(invocation, CommandExitReport::failure(invocation));
-    Ok(true)
+fn forget_command(serving: &CommandServing<'_>, invocation: &str) {
+    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
+        ledger.remove(invocation);
+    }
 }
 
 /// Replays one recorded terminal report: `Accepted` with the invocation
@@ -1724,114 +1809,62 @@ async fn teardown_command(
 #[cfg(unix)]
 async fn replay_command(
     serving: &mut CommandServing<'_>,
-    stream_id: u64,
     invocation: &str,
     report: &CommandExitReport,
-) -> Result<bool, Error> {
+) {
     let accepted = CommandAccepted {
-        stream_id,
+        stream_id: serving.sink.stream_id,
         stdin_credit: serving.refs.window_bytes,
         invocation_id: invocation.to_string(),
     };
-    let accepted_bytes = ipc::encode_control(&accepted).map_err(Error::Core)?;
-    send_frame(
-        serving.stream,
-        ipc::FrameKind::Accepted,
-        stream_id,
-        &accepted_bytes,
-        serving.refs,
-    )
-    .await?;
-    let exit_bytes = ipc::encode_control(report).map_err(Error::Core)?;
-    send_frame(
-        serving.stream,
-        ipc::FrameKind::Exit,
-        stream_id,
-        &exit_bytes,
-        serving.refs,
-    )
-    .await?;
-    Ok(false)
+    let accepted_bytes = match ipc::encode_control(&accepted) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    if send_frame(serving.sink, ipc::FrameKind::Accepted, &accepted_bytes)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let exit_bytes = match ipc::encode_control(report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(serving.sink, ipc::FrameKind::Exit, &exit_bytes).await;
 }
 
 /// Records the failure of a claimed `invocation` and reports it as `Error`
 /// plus the legacy terminal frame, so a later outcome lookup observes the
 /// failure instead of uncertainty.
 #[cfg(unix)]
-async fn refuse_command(
-    serving: &mut CommandServing<'_>,
-    stream_id: u64,
-    invocation: &str,
-    err: CoreError,
-) -> Result<(), Error> {
-    lock_outcomes(serving.refs)?.complete(invocation, CommandExitReport::failure(invocation));
-    send_error_exit(serving.stream, stream_id, &Error::Core(err), serving.refs).await
+async fn refuse_command(serving: &mut CommandServing<'_>, invocation: &str, err: CoreError) {
+    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
+        ledger.complete(invocation, CommandExitReport::failure(invocation));
+    }
+    let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
 }
 
 /// Reports a refusal without touching the ledger: the identity is empty or
 /// belongs to another command, so recording a failure would poison a row
 /// this open never claimed.
 #[cfg(unix)]
-async fn refuse_unclaimed(
-    serving: &mut CommandServing<'_>,
-    stream_id: u64,
-    err: CoreError,
-) -> Result<(), Error> {
-    send_error_exit(serving.stream, stream_id, &Error::Core(err), serving.refs).await
+async fn refuse_unclaimed(serving: &mut CommandServing<'_>, err: CoreError) {
+    let _ = send_error_exit(serving.sink, &Error::Core(err)).await;
 }
 
-/// Ends one cancelled command with its terminal report, then replays
-/// frames buffered for sibling streams. A stream-zero cancel also closes
-/// the connection, since no further frame can arrive on it.
+/// Ends one cancelled command with its terminal report.
 #[cfg(unix)]
-async fn cancel_command(
-    serving: &mut CommandServing<'_>,
-    stream_id: u64,
-    invocation: &str,
-    pending: Vec<ipc::Frame>,
-    close_connection: bool,
-) -> Result<bool, Error> {
+async fn cancel_command(serving: &mut CommandServing<'_>, invocation: &str) {
     let report = CommandExitReport::cancelled(invocation);
-    lock_outcomes(serving.refs)?.complete(invocation, report.clone());
-    if close_connection {
-        return Ok(true);
+    if let Ok(mut ledger) = serving.refs.outcomes.lock() {
+        ledger.complete(invocation, report.clone());
     }
-    let exit_bytes = ipc::encode_control(&report).map_err(Error::Core)?;
-    send_frame(
-        serving.stream,
-        ipc::FrameKind::Exit,
-        stream_id,
-        &exit_bytes,
-        serving.refs,
-    )
-    .await?;
-    replay_pending(serving, pending).await
-}
-
-/// Replays frames buffered for other streams while a command owned the
-/// socket, in arrival order.
-#[cfg(unix)]
-async fn replay_pending(
-    serving: &mut CommandServing<'_>,
-    pending: Vec<ipc::Frame>,
-) -> Result<bool, Error> {
-    for frame in pending {
-        // Boxed: replaying may serve another command inline, which recurses
-        // through `handle_stream_frame`; boxing breaks the async cycle.
-        if Box::pin(handle_stream_frame(
-            serving.stream,
-            frame,
-            serving.streams,
-            serving.credits,
-            serving.refs,
-            serving.peer,
-        ))
-        .await?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let exit_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(serving.sink, ipc::FrameKind::Exit, &exit_bytes).await;
 }
 
 /// Validates one command open against the filesystem, on the blocking
@@ -1959,105 +1992,12 @@ fn route_credit(
 enum CollectFate {
     /// `StdinEof` arrived with the collected bytes.
     Ready(Vec<u8>),
-    /// Cancellation arrived; only a stream-zero cancel closes the
-    /// connection.
-    Cancelled {
-        /// True when stream zero carried the cancel.
-        close_connection: bool,
-    },
-    /// The client tore the connection down.
-    Teardown,
+    /// A `Cancel` frame arrived for this stream.
+    Cancelled,
+    /// The connection reader is gone; the caller forgets the claim.
+    InputClosed,
     /// A protocol violation; the caller records a failure and refuses.
     Rejected(CoreError),
-}
-
-/// Collects stdin for one command stream, inline on the connection.
-/// `Stdin` chunks are credit-checked and acknowledged with a `stdin`
-/// grant each, so a client larger than one window keeps flowing.
-/// Stream-zero teardown maps to [`CollectFate::Cancelled`] (close) or
-/// [`CollectFate::Teardown`]; frames for other streams buffer into
-/// `pending` for replay after the terminal frame.
-#[cfg(unix)]
-async fn collect_command_stdin(
-    serving: &mut CommandServing<'_>,
-    stream_id: u64,
-    pending: &mut Vec<ipc::Frame>,
-) -> Result<CollectFate, Error> {
-    let mut stdin_bytes: Vec<u8> = Vec::new();
-    loop {
-        let deadline = tokio::time::Instant::now() + serving.refs.frame_timeout;
-        let frame = ipc::read_frame(serving.stream, deadline)
-            .await
-            .map_err(Error::Core)?;
-        if frame.stream_id != stream_id && frame.stream_id != ipc::CONTROL_STREAM_ID {
-            pending.push(frame);
-            continue;
-        }
-        if frame.stream_id == ipc::CONTROL_STREAM_ID {
-            match control_during_command(serving, &frame, deadline).await? {
-                ControlFate::Continue => continue,
-                ControlFate::Cancelled => {
-                    return Ok(CollectFate::Cancelled {
-                        close_connection: true,
-                    });
-                }
-                ControlFate::Teardown => return Ok(CollectFate::Teardown),
-            }
-        }
-        match frame.kind {
-            ipc::FrameKind::Stdin => {
-                match absorb_stdin_chunk(
-                    serving.credits,
-                    stream_id,
-                    &mut stdin_bytes,
-                    &frame.payload,
-                ) {
-                    Ok(width) => {
-                        let grant = StdinGrant {
-                            direction: "stdin".to_string(),
-                            bytes: width,
-                        };
-                        let bytes = ipc::encode_control(&grant).map_err(Error::Core)?;
-                        send_frame(
-                            serving.stream,
-                            ipc::FrameKind::WindowUpdate,
-                            stream_id,
-                            &bytes,
-                            serving.refs,
-                        )
-                        .await?;
-                    }
-                    Err(err) => return Ok(CollectFate::Rejected(err)),
-                }
-            }
-            ipc::FrameKind::StdinEof => return Ok(CollectFate::Ready(stdin_bytes)),
-            ipc::FrameKind::Cancel => {
-                return Ok(CollectFate::Cancelled {
-                    close_connection: false,
-                });
-            }
-            ipc::FrameKind::WindowUpdate => {
-                let credit: WindowCredit =
-                    ipc::decode_control(&frame.payload).map_err(Error::Core)?;
-                if let Err(err) = route_credit(serving.credits, stream_id, &credit) {
-                    return Ok(CollectFate::Rejected(err));
-                }
-            }
-            ipc::FrameKind::Open
-            | ipc::FrameKind::Accepted
-            | ipc::FrameKind::Stdout
-            | ipc::FrameKind::Stderr
-            | ipc::FrameKind::HookCall
-            | ipc::FrameKind::HookReply
-            | ipc::FrameKind::Exit
-            | ipc::FrameKind::Error => {
-                return Ok(CollectFate::Rejected(CoreError::new(
-                    ErrorCode::EInvalid,
-                    "daemon never receives this frame kind from a client",
-                )));
-            }
-        }
-    }
 }
 
 /// Absorbs one stdin chunk under the inbound window and the stream cap,
@@ -2086,52 +2026,78 @@ fn absorb_stdin_chunk(
     Ok(width)
 }
 
-/// The end of one stream-zero frame seen while a command owns the socket.
+/// Collects stdin for one command stream from its input channel. `Stdin`
+/// chunks are credit-checked and acknowledged with a `stdin` grant each,
+/// so a client larger than one window keeps flowing. A `Cancel` frame
+/// triggers the stream token and ends the collection cancelled.
 #[cfg(unix)]
-enum ControlFate {
-    /// An answered query or ignored grant; keep collecting.
-    Continue,
-    /// Stream-zero cancel; the command ends cancelled and the connection
-    /// closes.
-    Cancelled,
-    /// Stream-zero teardown; the command records a failure and closes.
-    Teardown,
-}
-
-/// Handles one stream-zero frame arriving mid-command: global cancel and
-/// teardown end the command, outcome lookups answer inline, grants are
-/// ignored.
-#[cfg(unix)]
-async fn control_during_command(
-    serving: &mut CommandServing<'_>,
-    frame: &ipc::Frame,
-    deadline: tokio::time::Instant,
-) -> Result<ControlFate, Error> {
-    match frame.kind {
-        ipc::FrameKind::Cancel => Ok(ControlFate::Cancelled),
-        ipc::FrameKind::Exit | ipc::FrameKind::Error => Ok(ControlFate::Teardown),
-        ipc::FrameKind::WindowUpdate => {
-            let credit: WindowCredit = ipc::decode_control(&frame.payload).map_err(Error::Core)?;
-            let _ = credit;
-            Ok(ControlFate::Continue)
-        }
-        ipc::FrameKind::Open => {
-            answer_control_open(serving.stream, frame, deadline, serving.refs).await?;
-            Ok(ControlFate::Continue)
-        }
-        ipc::FrameKind::Accepted
-        | ipc::FrameKind::Stdin
-        | ipc::FrameKind::StdinEof
-        | ipc::FrameKind::Stdout
-        | ipc::FrameKind::Stderr
-        | ipc::FrameKind::HookCall
-        | ipc::FrameKind::HookReply => {
-            let err = CoreError::new(
+async fn collect_command_stdin(serving: &mut CommandServing<'_>) -> CollectFate {
+    let stream_id = serving.sink.stream_id;
+    let mut stdin_bytes: Vec<u8> = Vec::new();
+    loop {
+        let Some(frame) = serving.input.recv().await else {
+            return CollectFate::InputClosed;
+        };
+        if frame.stream_id != stream_id {
+            return CollectFate::Rejected(CoreError::new(
                 ErrorCode::EInvalid,
-                "stream-zero carries only the handshake and control queries",
-            );
-            write_control_error(serving.stream, &err, deadline).await?;
-            Ok(ControlFate::Continue)
+                "stream received a frame of another stream",
+            ));
+        }
+        match frame.kind {
+            ipc::FrameKind::Stdin => {
+                match absorb_stdin_chunk(
+                    serving.credits,
+                    stream_id,
+                    &mut stdin_bytes,
+                    &frame.payload,
+                ) {
+                    Ok(width) => {
+                        let grant = StdinGrant {
+                            direction: "stdin".to_string(),
+                            bytes: width,
+                        };
+                        let grant_bytes = match ipc::encode_control(&grant) {
+                            Ok(bytes) => bytes,
+                            Err(_) => return CollectFate::InputClosed,
+                        };
+                        if send_frame(serving.sink, ipc::FrameKind::WindowUpdate, &grant_bytes)
+                            .await
+                            .is_err()
+                        {
+                            return CollectFate::InputClosed;
+                        }
+                    }
+                    Err(err) => return CollectFate::Rejected(err),
+                }
+            }
+            ipc::FrameKind::StdinEof => return CollectFate::Ready(stdin_bytes),
+            ipc::FrameKind::Cancel => {
+                serving.cancel.cancel();
+                return CollectFate::Cancelled;
+            }
+            ipc::FrameKind::WindowUpdate => {
+                let credit: WindowCredit = match ipc::decode_control(&frame.payload) {
+                    Ok(credit) => credit,
+                    Err(err) => return CollectFate::Rejected(err),
+                };
+                if let Err(err) = route_credit(serving.credits, stream_id, &credit) {
+                    return CollectFate::Rejected(err);
+                }
+            }
+            ipc::FrameKind::Open
+            | ipc::FrameKind::Accepted
+            | ipc::FrameKind::Stdout
+            | ipc::FrameKind::Stderr
+            | ipc::FrameKind::HookCall
+            | ipc::FrameKind::HookReply
+            | ipc::FrameKind::Exit
+            | ipc::FrameKind::Error => {
+                return CollectFate::Rejected(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "daemon never receives this frame kind from a client",
+                ));
+            }
         }
     }
 }
@@ -2139,60 +2105,58 @@ async fn control_during_command(
 /// The end of one output write loop.
 #[cfg(unix)]
 enum WriteFate {
-    /// Every byte reached the socket.
+    /// Every byte reached the writer task.
     Done,
-    /// Cancellation arrived mid-write; only stream-zero closes.
-    Cancelled {
-        /// True when stream zero carried the cancel.
-        close_connection: bool,
-    },
-    /// The client tore the connection down.
-    Teardown,
+    /// A `Cancel` frame arrived for this stream.
+    Cancelled,
+    /// The connection reader or writer is gone.
+    InputClosed,
+    /// A protocol violation; the caller ends the stream.
+    Rejected(CoreError),
 }
 
 /// Writes one output direction in window-sized chunks. When the outbound
-/// window exhausts, the loop reads frames until the client grants more
-/// credit, so outputs larger than the initial window still complete as
-/// long as the client keeps granting per chunk, the way the Go backend
-/// does.
+/// window exhausts, the loop reads the stream channel until the client
+/// grants more credit, so outputs larger than the initial window still
+/// complete as long as the client keeps granting per chunk, the way the
+/// Go backend does.
 #[cfg(unix)]
 async fn write_cmd_data(
     serving: &mut CommandServing<'_>,
-    stream_id: u64,
     kind: ipc::FrameKind,
     bytes: &[u8],
-    pending: &mut Vec<ipc::Frame>,
-) -> Result<WriteFate, Error> {
+) -> WriteFate {
+    let stream_id = serving.sink.stream_id;
     let mut offset = 0;
     while offset < bytes.len() {
         let end = (offset + ipc::MAX_DATA_CHUNK_BYTES).min(bytes.len());
-        let width = u64::try_from(end - offset).map_err(|_| {
-            Error::Core(CoreError::new(
-                ErrorCode::ELimit,
-                "data chunk exceeds its bound",
-            ))
-        })?;
+        let width = match u64::try_from(end - offset) {
+            Ok(width) => width,
+            Err(_) => {
+                return WriteFate::Rejected(CoreError::new(
+                    ErrorCode::ELimit,
+                    "data chunk exceeds its bound",
+                ));
+            }
+        };
         if serving.credits.consume_outbound(stream_id, width).is_ok() {
-            send_frame(
-                serving.stream,
-                kind,
-                stream_id,
-                &bytes[offset..end],
-                serving.refs,
-            )
-            .await?;
+            if send_frame(serving.sink, kind, &bytes[offset..end])
+                .await
+                .is_err()
+            {
+                return WriteFate::InputClosed;
+            }
             offset = end;
             continue;
         }
-        match await_outbound_credit(serving, stream_id, pending).await? {
+        match await_outbound_credit(serving).await {
             CreditFate::Granted => {}
-            CreditFate::Cancelled { close_connection } => {
-                return Ok(WriteFate::Cancelled { close_connection });
-            }
-            CreditFate::Teardown => return Ok(WriteFate::Teardown),
+            CreditFate::Cancelled => return WriteFate::Cancelled,
+            CreditFate::InputClosed => return WriteFate::InputClosed,
+            CreditFate::Rejected(err) => return WriteFate::Rejected(err),
         }
     }
-    Ok(WriteFate::Done)
+    WriteFate::Done
 }
 
 /// The end of one credit wait.
@@ -2200,54 +2164,43 @@ async fn write_cmd_data(
 enum CreditFate {
     /// A grant landed; retry the chunk.
     Granted,
-    /// Cancellation arrived; only stream-zero closes the connection.
-    Cancelled {
-        /// True when stream zero carried the cancel.
-        close_connection: bool,
-    },
-    /// The client tore the connection down.
-    Teardown,
+    /// A `Cancel` frame arrived for this stream.
+    Cancelled,
+    /// The connection reader is gone.
+    InputClosed,
+    /// A protocol violation; the caller ends the stream.
+    Rejected(CoreError),
 }
 
-/// Reads frames until the client grants outbound credit for `stream_id`.
-/// Late stdin endings are ignored; other streams buffer into `pending`.
+/// Reads the stream channel until the client grants outbound credit.
+/// Late stdin endings are ignored.
 #[cfg(unix)]
-async fn await_outbound_credit(
-    serving: &mut CommandServing<'_>,
-    stream_id: u64,
-    pending: &mut Vec<ipc::Frame>,
-) -> Result<CreditFate, Error> {
+async fn await_outbound_credit(serving: &mut CommandServing<'_>) -> CreditFate {
+    let stream_id = serving.sink.stream_id;
     loop {
-        let deadline = tokio::time::Instant::now() + serving.refs.frame_timeout;
-        let frame = ipc::read_frame(serving.stream, deadline)
-            .await
-            .map_err(Error::Core)?;
-        if frame.stream_id != stream_id && frame.stream_id != ipc::CONTROL_STREAM_ID {
-            pending.push(frame);
-            continue;
-        }
-        if frame.stream_id == ipc::CONTROL_STREAM_ID {
-            match control_during_command(serving, &frame, deadline).await? {
-                ControlFate::Continue => continue,
-                ControlFate::Cancelled => {
-                    return Ok(CreditFate::Cancelled {
-                        close_connection: true,
-                    });
-                }
-                ControlFate::Teardown => return Ok(CreditFate::Teardown),
-            }
+        let Some(frame) = serving.input.recv().await else {
+            return CreditFate::InputClosed;
+        };
+        if frame.stream_id != stream_id {
+            return CreditFate::Rejected(CoreError::new(
+                ErrorCode::EInvalid,
+                "stream received a frame of another stream",
+            ));
         }
         match frame.kind {
             ipc::FrameKind::WindowUpdate => {
-                let credit: WindowCredit =
-                    ipc::decode_control(&frame.payload).map_err(Error::Core)?;
-                route_credit(serving.credits, stream_id, &credit).map_err(Error::Core)?;
-                return Ok(CreditFate::Granted);
+                let credit: WindowCredit = match ipc::decode_control(&frame.payload) {
+                    Ok(credit) => credit,
+                    Err(err) => return CreditFate::Rejected(err),
+                };
+                match route_credit(serving.credits, stream_id, &credit) {
+                    Ok(()) => return CreditFate::Granted,
+                    Err(err) => return CreditFate::Rejected(err),
+                }
             }
             ipc::FrameKind::Cancel => {
-                return Ok(CreditFate::Cancelled {
-                    close_connection: false,
-                });
+                serving.cancel.cancel();
+                return CreditFate::Cancelled;
             }
             ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof => {}
             ipc::FrameKind::Open
@@ -2258,40 +2211,44 @@ async fn await_outbound_credit(
             | ipc::FrameKind::HookReply
             | ipc::FrameKind::Exit
             | ipc::FrameKind::Error => {
-                return Err(Error::Core(CoreError::new(
+                return CreditFate::Rejected(CoreError::new(
                     ErrorCode::EInvalid,
                     "daemon never receives this frame kind from a client",
-                )));
+                ));
             }
         }
     }
 }
 
+/// Serves one typed invocation on its stream task: opens the repository,
+/// answers `Accepted`, then dispatches on the coordinator while pumping
+/// the stream channel. A `Cancel` frame triggers the invocation token, so
+/// cancellation reaches the running dispatch through the coordinator's
+/// own checks; unexpected frames refuse the stream once dispatch ends.
 #[cfg(unix)]
-async fn open_inner(
-    stream: &mut tokio::net::UnixStream,
-    stream_id: u64,
+async fn typed_stream(
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    sink: &StreamSink,
     open: &InvocationOpen,
-    credits: &mut ipc::StreamCredits,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
-) -> Result<(), ()> {
-    let fail = async |stream: &mut tokio::net::UnixStream, err: Error, refs: &ConnectionRefs| {
-        send_error_exit(stream, stream_id, &err, refs).await
+) {
+    let stream_id = sink.stream_id;
+    let mut credits = ipc::StreamCredits::new(refs.window_bytes);
+    credits.open_stream(stream_id);
+    let (cancel_guard, cancel) = cancellation();
+    let fail = async |err: Error| {
+        let _ = send_error_exit(sink, &err).await;
     };
     let method = match Method::ALL.iter().find(|m| m.as_str() == open.method) {
         Some(method) => *method,
         None => {
-            let _ = fail(
-                stream,
-                Error::Core(CoreError::new(
-                    ErrorCode::EInvalid,
-                    format!("unknown method `{}`", open.method),
-                )),
-                refs,
-            )
+            fail(Error::Core(CoreError::new(
+                ErrorCode::EInvalid,
+                format!("unknown method `{}`", open.method),
+            )))
             .await;
-            return Err(());
+            return;
         }
     };
     let repo_ref = open.repo.clone();
@@ -2304,15 +2261,14 @@ async fn open_inner(
     let (handle, _, coordinator) = match opened {
         Ok(Ok(triple)) => triple,
         Ok(Err(err)) | Err(Error::Core(err)) => {
-            let _ = fail(stream, Error::Core(err), refs).await;
-            return Err(());
+            fail(Error::Core(err)).await;
+            return;
         }
         Err(err) => {
-            let _ = fail(stream, err, refs).await;
-            return Err(());
+            fail(err).await;
+            return;
         }
     };
-    let (_cancel_guard, cancel) = cancellation();
     let principal = Principal::from_peer_uid(peer.uid);
     let accepted = InvocationAccepted {
         stream_id,
@@ -2322,41 +2278,31 @@ async fn open_inner(
     let accepted_bytes = match ipc::encode_control(&accepted) {
         Ok(bytes) => bytes,
         Err(err) => {
-            let _ = fail(stream, Error::Core(err), refs).await;
-            return Err(());
+            fail(Error::Core(err)).await;
+            return;
         }
     };
-    if send_frame(
-        stream,
-        ipc::FrameKind::Accepted,
-        stream_id,
-        &accepted_bytes,
-        refs,
-    )
-    .await
-    .is_err()
+    if send_frame(sink, ipc::FrameKind::Accepted, &accepted_bytes)
+        .await
+        .is_err()
     {
-        return Err(());
+        return;
     }
     let session = match open.session_id.as_deref() {
         None => None,
         Some(text) => match text.parse::<SessionId>() {
             Ok(id) => Some(id),
             Err(err) => {
-                let _ = fail(
-                    stream,
-                    Error::Core(CoreError::new(
-                        ErrorCode::EInvalid,
-                        format!("invocation carries a malformed session id: {err}"),
-                    )),
-                    refs,
-                )
+                fail(Error::Core(CoreError::new(
+                    ErrorCode::EInvalid,
+                    format!("invocation carries a malformed session id: {err}"),
+                )))
                 .await;
-                return Err(());
+                return;
             }
         },
     };
-    match dispatch_method(
+    let dispatch = dispatch_method(
         &coordinator,
         &principal,
         method,
@@ -2364,29 +2310,64 @@ async fn open_inner(
         open.request_id.as_deref(),
         session,
         &cancel,
-    )
-    .await
-    {
-        Ok(stdout) => {
-            if write_data_chunks(
-                stream,
-                stream_id,
-                ipc::FrameKind::Stdout,
-                &stdout,
-                credits,
-                refs,
-            )
-            .await
-            .is_err()
-            {
-                return Err(());
+    );
+    tokio::pin!(dispatch);
+    let mut refused: Option<CoreError> = None;
+    let result = loop {
+        tokio::select! {
+            output = &mut dispatch => break output,
+            frame = input.recv() => {
+                let Some(frame) = frame else {
+                    return;
+                };
+                match frame.kind {
+                    ipc::FrameKind::Cancel => cancel_guard.cancel(),
+                    ipc::FrameKind::WindowUpdate => {
+                        match ipc::decode_control::<WindowCredit>(&frame.payload) {
+                            Ok(credit) => {
+                                if let Err(err) = route_credit(&mut credits, stream_id, &credit) {
+                                    refused = Some(err);
+                                }
+                            }
+                            Err(err) => refused = Some(err),
+                        }
+                    }
+                    _ => {
+                        refused = Some(CoreError::new(
+                            ErrorCode::EInvalid,
+                            "daemon never receives this frame kind from a client",
+                        ));
+                    }
+                }
             }
-            let _ = send_exit(stream, stream_id, 0, "OK", "Completed", refs).await;
-            Ok(())
+        }
+    };
+    if let Some(err) = refused {
+        fail(Error::Core(err)).await;
+        return;
+    }
+    match result {
+        Ok(stdout) => {
+            if write_typed_chunks(sink, &mut credits, &stdout)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = send_exit(sink, 0, "OK", "Completed").await;
         }
         Err(err) => {
-            let _ = fail(stream, Error::Core(err), refs).await;
-            Err(())
+            if err.code == ErrorCode::ECancelled {
+                let _ = send_exit(
+                    sink,
+                    130,
+                    ErrorCode::ECancelled.as_str(),
+                    "CancelledBeforeCommit",
+                )
+                .await;
+            } else {
+                fail(Error::Core(err)).await;
+            }
         }
     }
 }
@@ -2641,14 +2622,14 @@ fn decode_request_args(
     }
 }
 
+/// Writes one typed reply in window-sized chunks. Exhaustion refuses the
+/// stream instead of waiting: waiting for credit on typed replies lands
+/// with the credit-window row.
 #[cfg(unix)]
-async fn write_data_chunks(
-    stream: &mut tokio::net::UnixStream,
-    stream_id: u64,
-    kind: ipc::FrameKind,
-    bytes: &[u8],
+async fn write_typed_chunks(
+    sink: &StreamSink,
     credits: &mut ipc::StreamCredits,
-    refs: &ConnectionRefs,
+    bytes: &[u8],
 ) -> Result<(), Error> {
     if bytes.is_empty() {
         return Ok(());
@@ -2660,41 +2641,30 @@ async fn write_data_chunks(
                 "data chunk exceeds its bound",
             ))
         })?;
-        if let Err(err) = credits.consume_outbound(stream_id, width) {
-            send_error_exit(stream, stream_id, &Error::Core(err), refs).await?;
+        if let Err(err) = credits.consume_outbound(sink.stream_id, width) {
+            send_error_exit(sink, &Error::from(err)).await?;
             return Err(Error::Core(CoreError::new(
                 ErrorCode::ELimit,
                 "stream credit window is exhausted",
             )));
         }
-        send_frame(stream, kind, stream_id, chunk, refs).await?;
+        send_frame(sink, ipc::FrameKind::Stdout, chunk).await?;
     }
     Ok(())
 }
 
+/// Queues one frame of `sink` toward the connection-writer task.
+///
+/// # Errors
+/// `E_IO` when the writer task is gone and the connection is dead.
 #[cfg(unix)]
-async fn send_frame(
-    stream: &mut tokio::net::UnixStream,
-    kind: ipc::FrameKind,
-    stream_id: u64,
-    payload: &[u8],
-    refs: &ConnectionRefs,
-) -> Result<(), Error> {
-    let deadline = tokio::time::Instant::now() + refs.frame_timeout;
-    ipc::write_frame(stream, kind, stream_id, payload, deadline)
-        .await
-        .map_err(Error::Core)
+async fn send_frame(sink: &StreamSink, kind: ipc::FrameKind, payload: &[u8]) -> Result<(), Error> {
+    send_raw(&sink.writer, kind, sink.stream_id, payload).await
 }
 
+/// Queues the terminal `Exit` frame of `sink`.
 #[cfg(unix)]
-async fn send_exit(
-    stream: &mut tokio::net::UnixStream,
-    stream_id: u64,
-    status: i32,
-    code: &str,
-    outcome: &str,
-    refs: &ConnectionRefs,
-) -> Result<(), Error> {
+async fn send_exit(sink: &StreamSink, status: i32, code: &str, outcome: &str) -> Result<(), Error> {
     let completed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -2706,16 +2676,12 @@ async fn send_exit(
         completed_at,
     };
     let bytes = ipc::encode_control(&report)?;
-    send_frame(stream, ipc::FrameKind::Exit, stream_id, &bytes, refs).await
+    send_frame(sink, ipc::FrameKind::Exit, &bytes).await
 }
 
+/// Queues an `Error` frame plus the terminal `Exit` frame of `sink`.
 #[cfg(unix)]
-async fn send_error_exit(
-    stream: &mut tokio::net::UnixStream,
-    stream_id: u64,
-    err: &Error,
-    refs: &ConnectionRefs,
-) -> Result<(), Error> {
+async fn send_error_exit(sink: &StreamSink, err: &Error) -> Result<(), Error> {
     let core = match err {
         Error::Core(inner) => inner.clone(),
         Error::Config(detail) | Error::Unsupported(detail) => {
@@ -2727,19 +2693,11 @@ async fn send_error_exit(
     let status = if cancelled { 130 } else { 1 };
     let report = ErrorReply::from_core(&core);
     let bytes = ipc::encode_control(&report)?;
-    send_frame(stream, ipc::FrameKind::Error, stream_id, &bytes, refs).await?;
+    send_frame(sink, ipc::FrameKind::Error, &bytes).await?;
     let outcome = if cancelled {
         OUTCOME_CANCELLED
     } else {
         OUTCOME_FAILED
     };
-    send_exit(
-        stream,
-        stream_id,
-        status,
-        report.code.as_str(),
-        outcome,
-        refs,
-    )
-    .await
+    send_exit(sink, status, report.code.as_str(), outcome).await
 }

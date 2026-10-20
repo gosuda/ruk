@@ -681,6 +681,111 @@ async fn command_stream_cancel_reports_cancelled() {
     task.abort();
 }
 
+#[tokio::test]
+async fn streams_progress_while_sibling_waits_for_stdin() {
+    let root = temp_root("concurrent");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            5,
+            "req-init-1",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-1",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let payload = command_open_payload(
+        "req-wait-1",
+        r#"["hash-object","--stdin"]"#,
+        &repo,
+        &repo,
+        "digest-wait-1",
+    );
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 1);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let typed = Driver::typed_open(&store_repo, "schema", None, None, None);
+    let (schema, exit) = driver.run_typed(3, &typed).await;
+    assert_eq!(exit.status, 0);
+    assert!(
+        !schema.is_empty(),
+        "schema answers while stream 1 waits for stdin"
+    );
+
+    driver.send(FrameKind::Stdin, 1, b"hello\n").await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    assert_eq!(grant.stream_id, 1);
+    driver.send(FrameKind::StdinEof, 1, &[]).await;
+    let (stdout, _, exit) = driver.recv_exit(1).await;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.invocation_id, "req-wait-1");
+    assert_eq!(stdout.len(), 41, "one hex id plus newline");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn per_stream_cancel_leaves_sibling_streams_live() {
+    let root = temp_root("cancel-sibling");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = command_open_payload(
+        "req-cancel-1",
+        r#"["rev-parse","--is-inside-work-tree"]"#,
+        &repo,
+        &repo,
+        "digest-cancel-1",
+    );
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Cancel, 1, &[]).await;
+
+    let (_, _, exit) = driver.recv_exit(1).await;
+    assert_eq!(exit.exit_code, 130);
+    assert!(exit.cancelled);
+    assert_eq!(exit.outcome, "CancelledBeforeCommit");
+
+    let (_, _, exit) = driver
+        .run_command(
+            3,
+            "req-after-1",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-after-1",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.outcome, "Completed");
+
+    drop(driver);
+    task.abort();
+}
+
 #[test]
 fn error_frame_carries_full_reply_and_reads_old_payloads() {
     let reply = ErrorReply::from_core(

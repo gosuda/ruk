@@ -362,6 +362,13 @@ impl StreamCredits {
     }
 
     /// Forgets both directions of `stream_id`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller after the per-stream task split; the credit-window row reuses it"
+        )
+    )]
     pub(crate) fn close_stream(&mut self, stream_id: u64) {
         self.inbound.remove(&stream_id);
         self.outbound.remove(&stream_id);
