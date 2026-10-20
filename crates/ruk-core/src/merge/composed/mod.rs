@@ -2,8 +2,8 @@
 //!
 //! The composed-file specification fixes a single structured notice record
 //! that every surface reuses unchanged: native JSON replies (`merge_notices`),
-//! the hosted IPC `MergeNotices` event, CLI stderr, and the hosted merge
-//! result. This module is that record's only definition; nothing re-defines
+//! CLI stderr, and the hosted merge result. This module is that record's only
+//! definition; nothing re-defines
 //! its fields, its coalescing rule, its entry cap, or its truncation flag.
 //!
 //! * Coalescing: repeated notices that share `(path, language, code)` collapse
@@ -461,7 +461,7 @@ impl fmt::Display for MergeNotice {
 }
 
 /// The bounded notice set of one operation: the value of the native reply
-/// field `merge_notices` and the payload of the hosted `MergeNotices` event.
+/// field `merge_notices`.
 ///
 /// Invariants (enforced at every construction and on deserialization):
 /// at most [`MAX_NOTICES`] entries; entry keys `(path, language, code)` are

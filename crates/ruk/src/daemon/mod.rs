@@ -1133,7 +1133,8 @@ async fn handle_control_frame(
         | ipc::FrameKind::StdinEof
         | ipc::FrameKind::Stdout
         | ipc::FrameKind::Stderr
-        | ipc::FrameKind::MergeNotices => {
+        | ipc::FrameKind::HookCall
+        | ipc::FrameKind::HookReply => {
             let report = ErrorReport {
                 code: ErrorCode::EInvalid.as_str().to_string(),
                 message: String::from("stream-zero carries only the handshake and control queries"),
@@ -1301,7 +1302,8 @@ async fn handle_stream_frame(
         ipc::FrameKind::Accepted
         | ipc::FrameKind::Stdout
         | ipc::FrameKind::Stderr
-        | ipc::FrameKind::MergeNotices
+        | ipc::FrameKind::HookCall
+        | ipc::FrameKind::HookReply
         | ipc::FrameKind::Exit
         | ipc::FrameKind::Error => {
             send_error_exit(
@@ -2037,7 +2039,8 @@ async fn collect_command_stdin(
             | ipc::FrameKind::Accepted
             | ipc::FrameKind::Stdout
             | ipc::FrameKind::Stderr
-            | ipc::FrameKind::MergeNotices
+            | ipc::FrameKind::HookCall
+            | ipc::FrameKind::HookReply
             | ipc::FrameKind::Exit
             | ipc::FrameKind::Error => {
                 return Ok(CollectFate::Rejected(CoreError::new(
@@ -2113,7 +2116,8 @@ async fn control_during_command(
         | ipc::FrameKind::StdinEof
         | ipc::FrameKind::Stdout
         | ipc::FrameKind::Stderr
-        | ipc::FrameKind::MergeNotices => {
+        | ipc::FrameKind::HookCall
+        | ipc::FrameKind::HookReply => {
             let err = CoreError::new(
                 ErrorCode::EInvalid,
                 "stream-zero carries only the handshake and control queries",
@@ -2242,7 +2246,8 @@ async fn await_outbound_credit(
             | ipc::FrameKind::Accepted
             | ipc::FrameKind::Stdout
             | ipc::FrameKind::Stderr
-            | ipc::FrameKind::MergeNotices
+            | ipc::FrameKind::HookCall
+            | ipc::FrameKind::HookReply
             | ipc::FrameKind::Exit
             | ipc::FrameKind::Error => {
                 return Err(Error::Core(CoreError::new(

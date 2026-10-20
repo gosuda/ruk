@@ -319,10 +319,10 @@ impl Driver {
     }
 }
 
-/// Completes the stream-zero handshake with the Go client's shape: no
-/// `protocol_minor` field.
+/// Completes the stream-zero handshake: no `protocol_minor` field, so the
+/// daemon sees zero (unknown) and still negotiates.
 async fn handshake(driver: &mut Driver) {
-    let hello = r#"{"protocol_major":1,"profile":"host","object_formats":["sha1"],"features":["credits","merge-notices","outcome-lookup"]}"#;
+    let hello = r#"{"protocol_major":1,"profile":"host","object_formats":["sha1"],"features":["credits","hooks.v1","events.v1","archive.v1"]}"#;
     driver
         .send(FrameKind::Open, CONTROL_STREAM_ID, hello.as_bytes())
         .await;
@@ -332,6 +332,11 @@ async fn handshake(driver: &mut Driver) {
     let accept: ipc::HandshakeAccept =
         ipc::decode_control(&reply.payload).expect("handshake decodes");
     assert_eq!(accept.protocol_major, 1);
+    assert_eq!(accept.profile, "host");
+    assert_eq!(
+        accept.features,
+        ["credits", "hooks.v1", "events.v1", "archive.v1"].map(String::from)
+    );
 }
 
 /// Spawns `serve_connection` on a socket pair, returning the driver end.

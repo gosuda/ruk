@@ -38,10 +38,15 @@ pub(crate) const FRAME_PREFIX_BYTES: usize = 4;
 pub(crate) const FRAME_HEADER_BYTES: usize = 9;
 
 /// Feature strings this daemon build negotiates: directional credit flow,
-/// structured merge notices, and outcome lookup for reconnects.
-pub(crate) const SUPPORTED_FEATURES: &[&str] = &["credits", "merge-notices", "outcome-lookup"];
+/// hook invocation, event streaming, and archive access.
+pub(crate) const SUPPORTED_FEATURES: &[&str] = &["credits", "hooks.v1", "events.v1", "archive.v1"];
 
 /// The kind byte of one IPC frame.
+///
+/// Discriminant 9 is retired: it once named `MergeNotices`, and it is never
+/// reused, so old captures still fail closed as unknown kinds instead of
+/// decoding as something else. Discriminants are postcard-stable and are
+/// never renumbered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub(crate) enum FrameKind {
@@ -61,12 +66,14 @@ pub(crate) enum FrameKind {
     WindowUpdate = 7,
     /// Cancels its stream, or every stream on the control channel.
     Cancel = 8,
-    /// Carries bounded structured merge notices toward the client.
-    MergeNotices = 9,
     /// Ends one invocation with a JSON [`super::ExitReport`].
     Exit = 10,
     /// Reports one invocation failure with a JSON [`super::ErrorReport`].
     Error = 11,
+    /// Carries one hook invocation toward the hook host (control frame).
+    HookCall = 12,
+    /// Carries one hook result toward the daemon (control frame).
+    HookReply = 13,
 }
 
 impl FrameKind {
@@ -84,9 +91,10 @@ impl FrameKind {
             6 => Ok(Self::Stderr),
             7 => Ok(Self::WindowUpdate),
             8 => Ok(Self::Cancel),
-            9 => Ok(Self::MergeNotices),
             10 => Ok(Self::Exit),
             11 => Ok(Self::Error),
+            12 => Ok(Self::HookCall),
+            13 => Ok(Self::HookReply),
             _ => Err(CoreError::new(
                 ErrorCode::EInvalid,
                 format!("unknown IPC frame kind {byte}"),
@@ -106,9 +114,10 @@ impl FrameKind {
             Self::Stderr => 6,
             Self::WindowUpdate => 7,
             Self::Cancel => 8,
-            Self::MergeNotices => 9,
             Self::Exit => 10,
             Self::Error => 11,
+            Self::HookCall => 12,
+            Self::HookReply => 13,
         }
     }
 
@@ -122,9 +131,10 @@ impl FrameKind {
             | Self::StdinEof
             | Self::WindowUpdate
             | Self::Cancel
-            | Self::MergeNotices
             | Self::Exit
-            | Self::Error => false,
+            | Self::Error
+            | Self::HookCall
+            | Self::HookReply => false,
         }
     }
 }
@@ -429,7 +439,9 @@ pub(crate) struct HandshakeHello {
     /// the handshake.
     #[serde(default)]
     pub protocol_minor: u32,
-    /// The requested service profile, such as `host`.
+    /// The requested service profile. This build serves the `host` profile:
+    /// the daemon accepts any non-empty profile and echoes it back in the
+    /// acceptance, leaving profile gating to later changesets.
     pub profile: String,
     /// The object formats the client speaks, such as `sha1`.
     pub object_formats: Vec<String>,
@@ -444,7 +456,7 @@ pub(crate) struct HandshakeAccept {
     pub protocol_major: u32,
     /// The negotiated protocol minor version.
     pub protocol_minor: u32,
-    /// The accepted service profile.
+    /// The accepted service profile, echoed from the handshake proposal.
     pub profile: String,
     /// The object formats both peers speak.
     pub object_formats: Vec<String>,
@@ -452,7 +464,11 @@ pub(crate) struct HandshakeAccept {
     pub features: Vec<String>,
 }
 
-/// Negotiates one handshake proposal against this build.
+/// Negotiates one handshake proposal against this build: the acceptance
+/// echoes the proposed profile, takes the lesser of the two protocol
+/// minor versions, and carries the intersection of the proposed features
+/// with [`SUPPORTED_FEATURES`]. Unknown feature names are ignored, never
+/// an error.
 ///
 /// # Errors
 /// `E_VERSION` on a protocol major mismatch, `E_INVALID` on an empty
@@ -602,12 +618,18 @@ mod tests {
 
     #[test]
     fn frame_kind_round_trip() {
-        for byte in 1u8..=11u8 {
+        for byte in (1u8..=8u8).chain(10u8..=13u8) {
             let kind = FrameKind::from_u8(byte).expect("known kind decodes");
             assert_eq!(kind.as_u8(), byte);
         }
+        // Discriminant 9 is retired and never reused.
+        assert!(FrameKind::from_u8(9).is_err());
         assert!(FrameKind::from_u8(0).is_err());
-        assert!(FrameKind::from_u8(12).is_err());
+        assert!(FrameKind::from_u8(14).is_err());
+        assert_eq!(FrameKind::from_u8(12), Ok(FrameKind::HookCall));
+        assert_eq!(FrameKind::from_u8(13), Ok(FrameKind::HookReply));
+        assert!(!FrameKind::HookCall.is_data());
+        assert!(!FrameKind::HookReply.is_data());
     }
 
     #[test]
@@ -650,6 +672,24 @@ mod tests {
         assert!(credits.consume_outbound(7, 2048).is_ok());
         credits.close_stream(7);
         assert!(credits.grant_outbound(7, 1).is_err());
+    }
+
+    #[test]
+    fn handshake_negotiates_feature_intersection() {
+        let hello = HandshakeHello {
+            protocol_major: super::SCHEMA_MAJOR,
+            protocol_minor: 0,
+            profile: String::from("host"),
+            object_formats: vec![String::from("sha1")],
+            features: vec![
+                String::from("credits"),
+                String::from("hooks.v1"),
+                String::from("no-such-feature"),
+            ],
+        };
+        let accept = negotiate(&hello).expect("unknown names still negotiate");
+        assert_eq!(accept.profile, "host");
+        assert_eq!(accept.features, ["credits", "hooks.v1"].map(String::from));
     }
 
     #[test]
