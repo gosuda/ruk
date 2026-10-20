@@ -79,6 +79,12 @@ pub struct ReceiveHooks {
     repo_dir: Option<PathBuf>,
     timeout: Duration,
     quarantine_parent: Option<PathBuf>,
+    proc_receive_prefixes: Vec<String>,
+}
+
+/// The default `proc-receive` diversion prefixes.
+fn default_proc_receive_prefixes() -> Vec<String> {
+    vec!["refs/for".to_owned()]
 }
 
 impl ReceiveHooks {
@@ -89,6 +95,7 @@ impl ReceiveHooks {
             repo_dir: None,
             timeout: HOOK_TIMEOUT,
             quarantine_parent: None,
+            proc_receive_prefixes: default_proc_receive_prefixes(),
         }
     }
 
@@ -100,7 +107,29 @@ impl ReceiveHooks {
             repo_dir: Some(repo_dir),
             timeout: HOOK_TIMEOUT,
             quarantine_parent: None,
+            proc_receive_prefixes: default_proc_receive_prefixes(),
         }
+    }
+
+    /// Overrides which ref prefixes divert to the `proc-receive` hook.
+    /// The default is `["refs/for"]`: `refs/pull/` pushes land as plain
+    /// refs unless a caller opts back in.
+    #[must_use]
+    pub fn with_proc_receive_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.proc_receive_prefixes = prefixes;
+        self
+    }
+
+    /// The configured `proc-receive` diversion prefixes.
+    #[must_use]
+    pub(crate) fn proc_receive_prefixes(&self) -> &[String] {
+        &self.proc_receive_prefixes
+    }
+
+    /// The configured quarantine parent, if any.
+    #[must_use]
+    pub(crate) fn quarantine_parent(&self) -> Option<PathBuf> {
+        self.quarantine_parent.clone()
     }
 
     /// Overrides the per-hook wall-clock budget. A zero timeout falls back
@@ -158,7 +187,7 @@ impl ReceiveHooks {
 /// return (refusal, unpack failure, cancellation) cleans up without a
 /// dedicated call.
 #[derive(Debug)]
-pub(crate) struct Quarantine {
+pub struct Quarantine {
     dir: PathBuf,
 }
 
@@ -189,23 +218,21 @@ impl Drop for Quarantine {
 static QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Materializes `staged` as loose objects plus a manifest under a fresh
-/// per-push directory, or returns `None` when hooks are disabled.
+/// per-push directory below `parent`, or returns `None` without touching
+/// the filesystem when `parent` is `None`. Callers stage only when their
+/// policy needs quarantine.
 ///
 /// The directory is created even with no staged objects (delete-only
 /// pushes still run hooks with `GIT_QUARANTINE_PATH` set, mirroring the
 /// oracle). Total bytes are bounded by the pack ingest limits that already
 /// bounded the staging, so no second quota is enforced here.
 pub(crate) fn stage_quarantine(
-    hooks: &ReceiveHooks,
+    parent: Option<PathBuf>,
     staged: Option<&StagedPack>,
 ) -> Result<Option<Quarantine>, GitError> {
-    if !hooks.enabled() {
+    let Some(parent) = parent else {
         return Ok(None);
-    }
-    let parent: PathBuf = hooks
-        .quarantine_parent
-        .clone()
-        .unwrap_or_else(std::env::temp_dir);
+    };
     let id = QUARANTINE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = parent.join(format!("ruk-quarantine-{}-{id}", std::process::id()));
     let io = |what: &str, err: std::io::Error| GitError::Io {

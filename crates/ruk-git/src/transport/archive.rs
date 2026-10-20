@@ -1421,6 +1421,7 @@ mod tests {
             fx.kind,
             &fx.head,
             &Interrupt::none(),
+            &super::super::policy::NoPolicy,
         )
         .expect("dispatch");
         assert!(out.starts_with(b"0008ACK\n0000"), "dispatched framing");
@@ -1433,6 +1434,7 @@ mod tests {
             fx.kind,
             &fx.head,
             &Interrupt::none(),
+            &super::super::policy::NoPolicy,
         )
         .expect_err("unknown command");
         assert!(matches!(err, GitError::Unsupported { .. }), "{err:?}");

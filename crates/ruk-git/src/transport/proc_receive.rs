@@ -1,17 +1,13 @@
-//! AGit review routing: diverting `refs/for/` and `refs/pull/` pushes to
-//! the `proc-receive` hook.
+//! AGit review routing: diverting configured review prefixes (default
+//! `refs/for/`) to the `proc-receive` hook.
 //!
 //! The AGit flow ("push to `refs/for/<branch>` opens a pull request")
-//! runs through git's `proc-receive` hook, not through ref updates:
-//! every repository gets `receive.procReceiveRefs` values `refs/for` and
-//! `refs/pull/` (`forgejo/modules/git/git.go`) plus a generated
-//! `hooks/proc-receive` dispatcher chaining the host's `hook proc-receive`
-//! (`forgejo/modules/git/hook_generate.go`), which creates or updates the
-//! pull request and its `refs/pull/<N>/head` ref itself
-//! (`forgejo/services/agit/agit.go`, `forgejo/services/pull/pull.go`
-//! `UpdateRef`). The review backend therefore owns the alternate-ref
-//! write; this module only diverts the commands, speaks the hook
-//! protocol, and translates the verdicts into per-ref outcomes.
+//! runs through git's `proc-receive` hook, not through ref updates.
+//! The diversion prefixes are configurable per repository hook set
+//! (default `["refs/for"]`); `refs/pull/` pushes land as plain refs
+//! unless a caller opts back in. The review backend owns the
+//! alternate-ref write; this module only diverts the commands, speaks
+//! the hook protocol, and translates the verdicts into per-ref outcomes.
 //!
 //! The diversion mirrors the oracle (`git/builtin/receive-pack.c`):
 //!
@@ -53,17 +49,12 @@ use super::hooks::{Quarantine, ReceiveHooks, apply_hook_env};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush};
 use crate::{GitError, parse_oid_for};
 
-/// Refs diverted to the `proc-receive` hook: the configured
-/// `receive.procReceiveRefs` values with oracle-style trailing slashes
-/// stripped (`forgejo/modules/git/git.go`, `proc_receive_ref_append`).
-const PROC_RECEIVE_PREFIXES: [&str; 2] = ["refs/for", "refs/pull"];
-
 /// Whether a ref name diverts to the `proc-receive` hook: equal to a
 /// configured prefix or extending it past a `/`, mirroring
-/// `proc_receive_ref_matches`.
+/// `proc_receive_ref_matches` (oracle-style trailing slashes stripped).
 #[must_use]
-pub fn is_proc_receive_ref(name: &[u8]) -> bool {
-    PROC_RECEIVE_PREFIXES.iter().any(|prefix| {
+pub(crate) fn is_proc_receive_ref(prefixes: &[String], name: &[u8]) -> bool {
+    prefixes.iter().any(|prefix| {
         let raw = prefix.as_bytes();
         name == raw || (name.starts_with(raw) && name.get(raw.len()) == Some(&b'/'))
     })
@@ -98,10 +89,10 @@ pub struct ProcReceiveCommand {
 ///
 /// The hook performed the write itself (the review backend's `UpdateRef`), so the
 /// client still reports the original ref while `post-receive` observes
-/// this review ref (see `run_proc_receive_phase` in `serve.rs`).
+/// this review ref (see [`super::policy::ScriptPolicy`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlternateRef {
-    /// The review ref, e.g. `refs/pull/1/head`.
+    /// The review ref, e.g. `refs/changes/1/head`.
     pub refname: Vec<u8>,
     /// Previous review-ref tip, when the hook sent `option old-oid`.
     pub old_oid: Option<Oid>,
@@ -259,20 +250,10 @@ pub(crate) fn run_proc_receive(
         std::thread::sleep(CONVERSE_POLL);
     }
     reap(&mut child);
-    let stderr = stderr_rx.recv_timeout(CONVERSE_GRACE).unwrap_or_default();
-    let stderr_text = String::from_utf8_lossy(&stderr);
-    if !stderr_text.trim().is_empty() {
-        tracing::warn!(
-            "proc-receive hook stderr: {}",
-            stderr_text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(512)
-                .collect::<String>()
-        );
-    }
+    // Drain the stderr pipe so a chatty hook cannot block the reap; the
+    // text itself has no channel (no tracing subscriber exists), so it is
+    // dropped after the drain.
+    let _ = stderr_rx.recv_timeout(CONVERSE_GRACE);
     if cancelled {
         return reject_all(commands, "proc-receive hook was cancelled".to_owned());
     }
@@ -874,13 +855,17 @@ mod tests {
 
     #[test]
     fn prefix_matching_mirrors_the_oracle() {
-        assert!(is_proc_receive_ref(b"refs/for/main"));
-        assert!(is_proc_receive_ref(b"refs/for/main/topic"));
-        assert!(is_proc_receive_ref(b"refs/pull/1/head"));
-        assert!(!is_proc_receive_ref(b"refs/heads/main"));
-        assert!(!is_proc_receive_ref(b"refs/forum/main"));
+        let defaults = vec!["refs/for".to_owned()];
+        assert!(is_proc_receive_ref(&defaults, b"refs/for/main"));
+        assert!(is_proc_receive_ref(&defaults, b"refs/for/main/topic"));
+        assert!(!is_proc_receive_ref(&defaults, b"refs/pull/1/head"));
+        assert!(!is_proc_receive_ref(&defaults, b"refs/heads/main"));
+        assert!(!is_proc_receive_ref(&defaults, b"refs/forum/main"));
         // A bare prefix matches like the oracle (`!*remains`); the hook
         // then refuses it (the hook: empty branch name is no review).
-        assert!(is_proc_receive_ref(b"refs/for"));
+        assert!(is_proc_receive_ref(&defaults, b"refs/for"));
+        // Opting back in restores the old pair.
+        let pair = vec!["refs/for".to_owned(), "refs/pull".to_owned()];
+        assert!(is_proc_receive_ref(&pair, b"refs/pull/1/head"));
     }
 }
