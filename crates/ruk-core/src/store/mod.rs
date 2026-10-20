@@ -1147,7 +1147,19 @@ impl Store {
         let new_oldest = match (kept, page.more) {
             (Some(seq), _) => oldest.max(seq),
             (None, false) => head.saturating_add(1),
-            (None, true) => oldest,
+            (None, true) => {
+                // Every row in this page is pruned but more rows remain:
+                // oldest must advance past the page's final deleted
+                // sequence, or a cursor inside the hole would skip the
+                // pruned rows without the expired signal.
+                let last = page
+                    .rows
+                    .last()
+                    .map(|row| Self::seq_from_event_key(&row.key))
+                    .transpose()?
+                    .unwrap_or(oldest);
+                oldest.max(last.saturating_add(1))
+            }
         };
         if new_oldest != oldest || head_raw.is_none() {
             let row = EventHeadRow {
@@ -3844,5 +3856,62 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, 2);
         assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 2 });
+    }
+
+    #[test]
+    fn events_sweep_full_page_advances_oldest_past_pruned() {
+        let temp = TempRoot::new("events-sweep-full-page");
+        let store = create(&temp, HashKind::Sha1);
+        let mut facts = Vec::new();
+        for seq in 1_u64..=3 {
+            let event = StoreEvent {
+                name: format!("refs/heads/e{seq}").into_bytes(),
+                old: None,
+                new: Some(b"v1".to_vec()),
+                at: 1_000,
+                source: EventSource::Lane,
+                operation: None,
+                request_id: None,
+                session: None,
+            };
+            facts.push(FactMutation {
+                table: FactTable::Events,
+                key: seq.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &event).expect("encode")),
+            });
+        }
+        facts.push(FactMutation {
+            table: FactTable::EventHead,
+            key: EVENT_HEAD_KEY.to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(
+                encode("event head", &EventHeadRow { head: 3, oldest: 1 }).expect("encode"),
+            ),
+        });
+        store
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("seed events");
+        // The first page prunes every row it holds while more rows
+        // remain: oldest must jump past the page, not stay behind it.
+        let deletions = store.sweep_events_page(5_000, 2).expect("sweep");
+        assert_eq!(deletions.len(), 3, "two event rows plus the head bump");
+        store
+            .publish(
+                Vec::new(),
+                &deletions,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("publish sweep");
+        assert_eq!(read_head(&store), EventHeadRow { head: 3, oldest: 3 });
+        let remaining = read_events(&store);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 3);
     }
 }
