@@ -401,11 +401,43 @@ impl Store {
         budget: Arc<PreparationBudget>,
         timeout: Duration,
     ) -> Result<Self, StoreError> {
+        Self::open_with_timeout_inner(root, root, budget, timeout)
+    }
+
+    /// Opens the store at `open_root` while recording `record_root`: every
+    /// file access during the open travels `open_root`, so callers holding
+    /// a containment descriptor open through `/proc/self/fd` and keep the
+    /// recorded root free of process-local file descriptor numbers. The
+    /// recorded root must name the same directory.
+    ///
+    /// # Errors
+    /// As for [`Store::open`].
+    pub fn open_pinned(
+        open_root: &Path,
+        record_root: &Path,
+        budget: Arc<PreparationBudget>,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_timeout_inner(
+            open_root,
+            record_root,
+            budget,
+            metadata::open_wait_timeout(),
+        )
+    }
+
+    fn open_with_timeout_inner(
+        open_root: &Path,
+        record_root: &Path,
+        budget: Arc<PreparationBudget>,
+        timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let profiling = profile_enabled();
         let total = ProfileClock::now(profiling);
         let mut clock = ProfileClock::now(profiling);
-        let root = std::path::absolute(root)?;
+        let root = std::path::absolute(open_root)?;
         let root = root.as_path();
+        let record_root = std::path::absolute(record_root)?;
+        let record_root = record_root.as_path();
         let (format, format_file) = read_format(root)?;
         let format_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
@@ -455,7 +487,7 @@ impl Store {
         // reopening those segments on first serve.
         let recovery_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
-        let mut store = Self::assemble(root, format, meta, budget, guards, recovered);
+        let mut store = Self::assemble(record_root, format, meta, budget, guards, recovered);
         store.segment_fds = segment_fds;
         let assemble_ms = clock.elapsed_ms();
         if profiling {

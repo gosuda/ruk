@@ -203,6 +203,30 @@ impl Registry {
             .unwrap_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository path is unknown")))
     }
 
+    /// Resolves `requested` with its kernel pin held: the descriptor
+    /// stays open through the store open so verification can tell a
+    /// swapped path from the resolved directory.
+    ///
+    /// # Errors
+    /// As for [`Registry::resolve`].
+    pub(crate) fn resolve_pinned(
+        &self,
+        requested: &Path,
+    ) -> Result<ruk_core::contained::PinnedDir, CoreError> {
+        let mut refused: Option<CoreError> = None;
+        for root in &self.roots {
+            match ruk_core::contained::resolve_contained_pinned(root, requested) {
+                Ok(pinned) => return Ok(pinned),
+                Err(err) if err.code == ErrorCode::ENotFound => continue,
+                Err(err) => {
+                    refused = Some(err);
+                }
+            }
+        }
+        Err(refused
+            .unwrap_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository path is unknown")))
+    }
+
     /// Resolves a not-yet-existing destination beneath a configured root:
     /// the nearest existing ancestor is canonicalized and symlink
     /// components below it are refused (see `ruk_core::contained`).
@@ -251,15 +275,17 @@ impl Registry {
         &self,
         repo_ref: &str,
     ) -> Result<(String, PathBuf, Arc<HostedCoordinator>), CoreError> {
-        let (handle, path) = if repo_ref.starts_with('/') {
-            let path = self.resolve(Path::new(repo_ref))?;
-            let handle = self.handle_for_path(&path)?;
-            (handle, path)
+        let (handle, pinned) = if repo_ref.starts_with('/') {
+            let pinned = self.resolve_pinned(Path::new(repo_ref))?;
+            let handle = self.handle_for_path(pinned.path())?;
+            (handle, pinned)
         } else {
-            let path = self.open_by_handle(repo_ref)?;
-            (repo_ref.to_string(), path)
+            let stored = self.open_by_handle(repo_ref)?;
+            let pinned = self.resolve_pinned(&stored)?;
+            (repo_ref.to_string(), pinned)
         };
-        let coordinator = self.coordinator_for(&handle, &path)?;
+        let path = pinned.path().to_path_buf();
+        let coordinator = self.coordinator_for(&handle, pinned)?;
         Ok((handle, path, coordinator))
     }
 
@@ -276,7 +302,7 @@ impl Registry {
     fn coordinator_for(
         &self,
         handle: &str,
-        canonical: &Path,
+        pinned: ruk_core::contained::PinnedDir,
     ) -> Result<Arc<HostedCoordinator>, CoreError> {
         let runtime = self
             .runtime
@@ -296,14 +322,33 @@ impl Registry {
             entry.last_used = Instant::now();
             return Ok(Arc::clone(coordinator));
         }
-        let store = Store::open(canonical, Arc::new(PreparationBudget::reference_defaults()))
-            .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
-        let owner = Self::repository_owner(canonical)?;
-        let coordinator = Arc::new(HostedCoordinator::open(
-            Arc::new(store),
-            owner,
-            canonical.to_path_buf(),
-        )?);
+        let canonical = pinned.path().to_path_buf();
+        #[cfg(unix)]
+        let store = match pinned.open_path() {
+            Some(proc_root) => Store::open_pinned(
+                &proc_root,
+                &canonical,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .map_err(|err| CoreError::new(err.code(), err.to_string()))?,
+            None => Store::open(
+                &canonical,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .map_err(|err| CoreError::new(err.code(), err.to_string()))?,
+        };
+        #[cfg(not(unix))]
+        let store = Store::open(
+            &canonical,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+        pinned.verify_open(&canonical)?;
+        let owner = match pinned.owner_uid() {
+            Some(uid) => Principal::from_peer_uid(uid),
+            None => Self::repository_owner(&canonical)?,
+        };
+        let coordinator = Arc::new(HostedCoordinator::open(Arc::new(store), owner, canonical)?);
         let runner = coordinator.spawn_on(&runtime)?;
         coordinator
             .set_event_retention_seconds(self.event_retention_seconds.load(Ordering::Relaxed));
@@ -908,6 +953,77 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         worker.join().expect("swapper thread joins");
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_swap_never_opens_outside_store() {
+        use ruk_core::ids::HashKind;
+        use ruk_core::store::{PreparationBudget, Store};
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = scratch_root();
+        let stashed = root.join("stashed");
+        let shadow = root.join("shadow");
+        let victim = root.join("victim");
+        for dir in [&victim, &shadow] {
+            std::fs::create_dir_all(dir.join(".ruk")).expect("scratch dir fits on disk");
+        }
+        let budget = || Arc::new(PreparationBudget::reference_defaults());
+        let inside = Store::create(&victim.join(".ruk"), HashKind::Sha1, budget())
+            .expect("inside store creates")
+            .store_id();
+        Store::create(&shadow.join(".ruk"), HashKind::Sha1, budget())
+            .expect("outside store creates");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let victim = victim.clone();
+            let stashed = stashed.clone();
+            let shadow = shadow.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut to_live = false;
+                while !stop.load(Ordering::Relaxed) {
+                    if to_live {
+                        let _ = std::fs::remove_file(&victim);
+                        let _ = std::fs::rename(&stashed, &victim);
+                    } else {
+                        let _ = std::fs::rename(&victim, &stashed);
+                        let _ = symlink(&shadow, &victim);
+                    }
+                    to_live = !to_live;
+                }
+            })
+        };
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root registers");
+        let target = victim.join(".ruk");
+        let mut oks = 0u32;
+        for _ in 0..200 {
+            let pinned = match registry.resolve_pinned(&target) {
+                Ok(pinned) => pinned,
+                Err(_) => continue,
+            };
+            let Some(proc_root) = pinned.open_path() else {
+                continue;
+            };
+            let store = match Store::open_pinned(&proc_root, pinned.path(), budget()) {
+                Ok(store) => store,
+                Err(_) => continue,
+            };
+            if pinned.verify_open(pinned.path()).is_err() {
+                continue;
+            }
+            oks += 1;
+            assert_eq!(
+                store.store_id(),
+                inside,
+                "an open through the swap never serves the outside store"
+            );
+        }
+        assert!(oks > 0, "the race exercised at least one open");
+        stop.store(true, Ordering::Relaxed);
+        worker.join().expect("swapper thread joins");
     }
 
     #[test]
