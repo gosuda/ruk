@@ -785,7 +785,7 @@ fn local_push_inner(
             &EventContext::default(),
         )?;
     }
-    let (mut report, _) = apply_refs(dest, kind, &live, req.atomic)?;
+    let (mut report, _) = apply_refs(dest, kind, &live, req.atomic, None)?;
     report.extend(outcomes);
     plan.finalize(report.clone())?;
     persist_plan(dest, plan, kind, plan_encoding(dest, plan)?)?;
@@ -819,7 +819,12 @@ pub(crate) fn apply_refs(
     kind: HashKind,
     live: &[&PushUpdate],
     atomic: bool,
+    on_behalf_of: Option<&str>,
 ) -> Result<(Vec<RefOutcome>, Vec<RefEvent>), GitError> {
+    let context = EventContext {
+        on_behalf_of: on_behalf_of.map(str::to_owned),
+        ..EventContext::default()
+    };
     let zero = kind.zero_oid();
     let to_update = |update: &PushUpdate| -> Result<RefUpdate, GitError> {
         let name = RefName::new(update.name.clone()).map_err(|err| GitError::Invalid {
@@ -850,7 +855,7 @@ pub(crate) fn apply_refs(
             Vec::new(),
             &prepared.into_mutations(),
             EventSource::ReceivePack,
-            &EventContext::default(),
+            &context,
         ) {
             Ok(publication) => Ok((
                 live.iter()
@@ -900,7 +905,7 @@ pub(crate) fn apply_refs(
                         Vec::new(),
                         &prepared.into_mutations(),
                         EventSource::ReceivePack,
-                        &EventContext::default(),
+                        &context,
                     ) {
                         Ok(publication) => {
                             ref_events.extend(publication.ref_events);

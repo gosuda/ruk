@@ -91,6 +91,7 @@ use metadata::{Metadata, PublicationTxn};
 use pinned::{PinnedRoot, segment_rel};
 use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
 use segment::SegmentWriter;
+use types::decode_store_event;
 
 /// Longest delta chain accepted on write and read.
 pub(crate) const MAX_DELTA_DEPTH: u8 = 50;
@@ -1109,6 +1110,7 @@ impl Store {
                 operation: context.operation,
                 request_id: context.request_id.clone(),
                 session: context.session,
+                on_behalf_of: context.on_behalf_of.clone(),
             };
             out.push(FactMutation {
                 table: FactTable::Events,
@@ -1175,7 +1177,7 @@ impl Store {
         let mut out = Vec::new();
         let mut kept: Option<u64> = None;
         for row in &page.rows {
-            let event: StoreEvent = decode("event", &row.value)?;
+            let event: StoreEvent = decode_store_event(&row.value)?;
             if event.at < cutoff_millis {
                 out.push(FactMutation {
                     table: FactTable::Events,
@@ -3746,7 +3748,7 @@ mod tests {
             .map(|row| {
                 let seq =
                     u64::from_be_bytes(row.key.as_slice().try_into().expect("8-byte event key"));
-                let event: StoreEvent = decode("event", &row.value).expect("decode event");
+                let event: StoreEvent = decode_store_event(&row.value).expect("decode event");
                 (seq, event)
             })
             .collect()
@@ -3801,6 +3803,7 @@ mod tests {
             operation: Some(OperationId(7)),
             request_id: Some("req-lane".to_string()),
             session: Some(SessionId::from_bytes([3; 16])),
+            on_behalf_of: Some("agent-lane".to_string()),
         };
         let lane = [mutation(
             FactTable::Refs,
@@ -3834,7 +3837,9 @@ mod tests {
         assert_eq!(events[0].1.operation, Some(OperationId(7)));
         assert_eq!(events[0].1.request_id.as_deref(), Some("req-lane"));
         assert_eq!(events[0].1.session, Some(SessionId::from_bytes([3; 16])));
+        assert_eq!(events[0].1.on_behalf_of.as_deref(), Some("agent-lane"));
         assert_eq!(events[1].1.operation, None);
+        assert_eq!(events[1].1.on_behalf_of, None);
         assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 1 });
     }
 
@@ -3851,6 +3856,7 @@ mod tests {
             operation: None,
             request_id: None,
             session: None,
+            on_behalf_of: None,
         };
         let new_event = StoreEvent {
             name: b"refs/heads/new".to_vec(),
@@ -3861,6 +3867,7 @@ mod tests {
             operation: None,
             request_id: None,
             session: None,
+            on_behalf_of: None,
         };
         let facts = [
             FactMutation {
@@ -3923,6 +3930,7 @@ mod tests {
                 operation: None,
                 request_id: None,
                 session: None,
+                on_behalf_of: None,
             };
             facts.push(FactMutation {
                 table: FactTable::Events,

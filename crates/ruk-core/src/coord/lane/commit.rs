@@ -94,6 +94,7 @@ fn candidate_attribution(m: &ActiveMutation) -> EventContext {
         operation: m.allocated_op,
         request_id: Some(m.candidate.request_id.to_string()),
         session: Some(m.candidate.session.id()),
+        on_behalf_of: m.candidate.on_behalf_of.clone(),
     }
 }
 

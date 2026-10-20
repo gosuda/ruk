@@ -486,6 +486,7 @@ pub fn serve_receive_pack<R: Read, W: Write>(
         &NoPolicy,
         lfs,
         ReceiveLimits::default(),
+        None,
     )?;
     Ok(())
 }
@@ -597,7 +598,12 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     policy: &dyn ReceivePolicy,
     lfs: LfsMode,
     limits: ReceiveLimits,
+    on_behalf_of: Option<&str>,
 ) -> Result<Vec<u64>, GitError> {
+    let context = EventContext {
+        on_behalf_of: on_behalf_of.map(str::to_owned),
+        ..EventContext::default()
+    };
     if store.hash_kind() != kind {
         return Err(GitError::ObjectFormat {
             detail: "serving store uses another object format".to_owned(),
@@ -882,7 +888,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             pack.into_objects(),
             &facts,
             EventSource::ReceivePack,
-            &EventContext::default(),
+            &context,
         )
     {
         let err = GitError::from(err);
@@ -902,7 +908,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
         .collect();
     let mut operation_ids: Vec<u64> = Vec::new();
     if !atomic && !survivors.is_empty() {
-        match apply_refs(store, kind, &survivors, false) {
+        match apply_refs(store, kind, &survivors, false, on_behalf_of) {
             Ok((outcomes, ref_events)) => {
                 for outcome in &outcomes {
                     if let Some((index, _)) =
@@ -939,7 +945,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     // provisional `ok` above confirms only after the review ref lands.
     if !divert_writes.is_empty() {
         let updates: Vec<&PushUpdate> = divert_writes.iter().map(|(_, update)| update).collect();
-        match apply_refs(store, kind, &updates, false) {
+        match apply_refs(store, kind, &updates, false, on_behalf_of) {
             Ok((outcomes, ref_events)) => {
                 for outcome in &outcomes {
                     if let Some(position) = divert_writes
@@ -1084,6 +1090,7 @@ pub fn serve_command<R: Read, W: Write>(
             policy,
             LfsMode::Deny,
             ReceiveLimits::default(),
+            None,
         )
         .map(|_| ()),
         "upload-archive" => {
@@ -1488,6 +1495,7 @@ mod tests {
             &NoPolicy,
             LfsMode::Deny,
             limits,
+            None,
         )
     }
 
@@ -1674,6 +1682,7 @@ mod tests {
             &policy,
             LfsMode::Deny,
             ReceiveLimits::default(),
+            None,
         )
         .expect("atomic refusal stays in-band");
         assert_eq!(
@@ -1837,6 +1846,7 @@ mod tests {
             &NoPolicy,
             mode,
             ReceiveLimits::default(),
+            None,
         )
         .expect("serve reports refusals in-band");
         report_lines(&out)
@@ -2180,6 +2190,7 @@ mod tests {
                     max_push_options: limit,
                     ..ReceiveLimits::default()
                 },
+                None,
             );
             assert_eq!(
                 result.is_ok(),
@@ -2226,6 +2237,7 @@ mod tests {
                                 &NoPolicy,
                                 LfsMode::Deny,
                                 ReceiveLimits::default(),
+                                None,
                             )
                             .expect("identical push lands");
                             (seqs, report_lines(&out))
@@ -2287,6 +2299,7 @@ mod tests {
                 &NoPolicy,
                 LfsMode::Deny,
                 ReceiveLimits::default(),
+                None,
             )
             .expect("race serves in-band refusals");
             report_lines(&out)
@@ -2342,6 +2355,7 @@ mod tests {
             policy,
             LfsMode::Deny,
             ReceiveLimits::default(),
+            None,
         )
         .expect("serve completes refused pushes in-band");
         report_lines(&out)

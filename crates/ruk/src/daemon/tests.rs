@@ -41,7 +41,8 @@ use ruk_core::protocol::{
     TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
-use ruk_core::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, FactTable, ObjectKind, PreparationBudget, Store};
+use ruk_core::store::{FactPageBudget, types::decode_store_event};
 use ruk_git::transport::host::{HookCall, HookPhase, HookRefVerdict, HookReply, HookVerdict};
 use ruk_git::transport::serve::ReceiveLimits;
 use ruk_git::transport::{Interrupt, pack as git_pack};
@@ -2620,6 +2621,99 @@ async fn receive_ref_already_at_new_on_replay_is_ok() {
     assert!(
         text.contains("ok refs/heads/scratch"),
         "already-at-new must report ok, got {text:?}"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn hosted_push_records_envelope_provenance_in_events() {
+    let root = temp_root("host-provenance");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload_full(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-provenance-1"),
+        "",
+        Some("agent-push"),
+    );
+    let (out, exit) = driver
+        .run_git_hosted(5, &payload, &[body], accept_all)
+        .await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ok refs/heads/scratch"),
+        "push must land, got {text:?}"
+    );
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let page = coordinator
+        .store()
+        .fact_page(
+            FactTable::Events,
+            None,
+            FactPageBudget::new(100, usize::MAX),
+        )
+        .expect("read events");
+    assert!(!page.rows.is_empty(), "the push emits one event");
+    let event = page
+        .rows
+        .iter()
+        .map(|row| decode_store_event(&row.value).expect("event decodes"))
+        .rfind(|event| event.name == b"refs/heads/scratch")
+        .expect("the push emits the scratch event");
+    assert_eq!(
+        event.on_behalf_of.as_deref(),
+        Some("agent-push"),
+        "the stored event carries the envelope provenance"
+    );
+
+    let payload = Driver::typed_open(
+        &store_repo,
+        "events.tail",
+        None,
+        Some("{\"after\":0,\"limit\":100}".to_string()),
+        Some(&session),
+    );
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let envelope: ReplyEnvelope = ipc::decode_control(&stdout).expect("tail decodes");
+    let ReplyBody::Success(Reply::EventsTail(tail)) = envelope.body else {
+        panic!("events.tail must answer its own reply");
+    };
+    assert!(
+        tail.events
+            .iter()
+            .any(|event| event.name.as_bytes() == b"refs/heads/scratch"),
+        "provenance rows still page"
     );
 
     drop(driver);

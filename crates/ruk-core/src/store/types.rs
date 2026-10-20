@@ -385,6 +385,8 @@ pub struct EventContext {
     pub request_id: Option<String>,
     /// The session that moved the ref, if any.
     pub session: Option<SessionId>,
+    /// Provenance the invoking call declared; recorded, never authorized on.
+    pub on_behalf_of: Option<String>,
 }
 
 /// One ref event: the `Events` row at the big-endian sequence key, naming
@@ -407,6 +409,46 @@ pub struct StoreEvent {
     pub request_id: Option<String>,
     /// The session that moved the ref, if any.
     pub session: Option<SessionId>,
+    /// Provenance the invoking call declared; recorded, never authorized on.
+    /// Appended last so older rows decode through [`StoreEventV1`].
+    /// Never surfaced in `TailedEvent`.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+}
+
+/// Pre-provenance ref event: the [`StoreEvent`] shape before the trailing
+/// `on_behalf_of` field. Decode-only outside tests, for rows written before
+/// provenance existed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoreEventV1 {
+    pub name: Vec<u8>,
+    pub old: Option<Vec<u8>>,
+    pub new: Option<Vec<u8>>,
+    pub at: u64,
+    pub source: EventSource,
+    pub operation: Option<OperationId>,
+    pub request_id: Option<String>,
+    pub session: Option<SessionId>,
+}
+
+/// Decodes one `Events` row: the current shape first, then the
+/// pre-provenance shape with `on_behalf_of` absent.
+pub fn decode_store_event(raw: &[u8]) -> Result<StoreEvent, crate::store::StoreError> {
+    if let Ok(event) = crate::store::decode("event", raw) {
+        return Ok(event);
+    }
+    let old: StoreEventV1 = crate::store::decode("event", raw)?;
+    Ok(StoreEvent {
+        name: old.name,
+        old: old.old,
+        new: old.new,
+        at: old.at,
+        source: old.source,
+        operation: old.operation,
+        request_id: old.request_id,
+        session: old.session,
+        on_behalf_of: None,
+    })
 }
 
 /// The `EventHead` row: the event sequence horizon. `head` is the last
@@ -693,5 +735,51 @@ mod tests {
         bad[3] = 0xFF;
         assert_version("non-UTF-8 byte", &bad);
         assert_version("foreign content", b"not a store marker\n");
+    }
+
+    fn sample_event() -> StoreEvent {
+        StoreEvent {
+            name: b"refs/heads/main".to_vec(),
+            old: None,
+            new: Some(b"tip".to_vec()),
+            at: 1_000,
+            source: EventSource::ReceivePack,
+            operation: None,
+            request_id: Some("req-1".to_string()),
+            session: None,
+            on_behalf_of: Some("agent-x".to_string()),
+        }
+    }
+
+    #[test]
+    fn event_decode_reads_current_provenance() {
+        let event = sample_event();
+        let raw = crate::store::encode("event", &event).expect("encode");
+        let back = decode_store_event(&raw).expect("decode");
+        assert_eq!(back, event);
+    }
+
+    #[test]
+    fn event_decode_falls_back_to_pre_provenance_rows() {
+        let event = sample_event();
+        let old = StoreEventV1 {
+            name: event.name.clone(),
+            old: event.old.clone(),
+            new: event.new.clone(),
+            at: event.at,
+            source: event.source,
+            operation: event.operation,
+            request_id: event.request_id.clone(),
+            session: event.session,
+        };
+        let raw = crate::store::encode("event", &old).expect("encode v1");
+        assert!(
+            crate::store::decode::<StoreEvent>("event", &raw).is_err(),
+            "pre-provenance bytes must not decode as the current shape"
+        );
+        let back = decode_store_event(&raw).expect("fallback decodes");
+        assert_eq!(back.on_behalf_of, None);
+        assert_eq!(back.name, event.name);
+        assert_eq!(back.request_id, event.request_id);
     }
 }

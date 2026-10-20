@@ -792,7 +792,7 @@ impl HostedCoordinator {
                     )
                 })?);
                 let stored: StoreEvent =
-                    crate::store::decode("event", &row.value).map_err(CoreError::from)?;
+                    crate::store::types::decode_store_event(&row.value).map_err(CoreError::from)?;
                 if let Some(want) = prefix
                     && !stored.name.starts_with(want.as_bytes())
                 {

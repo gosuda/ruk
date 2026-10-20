@@ -1927,6 +1927,7 @@ async fn serve_git_service(
             commands,
             stdin: stdin_bytes,
             limits: req.limits.receive_limits(),
+            on_behalf_of: req.on_behalf_of.clone(),
         })
         .await;
         return;
@@ -2055,6 +2056,7 @@ struct HostedReceive<'a> {
     commands: Vec<Vec<u8>>,
     stdin: Vec<u8>,
     limits: ReceiveLimits,
+    on_behalf_of: Option<String>,
 }
 
 /// Relays one hook exchange: sends the callback, awaits its reply under
@@ -2143,6 +2145,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
         commands,
         stdin,
         limits,
+        on_behalf_of,
     } = h;
     if commands.len() > refs.registry.hook_max_commands() {
         let _ = send_error_exit(
@@ -2190,6 +2193,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     let serve_coordinator = Arc::clone(&coordinator);
     let serve_flag = Arc::clone(&cancel_flag);
     let serve_limits = limits;
+    let serve_provenance = on_behalf_of;
     let serve = refs.transport.run(move || {
         let store = serve_coordinator.store();
         let kind = store.hash_kind();
@@ -2206,6 +2210,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
             &*serve_policy,
             lfs,
             serve_limits,
+            serve_provenance.as_deref(),
         )?;
         Ok::<_, CoreError>((out, seqs))
     });
