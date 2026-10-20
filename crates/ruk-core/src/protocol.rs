@@ -731,6 +731,12 @@ pub struct StagedObject {
 pub struct StreamId(pub u64);
 
 /// Where a read reply's bytes are: in the frame, or on a stream.
+/// Producers must use `Streamed` for any body that would push the
+/// reply past [`MAX_CONTROL_FRAME_BYTES`]; the transport layer writes
+/// exactly `size` bytes on `stream` after the reply frame, and the
+/// caller correlates them by stream id. No served read produces one
+/// yet: every served page fits the control bound with room to spare,
+/// and the first bulk-body producer owns the delivery half.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ByteSource {

@@ -630,6 +630,16 @@ mod tests {
     }
 
     #[test]
+    fn control_encode_refuses_over_bound() {
+        use super::{ErrorCode, encode_control};
+
+        assert!(encode_control(&"small".to_string()).is_ok());
+        assert!(encode_control(&"x".repeat(MAX_IPC_CONTROL_BYTES - 2)).is_ok());
+        let err = encode_control(&"x".repeat(MAX_IPC_CONTROL_BYTES)).expect_err("over bound");
+        assert_eq!(err.code, ErrorCode::ELimit);
+    }
+
+    #[test]
     fn data_and_control_bounds_differ() {
         assert!(FrameKind::Stdout.is_data());
         assert!(!FrameKind::Open.is_data());

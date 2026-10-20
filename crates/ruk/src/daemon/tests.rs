@@ -4288,3 +4288,83 @@ async fn admin_dispatch_gates_before_any_coordinator_call() {
     .expect_err("non-admin refused");
     assert_eq!(err.code, ErrorCode::EForbidden);
 }
+
+#[tokio::test]
+async fn largest_served_tail_page_fits_control_bound() {
+    use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
+
+    use super::{Caller, InvocationOpen, dispatch_method};
+
+    let root = temp_root("tail-bound");
+    seed_store(root.to_str().expect("utf8 root"));
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Arc::new(Store::open(&root.join(".ruk"), budget).expect("open store"));
+    let peer = Principal::from_peer_uid(1000);
+    let coordinator = Arc::new(
+        HostedCoordinator::open(Arc::clone(&store), peer.clone(), root.clone())
+            .expect("open coordinator"),
+    );
+    let oid = Oid::from_bytes(&[0x31; 20]).expect("oid");
+    let updates: Vec<ruk_core::refdata::RefUpdate> = (0..1000u32)
+        .map(|index| ruk_core::refdata::RefUpdate {
+            name: RefName::new(format!("refs/heads/b{index:04}")).expect("ref name"),
+            expected: ruk_core::refdata::RefExpect::Absent,
+            change: ruk_core::refdata::RefChange::Set(ruk_core::refdata::RefTarget::Direct(oid)),
+        })
+        .collect();
+    let transaction =
+        ruk_core::refdata::RefTransaction::new(ruk_core::ids::HashKind::Sha1, updates)
+            .expect("ref transaction");
+    let prepared =
+        ruk_core::refs::prepare_checked_transaction(&store, &transaction).expect("prepare refs");
+    store
+        .publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::ReceivePack,
+            &EventContext::default(),
+        )
+        .expect("publish refs");
+
+    let _runner = coordinator
+        .spawn_on(&tokio::runtime::Handle::current())
+        .expect("spawn lane");
+    let (_handle, cancel) = cancellation();
+    let (session, _) = coordinator
+        .open_session(&peer, &SessionOpenArgs::default(), &cancel)
+        .await
+        .expect("open session");
+    let open = InvocationOpen {
+        repo: String::new(),
+        method: "events.tail".to_string(),
+        request_id: None,
+        args_json: Some("{\"after\":0,\"limit\":1000}".to_string()),
+        session_id: Some(session.to_string()),
+        on_behalf_of: None,
+    };
+    let caller = Caller {
+        principal: &peer,
+        admin_uids: &[],
+    };
+    let bytes = dispatch_method(
+        &coordinator,
+        caller,
+        &open,
+        Method::EventsTail,
+        Some(session),
+        &cancel,
+    )
+    .await
+    .expect("maximal tail page encodes");
+    assert!(
+        bytes.len() < ipc::MAX_IPC_CONTROL_BYTES,
+        "1000-event page uses {} of {} control bytes",
+        bytes.len(),
+        ipc::MAX_IPC_CONTROL_BYTES
+    );
+    let envelope: ReplyEnvelope = ipc::decode_control(&bytes).expect("reply decodes");
+    let ReplyBody::Success(Reply::EventsTail(tail)) = envelope.body else {
+        panic!("events.tail must answer its own reply");
+    };
+    assert_eq!(tail.events.len(), 1000);
+}
