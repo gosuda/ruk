@@ -154,7 +154,7 @@ fn read_frame<R: Read>(pkt: &mut PktReader<R>, what: &str) -> Result<Option<Vec<
 /// Largest push-option count accepted: the oracle bounds nothing, but an
 /// unbounded pre-pack read is a memory sink, and no real client (review
 /// backends use at most four AGit keys) approaches this.
-const MAX_PUSH_OPTIONS: usize = 256;
+const MAX_PUSH_OPTIONS: u64 = 256;
 
 /// One parsed `want` line: the requested OID and whether the client asked
 /// for multi-ack negotiation on this line's capability list.
@@ -413,9 +413,10 @@ fn ingest_and_verify<R: Read>(
     store: &Store,
     kind: HashKind,
     news: &[Oid],
+    limits: IngestLimits,
     interrupt: &Interrupt,
 ) -> Result<(StagedPack, Vec<FactMutation>), GitError> {
-    let staged = ingest_pack(reader, kind, store, IngestLimits::default(), interrupt)?;
+    let staged = ingest_pack(reader, kind, store, limits, interrupt)?;
     verify_closure(store, &staged, news, None, &[], interrupt)?;
     let facts = commit_record_facts(store, &staged)?;
     Ok((staged, facts))
@@ -475,7 +476,17 @@ pub fn serve_receive_pack<R: Read, W: Write>(
     interrupt: &Interrupt,
     lfs: LfsMode,
 ) -> Result<(), GitError> {
-    serve_receive_pack_with(reader, writer, store, kind, head, interrupt, &NoPolicy, lfs)?;
+    serve_receive_pack_with(
+        reader,
+        writer,
+        store,
+        kind,
+        head,
+        interrupt,
+        &NoPolicy,
+        lfs,
+        ReceiveLimits::default(),
+    )?;
     Ok(())
 }
 
@@ -531,6 +542,25 @@ pub fn git_service_digest(service: &str, commands: &[Vec<u8>], limits: &[u8]) ->
     hex
 }
 
+/// Bounds for one receive-pack round: pack ingest quotas plus the push
+/// option cap. Envelopes without explicit quotas serve with the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveLimits {
+    /// Pack ingest quotas applied to the round's pack.
+    pub ingest: IngestLimits,
+    /// Largest push-option count accepted when negotiated.
+    pub max_push_options: u64,
+}
+
+impl Default for ReceiveLimits {
+    fn default() -> Self {
+        Self {
+            ingest: IngestLimits::default(),
+            max_push_options: MAX_PUSH_OPTIONS,
+        }
+    }
+}
+
 /// Serves one `receive-pack` session with quarantine staging and hook
 /// phases (see [`super::hooks`]): the pack stages unpublished, hooks
 /// observe it through the quarantine directory, staged objects publish
@@ -566,6 +596,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     interrupt: &Interrupt,
     policy: &dyn ReceivePolicy,
     lfs: LfsMode,
+    limits: ReceiveLimits,
 ) -> Result<Vec<u64>, GitError> {
     if store.hash_kind() != kind {
         return Err(GitError::ObjectFormat {
@@ -612,9 +643,9 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
     let mut push_options: Vec<String> = Vec::new();
     if client_push_options {
         while let Some(line) = read_frame(&mut pkt, "push options")? {
-            if push_options.len() >= MAX_PUSH_OPTIONS {
+            if push_options.len() as u64 >= limits.max_push_options {
                 return Err(GitError::Limit {
-                    detail: format!("push sent more than {MAX_PUSH_OPTIONS} options"),
+                    detail: format!("push sent more than {} options", limits.max_push_options),
                 });
             }
             let option =
@@ -656,7 +687,7 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
             .filter(|cmd| cmd.new != zero)
             .map(|cmd| cmd.new)
             .collect();
-        match ingest_and_verify(pkt.get_mut(), store, kind, &news, interrupt) {
+        match ingest_and_verify(pkt.get_mut(), store, kind, &news, limits.ingest, interrupt) {
             Ok((pack, commit_facts)) => {
                 staged = Some(pack);
                 facts = commit_facts;
@@ -1022,6 +1053,7 @@ pub fn serve_command<R: Read, W: Write>(
             interrupt,
             policy,
             LfsMode::Deny,
+            ReceiveLimits::default(),
         )
         .map(|_| ()),
         "upload-archive" => {
@@ -1295,6 +1327,121 @@ mod tests {
         framed(line.as_bytes())
     }
 
+    fn blob_oid(data: &[u8]) -> Oid {
+        HashKind::Sha1
+            .hash_git_object("blob", data)
+            .expect("blob hashes")
+    }
+
+    fn tree_for_blob(name: &[u8], blob: Oid) -> (Vec<u8>, Oid) {
+        let mut bytes = format!("100644 {}\0", String::from_utf8_lossy(name)).into_bytes();
+        bytes.extend_from_slice(blob.as_bytes());
+        let oid = HashKind::Sha1
+            .hash_git_object("tree", &bytes)
+            .expect("tree hashes");
+        (bytes, oid)
+    }
+
+    fn commit_for_tree(tree: Oid) -> (Vec<u8>, Oid) {
+        let body = format!(
+            "tree {}\nauthor T <t@t.invalid> 0 +0000\ncommitter T <t@t.invalid> 0 +0000\n\nlimits\n",
+            tree.to_hex()
+        );
+        let bytes = body.into_bytes();
+        let oid = HashKind::Sha1
+            .hash_git_object("commit", &bytes)
+            .expect("commit hashes");
+        (bytes, oid)
+    }
+
+    fn limit_pack() -> (Vec<u8>, Oid, usize) {
+        let blob: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        let blob_id = blob_oid(&blob);
+        let (tree_bytes, tree_id) = tree_for_blob(b"f", blob_id);
+        let (commit_bytes, commit_id) = commit_for_tree(tree_id);
+        let entries = [
+            PackEntry {
+                oid: commit_id,
+                kind: ObjectKind::Commit,
+                bytes: &commit_bytes,
+                base: None,
+            },
+            PackEntry {
+                oid: tree_id,
+                kind: ObjectKind::Tree,
+                bytes: &tree_bytes,
+                base: None,
+            },
+            PackEntry {
+                oid: blob_id,
+                kind: ObjectKind::Blob,
+                bytes: &blob,
+                base: None,
+            },
+        ];
+        let mut pack = Vec::new();
+        write_pack(&mut pack, HashKind::Sha1, &entries, &Interrupt::none()).expect("pack");
+        (pack, commit_id, blob.len())
+    }
+
+    fn pack_stats(pack: &[u8]) -> (u64, u64, u64) {
+        use gix_pack::data::input::{BytesToEntriesIter, EntryDataMode, Mode};
+        let mut stream = pack;
+        let iter = BytesToEntriesIter::new_from_header(
+            &mut stream,
+            Mode::Verify,
+            EntryDataMode::Keep,
+            HashKind::Sha1.gix(),
+        )
+        .expect("pack parses");
+        let mut count = 0u64;
+        let mut largest = 0u64;
+        let mut compressed = 0u64;
+        for item in iter {
+            let entry = item.expect("entry parses");
+            count += 1;
+            largest = largest.max(entry.decompressed_size);
+            compressed = compressed.saturating_add(entry.compressed_size);
+        }
+        (count, largest, compressed)
+    }
+
+    fn serve_push_with_limits(
+        dest: &Store,
+        new: Oid,
+        pack: &[u8],
+        limits: ReceiveLimits,
+    ) -> Result<Vec<u64>, GitError> {
+        let kind = HashKind::Sha1;
+        let mut input = command(
+            kind.zero_oid(),
+            new,
+            b"refs/heads/main",
+            Some("report-status"),
+        );
+        input.extend_from_slice(b"0000");
+        input.extend_from_slice(pack);
+        let mut out = Vec::new();
+        serve_receive_pack_with(
+            &input[..],
+            &mut out,
+            dest,
+            kind,
+            &head(),
+            &Interrupt::none(),
+            &NoPolicy,
+            LfsMode::Deny,
+            limits,
+        )
+    }
+
+    fn with_ingest(f: impl Fn(IngestLimits) -> IngestLimits) -> ReceiveLimits {
+        ReceiveLimits {
+            ingest: f(IngestLimits::default()),
+            ..ReceiveLimits::default()
+        }
+    }
+
     fn report_lines(mut out: &[u8]) -> Vec<Vec<u8>> {
         let mut pkt = PktReader::new(&mut out, Interrupt::none());
         match read_initial(&mut pkt, HashKind::Sha1).expect("advertisement") {
@@ -1558,6 +1705,7 @@ mod tests {
             &Interrupt::none(),
             &NoPolicy,
             mode,
+            ReceiveLimits::default(),
         )
         .expect("serve reports refusals in-band");
         report_lines(&out)
@@ -1664,6 +1812,257 @@ mod tests {
     /// Serves one push whose first command carries `first_caps`, with raw
     /// `middle` bytes (push-option frames) between the commands flush and
     /// the pack, returning the report lines.
+    fn pack_header_entry(type_id: u8, size: u64) -> Vec<u8> {
+        let mut first = (type_id << 4) | ((size & 0x0f) as u8);
+        let mut rest = size >> 4;
+        if rest != 0 {
+            first |= 0x80;
+        }
+        let mut out = vec![first];
+        while rest != 0 {
+            let mut byte = (rest & 0x7f) as u8;
+            rest >>= 7;
+            if rest != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+        }
+        out
+    }
+
+    fn pack_ofs_distance(distance: u64) -> Vec<u8> {
+        let mut parts = vec![(distance & 127) as u8];
+        let mut rest = distance >> 7;
+        while rest > 0 {
+            rest -= 1;
+            parts.push(0x80 | ((rest & 127) as u8));
+            rest >>= 7;
+        }
+        parts.reverse();
+        parts
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).expect("deflate");
+        encoder.finish().expect("finish")
+    }
+
+    fn delta_chain_pack() -> (Vec<u8>, Oid) {
+        let base: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
+        let mut mid = base.clone();
+        for byte in &mut mid[1000..1010] {
+            *byte = byte.wrapping_add(1);
+        }
+        let mut tip = mid.clone();
+        for byte in &mut tip[500..510] {
+            *byte = byte.wrapping_add(2);
+        }
+        let tip_id = blob_oid(&tip);
+        let (tree_bytes, tree_id) = tree_for_blob(b"f", tip_id);
+        let (commit_bytes, commit_id) = commit_for_tree(tree_id);
+        let mut pack = b"PACK".to_vec();
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&5u32.to_be_bytes());
+        let mut entry_offsets = Vec::new();
+        for (type_id, bytes) in [
+            (1u8, commit_bytes.as_slice()),
+            (2u8, tree_bytes.as_slice()),
+            (3u8, base.as_slice()),
+        ] {
+            entry_offsets.push(pack.len() as u64);
+            pack.extend_from_slice(&pack_header_entry(type_id, bytes.len() as u64));
+            pack.extend_from_slice(&zlib(bytes));
+        }
+        let mut base_offset = entry_offsets[2];
+        for (from, to) in [(&base, &mid), (&mid, &tip)] {
+            let delta = super::super::pack::encode_delta(from, to);
+            let entry_offset = pack.len() as u64;
+            pack.extend_from_slice(&pack_header_entry(6, delta.len() as u64));
+            pack.extend_from_slice(&pack_ofs_distance(entry_offset - base_offset));
+            pack.extend_from_slice(&zlib(&delta));
+            base_offset = entry_offset;
+        }
+        let mut hasher = gix_hash::hasher(HashKind::Sha1.gix());
+        hasher.update(&pack);
+        let trailer = hasher.try_finalize().expect("pack hashes");
+        pack.extend_from_slice(trailer.as_bytes());
+        (pack, commit_id)
+    }
+
+    #[test]
+    fn receive_limits_refuse_extra_objects() {
+        let (pack, commit, _) = limit_pack();
+        let (count, _, _) = pack_stats(&pack);
+        assert_eq!(count, 3, "the limit pack holds commit, tree, and blob");
+        for (limit, accepted) in [(count - 1, false), (count, true), (count + 1, true)] {
+            let dest = test_store(HashKind::Sha1);
+            let result = serve_push_with_limits(
+                &dest,
+                commit,
+                &pack,
+                with_ingest(|ingest| IngestLimits {
+                    max_objects: limit,
+                    ..ingest
+                }),
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "object quota {limit} decides the three-object push"
+            );
+            if accepted {
+                assert_eq!(result.expect("accepted push lands").len(), 1);
+            } else {
+                assert!(
+                    matches!(result, Err(GitError::Limit { .. })),
+                    "over-quota push refuses with Limit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn receive_limits_refuse_oversize_object() {
+        let (pack, commit, blob_size) = limit_pack();
+        let (_, largest, _) = pack_stats(&pack);
+        assert_eq!(largest, blob_size as u64, "the blob is the largest entry");
+        for (limit, accepted) in [(largest - 1, false), (largest, true), (largest + 1, true)] {
+            let dest = test_store(HashKind::Sha1);
+            let result = serve_push_with_limits(
+                &dest,
+                commit,
+                &pack,
+                with_ingest(|ingest| IngestLimits {
+                    max_object_bytes: limit,
+                    ..ingest
+                }),
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "object byte quota {limit} decides the push"
+            );
+            assert_eq!(
+                matches!(result, Err(GitError::Limit { .. })),
+                !accepted,
+                "over-quota push refuses with Limit"
+            );
+        }
+    }
+
+    #[test]
+    fn receive_limits_refuse_oversize_pack() {
+        let (pack, commit, _) = limit_pack();
+        let (_, _, compressed) = pack_stats(&pack);
+        assert!(compressed > 0, "the pack carries compressed bytes");
+        for (limit, accepted) in [
+            (compressed.saturating_sub(1), false),
+            (compressed, true),
+            (compressed + 1, true),
+        ] {
+            let dest = test_store(HashKind::Sha1);
+            let result = serve_push_with_limits(
+                &dest,
+                commit,
+                &pack,
+                with_ingest(|ingest| IngestLimits {
+                    max_pack_bytes: limit,
+                    ..ingest
+                }),
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "pack byte quota {limit} decides the push"
+            );
+            assert_eq!(
+                matches!(result, Err(GitError::Limit { .. })),
+                !accepted,
+                "over-quota push refuses with Limit"
+            );
+        }
+    }
+
+    #[test]
+    fn receive_limits_refuse_deep_delta_chain() {
+        let (pack, commit) = delta_chain_pack();
+        for (limit, accepted) in [(0, false), (1, true), (2, true)] {
+            let dest = test_store(HashKind::Sha1);
+            let result = serve_push_with_limits(
+                &dest,
+                commit,
+                &pack,
+                with_ingest(|ingest| IngestLimits {
+                    max_delta_depth: limit,
+                    ..ingest
+                }),
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "delta depth quota {limit} decides the two-delta push"
+            );
+            if !accepted {
+                let detail = format!("{}", result.expect_err("deep chain refuses"));
+                assert!(
+                    detail.contains("depth bound"),
+                    "deep chain refuses on depth: {detail}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn receive_limits_refuse_extra_push_options() {
+        let (pack, commit, _) = limit_pack();
+        let mut middle = Vec::new();
+        for option in ["topic=f1", "foo=bar", "baz=qux"] {
+            encode_data(&mut middle, option.as_bytes()).expect("frame");
+        }
+        middle.extend_from_slice(b"0000");
+        for (limit, accepted) in [(2, false), (3, true), (4, true)] {
+            let dest = test_store(HashKind::Sha1);
+            let mut input = command(
+                HashKind::Sha1.zero_oid(),
+                commit,
+                b"refs/heads/main",
+                Some("report-status push-options"),
+            );
+            input.extend_from_slice(b"0000");
+            input.extend_from_slice(&middle);
+            input.extend_from_slice(&pack);
+            let mut out = Vec::new();
+            let result = serve_receive_pack_with(
+                &input[..],
+                &mut out,
+                &dest,
+                HashKind::Sha1,
+                &head(),
+                &Interrupt::none(),
+                &NoPolicy,
+                LfsMode::Deny,
+                ReceiveLimits {
+                    max_push_options: limit,
+                    ..ReceiveLimits::default()
+                },
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "option cap {limit} decides the three-option push"
+            );
+            assert_eq!(
+                matches!(result, Err(GitError::Limit { .. })),
+                !accepted,
+                "over-cap push refuses with Limit"
+            );
+        }
+    }
+
     fn serve_push_raw(
         dest: &Store,
         kind: HashKind,
@@ -1691,6 +2090,7 @@ mod tests {
             &Interrupt::none(),
             policy,
             LfsMode::Deny,
+            ReceiveLimits::default(),
         )
         .expect("serve completes refused pushes in-band");
         report_lines(&out)

@@ -50,11 +50,11 @@ pub struct IngestLimits {
     /// Largest total compressed entry bytes accepted.
     pub max_pack_bytes: u64,
     /// Largest entry count accepted.
-    pub max_objects: u32,
+    pub max_objects: u64,
     /// Largest single decompressed object accepted.
     pub max_object_bytes: u64,
     /// Deepest delta chain followed before refusing.
-    pub max_delta_depth: u32,
+    pub max_delta_depth: u64,
 }
 
 impl Default for IngestLimits {
@@ -317,7 +317,7 @@ pub fn ingest_pack<R: Read>(
         let count = u64::try_from(raw.len()).map_err(|_| GitError::Limit {
             detail: "pack entry count does not fit".to_owned(),
         })?;
-        if count >= u64::from(limits.max_objects) {
+        if count >= limits.max_objects {
             return Err(GitError::Limit {
                 detail: format!("pack holds more than {} objects", limits.max_objects),
             });
@@ -415,7 +415,7 @@ pub fn stage_local_objects(
     let count = u64::try_from(objects.len()).map_err(|_| GitError::Limit {
         detail: "closure entry count does not fit".to_owned(),
     })?;
-    if count > u64::from(limits.max_objects) {
+    if count > limits.max_objects {
         return Err(GitError::Limit {
             detail: format!("closure holds more than {} objects", limits.max_objects),
         });
@@ -632,8 +632,10 @@ fn resolve_all(
     while !deferred.is_empty() {
         interrupt.check("resolving pack deltas")?;
         let mut progress = false;
-        let pending: Vec<usize> = deferred.iter().copied().collect();
-        for index in pending {
+        for index in (0..raw.len()).rev() {
+            if !deferred.contains(&index) {
+                continue;
+            }
             match resolver.resolve(index, 0)? {
                 Resolution::Done => {
                     deferred.remove(&index);
@@ -662,7 +664,7 @@ impl Resolver<'_> {
         if self.payloads[index].is_some() {
             return Ok(Resolution::Done);
         }
-        if depth > self.limits.max_delta_depth {
+        if u64::from(depth) > self.limits.max_delta_depth {
             return Err(corrupt("pack delta chain exceeds its depth bound"));
         }
         if self.resolving[index] {
@@ -711,7 +713,12 @@ impl Resolver<'_> {
                 }
                 if !self.oid_index.contains_key(&base_oid) {
                     match self.store.read(base_oid) {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let entry_depth = 1u64;
+                            if entry_depth > self.limits.max_delta_depth {
+                                return Err(corrupt("pack delta chain exceeds its depth bound"));
+                            }
+                        }
                         Err(err) if err.code() == ruk_core::error::ErrorCode::ENotFound => {
                             return Ok(Resolution::Deferred);
                         }

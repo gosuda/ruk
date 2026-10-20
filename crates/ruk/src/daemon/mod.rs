@@ -44,6 +44,8 @@ use ruk_core::protocol::{
 };
 use ruk_core::refdata::RefName;
 use ruk_git::transport::host::{HookCall, HookReply, HostPolicy, hook_bridge};
+use ruk_git::transport::pack::IngestLimits;
+use ruk_git::transport::serve::ReceiveLimits;
 
 /// Default concurrent connections of one daemon process.
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 128;
@@ -793,6 +795,21 @@ impl Default for GitLimits {
 }
 
 impl GitLimits {
+    /// Builds the receive-pack bounds from the effective envelope quotas.
+    /// Operator values wider than the ingest counters saturate instead of
+    /// refusing the stream.
+    fn receive_limits(&self) -> ReceiveLimits {
+        ReceiveLimits {
+            ingest: IngestLimits {
+                max_pack_bytes: self.max_pack_bytes,
+                max_objects: self.max_objects,
+                max_object_bytes: self.max_object_bytes,
+                max_delta_depth: self.max_delta_depth,
+            },
+            max_push_options: self.max_push_options,
+        }
+    }
+
     /// Encodes the effective limits canonically for the daemon-side digest.
     fn encode(&self) -> Vec<u8> {
         format!(
@@ -1824,6 +1841,7 @@ async fn serve_git_service(
             digest,
             commands,
             stdin: stdin_bytes,
+            limits: req.limits.receive_limits(),
         })
         .await;
         return;
@@ -1917,6 +1935,7 @@ struct HostedReceive<'a> {
     digest: String,
     commands: Vec<Vec<u8>>,
     stdin: Vec<u8>,
+    limits: ReceiveLimits,
 }
 
 /// Relays one hook exchange: sends the callback, awaits its reply under
@@ -1980,6 +1999,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
         digest,
         commands,
         stdin,
+        limits,
     } = h;
     if commands.len() > refs.registry.hook_max_commands() {
         let _ = send_error_exit(
@@ -2024,6 +2044,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     let lfs = ruk_core::mode_for_store(coordinator.store().root());
     let serve_policy = Arc::clone(&policy);
     let serve_coordinator = Arc::clone(&coordinator);
+    let serve_limits = limits;
     let serve = refs.transport.run(move || {
         let store = serve_coordinator.store();
         let kind = store.hash_kind();
@@ -2039,6 +2060,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
             &interrupt,
             &*serve_policy,
             lfs,
+            serve_limits,
         )?;
         Ok::<_, CoreError>((out, seqs))
     });

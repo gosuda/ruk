@@ -43,6 +43,7 @@ use ruk_core::protocol::{
 use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
 use ruk_core::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
 use ruk_git::transport::host::{HookCall, HookPhase, HookRefVerdict, HookReply, HookVerdict};
+use ruk_git::transport::serve::ReceiveLimits;
 
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
@@ -658,6 +659,28 @@ fn hook_max_commands_accepts_only_1_through_4096() {
     for valid in ["hook_max_commands = 1\n", "hook_max_commands = 4096\n"] {
         DaemonConfig::from_toml(&config_doc(valid)).expect("boundary must parse");
     }
+}
+
+#[test]
+fn envelope_limits_convert_to_receive_bounds() {
+    assert_eq!(
+        GitLimits::default().receive_limits(),
+        ReceiveLimits::default()
+    );
+    let saturated = GitLimits {
+        max_pack_bytes: u64::MAX,
+        max_objects: u64::MAX,
+        max_object_bytes: u64::MAX,
+        max_delta_depth: u64::MAX,
+        max_stdin_bytes: u64::MAX,
+        max_push_options: u64::MAX,
+    }
+    .receive_limits();
+    assert_eq!(saturated.ingest.max_pack_bytes, u64::MAX);
+    assert_eq!(saturated.ingest.max_objects, u64::MAX);
+    assert_eq!(saturated.ingest.max_object_bytes, u64::MAX);
+    assert_eq!(saturated.ingest.max_delta_depth, u64::MAX);
+    assert_eq!(saturated.max_push_options, u64::MAX);
 }
 
 #[test]
@@ -2221,6 +2244,83 @@ async fn socket_round_trip_push_reports_operations() {
         vec!["2".to_owned()],
         "the exit report names the landed delete event"
     );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_envelope_push_option_quota_refuses_push() {
+    let root = temp_root("option-quota");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\0report-status push-options\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    body.extend_from_slice(&pkt(b"topic=quota"));
+    body.extend_from_slice(&flush());
+
+    let open = CommandOpen {
+        service: "receive-pack".to_owned(),
+        repository: store_repo,
+        session_id: Some(session),
+        request_id: Some("req-option-quota-1".to_owned()),
+        git_protocol: String::new(),
+        advertise: false,
+        stdout_credit: 262_144,
+        limits: GitLimits {
+            max_push_options: 0,
+            ..GitLimits::default()
+        },
+        on_behalf_of: None,
+    };
+    let payload = sonic_rs::to_string(&open)
+        .expect("git-service open encodes")
+        .into_bytes();
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 5, &body).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    let err_frame = driver.recv().await;
+    assert_eq!(err_frame.kind, FrameKind::Error);
+    assert_eq!(err_frame.stream_id, 5);
+    let report: ErrorReply = ipc::decode_control(&err_frame.payload).expect("error decodes");
+    assert_eq!(report.code, ErrorCode::ELimit);
+    assert!(
+        report.message.contains("more than 0 options"),
+        "quota names its bound: {}",
+        report.message
+    );
+    let exit_frame = driver.recv().await;
+    assert_eq!(exit_frame.kind, FrameKind::Exit);
+    assert_eq!(exit_frame.stream_id, 5);
+    let exit: ExitReport = ipc::decode_control(&exit_frame.payload).expect("exit decodes");
+    assert_eq!(exit.status, 1);
+    assert_eq!(exit.outcome, "Failed");
 
     drop(driver);
     task.abort();
