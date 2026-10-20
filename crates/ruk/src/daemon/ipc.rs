@@ -19,8 +19,10 @@ use ruk_core::protocol::{SCHEMA_MAJOR, SCHEMA_MINOR};
 /// Maximum payload bytes of one data frame.
 pub(crate) const MAX_DATA_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Maximum payload bytes of one control frame.
-pub(crate) const MAX_IPC_CONTROL_BYTES: usize = 1024 * 1024;
+/// Maximum payload bytes of one control frame, aligned with the schema
+/// `control_frame_bytes` limit. The per-stream credit window stays bounded
+/// at [`MAX_STREAM_WINDOW_BYTES`], so a large bound widens no window.
+pub(crate) const MAX_IPC_CONTROL_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stream identifier of the connection control channel.
 pub(crate) const CONTROL_STREAM_ID: u64 = 0;
@@ -361,19 +363,6 @@ impl StreamCredits {
         self.outbound.insert(stream_id, window);
     }
 
-    /// Forgets both directions of `stream_id`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no caller after the per-stream task split; the credit-window row reuses it"
-        )
-    )]
-    pub(crate) fn close_stream(&mut self, stream_id: u64) {
-        self.inbound.remove(&stream_id);
-        self.outbound.remove(&stream_id);
-    }
-
     /// Adds `bytes` of outbound credit to `stream_id`.
     ///
     /// # Errors
@@ -660,6 +649,15 @@ mod tests {
     }
 
     #[test]
+    fn control_bound_matches_schema_limit() {
+        assert_eq!(MAX_IPC_CONTROL_BYTES, 16 * 1024 * 1024);
+        let midsize = vec![0u8; 2 * 1024 * 1024];
+        assert!(encode_frame(FrameKind::Open, 1, &midsize).is_ok());
+        let oversized = vec![0u8; MAX_IPC_CONTROL_BYTES + 1];
+        assert!(encode_frame(FrameKind::Open, 1, &oversized).is_err());
+    }
+
+    #[test]
     fn credit_window_exhaustion_fails() {
         let mut window = CreditWindow::new(100, 100);
         assert!(window.consume(64).is_ok());
@@ -678,8 +676,7 @@ mod tests {
         assert!(credits.consume_outbound(7, 2048).is_err());
         assert!(credits.grant_outbound(7, 4096).is_ok());
         assert!(credits.consume_outbound(7, 2048).is_ok());
-        credits.close_stream(7);
-        assert!(credits.grant_outbound(7, 1).is_err());
+        assert!(credits.grant_outbound(8, 1).is_err());
     }
 
     #[test]

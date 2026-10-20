@@ -342,6 +342,15 @@ async fn handshake(driver: &mut Driver) {
 
 /// Spawns `serve_connection` on a socket pair, returning the driver end.
 fn spawn_pair(root: &Path) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
+    spawn_pair_with_window(root, INITIAL_STREAM_WINDOW_BYTES)
+}
+
+/// Spawns `serve_connection` on a socket pair with one stream window size,
+/// so credit tests can force the daemon to wait for grants.
+fn spawn_pair_with_window(
+    root: &Path,
+    window_bytes: u64,
+) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
     let registry = Arc::new(Registry::new(vec![root.to_path_buf()]).expect("registry"));
     registry.set_runtime(tokio::runtime::Handle::current());
     let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
@@ -352,7 +361,7 @@ fn spawn_pair(root: &Path) -> (Driver, tokio::task::JoinHandle<Result<(), super:
         registry,
         executor: BoundedExecutor::new(4).expect("executor"),
         outcomes: Arc::new(std::sync::Mutex::new(OutcomeLedger::default())),
-        window_bytes: INITIAL_STREAM_WINDOW_BYTES,
+        window_bytes,
         handshake_timeout: Duration::from_secs(10),
         frame_timeout: Duration::from_secs(15),
         allowed_uids: vec![uid],
@@ -781,6 +790,78 @@ async fn per_stream_cancel_leaves_sibling_streams_live() {
         .await;
     assert_eq!(exit.exit_code, 0);
     assert_eq!(exit.outcome, "Completed");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn typed_reply_waits_for_outbound_credit() {
+    let root = temp_root("credit-wait");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+
+    let (mut driver, task) = spawn_pair_with_window(&root, 1024);
+    handshake(&mut driver).await;
+
+    let (_, _, exit) = driver
+        .run_command(
+            1,
+            "req-init-1",
+            r#"["init"]"#,
+            &repo,
+            &repo,
+            "digest-init-1",
+        )
+        .await;
+    assert_eq!(exit.exit_code, 0);
+
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let typed = Driver::typed_open(&store_repo, "schema", None, None, None);
+    driver.send(FrameKind::Open, 3, &typed).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 3);
+
+    let mut body = Vec::new();
+    let mut chunks = 0;
+    loop {
+        let grant = r#"{"credit_bytes":65536,"direction":"stdout"}"#;
+        driver
+            .send(FrameKind::WindowUpdate, 3, grant.as_bytes())
+            .await;
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, 3);
+        match frame.kind {
+            FrameKind::Stdout => {
+                chunks += 1;
+                body.extend_from_slice(&frame.payload);
+            }
+            FrameKind::Exit => {
+                let exit: ExitReport =
+                    ipc::decode_control(&frame.payload).expect("typed exit decodes");
+                assert_eq!(exit.status, 0);
+                assert_eq!(exit.code, "OK");
+                break;
+            }
+            FrameKind::Error => panic!(
+                "typed stream refused instead of waiting: {}",
+                String::from_utf8_lossy(&frame.payload)
+            ),
+            other => panic!("unexpected frame {other:?} on typed stream 3"),
+        }
+    }
+    assert!(
+        body.len() > 1024,
+        "the reply exceeds the window and still completes: {} bytes in {chunks} chunks",
+        body.len()
+    );
+    assert!(chunks > 1, "a large body streams in many chunks");
 
     drop(driver);
     task.abort();

@@ -2176,9 +2176,27 @@ enum CreditFate {
 /// Late stdin endings are ignored.
 #[cfg(unix)]
 async fn await_outbound_credit(serving: &mut CommandServing<'_>) -> CreditFate {
-    let stream_id = serving.sink.stream_id;
+    wait_outbound_credit(
+        serving.input,
+        serving.sink.stream_id,
+        serving.credits,
+        serving.cancel,
+    )
+    .await
+}
+
+/// Reads one stream channel until its client grants outbound credit,
+/// shared by command output and typed replies. Late stdin endings are
+/// ignored; a `Cancel` frame triggers the stream token.
+#[cfg(unix)]
+async fn wait_outbound_credit(
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    stream_id: u64,
+    credits: &mut ipc::StreamCredits,
+    cancel: &CancelHandle,
+) -> CreditFate {
     loop {
-        let Some(frame) = serving.input.recv().await else {
+        let Some(frame) = input.recv().await else {
             return CreditFate::InputClosed;
         };
         if frame.stream_id != stream_id {
@@ -2193,13 +2211,13 @@ async fn await_outbound_credit(serving: &mut CommandServing<'_>) -> CreditFate {
                     Ok(credit) => credit,
                     Err(err) => return CreditFate::Rejected(err),
                 };
-                match route_credit(serving.credits, stream_id, &credit) {
+                match route_credit(credits, stream_id, &credit) {
                     Ok(()) => return CreditFate::Granted,
                     Err(err) => return CreditFate::Rejected(err),
                 }
             }
             ipc::FrameKind::Cancel => {
-                serving.cancel.cancel();
+                cancel.cancel();
                 return CreditFate::Cancelled;
             }
             ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof => {}
@@ -2348,13 +2366,12 @@ async fn typed_stream(
     }
     match result {
         Ok(stdout) => {
-            if write_typed_chunks(sink, &mut credits, &stdout)
-                .await
-                .is_err()
-            {
-                return;
+            match write_typed_chunks(sink, input, &mut credits, &cancel_guard, &stdout).await {
+                TypedWriteFate::Done => {
+                    let _ = send_exit(sink, 0, "OK", "Completed").await;
+                }
+                TypedWriteFate::Cancelled | TypedWriteFate::Gone => {}
             }
-            let _ = send_exit(sink, 0, "OK", "Completed").await;
         }
         Err(err) => {
             if err.code == ErrorCode::ECancelled {
@@ -2622,35 +2639,77 @@ fn decode_request_args(
     }
 }
 
-/// Writes one typed reply in window-sized chunks. Exhaustion refuses the
-/// stream instead of waiting: waiting for credit on typed replies lands
-/// with the credit-window row.
+/// The end of one typed reply write.
+#[cfg(unix)]
+enum TypedWriteFate {
+    /// Every byte reached the writer task.
+    Done,
+    /// A `Cancel` frame arrived mid-write; the cancelled exit is sent.
+    Cancelled,
+    /// The connection reader or writer is gone.
+    Gone,
+}
+
+/// Writes one typed reply in window-sized chunks. When the outbound window
+/// exhausts, the write waits for the client to grant more credit instead
+/// of refusing, so large bodies stream as `Stdout` frames under the reply
+/// window.
 #[cfg(unix)]
 async fn write_typed_chunks(
     sink: &StreamSink,
+    input: &mut mpsc::Receiver<ipc::Frame>,
     credits: &mut ipc::StreamCredits,
+    cancel: &CancelHandle,
     bytes: &[u8],
-) -> Result<(), Error> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    for chunk in bytes.chunks(ipc::MAX_DATA_CHUNK_BYTES) {
-        let width = u64::try_from(chunk.len()).map_err(|_| {
-            Error::Core(CoreError::new(
-                ErrorCode::ELimit,
-                "data chunk exceeds its bound",
-            ))
-        })?;
-        if let Err(err) = credits.consume_outbound(sink.stream_id, width) {
-            send_error_exit(sink, &Error::from(err)).await?;
-            return Err(Error::Core(CoreError::new(
-                ErrorCode::ELimit,
-                "stream credit window is exhausted",
-            )));
+) -> TypedWriteFate {
+    let stream_id = sink.stream_id;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + ipc::MAX_DATA_CHUNK_BYTES).min(bytes.len());
+        let width = match u64::try_from(end - offset) {
+            Ok(width) => width,
+            Err(_) => {
+                let _ = send_error_exit(
+                    sink,
+                    &Error::Core(CoreError::new(
+                        ErrorCode::ELimit,
+                        "data chunk exceeds its bound",
+                    )),
+                )
+                .await;
+                return TypedWriteFate::Gone;
+            }
+        };
+        if credits.consume_outbound(stream_id, width).is_ok() {
+            if send_frame(sink, ipc::FrameKind::Stdout, &bytes[offset..end])
+                .await
+                .is_err()
+            {
+                return TypedWriteFate::Gone;
+            }
+            offset = end;
+            continue;
         }
-        send_frame(sink, ipc::FrameKind::Stdout, chunk).await?;
+        match wait_outbound_credit(input, stream_id, credits, cancel).await {
+            CreditFate::Granted => {}
+            CreditFate::Cancelled => {
+                let _ = send_exit(
+                    sink,
+                    130,
+                    ErrorCode::ECancelled.as_str(),
+                    "CancelledBeforeCommit",
+                )
+                .await;
+                return TypedWriteFate::Cancelled;
+            }
+            CreditFate::InputClosed => return TypedWriteFate::Gone,
+            CreditFate::Rejected(err) => {
+                let _ = send_error_exit(sink, &Error::Core(err)).await;
+                return TypedWriteFate::Gone;
+            }
+        }
     }
-    Ok(())
+    TypedWriteFate::Done
 }
 
 /// Queues one frame of `sink` toward the connection-writer task.
