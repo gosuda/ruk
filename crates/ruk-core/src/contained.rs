@@ -236,6 +236,87 @@ fn pinned(fd: OwnedFd, canonical: PathBuf) -> Result<PinnedDir, CoreError> {
     })
 }
 
+/// Refuses symlink components traversed while resolving an unprefixed
+/// path. `canonicalize` follows every link, so without this an in-root
+/// link whose target stays under the root passes where the prefixed
+/// route (`openat2` `NO_SYMLINKS`) refuses. Components resolving
+/// outside the root stay free to alias; once resolution reaches the
+/// root, every further spelling component, including the entering one,
+/// must be a real directory. This ends aliased-root spellings too
+/// (fail closed): operators configure canonical roots.
+///
+/// The check runs before the open, so a swap between the two still has
+/// the `openat2` pin and the post-open identity verification behind
+/// it; this closes the resolve-time gap, not the race after it.
+///
+/// # Errors
+/// `E_NOT_FOUND` for a path that vanishes mid-walk, `E_IO` when a
+/// component is unreadable, `E_FORBIDDEN` through a symlink component
+/// at or below the root.
+fn refuse_traversed_symlinks(root: &Path, absolute: &Path) -> Result<(), CoreError> {
+    let root = std::fs::canonicalize(root).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            CoreError::new(ErrorCode::ENotFound, "repository path is unknown")
+        }
+        _ => CoreError::new(
+            ErrorCode::EIo,
+            format!("repository root is not accessible: {err}"),
+        ),
+    })?;
+    let collapsed = collapse_lexical(absolute);
+    let mut resolved = PathBuf::new();
+    let mut under_root = false;
+    for component in collapsed.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                resolved = PathBuf::from(prefix.as_os_str());
+                under_root = false;
+            }
+            Component::RootDir => {
+                resolved.push(component.as_os_str());
+                under_root = false;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                under_root = resolved == root || resolved.starts_with(&root);
+            }
+            Component::Normal(part) => {
+                let candidate = resolved.join(part);
+                let is_link = std::fs::symlink_metadata(&candidate)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .map_err(|err| match err.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            CoreError::new(ErrorCode::ENotFound, "repository path is unknown")
+                        }
+                        _ => CoreError::new(
+                            ErrorCode::EIo,
+                            format!("repository path is not accessible: {err}"),
+                        ),
+                    })?;
+                resolved = std::fs::canonicalize(&candidate).map_err(|err| match err.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        CoreError::new(ErrorCode::ENotFound, "repository path is unknown")
+                    }
+                    _ => CoreError::new(
+                        ErrorCode::EIo,
+                        format!("repository path is not accessible: {err}"),
+                    ),
+                })?;
+                let now_under = resolved == root || resolved.starts_with(&root);
+                if is_link && (under_root || now_under) {
+                    return Err(CoreError::new(
+                        ErrorCode::EForbidden,
+                        "repository path passes through a symlink component",
+                    ));
+                }
+                under_root = now_under;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Handles paths no lexical prefix of `root` covers with the kernel pin
 /// held: `..` spellings may still land beneath it, so canonicalize once
 /// and re-route; anything else is outside.
@@ -267,6 +348,7 @@ fn resolve_contained_unprefixed_pinned(
             "repository path is outside the configured roots",
         )
     })?;
+    refuse_traversed_symlinks(root, absolute)?;
     if rel.as_os_str().is_empty() {
         return pin_root(root);
     }
@@ -434,4 +516,65 @@ pub fn resolve_new_destination(root: &Path, requested: &Path) -> Result<PathBuf,
         }
     }
     Ok(built)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_case(tag: &str) -> PathBuf {
+        let id = NEXT_CASE.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("ruk-contained-{}-{id}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp case");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn symlink(link: &Path, target: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unprefixed_refuses_in_root_symlink_by_outside_spelling() {
+        let base = temp_case("outside-spelling");
+        let root = base.join("root");
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        symlink(&outside.join("link"), &real);
+        let err = resolve_contained_pinned(&root, &outside.join("link"))
+            .expect_err("outside spelling of an in-root link is refused");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unprefixed_refuses_aliased_root_spelling() {
+        let base = temp_case("alias");
+        let root = base.join("root");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        symlink(&base.join("alias"), &root);
+        let err = resolve_contained_pinned(&root, &base.join("alias").join("repo"))
+            .expect_err("aliased root spelling is refused");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn canonical_spelling_still_resolves() {
+        let base = temp_case("canonical");
+        let root = base.join("root");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let pinned = resolve_contained_pinned(&root, &repo).expect("canonical spelling resolves");
+        assert!(pinned.path.starts_with(&root));
+    }
 }
