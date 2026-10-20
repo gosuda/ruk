@@ -90,7 +90,7 @@ impl Cancel {
     ///
     /// Cancellation drops the future. The caller must discard partially read
     /// streams and keep blocking-work ownership inside the blocking closure.
-    pub async fn until<F: Future>(&self, work: F) -> Result<F::Output, CoreError> {
+    pub(crate) async fn until<F: Future>(&self, work: F) -> Result<F::Output, CoreError> {
         let mut observer = self.clone();
         let mut cancelled = pin!(observer.cancelled());
         let mut work = pin!(work);

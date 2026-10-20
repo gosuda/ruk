@@ -451,10 +451,19 @@ impl Store {
         // segment open travels this descriptor, so flips of the recorded
         // path after this point cannot redirect them.
         let pin = PinnedRoot::open(root)?;
-        let (format, format_file) = read_format(root)?;
+        // The format and metadata opens travel the held descriptor when
+        // pinned, so no later segment, metadata, or format access follows
+        // the recorded path by name.
+        let format_path = pin
+            .proc_subpath(FORMAT_FILE)
+            .unwrap_or_else(|| root.join(FORMAT_FILE));
+        let (format, format_file) = read_format_file(&format_path)?;
         let format_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
-        let meta = Metadata::open_with_timeout(&root.join(META_FILE), timeout)?;
+        let meta_path = pin
+            .proc_subpath(META_FILE)
+            .unwrap_or_else(|| root.join(META_FILE));
+        let meta = Metadata::open_with_timeout(&meta_path, timeout)?;
         let meta_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
         durability::sync_file(&format_file)?;
@@ -1967,12 +1976,16 @@ fn require_absent(path: &Path) -> Result<(), StoreError> {
 /// read through. The handle can write because flushing a file needs a
 /// write-capable handle on Windows; it is never written.
 pub(crate) fn read_format(root: &Path) -> Result<(StoreFormat, File), StoreError> {
-    let mut file = match durability::open_existing(&root.join(FORMAT_FILE)) {
+    read_format_file(&root.join(FORMAT_FILE))
+}
+
+fn read_format_file(path: &Path) -> Result<(StoreFormat, File), StoreError> {
+    let mut file = match durability::open_existing(path) {
         Ok(file) => file,
         Err(StoreError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
             return Err(StoreError::NotFound(format!(
                 "no store format file under {}",
-                root.display()
+                path.display()
             )));
         }
         Err(err) => return Err(err),

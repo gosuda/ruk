@@ -11,11 +11,10 @@
 //!
 //! Without the descriptor (non-Linux builds, or callers that never
 //! pinned) every helper falls back to the recorded path, preserving the
-//! historical behavior. A kernel without `openat2` (`ENOSYS`) falls back
-//! to plain `openat` against the held descriptor: the access stays
-//! beneath the pinned directory (immune to swaps above the root) but
-//! follows symlinks below it, like the historical path behavior. Any
-//! other refusal stays an error.
+//! historical behavior. A kernel without `openat2` (`ENOSYS`) opens in
+//! two steps against the held descriptor — the parent with `O_NOFOLLOW`,
+//! then the final name with `O_NOFOLLOW` inside it — so no step traverses
+//! a symlink there either. Any other refusal stays an error.
 //!
 //! Scope: segment files only. Scratch spools (`store_root/scratch`) and
 //! LFS sidecars (`store_root/lfs/objects`) still travel the recorded
@@ -81,6 +80,27 @@ impl PinnedRoot {
             Ok(Self {
                 record: dir.to_path_buf(),
             })
+        }
+    }
+
+    /// A process-local path naming `name` inside the pinned directory:
+    /// `/proc/self/fd/<n>/<name>` while a descriptor is held, so file
+    /// APIs that only take paths (like the metadata database open) still
+    /// travel the pin instead of the recorded path. Absent without a
+    /// descriptor.
+    #[must_use]
+    pub(super) fn proc_subpath(&self, name: &str) -> Option<PathBuf> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            self.fd
+                .as_ref()
+                .map(|fd| PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())).join(name))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            None
         }
     }
 
@@ -398,6 +418,39 @@ mod tests {
         assert!(!pin.exists(&rel));
         pin.sync_segments_dir().expect("segments dir syncs");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proc_subpath_survives_a_parent_swap() {
+        let outer = std::env::temp_dir().join(format!("ruk-pinned-{}-procsub", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outer);
+        std::fs::create_dir_all(outer.join("live")).expect("live dir fits on disk");
+        std::fs::write(outer.join("live").join("marker"), b"pinned").expect("marker fits on disk");
+        std::fs::create_dir_all(outer.join("shadow")).expect("shadow dir fits on disk");
+        std::fs::write(outer.join("shadow").join("marker"), b"shadow")
+            .expect("shadow marker fits on disk");
+        let pin = PinnedRoot::open(&outer.join("live")).expect("pin live dir");
+        let sub = pin.proc_subpath("marker").expect("proc subpath");
+        assert_eq!(
+            std::fs::read(&sub).expect("read through proc subpath"),
+            b"pinned"
+        );
+        // Swap the name away and point it at the shadow: the previously
+        // resolved subpath still names the pinned directory.
+        std::fs::rename(outer.join("live"), outer.join("stashed")).expect("stash live");
+        std::os::unix::fs::symlink(outer.join("shadow"), outer.join("live"))
+            .expect("swap live link");
+        assert_eq!(
+            std::fs::read(&sub).expect("read through swap"),
+            b"pinned",
+            "a swapped parent cannot redirect the pinned subpath"
+        );
+        assert_eq!(
+            std::fs::read(outer.join("live").join("marker")).expect("read by name"),
+            b"shadow"
+        );
+        let _ = std::fs::remove_dir_all(&outer);
     }
 
     #[test]
