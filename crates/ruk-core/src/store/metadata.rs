@@ -710,6 +710,41 @@ impl Metadata {
         after: Option<&[u8]>,
         budget: FactPageBudget,
     ) -> Result<FactPage, StoreError> {
+        let lower: Bound<&[u8]> = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.fact_page_range(table, lower, None, budget)
+    }
+
+    /// A bounded page of raw fact rows under `prefix`, seeking inclusively
+    /// at the prefix when `after` is absent and exclusively after `after`
+    /// otherwise. Stops at the first key outside `prefix`, so prefix
+    /// listings never scan the whole namespace. `more` is true only while
+    /// rows under the prefix may remain.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for zero rows or bytes in `budget`;
+    /// [`StoreError::Limit`] if the first row alone exceeds the byte budget;
+    /// [`StoreError::Corrupt`] or [`StoreError::Storage`] for redb failures.
+    pub(crate) fn fact_page_prefixed(
+        &self,
+        table: FactTable,
+        after: Option<&[u8]>,
+        prefix: &[u8],
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
+        let lower: Bound<&[u8]> = match after {
+            Some(key) => Bound::Excluded(key),
+            None => Bound::Included(prefix),
+        };
+        self.fact_page_range(table, lower, Some(prefix), budget)
+    }
+
+    fn fact_page_range(
+        &self,
+        table: FactTable,
+        lower: Bound<&[u8]>,
+        prefix: Option<&[u8]>,
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
         if budget.rows == 0 || budget.bytes == 0 {
             return Err(StoreError::Invalid(format!(
                 "fact page budget must specify non-zero rows and bytes, found rows={} bytes={}",
@@ -726,7 +761,6 @@ impl Metadata {
         let fact_table = txn
             .open_table(fact_definition(table))
             .map_err(table_error)?;
-        let lower: Bound<&[u8]> = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut iter = fact_table
             .range::<&[u8]>((lower, Bound::Unbounded))
             .map_err(storage)?;
@@ -735,6 +769,12 @@ impl Metadata {
             let (key_guard, value_guard) = item.map_err(storage)?;
             let key = key_guard.value();
             let value = value_guard.value();
+
+            if let Some(prefix) = prefix
+                && !key.starts_with(prefix)
+            {
+                break;
+            }
 
             let row_bytes = key.len().checked_add(value.len()).ok_or_else(|| {
                 StoreError::Capacity("fact row key + value bytes overflow usize".to_owned())
@@ -752,7 +792,16 @@ impl Metadata {
                         budget.bytes
                     )));
                 }
-                more = true;
+                // An unprefixed scan keeps the historical over-report; a
+                // prefixed scan continues only past a row the prefix
+                // still covers.
+                more = match prefix {
+                    None => true,
+                    Some(want) => matches!(
+                        iter.next().transpose().map_err(storage)?,
+                        Some((next_key, _)) if next_key.value().starts_with(want)
+                    ),
+                };
                 break;
             }
 
@@ -763,9 +812,12 @@ impl Metadata {
             accumulated_bytes = new_total;
 
             if rows.len() == max_rows || accumulated_bytes == budget.bytes {
-                if iter.next().transpose().map_err(storage)?.is_some() {
-                    more = true;
-                }
+                more = match iter.next().transpose().map_err(storage)? {
+                    None => false,
+                    Some((next_key, _)) => {
+                        prefix.is_none_or(|want| next_key.value().starts_with(want))
+                    }
+                };
                 break;
             }
         }

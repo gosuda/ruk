@@ -67,11 +67,12 @@ use crate::change::{LeaseId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{
     AttestListArgs, AttestListReply, ClaimHolderFilter, ClaimListArgs, ClaimListReply,
-    MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor, PageLimit, QueryDigest,
-    ReconnectSecret, Reply, Request, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
-    SessionResumeReply, Timestamp, ViewInfo,
+    DEFAULT_PAGE_SIZE, KeysetPage, MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor,
+    PageLimit, QueryDigest, ReconnectSecret, RefsListArgs, RefsListReply, Reply, Request,
+    SessionAuthority, SessionOpenArgs, SessionResumeArgs, SessionResumeReply, Timestamp, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
+use crate::refs::page_refs_prefixed;
 use crate::store::CompactionStats;
 use crate::store::FactPageBudget;
 use crate::store::Store;
@@ -665,6 +666,10 @@ impl HostedCoordinator {
                 let reply = self.read_attestations_page(session, &args, times.mono)?;
                 Ok(Reply::AttestList(Box::new(reply)))
             }
+            Request::RefsList(args) => {
+                let reply = self.read_refs_page(&args)?;
+                Ok(Reply::RefsList(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -674,6 +679,32 @@ impl HostedCoordinator {
                 ),
             )),
         }
+    }
+
+    /// Serves one `refs.list` page with prefix and inclusive-start seek.
+    /// Reads the event head before the page so `as_of` never runs ahead
+    /// of the events the page reflects. The page binds no lease: the
+    /// caller resumes from the stateless `next_after` cursor.
+    fn read_refs_page(&self, args: &RefsListArgs) -> Result<RefsListReply, CoreError> {
+        let limit = args.limit.map_or(DEFAULT_PAGE_SIZE, PageLimit::get);
+        let prefix = args
+            .prefix
+            .as_ref()
+            .map(ByteString::as_bytes)
+            .unwrap_or_default();
+        let (head, _) = self.store.event_head().map_err(CoreError::from)?;
+        let page = page_refs_prefixed(&self.store, prefix, args.after.as_ref(), limit)?;
+        let next_after = page.more.then(|| {
+            page.entries
+                .last()
+                .map(|entry| ByteString::from(entry.name.as_bytes().to_vec()))
+        });
+        let next_after = next_after.flatten();
+        Ok(RefsListReply {
+            view: current_view(&self.store)?,
+            refs: KeysetPage::new(page.entries, next_after)?,
+            as_of: head,
+        })
     }
 
     /// Mints one interactive read lease and retains its owner guard.
@@ -1682,6 +1713,168 @@ mod tests {
             }
             DispatchReady::Prepared(_) => panic!("a committed request must replay, not prepare"),
         }
+    }
+
+    fn seed_branch_refs(coord: &HostedCoordinator) {
+        use crate::refdata::{RefChange, RefExpect, RefTransaction, RefUpdate};
+        use crate::refs::prepare_checked_transaction;
+
+        let oid = |n: u8| Oid::from_hex(&format!("{n:02x}").repeat(20)).expect("oid");
+        let update = |name: &str, n: u8| RefUpdate {
+            name: RefName::new(name).expect("ref name"),
+            expected: RefExpect::Absent,
+            change: RefChange::Set(crate::refdata::RefTarget::Direct(oid(n))),
+        };
+        let transaction = RefTransaction::new(
+            HashKind::Sha1,
+            vec![
+                update("refs/heads/feat", 2),
+                update("refs/heads/main", 1),
+                update("refs/tags/v1", 3),
+            ],
+        )
+        .expect("ref transaction");
+        let prepared =
+            prepare_checked_transaction(coord.store(), &transaction).expect("prepare refs");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::ReceivePack,
+                &EventContext::default(),
+            )
+            .expect("publish refs");
+    }
+
+    async fn refs_list(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::RefsListArgs,
+    ) -> crate::protocol::RefsListReply {
+        let reply = coord
+            .read(owner, session, Request::RefsList(Box::new(args)), cancel)
+            .await
+            .expect("refs.list serves");
+        let Reply::RefsList(page) = reply else {
+            panic!("refs.list must answer its own reply");
+        };
+        *page
+    }
+
+    #[tokio::test]
+    async fn refs_list_serves_prefix_seek_with_as_of() {
+        use crate::protocol::RefsListArgs;
+
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        seed_branch_refs(&coord);
+
+        let query = |prefix: Option<&str>, after: Option<&str>, limit: Option<u32>| RefsListArgs {
+            prefix: prefix.map(ByteString::from),
+            after: after.map(|text| RefName::new(text).expect("cursor name")),
+            limit: limit.map(|rows| PageLimit::new(rows).expect("page limit")),
+        };
+        let names = |page: &crate::protocol::RefsListReply| {
+            page.refs
+                .items
+                .iter()
+                .map(|entry| entry.name.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        };
+
+        let full = refs_list(&coord, &owner, session, &cancel, query(None, None, None)).await;
+        assert_eq!(
+            names(&full),
+            [
+                b"refs/heads/feat".to_vec(),
+                b"refs/heads/main".to_vec(),
+                b"refs/tags/v1".to_vec()
+            ]
+        );
+        assert_eq!(full.refs.next_after, None);
+        assert_eq!(full.as_of, 3);
+
+        let heads = refs_list(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            query(Some("refs/heads/"), None, None),
+        )
+        .await;
+        assert_eq!(
+            names(&heads),
+            [b"refs/heads/feat".to_vec(), b"refs/heads/main".to_vec()]
+        );
+        assert_eq!(heads.as_of, 3);
+
+        let exact = refs_list(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            query(Some("refs/heads/main"), None, None),
+        )
+        .await;
+        assert_eq!(names(&exact), [b"refs/heads/main".to_vec()]);
+
+        let rest = refs_list(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            query(Some("refs/heads/"), Some("refs/heads/feat"), None),
+        )
+        .await;
+        assert_eq!(names(&rest), [b"refs/heads/main".to_vec()]);
+        assert_eq!(rest.refs.next_after, None);
+
+        let first = refs_list(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            query(Some("refs/heads/"), None, Some(1)),
+        )
+        .await;
+        assert_eq!(names(&first), [b"refs/heads/feat".to_vec()]);
+        let cursor = first.refs.next_after.clone().expect("more remains");
+        assert_eq!(cursor.as_bytes(), b"refs/heads/feat");
+        let second = refs_list(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            query(Some("refs/heads/"), Some("refs/heads/feat"), Some(1)),
+        )
+        .await;
+        assert_eq!(names(&second), [b"refs/heads/main".to_vec()]);
+        assert_eq!(second.refs.next_after, None);
+
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::RefsList(Box::new(query(
+                    Some("refs/heads/"),
+                    Some("refs/tags/v1"),
+                    None,
+                ))),
+                &cancel,
+            )
+            .await
+            .expect_err("cursor outside the prefix is invalid");
+        assert_eq!(err.code, ErrorCode::EInvalid);
     }
 
     fn presented_cursor() -> PageCursor {

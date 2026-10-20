@@ -96,6 +96,50 @@ pub struct RefPage {
     pub more: bool,
 }
 
+/// One page of refs under `prefix`, seeking inclusively at the prefix
+/// when `after` is absent and exclusively after `after` otherwise, so
+/// single-ref resolve and prefix listings never scan the namespace.
+pub fn page_refs_prefixed(
+    store: &Store,
+    prefix: &[u8],
+    after: Option<&RefName>,
+    limit: usize,
+) -> Result<RefPage, CoreError> {
+    if limit == 0 {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "ref page limit must be non-zero",
+        ));
+    }
+    if let Some(cursor) = after
+        && !cursor.as_bytes().starts_with(prefix)
+    {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "ref page cursor must stay under its prefix",
+        ));
+    }
+    let max_rows = limit.min(1000);
+    let budget = FactPageBudget::new(max_rows, MAX_CONTROL_FRAME_BYTES);
+    let page = store.fact_page_prefixed(
+        FactTable::Refs,
+        after.map(RefName::as_bytes),
+        prefix,
+        budget,
+    )?;
+    let mut entries = Vec::with_capacity(page.rows.len());
+    for row in page.rows {
+        let name = RefName::new(row.key)
+            .map_err(|err| corrupt_store(store, format!("stored ref key is invalid: {err}")))?;
+        let target = decode_stored_target(store, &name, &row.value)?;
+        entries.push(RefEntry { name, target });
+    }
+    Ok(RefPage {
+        entries,
+        more: page.more,
+    })
+}
+
 pub fn page_refs(store: &Store, after: Option<&[u8]>, limit: usize) -> Result<RefPage, CoreError> {
     if limit == 0 {
         return Err(CoreError::new(

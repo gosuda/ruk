@@ -934,6 +934,33 @@ impl Store {
         result
     }
 
+    /// A bounded page of raw fact rows under `prefix`, seeking inclusively
+    /// at the prefix when `after` is absent and exclusively after `after`
+    /// otherwise. Stops at the first key outside `prefix`.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for zero rows or bytes in `budget`;
+    /// [`StoreError::Limit`] if the first row alone exceeds the byte budget;
+    /// [`StoreError::Corrupt`] for storage damage, which also latches quarantine;
+    /// quarantine refuses.
+    pub fn fact_page_prefixed(
+        &self,
+        table: FactTable,
+        after: Option<&[u8]>,
+        prefix: &[u8],
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.io.fact_page_calls.fetch_add(1, Ordering::Relaxed);
+        let result = self.observe(self.meta.fact_page_prefixed(table, after, prefix, budget));
+        if let Ok(page) = &result {
+            self.io
+                .fact_rows
+                .fetch_add(page.rows.len() as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
     /// Reads one fact value.
     ///
     /// # Errors
@@ -1102,6 +1129,16 @@ impl Store {
             value: Some(encode("event head", &row)?),
         });
         Ok((out, ref_events))
+    }
+
+    /// The event horizon: the last assigned sequence and the oldest
+    /// retained sequence. Absent rows mean no event ever committed.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn event_head(&self) -> Result<(u64, u64), StoreError> {
+        let (head, oldest, _) = self.read_event_head()?;
+        Ok((head, oldest))
     }
 
     /// Reads the event horizon: the last assigned sequence, the oldest
