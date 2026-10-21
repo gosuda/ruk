@@ -2063,6 +2063,23 @@ async fn serve_git_service(
     {
         return;
     }
+    if !req.advertise
+        && (req.service == GIT_SERVICE_UPLOAD_PACK || req.service == GIT_SERVICE_UPLOAD_ARCHIVE)
+    {
+        serve_upload_streaming(StreamingUpload {
+            input,
+            sink,
+            credits: &mut credits,
+            cancel_guard: &cancel_guard,
+            token: &token,
+            cancel_flag: &cancel_flag,
+            refs,
+            coordinator: &coordinator,
+            req: &req,
+        })
+        .await;
+        return;
+    }
     let stdin_bytes = if req.advertise {
         Vec::new()
     } else {
@@ -2841,6 +2858,508 @@ async fn await_git_round<T>(
             }
         }
     }
+}
+
+#[cfg(unix)]
+struct PipeReader {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Option<Vec<u8>>>,
+    current: Vec<u8>,
+    pos: usize,
+    eof: bool,
+}
+
+#[cfg(unix)]
+impl std::io::Read for PipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.pos < self.current.len() {
+                let end = (self.current.len() - self.pos).min(buf.len());
+                buf[..end].copy_from_slice(&self.current[self.pos..self.pos + end]);
+                self.pos += end;
+                if self.pos >= self.current.len() {
+                    self.current.clear();
+                    self.pos = 0;
+                }
+                return Ok(end);
+            }
+            if self.eof {
+                return Ok(0);
+            }
+            match self.rx.blocking_recv() {
+                Some(Some(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    self.current = chunk;
+                    self.pos = 0;
+                }
+                Some(None) | None => {
+                    self.eof = true;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct PipeWriter {
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl std::io::Write for PipeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.tx.send(buf.to_vec()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "git-service output closed")
+        })?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+enum AdvertisementEnd {
+    Incomplete,
+    DiscardThrough(usize),
+}
+
+#[cfg(unix)]
+fn advertisement_end(output: &[u8]) -> AdvertisementEnd {
+    let mut offset = 0;
+    while offset + 4 <= output.len() {
+        let text = match std::str::from_utf8(&output[offset..offset + 4]) {
+            Ok(text) => text,
+            Err(_) => return AdvertisementEnd::Incomplete,
+        };
+        let len = match usize::from_str_radix(text, 16) {
+            Ok(len) => len,
+            Err(_) => return AdvertisementEnd::Incomplete,
+        };
+        if len == 0 {
+            return AdvertisementEnd::DiscardThrough(offset + 4);
+        }
+        if len < 4 || offset + len > output.len() {
+            return AdvertisementEnd::Incomplete;
+        }
+        offset += len;
+    }
+    AdvertisementEnd::Incomplete
+}
+
+#[cfg(unix)]
+fn run_streaming_upload(
+    coordinator: &Arc<HostedCoordinator>,
+    service: &str,
+    git_protocol: &str,
+    stdin_rx: tokio::sync::mpsc::UnboundedReceiver<Option<Vec<u8>>>,
+    stdout_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(), CoreError> {
+    use ruk_git::transport::serve::serve_upload_pack;
+    use ruk_git::transport::serve_v2::{git_protocol_requests_v2, serve_upload_pack_v2};
+    let store = coordinator.store();
+    let kind = store.hash_kind();
+    let head = crate::cli::verbs_transport::serve_head(store)?;
+    let interrupt = ruk_git::transport::Interrupt::none().with_cancel(cancel_flag);
+    let reader = PipeReader {
+        rx: stdin_rx,
+        current: Vec::new(),
+        pos: 0,
+        eof: false,
+    };
+    let mut writer = PipeWriter { tx: stdout_tx };
+    if service == GIT_SERVICE_UPLOAD_ARCHIVE {
+        ruk_git::transport::archive::serve_upload_archive(
+            reader,
+            &mut writer,
+            store,
+            kind,
+            &head,
+            &interrupt,
+        )?;
+        return Ok(());
+    }
+    if git_protocol_requests_v2(Some(git_protocol)) {
+        serve_upload_pack_v2(reader, &mut writer, store, kind, &head, &interrupt)?;
+    } else {
+        serve_upload_pack(reader, &mut writer, store, kind, &head, &interrupt)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct StreamingUpload<'a> {
+    input: &'a mut StreamInput,
+    sink: &'a StreamSink,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    token: &'a Cancel,
+    cancel_flag: &'a Arc<AtomicBool>,
+    refs: &'a ConnectionRefs,
+    coordinator: &'a Arc<HostedCoordinator>,
+    req: &'a CommandOpen,
+}
+
+#[cfg(unix)]
+async fn send_streaming_error(
+    sink: &StreamSink,
+    cancel_flag: &Arc<AtomicBool>,
+    stdin_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<Option<Vec<u8>>>>,
+    err: CoreError,
+) {
+    let _ = send_error_exit(sink, &Error::Core(err)).await;
+    cancel_flag.store(true, Ordering::SeqCst);
+    drop(stdin_tx.take());
+}
+
+#[cfg(unix)]
+async fn serve_upload_streaming(upload: StreamingUpload<'_>) {
+    let StreamingUpload {
+        input,
+        sink,
+        credits,
+        cancel_guard,
+        token,
+        cancel_flag,
+        refs,
+        coordinator,
+        req,
+    } = upload;
+    let stream_id = sink.stream_id;
+    if token.check().is_err() {
+        let report = CommandExitReport::cancelled(&req.request_id.clone().unwrap_or_default());
+        let exit_bytes = match ipc::encode_control(&report) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+        return;
+    }
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Option<Vec<u8>>>();
+    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let strip = req.service == GIT_SERVICE_UPLOAD_PACK;
+    let run_coordinator = Arc::clone(coordinator);
+    let run_flag = Arc::clone(cancel_flag);
+    let service = req.service.clone();
+    let protocol = req.git_protocol.clone();
+    let run = refs.executor.run(move || {
+        run_streaming_upload(
+            &run_coordinator,
+            &service,
+            &protocol,
+            stdin_rx,
+            stdout_tx,
+            run_flag,
+        )
+    });
+    tokio::pin!(run);
+    let mut stdin_tx = Some(stdin_tx);
+    let mut stdin_accum: Vec<u8> = Vec::new();
+    let mut strip_buf: Vec<u8> = Vec::new();
+    let mut stripped = !strip;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut stdout_closed = false;
+    let mut run_result: Option<Result<(), CoreError>> = None;
+    let mut cancelled = false;
+    loop {
+        if run_result.is_some() && stdout_closed && pending.is_empty() {
+            break;
+        }
+        while !pending.is_empty() {
+            let end = pending.len().min(ipc::MAX_DATA_CHUNK_BYTES);
+            let width = match u64::try_from(end) {
+                Ok(width) => width,
+                Err(_) => {
+                    send_streaming_error(
+                        sink,
+                        cancel_flag,
+                        &mut stdin_tx,
+                        CoreError::new(ErrorCode::ELimit, "data chunk exceeds its bound"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if credits.consume_outbound(stream_id, width).is_err() {
+                break;
+            }
+            let chunk = pending[..end].to_vec();
+            pending.drain(..end);
+            if send_frame(sink, ipc::FrameKind::Stdout, &chunk)
+                .await
+                .is_err()
+            {
+                cancel_flag.store(true, Ordering::SeqCst);
+                drop(stdin_tx.take());
+                return;
+            }
+        }
+        if run_result.is_some() && stdout_closed && pending.is_empty() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            frame = input.control.recv() => {
+                let Some(frame) = frame else {
+                    cancel_flag.store(true, Ordering::SeqCst);
+                    drop(stdin_tx.take());
+                    return;
+                };
+                if frame.stream_id != stream_id {
+                    send_streaming_error(
+                        sink,
+                        cancel_flag,
+                        &mut stdin_tx,
+                        CoreError::new(ErrorCode::EInvalid, "stream received a frame of another stream"),
+                    )
+                    .await;
+                    return;
+                }
+                match frame.kind {
+                    ipc::FrameKind::Cancel => {
+                        cancelled = true;
+                        cancel_guard.cancel();
+                        cancel_flag.store(true, Ordering::SeqCst);
+                        drop(stdin_tx.take());
+                    }
+                    ipc::FrameKind::WindowUpdate => {
+                        let credit: WindowCredit = match ipc::decode_control(&frame.payload) {
+                            Ok(credit) => credit,
+                            Err(err) => {
+                                send_streaming_error(sink, cancel_flag, &mut stdin_tx, err).await;
+                                return;
+                            }
+                        };
+                        if let Err(err) = route_credit(credits, stream_id, &credit) {
+                            send_streaming_error(sink, cancel_flag, &mut stdin_tx, err).await;
+                            return;
+                        }
+                    }
+                    _ => {
+                        send_streaming_error(
+                            sink,
+                            cancel_flag,
+                            &mut stdin_tx,
+                            CoreError::new(ErrorCode::EInvalid, "frame kind is misplaced on this stream"),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            frame = input.data.recv() => {
+                let Some(frame) = frame else {
+                    cancel_flag.store(true, Ordering::SeqCst);
+                    drop(stdin_tx.take());
+                    return;
+                };
+                if frame.stream_id != stream_id {
+                    send_streaming_error(
+                        sink,
+                        cancel_flag,
+                        &mut stdin_tx,
+                        CoreError::new(ErrorCode::EInvalid, "stream received a frame of another stream"),
+                    )
+                    .await;
+                    return;
+                }
+                match frame.kind {
+                    ipc::FrameKind::Stdin => {
+                        let Some(tx) = stdin_tx.as_ref() else {
+                            continue;
+                        };
+                        let width = match u64::try_from(frame.payload.len()) {
+                            Ok(width) => width,
+                            Err(_) => {
+                                send_streaming_error(
+                                    sink,
+                                    cancel_flag,
+                                    &mut stdin_tx,
+                                    CoreError::new(ErrorCode::ELimit, "stdin chunk exceeds its bound"),
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                        let grown = match u64::try_from(stdin_accum.len()) {
+                            Ok(len) => len.saturating_add(width),
+                            Err(_) => req.limits.max_stdin_bytes.saturating_add(1),
+                        };
+                        if grown > req.limits.max_stdin_bytes {
+                            send_streaming_error(
+                                sink,
+                                cancel_flag,
+                                &mut stdin_tx,
+                                CoreError::new(ErrorCode::ELimit, "request body exceeds its bound"),
+                            )
+                            .await;
+                            return;
+                        }
+                        if credits.consume_inbound(stream_id, width).is_err() {
+                            send_streaming_error(
+                                sink,
+                                cancel_flag,
+                                &mut stdin_tx,
+                                CoreError::new(ErrorCode::ELimit, "stream credit window is exhausted"),
+                            )
+                            .await;
+                            return;
+                        }
+                        input
+                            .outstanding
+                            .fetch_sub(width.saturating_add(1), Ordering::SeqCst);
+                        stdin_accum.extend_from_slice(&frame.payload);
+                        if credits.grant_inbound(stream_id, width).is_err() {
+                            send_streaming_error(
+                                sink,
+                                cancel_flag,
+                                &mut stdin_tx,
+                                CoreError::new(ErrorCode::EInvalid, "git-service stream is not tracked"),
+                            )
+                            .await;
+                            return;
+                        }
+                        let grant = StdinGrant {
+                            direction: "stdin".to_string(),
+                            bytes: width,
+                        };
+                        let grant_bytes = match ipc::encode_control(&grant) {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                cancel_flag.store(true, Ordering::SeqCst);
+                                drop(stdin_tx.take());
+                                return;
+                            }
+                        };
+                        if send_frame(sink, ipc::FrameKind::WindowUpdate, &grant_bytes)
+                            .await
+                            .is_err()
+                        {
+                            cancel_flag.store(true, Ordering::SeqCst);
+                            drop(stdin_tx.take());
+                            return;
+                        }
+                        if tx.send(Some(frame.payload)).is_err() {
+                            drop(stdin_tx.take());
+                        }
+                    }
+                    ipc::FrameKind::StdinEof => {
+                        if let Some(tx) = stdin_tx.take() {
+                            let _ = tx.send(None);
+                        }
+                    }
+                    _ => {
+                        send_streaming_error(
+                            sink,
+                            cancel_flag,
+                            &mut stdin_tx,
+                            CoreError::new(ErrorCode::EInvalid, "frame kind is misplaced on this stream"),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            chunk = async {
+                if stdout_closed {
+                    std::future::pending::<Option<Vec<u8>>>().await
+                } else {
+                    stdout_rx.recv().await
+                }
+            } => {
+                match chunk {
+                    Some(bytes) => {
+                        if stripped {
+                            pending.extend_from_slice(&bytes);
+                        } else {
+                            strip_buf.extend_from_slice(&bytes);
+                            if let AdvertisementEnd::DiscardThrough(off) =
+                                advertisement_end(&strip_buf)
+                            {
+                                stripped = true;
+                                pending.extend_from_slice(&strip_buf[off..]);
+                                strip_buf.clear();
+                            }
+                        }
+                    }
+                    None => {
+                        stdout_closed = true;
+                    }
+                }
+            }
+            result = async {
+                if run_result.is_some() {
+                    std::future::pending().await
+                } else {
+                    (&mut run).await
+                }
+            } => {
+                run_result = Some(match result {
+                    Ok(inner) => inner,
+                    Err(err) => Err(err),
+                });
+                drop(stdin_tx.take());
+            }
+        }
+    }
+    let commands = parse_git_commands(&stdin_accum);
+    let digest = ruk_git::transport::serve::git_service_digest(
+        &req.service,
+        &commands,
+        &req.limits.encode(),
+    );
+    let request_id = req.request_id.clone().unwrap_or_default();
+    let invocation = if request_id.is_empty() {
+        format!("digest-{digest}")
+    } else {
+        request_id
+    };
+    if cancelled || token.check().is_err() {
+        cancel_flag.store(true, Ordering::SeqCst);
+        let report = CommandExitReport::cancelled(&invocation);
+        let exit_bytes = match ipc::encode_control(&report) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+        return;
+    }
+    let outcome = match run_result {
+        Some(outcome) => outcome,
+        None => Err(CoreError::new(
+            ErrorCode::EIo,
+            "git-service worker vanished",
+        )),
+    };
+    if let Err(err) = outcome {
+        let _ = send_error_exit(sink, &Error::Core(err)).await;
+        return;
+    }
+    if !stripped {
+        match strip_advertisement(std::mem::take(&mut strip_buf)) {
+            Ok(rest) => pending.extend_from_slice(&rest),
+            Err(_) => pending.clear(),
+        }
+    }
+    match write_typed_chunks(sink, &mut input.control, credits, cancel_guard, &pending).await {
+        TypedWriteFate::Done => {}
+        TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
+    }
+    let report = CommandExitReport::success(&invocation, 0);
+    let exit_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
 }
 
 fn run_git_service(

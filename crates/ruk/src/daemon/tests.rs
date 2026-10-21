@@ -878,6 +878,88 @@ async fn git_service_request_matches_oracle_objects() {
 }
 
 #[tokio::test]
+async fn advertisement_end_discards_through_first_flush() {
+    let mut advert = pkt(b"version 2\n");
+    advert.extend_from_slice(&pkt(b"ls-refs=unborn\n"));
+    advert.extend_from_slice(&flush());
+    let mut wire = advert.clone();
+    wire.extend_from_slice(&pkt(b"NAK\n"));
+    assert!(matches!(
+        super::advertisement_end(&advert[..advert.len() - 2]),
+        super::AdvertisementEnd::Incomplete
+    ));
+    match super::advertisement_end(&wire) {
+        super::AdvertisementEnd::DiscardThrough(off) => {
+            assert_eq!(&wire[off..], &pkt(b"NAK\n")[..]);
+        }
+        super::AdvertisementEnd::Incomplete => {
+            panic!("a framed advertisement splits at its first flush");
+        }
+    }
+}
+
+#[tokio::test]
+async fn git_service_upload_pack_streams_nak_before_eof() {
+    let root = temp_root("upload-streaming");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 1);
+
+    let mut first = pkt(format!("want {}\n", commit.to_hex()).as_bytes());
+    first.extend_from_slice(&flush());
+    driver.send(FrameKind::Stdin, 1, &first).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+
+    let mut second = pkt(format!("have {}\n", commit.to_hex()).as_bytes());
+    second.extend_from_slice(&flush());
+    driver.send(FrameKind::Stdin, 1, &second).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+
+    let nak = driver.recv().await;
+    assert_eq!(nak.kind, FrameKind::Stdout);
+    assert!(
+        nak.payload.windows(3).any(|w| w == b"NAK"),
+        "the daemon answers negotiation before stdin EOF",
+    );
+
+    let done = pkt(b"done\n");
+    driver.send(FrameKind::Stdin, 1, &done).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 1, &[]).await;
+
+    let (pack, _, exit) = driver.recv_exit(1).await;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.outcome, "Completed");
+    assert!(
+        pack.starts_with(b"PACK"),
+        "the pack follows the terminal done",
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn git_service_unknown_service_refused() {
     let root = temp_root("unknown-service");
     let repo_dir = root.join("repo");
