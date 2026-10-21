@@ -717,7 +717,8 @@ pub(crate) const BLAME_MAX_POSITIONS: usize = 65_536;
 /// Walks ancestors breadth-first from `start`, tracking for each start
 /// line the `(commit, index)` positions where its content currently lives.
 /// Visiting a commit aligns its file version against every parent version
-/// with [`lcs_align`]: a position matching a parent line moves there,
+/// once per (current, parent) blob pair with [`lcs_align`]: a position
+/// matching a parent line moves there,
 /// while a position no parent carries is introduced by the commit.
 /// Commits past [`BLAME_MAX_COMMITS`], positions past
 /// [`BLAME_MAX_POSITIONS`], or one alignment past [`LCS_MAX_CELLS`]
@@ -814,6 +815,22 @@ pub(crate) fn blame_attribute(
         for parent in record.parents() {
             parents.push((*parent, blame_version(store, parent, path, &mut versions)?));
         }
+        let mut maps: Vec<(Head, Option<Vec<Option<usize>>>)> =
+            Vec::with_capacity(parents.len());
+        for (parent, version) in &parents {
+            let Some((oid, lines)) = version else {
+                maps.push((*parent, None));
+                continue;
+            };
+            if *oid == current_oid {
+                let identity: Vec<Option<usize>> =
+                    (0..current_refs.len()).map(Some).collect();
+                maps.push((*parent, Some(identity)));
+                continue;
+            }
+            let parent_refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+            maps.push((*parent, Some(parent_line_map(&current_refs, &parent_refs)?)));
+        }
         let mut moves: Vec<(usize, Vec<(Head, usize)>)> = Vec::new();
         for index in &at_current {
             let mut targets: Vec<(Head, usize)> = Vec::new();
@@ -823,9 +840,16 @@ pub(crate) fn blame_attribute(
                 .map(|(_, line)| *line)
                 .collect::<Vec<_>>()
             {
-                if let Some(next) =
-                    resolve_blame_position(&current_refs, line_index, &parents, current_oid)?
-                {
+                let mut target: Option<(Head, usize)> = None;
+                for (parent, map) in &maps {
+                    let Some(map) = map else {
+                        continue;
+                    };
+                    if let Some(parent_at) = map[line_index] {
+                        target = Some((*parent, parent_at));
+                    }
+                }
+                if let Some(next) = target {
                     targets.push(next);
                 }
             }
@@ -863,57 +887,36 @@ pub(crate) fn blame_attribute(
     Ok((start_lines, heads))
 }
 
-/// Resolves where one blame position moves: the matching parent line, or
-/// `None` when no parent carries the line and the current commit
-/// introduces it.
+/// Maps every current line onto its matching parent line.
 ///
-/// An identical parent blob transfers the index untouched; a parent
-/// without the file contributes no match. Otherwise the cell-capped
-/// [`lcs_align`] maps current lines onto parent lines.
-fn resolve_blame_position(
+/// Runs the cell-capped [`lcs_align`] once for the (current, parent) blob
+/// pair; the blame walk indexes the map once per live line instead of
+/// re-aligning per line. The entry is `None` where the parent carries no
+/// line matching the current one.
+fn parent_line_map(
     current_refs: &[&[u8]],
-    line_index: usize,
-    parents: &[(Head, Option<BlameVersion>)],
-    current_oid: Oid,
-) -> Result<Option<(Head, usize)>, CoreError> {
-    let mut introduced = true;
-    let mut target: Option<(Head, usize)> = None;
-    for (parent, version) in parents {
-        let Some((oid, lines)) = version else {
-            continue;
-        };
-        if *oid == current_oid {
-            target = Some((*parent, line_index));
-            introduced = false;
-            continue;
-        }
-        let parent_refs: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
-        let ops = lcs_align(current_refs, &parent_refs)?;
-        let mut current_at = 0;
-        let mut parent_at = 0;
-        for op in ops {
-            match op {
-                LcsOp::Match => {
-                    if current_at == line_index {
-                        target = Some((*parent, parent_at));
-                        introduced = false;
-                    }
-                    current_at += 1;
-                    parent_at += 1;
-                }
-                LcsOp::Del => {
-                    current_at += 1;
-                }
-                LcsOp::Ins => {
-                    parent_at += 1;
-                }
+    parent_refs: &[&[u8]],
+) -> Result<Vec<Option<usize>>, CoreError> {
+    let ops = lcs_align(current_refs, parent_refs)?;
+    let mut map: Vec<Option<usize>> = vec![None; current_refs.len()];
+    let mut current_at = 0;
+    let mut parent_at = 0;
+    for op in ops {
+        match op {
+            LcsOp::Match => {
+                map[current_at] = Some(parent_at);
+                current_at += 1;
+                parent_at += 1;
+            }
+            LcsOp::Del => {
+                current_at += 1;
+            }
+            LcsOp::Ins => {
+                parent_at += 1;
             }
         }
     }
-    if introduced {
-        return Ok(None);
-    }
-    Ok(target)
+    Ok(map)
 }
 
 /// Resolves one change reference to its single head.
@@ -945,6 +948,126 @@ pub(crate) fn change_head(store: &Store, change: &ChangeRef) -> Result<Head, Cor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "ruk-reads-test-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_store(temp: &TempRoot) -> Store {
+        use std::sync::Arc;
+
+        use crate::store::PreparationBudget;
+        Store::create(
+            &temp.0,
+            HashKind::Sha1,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create store")
+    }
+
+    fn put_blob(store: &Store, bytes: &[u8]) -> Oid {
+        use crate::store::{EventContext, EventSource};
+        let length = u64::try_from(bytes.len()).expect("object length");
+        let prepared = store
+            .prepare(ObjectKind::Blob, length, bytes, None)
+            .expect("prepare blob");
+        let oid = prepared.oid();
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish blob");
+        oid
+    }
+
+    fn put_tree(store: &Store, items: &[(&str, TreeMode, Oid)]) -> Oid {
+        use crate::store::{EventContext, EventSource};
+        use crate::workcopy::tree::encode_tree;
+        let encoded = encode_tree(
+            &items
+                .iter()
+                .map(|(name, mode, oid)| TreeItem {
+                    name: name.as_bytes().to_vec(),
+                    mode: *mode,
+                    oid: *oid,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let length = u64::try_from(encoded.len()).expect("object length");
+        let prepared = store
+            .prepare(ObjectKind::Tree, length, encoded.as_slice(), None)
+            .expect("prepare tree");
+        let oid = prepared.oid();
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tree");
+        oid
+    }
+
+    fn new_commit(store: &Store, tree: Oid, parents: Vec<Head>, message: &str) -> Head {
+        use crate::conflict::{Signature, TzOffset};
+        let signature = || Signature {
+            name: ByteString::from("ada"),
+            email: ByteString::from("ada@example.com"),
+            timestamp: 1_700_000_000,
+            offset: TzOffset::new(false, 0).expect("tz offset"),
+        };
+        crate::ops::new(
+            store,
+            crate::ops::NewRequest {
+                tree,
+                parents,
+                author: signature(),
+                committer: signature(),
+                message: ByteString::from(message),
+                change_id: None,
+                predecessor: None,
+                provenance: None,
+            },
+        )
+        .expect("new commit")
+        .head
+    }
+
+    fn put_file_commit(
+        store: &Store,
+        parents: Vec<Head>,
+        message: &str,
+        bytes: &[u8],
+    ) -> (Head, Oid) {
+        let blob = put_blob(store, bytes);
+        let tree = put_tree(
+            store,
+            &[("f.txt", TreeMode::File(FileMode::Regular), blob)],
+        );
+        (new_commit(store, tree, parents, message), tree)
+    }
 
     #[test]
     fn lcs_align_matches_insert_delete() {
@@ -1002,5 +1125,38 @@ mod tests {
         assert_eq!(text.matches("@@").count() / 2, 2, "two hunks: {text}");
         assert!(text.contains("-l1\n"), "deletion renders: {text}");
         assert!(text.contains("+CHANGED\n"), "insertion renders: {text}");
+    }
+
+    #[test]
+    fn parent_line_map_aligns_once_per_pair() {
+        let current: Vec<&[u8]> = vec![b"a\n", b"b\n", b"c\n"];
+        let parent: Vec<&[u8]> = vec![b"a\n", b"C\n", b"c\n"];
+        let map = parent_line_map(&current, &parent).expect("align");
+        assert_eq!(map, vec![Some(0), None, Some(2)]);
+    }
+
+    #[test]
+    fn blame_attributes_merge_lines_to_introducing_parent() {
+        let temp = TempRoot::new("merge");
+        let store = test_store(&temp);
+        let (head_a, _) = put_file_commit(&store, Vec::new(), "base", b"one\ntwo\nthree\nfour\n");
+        let (head_p1, _) =
+            put_file_commit(&store, vec![head_a], "left", b"ONE\ntwo\nthree\nfour\n");
+        let (head_p2, _) =
+            put_file_commit(&store, vec![head_a], "right", b"one\ntwo\nTHREE\nfour\n");
+        let (head_m, _) = put_file_commit(
+            &store,
+            vec![head_p1, head_p2],
+            "merge",
+            b"ONE\ntwo\nTHREE\nfour\n",
+        );
+        let path = RepoPath::new("f.txt").expect("path");
+        let (lines, heads) = blame_attribute(&store, &head_m, &path).expect("blame serves merge");
+        assert_eq!(lines.len(), 4, "four blamed lines");
+        assert_eq!(
+            heads,
+            vec![head_p1, head_a, head_p2, head_a],
+            "each line attributes to its introducer"
+        );
     }
 }
