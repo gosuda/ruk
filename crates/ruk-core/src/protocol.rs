@@ -70,8 +70,10 @@ pub const SCHEMA_MAJOR: u32 = 1;
 /// `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`,
 /// `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`,
 /// `claim.renew`, `policy.set`) and the `Admin` method kind; older readers
-/// refuse its frames as unknown methods.
-pub const SCHEMA_MINOR: u32 = 2;
+/// refuse its frames as unknown methods. Minor 3 gives `repo.fork` its
+/// served reply: the forked generation, sealed and tail object counts, the
+/// hardlinked and copied segment ids, and the linked LFS payload count.
+pub const SCHEMA_MINOR: u32 = 3;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -3393,7 +3395,9 @@ pub enum ForkRefs {
     None,
 }
 
-/// `repo.fork`: copies one repository to a fresh store id.
+/// `repo.fork`: copies one repository to a fresh store id. Sealed segments
+/// hardlink into the fork (a cross-device link copies and is reported);
+/// tail objects re-publish base-first; facts copy under full revalidation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepoForkArgs {
     pub source: String,
@@ -3406,7 +3410,15 @@ pub struct RepoForkArgs {
 pub struct RepoForkReply {
     pub path: String,
     pub store_id: StoreId,
+    pub source_generation: u64,
+    pub objects: u64,
+    pub sealed_objects: u64,
+    pub tail_objects: u64,
     pub refs_copied: u64,
+    pub segments_linked: Vec<u64>,
+    pub segments_copied: Vec<u64>,
+    pub lfs_linked: u64,
+    pub generation: u64,
 }
 
 fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
