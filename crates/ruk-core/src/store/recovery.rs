@@ -287,6 +287,7 @@ impl Committed<'_> {
             base,
             self.budget,
             self.root,
+            self.pin,
         )?;
         payload.finish()?;
         Ok(decoded)

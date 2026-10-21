@@ -473,7 +473,7 @@ impl Store {
         drop(format_file);
         let sync_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
-        budget.register_scratch(root)?;
+        budget.register_scratch(&pin, root)?;
         let scratch_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
         let generation = meta.generation()?;
@@ -798,6 +798,7 @@ impl Store {
             base.as_ref().map(|(oid, read)| (*oid, read)),
             &self.budget,
             &self.root,
+            &self.pin,
         )
     }
 
@@ -889,6 +890,7 @@ impl Store {
             base.as_ref().map(|(oid, spool)| (*oid, spool.view())),
             &self.budget,
             &self.root,
+            &self.pin,
         )
     }
 
@@ -2315,9 +2317,11 @@ mod tests {
             let meta = Metadata::open(&meta_file(temp)).expect("healthy metadata");
             let generation = meta.generation().expect("healthy generation");
             let guards = Arc::new(GenerationRegistry::new(generation));
-            shared.register_scratch(&root).expect("scratch accounting");
-            let files = SegmentFileCache::default();
             let pin = PinnedRoot::open(&root).expect("pin test store");
+            shared
+                .register_scratch(&pin, &root)
+                .expect("scratch accounting");
+            let files = SegmentFileCache::default();
             let committed = Committed {
                 root: &root,
                 kind: format.kind,

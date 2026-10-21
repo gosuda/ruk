@@ -16,9 +16,9 @@
 //! then the final name with `O_NOFOLLOW` inside it — so no step traverses
 //! a symlink there either. Any other refusal stays an error.
 //!
-//! Scope: segment files only. Scratch spools (`store_root/scratch`) and
-//! LFS sidecars (`store_root/lfs/objects`) still travel the recorded
-//! path by name.
+//! Scope: segment files and scratch spools (`store_root/scratch`)
+//! travel the descriptor; LFS sidecars (`store_root/lfs/objects`)
+//! still travel the recorded path by name.
 
 use std::fs::File;
 use std::io;
@@ -43,7 +43,7 @@ pub(super) fn segment_rel(id: u64) -> PathBuf {
 /// from. The descriptor pins every later segment access; the recorded
 /// path serves the fallback and error display.
 #[derive(Debug, Default)]
-pub(super) struct PinnedRoot {
+pub(crate) struct PinnedRoot {
     record: PathBuf,
     #[cfg(unix)]
     fd: Option<rustix::fd::OwnedFd>,
@@ -219,6 +219,71 @@ impl PinnedRoot {
         {
             let _ = rel;
             Ok(())
+        }
+    }
+
+    /// Duplicates the hold: the fork names the same directory through a
+    /// new descriptor and carries the same recorded path. A failed dup
+    /// degrades to an unpinned fork (recorded-path behavior), never to
+    /// an error: the callers that need a pin open it themselves, and a
+    /// scratch writer must never fail for want of a spare descriptor.
+    pub(super) fn fork(&self) -> Self {
+        #[cfg(unix)]
+        if let Some(fd) = self.fd.as_ref() {
+            use rustix::fd::AsFd as _;
+            if let Ok(dup) = fd.as_fd().try_clone_to_owned() {
+                return Self {
+                    record: self.record.clone(),
+                    fd: Some(dup),
+                };
+            }
+        }
+        Self {
+            record: self.record.clone(),
+            #[cfg(unix)]
+            fd: None,
+        }
+    }
+
+    /// Creates the bare `rel` subdirectory below the held descriptor,
+    /// refusing to traverse or adopt a symlink: an existing name must
+    /// open as a directory without following links, else the create
+    /// fails closed. Without a descriptor the recorded path is used,
+    /// refusing a symlinked final component the same way.
+    pub(super) fn create_dir_all(&self, rel: &Path) -> io::Result<()> {
+        if rel.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+            return Err(io::Error::other("pin mkdir takes a bare directory name"));
+        }
+        #[cfg(unix)]
+        if let Some(fd) = self.fd.as_ref() {
+            use rustix::fd::AsFd as _;
+            match rustix::fs::mkdirat(fd.as_fd(), rel, rustix::fs::Mode::from_bits_truncate(0o777))
+            {
+                Ok(()) => return Ok(()),
+                Err(rustix::io::Errno::EXIST) => {
+                    let opened = self.open_dir_nosymlink(fd.as_fd(), rel)?;
+                    if File::from(opened).metadata()?.is_dir() {
+                        return Ok(());
+                    }
+                    return Err(io::Error::other("pin mkdir found a non-directory"));
+                }
+                Err(err) => return Err(io::Error::from(err)),
+            }
+        }
+        let dir = self.record.join(rel);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if std::fs::symlink_metadata(&dir)
+                    .map(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("pin mkdir found a non-directory"))
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 
