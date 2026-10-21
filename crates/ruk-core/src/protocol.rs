@@ -6045,9 +6045,9 @@ mod tests {
             assert_eq!(method.is_mutation(), method.kind() == MethodKind::Mutation);
         }
         let required = [
+            "schema",
             "session.open",
             "session.resume",
-            "schema",
             "ws.new",
             "ws.scope",
             "ws.take",
@@ -6111,5 +6111,15 @@ mod tests {
             assert!(names.contains(method), "missing method {method}");
         }
         assert_eq!(names.len(), required.len(), "methods beyond the contract");
+        // Order is part of the contract: a method's position in the table is
+        // its discriminant, so a reordered row changes the wire.
+        assert!(
+            Method::ALL
+                .iter()
+                .copied()
+                .map(Method::as_str)
+                .eq(required.iter().copied()),
+            "method table order differs from the contract order"
+        );
     }
 }
