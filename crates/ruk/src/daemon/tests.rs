@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
 use super::{
-    BoundedExecutor, CommandAccepted, CommandExitReport, CommandOpen, ConnectionRefs, ExitReport,
-    GitLimits, InvocationAccepted, InvocationOpen, Registry, SessionOpened, serve_connection,
+    ArchiveAcceptedResult, BoundedExecutor, CommandAccepted, CommandExitReport, CommandOpen,
+    ConnectionRefs, ExitReport, GitLimits, InvocationAccepted, InvocationOpen, Registry,
+    SessionOpened, serve_connection,
 };
 use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
@@ -5012,4 +5013,592 @@ async fn cancelled_run_keeps_its_permit_until_the_worker_finishes() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// Mints one stored commit with a single file directly in the repository
+/// store, returning the commit behind it.
+fn seed_file_commit(repo_dir: &Path) -> Oid {
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let blob = store
+        .prepare(ObjectKind::Blob, 6, &b"hello\n"[..], None)
+        .expect("prepare blob");
+    let blob_oid = blob.oid();
+    store
+        .publish(
+            vec![blob],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish blob");
+    let mut tree_bytes = Vec::new();
+    tree_bytes.extend_from_slice(b"100644 a.txt\0");
+    tree_bytes.extend_from_slice(blob_oid.as_bytes());
+    let tree = store
+        .prepare(
+            ObjectKind::Tree,
+            u64::try_from(tree_bytes.len()).expect("tree fits"),
+            &tree_bytes[..],
+            None,
+        )
+        .expect("prepare tree");
+    let tree_oid = tree.oid();
+    store
+        .publish(
+            vec![tree],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish tree");
+    let signature = Signature {
+        name: ByteString::from("Tag"),
+        email: ByteString::from("tag@example.invalid"),
+        timestamp: 1_700_000_000,
+        offset: TzOffset::UTC,
+    };
+    let prepared = prepare_new(
+        &store,
+        NewRequest {
+            tree: tree_oid,
+            parents: Vec::new(),
+            author: signature.clone(),
+            committer: signature,
+            message: ByteString::from("seed"),
+            change_id: None,
+            predecessor: None,
+            provenance: None,
+        },
+    )
+    .expect("prepare seed commit");
+    let oid = prepared.output.oid.expect("seed commit is a Git commit");
+    store
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed commit");
+    oid
+}
+
+/// Opens a plain session for typed reads.
+async fn open_read_session(driver: &mut Driver, store_repo: &str) -> String {
+    let payload = Driver::typed_open(store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    opened.session.to_string()
+}
+
+/// Runs one archive open to its terminal `Exit`, returning the accepted
+/// metadata and the streamed body. Panics on refusal: refusals go through
+/// `expect_archive_refused`.
+async fn run_archive_ok(
+    driver: &mut Driver,
+    stream_id: u64,
+    payload: &[u8],
+    pre_grant: bool,
+) -> (ArchiveAcceptedResult, Vec<u8>) {
+    driver.send(FrameKind::Open, stream_id, payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, stream_id);
+    let reply: InvocationAccepted =
+        ipc::decode_control(&accepted.payload).expect("archive accepted decodes");
+    let result = reply
+        .result
+        .expect("a served archive answers its metadata in Accepted");
+    let mut body = Vec::new();
+    loop {
+        if pre_grant {
+            let grant = r#"{"credit_bytes":65536,"direction":"stdout"}"#;
+            driver
+                .send(FrameKind::WindowUpdate, stream_id, grant.as_bytes())
+                .await;
+        }
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, stream_id);
+        match frame.kind {
+            FrameKind::Stdout => body.extend_from_slice(&frame.payload),
+            FrameKind::Exit => {
+                let exit: ExitReport =
+                    ipc::decode_control(&frame.payload).expect("archive exit decodes");
+                assert_eq!(exit.status, 0);
+                assert_eq!(exit.code, "OK");
+                assert_eq!(exit.outcome, "Completed");
+                return (result, body);
+            }
+            FrameKind::Error => panic!(
+                "archive stream {stream_id} refused: {}",
+                String::from_utf8_lossy(&frame.payload)
+            ),
+            other => panic!("unexpected frame {other:?} on archive stream {stream_id}"),
+        }
+    }
+}
+
+/// Runs one archive open expecting refusal: `Accepted` with an empty
+/// result, no body byte, then an `Error` and a failed `Exit`.
+async fn expect_archive_refused(driver: &mut Driver, stream_id: u64, payload: &[u8]) -> ErrorReply {
+    driver.send(FrameKind::Open, stream_id, payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, stream_id);
+    let reply: InvocationAccepted =
+        ipc::decode_control(&accepted.payload).expect("archive accepted decodes");
+    assert_eq!(reply.result, None, "a refused archive carries no metadata");
+    let mut body = 0;
+    loop {
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, stream_id);
+        match frame.kind {
+            FrameKind::Stdout => body += frame.payload.len(),
+            FrameKind::Error => {
+                let report: ErrorReply =
+                    ipc::decode_control(&frame.payload).expect("error decodes");
+                let exit_frame = driver.recv().await;
+                assert_eq!(exit_frame.kind, FrameKind::Exit);
+                let exit: ExitReport =
+                    ipc::decode_control(&exit_frame.payload).expect("exit decodes");
+                assert_eq!(exit.status, 1);
+                assert_eq!(exit.outcome, "Failed");
+                assert_eq!(body, 0, "no body byte precedes the refusal");
+                return report;
+            }
+            other => panic!("unexpected frame {other:?} on refused archive {stream_id}"),
+        }
+    }
+}
+
+fn archive_payload(
+    store_repo: &str,
+    session: &str,
+    args: &ruk_core::protocol::ArchiveArgs,
+) -> Vec<u8> {
+    let args_json = sonic_rs::to_string(args).expect("archive args encode");
+    Driver::typed_open(store_repo, "archive", None, Some(args_json), Some(session))
+}
+
+#[tokio::test]
+async fn archive_typed_stream_reports_result_and_tar_body() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-tar");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Ref(RefName::new("refs/heads/main").expect("ref name")),
+        format: None,
+    };
+    let (result, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        false,
+    )
+    .await;
+    assert_eq!(result.commit, commit);
+    assert_eq!(result.format, ArchiveFormat::Tar);
+    assert_eq!(result.content_type, "application/x-tar");
+    assert!(
+        body.windows(commit.to_hex().len())
+            .any(|w| w == commit.to_hex().as_bytes()),
+        "the global header names the commit"
+    );
+    assert!(
+        body.windows(5).any(|w| w == b"a.txt"),
+        "the walked file is in the stream"
+    );
+    assert!(
+        body.windows(6).any(|w| w == b"hello\n"),
+        "the file payload streams"
+    );
+    assert!(
+        body.len() >= 1024 && body[body.len() - 1024..].iter().all(|b| *b == 0),
+        "two zero blocks close the stream"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_zip_transcodes_through_shared_transcoder() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-zip");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Zip),
+    };
+    let (result, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        false,
+    )
+    .await;
+    assert_eq!(result.commit, commit);
+    assert_eq!(result.format, ArchiveFormat::Zip);
+    assert_eq!(result.content_type, "application/zip");
+    assert_eq!(&body[..4], b"PK\x03\x04", "the stream is a zip file");
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body)).expect("zip parses");
+    assert_eq!(zip.len(), 1);
+    let mut entry = zip.by_index(0).expect("one entry");
+    assert_eq!(entry.name().expect("entry name"), "a.txt");
+    let mut contents = Vec::new();
+    use std::io::Read as _;
+    entry.read_to_end(&mut contents).expect("zip entry reads");
+    assert_eq!(contents, b"hello\n");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_limit_fails_before_first_byte() {
+    use ruk_core::protocol::{ArchiveArgs, CommitRev};
+    let root = temp_root("archive-limit");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    registry.set_archive_max_bytes(16);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: None,
+    };
+    let report = expect_archive_refused(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+    )
+    .await;
+    assert_eq!(report.code.as_str(), "E_LIMIT");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_unknown_rev_refused_without_metadata() {
+    use ruk_core::protocol::{ArchiveArgs, CommitRev};
+    let root = temp_root("archive-unknown");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let missing = Oid::from_bytes(&[0xab; 20]).expect("fixture oid");
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(missing),
+        format: None,
+    };
+    let report = expect_archive_refused(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+    )
+    .await;
+    assert_eq!(report.code.as_str(), "E_NOT_FOUND");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_stream_waits_for_credit() {
+    use ruk_core::protocol::{ArchiveArgs, CommitRev};
+    let root = temp_root("archive-credit");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair_with_window(&root, 512);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: None,
+    };
+    let (result, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        true,
+    )
+    .await;
+    assert_eq!(result.commit, commit);
+    assert!(
+        body.len() > 512,
+        "the body exceeds the window and still completes: {} bytes",
+        body.len()
+    );
+    assert!(
+        body.windows(6).any(|w| w == b"hello\n"),
+        "the file payload streams through grants"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+/// Mints one stored commit whose single file `a.txt` carries `content`.
+fn seed_content_commit(repo_dir: &Path, content: &[u8]) -> Oid {
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let length = u64::try_from(content.len()).expect("content fits in u64");
+    let blob = store
+        .prepare(ObjectKind::Blob, length, content, None)
+        .expect("prepare blob");
+    let blob_oid = blob.oid();
+    store
+        .publish(
+            vec![blob],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish blob");
+    let mut tree_bytes = Vec::new();
+    tree_bytes.extend_from_slice(b"100644 a.txt\0");
+    tree_bytes.extend_from_slice(blob_oid.as_bytes());
+    let tree_len = u64::try_from(tree_bytes.len()).expect("tree fits in u64");
+    let tree = store
+        .prepare(ObjectKind::Tree, tree_len, &tree_bytes[..], None)
+        .expect("prepare tree");
+    let tree_oid = tree.oid();
+    store
+        .publish(
+            vec![tree],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish tree");
+    let signature = Signature {
+        name: ByteString::from("Tag"),
+        email: ByteString::from("tag@example.invalid"),
+        timestamp: 1_700_000_000,
+        offset: TzOffset::UTC,
+    };
+    let prepared = prepare_new(
+        &store,
+        NewRequest {
+            tree: tree_oid,
+            parents: Vec::new(),
+            author: signature.clone(),
+            committer: signature,
+            message: ByteString::from("seed"),
+            change_id: None,
+            predecessor: None,
+            provenance: None,
+        },
+    )
+    .expect("prepare seed commit");
+    let oid = prepared.output.oid.expect("seed commit is a Git commit");
+    store
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed commit");
+    oid
+}
+
+/// Pseudo-random bytes: incompressible, so deflate takes its stored fallback
+/// and the zip bound is exercised at its worst case.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0x2545_f491;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        out.push(state.to_le_bytes()[0]);
+    }
+    out
+}
+
+/// Seeds the incompressible commit and measures it before any stream opens.
+fn measured_incompressible_commit(
+    repo_dir: &Path,
+) -> (Oid, ruk_git::transport::archive::ArchiveSize) {
+    let commit = seed_content_commit(repo_dir, &incompressible(200_000));
+    seed_ref(repo_dir, "refs/heads/main", commit);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let kind = store.hash_kind();
+    let plan =
+        ruk_git::transport::archive::plan_commit_archive(&store, kind, commit).expect("plan");
+    let size = ruk_git::transport::archive::count_commit_tar(
+        &store,
+        kind,
+        &plan,
+        &ruk_git::transport::Interrupt::none(),
+    )
+    .expect("count");
+    (commit, size)
+}
+
+#[tokio::test]
+async fn archive_zip_size_bound_covers_actual_zip() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-zip-bound");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (commit, size) = measured_incompressible_commit(&repo_dir);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Zip),
+    };
+    let (_, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        false,
+    )
+    .await;
+    let actual = u64::try_from(body.len()).expect("zip length fits in u64");
+    assert!(
+        actual <= size.zip,
+        "the zip bound {} covers the {actual}-byte zip",
+        size.zip
+    );
+    assert!(
+        size.zip - actual <= 1024,
+        "the bound stays tight: {} over {actual}",
+        size.zip
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_cap_binds_each_format_by_its_own_size() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-cap-format");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (commit, size) = measured_incompressible_commit(&repo_dir);
+    assert!(
+        size.tar > size.zip,
+        "this payload makes the tar larger than the zip bound, so the cap separates them"
+    );
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    registry.set_archive_max_bytes(size.zip);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let zip = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Zip),
+    };
+    let (_, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &zip),
+        false,
+    )
+    .await;
+    assert!(
+        !body.is_empty(),
+        "the zip bound fits the cap, so zip is served"
+    );
+    let tar = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Tar),
+    };
+    let report = expect_archive_refused(
+        &mut driver,
+        7,
+        &archive_payload(&store_repo, &session, &tar),
+    )
+    .await;
+    assert_eq!(
+        report.code.as_str(),
+        "E_LIMIT",
+        "the exact tar bytes exceed the cap"
+    );
+
+    drop(driver);
+    task.abort();
 }

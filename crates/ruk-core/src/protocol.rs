@@ -70,8 +70,11 @@ pub const SCHEMA_MAJOR: u32 = 1;
 /// `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`,
 /// `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`,
 /// `claim.renew`, `policy.set`) and the `Admin` method kind; older readers
-/// refuse its frames as unknown methods.
-pub const SCHEMA_MINOR: u32 = 2;
+/// refuse its frames as unknown methods. Minor 3 adds the `result` field to
+/// the `archive` invocation's `Accepted` frame (commit, format, content
+/// type). The field is serde-defaulted, so minor-2 readers decode the frame
+/// unchanged and simply ignore the metadata.
+pub const SCHEMA_MINOR: u32 = 3;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -3231,6 +3234,17 @@ pub struct SearchReply {
 pub enum ArchiveFormat {
     Tar,
     Zip,
+}
+
+impl ArchiveFormat {
+    /// The media type of the streamed payload.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Tar => "application/x-tar",
+            Self::Zip => "application/zip",
+        }
+    }
 }
 
 /// `archive`: metadata for the streamed payload; bytes ride `Stdout`

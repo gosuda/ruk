@@ -63,6 +63,8 @@ pub(crate) struct Registry {
     hook_timeout_ms: AtomicU64,
     /// Cap of ref commands accepted per hosted push batch.
     hook_max_commands: AtomicUsize,
+    /// Cap of archive bytes served per streamed read.
+    archive_max_bytes: AtomicU64,
     /// Default branch new repositories record in `RepoMeta`.
     default_branch: Mutex<String>,
 }
@@ -118,6 +120,7 @@ impl Registry {
             event_retention_seconds: AtomicU64::new(super::DEFAULT_EVENT_RETENTION_SECONDS),
             hook_timeout_ms: AtomicU64::new(super::DEFAULT_HOOK_TIMEOUT_MS),
             hook_max_commands: AtomicUsize::new(super::MAX_HOOK_MAX_COMMANDS),
+            archive_max_bytes: AtomicU64::new(super::DEFAULT_ARCHIVE_MAX_BYTES),
             default_branch: Mutex::new(String::from(super::DEFAULT_DEFAULT_BRANCH)),
         };
         registry.sweep_tombstones();
@@ -215,6 +218,18 @@ impl Registry {
     /// Reads the cap of ref commands accepted per hosted push batch.
     pub(crate) fn hook_max_commands(&self) -> usize {
         self.hook_max_commands.load(Ordering::Relaxed)
+    }
+
+    /// Sets the cap of archive bytes served per streamed read.
+    ///
+    /// `serve` calls this once from the daemon configuration before serving.
+    pub(crate) fn set_archive_max_bytes(&self, max: u64) {
+        self.archive_max_bytes.store(max, Ordering::SeqCst);
+    }
+
+    /// Reads the cap of archive bytes served per streamed read.
+    pub(crate) fn archive_max_bytes(&self) -> u64 {
+        self.archive_max_bytes.load(Ordering::SeqCst)
     }
 
     /// Sets the default branch new repositories record in `RepoMeta`.

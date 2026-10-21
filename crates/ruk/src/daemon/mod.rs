@@ -39,12 +39,19 @@ use ruk_core::coord::{
     cancellation,
 };
 use ruk_core::error::{CoreError, ErrorCode};
+use ruk_core::ids::Oid;
 use ruk_core::protocol::{
-    ErrorReply, Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request, SessionOpenArgs,
-    SessionResumeArgs, decode_json,
+    ArchiveFormat, ErrorReply, Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request,
+    SessionOpenArgs, SessionResumeArgs, decode_json,
 };
 use ruk_core::refdata::RefName;
+use ruk_git::GitError;
+use ruk_git::transport::archive::{
+    ArchivePlan, TarSink, count_commit_tar, plan_commit_archive, stream_commit_tar,
+};
 use ruk_git::transport::host::{HookCall, HookReply, HostPolicy, hook_bridge};
+
+use crate::archive_zip::ZipTranscoder;
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::serve::ReceiveLimits;
 
@@ -632,6 +639,23 @@ pub(crate) struct InvocationAccepted {
     pub method: String,
     /// The opaque repository handle serving this invocation.
     pub repo_handle: String,
+    /// The archive metadata, present only on `archive` streams: the pinned
+    /// commit, the negotiated format, and the media type of the body that
+    /// follows as `Stdout` frames. Absent on every other method.
+    #[serde(default)]
+    pub result: Option<ArchiveAcceptedResult>,
+}
+
+/// The archive metadata one `Accepted` frame carries: the pinned commit the
+/// streamed body walks, the negotiated format, and its media type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArchiveAcceptedResult {
+    /// The archived commit the body walks.
+    pub commit: Oid,
+    /// The negotiated payload format.
+    pub format: ArchiveFormat,
+    /// The media type of the streamed body.
+    pub content_type: String,
 }
 
 /// The `WindowUpdate` payload granting outbound credit to its stream.
@@ -978,7 +1002,7 @@ pub(crate) fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::open_session/resume_session"
         }
         ruk_core::protocol::MethodKind::Read => {
-            "HostedCoordinator::read (op.log, claim.list, attest.list, refs.list, events.tail, file, show, log, diff, blame, query, status, repo.stat, tree served; other reads name their missing implementation)"
+            "HostedCoordinator::read (op.log, claim.list, attest.list, refs.list, events.tail, file, show, log, diff, blame, query, status, repo.stat, tree, archive served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
             "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, split, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, resolve, revert, undo, land.prepare mutations covered; the rest name their missing preparation)"
@@ -1038,6 +1062,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
         registry.set_event_retention_seconds(config.event_retention_seconds);
         registry.set_hook_timeout(config.hook_timeout);
         registry.set_hook_max_commands(config.hook_max_commands);
+        registry.set_archive_max_bytes(config.archive_max_bytes);
         registry.set_default_branch(config.default_branch.clone());
         let executor = BoundedExecutor::new(config.blocking_pool_size)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3051,10 +3076,35 @@ async fn typed_stream(
                 }
             }
         };
+    if method == Method::Archive {
+        let Some(coordinator) = coordinator.as_ref() else {
+            fail(Error::Core(CoreError::new(
+                ErrorCode::EHosted,
+                "internal: archive arrived without a coordinator",
+            )))
+            .await;
+            return;
+        };
+        serve_typed_archive(ArchiveStream {
+            input,
+            sink,
+            open,
+            refs,
+            principal: &principal,
+            coordinator,
+            handle: handle.as_str(),
+            cancel_guard: &cancel_guard,
+            cancel: &cancel,
+            credits: &mut credits,
+        })
+        .await;
+        return;
+    }
     let accepted = InvocationAccepted {
         stream_id,
         method: method.as_str().to_string(),
         repo_handle: handle,
+        result: None,
     };
     let accepted_bytes = match ipc::encode_control(&accepted) {
         Ok(bytes) => bytes,
@@ -3162,6 +3212,519 @@ async fn typed_stream(
             }
         }
     }
+}
+
+/// One `archive` stream's handles: the typed-stream halves plus the open
+/// coordinator the metadata read runs on and the repository handle the
+/// `Accepted` frame echoes.
+struct ArchiveStream<'a> {
+    input: &'a mut mpsc::Receiver<ipc::Frame>,
+    sink: &'a StreamSink,
+    open: &'a InvocationOpen,
+    refs: &'a ConnectionRefs,
+    principal: &'a Principal,
+    coordinator: &'a Arc<HostedCoordinator>,
+    handle: &'a str,
+    cancel_guard: &'a CancelHandle,
+    cancel: &'a Cancel,
+    credits: &'a mut ipc::StreamCredits,
+}
+
+/// A [`TarSink`](ruk_git::transport::archive::TarSink) emitting one bounded
+/// chunk per write: the blocking walk pushes 64 KiB frames into the stream
+/// task, which sends them as `Stdout` frames under the reply credit window.
+/// Never buffers the archive.
+struct ChannelSink {
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
+impl TarSink for ChannelSink {
+    fn write_tar(&mut self, bytes: &[u8]) -> Result<(), GitError> {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let width = rest.len().min(ipc::MAX_DATA_CHUNK_BYTES);
+            let chunk = rest[..width].to_vec();
+            rest = &rest[width..];
+            self.sender.blocking_send(chunk).map_err(|_| GitError::Io {
+                detail: "archive consumer is gone".to_owned(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, _message: &str) -> Result<(), GitError> {
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), GitError> {
+        Ok(())
+    }
+}
+
+/// Adapts the stream channel to `io::Write` for the zip transcoder. Zip
+/// output coalesces into [`ipc::MAX_DATA_CHUNK_BYTES`] frames, so the
+/// transcoder's small header writes never become tiny `Stdout` frames. A
+/// dropped consumer surfaces as a broken pipe, which ends the walk.
+struct ChannelWriter {
+    sender: mpsc::Sender<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+impl ChannelWriter {
+    fn new(sender: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            sender,
+            pending: Vec::new(),
+        }
+    }
+
+    fn send_chunk(&self, chunk: Vec<u8>) -> std::io::Result<()> {
+        self.sender.blocking_send(chunk).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "archive consumer is gone")
+        })
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        while self.pending.len() >= ipc::MAX_DATA_CHUNK_BYTES {
+            let chunk: Vec<u8> = self.pending.drain(..ipc::MAX_DATA_CHUNK_BYTES).collect();
+            self.send_chunk(chunk)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.pending);
+        self.send_chunk(chunk)
+    }
+}
+
+/// The end of one archive body pump.
+enum ArchivePumpOutcome {
+    /// Every body byte reached the writer task.
+    Done,
+    /// A `Cancel` frame arrived mid-stream; the walk was interrupted.
+    Cancelled,
+    /// The connection reader or writer is gone.
+    Gone,
+    /// A protocol violation; the caller reports it.
+    Failed(CoreError),
+}
+
+/// Pumps walked tar chunks as `Stdout` frames under the reply credit
+/// window. A chunk waits for outbound credit instead of refusing, so the
+/// body streams in 64 KiB frames; a `Cancel` frame interrupts the walk and
+/// ends the pump.
+#[cfg(unix)]
+async fn pump_archive_body(
+    sink: &StreamSink,
+    input: &mut mpsc::Receiver<ipc::Frame>,
+    credits: &mut ipc::StreamCredits,
+    cancel_guard: &CancelHandle,
+    interrupt_flag: &Arc<AtomicBool>,
+    rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> ArchivePumpOutcome {
+    let stream_id = sink.stream_id;
+    let mut pending: Option<Vec<u8>> = None;
+    loop {
+        if pending.is_none() {
+            tokio::select! {
+                chunk = rx.recv() => {
+                    match chunk {
+                        Some(bytes) => pending = Some(bytes),
+                        None => return ArchivePumpOutcome::Done,
+                    }
+                }
+                frame = input.recv() => {
+                    match archive_idle_frame(frame, sink, credits, cancel_guard, interrupt_flag).await {
+                        ArchivePumpOutcome::Done => {}
+                        outcome => return outcome,
+                    }
+                }
+            }
+        }
+        let bytes = pending.take().unwrap_or_default();
+        let width = match u64::try_from(bytes.len()) {
+            Ok(width) => width,
+            Err(_) => {
+                return ArchivePumpOutcome::Failed(CoreError::new(
+                    ErrorCode::ELimit,
+                    "archive chunk exceeds the data bound",
+                ));
+            }
+        };
+        if credits.consume_outbound(stream_id, width).is_ok() {
+            if send_frame(sink, ipc::FrameKind::Stdout, &bytes)
+                .await
+                .is_err()
+            {
+                return ArchivePumpOutcome::Gone;
+            }
+            continue;
+        }
+        pending = Some(bytes);
+        match wait_outbound_credit(input, stream_id, credits, cancel_guard).await {
+            CreditFate::Granted => {}
+            CreditFate::Cancelled => {
+                interrupt_flag.store(true, Ordering::SeqCst);
+                cancel_guard.cancel();
+                return ArchivePumpOutcome::Cancelled;
+            }
+            CreditFate::InputClosed => return ArchivePumpOutcome::Gone,
+            CreditFate::Rejected(err) => return ArchivePumpOutcome::Failed(err),
+        }
+    }
+}
+
+/// Handles one stream frame arriving while the pump waits for the next
+/// walked chunk: `Cancel` interrupts the walk, credit grants accumulate,
+/// late stdin endings are ignored, and anything else refuses the stream.
+#[cfg(unix)]
+async fn archive_idle_frame(
+    frame: Option<ipc::Frame>,
+    sink: &StreamSink,
+    credits: &mut ipc::StreamCredits,
+    cancel_guard: &CancelHandle,
+    interrupt_flag: &Arc<AtomicBool>,
+) -> ArchivePumpOutcome {
+    let Some(frame) = frame else {
+        return ArchivePumpOutcome::Gone;
+    };
+    if frame.stream_id != sink.stream_id {
+        return ArchivePumpOutcome::Failed(CoreError::new(
+            ErrorCode::EInvalid,
+            "stream received a frame of another stream",
+        ));
+    }
+    match frame.kind {
+        ipc::FrameKind::Cancel => {
+            interrupt_flag.store(true, Ordering::SeqCst);
+            cancel_guard.cancel();
+            ArchivePumpOutcome::Cancelled
+        }
+        ipc::FrameKind::WindowUpdate => match ipc::decode_control::<WindowCredit>(&frame.payload) {
+            Ok(credit) => match route_credit(credits, sink.stream_id, &credit) {
+                Ok(()) => ArchivePumpOutcome::Done,
+                Err(err) => ArchivePumpOutcome::Failed(err),
+            },
+            Err(err) => ArchivePumpOutcome::Failed(err),
+        },
+        ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof => ArchivePumpOutcome::Done,
+        _ => ArchivePumpOutcome::Failed(CoreError::new(
+            ErrorCode::EInvalid,
+            "frame kind is misplaced on this stream",
+        )),
+    }
+}
+
+/// Serves one `archive` invocation: reads the metadata, answers `Accepted`
+/// carrying the pinned commit, and streams the body as `Stdout` frames in
+/// 64 KiB chunks under the reply credit window.
+///
+/// The order is the contract: the typed stream always answers `Accepted`
+/// first, with the metadata on success and an empty result on refusal, and
+/// the cap count completes before it, so an over-cap archive reports
+/// `E_LIMIT` before the first body byte. Zip transcodes the counted tar
+/// through the shared transcoder and checks the cap again before the first
+/// byte.
+#[cfg(unix)]
+async fn serve_typed_archive(stream: ArchiveStream<'_>) {
+    let ArchiveStream {
+        input,
+        sink,
+        open,
+        refs,
+        principal,
+        coordinator,
+        handle,
+        cancel_guard,
+        cancel,
+        credits,
+    } = stream;
+    let stream_id = sink.stream_id;
+    let fail = async |err: Error| {
+        let _ = send_error_exit(sink, &err).await;
+    };
+    // Everything failable runs before the first frame: the metadata read
+    // and the cap count both complete while the stream is still silent. The
+    // prelude pumps the stream channel while it runs, so a `Cancel` during
+    // a long count interrupts the walk instead of waiting it out.
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    let prelude: Result<(ArchiveAcceptedResult, ArchivePlan), Error> = {
+        let count_flag = Arc::clone(&interrupt_flag);
+        let mut pending = Box::pin(async {
+            let session = match open.session_id.as_deref() {
+                None => return Err(Error::Core(refuse_sessionless(Method::Archive, None))),
+                Some(text) => text.parse::<SessionId>().map_err(|err| {
+                    Error::Core(CoreError::new(
+                        ErrorCode::EInvalid,
+                        format!("invocation carries a malformed session id: {err}"),
+                    ))
+                })?,
+            };
+            let request = decode_request_args(Method::Archive, open.args_json.as_deref(), None)
+                .map_err(Error::Core)?;
+            request.validate().map_err(Error::Core)?;
+            let meta = match coordinator.read(principal, session, request, cancel).await {
+                Ok(Reply::Archive(meta)) => meta,
+                Ok(_) => {
+                    return Err(Error::Core(CoreError::new(
+                        ErrorCode::EHosted,
+                        "internal: archive read answered another method",
+                    )));
+                }
+                Err(err) => return Err(Error::Core(err)),
+            };
+            let cap = refs.registry.archive_max_bytes();
+            let commit = meta.commit;
+            let format = meta.format;
+            let content_type = meta.content_type.clone();
+            let planner = Arc::clone(coordinator);
+            let plan = refs
+                .executor
+                .run(move || {
+                    let store = planner.store();
+                    let kind = store.hash_kind();
+                    let interrupt = ruk_git::transport::Interrupt::none().with_cancel(count_flag);
+                    let plan = plan_commit_archive(store, kind, commit).map_err(CoreError::from)?;
+                    let size = count_commit_tar(store, kind, &plan, &interrupt)
+                        .map_err(CoreError::from)?;
+                    Ok::<_, CoreError>((plan, size))
+                })
+                .await
+                .map_err(Error::Core)?
+                .map_err(Error::Core)?;
+            // The cap binds the bytes this format will serve: exact tar bytes
+            // for tar, the zip upper bound for zip. Either way it is decided
+            // here, before the first frame.
+            let (plan, size) = plan;
+            let (measured, label) = match format {
+                ArchiveFormat::Tar => (size.tar, "archive"),
+                ArchiveFormat::Zip => (size.zip, "zip archive bound"),
+            };
+            if measured > cap {
+                return Err(Error::Core(CoreError::new(
+                    ErrorCode::ELimit,
+                    format!("{label} of {measured} bytes exceeds the {cap}-byte cap"),
+                )));
+            }
+            Ok((
+                ArchiveAcceptedResult {
+                    commit,
+                    format,
+                    content_type,
+                },
+                plan,
+            ))
+        });
+        loop {
+            tokio::select! {
+                result = &mut pending => break result,
+                frame = input.recv() => {
+                    let Some(frame) = frame else {
+                        interrupt_flag.store(true, Ordering::SeqCst);
+                        return;
+                    };
+                    match frame.kind {
+                        ipc::FrameKind::Cancel => {
+                            interrupt_flag.store(true, Ordering::SeqCst);
+                            cancel_guard.cancel();
+                        }
+                        ipc::FrameKind::WindowUpdate => {
+                            if let Ok(credit) =
+                                ipc::decode_control::<WindowCredit>(&frame.payload)
+                            {
+                                let _ = route_credit(credits, stream_id, &credit);
+                            }
+                        }
+                        ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof => {}
+                        _ => {}
+                    }
+                }
+            }
+        }
+    };
+    // The typed contract answers `Accepted` before every terminal frame, so
+    // a refused archive still opens the stream: the empty result names the
+    // refusal to come, and no body byte precedes the verdict.
+    let (result, plan): (ArchiveAcceptedResult, ArchivePlan) = match prelude {
+        Ok(pair) => pair,
+        Err(err) => {
+            let refused = InvocationAccepted {
+                stream_id,
+                method: Method::Archive.as_str().to_string(),
+                repo_handle: handle.to_string(),
+                result: None,
+            };
+            match ipc::encode_control(&refused) {
+                Ok(bytes) => {
+                    if send_frame(sink, ipc::FrameKind::Accepted, &bytes)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    fail(Error::Core(err)).await;
+                    return;
+                }
+            }
+            fail(err).await;
+            return;
+        }
+    };
+    let format = result.format;
+    let accepted = InvocationAccepted {
+        stream_id,
+        method: Method::Archive.as_str().to_string(),
+        repo_handle: handle.to_string(),
+        result: Some(result),
+    };
+    let accepted_bytes = match ipc::encode_control(&accepted) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            fail(Error::Core(err)).await;
+            return;
+        }
+    };
+    if send_frame(sink, ipc::FrameKind::Accepted, &accepted_bytes)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Both formats stream through one path: the walk runs on the blocking
+    // pool, the zip transcoder (for `zip`) or the raw tar chunker (for `tar`)
+    // writes into the bounded channel, and the stream pumps each chunk as a
+    // 64 KiB `Stdout` frame under the credit window. Memory stays bounded by
+    // the channel and the transcoder's one pending record, never the archive.
+    let body = ArchiveBody {
+        sink,
+        input,
+        credits,
+        cancel_guard,
+        interrupt_flag: &interrupt_flag,
+        coordinator,
+        executor: &refs.executor,
+        plan,
+    };
+    match format {
+        ArchiveFormat::Tar => {
+            stream_archive_body(body, |tx| ChannelSink { sender: tx }).await;
+        }
+        ArchiveFormat::Zip => {
+            stream_archive_body(body, |tx| ZipTranscoder::new(ChannelWriter::new(tx))).await;
+        }
+    }
+}
+
+/// Everything one archive body stream needs: the stream's halves, the
+/// interrupt flag its prelude may already have tripped, the coordinator the
+/// walk reads, and the planned commit.
+struct ArchiveBody<'a> {
+    sink: &'a StreamSink,
+    input: &'a mut mpsc::Receiver<ipc::Frame>,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    interrupt_flag: &'a Arc<AtomicBool>,
+    coordinator: &'a Arc<HostedCoordinator>,
+    executor: &'a BoundedExecutor,
+    plan: ArchivePlan,
+}
+
+/// Streams one planned archive body. The walk runs on the blocking pool
+/// into the sink `make_sink` builds over the channel, and each chunk it
+/// produces is pumped as a `Stdout` frame under the credit window.
+///
+/// Every path joins the walk task before returning, so no detached worker
+/// outlives the stream. Interrupting the walk and dropping the receiver
+/// fails its next send, so it reports even when the pump stopped draining
+/// first. The flag alone cannot unblock a send parked on a full channel.
+async fn stream_archive_body<S, F>(body: ArchiveBody<'_>, make_sink: F)
+where
+    S: TarSink + Send + 'static,
+    F: FnOnce(mpsc::Sender<Vec<u8>>) -> S,
+{
+    let ArchiveBody {
+        sink,
+        input,
+        credits,
+        cancel_guard,
+        interrupt_flag,
+        coordinator,
+        executor,
+        plan,
+    } = body;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+    let walk_sink = make_sink(tx);
+    let walk_flag = Arc::clone(interrupt_flag);
+    let walker = Arc::clone(coordinator);
+    let walk_executor = executor.clone();
+    let walk = tokio::spawn(async move {
+        match walk_executor
+            .run(move || {
+                let store = walker.store();
+                let kind = store.hash_kind();
+                let interrupt = ruk_git::transport::Interrupt::none().with_cancel(walk_flag);
+                stream_commit_tar(store, kind, &plan, &interrupt, walk_sink)
+                    .map_err(CoreError::from)
+            })
+            .await
+        {
+            Ok(inner) => inner,
+            Err(outer) => Err(outer),
+        }
+    });
+    let outcome =
+        pump_archive_body(sink, input, credits, cancel_guard, interrupt_flag, &mut rx).await;
+    interrupt_flag.store(true, Ordering::SeqCst);
+    drop(rx);
+    let walked = match walk.await {
+        Ok(inner) => inner,
+        Err(err) => Err(CoreError::new(
+            ErrorCode::EIo,
+            format!("archive walk failed to report: {err}"),
+        )),
+    };
+    if matches!(outcome, ArchivePumpOutcome::Gone) {
+        return;
+    }
+    let walk_cancelled = matches!(&walked, Err(err) if cancelled(err));
+    if matches!(outcome, ArchivePumpOutcome::Cancelled) || walk_cancelled {
+        let _ = send_exit(
+            sink,
+            130,
+            ErrorCode::ECancelled.as_str(),
+            "CancelledBeforeCommit",
+        )
+        .await;
+        return;
+    }
+    match walked {
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
+        }
+        Ok(()) => match outcome {
+            ArchivePumpOutcome::Done => {
+                let _ = send_exit(sink, 0, "OK", "Completed").await;
+            }
+            ArchivePumpOutcome::Failed(err) => {
+                let _ = send_error_exit(sink, &Error::Core(err)).await;
+            }
+            ArchivePumpOutcome::Cancelled | ArchivePumpOutcome::Gone => {}
+        },
+    }
+}
+
+/// Reports whether an archive failure cancelled the stream.
+fn cancelled(err: &CoreError) -> bool {
+    err.code == ErrorCode::ECancelled
 }
 
 /// Dispatches one authorized invocation on its repository coordinator.
