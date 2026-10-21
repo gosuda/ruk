@@ -609,6 +609,7 @@ pub fn discover_endpoint(
     endpoint: &Endpoint,
     service: Service,
     kind: HashKind,
+    auth: &super::credentials::AuthPolicy,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
     match endpoint {
         Endpoint::Http { url, .. } => {
@@ -618,9 +619,7 @@ pub fn discover_endpoint(
                 Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
                 Service::UploadArchive => super::smart_http::SmartService::UploadArchive,
             };
-            // No repo config reaches this layer, so no `http.extraHeader`
-            // rows join here; the verbs pass them explicitly.
-            Ok(super::smart_http::discover(&base, smart, kind, &[])?.refs)
+            Ok(super::smart_http::discover(&base, smart, kind, &[], auth)?.refs)
         }
         _ => discover(open_stream(endpoint, service)?, kind),
     }
@@ -1169,7 +1168,15 @@ mod tests {
             path: "/srv/a.git".to_owned(),
         };
         let refs = to_local_refs(
-            discover_endpoint(&endpoint, Service::UploadPack, HashKind::Sha1).expect("discover"),
+            discover_endpoint(
+                &endpoint,
+                Service::UploadPack,
+                HashKind::Sha1,
+                &crate::transport::credentials::AuthPolicy::explicit(
+                    crate::transport::credentials::TransportAuth::none(),
+                ),
+            )
+            .expect("discover"),
         )
         .expect("map");
         assert!(refs.iter().any(|entry| entry.name == b"refs/heads/main"));

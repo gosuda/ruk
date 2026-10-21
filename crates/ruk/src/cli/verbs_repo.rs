@@ -1007,6 +1007,7 @@ fn remote_update(ctx: &mut Ctx, tail: &[String]) -> Result<Vec<u8>, GitError> {
                 depth: None,
                 fetch_tags: false,
                 prune,
+                auth: ruk_git::transport::credentials::AuthPolicy::ambient_in(ctx.env.vars.clone()),
             },
         )?;
         out.extend_from_slice(&bytes);
