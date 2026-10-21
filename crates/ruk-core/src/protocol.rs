@@ -578,8 +578,8 @@ pub enum CommitRev {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct KeysetPage<T> {
     pub items: Vec<T>,
-    /// The last returned key, hex-encoded; absent when the listing is
-    /// exhausted.
+    /// The last returned key as raw bytes: a ref name for `refs.list`, an
+    /// entry name for `tree`. Absent when the listing is exhausted.
     #[serde(default)]
     pub next_after: Option<ByteString>,
 }
