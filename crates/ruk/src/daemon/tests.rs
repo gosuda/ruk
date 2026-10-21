@@ -2152,6 +2152,79 @@ async fn host_duplicate_divert_second_fails_first_kept() {
 }
 
 #[tokio::test]
+async fn host_post_receive_reports_only_landed_refs() {
+    let root = temp_root("host-post-landed");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/scratch", commit);
+
+    let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let session = open_push_session(&mut driver, &store_repo, &["refs/heads/**"]).await;
+    let zero = "0".repeat(40);
+    let bogus = "f".repeat(40);
+    let mut body = pkt(format!(
+        "{commit} {zero} refs/heads/scratch\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&pkt(
+        format!("{bogus} {zero} refs/heads/nosuch\n").as_bytes()
+    ));
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-post-landed-1"),
+    );
+    let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&posted);
+    let answer = move |call: &HookCall| {
+        if call.phase == HookPhase::PostReceive {
+            seen.lock()
+                .expect("post log")
+                .extend(call.commands.iter().map(|command| command.name.clone()));
+            return Some(HookReply {
+                reject_all: false,
+                reason: None,
+                verdicts: Vec::new(),
+            });
+        }
+        accept_all(call)
+    };
+    let (out, exit) = driver.run_git_hosted(5, &payload, &[body], answer).await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ok refs/heads/scratch"),
+        "the landed delete reports ok: {text:?}"
+    );
+    assert!(
+        text.contains("ng refs/heads/nosuch"),
+        "the refused delete reports ng: {text:?}"
+    );
+    let posted = posted.lock().expect("post log");
+    assert_eq!(
+        posted.as_slice(),
+        ["refs/heads/scratch"],
+        "the advisory callback names only the landed ref"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn host_reply_missing_ref_means_reject_all() {
     let root = temp_root("host-missing");
     let repo_dir = root.join("repo");

@@ -448,21 +448,62 @@ impl ReceivePolicy for HostPolicy {
         if landed.lines.is_empty() {
             return;
         }
-        let landed_commands: Vec<HookCommand> = state
-            .commands
-            .into_iter()
-            .zip(state.verdicts)
-            .filter_map(|(command, verdict)| {
-                matches!(verdict, RefVerdict::Accept | RefVerdict::Divert { .. }).then(|| {
-                    HookCommand {
-                        name: command.name,
-                        old: command.old,
-                        new: command.new,
-                        authorized: command.authorized,
+        let mut outstanding: std::collections::HashMap<(&str, &str, &str), usize> =
+            std::collections::HashMap::new();
+        for line in landed.lines.split_terminator('\n') {
+            let mut parts = line.splitn(3, ' ');
+            if let (Some(old), Some(new), Some(name)) = (parts.next(), parts.next(), parts.next()) {
+                *outstanding.entry((old, new, name)).or_insert(0) += 1;
+            }
+        }
+        let mut landed_commands: Vec<HookCommand> = Vec::new();
+        for (command, verdict) in state.commands.iter().zip(state.verdicts.iter()) {
+            let landed_now = match verdict {
+                RefVerdict::Accept => {
+                    let key = (
+                        command.old.as_str(),
+                        command.new.as_str(),
+                        command.name.as_str(),
+                    );
+                    match outstanding.get_mut(&key) {
+                        Some(count) if *count > 0 => {
+                            *count -= 1;
+                            true
+                        }
+                        _ => false,
                     }
-                })
-            })
-            .collect();
+                }
+                RefVerdict::Divert { alternate, .. } => {
+                    let name = String::from_utf8_lossy(&alternate.refname).into_owned();
+                    let new = alternate
+                        .new_oid
+                        .map(|oid| oid.to_hex())
+                        .unwrap_or_else(|| command.new.clone());
+                    match outstanding
+                        .iter_mut()
+                        .find(|((_, entry_new, entry_name), count)| {
+                            **count > 0
+                                && *entry_new == new.as_str()
+                                && *entry_name == name.as_str()
+                        }) {
+                        Some((_, count)) => {
+                            *count -= 1;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                RefVerdict::Reject { .. } | RefVerdict::RejectPush { .. } => false,
+            };
+            if landed_now {
+                landed_commands.push(HookCommand {
+                    name: command.name.clone(),
+                    old: command.old.clone(),
+                    new: command.new.clone(),
+                    authorized: command.authorized,
+                });
+            }
+        }
         if landed_commands.is_empty() {
             return;
         }
