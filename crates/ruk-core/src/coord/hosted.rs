@@ -1786,12 +1786,21 @@ impl HostedCoordinator {
         }
     }
 
+    /// Encoded-byte budget for one served tail page, held below the
+    /// control frame bound with room for the reply envelope (view, head,
+    /// oldest, expiry flag) around the events array.
+    const TAIL_PAGE_ENCODE_BUDGET: usize = MAX_CONTROL_FRAME_BYTES - 65_536;
+
     /// Scans forward from `after`, oldest first, collecting up to `limit`
     /// events whose names fall under `prefix`, and returns them with the
     /// last examined sequence. The scan pages internally to the end of
     /// the table: a filtered page never hides matching rows past its
     /// window, and the caller resumes from the last seen sequence, so no
-    /// event is missed or repeated.
+    /// event is missed or repeated. The accumulated page also stops at
+    /// an encoded-size budget below the control frame bound: names and
+    /// request ids have no length bound, so a row-count limit alone
+    /// cannot keep the reply encodable. A partial page resumes from its
+    /// last event, so the follower still advances.
     fn tail_page(
         &self,
         after: u64,
@@ -1799,6 +1808,7 @@ impl HostedCoordinator {
         prefix: Option<&ByteString>,
     ) -> Result<(Vec<TailedEvent>, u64), CoreError> {
         let mut events = Vec::new();
+        let mut encoded: usize = 0;
         let mut cursor = after;
         loop {
             let budget = FactPageBudget::new(limit, MAX_CONTROL_FRAME_BYTES);
@@ -1826,7 +1836,7 @@ impl HostedCoordinator {
                 {
                     continue;
                 }
-                events.push(TailedEvent {
+                let event = TailedEvent {
                     seq: cursor,
                     name: ByteString::from(stored.name),
                     old: stored
@@ -1844,7 +1854,24 @@ impl HostedCoordinator {
                     operation: stored.operation,
                     request_id: stored.request_id,
                     session: stored.session,
-                });
+                };
+                let width = sonic_rs::to_string(&event)
+                    .map(|text| text.len())
+                    .unwrap_or(usize::MAX);
+                // A lone oversize event still goes out alone: the transport
+                // refuses it the way it would have before, instead of the
+                // scan wedging on an undeliverable row.
+                if !events.is_empty()
+                    && encoded.saturating_add(width) > Self::TAIL_PAGE_ENCODE_BUDGET
+                {
+                    let end = events
+                        .last()
+                        .map(|event: &TailedEvent| event.seq)
+                        .unwrap_or(cursor);
+                    return Ok((events, end));
+                }
+                encoded = encoded.saturating_add(width);
+                events.push(event);
             }
             if events.len() == limit || !page.more {
                 break;
@@ -4090,6 +4117,74 @@ mod tests {
         assert_eq!(tail.events[0].seq, 4);
         assert_eq!(tail.events[0].name.as_bytes(), b"refs/heads/next");
         assert!(!tail.expired);
+    }
+
+    /// A row-count limit alone cannot keep the reply encodable: ref names
+    /// and request ids have no length bound, so 300 events with 60 KiB
+    /// names must come back as partial pages that still advance the
+    /// follower, and the encoded page must fit the control bound.
+    #[tokio::test]
+    async fn events_tail_bounds_long_names_in_encoded_bytes() {
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let names: Vec<String> = (0..300u32)
+            .map(|index| format!("refs/heads/{index:05}-{}", "x".repeat(61_400)))
+            .collect();
+        seed_refs(
+            &coord,
+            &names
+                .iter()
+                .map(|name| (name.as_str(), 1))
+                .collect::<Vec<_>>(),
+        );
+        let first = events_tail(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            tail_query(0, Some(1000), None),
+        )
+        .await;
+        assert!(!first.expired);
+        assert!(
+            first.events.len() < 300,
+            "the byte budget stops the page before the row limit: {}",
+            first.events.len()
+        );
+        assert!(
+            !first.events.is_empty(),
+            "a partial page still delivers events"
+        );
+        let encoded = sonic_rs::to_string(&first).expect("reply encodes");
+        assert!(
+            encoded.len() < MAX_CONTROL_FRAME_BYTES,
+            "partial page uses {} of {} control bytes",
+            encoded.len(),
+            MAX_CONTROL_FRAME_BYTES
+        );
+        let resume = events_tail(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            tail_query(first.events.last().expect("last seq").seq, Some(1000), None),
+        )
+        .await;
+        assert!(
+            !resume.events.is_empty(),
+            "the follower resumes past the partial page"
+        );
+        assert!(
+            resume.events[0].seq > first.events.last().expect("last seq").seq,
+            "no event repeats across the resume"
+        );
     }
 
     #[tokio::test]
