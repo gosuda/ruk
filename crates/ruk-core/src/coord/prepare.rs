@@ -3605,6 +3605,9 @@ fn land_prepare_parts(
 /// is served: `remote` must be absent (this store); a present remote names
 /// a transport push the coordinator does not run.
 ///
+/// The staged target move travels in `Parts.transaction` so the lane
+/// re-runs its collision check against live state at publication.
+///
 /// # Errors
 /// `E_HOSTED` for a present remote; `E_NOT_FOUND` for an unknown plan;
 /// `E_STALE` for a non-primary candidate, an expired plan, a moved target
@@ -3639,6 +3642,18 @@ fn land_execute_parts(
     let (outcome, facts) =
         super::land::prepare_land_execute(ctx.store, args.plan, args.candidate, now, checkpoint)?;
     row.capabilities.require_land(&outcome.target)?;
+    let transaction = RefTransaction::new(
+        ctx.store.hash_kind(),
+        vec![RefUpdate {
+            name: outcome.target.clone(),
+            expected: match outcome.base {
+                Some(base) => RefExpect::Present(RefTarget::Direct(base)),
+                None => RefExpect::Absent,
+            },
+            change: RefChange::Set(RefTarget::Direct(outcome.candidate)),
+        }],
+    )
+    .map_err(CoreError::from)?;
     let reply = Reply::LandExecute(Box::new(LandExecuteReply {
         outcome: pending_outcome(ctx.session, request_id),
         plan: outcome.plan,
@@ -3654,8 +3669,8 @@ fn land_execute_parts(
         reply,
         objects: Vec::new(),
         facts,
-        transaction: None,
-        dependencies: Vec::new(),
+        transaction: Some(transaction),
+        dependencies: vec![outcome.target.clone()],
         fence: None,
     })
 }
@@ -4962,6 +4977,75 @@ mod tests {
         )
         .expect_err("land.execute without the land grant is forbidden");
         assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn land_execute_carries_a_transaction_that_refuses_new_collisions() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        // A file ref appears below the target after prepare, so the staged
+        // target move now collides with live state.
+        let child_target = crate::refdata::RefTarget::Direct(oid);
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: crate::store::types::FactTable::Refs,
+                    key: b"refs/heads/main/child".to_vec(),
+                    expected: crate::store::types::FactExpectation::Absent,
+                    value: Some(
+                        crate::store::encode("ref target", &child_target)
+                            .expect("encode child target"),
+                    ),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish colliding child ref");
+        let staged = prepare_mutation_with(
+            &ctx,
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: oid,
+                },
+            })),
+        )
+        .expect("land.execute stages against a moved ref namespace");
+        let transaction = staged
+            .ref_transaction
+            .as_ref()
+            .expect("land.execute stages its target move");
+        let err = transaction
+            .check(&StoreRefs::new(&store))
+            .expect_err("a new directory/file collision refuses at publication");
+        assert!(
+            matches!(err, crate::refdata::RefError::Collision { .. }),
+            "a collision refuses, got: {err:?}"
+        );
     }
 
     #[test]
