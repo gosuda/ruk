@@ -296,7 +296,9 @@ pub(crate) fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
 /// Renders one unified patch from an alignment script.
 ///
 /// Hunk headers count lines with their terminators stripped; emitted lines
-/// carry the raw line bytes without the terminator plus one `\n`.
+/// carry the raw line bytes without the terminator plus one `\n`. A line
+/// whose source lacked the terminator gains a trailing
+/// `\ No newline at end of file` marker.
 pub(crate) fn unified_patch(
     old_label: &str,
     new_label: &str,
@@ -403,6 +405,9 @@ pub(crate) fn unified_patch(
             let stripped = line.strip_suffix(b"\n").unwrap_or(line);
             out.extend_from_slice(stripped);
             out.push(b'\n');
+            if !line.ends_with(b"\n") {
+                out.extend_from_slice(b"\\ No newline at end of file\n");
+            }
         }
     }
     out
@@ -1157,6 +1162,38 @@ mod tests {
             heads,
             vec![head_p1, head_a, head_p2, head_a],
             "each line attributes to its introducer"
+        );
+    }
+
+    #[test]
+    fn unified_patch_marks_missing_trailing_newline() {
+        let old: Vec<&[u8]> = vec![b"one\n", b"two"];
+        let new: Vec<&[u8]> = vec![b"one\n", b"TWO"];
+        let ops = lcs_align(&old, &new).expect("align");
+        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let text = String::from_utf8(patch).expect("patch is UTF-8");
+        assert_eq!(
+            text.matches("\\ No newline at end of file\n").count(),
+            2,
+            "both sides lack the terminator: {text}"
+        );
+    }
+
+    #[test]
+    fn unified_patch_marks_only_the_unterminated_line() {
+        let old: Vec<&[u8]> = vec![b"keep\n", b"two"];
+        let new: Vec<&[u8]> = vec![b"keep\n", b"TWO\n"];
+        let ops = lcs_align(&old, &new).expect("align");
+        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let text = String::from_utf8(patch).expect("patch is UTF-8");
+        assert_eq!(
+            text.matches("\\ No newline at end of file\n").count(),
+            1,
+            "only the deletion lacks the terminator: {text}"
+        );
+        assert!(
+            text.contains("-two\n\\ No newline at end of file\n"),
+            "marker follows the line: {text}"
         );
     }
 }
