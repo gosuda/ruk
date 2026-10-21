@@ -2301,7 +2301,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
         sink,
         credits,
         cancel_guard,
-        mut token,
+        token,
         cancel_flag,
         refs,
         coordinator,
@@ -2387,9 +2387,11 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     });
     drop(policy);
     tokio::pin!(serve);
-    // The wait ends on cancel or connection drop at once: dropping the
-    // run future frees its bulkhead permit, and the tripped flag stops
-    // the detached blocking serve at its next interrupt check.
+    // The wait ends on connection drop at once. A cancel trips the flag
+    // and the guard, and the loop keeps awaiting the detached serve
+    // instead of reporting at once: the serve stops at its next interrupt
+    // check, so the terminal report names what it actually did and the
+    // receipt below always records a finished push.
     let outcome: Result<(Vec<u8>, Vec<u64>), CoreError> = loop {
         tokio::select! {
             done = &mut serve => {
@@ -2397,15 +2399,6 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
                     Ok(inner) => inner,
                     Err(err) => Err(err),
                 };
-            }
-            _ = token.cancelled() => {
-                let report = CommandExitReport::cancelled(&invocation);
-                let exit_bytes = match ipc::encode_control(&report) {
-                    Ok(bytes) => bytes,
-                    Err(_) => return,
-                };
-                let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
-                return;
             }
             frame = input.recv() => {
                 let Some(frame) = frame else {
@@ -2489,15 +2482,6 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
             let _ = send_error_exit(sink, &store_err).await;
             return;
         }
-    }
-    if token.check().is_err() {
-        let report = CommandExitReport::cancelled(&invocation);
-        let exit_bytes = match ipc::encode_control(&report) {
-            Ok(bytes) => bytes,
-            Err(_) => return,
-        };
-        let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
-        return;
     }
     match write_typed_chunks(sink, input, credits, cancel_guard, &out).await {
         TypedWriteFate::Done => {}

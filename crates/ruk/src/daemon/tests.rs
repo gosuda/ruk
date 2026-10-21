@@ -2865,6 +2865,82 @@ async fn small_stdin_frames_within_window_are_not_refused() {
     task.abort();
 }
 
+/// A cancel racing an accepted hook verdict must not report
+/// `CancelledBeforeCommit` for refs that landed anyway: the stream keeps
+/// awaiting the detached serve and reports what it actually did.
+#[tokio::test]
+async fn cancel_after_accept_reports_completed_push() {
+    use std::time::Duration;
+    let root = temp_root("cancel-after-accept");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let hex = commit.to_hex();
+    let mut body = pkt(format!("{hex} {zero} refs/heads/main\n").as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-probe-cancel"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    assert_eq!(driver.recv().await.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 5, &body).await;
+    assert_eq!(driver.recv().await.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    let outcome = loop {
+        let frame = driver.recv().await;
+        match frame.kind {
+            FrameKind::HookCall => {
+                let call: HookCall = ipc::decode_control(&frame.payload).expect("call");
+                if let Some(reply) = accept_all(&call) {
+                    let bytes = ipc::encode_control(&reply).expect("reply");
+                    driver.send(FrameKind::HookReply, 5, &bytes).await;
+                    driver.send(FrameKind::Cancel, 5, &[]).await;
+                }
+                continue;
+            }
+            FrameKind::Exit => {
+                let report: CommandExitReport = ipc::decode_control(&frame.payload).expect("exit");
+                break report.outcome.clone();
+            }
+            _ => continue,
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let main = coordinator
+        .store()
+        .fact(ruk_core::store::FactTable::Refs, b"refs/heads/main")
+        .expect("read");
+    assert!(
+        !(outcome == "CancelledBeforeCommit" && main.is_none()),
+        "reported {outcome} but the delete landed",
+    );
+    assert_eq!(outcome, "Completed");
+    drop(driver);
+    task.abort();
+}
+
 #[tokio::test]
 async fn frame_kind_9_rejected_on_any_stream() {
     let root = temp_root("kind-nine");
