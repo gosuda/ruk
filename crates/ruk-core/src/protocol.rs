@@ -99,6 +99,7 @@ pub const REQUEST_DIGEST_VERSION: u8 = 1;
 
 const DIGEST_DOMAIN_V1: &[u8] = b"ruk-request-digest-v1";
 const ATTEST_PAYLOAD_DOMAIN_V1: &[u8] = b"ruk-attest-payload-v1";
+const ATTEST_PAYLOAD_DOMAIN_V2: &[u8] = b"ruk-attest-payload-v2";
 
 fn invalid(detail: impl Into<String>) -> CoreError {
     CoreError::new(ErrorCode::EInvalid, detail)
@@ -1830,6 +1831,10 @@ pub struct ClaimListReply {
 // ---------------------------------------------------------------------------
 
 /// What a signer attests about one exact object.
+///
+/// `evidence` is appended last so the postcard encoding of every earlier
+/// field is unchanged; stored v1 rows decode through the versioned fallback
+/// in `attestation::rows`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestStatement {
     pub subject: Oid,
@@ -1840,10 +1845,17 @@ pub struct AttestStatement {
     /// The earlier statement this one explicitly supersedes.
     #[serde(default)]
     pub supersedes: Option<StatementDigest>,
+    /// The SHA-256 of an external blob this statement binds, such as a CI
+    /// log. `None` and `Some(zero)` differ on the wire: absence encodes as an
+    /// empty field, presence as exactly 32 bytes.
+    #[serde(default)]
+    pub evidence: Option<StatementDigest>,
 }
 
-/// `attest.add`: the signature is over [`AttestStatement::canonical_payload_v1`]
+/// `attest.add`: the signature is over [`AttestStatement::canonical_payload_v2`]
 /// in namespace `ruk-attest`; private keys never reach the coordinator.
+/// Statements without evidence signed over
+/// [`AttestStatement::canonical_payload_v1`] stay verifiable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestAddArgs {
     pub statement: AttestStatement,
@@ -4090,17 +4102,27 @@ pub fn control_frame_len(prefix: [u8; FRAME_PREFIX_BYTES]) -> Result<usize, Core
 // ---------------------------------------------------------------------------
 
 impl AttestStatement {
-    /// The canonical payload that is signed (namespace `ruk-attest`): seven
-    /// length-prefixed fields (4-byte big-endian length each) in this order:
-    /// domain separator, object format name, exact OID bytes, kind, result,
-    /// UTC timestamp text, and the superseded statement digest (empty when
-    /// the statement supersedes nothing; otherwise exactly 32 bytes, so
+    /// The canonical v1 payload that is signed (namespace `ruk-attest`):
+    /// seven length-prefixed fields (4-byte big-endian length each) in this
+    /// order: domain separator, object format name, exact OID bytes, kind,
+    /// result, UTC timestamp text, and the superseded statement digest (empty
+    /// when the statement supersedes nothing; otherwise exactly 32 bytes, so
     /// absence and presence cannot be confused). Length prefixes make the
     /// field boundaries unambiguous: `("a", "bc")` and `("ab", "c")` differ.
     ///
+    /// Only evidenceless statements have a v1 payload: v1 cannot bind
+    /// evidence, so signing one would silently drop it. New signatures cover
+    /// [`Self::canonical_payload_v2`]; v1 stays verifiable for old ones.
+    ///
     /// # Errors
     /// `E_OBJECT_FORMAT` when the subject's width is not `format`'s.
+    /// `E_INVALID` when the statement carries evidence, which v1 cannot bind.
     pub fn canonical_payload_v1(&self, format: HashKind) -> Result<Vec<u8>, CoreError> {
+        if self.evidence.is_some() {
+            return Err(invalid(
+                "an attestation carrying evidence has no v1 payload: sign the v2 payload",
+            ));
+        }
         if self.subject.kind() != format {
             return Err(CoreError::new(
                 ErrorCode::EObjectFormat,
@@ -4125,6 +4147,52 @@ impl AttestStatement {
             superseded,
         ];
         let mut payload = Vec::with_capacity(128);
+        for field in fields {
+            push_field(&mut payload, field)?;
+        }
+        Ok(payload)
+    }
+
+    /// The canonical v2 payload that is signed (namespace `ruk-attest`):
+    /// eight length-prefixed fields (4-byte big-endian length each) in this
+    /// order: the v2 domain separator, object format name, exact OID bytes,
+    /// kind, result, UTC timestamp text, the superseded statement digest,
+    /// and the bound evidence digest. Either digest field is empty when
+    /// absent and exactly 32 bytes when present, so absence and presence
+    /// cannot be confused and `None` differs from a zero digest.
+    ///
+    /// # Errors
+    /// `E_OBJECT_FORMAT` when the subject's width is not `format`'s.
+    pub fn canonical_payload_v2(&self, format: HashKind) -> Result<Vec<u8>, CoreError> {
+        if self.subject.kind() != format {
+            return Err(CoreError::new(
+                ErrorCode::EObjectFormat,
+                format!(
+                    "attestation subject is a {} object but the repository is {format}",
+                    self.subject.kind()
+                ),
+            ));
+        }
+        let timestamp = self.signed_at.to_string();
+        let superseded: &[u8] = match &self.supersedes {
+            Some(digest) => digest.as_bytes(),
+            None => &[],
+        };
+        let evidence: &[u8] = match &self.evidence {
+            Some(digest) => digest.as_bytes(),
+            None => &[],
+        };
+        let fields: [&[u8]; 8] = [
+            ATTEST_PAYLOAD_DOMAIN_V2,
+            format.format_name().as_bytes(),
+            self.subject.as_bytes(),
+            self.kind.as_str().as_bytes(),
+            self.result.as_str().as_bytes(),
+            timestamp.as_bytes(),
+            superseded,
+            evidence,
+        ];
+        let mut payload = Vec::with_capacity(160);
         for field in fields {
             push_field(&mut payload, field)?;
         }
@@ -5194,6 +5262,7 @@ mod tests {
             result: AttestResult::new(result).expect("result"),
             signed_at: timestamp("2026-10-17T12:00:00Z"),
             supersedes: None,
+            evidence: None,
         }
     }
 
@@ -5257,6 +5326,60 @@ mod tests {
             .canonical_payload_v1(HashKind::Sha256)
             .expect_err("a sha1 subject in a sha256 repository");
         assert_eq!(err.code, ErrorCode::EObjectFormat);
+    }
+
+    #[test]
+    fn attestation_payload_v2_has_eight_fields_and_binds_evidence() {
+        let plain = statement("a", "bc");
+        let payload = plain.canonical_payload_v2(HashKind::Sha1).expect("payload");
+        let fields = split_fields(&payload);
+        assert_eq!(fields.len(), 8);
+        assert_eq!(fields[0], ATTEST_PAYLOAD_DOMAIN_V2);
+        assert_eq!(fields[1], b"sha1");
+        assert_eq!(fields[2], oid(7).as_bytes());
+        assert_eq!(fields[3], b"a");
+        assert_eq!(fields[4], b"bc");
+        assert_eq!(fields[5], b"2026-10-17T12:00:00Z");
+        assert!(fields[6].is_empty());
+        assert!(fields[7].is_empty());
+
+        // The domain bump alone separates the versions: the same statement
+        // signs different bytes under v1 and v2.
+        let v1 = plain
+            .canonical_payload_v1(HashKind::Sha1)
+            .expect("v1 payload");
+        assert_ne!(v1, payload);
+
+        // Evidence is covered: one byte changes the payload.
+        let digest = |byte: u8| StatementDigest::from_bytes([byte; 32]);
+        let bound = |evidence: Option<StatementDigest>| {
+            let mut with = statement("a", "bc");
+            with.evidence = evidence;
+            with.canonical_payload_v2(HashKind::Sha1).expect("payload")
+        };
+        assert_ne!(payload, bound(Some(digest(1))));
+        assert_ne!(bound(Some(digest(1))), bound(Some(digest(2))));
+        // Absence and a zero digest are distinct on the wire.
+        assert_eq!(split_fields(&bound(Some(digest(0))))[7], vec![0_u8; 32]);
+        assert_ne!(payload, bound(Some(digest(0))));
+    }
+
+    #[test]
+    fn attestation_payload_v2_rejects_a_subject_of_the_wrong_object_format() {
+        let err = statement("a", "b")
+            .canonical_payload_v2(HashKind::Sha256)
+            .expect_err("a sha1 subject in a sha256 repository");
+        assert_eq!(err.code, ErrorCode::EObjectFormat);
+    }
+
+    #[test]
+    fn attestation_payload_v1_refuses_a_statement_carrying_evidence() {
+        let mut with = statement("a", "b");
+        with.evidence = Some(StatementDigest::from_bytes([9; 32]));
+        let err = with
+            .canonical_payload_v1(HashKind::Sha1)
+            .expect_err("v1 cannot bind evidence");
+        assert_eq!(err.code, ErrorCode::EInvalid);
     }
 
     #[test]

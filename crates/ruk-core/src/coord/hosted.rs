@@ -5021,6 +5021,7 @@ mod tests {
                 result: AttestResult::new("pass").expect("result"),
                 signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
                 supersedes: None,
+                evidence: None,
             };
             let args = sign_statement(&key, statement);
             let open = |_: crate::attestation::Progress| Ok::<(), CoreError>(());
