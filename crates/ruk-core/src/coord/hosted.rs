@@ -4307,11 +4307,21 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             seed_refs(&coord, &[("refs/heads/next", 4)]);
         };
+        let started = std::time::Instant::now();
         let (tail, ()) = tokio::join!(tail_fut, publish_fut);
+        let elapsed = started.elapsed();
         assert_eq!(tail.events.len(), 1);
         assert_eq!(tail.events[0].seq, 4);
         assert_eq!(tail.events[0].name.as_bytes(), b"refs/heads/next");
         assert!(!tail.expired);
+        // The publish lands at 150 ms and the poll rescans every 100 ms, so
+        // the answer is near 250 ms. A poll that waited out its 5 s deadline
+        // and rescanned once would still return the same event; the bound
+        // is what tells the two apart.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "the parked poll answers after the publish, not at its deadline: {elapsed:?}"
+        );
     }
 
     /// A row-count limit alone cannot keep the reply encodable: ref names
