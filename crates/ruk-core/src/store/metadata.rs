@@ -792,16 +792,10 @@ impl Metadata {
                         budget.bytes
                     )));
                 }
-                // An unprefixed scan keeps the historical over-report; a
-                // prefixed scan continues only past a row the prefix
-                // still covers.
-                more = match prefix {
-                    None => true,
-                    Some(want) => matches!(
-                        iter.next().transpose().map_err(storage)?,
-                        Some((next_key, _)) if next_key.value().starts_with(want)
-                    ),
-                };
+                // The current row matches the scan (a non-matching prefixed
+                // row breaks above) and is omitted from this page, so more
+                // rows remain regardless of what follows it.
+                more = true;
                 break;
             }
 

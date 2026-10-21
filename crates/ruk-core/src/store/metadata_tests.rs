@@ -1644,6 +1644,64 @@ fn fact_page_exact_budget_eof_versus_another_row() {
 }
 
 #[test]
+fn fact_page_prefixed_omitted_matching_row_reports_more() {
+    let dir = TestDir::new("fact-page-prefixed-omitted-more");
+    let meta = create(&dir);
+    publish(
+        &meta,
+        &[
+            put(FactTable::Refs, b"p/a", b"v1"),
+            put(FactTable::Refs, b"p/b", b"v2"),
+            put(FactTable::Refs, b"q/z", b"v3"),
+        ],
+    );
+
+    // Each row costs 5 bytes (3 key + 2 value). A 9-byte budget returns the
+    // first match and omits the second; the omitted row still matches the
+    // prefix, so more must be true even though the row after it does not.
+    let page = meta
+        .fact_page_prefixed(FactTable::Refs, None, b"p/", FactPageBudget::new(10, 9))
+        .expect("prefixed page");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].key, b"p/a");
+    assert!(page.more, "omitted matching row means more remain");
+
+    // The continuation returns the omitted row; nothing follows under the
+    // prefix, so more is false.
+    let next = meta
+        .fact_page_prefixed(
+            FactTable::Refs,
+            Some(b"p/a"),
+            b"p/",
+            FactPageBudget::new(10, 1024),
+        )
+        .expect("continuation page");
+    assert_eq!(next.rows.len(), 1);
+    assert_eq!(next.rows[0].key, b"p/b");
+    assert!(!next.more);
+
+    // Same omission at end of table: no row follows the omitted match.
+    let dir_eof = TestDir::new("fact-page-prefixed-omitted-eof");
+    let meta_eof = create(&dir_eof);
+    publish(
+        &meta_eof,
+        &[
+            put(FactTable::Refs, b"p/a", b"v1"),
+            put(FactTable::Refs, b"p/b", b"v2"),
+        ],
+    );
+    let page_eof = meta_eof
+        .fact_page_prefixed(FactTable::Refs, None, b"p/", FactPageBudget::new(10, 9))
+        .expect("prefixed page at eof");
+    assert_eq!(page_eof.rows.len(), 1);
+    assert_eq!(page_eof.rows[0].key, b"p/a");
+    assert!(
+        page_eof.more,
+        "omitted final matching row means more remain"
+    );
+}
+
+#[test]
 fn fact_page_counts_both_key_and_value_bytes() {
     let dir = TestDir::new("fact-page-key-bytes");
     let meta = create(&dir);
