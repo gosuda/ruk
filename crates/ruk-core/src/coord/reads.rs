@@ -725,7 +725,10 @@ pub(crate) const BLAME_MAX_POSITIONS: usize = 65_536;
 /// once per (current, parent) blob pair with [`lcs_align`]: a position
 /// matching a parent line moves there,
 /// while a position no parent carries is introduced by the commit.
-/// Commits past [`BLAME_MAX_COMMITS`], positions past
+/// A commit with no live positions is skipped without effect; one reached
+/// again after new positions arrive is revisited, so a common ancestor
+/// first met through a short path still places positions arriving through
+/// a longer one. Commits past [`BLAME_MAX_COMMITS`], positions past
 /// [`BLAME_MAX_POSITIONS`], or one alignment past [`LCS_MAX_CELLS`]
 /// refuse with [`ErrorCode::ELimit`]. Binary files refuse
 /// [`ErrorCode::EInvalid`]; directories and missing paths refuse at
@@ -780,10 +783,16 @@ pub(crate) fn blame_attribute(
         if live_positions == 0 {
             break;
         }
-        if !visited.insert(current) {
+        let at_current: Vec<usize> = lives
+            .iter()
+            .enumerate()
+            .filter(|(_, positions)| positions.iter().any(|(head, _)| *head == current))
+            .map(|(index, _)| index)
+            .collect();
+        if at_current.is_empty() {
             continue;
         }
-        if visited.len() > BLAME_MAX_COMMITS {
+        if visited.insert(current) && visited.len() > BLAME_MAX_COMMITS {
             return Err(CoreError::new(
                 ErrorCode::ELimit,
                 "blame walks more commits than its bound",
@@ -792,12 +801,6 @@ pub(crate) fn blame_attribute(
         let record = Records::new(store)
             .get_commit(&current)?
             .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "blame commit is missing"))?;
-        let at_current: Vec<usize> = lives
-            .iter()
-            .enumerate()
-            .filter(|(_, positions)| positions.iter().any(|(head, _)| *head == current))
-            .map(|(index, _)| index)
-            .collect();
         if record.parents().is_empty() {
             for index in at_current {
                 if attr[index].is_none() {
@@ -820,16 +823,14 @@ pub(crate) fn blame_attribute(
         for parent in record.parents() {
             parents.push((*parent, blame_version(store, parent, path, &mut versions)?));
         }
-        let mut maps: Vec<(Head, Option<Vec<Option<usize>>>)> =
-            Vec::with_capacity(parents.len());
+        let mut maps: Vec<(Head, Option<Vec<Option<usize>>>)> = Vec::with_capacity(parents.len());
         for (parent, version) in &parents {
             let Some((oid, lines)) = version else {
                 maps.push((*parent, None));
                 continue;
             };
             if *oid == current_oid {
-                let identity: Vec<Option<usize>> =
-                    (0..current_refs.len()).map(Some).collect();
+                let identity: Vec<Option<usize>> = (0..current_refs.len()).map(Some).collect();
                 maps.push((*parent, Some(identity)));
                 continue;
             }
@@ -1067,10 +1068,7 @@ mod tests {
         bytes: &[u8],
     ) -> (Head, Oid) {
         let blob = put_blob(store, bytes);
-        let tree = put_tree(
-            store,
-            &[("f.txt", TreeMode::File(FileMode::Regular), blob)],
-        );
+        let tree = put_tree(store, &[("f.txt", TreeMode::File(FileMode::Regular), blob)]);
         (new_commit(store, tree, parents, message), tree)
     }
 
@@ -1162,6 +1160,32 @@ mod tests {
             heads,
             vec![head_p1, head_a, head_p2, head_a],
             "each line attributes to its introducer"
+        );
+    }
+
+    #[test]
+    fn blame_revisits_ancestor_for_late_arriving_positions() {
+        let temp = TempRoot::new("strand");
+        let store = test_store(&temp);
+        let (head_x, _) = put_file_commit(&store, Vec::new(), "root", b"a\nb\n");
+        let (head_a, _) = put_file_commit(&store, vec![head_x], "introduce", b"a\nL\nb\n");
+        let (head_q1, _) = put_file_commit(&store, vec![head_a], "extend", b"a\nL\nb\nq1\n");
+        let (head_q2, _) =
+            put_file_commit(&store, vec![head_q1], "extend more", b"a\nL\nb\nq1\nq2\n");
+        let (head_s, _) = put_file_commit(&store, vec![head_a], "rewrite", b"a\nb\ns\n");
+        let (head_m, _) = put_file_commit(
+            &store,
+            vec![head_s, head_q2],
+            "merge",
+            b"a\nL\nb\nq1\nq2\ns\n",
+        );
+        let path = RepoPath::new("f.txt").expect("path");
+        let (lines, heads) = blame_attribute(&store, &head_m, &path).expect("blame serves merge");
+        assert_eq!(lines.len(), 6, "six blamed lines");
+        assert_eq!(
+            heads,
+            vec![head_x, head_a, head_x, head_q1, head_q2, head_s],
+            "the common ancestor keeps lines arriving through the long path"
         );
     }
 
