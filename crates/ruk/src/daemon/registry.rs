@@ -135,8 +135,9 @@ impl Registry {
     ///
     /// A delete that crashes between the tombstone rename and the removal
     /// leaves the tombstone behind; the next startup sweeps it. Only
-    /// directories carrying the tombstone suffix are removed, and failures
-    /// are reported to stderr without refusing startup.
+    /// directories in the reserved `.tombstone-` prefix namespace are
+    /// removed, and failures are reported to stderr without refusing
+    /// startup.
     fn sweep_tombstones(&self) {
         for root in &self.roots {
             let entries = match std::fs::read_dir(root) {
@@ -360,11 +361,32 @@ impl Registry {
             ));
         }
         let requested = Path::new(&args.root).join(&args.path);
+        if Path::new(&args.path)
+            .components()
+            .any(|component| match component {
+                std::path::Component::Normal(name) => is_tombstone_name(&name.to_string_lossy()),
+                _ => false,
+            })
+        {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository name is reserved",
+            ));
+        }
         let destination = self.resolve_destination(&requested)?;
         if !destination.starts_with(&claimed) {
             return Err(CoreError::new(
                 ErrorCode::EForbidden,
                 "repository path escapes its root",
+            ));
+        }
+        if destination
+            .file_name()
+            .is_some_and(|name| is_tombstone_name(&name.to_string_lossy()))
+        {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository name is reserved",
             ));
         }
         if destination.exists() {
@@ -522,12 +544,30 @@ impl Registry {
                 )
             })?;
         let new_path = Path::new(&args.new_path);
+        if new_path.components().any(|component| match component {
+            std::path::Component::Normal(name) => is_tombstone_name(&name.to_string_lossy()),
+            _ => false,
+        }) {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository name is reserved",
+            ));
+        }
         let requested = if new_path.is_absolute() {
             new_path.to_path_buf()
         } else {
             root.join(new_path)
         };
         let destination = self.resolve_destination(&requested)?;
+        if destination
+            .file_name()
+            .is_some_and(|name| is_tombstone_name(&name.to_string_lossy()))
+        {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository name is reserved",
+            ));
+        }
         if destination.exists() {
             return Err(CoreError::new(
                 ErrorCode::EInvalid,
@@ -614,19 +654,33 @@ fn entry_by_path_mut<'a>(
         .find(|entry| entry.path == canonical)
 }
 
+/// Whether a file name sits in the reserved tombstone namespace.
+fn is_tombstone_name(name: &str) -> bool {
+    name.starts_with(".tombstone-")
+}
+
 /// Names the tombstone a deleted repository renames to before removal.
+///
+/// Tombstones live in the reserved `.tombstone-` prefix namespace, which
+/// [`Registry::create_repo`] rejects, so the startup sweep only removes
+/// directories the daemon renamed and never a legitimately named
+/// repository containing `.tombstone-` elsewhere in its name.
 fn tombstone_for(canonical: &Path, nonce: u64) -> PathBuf {
     let name = canonical
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    canonical.with_file_name(format!("{name}.tombstone-{nonce}"))
+    if name.is_empty() {
+        canonical.with_file_name(format!(".tombstone-{nonce}"))
+    } else {
+        canonical.with_file_name(format!(".tombstone-{nonce}-{name}"))
+    }
 }
 
 /// Whether a directory entry is a delete tombstone.
 fn is_tombstone(entry: &std::fs::DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy().into_owned();
-    name.contains(".tombstone-") && entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+    is_tombstone_name(&name) && entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
 }
 
 /// Persists one directory's entries.
@@ -1353,12 +1407,65 @@ mod tests {
     fn startup_sweep_removes_tombstones() {
         let root = scratch_root();
         let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
-        std::fs::create_dir_all(canonical.join("dead.tombstone-7")).expect("tombstone stages");
+        std::fs::create_dir_all(canonical.join(".tombstone-7-dead")).expect("tombstone stages");
         Registry::new(vec![root.clone()]).expect("startup sweeps tombstones");
         assert!(
-            !canonical.join("dead.tombstone-7").exists(),
+            !canonical.join(".tombstone-7-dead").exists(),
             "tombstone is swept at startup"
         );
+    }
+
+    #[test]
+    fn repo_named_with_tombstone_substring_survives_restart() {
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let created = registry
+            .create_repo(&init_args(&root, "customer.tombstone-backup"))
+            .expect("tombstone-substring name inits");
+        assert!(
+            canonical
+                .join("customer.tombstone-backup")
+                .join(".ruk")
+                .is_dir()
+        );
+        drop(registry);
+        Registry::new(vec![root.clone()]).expect("restart sweeps");
+        assert!(
+            canonical
+                .join("customer.tombstone-backup")
+                .join(".ruk")
+                .is_dir(),
+            "legitimately named repo survives restart"
+        );
+        assert_eq!(
+            created.path,
+            canonical
+                .join("customer.tombstone-backup")
+                .to_str()
+                .expect("utf8")
+        );
+    }
+
+    #[test]
+    fn reserved_tombstone_prefix_is_rejected() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let err = registry
+            .create_repo(&init_args(&root, ".tombstone-1-evil"))
+            .expect_err("reserved prefix refuses");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let created = registry
+            .create_repo(&init_args(&root, "acme/old"))
+            .expect("init creates");
+        let clash = registry
+            .rename_repo(&ruk_core::protocol::RepoRenameArgs {
+                repo: created.path.clone(),
+                new_path: ".tombstone-2-new".to_owned(),
+            })
+            .expect_err("reserved rename destination refuses");
+        assert_eq!(clash.code, ErrorCode::EInvalid);
     }
 
     #[test]
