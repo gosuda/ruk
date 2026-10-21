@@ -1366,9 +1366,9 @@ impl HostedCoordinator {
         let (_, left_root) = resolve_search_root(&self.store, &args.left)?;
         let (_, right_root) = resolve_search_root(&self.store, &args.right)?;
         let changes = diff_trees(&self.store, kind, left_root, right_root)?;
-        let mut files = Vec::with_capacity(changes.len().min(args.page.effective_limit()));
+        let mut selected = Vec::with_capacity(changes.len().min(args.page.effective_limit()));
         for change in &changes {
-            let selected = match &args.paths {
+            let wanted = match &args.paths {
                 PathSelection::All => true,
                 PathSelection::Paths(wanted) => wanted.iter().any(|prefix| {
                     let bytes = prefix.as_bytes();
@@ -1377,9 +1377,32 @@ impl HostedCoordinator {
                             && change.path.get(bytes.len()) == Some(&b'/')
                 }),
             };
-            if !selected {
-                continue;
+            if wanted {
+                selected.push(change);
             }
+        }
+        let query = self.diff_query_digest(args);
+        let total = selected.len();
+        let start = match args.page.cursor.as_ref() {
+            None => 0,
+            Some(cursor) => {
+                let want = CursorWant {
+                    store: self.store.store_id(),
+                    session: viewer,
+                    view: current_view(&self.store)?.view,
+                    query,
+                };
+                self.leases.check_cursor(cursor, &want, now)?;
+                usize::from_be_bytes(cursor.position.as_bytes().try_into().map_err(|_| {
+                    CoreError::new(ErrorCode::EInvalid, "diff continuation is not an index")
+                })?)
+            }
+        };
+        let limit = args.page.effective_limit();
+        let start = start.min(total);
+        let end = start.saturating_add(limit).min(total);
+        let mut files = Vec::with_capacity(end.saturating_sub(start));
+        for change in &selected[start..end] {
             let path = RepoPath::new(change.path.clone()).map_err(|err| {
                 CoreError::new(ErrorCode::ECorrupt, format!("diff path is invalid: {err}"))
             })?;
@@ -1435,26 +1458,6 @@ impl HostedCoordinator {
                 body,
             });
         }
-        let query = self.diff_query_digest(args);
-        let total = files.len();
-        let start = match args.page.cursor.as_ref() {
-            None => 0,
-            Some(cursor) => {
-                let want = CursorWant {
-                    store: self.store.store_id(),
-                    session: viewer,
-                    view: current_view(&self.store)?.view,
-                    query,
-                };
-                self.leases.check_cursor(cursor, &want, now)?;
-                usize::from_be_bytes(cursor.position.as_bytes().try_into().map_err(|_| {
-                    CoreError::new(ErrorCode::EInvalid, "diff continuation is not an index")
-                })?)
-            }
-        };
-        let limit = args.page.effective_limit();
-        let end = start.saturating_add(limit).min(total);
-        let items = files.get(start..end).unwrap_or_default().to_vec();
         let view = current_view(&self.store)?;
         let next = if end >= total {
             None
@@ -1465,7 +1468,7 @@ impl HostedCoordinator {
         };
         Ok(DiffReply {
             view,
-            files: Page::new(items, next)?,
+            files: Page::new(files, next)?,
         })
     }
 
