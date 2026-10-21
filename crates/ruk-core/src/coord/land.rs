@@ -4,9 +4,10 @@
 //! candidate commit set, the required base tip, the attestation predicates,
 //! and the execution deadline. [`land_prepare`] computes the plan and stores
 //! it in [`FactTable::LandPlans`](crate::store::types::FactTable::LandPlans).
-//! [`land_execute`] validates the stored plan against live state and
-//! publishes the target move in one store commit. Any drift refuses with a
-//! typed decline. Execution never re-plans silently.
+//! [`prepare_land_execute`] validates the stored plan against live state
+//! and stages the target move plus plan-row deletion for the lane to publish
+//! atomically. Any drift refuses with a typed decline. Execution never
+//! re-plans silently.
 //!
 //! # Exactness contract
 //! - The candidate set is frozen sorted and deduplicated. Execution publishes
@@ -28,10 +29,10 @@
 //!   `plan`, `candidate` (the primary candidate), `base` (the zero OID of the
 //!   store hash kind when the target is unborn), `expires_at`,
 //!   `policy_generation`, and `requirements`.
-//! - [`land_execute`] takes the stored plan. A daemon serving
-//!   [`LandExecuteArgs`](crate::protocol::LandExecuteArgs) loads the plan
-//!   with [`load_plan`], refuses `E_STALE` when `args.candidate` differs from
-//!   the primary candidate, then calls [`land_execute`].
+//! - [`prepare_land_execute`] takes a stored plan id plus the presented
+//!   candidate. A daemon serving [`LandExecuteArgs`](crate::protocol::LandExecuteArgs)
+//!   stages it, refuses `E_STALE` when `args.candidate` differs from the
+//!   primary candidate, then publishes through the lane.
 //! - [`LandOutcome`] is the local publish leg. The remote push leg and the
 //!   [`LandExecuteReply`](crate::protocol::LandExecuteReply) assembly stay
 //!   with the transport owner.
@@ -137,7 +138,6 @@ impl LandPlan {
     ///
     /// The plan stays valid at exactly `expires_at` and refuses after it.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
     pub(super) fn is_expired(&self, now: Timestamp) -> bool {
         now.instant() > self.expires_at.instant()
     }
@@ -145,7 +145,6 @@ impl LandPlan {
 
 /// The local publish leg of one executed land plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
 pub(super) struct LandOutcome {
     /// The executed plan.
     pub plan: PlanId,
@@ -348,41 +347,51 @@ pub(super) fn land_prepare(
     Ok(plan)
 }
 
-/// Executes a land plan after validating it against live state.
+/// Stages one land plan execution without publishing it: validates the
+/// stored plan against live state and builds the exact ref move plus the
+/// plan-row deletion. The lane publishes the facts atomically with the
+/// receipt, so a second execution loses the plan-row race instead of
+/// double-landing.
 ///
-/// The stored plan row must equal `plan` exactly, the plan must be
-/// unexpired, the live target tip must still equal the frozen base, and
-/// every candidate must meet every requirement under the frozen trust set.
-/// The commit moves the target to the primary candidate and consumes the
-/// plan row in one atomic publication.
+/// The presented candidate must be the plan's primary candidate: landing
+/// runs what the caller reviewed, never a reselected member. Candidates
+/// are deterministic for a given head and base: prepare freezes one exact
+/// commit, so re-preparing the same change yields the same primary.
 ///
 /// # Errors
 /// `E_NOT_FOUND` for an unknown plan; `E_STALE` for an expired plan, a
-/// stored plan that differs from `plan`, a moved target tip, or a lost
-/// commit race; `E_POLICY` for a candidate that misses a requirement;
-/// `E_CORRUPT` or `E_IO` from the store.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
-pub(super) fn land_execute(
+/// presented candidate that differs from the primary, a moved target tip,
+/// a changed land policy, or a lost commit race; `E_POLICY` for a
+/// candidate that misses a requirement; `E_CORRUPT` or `E_IO` from the
+/// store.
+pub(super) fn prepare_land_execute(
     store: &Store,
-    plan: &LandPlan,
+    plan: PlanId,
+    candidate: Oid,
     now: Timestamp,
     checkpoint: &Checkpoint<'_>,
-) -> Result<LandOutcome, CoreError> {
-    let raw = store.fact(FactTable::LandPlans, &plan_key(plan.plan))?;
+) -> Result<(LandOutcome, Vec<FactMutation>), CoreError> {
+    let raw = store.fact(FactTable::LandPlans, &plan_key(plan))?;
     let Some(stored_bytes) = raw else {
         return Err(CoreError::new(
             ErrorCode::ENotFound,
-            format!("unknown land plan {}", plan.plan),
+            format!("unknown land plan {plan}"),
         ));
     };
     let stored: LandPlan = store.observe(decode("land plan", &stored_bytes))?;
-    if stored != *plan {
+    let Some(primary) = stored.candidate() else {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            "stored land plan has an empty candidate set",
+        ));
+    };
+    if candidate != primary {
         return Err(CoreError::new(
             ErrorCode::EStale,
-            "stored land plan differs from the presented plan; re-prepare",
+            "presented candidate differs from the stored primary candidate; re-prepare",
         ));
     }
-    if plan.is_expired(now) {
+    if stored.is_expired(now) {
         return Err(CoreError::new(
             ErrorCode::EStale,
             "land plan expired; re-prepare",
@@ -392,28 +401,28 @@ pub(super) fn land_execute(
         .repo_meta()
         .map_err(CoreError::from)?
         .map_or(0, |meta| meta.policy_generation);
-    if current_generation != plan.policy_generation {
+    if current_generation != stored.policy_generation {
         return Err(CoreError::new(
             ErrorCode::EStale,
             "land policy changed since prepare; re-prepare",
         ));
     }
     let refs = StoreRefs::new(store);
-    let resolved = resolve(&refs, &plan.target).map_err(CoreError::from)?;
-    if resolved.terminal != plan.target {
+    let resolved = resolve(&refs, &stored.target).map_err(CoreError::from)?;
+    if resolved.terminal != stored.target {
         return Err(CoreError::new(
             ErrorCode::EStale,
             "land target no longer resolves directly; re-prepare",
         ));
     }
-    if resolved.oid != plan.base {
+    if resolved.oid != stored.base {
         return Err(CoreError::new(
             ErrorCode::EStale,
             "land target tip moved since prepare; re-prepare",
         ));
     }
-    for candidate in &plan.candidates {
-        let bounded: Vec<BoundedRequirement> = plan
+    for candidate in &stored.candidates {
+        let bounded: Vec<BoundedRequirement> = stored
             .requirements
             .iter()
             .map(|requirement| BoundedRequirement {
@@ -422,7 +431,7 @@ pub(super) fn land_execute(
             })
             .collect();
         let evaluation =
-            evaluate_bounded_requirements(store, candidate, &bounded, &plan.trusted, checkpoint)?;
+            evaluate_bounded_requirements(store, candidate, &bounded, &stored.trusted, checkpoint)?;
         if !evaluation.satisfied {
             return Err(CoreError::new(
                 ErrorCode::EPolicy,
@@ -430,20 +439,14 @@ pub(super) fn land_execute(
             ));
         }
     }
-    let Some(primary) = plan.candidate() else {
-        return Err(CoreError::new(
-            ErrorCode::ECorrupt,
-            "stored land plan has an empty candidate set",
-        ));
-    };
-    let ref_expected = match plan.base {
+    let ref_expected = match stored.base {
         Some(base) => RefExpect::Present(RefTarget::Direct(base)),
         None => RefExpect::Absent,
     };
     let transaction = RefTransaction::new(
         store.hash_kind(),
         vec![RefUpdate {
-            name: plan.target.clone(),
+            name: stored.target.clone(),
             expected: ref_expected,
             change: RefChange::Set(RefTarget::Direct(primary)),
         }],
@@ -453,24 +456,19 @@ pub(super) fn land_execute(
     let mut mutations = prepared.into_mutations();
     mutations.push(FactMutation {
         table: FactTable::LandPlans,
-        key: plan_key(plan.plan).to_vec(),
+        key: plan_key(plan).to_vec(),
         expected: FactExpectation::Value(stored_bytes),
         value: None,
     });
-    store.publish(
-        Vec::new(),
-        &mutations,
-        EventSource::Land,
-        &EventContext::default(),
-    )?;
-    Ok(LandOutcome {
-        plan: plan.plan,
-        target: plan.target.clone(),
-        base: plan.base,
+    let outcome = LandOutcome {
+        plan: stored.plan,
+        target: stored.target.clone(),
+        base: stored.base,
         candidate: primary,
-        candidates: plan.candidates.clone(),
-        expires_at: plan.expires_at,
-    })
+        candidates: stored.candidates.clone(),
+        expires_at: stored.expires_at,
+    };
+    Ok((outcome, mutations))
 }
 
 #[cfg(test)]
@@ -651,14 +649,21 @@ mod tests {
             !plan.satisfied_at_prepare,
             "a bound before signing leaves the gate unsatisfied"
         );
-        let err = land_execute(
+        let candidate = plan.candidate().expect("prepared candidate");
+        let err = prepare_land_execute(
             &lab.store,
-            &plan,
+            plan.plan,
+            candidate,
             Timestamp::parse(SIGNED_AT).expect("now"),
             &checkpoint,
         )
         .expect_err("expired evidence refuses execution");
         assert_eq!(err.code, ErrorCode::EPolicy);
+        assert!(
+            err.message.contains("misses a required attestation"),
+            "names the gap: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -703,9 +708,11 @@ mod tests {
                 &EventContext::default(),
             )
             .expect("bump the land policy");
-        let err = land_execute(
+        let candidate = plan.candidate().expect("prepared candidate");
+        let err = prepare_land_execute(
             &lab.store,
-            &plan,
+            plan.plan,
+            candidate,
             Timestamp::parse(SIGNED_AT).expect("now"),
             &checkpoint,
         )

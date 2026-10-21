@@ -990,7 +990,7 @@ pub(crate) fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::read (op.log, claim.list, attest.list, refs.list, events.tail, file, show, log, diff, blame, query, status, repo.stat, tree, compare served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
-            "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, split, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, resolve, revert, undo, land.prepare, policy.set mutations covered; the rest name their missing preparation)"
+            "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, split, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, resolve, revert, undo, land.prepare, land.execute, policy.set mutations covered; the rest name their missing preparation)"
         }
         ruk_core::protocol::MethodKind::Admin => {
             "admin dispatch before any coordinator call, gated by admin_uids (no registry producer serves these methods yet)"

@@ -121,8 +121,9 @@ use crate::protocol::{
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
     ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
     EditReply, EffectiveIdentity, GitCommitArgs, HeadRewrite, IdentityClaim, IdentitySource,
-    LandPrepareArgs, LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply,
-    PolicySetArgs, PolicySetReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
+    LandExecuteArgs, LandExecuteReply, LandLocalState, LandPrepareArgs, LandPrepareReply,
+    MutationOutcome, NewArgs, NewReply, PinArgs, PinReply, PolicySetArgs, PolicySetReply,
+    PushRefOutcome, PushRefStatus, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
     RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
     TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
     WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs,
@@ -300,12 +301,7 @@ pub(crate) fn prepare_mutation_with(
         }
         Request::LandPrepare(m) => land_prepare_parts(ctx, m.request_id, &m.args)?,
         Request::PolicySet(m) => policy_set_parts(ctx, m.request_id, &m.args)?,
-        Request::LandExecute(_) => {
-            return Err(uncovered(
-                "land.execute",
-                "land.execute pushes a stored candidate: the local leg (coord/land.rs land_execute) publishes eagerly outside the lane and the remote push leg lives in transport, so executing through preparation needs a prepare/job split with no producer on this path — load the plan with load_plan and re-prepare when it drifts",
-            ));
-        }
+        Request::LandExecute(m) => land_execute_parts(ctx, m.request_id, &m.args)?,
         Request::OpPrune(_) => {
             return Err(uncovered(
                 "op.prune",
@@ -3544,6 +3540,12 @@ fn land_prepare_parts(
         ));
     };
     row.capabilities.require_land(&args.target)?;
+    if args.remote.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::EHosted,
+            "land.prepare with a remote refuses: the transport push leg is not served yet",
+        ));
+    }
     let (requirements, trusted, policy_generation) =
         match store.repo_meta().map_err(CoreError::from)? {
             Some(meta) => (
@@ -3586,6 +3588,62 @@ fn land_prepare_parts(
         reply: Reply::LandPrepare(Box::new(reply)),
         objects: Vec::new(),
         facts: vec![mutation],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// Prepares `land.execute`: validates the stored plan against live state and
+/// stages the target move plus plan-row deletion for the lane to publish.
+///
+/// The presented candidate must be the plan's primary candidate, and the
+/// policy generation must still match: a `policy.set` after prepare fails
+/// the execution as stale. Only the local leg is served: `remote` must be
+/// absent (this store); a present remote names a transport push the
+/// coordinator does not run.
+///
+/// # Errors
+/// `E_HOSTED` for a present remote; `E_NOT_FOUND` for an unknown plan;
+/// `E_STALE` for a non-primary candidate, an expired plan, a moved target
+/// tip, a changed land policy, or a lost commit race; `E_POLICY` for a
+/// candidate that misses a requirement; `E_CORRUPT` or `E_IO` from the
+/// store.
+fn land_execute_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &LandExecuteArgs,
+) -> Result<Parts, CoreError> {
+    let clock = ctx.clock.ok_or_else(|| {
+        uncovered(
+            "land.execute",
+            "land.execute checks the plan deadline, which needs the coordinator clock this path does not supply",
+        )
+    })?;
+    let Some(checkpoint) = ctx.checkpoint else {
+        return Err(uncovered(
+            "land.execute",
+            "land.execute re-evaluates attestations, which needs the attestation progress gate this path does not supply",
+        ));
+    };
+    let now = clock.sample()?.timestamp();
+    let (outcome, facts) =
+        super::land::prepare_land_execute(ctx.store, args.plan, args.candidate, now, checkpoint)?;
+    let reply = Reply::LandExecute(Box::new(LandExecuteReply {
+        outcome: pending_outcome(ctx.session, request_id),
+        plan: outcome.plan,
+        remote: PushRefOutcome {
+            remote_ref: outcome.target.clone(),
+            status: PushRefStatus::Confirmed {
+                new: Some(outcome.candidate),
+            },
+        },
+        local: LandLocalState::Published,
+    }));
+    Ok(Parts {
+        reply,
+        objects: Vec::new(),
+        facts,
         transaction: None,
         dependencies: Vec::new(),
         fence: None,
@@ -4605,7 +4663,19 @@ mod tests {
             request_id: request_id(),
             args: LandPrepareArgs {
                 change: ChangeRef { change, head },
-                remote: origin_remote(),
+                remote: None,
+                target: name("refs/heads/main"),
+                merge: MergeSelection::default(),
+            },
+        }))
+    }
+
+    fn land_request_remote(change: ChangeId, head: Option<Head>) -> Request {
+        Request::LandPrepare(Box::new(WireMutation {
+            request_id: request_id(),
+            args: LandPrepareArgs {
+                change: ChangeRef { change, head },
+                remote: Some(origin_remote()),
                 target: name("refs/heads/main"),
                 merge: MergeSelection::default(),
             },
@@ -4718,6 +4788,138 @@ mod tests {
         };
         assert_eq!(reply.policy_generation, 2);
         assert_eq!(reply.requirements, vec![requirement()]);
+    }
+
+    #[test]
+    fn land_execute_moves_the_tip_and_consumes_the_plan() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        let execute = || {
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: oid,
+                },
+            }))
+        };
+        let staged = prepare_mutation_with(&ctx, execute()).expect("land.execute serves");
+        let Reply::LandExecute(run) = staged.reply else {
+            panic!("land.execute must answer its own reply");
+        };
+        assert_eq!(run.plan, reply.plan);
+        assert_eq!(
+            run.remote,
+            PushRefOutcome {
+                remote_ref: RefName::new("refs/heads/main").expect("target"),
+                status: crate::protocol::PushRefStatus::Confirmed { new: Some(oid) },
+            }
+        );
+        assert_eq!(run.local, LandLocalState::Published);
+        store
+            .publish(
+                staged.objects,
+                &staged.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land execution");
+        let target = store
+            .fact(crate::store::types::FactTable::Refs, b"refs/heads/main")
+            .expect("read target")
+            .expect("target landed");
+        let moved: crate::refdata::RefTarget =
+            crate::store::decode("ref target", &target).expect("decode target");
+        assert_eq!(moved, crate::refdata::RefTarget::Direct(oid));
+        assert!(
+            load_plan(&store, reply.plan).expect("read plans").is_none(),
+            "the executed plan is consumed"
+        );
+        let err =
+            prepare_mutation_with(&ctx, execute()).expect_err("a second execution finds no plan");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+    }
+
+    #[test]
+    fn land_execute_refuses_a_non_primary_candidate() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        let wrong = Oid::from_bytes(&[0xabu8; 20]).expect("test oid");
+        assert_ne!(wrong, oid);
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: wrong,
+                },
+            })),
+        )
+        .expect_err("a non-primary candidate refuses");
+        assert_eq!(err.code, ErrorCode::EStale);
+    }
+
+    #[test]
+    fn land_prepare_refuses_a_remote_push_leg() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, _) = seed_commit(&store, None);
+        let err = prepare_mutation_with(&ctx, land_request_remote(change, Some(head)))
+            .expect_err("remote land.prepare refuses");
+        assert_eq!(err.code, ErrorCode::EHosted);
     }
 
     #[test]
@@ -4845,12 +5047,12 @@ mod tests {
                 candidate: oid(0x31),
             },
         }));
-        let err = prepare_mutation_with(&ctx, execute)
-            .expect_err("land.execute stays refused with context");
-        assert_eq!(err.code, ErrorCode::EHosted);
+        let err =
+            prepare_mutation_with(&ctx, execute).expect_err("unknown land.execute plan refuses");
+        assert_eq!(err.code, ErrorCode::ENotFound);
         assert!(
-            err.message.contains("load_plan"),
-            "land.execute names its plan machinery: {}",
+            err.message.contains("unknown land plan"),
+            "land.execute names the missing plan: {}",
             err.message
         );
     }

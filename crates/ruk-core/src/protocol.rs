@@ -2083,7 +2083,10 @@ pub struct PushReconcileReply {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LandPrepareArgs {
     pub change: ChangeRef,
-    pub remote: RemoteSpec,
+    /// Where to push the landed candidate; absent means this store.
+    /// A present remote refuses: the transport push leg is not served yet.
+    #[serde(default)]
+    pub remote: Option<RemoteSpec>,
     /// The target ref to land onto, e.g. `refs/heads/main`.
     pub target: RefName,
     #[serde(default)]

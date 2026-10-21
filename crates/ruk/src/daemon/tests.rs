@@ -4825,10 +4825,10 @@ async fn typed_land_execute_refusal_names_plan() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(5, &payload).await;
-    assert_eq!(report.code.as_str(), "E_HOSTED");
+    assert_eq!(report.code.as_str(), "E_NOT_FOUND");
     assert!(
-        report.message.contains("load_plan"),
-        "land.execute names its plan machinery: {}",
+        report.message.contains("unknown land plan"),
+        "land.execute names the missing plan: {}",
         report.message
     );
 
