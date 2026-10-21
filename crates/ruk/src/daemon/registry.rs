@@ -13,7 +13,7 @@
 //! through `shutdown_and_drain`, which awaits every lane runner so the
 //! drain completes before the runtime drops.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -43,6 +43,8 @@ struct RepoEntry {
 struct RegistryInner {
     /// Opaque handle to repository entry.
     entries: HashMap<String, RepoEntry>,
+    /// Canonical stores reserved until their directory retirement completes.
+    deleting: HashSet<PathBuf>,
 }
 
 /// The hosted repository registry of one daemon process.
@@ -113,6 +115,7 @@ impl Registry {
             roots: canonical,
             inner: Mutex::new(RegistryInner {
                 entries: HashMap::new(),
+                deleting: HashSet::new(),
             }),
             next_handle: AtomicU64::new(1),
             runtime: Mutex::new(None),
@@ -483,10 +486,11 @@ impl Registry {
     /// the busy check, and the filesystem tombstone renames the
     /// repository root. The entry leaves the handle table under the
     /// registry lock while no invocation holds its coordinator (counted
-    /// through the shared ownership the eviction pass uses), so new opens
-    /// miss and racing deletes serialize. The coordinator shuts down
-    /// outside the lock, then the directory renames to a tombstone and is
-    /// removed: a crash between the two leaves the tombstone for the
+    /// through the shared ownership the eviction pass uses), and its path
+    /// stays reserved until retirement finishes. New opens refuse that path
+    /// and racing deletes serialize. The coordinator shuts down outside the
+    /// lock, then the directory renames to a tombstone and is removed: a
+    /// crash between the two leaves the tombstone for the
     /// startup sweep. `confirm_path` must name the same repository.
     ///
     /// # Errors
@@ -508,12 +512,18 @@ impl Registry {
         let path = repo_root
             .to_str()
             .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
-        let retired = {
+        let (handle, entry, retired) = {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
+            if inner.deleting.contains(&store) {
+                return Err(CoreError::new(
+                    ErrorCode::EConflicted,
+                    "repository removal is already in progress",
+                ));
+            }
             Self::verify_is_store(&store)?;
-            let Some((handle, entry)) = take_entry_by_path(&mut inner, &store) else {
+            let Some((handle, mut entry)) = take_entry_by_path(&mut inner, &store) else {
                 return Err(CoreError::new(
                     ErrorCode::ENotFound,
                     "repository is not registered",
@@ -530,24 +540,42 @@ impl Registry {
                     "repository has invocations in flight",
                 ));
             }
-            entry.coordinator
+            let retired = entry.coordinator.take();
+            inner.deleting.insert(store.clone());
+            (handle, entry, retired)
         };
         if let Some(coordinator) = retired {
             coordinator.shutdown();
         }
         let tombstone = tombstone_for(&repo_root, self.next_handle.fetch_add(1, Ordering::Relaxed));
-        std::fs::rename(&repo_root, &tombstone).map_err(|err| {
-            CoreError::new(
+        if let Err(err) = std::fs::rename(&repo_root, &tombstone) {
+            let mut inner = self.inner.lock().map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+            })?;
+            inner.deleting.remove(&store);
+            inner.entries.insert(handle, entry);
+            return Err(CoreError::new(
                 ErrorCode::EIo,
                 format!("repository tombstone failed: {err}"),
-            )
-        })?;
-        std::fs::remove_dir_all(&tombstone).map_err(|err| {
-            CoreError::new(ErrorCode::EIo, format!("repository removal failed: {err}"))
-        })?;
-        if let Some(parent) = repo_root.parent() {
-            fsync_dir(parent)?;
+            ));
         }
+        let retirement_result = std::fs::remove_dir_all(&tombstone)
+            .map_err(|err| {
+                CoreError::new(ErrorCode::EIo, format!("repository removal failed: {err}"))
+            })
+            .and_then(|()| {
+                if let Some(parent) = repo_root.parent() {
+                    fsync_dir(parent)?;
+                }
+                Ok(())
+            });
+        {
+            let mut inner = self.inner.lock().map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+            })?;
+            inner.deleting.remove(&store);
+        }
+        retirement_result?;
         Ok(RepoDeleteReply {
             deleted_path: path.to_owned(),
         })
@@ -950,6 +978,12 @@ impl Registry {
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        if inner.deleting.contains(canonical) {
+            return Err(CoreError::new(
+                ErrorCode::EConflicted,
+                "repository removal is in progress",
+            ));
+        }
         for (handle, entry) in inner.entries.iter_mut() {
             if entry.path == canonical {
                 entry.last_used = Instant::now();
@@ -1281,7 +1315,10 @@ mod tests {
 
         let grouping = canonical.join("team");
         std::fs::create_dir_all(grouping.join(".ruk")).expect("grouping directory exists");
-        let grouping_path = grouping.to_str().expect("grouping path is UTF-8").to_owned();
+        let grouping_path = grouping
+            .to_str()
+            .expect("grouping path is UTF-8")
+            .to_owned();
         let grouping_error = registry
             .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
                 repo: grouping_path.clone(),
@@ -1311,6 +1348,64 @@ mod tests {
             .expect_err("valid but unregistered store refuses deletion");
         assert_eq!(unregistered_error.code, ErrorCode::ENotFound);
         assert!(unregistered.exists(), "unregistered store remains intact");
+    }
+
+    #[test]
+    fn path_open_cannot_reregister_while_deleting() {
+        use ruk_core::error::ErrorCode;
+
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let path = canonical.join("repo-a/.ruk");
+        std::fs::create_dir_all(&path).expect("store directory exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let handle = registry.open_by_path(&path).expect("path registers");
+        {
+            let mut inner = registry.inner.lock().expect("registry lock holds");
+            assert!(inner.entries.remove(&handle).is_some());
+            inner.deleting.insert(path.clone());
+        }
+
+        let error = registry
+            .open_by_path(&path)
+            .expect_err("open refuses while deletion is reserved");
+        assert_eq!(error.code, ErrorCode::EConflicted);
+        assert_eq!(registry.len().expect("registry lock holds"), 0);
+    }
+
+    #[test]
+    fn remove_repo_restores_handle_when_tombstone_rename_fails() {
+        use ruk_core::error::ErrorCode;
+
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let created = registry
+            .create_repo(&init_args(&root, "gone"))
+            .expect("init creates");
+        let repo_root = std::path::Path::new(&created.path);
+        let store = repo_root.join(".ruk");
+        let handle = registry.open_by_path(&store).expect("store path registers");
+
+        let tombstone =
+            super::tombstone_for(repo_root, registry.next_handle.load(Ordering::Relaxed));
+        std::fs::create_dir_all(&tombstone).expect("tombstone collision exists");
+        std::fs::write(tombstone.join("blocker"), b"keep rename from replacing it")
+            .expect("tombstone is nonempty");
+
+        let error = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: created.path.clone(),
+                confirm_path: created.path,
+            })
+            .expect_err("existing tombstone refuses rename");
+        assert_eq!(error.code, ErrorCode::EIo);
+        assert_eq!(
+            registry
+                .open_by_handle(&handle)
+                .expect("failed deletion keeps its handle"),
+            canonical.join("gone/.ruk")
+        );
     }
 
     #[test]
