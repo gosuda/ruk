@@ -90,6 +90,9 @@ pub(crate) const DEFAULT_SEARCH_MAX_SCAN_BYTES: u64 = 67_108_864;
 /// Default permits of the search worker pool.
 pub(crate) const DEFAULT_SEARCH_POOL_SIZE: usize = 8;
 
+/// Most permits of the search worker pool, mirroring the core bound.
+pub(crate) const SEARCH_POOL_MAX_SIZE: usize = 64;
+
 /// Configuration of one `ruk serve` process.
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonConfig {
@@ -509,9 +512,9 @@ impl DaemonConfig {
                 "transport_permits must hold at least one permit",
             )));
         }
-        if self.search_pool_size == 0 {
-            return Err(Error::Config(String::from(
-                "search_pool_size must hold at least one permit",
+        if self.search_pool_size == 0 || self.search_pool_size > SEARCH_POOL_MAX_SIZE {
+            return Err(Error::Config(format!(
+                "search_pool_size must be within 1..={SEARCH_POOL_MAX_SIZE}"
             )));
         }
         if self.hook_timeout.is_zero() {
@@ -978,7 +981,7 @@ pub(crate) fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::open_session/resume_session"
         }
         ruk_core::protocol::MethodKind::Read => {
-            "HostedCoordinator::read (op.log, claim.list, attest.list, refs.list, events.tail, file, show, log, diff, blame, query, status, repo.stat, tree served; other reads name their missing implementation)"
+            "HostedCoordinator::read (op.log, claim.list, attest.list, refs.list, events.tail, file, show, log, diff, blame, query, status, repo.stat, tree, search served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
             "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, split, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, resolve, revert, undo, land.prepare mutations covered; the rest name their missing preparation)"
@@ -1039,6 +1042,8 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
         registry.set_hook_timeout(config.hook_timeout);
         registry.set_hook_max_commands(config.hook_max_commands);
         registry.set_default_branch(config.default_branch.clone());
+        registry.set_search_pool_size(config.search_pool_size);
+        registry.set_search_max_scan_bytes(config.search_max_scan_bytes);
         let executor = BoundedExecutor::new(config.blocking_pool_size)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)

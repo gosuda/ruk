@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use std::time::Instant as StdInstant;
@@ -75,12 +75,18 @@ use crate::protocol::{
     FileBody, FileDiff, FileReply, KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs,
     OpLogReply, Page, PageCursor, PageLimit, PathChangeKind, PathSelection, PathStatus, QueryArgs,
     QueryDigest, QueryMatch, QueryReply, ReconnectSecret, RefsListArgs, RefsListReply, Reply,
-    RepoStatReply, Request, RevisionRef, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
-    SessionResumeReply, ShowArgs, ShowBody, ShowReply, ShowTarget, SnapshotPolicy, StatusArgs,
-    StatusReply, TailedEvent, Timestamp, TreeArgs, TreeEntry, TreeReply, ViewInfo,
+    RepoStatReply, Request, RevisionRef, ScanExhaustion, SearchArgs, SearchReply, SessionAuthority,
+    SessionOpenArgs, SessionResumeArgs, SessionResumeReply, ShowArgs, ShowBody, ShowReply,
+    ShowTarget, SnapshotPolicy, StatusArgs, StatusReply, TailedEvent, Timestamp, TreeArgs,
+    TreeEntry, TreeReply, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
+use crate::search::{
+    SearchFold, SearchPool, SearchPoolConfig, ShardScan, WalkResume, build_search_matcher,
+    collect_search_candidates, decode_search_position, encode_search_position, scan_search_shard,
+    seal_search_fold, search_deadline, search_hit, search_query_digest, shard_search_entries,
+};
 use crate::store::CompactionStats;
 use crate::store::FactPageBudget;
 use crate::store::Store;
@@ -174,6 +180,8 @@ pub struct HostedCoordinator {
     leases: Arc<LeaseRegistry>,
     page_guards: Mutex<HashMap<LeaseId, (OwnerGuard, StdInstant)>>,
     event_retention_seconds: AtomicU64,
+    search_pool: Arc<SearchPool>,
+    search_max_scan_bytes: AtomicU64,
     /// Resume key for the service-receipt sweep rotation. In memory
     /// only: a restart re-scans from the first key, which delays but
     /// never breaks convergence, and no head-schema change is needed.
@@ -266,8 +274,29 @@ impl HostedCoordinator {
             leases,
             page_guards: Mutex::new(HashMap::new()),
             event_retention_seconds: AtomicU64::new(DEFAULT_EVENT_RETENTION_SECONDS),
+            search_pool: Arc::new(SearchPool::new(SearchPoolConfig::default())?),
+            search_max_scan_bytes: AtomicU64::new(crate::search::DEFAULT_SEARCH_MAX_SCAN_BYTES),
             receipt_sweep_cursor: Mutex::new(None),
         })
+    }
+
+    /// Replaces the search worker pool, injecting the daemon's configured
+    /// size. The default pool scans with
+    /// [`SearchPoolConfig::DEFAULT_PERMITS`] permits.
+    #[must_use]
+    pub fn with_search_pool(mut self, pool: SearchPool) -> Self {
+        self.search_pool = Arc::new(pool);
+        self
+    }
+
+    /// Caps decoded bytes one `search` page scans, in bytes.
+    ///
+    /// `serve` calls this once from the daemon configuration; each
+    /// coordinator opened afterwards scans within this ceiling. The page
+    /// seals with a cursor instead of refusing, so the ceiling never
+    /// surfaces `E_LIMIT`.
+    pub fn set_search_max_scan_bytes(&self, bytes: u64) {
+        self.search_max_scan_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Sets the horizon pruning event rows, in seconds.
@@ -594,10 +623,11 @@ impl HostedCoordinator {
     /// resources, authorizes it against the session's negotiated capabilities,
     /// and runs the read implementation. `op.log`, `claim.list`,
     /// `attest.list`, `refs.list`, `events.tail`, `file`, `show`, `log`,
-    /// `diff`, `blame`, `query`, and `status` have implementations; every
-    /// other read runs the same session checks and then names its missing
-    /// implementation with [`ErrorCode::EHosted`], so an unknown session
-    /// still reports `E_FORBIDDEN` rather than a missing-impl error.
+    /// `diff`, `blame`, `query`, `status`, `repo.stat`, `tree`, and `search`
+    /// have implementations; every other read runs the same session checks
+    /// and then names its missing implementation with [`ErrorCode::EHosted`],
+    /// so an unknown session still reports `E_FORBIDDEN` rather than a
+    /// missing-impl error.
     ///
     /// Capability mapping follows the existing handlers rather than a
     /// blanket table: ordinary reads authorize as [`ReadAccess::Objects`],
@@ -741,6 +771,10 @@ impl HostedCoordinator {
                 let reply = self.read_repo_stat()?;
                 Ok(Reply::RepoStat(Box::new(reply)))
             }
+            Request::Search(args) => {
+                let reply = self.read_search(session, &args, cancel, times.mono).await?;
+                Ok(Reply::Search(Box::new(reply)))
+            }
             Request::Tree(args) => {
                 let reply = self.read_tree(&args)?;
                 Ok(Reply::Tree(Box::new(reply)))
@@ -765,6 +799,141 @@ impl HostedCoordinator {
     /// `E_CORRUPT` for a damaged head row.
     pub fn view(&self) -> Result<ViewInfo, CoreError> {
         current_view(&self.store)
+    }
+
+    /// Serves one `search` page: path-ordered matching lines over the
+    /// resolved revision tree, scanned on the core-owned pool.
+    ///
+    /// The walk enumerates in path-byte order, dedupes identical blobs,
+    /// and scans contiguous shards concurrently; emission stays in shard
+    /// order, so completion order never changes emitted rows. Over-cap wire
+    /// budgets already refused in [`Validate`]; the daemon scan ceiling
+    /// seals the page with a cursor instead of refusing. Reads hold no
+    /// lane and publish nothing.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::EInvalid`] for a bad pattern, glob, budget, or cursor
+    ///   position, or a workspace revision.
+    /// - [`ErrorCode::EForbidden`] on a cursor binding mismatch or a stale
+    ///   view: the client restarts from a fresh first page.
+    /// - [`ErrorCode::ELeaseLost`] on an unknown, retired, or expired lease.
+    /// - [`ErrorCode::ECancelled`] once `cancel` fires.
+    /// - [`ErrorCode::EIo`] when a shard task fails.
+    /// - [`ErrorCode::ECorrupt`] for a damaged tree.
+    async fn read_search(
+        &self,
+        viewer: SessionId,
+        args: &SearchArgs,
+        cancel: &Cancel,
+        now: StdInstant,
+    ) -> Result<SearchReply, CoreError> {
+        let (view_first, root) = resolve_search_root(&self.store, &args.at)?;
+        let query = search_query_digest(root, args);
+        let cursor_view = args.page.cursor.as_ref().map(|cursor| cursor.view);
+        let mut skip_before = (Vec::new(), 0);
+        if let Some(cursor) = args.page.cursor.as_ref() {
+            let want = CursorWant {
+                store: self.store.store_id(),
+                session: viewer,
+                view: view_first.view,
+                query,
+            };
+            self.leases.check_cursor(cursor, &want, now)?;
+            let (scan_after, emit_after) = decode_search_position(&cursor.position)?;
+            skip_before = match (scan_after, emit_after) {
+                (Some(scan), Some((_, line))) => (scan, line),
+                (Some(scan), None) => (scan, 0),
+                (None, _) => (Vec::new(), 0),
+            };
+        }
+        let limit = args.page.effective_limit();
+        let max_bytes = args
+            .budget
+            .effective_max_bytes()
+            .min(self.search_max_scan_bytes.load(Ordering::Relaxed));
+        let deadline = search_deadline(now, &args.budget);
+        let matcher = build_search_matcher(&args.pattern, args.case_insensitive)?;
+        let walk_resume = WalkResume {
+            below: skip_before.0.as_slice(),
+            equal: skip_before.1 == 0 && !skip_before.0.is_empty(),
+        };
+        let walk = collect_search_candidates(
+            &self.store,
+            self.store.hash_kind(),
+            root,
+            args,
+            walk_resume,
+        )?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for shard in shard_search_entries(walk.entries) {
+            cancel.check()?;
+            let permit = self.search_pool.acquire_owned().await?;
+            let store = Arc::clone(&self.store);
+            let job = ShardScan {
+                shard,
+                matcher: matcher.clone(),
+                row_cap: limit.saturating_add(1),
+                skip_before: skip_before.clone(),
+                stop: Arc::clone(&stop),
+                cancel: cancel.clone(),
+                deadline,
+            };
+            handles.push(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                scan_search_shard(&store, &job)
+            }));
+        }
+        let mut fold = SearchFold::new(limit, &args.budget, max_bytes, deadline, skip_before);
+        fold.add_skipped(walk.prefilter_skipped);
+        for handle in handles {
+            cancel.check()?;
+            let joined = handle
+                .await
+                .map_err(|_| CoreError::new(ErrorCode::EIo, "search shard failed"))?;
+            fold.push_shard(joined?);
+            if fold.sealed() {
+                stop.store(true, Ordering::SeqCst);
+            }
+        }
+        let view = current_view(&self.store)?;
+        if let Some(first) = cursor_view
+            && view.view != first
+        {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "search cursor names a stale view: open a fresh first page",
+            ));
+        }
+        let sealed = seal_search_fold(fold, walk.complete, walk.frontier);
+        let mut hits = Vec::with_capacity(sealed.rows.len().min(limit));
+        for row in sealed.rows.iter().take(limit) {
+            hits.push(search_hit(row)?);
+        }
+        let next = match sealed.resume {
+            None => None,
+            Some((scan_after, emit_after)) => {
+                let emit = emit_after
+                    .as_ref()
+                    .map(|(path, line)| (path.as_slice(), *line));
+                let position = encode_search_position(Some(&scan_after), emit)?;
+                Some(self.mint_read_lease(viewer, view.view, query, position.as_bytes(), now)?)
+            }
+        };
+        let truncated = next.is_some();
+        Ok(SearchReply {
+            view,
+            hits: Page::new(hits, next)?,
+            truncated,
+            exhausted: if truncated {
+                sealed.exhausted
+            } else {
+                ScanExhaustion::None
+            },
+            scanned_blobs: sealed.scanned_blobs,
+            scanned_bytes: sealed.scanned_bytes,
+            skipped_blobs: sealed.skipped_blobs,
+        })
     }
 
     /// Serves one `repo.stat` read: store identity, object format, default
@@ -2759,14 +2928,11 @@ impl HostedCoordinator {
 fn read_gap(method: Method) -> &'static str {
     match method {
         Method::Compare => "compare needs a merge-base walk with bounded ahead and behind counts",
-        Method::Search => {
-            "search needs the core-owned search pool plus lease cursors over bounded parallel scans"
-        }
         Method::Archive => "archive needs a streaming body writer under the reply credit window",
         Method::RemoteRefs => {
             "remote.refs needs an ls-refs round-trip against an explicit remote URL"
         }
-        _ => "only compare, search, archive, and remote.refs lack hosted read arms",
+        _ => "only compare, archive, and remote.refs lack hosted read arms",
     }
 }
 

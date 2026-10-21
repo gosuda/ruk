@@ -8,6 +8,7 @@ description = "Ruk native model, merge algebra, and typed schemas"
 
 [dependencies]
 gix-hash.workspace = true
+regex.workspace = true
 serde.workspace = true
 sonic-rs.workspace = true
 stacker.workspace = true
