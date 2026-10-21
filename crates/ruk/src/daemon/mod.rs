@@ -2746,10 +2746,10 @@ struct GitRound<'a> {
 }
 
 /// Awaits one blocking git-service round, watching for `Cancel` and
-/// connection drop: either stops the wait at once — dropping the run
-/// future frees its bulkhead permit — and reports the cancelled exit.
-/// The tripped sync flag stops the detached blocking serve at its next
-/// interrupt check.
+/// connection drop: either stops the wait at once — the waiter stops
+/// awaiting while the detached worker keeps its bulkhead permit until
+/// it finishes — and reports the cancelled exit. The tripped sync flag
+/// stops the detached blocking serve at its next interrupt check.
 #[cfg(unix)]
 async fn await_git_round<T>(
     mut round: GitRound<'_>,

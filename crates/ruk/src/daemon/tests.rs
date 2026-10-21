@@ -1228,8 +1228,8 @@ async fn run_git_service_honors_a_tripped_cancel_flag() {
 }
 
 /// A `Cancel` frame ends a parked blocking wait at once: the helper
-/// stops awaiting (freeing the bulkhead permit), trips the sync flag,
-/// and reports the cancelled exit.
+/// stops awaiting (the detached worker keeps its bulkhead permit until
+/// it finishes), trips the sync flag, and reports the cancelled exit.
 #[tokio::test]
 async fn git_round_cancel_stops_a_parked_serve() {
     use super::{GitRound, await_git_round};
