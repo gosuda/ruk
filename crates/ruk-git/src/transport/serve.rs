@@ -880,6 +880,17 @@ pub fn serve_receive_pack_with<R: Read, W: Write>(
                 alternate,
                 write_through_cas,
             } => {
+                if write_through_cas
+                    && divert_writes
+                        .iter()
+                        .any(|(_, update)| update.name == alternate.refname)
+                {
+                    results[command_index] = Some(Err(format!(
+                        "duplicate divert to review ref `{}`",
+                        String::from_utf8_lossy(&alternate.refname)
+                    )));
+                    continue;
+                }
                 alternates.push((command_index, alternate.clone()));
                 results[command_index] = Some(Ok(()));
                 if write_through_cas {

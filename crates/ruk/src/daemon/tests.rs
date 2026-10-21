@@ -1998,6 +1998,159 @@ async fn host_divert_writes_review_ref_only() {
     task.abort();
 }
 
+fn hosted_two_chain_pack(seed_a: u8, seed_b: u8) -> (Vec<u8>, Oid, Oid) {
+    let kind = ruk_core::ids::HashKind::Sha1;
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut trees: Vec<Vec<u8>> = Vec::new();
+    let mut commits: Vec<Vec<u8>> = Vec::new();
+    let mut blob_ids: Vec<Oid> = Vec::new();
+    let mut tree_ids: Vec<Oid> = Vec::new();
+    let mut commit_ids: Vec<Oid> = Vec::new();
+    for seed in [seed_a, seed_b] {
+        let blob: Vec<u8> = (0..1000)
+            .map(|i| ((i + usize::from(seed) * 131) % 251) as u8)
+            .collect();
+        let blob_id = hosted_blob_oid(&blob);
+        let mut tree = b"100644 f\0".to_vec();
+        tree.extend_from_slice(blob_id.as_bytes());
+        let tree_id = kind.hash_git_object("tree", &tree).expect("tree hashes");
+        let commit = format!(
+            "tree {}\nauthor T <t@t.invalid> 0 +0000\ncommitter T <t@t.invalid> 0 +0000\n\nhosted\n",
+            tree_id.to_hex()
+        )
+        .into_bytes();
+        let commit_id = kind
+            .hash_git_object("commit", &commit)
+            .expect("commit hashes");
+        blobs.push(blob);
+        trees.push(tree);
+        commits.push(commit);
+        blob_ids.push(blob_id);
+        tree_ids.push(tree_id);
+        commit_ids.push(commit_id);
+    }
+    let entries = [
+        git_pack::PackEntry {
+            oid: commit_ids[0],
+            kind: ObjectKind::Commit,
+            bytes: &commits[0],
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: tree_ids[0],
+            kind: ObjectKind::Tree,
+            bytes: &trees[0],
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: blob_ids[0],
+            kind: ObjectKind::Blob,
+            bytes: &blobs[0],
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: commit_ids[1],
+            kind: ObjectKind::Commit,
+            bytes: &commits[1],
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: tree_ids[1],
+            kind: ObjectKind::Tree,
+            bytes: &trees[1],
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: blob_ids[1],
+            kind: ObjectKind::Blob,
+            bytes: &blobs[1],
+            base: None,
+        },
+    ];
+    let mut pack = Vec::new();
+    git_pack::write_pack(&mut pack, kind, &entries, &Interrupt::none()).expect("pack");
+    (pack, commit_ids[0], commit_ids[1])
+}
+
+#[tokio::test]
+async fn host_duplicate_divert_second_fails_first_kept() {
+    let root = temp_root("host-dup-divert");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (pack, commit_a, commit_b) = hosted_two_chain_pack(11, 12);
+    assert_ne!(commit_a, commit_b, "the diverters carry distinct commits");
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let session = open_push_session(&mut driver, &store_repo, &["refs/for/**"]).await;
+    let zero = "0".repeat(40);
+    let mut body =
+        pkt(format!("{zero} {commit} refs/for/a\n", commit = commit_a.to_hex()).as_bytes());
+    body.extend_from_slice(&pkt(format!(
+        "{zero} {commit} refs/for/b\n",
+        commit = commit_b.to_hex()
+    )
+    .as_bytes()));
+    body.extend_from_slice(&flush());
+    body.extend_from_slice(&pack);
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-dup-divert-1"),
+    );
+    let answer = |call: &HookCall| {
+        if call.phase == HookPhase::PostReceive {
+            return accept_all(call);
+        }
+        Some(HookReply {
+            reject_all: false,
+            reason: None,
+            verdicts: call
+                .commands
+                .iter()
+                .map(|command| HookRefVerdict {
+                    name: command.name.clone(),
+                    verdict: HookVerdict::Divert {
+                        review_ref: "refs/changes/7/head".to_owned(),
+                    },
+                })
+                .collect(),
+        })
+    };
+    let (out, exit) = driver.run_git_hosted(5, &payload, &[body], answer).await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ok refs/for/a"),
+        "the first divert keeps its report: {text:?}"
+    );
+    assert!(
+        text.contains("ng refs/for/b"),
+        "the duplicate divert fails in-band: {text:?}"
+    );
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let review = ruk_core::refs::StoreRefs::new(coordinator.store())
+        .get(&RefName::new("refs/changes/7/head".to_string()).expect("ref name"))
+        .expect("read review");
+    assert_eq!(
+        review,
+        Some(RefTarget::Direct(commit_a)),
+        "the first divert wins the review ref"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
 #[tokio::test]
 async fn host_reply_missing_ref_means_reject_all() {
     let root = temp_root("host-missing");
