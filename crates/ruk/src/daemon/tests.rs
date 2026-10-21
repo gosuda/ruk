@@ -1095,10 +1095,20 @@ async fn reader_never_blocks_on_a_full_stream() {
     };
     let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
     let (done_tx, _done_rx) = tokio::sync::mpsc::channel(64);
-    let mut streams: HashMap<u64, (tokio::sync::mpsc::Sender<ipc::Frame>, u64)> = HashMap::new();
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
     // Parked task: the receiver lives but never drains.
     let (tx, _parked) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BOUND);
-    streams.insert(7, (tx.clone(), 1));
+    let (_data_tx, _data_parked) = tokio::sync::mpsc::unbounded_channel();
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx.clone(),
+            data: _data_tx,
+            outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            generation: 1,
+            git: true,
+        },
+    );
     for _ in 0..STREAM_CHANNEL_BOUND {
         tx.try_send(ipc::Frame {
             kind: FrameKind::WindowUpdate,
@@ -1128,7 +1138,17 @@ async fn reader_never_blocks_on_a_full_stream() {
     assert_eq!(first.stream_id, 7);
     // A live sibling still receives its frame promptly after the refusal.
     let (sib_tx, mut sib_rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BOUND);
-    streams.insert(9, (sib_tx, 1));
+    let (sib_data_tx, _sib_data_parked) = tokio::sync::mpsc::unbounded_channel();
+    streams.insert(
+        9,
+        super::StreamRoute {
+            control: sib_tx,
+            data: sib_data_tx,
+            outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            generation: 1,
+            git: true,
+        },
+    );
     let sibling = ipc::Frame {
         kind: FrameKind::Cancel,
         stream_id: 9,
@@ -2789,6 +2809,58 @@ async fn duplicate_open_for_live_stream_is_refused() {
         "first stream completes after the refused duplicate",
     );
 
+    drop(driver);
+    task.abort();
+}
+
+/// A compliant client may split a small request body into many tiny
+/// `Stdin` frames inside its credit window: the router must not refuse
+/// them for frame count while every byte fits the window.
+#[tokio::test]
+async fn small_stdin_frames_within_window_are_not_refused() {
+    let root = temp_root("small-frames");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+    let mut request = pkt(format!("want {}\n", commit.to_hex()).as_bytes());
+    request.extend_from_slice(&flush());
+    request.extend_from_slice(&pkt(b"done\n"));
+    let chunks: Vec<Vec<u8>> = request.chunks(1).map(<[u8]>::to_vec).collect();
+    assert!(chunks.len() > 40, "{} frames", chunks.len());
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    assert_eq!(driver.recv().await.kind, FrameKind::Accepted);
+    for chunk in &chunks {
+        driver.send(FrameKind::Stdin, 1, chunk).await;
+    }
+    let mut grants = 0;
+    while grants < chunks.len() {
+        let frame = driver.recv().await;
+        assert_ne!(
+            frame.kind,
+            FrameKind::Error,
+            "compliant stream refused: {}",
+            String::from_utf8_lossy(&frame.payload),
+        );
+        assert_eq!(frame.kind, FrameKind::WindowUpdate);
+        grants += 1;
+    }
+    driver.send(FrameKind::StdinEof, 1, &[]).await;
+    let (stdout, _, exit) = driver.recv_exit(1).await;
+    assert_eq!(exit.exit_code, 0);
+    assert!(stdout.starts_with(b"PACK"));
     drop(driver);
     task.abort();
 }

@@ -22,7 +22,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1183,7 +1183,7 @@ async fn serve_connection(
     tokio::spawn(async move {
         connection_writer(writer_rx, write_half, writer_timeout).await;
     });
-    let mut streams: HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)> = HashMap::new();
+    let mut streams: HashMap<u64, StreamRoute> = HashMap::new();
     let mut generation: u64 = 0;
     let (done_tx, mut done_rx) = mpsc::channel(COMPLETION_CHANNEL_BOUND);
     loop {
@@ -1198,7 +1198,7 @@ async fn serve_connection(
         };
         while let Ok((stream_id, stream_generation)) = done_rx.try_recv() {
             if let std::collections::hash_map::Entry::Occupied(entry) = streams.entry(stream_id)
-                && entry.get().1 == stream_generation
+                && entry.get().generation == stream_generation
             {
                 entry.remove();
             }
@@ -1258,7 +1258,7 @@ async fn connection_writer(
 async fn handle_control_frame(
     writer: &mpsc::Sender<OutboundFrame>,
     frame: &ipc::Frame,
-    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    streams: &mut HashMap<u64, StreamRoute>,
 ) -> Result<bool, Error> {
     match frame.kind {
         ipc::FrameKind::Cancel => {
@@ -1268,13 +1268,13 @@ async fn handle_control_frame(
             // including their Cancel frames. A full channel declares its
             // stream dead instead.
             let mut overflowed = Vec::new();
-            for (stream_id, (tx, _)) in streams.iter() {
+            for (stream_id, route) in streams.iter() {
                 let cancel = ipc::Frame {
                     kind: ipc::FrameKind::Cancel,
                     stream_id: *stream_id,
                     payload: Vec::new(),
                 };
-                match tx.try_send(cancel) {
+                match route.control.try_send(cancel) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => continue,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -1368,7 +1368,7 @@ async fn write_control_error(
 async fn route_stream_frame(
     writer: &mpsc::Sender<OutboundFrame>,
     frame: ipc::Frame,
-    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    streams: &mut HashMap<u64, StreamRoute>,
     done: &mpsc::Sender<(u64, u64)>,
     generation: u64,
     refs: &ConnectionRefs,
@@ -1395,7 +1395,28 @@ async fn route_stream_frame(
             spawn_stream(writer, frame, streams, done, generation, refs, peer);
             Ok(false)
         }
-        ipc::FrameKind::Stdin | ipc::FrameKind::StdinEof | ipc::FrameKind::HookReply => {
+        ipc::FrameKind::Stdin => {
+            let git = streams.get(&stream_id).is_some_and(|route| route.git);
+            if git {
+                route_stdin_frame(writer, streams, refs, stream_id, frame).await?;
+            } else {
+                route_frame_try_send(writer, streams, stream_id, frame).await?;
+            }
+            Ok(false)
+        }
+        ipc::FrameKind::StdinEof => {
+            let Some(route) = streams.get(&stream_id) else {
+                return Ok(false);
+            };
+            match route.data.send(frame) {
+                Ok(()) => Ok(false),
+                Err(_) => {
+                    streams.remove(&stream_id);
+                    Ok(false)
+                }
+            }
+        }
+        ipc::FrameKind::HookReply => {
             route_frame_try_send(writer, streams, stream_id, frame).await?;
             Ok(false)
         }
@@ -1470,14 +1491,14 @@ async fn route_stream_frame(
 #[cfg(unix)]
 async fn route_frame_try_send(
     writer: &mpsc::Sender<OutboundFrame>,
-    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    streams: &mut HashMap<u64, StreamRoute>,
     stream_id: u64,
     frame: ipc::Frame,
 ) -> Result<(), Error> {
-    let Some((tx, _)) = streams.get(&stream_id) else {
+    let Some(route) = streams.get(&stream_id) else {
         return Ok(());
     };
-    match tx.try_send(frame) {
+    match route.control.try_send(frame) {
         Ok(()) => Ok(()),
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             streams.remove(&stream_id);
@@ -1489,13 +1510,79 @@ async fn route_frame_try_send(
     }
 }
 
+/// Routes one `Stdin` chunk to its stream's data channel, admitting it
+/// against the connection's inbound credit window first.
+///
+/// The admitted total must fit the window the daemon configured for the
+/// connection: a chunk past it refuses with `E_LIMIT` instead of
+/// queueing, so only credit-valid bytes ever wait on a parked task. Past
+/// admission the data channel never refuses: tiny frames inside a valid
+/// window always route, no matter how far behind the task has fallen. The
+/// serving task releases bytes as it consumes them. A closed channel
+/// drops the entry; the task is already gone.
+#[cfg(unix)]
+async fn route_stdin_frame(
+    writer: &mpsc::Sender<OutboundFrame>,
+    streams: &mut HashMap<u64, StreamRoute>,
+    refs: &ConnectionRefs,
+    stream_id: u64,
+    frame: ipc::Frame,
+) -> Result<(), Error> {
+    // The admitted width counts the payload plus one framing byte, so an
+    // empty chunk still occupies queue bookkeeping and an empty-frame
+    // flood stops at the window. The task releases the same width on
+    // consume, keeping the counter exact.
+    let width = u64::try_from(frame.payload.len())
+        .map_err(|_| {
+            Error::Core(CoreError::new(
+                ErrorCode::ELimit,
+                "stdin chunk exceeds its bound",
+            ))
+        })?
+        .saturating_add(1);
+    let Some(route) = streams.get(&stream_id) else {
+        return Ok(());
+    };
+    let admitted = route
+        .outstanding
+        .load(Ordering::SeqCst)
+        .saturating_add(width);
+    if admitted > refs.window_bytes {
+        let sink = StreamSink {
+            writer: writer.clone(),
+            stream_id,
+        };
+        send_error_exit(
+            &sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::ELimit,
+                "stream credit window is exhausted",
+            )),
+        )
+        .await?;
+        return Ok(());
+    }
+    // Framing is never free: an empty chunk still occupies queue
+    // bookkeeping, so the width above counts at least one byte and an
+    // empty-frame flood stops at the window instead of growing the
+    // channel without bound.
+    route.outstanding.store(admitted, Ordering::SeqCst);
+    match route.data.send(frame) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            streams.remove(&stream_id);
+            Ok(())
+        }
+    }
+}
+
 /// Ends an overflowed stream with an explicit error exit and drops its
 /// routing entry: the reader never waits for a task that stopped
 /// draining, and the client learns the stream died instead of hanging.
 #[cfg(unix)]
 async fn refuse_overflowed_stream(
     writer: &mpsc::Sender<OutboundFrame>,
-    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    streams: &mut HashMap<u64, StreamRoute>,
     stream_id: u64,
 ) -> Result<(), Error> {
     streams.remove(&stream_id);
@@ -1513,23 +1600,57 @@ async fn refuse_overflowed_stream(
     .await
 }
 
+/// One stream's routing state: a bounded control channel, an unbounded
+/// data channel, and the admitted-but-unconsumed byte count.
+///
+/// Control frames (`Cancel`, `WindowUpdate`, `HookReply`) stay on the
+/// bounded channel with `try_send`: they are low-volume and idempotent,
+/// so a full control channel refuses the stream instead of stalling the
+/// reader. `Stdin` bytes ride the data channel, whose bound follows the
+/// inbound credit window instead of a frame count: the reader admits a
+/// chunk only while the admitted total fits the window, and the serving
+/// task releases bytes as it consumes them. `StdinEof` rides the data
+/// channel too, so the terminator never overtakes its bytes.
+struct StreamRoute {
+    control: mpsc::Sender<ipc::Frame>,
+    data: mpsc::UnboundedSender<ipc::Frame>,
+    outstanding: Arc<AtomicU64>,
+    generation: u64,
+    /// Whether the stream runs a git service (and consumes `Stdin`).
+    /// Typed invocations never read the data channel, so their `Stdin`
+    /// frames stay on the control path and keep the old misplaced-frame
+    /// refusal instead of buffering behind a reader that never drains.
+    git: bool,
+}
+
 /// Spawns one task serving the stream of one `Open` frame. The reader
-/// keeps only the task's input channel: every later frame of the stream
-/// routes through it, so a long invocation never blocks sibling streams
+/// keeps only the task's input channels: every later frame of the stream
+/// routes through them, so a long invocation never blocks sibling streams
 /// and `Cancel` reaches a running invocation.
 #[cfg(unix)]
 fn spawn_stream(
     writer: &mpsc::Sender<OutboundFrame>,
     frame: ipc::Frame,
-    streams: &mut HashMap<u64, (mpsc::Sender<ipc::Frame>, u64)>,
+    streams: &mut HashMap<u64, StreamRoute>,
     done: &mpsc::Sender<(u64, u64)>,
     generation: u64,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
 ) {
     let stream_id = frame.stream_id;
-    let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BOUND);
-    if let Some((old, _)) = streams.insert(stream_id, (tx, generation)) {
+    let (control_tx, control_rx) = mpsc::channel(STREAM_CHANNEL_BOUND);
+    let (data_tx, data_rx) = mpsc::unbounded_channel();
+    let git = ipc::decode_control::<CommandOpen>(&frame.payload).is_ok();
+    let outstanding = Arc::new(AtomicU64::new(0));
+    let task_outstanding = Arc::clone(&outstanding);
+    let route = StreamRoute {
+        control: control_tx,
+        data: data_tx,
+        outstanding,
+        generation,
+        git,
+    };
+    if let Some(old) = streams.insert(stream_id, route) {
         drop(old);
     }
     let sink = StreamSink {
@@ -1539,7 +1660,16 @@ fn spawn_stream(
     let task_refs = refs.clone();
     let task_done = done.clone();
     tokio::spawn(async move {
-        serve_stream(rx, &sink, frame.payload, &task_refs, peer).await;
+        serve_stream(
+            control_rx,
+            data_rx,
+            task_outstanding,
+            &sink,
+            frame.payload,
+            &task_refs,
+            peer,
+        )
+        .await;
         let _ = task_done.try_send((stream_id, generation));
     });
 }
@@ -1550,15 +1680,27 @@ fn spawn_stream(
 #[cfg(unix)]
 async fn serve_stream(
     mut input: mpsc::Receiver<ipc::Frame>,
+    data: mpsc::UnboundedReceiver<ipc::Frame>,
+    outstanding: Arc<AtomicU64>,
     sink: &StreamSink,
     open_payload: Vec<u8>,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
 ) {
     if let Ok(command) = ipc::decode_control::<CommandOpen>(&open_payload) {
-        serve_git_service(&mut input, sink, command, refs, peer.uid).await;
+        serve_git_service(
+            &mut input,
+            data,
+            &outstanding,
+            sink,
+            command,
+            refs,
+            peer.uid,
+        )
+        .await;
         return;
     }
+    let _typed_data_live = data;
     let open: InvocationOpen = match ipc::decode_control(&open_payload) {
         Ok(open) => open,
         Err(err) => {
@@ -1740,6 +1882,8 @@ async fn store_git_outcome(
 #[cfg(unix)]
 async fn serve_git_service(
     input: &mut mpsc::Receiver<ipc::Frame>,
+    mut data: mpsc::UnboundedReceiver<ipc::Frame>,
+    outstanding: &AtomicU64,
     sink: &StreamSink,
     req: CommandOpen,
     refs: &ConnectionRefs,
@@ -1843,7 +1987,16 @@ async fn serve_git_service(
     let stdin_bytes = if req.advertise {
         Vec::new()
     } else {
-        match collect_git_stdin(input, sink, &mut credits, &req.limits).await {
+        match collect_git_stdin(
+            input,
+            &mut data,
+            outstanding,
+            sink,
+            &mut credits,
+            &req.limits,
+        )
+        .await
+        {
             GitStdinFate::Ready(bytes) => bytes,
             GitStdinFate::Cancelled => {
                 let report = CommandExitReport::cancelled(&accepted.invocation_id);
@@ -2387,6 +2540,8 @@ enum GitStdinFate {
 #[cfg(unix)]
 async fn collect_git_stdin(
     input: &mut mpsc::Receiver<ipc::Frame>,
+    data: &mut mpsc::UnboundedReceiver<ipc::Frame>,
+    outstanding: &AtomicU64,
     sink: &StreamSink,
     credits: &mut ipc::StreamCredits,
     limits: &GitLimits,
@@ -2394,7 +2549,22 @@ async fn collect_git_stdin(
     let stream_id = sink.stream_id;
     let mut stdin_bytes: Vec<u8> = Vec::new();
     loop {
-        let Some(frame) = input.recv().await else {
+        let frame = tokio::select! {
+            biased;
+            control = input.recv() => {
+                let Some(frame) = control else {
+                    return GitStdinFate::Gone;
+                };
+                if frame.kind == ipc::FrameKind::StdinEof {
+                    continue;
+                }
+                Some(frame)
+            }
+            chunk = data.recv() => {
+                chunk
+            }
+        };
+        let Some(frame) = frame else {
             return GitStdinFate::Gone;
         };
         if frame.stream_id != stream_id {
@@ -2427,6 +2597,10 @@ async fn collect_git_stdin(
                         "stream credit window is exhausted",
                     ));
                 }
+                // Release matches the reader's admission width: payload
+                // plus one framing byte, keeping the shared counter exact
+                // while protocol credit stays in payload bytes.
+                outstanding.fetch_sub(width.saturating_add(1), Ordering::SeqCst);
                 stdin_bytes.extend_from_slice(&frame.payload);
                 if credits.grant_inbound(stream_id, width).is_err() {
                     return GitStdinFate::Rejected(CoreError::new(
