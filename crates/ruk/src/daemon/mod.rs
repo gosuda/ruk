@@ -2515,21 +2515,24 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     drop(policy);
     tokio::pin!(serve);
     let mut deliver = true;
-    let outcome: Result<(Vec<u8>, Vec<u64>), CoreError> = loop {
+    // Breaks with `None` when the frame task abandons the pump while
+    // the serve still runs; the loop then stops selecting and the
+    // drain below owns the bridge. Awaiting `serve` inside an arm
+    // instead would let the pump stop answering a blocked hook
+    // exchange: the deadline lives only here, so the serve would hang
+    // with its receipt unwritten.
+    let outcome: Option<Result<(Vec<u8>, Vec<u64>), CoreError>> = 'serve: loop {
         tokio::select! {
             done = &mut serve => {
-                break match done {
+                break 'serve Some(match done {
                     Ok(inner) => inner,
                     Err(err) => Err(err),
-                };
+                });
             }
             frame = input.recv() => {
                 let Some(frame) = frame else {
                     deliver = false;
-                    break match serve.await {
-                        Ok(inner) => inner,
-                        Err(err) => Err(err),
-                    };
+                    break 'serve None;
                 };
                 match frame.kind {
                     ipc::FrameKind::Cancel => {
@@ -2552,11 +2555,9 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
             exchange = server.recv() => {
                 let Some(exchange) = exchange else {
                     // The policy is gone, so the serve task owns the
-                    // outcome now; await it directly.
-                    break match serve.await {
-                        Ok(inner) => inner,
-                        Err(err) => Err(err),
-                    };
+                    // outcome now; the drain below re-awaits the
+                    // pinned serve without re-polling it.
+                    break 'serve None;
                 };
                 let reply = pump_one_exchange(
                     input,
@@ -2568,6 +2569,32 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
                 )
                 .await;
                 let _ = exchange.reply.send(reply);
+            }
+        }
+    };
+    // The pump abandoned the bridge: a queued hook exchange still
+    // holds the blocking serve inside its reply slot with no deadline
+    // left, so fail the drain closed — the discarded exchanges drop
+    // their senders and the blocked exchange refuses the whole push —
+    // then await the serve so the outcome still records a receipt.
+    let outcome = match outcome {
+        Some(outcome) => outcome,
+        None => {
+            // The pump abandoned the bridge while the serve still
+            // runs. A queued hook exchange holds the blocking serve
+            // inside its reply slot with no deadline left, so fail
+            // the drain closed: the discarded exchanges drop their
+            // oneshot senders and the blocked exchange refuses the
+            // whole push. The serve still completes, so its outcome
+            // records a receipt either way.
+            server.fail_closed();
+            match serve.await {
+                Ok(Ok(inner)) => Ok(inner),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(CoreError::new(
+                    ErrorCode::ECancelled,
+                    format!("serve join failed mid-publish: {err}"),
+                )),
             }
         }
     };

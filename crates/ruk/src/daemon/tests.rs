@@ -3962,6 +3962,139 @@ async fn host_disconnect_mid_publish_still_records_receipt() {
     task.abort();
 }
 
+/// A client that drops while its hook callback sits unanswered must not
+/// wedge the serve inside the blocking exchange: abandoning the pump
+/// fails the bridge closed, the push refuses, and the outcome still
+/// records a service receipt.
+///
+/// Sequencing matters. The socket stays open after `StdinEof` so stdin
+/// collection deterministically finishes first; the drop below then
+/// lands while the serve is still ingesting the pack below, before it
+/// can queue its hook exchange. On the unfixed code the serve parks in
+/// the exchange forever with no pump left to answer it.
+#[tokio::test]
+async fn host_disconnect_with_unanswered_hook_still_records_receipt() {
+    let root = temp_root("host-gone-unanswered");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    // A large incompressible blob keeps pack ingest well above the
+    // sleep below, so the drop lands mid-ingest every run.
+    let kind = ruk_core::ids::HashKind::Sha1;
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    let blob: Vec<u8> = (0..4 * 1024 * 1024)
+        .map(|_| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            u8::try_from((x >> 33) & 0xff).expect("masked byte fits u8")
+        })
+        .collect();
+    let blob_id = hosted_blob_oid(&blob);
+    let mut tree = b"100644 f\0".to_vec();
+    tree.extend_from_slice(blob_id.as_bytes());
+    let tree_id = kind.hash_git_object("tree", &tree).expect("tree hashes");
+    let commit = format!(
+        "tree {}\nauthor T <t@t.invalid> 0 +0000\ncommitter T <t@t.invalid> 0 +0000\n\nhosted\n",
+        tree_id.to_hex()
+    )
+    .into_bytes();
+    let commit_id = kind
+        .hash_git_object("commit", &commit)
+        .expect("commit hashes");
+    let entries = [
+        git_pack::PackEntry {
+            oid: commit_id,
+            kind: ObjectKind::Commit,
+            bytes: &commit,
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: tree_id,
+            kind: ObjectKind::Tree,
+            bytes: &tree,
+            base: None,
+        },
+        git_pack::PackEntry {
+            oid: blob_id,
+            kind: ObjectKind::Blob,
+            bytes: &blob,
+            base: None,
+        },
+    ];
+    let mut pack = Vec::new();
+    git_pack::write_pack(&mut pack, kind, &entries, &Interrupt::none()).expect("pack");
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let peer_uid = driver.conn.peer_cred().expect("peer credentials").uid();
+    let session = open_push_session(&mut driver, &store_repo, &["refs/heads/**"]).await;
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{zero} {commit} refs/heads/gone-unanswered\n",
+        commit = commit_id.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    body.extend_from_slice(&pack);
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-hosted-gone-2"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    for chunk in body.chunks(64 * 1024) {
+        driver.send(FrameKind::Stdin, 5, chunk).await;
+        let grant = driver.recv().await;
+        assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    }
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    // The socket stays open here, so no teardown can race stdin
+    // collection; the sleep only lets the daemon consume `StdinEof`.
+    // The drop below then lands mid-ingest, before any hook exchange
+    // exists, and the abandoned pump must fail the serve closed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(driver);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (_, canonical, coordinator) = registry.open(&store_repo).expect("open coordinator");
+        let landed = ruk_core::refs::StoreRefs::new(coordinator.store())
+            .get(&RefName::new("refs/heads/gone-unanswered".to_string()).expect("ref name"))
+            .expect("read ref");
+        let receipt = ruk_core::coord::service_receipts::lookup_service_receipt(
+            coordinator.store(),
+            peer_uid,
+            canonical.as_os_str().as_bytes(),
+            "req-hosted-gone-2",
+        )
+        .expect("read receipt");
+        assert!(
+            landed.is_none(),
+            "the unanswered callback refuses the push instead of landing it"
+        );
+        if receipt.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the serve finishes and a receipt is recorded after the unanswered disconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    task.abort();
+}
+
 #[tokio::test]
 async fn typed_reply_waits_for_outbound_credit() {
     let root = temp_root("credit-wait");
