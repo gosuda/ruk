@@ -44,6 +44,7 @@ use ruk_core::protocol::{
     SessionResumeArgs, decode_json,
 };
 use ruk_core::refdata::RefName;
+use ruk_git::transport::credentials::TransportAuth;
 use ruk_git::transport::host::{HookCall, HookReply, HostPolicy, hook_bridge};
 use ruk_git::transport::pack::IngestLimits;
 use ruk_git::transport::serve::ReceiveLimits;
@@ -621,6 +622,12 @@ pub(crate) struct InvocationOpen {
     /// authorization input.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// A credential injected for remote authentication on this call only.
+    /// It never enters digests, receipts, or logs: [`TransportAuth`]
+    /// redacts its [`fmt::Debug`], and digest helpers take only parsed
+    /// commands plus limits.
+    #[serde(default)]
+    pub transport_auth: TransportAuth,
 }
 
 /// The `Accepted` payload answering one `Open`.
@@ -3008,6 +3015,10 @@ async fn typed_stream(
     let fail = async |err: Error| {
         let _ = send_error_exit(sink, &err).await;
     };
+    if let Err(err) = open.transport_auth.validate() {
+        fail(Error::Core(CoreError::from(err))).await;
+        return;
+    }
     let method = match Method::ALL.iter().find(|m| m.as_str() == open.method) {
         Some(method) => *method,
         None => {
@@ -3397,6 +3408,25 @@ fn mutation_request<Args>(
 /// `E_INVALID` for over-nested, malformed, or mismatched JSON.
 fn decode_args<Args: DeserializeOwned>(text: &str) -> Result<Args, CoreError> {
     decode_json(text.as_bytes())
+}
+
+/// The idempotency digest of one typed invocation: the request's own
+/// digest inputs only. The accompanying [`TransportAuth`] validates
+/// fail-closed here and rides alongside toward the transport job without
+/// entering the digest, so an authed retry replays the anonymous receipt
+/// instead of forking one. Test-only until the hosted transport job calls
+/// it.
+///
+/// # Errors
+/// `E_INVALID` for a half-specified credential, or when the request
+/// arguments cannot be encoded.
+#[cfg(test)]
+fn invocation_digest(
+    request: &Request,
+    auth: &TransportAuth,
+) -> Result<Option<Vec<u8>>, CoreError> {
+    auth.validate().map_err(CoreError::from)?;
+    request.digest_input_v1()
 }
 
 /// Decodes `args_json` into the typed [`Request`] of `method`.

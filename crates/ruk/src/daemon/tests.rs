@@ -15,7 +15,8 @@ use std::time::Duration;
 use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
 use super::{
     BoundedExecutor, CommandAccepted, CommandExitReport, CommandOpen, ConnectionRefs, ExitReport,
-    GitLimits, InvocationAccepted, InvocationOpen, Registry, SessionOpened, serve_connection,
+    GitLimits, InvocationAccepted, InvocationOpen, Registry, SessionOpened, TransportAuth,
+    serve_connection,
 };
 use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
@@ -34,11 +35,11 @@ use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
     BookmarkSetArgs, BookmarkTarget, BoundedList, ChangeRef, ClaimAcquireArgs, ClaimMode,
     ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, ErrorDetail, ErrorReply, FetchArgs,
-    FetchFilter, FetchRefs, Fix, IdentityClaim, LandExecuteArgs, Method, NewArgs, OpLogArgs,
-    PageCursor, PageLimit, PageRequest, PathSelection, PinArgs, PushRefOutcome, PushRefStatus,
-    PushState, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope,
-    SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
-    TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
+    FetchFilter, FetchRefs, Fix, IdentityClaim, LandExecuteArgs, Method, Mutation, NewArgs,
+    OpLogArgs, PageCursor, PageLimit, PageRequest, PathSelection, PinArgs, PushRefOutcome,
+    PushRefStatus, PushState, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope,
+    Request, SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
+    TagSetArgs, UndoArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
 use ruk_core::store::{EventContext, EventSource, FactTable, ObjectKind, PreparationBudget, Store};
@@ -407,6 +408,7 @@ impl Driver {
             args_json,
             session_id: session_id.map(str::to_string),
             on_behalf_of: on_behalf_of.map(str::to_string),
+            transport_auth: TransportAuth::default(),
         };
         sonic_rs::to_string(&open)
             .expect("typed open encodes")
@@ -4842,6 +4844,7 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         args_json: Some(sonic_rs::to_string(&init_args).expect("init args encode")),
         session_id: None,
         on_behalf_of: None,
+        transport_auth: TransportAuth::default(),
     };
     let (_handle, cancel) = cancellation();
     let _ = &cancel;
@@ -4877,6 +4880,7 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         args_json: Some("{\"source\":\"acme/hello\",\"path\":\"acme/fork\"}".to_string()),
         session_id: None,
         on_behalf_of: None,
+        transport_auth: TransportAuth::default(),
     };
     let admin = Caller {
         principal: &Principal::from_peer_uid(1000),
@@ -4940,6 +4944,7 @@ async fn largest_served_tail_page_fits_control_bound() {
         args_json: Some("{\"after\":0,\"limit\":1000}".to_string()),
         session_id: Some(session.to_string()),
         on_behalf_of: None,
+        transport_auth: TransportAuth::default(),
     };
     let caller = Caller {
         principal: &peer,
@@ -5012,4 +5017,66 @@ async fn cancelled_run_keeps_its_permit_until_the_worker_finishes() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+#[test]
+fn injected_auth_never_enters_the_service_digest() {
+    use ruk_git::transport::credentials::{TransportAuth, TransportAuthKind};
+
+    let authed = InvocationOpen {
+        repo: "acme/hello".to_owned(),
+        method: "push".to_owned(),
+        request_id: Some("req-1".to_owned()),
+        args_json: None,
+        session_id: None,
+        on_behalf_of: None,
+        transport_auth: TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "tok_s3cret".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        },
+    };
+    let frame = sonic_rs::to_vec(&authed).expect("authed open encodes");
+    let decoded: InvocationOpen = sonic_rs::from_slice(&frame).expect("authed open decodes");
+    let undo = || {
+        Request::Undo(Box::new(Mutation {
+            request_id: RequestId::generate(),
+            args: UndoArgs {
+                operation: OperationId(7),
+            },
+        }))
+    };
+    let anonymous = super::invocation_digest(&undo(), &TransportAuth::none())
+        .expect("encodable")
+        .expect("a mutation digests");
+    assert!(
+        decoded
+            .transport_auth
+            .header_for("https://host.x/r.git")
+            .is_some()
+    );
+    let carried = super::invocation_digest(&undo(), &decoded.transport_auth)
+        .expect("encodable")
+        .expect("a mutation digests");
+    assert_eq!(anonymous, carried);
+    let moved = super::invocation_digest(
+        &Request::Undo(Box::new(Mutation {
+            request_id: RequestId::generate(),
+            args: UndoArgs {
+                operation: OperationId(8),
+            },
+        })),
+        &decoded.transport_auth,
+    )
+    .expect("encodable")
+    .expect("a mutation digests");
+    assert_ne!(anonymous, moved);
+    let half = TransportAuth {
+        kind: TransportAuthKind::Bearer,
+        credential: String::new(),
+        origin: "https://host.x:443".to_owned(),
+    };
+    super::invocation_digest(&undo(), &half).expect_err("half-specified auth fails closed");
+    let rendered = format!("{decoded:?}");
+    assert!(!rendered.contains("tok_s3cret"), "{rendered:?}");
 }

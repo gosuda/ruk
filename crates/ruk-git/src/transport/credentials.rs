@@ -37,10 +37,13 @@
 //! [`auth_header_for_url_with`] instead of spawning processes.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use super::http;
 
@@ -777,6 +780,160 @@ pub fn auth_header_for_url(url: &str, vars: &HashMap<String, String>) -> Option<
     auth_header_for_url_with(url, vars, &helpers, run_helper)
 }
 
+/// How one call authenticates to a remote. `None` sends nothing; any other
+/// kind sends exactly one `Authorization` header and never consults helpers
+/// or the environment (H4b fail closed). SSH key injection stays deferred.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportAuthKind {
+    /// No credential: anonymous, or ambient resolution downstream.
+    #[default]
+    None,
+    /// HTTP Basic: `credential` is `user:password` in the clear.
+    Basic,
+    /// Bearer token: `credential` is the token in the clear.
+    Bearer,
+}
+
+/// A credential injected on one call for remote authentication.
+///
+/// The secret travels only toward the transport job that needs it: [`fmt::Debug`]
+/// redacts it, and digest helpers take only parsed commands plus limits,
+/// so it never enters argument digests, receipts, or logs. `origin`
+/// scopes it to one `scheme://host[:port]`; a cross-origin redirect drops
+/// it instead of forwarding it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportAuth {
+    /// Which header the credential becomes, or none.
+    #[serde(default)]
+    pub kind: TransportAuthKind,
+    /// The secret: `user:password` for basic, the token for bearer.
+    #[serde(default)]
+    pub credential: String,
+    /// The `scheme://host[:port]` this credential may be sent to.
+    #[serde(default)]
+    pub origin: String,
+}
+
+impl fmt::Debug for TransportAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportAuth")
+            .field("kind", &self.kind)
+            .field("credential", &"[redacted]")
+            .field("origin", &self.origin)
+            .finish()
+    }
+}
+
+impl TransportAuth {
+    /// No credential: anonymous, or ambient resolution downstream.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Fails closed on a half-specified credential: an explicit kind needs
+    /// both the secret and a well-formed origin scope; `None` carries
+    /// nothing and always passes.
+    ///
+    /// # Errors
+    /// [`crate::GitError::Invalid`] naming the missing half.
+    pub fn validate(&self) -> Result<(), crate::GitError> {
+        if self.kind == TransportAuthKind::None {
+            return Ok(());
+        }
+        if self.credential.is_empty() {
+            return Err(crate::GitError::Invalid {
+                detail: "injected transport auth needs its credential".to_owned(),
+            });
+        }
+        let scoped = Self::origin_of(&format!("{}/", self.origin));
+        if scoped.as_deref() != Some(self.origin.as_str()) {
+            return Err(crate::GitError::Invalid {
+                detail: "injected transport auth needs a scheme://host[:port] origin".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The `Authorization` header for `url`, only when `url` stays inside
+    /// the credential's origin scope. A cross-origin `url` yields nothing:
+    /// the caller drops the credential instead of forwarding it.
+    #[must_use]
+    pub fn header_for(&self, url: &str) -> Option<(String, String)> {
+        match self.kind {
+            TransportAuthKind::None => None,
+            TransportAuthKind::Basic | TransportAuthKind::Bearer => {
+                if self.credential.is_empty() {
+                    return None;
+                }
+                let origin = Self::origin_of(url)?;
+                if origin != self.origin {
+                    return None;
+                }
+                let value = match self.kind {
+                    TransportAuthKind::Basic => {
+                        format!("Basic {}", base64_encode(self.credential.as_bytes()))
+                    }
+                    TransportAuthKind::Bearer => {
+                        format!("Bearer {}", self.credential)
+                    }
+                    TransportAuthKind::None => return None,
+                };
+                Some(("authorization".to_owned(), value))
+            }
+        }
+    }
+
+    /// The origin scope of one `http(s)` URL: lowercase
+    /// `scheme://host:port` with browser defaults (80/443) filled in, the
+    /// same normalization [`super::http::same_origin`] compares. Userinfo
+    /// never enters the scope. `None` for non-HTTP URLs.
+    #[must_use]
+    pub fn origin_of(url: &str) -> Option<String> {
+        let (scheme, rest) = url.split_once("://")?;
+        let scheme = scheme.to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return None;
+        }
+        let authority = rest.split('/').next()?;
+        let hostport = authority.rsplit('@').next().unwrap_or_default();
+        let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
+            let end = bracketed.find(']')?;
+            let host = bracketed[..end].to_ascii_lowercase();
+            if host.is_empty() {
+                return None;
+            }
+            let port = match bracketed[end + 1..].strip_prefix(':') {
+                Some(text) => text.parse::<u16>().ok()?,
+                None if end + 1 == bracketed.len() => 0,
+                None => return None,
+            };
+            (host, port)
+        } else if let Some((host, text)) = hostport.rsplit_once(':')
+            && !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            if host.is_empty() {
+                return None;
+            }
+            (host.to_ascii_lowercase(), text.parse::<u16>().ok()?)
+        } else {
+            if hostport.is_empty() {
+                return None;
+            }
+            (hostport.to_ascii_lowercase(), 0)
+        };
+        let port = if port == 0 {
+            if scheme == "https" { 443 } else { 80 }
+        } else {
+            port
+        };
+        Some(format!("{scheme}://{host}:{port}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1142,6 +1299,96 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn injected_auth_debug_redacts_the_secret() {
+        let auth = TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "tok_s3cret".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("Bearer"), "{rendered:?}");
+        assert!(rendered.contains("https://host.x:443"), "{rendered:?}");
+        assert!(!rendered.contains("tok_s3cret"), "{rendered:?}");
+    }
+
+    #[test]
+    fn injected_auth_validate_fails_closed() {
+        TransportAuth::none()
+            .validate()
+            .expect("none carries nothing");
+        for auth in [
+            TransportAuth {
+                kind: TransportAuthKind::Bearer,
+                credential: String::new(),
+                origin: "https://host.x:443".to_owned(),
+            },
+            TransportAuth {
+                kind: TransportAuthKind::Basic,
+                credential: "alice:pw".to_owned(),
+                origin: String::new(),
+            },
+            TransportAuth {
+                kind: TransportAuthKind::Bearer,
+                credential: "tok".to_owned(),
+                origin: "not an origin".to_owned(),
+            },
+        ] {
+            auth.validate().expect_err("half-specified auth must fail");
+        }
+        TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "tok".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        }
+        .validate()
+        .expect("full credential passes");
+    }
+
+    #[test]
+    fn injected_auth_stays_inside_its_origin() {
+        let auth = TransportAuth {
+            kind: TransportAuthKind::Basic,
+            credential: "alice:pw".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        };
+        let (name, value) = auth
+            .header_for("https://host.x/a.git")
+            .expect("same origin sends");
+        assert_eq!(name, "authorization");
+        assert_eq!(value, "Basic YWxpY2U6cHc=");
+        assert_eq!(
+            auth.header_for("http://host.x/a.git"),
+            None,
+            "scheme downgrade drops the credential"
+        );
+        assert_eq!(
+            auth.header_for("https://other.x/a.git"),
+            None,
+            "cross origin drops the credential"
+        );
+        assert_eq!(
+            auth.header_for("https://alice:pw@host.x/a.git"),
+            Some((name.clone(), value.clone())),
+            "userinfo in the URL never widens the scope"
+        );
+        assert_eq!(TransportAuth::none().header_for("https://host.x/a"), None);
+    }
+
+    #[test]
+    fn injected_auth_origin_of_normalizes_ports() {
+        assert_eq!(
+            TransportAuth::origin_of("https://host.x/a.git"),
+            Some("https://host.x:443".to_owned())
+        );
+        assert_eq!(
+            TransportAuth::origin_of("http://host.x:8080/a"),
+            Some("http://host.x:8080".to_owned())
+        );
+        assert_eq!(TransportAuth::origin_of("ssh://host.x/a"), None);
+        assert_eq!(TransportAuth::origin_of("https://"), None);
     }
 
     #[test]
