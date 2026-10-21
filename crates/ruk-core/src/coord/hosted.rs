@@ -1747,6 +1747,19 @@ impl HostedCoordinator {
     /// from `refs.list` with `as_of`. The only ref feed. The poll holds
     /// no lane and no writer lock: it sleeps between head checks, and a
     /// repeated call replays the same rows, so delivery stays idempotent.
+    /// Whether the follower has missed events: its next row, `after + 1`,
+    /// predates the oldest retained row, so a resume would skip pruned
+    /// rows silently and the follower must resnapshot. The saturating add
+    /// holds the caught-up edge: `after` at `u64::MAX` never expires.
+    fn tail_expired(after: u64, oldest: u64) -> bool {
+        after.saturating_add(1) < oldest
+    }
+
+    /// The head and oldest are re-read after the page: a retention sweep
+    /// between the two reads can prune rows the follower never saw, and
+    /// a publish in between can leave events above the returned head.
+    /// The re-check reports `expired` instead of silently skipping the
+    /// pruned rows, and the reply head always covers the returned events.
     async fn read_events_tail(
         &self,
         args: &EventsTailArgs,
@@ -1762,7 +1775,7 @@ impl HostedCoordinator {
         loop {
             cancel.check()?;
             let (head, oldest) = self.store.event_head().map_err(CoreError::from)?;
-            if args.after.saturating_add(1) < oldest {
+            if Self::tail_expired(args.after, oldest) {
                 return Ok(EventsTailReply {
                     view: current_view(&self.store)?,
                     events: Vec::new(),
@@ -1772,6 +1785,16 @@ impl HostedCoordinator {
                 });
             }
             let (events, end) = self.tail_page(scanned, limit, args.prefix.as_ref())?;
+            let (head, oldest) = self.store.event_head().map_err(CoreError::from)?;
+            if Self::tail_expired(args.after, oldest) {
+                return Ok(EventsTailReply {
+                    view: current_view(&self.store)?,
+                    events: Vec::new(),
+                    head,
+                    oldest,
+                    expired: true,
+                });
+            }
             if !events.is_empty() || tokio::time::Instant::now() >= deadline {
                 return Ok(EventsTailReply {
                     view: current_view(&self.store)?,
@@ -4185,6 +4208,21 @@ mod tests {
             resume.events[0].seq > first.events.last().expect("last seq").seq,
             "no event repeats across the resume"
         );
+    }
+
+    #[test]
+    fn tail_expired_holds_the_retention_edge() {
+        use super::HostedCoordinator;
+        // The documented lost-event case: the follower holds `after=5`
+        // and a sweep deletes rows 6 and 7, leaving `oldest=8`.
+        assert!(HostedCoordinator::tail_expired(5, 8));
+        // The next row survives: no gap, no expiry.
+        assert!(!HostedCoordinator::tail_expired(5, 6));
+        assert!(!HostedCoordinator::tail_expired(5, 5));
+        assert!(!HostedCoordinator::tail_expired(5, 1));
+        // A caught-up follower never expires, even at the numeric edge.
+        assert!(!HostedCoordinator::tail_expired(u64::MAX, u64::MAX));
+        assert!(!HostedCoordinator::tail_expired(u64::MAX - 1, u64::MAX));
     }
 
     #[tokio::test]
