@@ -1862,6 +1862,18 @@ async fn dispatch_stored_receipt(
     }
 }
 
+static RECEIPT_STRIPES: std::sync::LazyLock<[Arc<tokio::sync::Mutex<()>>; 64]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(()))));
+
+fn receipt_stripe(key: &[u8]) -> Arc<tokio::sync::Mutex<()>> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let stripe =
+        usize::try_from(hasher.finish() % RECEIPT_STRIPES.len() as u64).expect("stripe fits");
+    Arc::clone(&RECEIPT_STRIPES[stripe])
+}
+
 /// Locates one service receipt: the key (peer, repository, request id)
 /// plus the digest the current round computed.
 struct ReceiptLocator {
@@ -2099,6 +2111,17 @@ async fn serve_git_service(
     let receipted = req.service == GIT_SERVICE_RECEIVE_PACK && !req.advertise;
     let request_id = req.request_id.clone().unwrap_or_default();
     let repository = canonical.as_os_str().as_bytes().to_vec();
+    let _receipt_guard = if receipted {
+        let mut slot_key = Vec::with_capacity(4 + 1 + repository.len() + 1 + request_id.len());
+        slot_key.extend_from_slice(&peer_uid.to_be_bytes());
+        slot_key.push(0);
+        slot_key.extend_from_slice(&repository);
+        slot_key.push(0);
+        slot_key.extend_from_slice(request_id.as_bytes());
+        Some(receipt_stripe(&slot_key).lock_owned().await)
+    } else {
+        None
+    };
     if receipted {
         let lookup_coordinator = Arc::clone(&coordinator);
         let lookup_repository = repository.clone();

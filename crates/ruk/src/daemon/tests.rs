@@ -3679,6 +3679,123 @@ async fn concurrent_hosted_race_on_one_branch_refuses_exactly_one() {
 }
 
 #[tokio::test]
+async fn concurrent_same_request_id_executes_once_and_replays() {
+    let root = temp_root("host-same-req");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (pack, commit) = hosted_chain_pack(21);
+
+    let (mut first, registry, first_task) = spawn_hosted(&root, 10_000);
+    handshake(&mut first).await;
+    let (mut second, second_task) = spawn_extra_driver(&registry);
+    handshake(&mut second).await;
+    let session_a = open_push_session(&mut first, &store_repo, &["refs/heads/**"]).await;
+    let session_b = open_push_session(&mut second, &store_repo, &["refs/heads/**"]).await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let pre_count = Arc::new(AtomicU64::new(0));
+    let push_same = |mut driver: Driver,
+                     session: String,
+                     pack: Vec<u8>,
+                     barrier: Arc<tokio::sync::Barrier>,
+                     pre_count: Arc<AtomicU64>| {
+        let repo = store_repo.clone();
+        tokio::spawn(async move {
+            let zero = "0".repeat(40);
+            let mut body = pkt(format!(
+                "{zero} {commit} refs/heads/same\n",
+                commit = commit.to_hex()
+            )
+            .as_bytes());
+            body.extend_from_slice(&flush());
+            body.extend_from_slice(&pack);
+            let payload = git_open_payload(
+                "receive-pack",
+                &repo,
+                false,
+                Some(&session),
+                Some("req-hosted-same-1"),
+            );
+            driver.send(FrameKind::Open, 1, &payload).await;
+            let accepted = driver.recv().await;
+            assert_eq!(accepted.kind, FrameKind::Accepted);
+            driver.send(FrameKind::Stdin, 1, &body).await;
+            let grant = driver.recv().await;
+            assert_eq!(grant.kind, FrameKind::WindowUpdate);
+            tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+                .await
+                .expect("rendezvous");
+            driver.send(FrameKind::StdinEof, 1, &[]).await;
+            let mut stdout = Vec::new();
+            loop {
+                let frame = driver.recv().await;
+                assert_eq!(frame.stream_id, 1);
+                match frame.kind {
+                    FrameKind::HookCall => {
+                        let call: HookCall =
+                            ipc::decode_control(&frame.payload).expect("hook call decodes");
+                        if call.phase == HookPhase::PreReceive {
+                            pre_count.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        let reply = accept_all(&call).expect("hook reply answered");
+                        let bytes = ipc::encode_control(&reply).expect("hook reply encodes");
+                        driver.send(FrameKind::HookReply, 1, &bytes).await;
+                    }
+                    FrameKind::Stdout => stdout.extend_from_slice(&frame.payload),
+                    FrameKind::Exit => {
+                        let report: CommandExitReport =
+                            ipc::decode_control(&frame.payload).expect("exit decodes");
+                        return (stdout, report);
+                    }
+                    FrameKind::Error => panic!(
+                        "stream refused: {}",
+                        String::from_utf8_lossy(&frame.payload)
+                    ),
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        })
+    };
+    let racer_a = push_same(
+        first,
+        session_a,
+        pack.clone(),
+        Arc::clone(&barrier),
+        Arc::clone(&pre_count),
+    );
+    let racer_b = push_same(second, session_b, pack, barrier, Arc::clone(&pre_count));
+    let (out_a, exit_a) = racer_a.await.expect("first push");
+    let (out_b, exit_b) = racer_b.await.expect("second push");
+    assert_eq!(exit_a.exit_code, 0);
+    assert_eq!(exit_b.exit_code, 0);
+    assert_eq!(out_a, out_b, "the replay returns the stored report");
+    assert_eq!(
+        pre_count.load(Ordering::SeqCst),
+        1,
+        "exactly one same-key push executes"
+    );
+    assert!(
+        !exit_a.operation_ids.is_empty(),
+        "the live run names its operations"
+    );
+    assert_eq!(
+        exit_a.operation_ids, exit_b.operation_ids,
+        "the replay reports the same operations"
+    );
+
+    first_task.abort();
+    second_task.abort();
+}
+
+#[tokio::test]
 async fn typed_reply_waits_for_outbound_credit() {
     let root = temp_root("credit-wait");
     let repo_dir = root.join("repo");
