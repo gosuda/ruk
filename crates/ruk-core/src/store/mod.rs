@@ -402,6 +402,25 @@ impl Store {
         Self::open_with_timeout(root, budget, metadata::open_wait_timeout())
     }
 
+    /// The on-disk name of the store format file.
+    #[must_use]
+    pub const fn format_file() -> &'static str {
+        FORMAT_FILE
+    }
+
+    /// Parses `bytes` as a store format header without touching disk.
+    ///
+    /// Daemons and hosts gate destructive filesystem work on this check:
+    /// a directory without a parseable store header is not a repository,
+    /// whatever its name. The upper byte bound stays the caller's
+    /// responsibility; the header itself is three short lines.
+    ///
+    /// # Errors
+    /// The decode errors of the format encoding.
+    pub fn parses_format(bytes: &[u8]) -> Result<StoreFormat, StoreError> {
+        StoreFormat::from_bytes(bytes)
+    }
+
     /// Opens the store, waiting up to `timeout` for a lock-busy peer at the
     /// metadata open; corruption still refuses on the first attempt. A
     /// `timeout` of zero means a single attempt. The budget defaults to

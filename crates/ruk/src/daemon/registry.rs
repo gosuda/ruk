@@ -333,6 +333,44 @@ impl Registry {
         Ok((repo_root, store))
     }
 
+    /// Verifies `store` names a real store by parsing its format file.
+    ///
+    /// A directory that merely looks like a repository is not safe to
+    /// delete. In particular, grouping directories and foreign content
+    /// must not be removed as stores.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` when the format file is absent or unreadable,
+    /// `E_CORRUPT` when it does not parse as a store header.
+    fn verify_is_store(store: &Path) -> Result<(), CoreError> {
+        use std::io::Read as _;
+        const MAX_FORMAT_BYTES: u64 = 128;
+        let bytes = {
+            let file = std::fs::File::open(store.join(Store::format_file())).map_err(|err| {
+                CoreError::new(
+                    ErrorCode::ENotFound,
+                    format!("repository store format is not readable: {err}"),
+                )
+            })?;
+            let mut limited = Vec::new();
+            file.take(MAX_FORMAT_BYTES + 1)
+                .read_to_end(&mut limited)
+                .map_err(|err| {
+                    CoreError::new(
+                        ErrorCode::ENotFound,
+                        format!("repository store format is not readable: {err}"),
+                    )
+                })?;
+            limited
+        };
+        Store::parses_format(&bytes).map(|_| ()).map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("repository store format does not parse: {err}"),
+            )
+        })
+    }
+
     /// Creates one repository beneath `args.root` at `args.path`.
     ///
     /// The destination must be absent; `Store::create` enforces the same
@@ -474,23 +512,25 @@ impl Registry {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
-            let taken = take_entry_by_path(&mut inner, &store);
-            if let Some((_, entry)) = &taken {
-                let busy = entry
-                    .coordinator
-                    .as_ref()
-                    .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
-                if busy {
-                    if let Some((handle, entry)) = taken {
-                        inner.entries.insert(handle, entry);
-                    }
-                    return Err(CoreError::new(
-                        ErrorCode::EConflicted,
-                        "repository has invocations in flight",
-                    ));
-                }
+            Self::verify_is_store(&store)?;
+            let Some((handle, entry)) = take_entry_by_path(&mut inner, &store) else {
+                return Err(CoreError::new(
+                    ErrorCode::ENotFound,
+                    "repository is not registered",
+                ));
+            };
+            let busy = entry
+                .coordinator
+                .as_ref()
+                .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
+            if busy {
+                inner.entries.insert(handle, entry);
+                return Err(CoreError::new(
+                    ErrorCode::EConflicted,
+                    "repository has invocations in flight",
+                ));
             }
-            taken.and_then(|(_, entry)| entry.coordinator)
+            entry.coordinator
         };
         if let Some(coordinator) = retired {
             coordinator.shutdown();
@@ -1227,6 +1267,50 @@ mod tests {
             })
             .expect_err("confirmation mismatch refuses");
         assert_eq!(mismatch.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn remove_repo_refuses_unregistered_and_unformatted_paths() {
+        use ruk_core::error::ErrorCode;
+        use ruk_core::ids::HashKind;
+        use ruk_core::store::{PreparationBudget, Store};
+
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+
+        let grouping = canonical.join("team");
+        std::fs::create_dir_all(grouping.join(".ruk")).expect("grouping directory exists");
+        let grouping_path = grouping.to_str().expect("grouping path is UTF-8").to_owned();
+        let grouping_error = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: grouping_path.clone(),
+                confirm_path: grouping_path,
+            })
+            .expect_err("unformatted grouping directory refuses deletion");
+        assert_eq!(grouping_error.code, ErrorCode::ENotFound);
+        assert!(grouping.exists(), "grouping directory remains intact");
+
+        let unregistered = canonical.join("stray-store");
+        let store = Store::create(
+            &unregistered,
+            HashKind::Sha256,
+            std::sync::Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("stray store is valid");
+        drop(store);
+        let unregistered_path = unregistered
+            .to_str()
+            .expect("unregistered path is UTF-8")
+            .to_owned();
+        let unregistered_error = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: unregistered_path.clone(),
+                confirm_path: unregistered_path,
+            })
+            .expect_err("valid but unregistered store refuses deletion");
+        assert_eq!(unregistered_error.code, ErrorCode::ENotFound);
+        assert!(unregistered.exists(), "unregistered store remains intact");
     }
 
     #[test]
