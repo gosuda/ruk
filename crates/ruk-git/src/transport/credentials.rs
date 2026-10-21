@@ -470,6 +470,11 @@ fn run_helper_op_in(
         .stderr(Stdio::null())
         .env_clear()
         .envs(vars)
+        .env(
+            "PATH",
+            vars.get("PATH")
+                .map_or("/usr/local/bin:/usr/bin:/bin", String::as_str),
+        )
         .env("GIT_TERMINAL_PROMPT", "0")
         .spawn()
         .ok()?;
@@ -1339,7 +1344,7 @@ mod tests {
         // `-c` string as one argument, never as an argv element before it.
         let out = run_helper(
             "sh",
-            &["-c".to_owned(), "echo hello".to_owned()],
+            &["-c".to_owned(), "cat >/dev/null; echo hello".to_owned()],
             b"protocol=https\nhost=h\n\n",
         )
         .expect("shell helper answers");
