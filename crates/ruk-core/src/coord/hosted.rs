@@ -70,14 +70,15 @@ use crate::heads::Head;
 use crate::ids::Oid;
 use crate::protocol::{
     AttestListArgs, AttestListReply, BlameArgs, BlameHunk, BlameReply, ChangeHead,
-    ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitRev, CommitSummary, DEFAULT_PAGE_SIZE,
-    DiffArgs, DiffBlob, DiffBody, DiffKind, DiffReply, EventsTailArgs, EventsTailReply, FileArgs,
-    FileBody, FileDiff, FileReply, KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs,
-    OpLogReply, Page, PageCursor, PageLimit, PathChangeKind, PathSelection, PathStatus, QueryArgs,
-    QueryDigest, QueryMatch, QueryReply, ReconnectSecret, RefsListArgs, RefsListReply, Reply,
-    RepoStatReply, Request, RevisionRef, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
-    SessionResumeReply, ShowArgs, ShowBody, ShowReply, ShowTarget, SnapshotPolicy, StatusArgs,
-    StatusReply, TailedEvent, Timestamp, TreeArgs, TreeEntry, TreeReply, ViewInfo,
+    ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitRev, CommitSummary, CompareArgs,
+    CompareReply, DEFAULT_PAGE_SIZE, DiffArgs, DiffBlob, DiffBody, DiffKind, DiffReply,
+    EventsTailArgs, EventsTailReply, FileArgs, FileBody, FileDiff, FileReply, KeysetPage, LogArgs,
+    LogReply, MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor, PageLimit,
+    PathChangeKind, PathSelection, PathStatus, QueryArgs, QueryDigest, QueryMatch, QueryReply,
+    ReconnectSecret, RefsListArgs, RefsListReply, Reply, RepoStatReply, Request, RevisionRef,
+    SessionAuthority, SessionOpenArgs, SessionResumeArgs, SessionResumeReply, ShowArgs, ShowBody,
+    ShowReply, ShowTarget, SnapshotPolicy, StatusArgs, StatusReply, TailedEvent, Timestamp,
+    TreeArgs, TreeEntry, TreeReply, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
@@ -174,6 +175,7 @@ pub struct HostedCoordinator {
     leases: Arc<LeaseRegistry>,
     page_guards: Mutex<HashMap<LeaseId, (OwnerGuard, StdInstant)>>,
     event_retention_seconds: AtomicU64,
+    compare_max_commits: AtomicU64,
     /// Resume key for the service-receipt sweep rotation. In memory
     /// only: a restart re-scans from the first key, which delays but
     /// never breaks convergence, and no head-schema change is needed.
@@ -251,6 +253,10 @@ impl HostedCoordinator {
         // the repository root. Interactive read leases carry no object roots,
         // so the scratch directory is only a path until collection runs.
         let leases = LeaseRegistry::new(clock.clone(), store_root.join("leases-scratch"));
+        let compare_max_commits = AtomicU64::new(
+            u64::try_from(crate::ops::compare::DEFAULT_COMPARE_MAX_COMMITS)
+                .expect("compare budget fits u64"),
+        );
         Ok(Self {
             store,
             sessions,
@@ -266,6 +272,7 @@ impl HostedCoordinator {
             leases,
             page_guards: Mutex::new(HashMap::new()),
             event_retention_seconds: AtomicU64::new(DEFAULT_EVENT_RETENTION_SECONDS),
+            compare_max_commits,
             receipt_sweep_cursor: Mutex::new(None),
         })
     }
@@ -274,6 +281,11 @@ impl HostedCoordinator {
     pub fn set_event_retention_seconds(&self, seconds: u64) {
         self.event_retention_seconds
             .store(seconds, Ordering::Relaxed);
+    }
+
+    /// Sets the per-compare commit visit budget.
+    pub fn set_compare_max_commits(&self, commits: u64) {
+        self.compare_max_commits.store(commits, Ordering::Relaxed);
     }
 
     /// Returns the owned store for request preparation reads.
@@ -745,6 +757,10 @@ impl HostedCoordinator {
                 let reply = self.read_tree(&args)?;
                 Ok(Reply::Tree(Box::new(reply)))
             }
+            Request::Compare(args) => {
+                let reply = self.read_compare(&args)?;
+                Ok(Reply::Compare(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -791,6 +807,38 @@ impl HostedCoordinator {
         })
     }
 
+    /// Resolves one ref to the commit it names, chasing symbolic links.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ENotFound`] for a ref the store does not know.
+    /// - [`ErrorCode::EInvalid`] for a ref that is too deeply symbolic.
+    fn resolve_ref_target(&self, name: &RefName) -> Result<Oid, CoreError> {
+        let mut target = self
+            .store
+            .fact(crate::store::types::FactTable::Refs, name.as_bytes())?
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+            .and_then(|raw| crate::store::decode("ref target", &raw).map_err(CoreError::from))?;
+        let mut oid = None;
+        for _ in 0..16 {
+            match target {
+                crate::refdata::RefTarget::Direct(found) => {
+                    oid = Some(found);
+                    break;
+                }
+                crate::refdata::RefTarget::Symbolic(next) => {
+                    target = self
+                        .store
+                        .fact(crate::store::types::FactTable::Refs, next.as_bytes())?
+                        .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+                        .and_then(|raw| {
+                            crate::store::decode("ref target", &raw).map_err(CoreError::from)
+                        })?;
+                }
+            }
+        }
+        oid.ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "ref is too deeply symbolic"))
+    }
+
     /// Resolves one tree revision to its root tree.
     ///
     /// A ref name follows symbolic targets (at most 16 hops) to a direct
@@ -800,37 +848,7 @@ impl HostedCoordinator {
     fn resolve_tree_rev(&self, rev: &CommitRev) -> Result<Oid, CoreError> {
         use crate::records::Records;
         let oid = match rev {
-            CommitRev::Ref(name) => {
-                let mut target = self
-                    .store
-                    .fact(crate::store::types::FactTable::Refs, name.as_bytes())?
-                    .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
-                    .and_then(|raw| {
-                        crate::store::decode("ref target", &raw).map_err(CoreError::from)
-                    })?;
-                let mut oid = None;
-                for _ in 0..16 {
-                    match target {
-                        crate::refdata::RefTarget::Direct(found) => {
-                            oid = Some(found);
-                            break;
-                        }
-                        crate::refdata::RefTarget::Symbolic(next) => {
-                            target = self
-                                .store
-                                .fact(crate::store::types::FactTable::Refs, next.as_bytes())?
-                                .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
-                                .and_then(|raw| {
-                                    crate::store::decode("ref target", &raw)
-                                        .map_err(CoreError::from)
-                                })?;
-                        }
-                    }
-                }
-                oid.ok_or_else(|| {
-                    CoreError::new(ErrorCode::EInvalid, "ref is too deeply symbolic")
-                })?
-            }
+            CommitRev::Ref(name) => self.resolve_ref_target(name)?,
             CommitRev::Commit(oid) => *oid,
         };
         let record = Records::new(&self.store)
@@ -863,6 +881,86 @@ impl HostedCoordinator {
         Ok(TreeReply {
             view: current_view(&self.store)?,
             entries,
+        })
+    }
+
+    /// Resolves one compare revision to its commit.
+    ///
+    /// Refs chase symbolic links like tree reads; literal commits must
+    /// exist in the store.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ENotFound`] for an unknown ref or commit.
+    /// - [`ErrorCode::EInvalid`] for a ref that is too deeply symbolic.
+    fn resolve_compare_rev(&self, rev: &CommitRev) -> Result<Oid, CoreError> {
+        let oid = match rev {
+            CommitRev::Ref(name) => self.resolve_ref_target(name)?,
+            CommitRev::Commit(oid) => *oid,
+        };
+        use crate::records::Records;
+        Records::new(&self.store)
+            .get_commit(&Head::Git { oid })?
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "compare commit is missing"))?;
+        Ok(oid)
+    }
+
+    /// Serves one `compare` read: minimal merge bases plus bounded
+    /// ahead/behind counts.
+    ///
+    /// Consistency: one store view; the base and head resolve and every
+    /// commit the walks touch come from the same snapshot. The budget is
+    /// the smaller of the configured ceiling and the request limit, so a
+    /// caller can ask for less but never more.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::ENotFound`] for an unknown ref or commit.
+    /// - [`ErrorCode::EInvalid`] for a ref that is too deeply symbolic.
+    fn read_compare(&self, args: &CompareArgs) -> Result<CompareReply, CoreError> {
+        use crate::ops::compare;
+        use crate::records::Records;
+        let base = self.resolve_compare_rev(&args.base)?;
+        let head = self.resolve_compare_rev(&args.head)?;
+        let records = Records::new(&self.store);
+        let canonicalize = |oid: Oid| oid;
+        let parents = |oid: Oid| -> Result<Vec<Oid>, CoreError> {
+            let record = records.get_commit(&Head::Git { oid })?.ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ENotFound,
+                    "compare commit is missing from the store",
+                )
+            })?;
+            Ok(record
+                .parents()
+                .iter()
+                .filter_map(|head| head.as_git().copied())
+                .collect())
+        };
+        let committer_time = |oid: Oid| -> Result<i64, CoreError> {
+            let record = records.get_commit(&Head::Git { oid })?.ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ENotFound,
+                    "compare commit is missing from the store",
+                )
+            })?;
+            Ok(record
+                .committer()
+                .map(|sig| sig.timestamp)
+                .unwrap_or(i64::MIN))
+        };
+        let configured = self.compare_max_commits.load(Ordering::Relaxed);
+        let budget = args
+            .limit
+            .map(|limit| limit.get() as u64)
+            .unwrap_or(u64::MAX)
+            .min(configured);
+        let outcome =
+            compare::compare(&canonicalize, &parents, &committer_time, budget, base, head)?;
+        Ok(CompareReply {
+            view: current_view(&self.store)?,
+            bases: outcome.bases,
+            ahead: outcome.ahead,
+            behind: outcome.behind,
+            exact: outcome.exact,
         })
     }
 
@@ -2974,7 +3072,7 @@ fn read_gap(method: Method) -> &'static str {
         Method::RemoteRefs => {
             "remote.refs needs an ls-refs round-trip against an explicit remote URL"
         }
-        _ => "only compare, search, archive, and remote.refs lack hosted read arms",
+        _ => "only search, archive, and remote.refs lack hosted read arms",
     }
 }
 
@@ -5658,6 +5756,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oplog_ascending_resume_advances_over_a_pruned_run() {
+        use crate::coord::oplog::{OpMeta, record};
+        use crate::coord::rows::op_key;
+
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        // 1005 operations, then prune the middle run: headers 2..=1001 are
+        // gone while the head still covers them. A resume into the run must
+        // advance past it with a usable position, never stall.
+        let target = {
+            let oid = Oid::from_hex(&format!("{:040x}", 7)).expect("test oid");
+            crate::store::encode("ref target", &crate::refdata::RefTarget::Direct(oid))
+                .expect("encode test target")
+        };
+        let meta = OpMeta {
+            session,
+            method: Method::TagSet,
+            committed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
+            undoes: None,
+            on_behalf_of: None,
+        };
+        let mut ops = crate::change::CheckedOperationId::new(0, u64::MAX);
+        let mut all = Vec::new();
+        for n in 1..=1005u64 {
+            let changes = vec![FactMutation {
+                table: FactTable::Refs,
+                key: format!("refs/heads/t{n:04}").into_bytes(),
+                expected: FactExpectation::Absent,
+                value: Some(target.clone()),
+            }];
+            let (_, mutations) = record(&mut ops, None, meta.clone(), &changes)
+                .expect("record op")
+                .expect("refs op recorded");
+            all.extend(mutations);
+        }
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &all,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish ops");
+        let drops: Vec<FactMutation> = (2..=1001u64)
+            .map(|id| FactMutation {
+                table: FactTable::Ops,
+                key: op_key(OperationId(id), 0).to_vec(),
+                expected: FactExpectation::Any,
+                value: None,
+            })
+            .collect();
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &drops,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("prune middle run");
+        let (entries, scanned, exhausted) =
+            walk_oplog_page_ascending(coord.store(), Some(OperationId(1005)), 2, false, None, 100)
+                .expect("walk over pruned run");
+        assert!(!exhausted);
+        assert_eq!(
+            scanned,
+            Some(OperationId(1001)),
+            "the resume position is the last examined id, not the last found header"
+        );
+        assert!(entries.is_empty());
+        let (entries, _, exhausted) = walk_oplog_page_ascending(
+            coord.store(),
+            Some(OperationId(1005)),
+            1002,
+            false,
+            None,
+            100,
+        )
+        .expect("resume past the pruned run");
+        assert!(exhausted);
+        let ids: Vec<u64> = entries.iter().map(|entry| entry.id.0).collect();
+        assert_eq!(ids, vec![1002, 1003, 1004, 1005]);
+        coord.shutdown();
+        runner.abort();
+    }
+
+    #[tokio::test]
     async fn undo_of_journaled_attestation_refuses_without_corruption() {
         let (_temp, coord, owner) = coordinator();
         let runner = coord
@@ -5690,6 +5883,120 @@ mod tests {
             "the refusal is policy, not corruption: {}",
             err.message
         );
+        coord.shutdown();
+        runner.abort();
+    }
+
+    /// Commits one record with the given committer timestamp and parents,
+    /// returning its id. The empty tree stands in for content: compare
+    /// never reads trees.
+    fn publish_parented_commit(
+        store: &Store,
+        timestamp: i64,
+        parents: &[Oid],
+        message: &str,
+    ) -> Oid {
+        use crate::conflict::{Signature, TzOffset};
+        use crate::merge::Merge;
+        let ident = || Signature {
+            name: ByteString::from("Compare"),
+            email: ByteString::from("compare@test.invalid"),
+            timestamp,
+            offset: TzOffset::UTC,
+        };
+        let input = crate::commit::NativeCommitInput {
+            change_id: crate::change::ChangeId::generate(),
+            tree: Merge::from_vec(vec![
+                Oid::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904").expect("empty tree"),
+            ]),
+            parents: parents.iter().map(|oid| Head::Git { oid: *oid }).collect(),
+            predecessor: None,
+            author: ident(),
+            committer: ident(),
+            extra_headers: Vec::new(),
+            message: ByteString::from(message),
+            provenance: None,
+        };
+        let mut preparer = crate::records::Records::new(store).batch_preparer();
+        let head = preparer
+            .add_native_commit(input)
+            .expect("prepare native commit");
+        let batch = preparer.finish().expect("finish record batch");
+        store
+            .publish(
+                batch.prepared_objects,
+                &batch.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish commit");
+        head.as_git().copied().expect("native commit head")
+    }
+
+    #[tokio::test]
+    async fn compare_reports_bases_and_bounded_counts() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let root = publish_parented_commit(coord.store(), 100, &[], "root");
+        let base_tip = publish_parented_commit(coord.store(), 200, &[root], "base");
+        let head_tip = publish_parented_commit(coord.store(), 150, &[root], "head");
+        let mut refs = Vec::new();
+        for (name, oid) in [("refs/heads/base", base_tip), ("refs/heads/head", head_tip)] {
+            refs.push(FactMutation {
+                table: FactTable::Refs,
+                key: name.as_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(
+                    crate::store::encode("ref target", &crate::refdata::RefTarget::Direct(oid))
+                        .expect("encode test target"),
+                ),
+            });
+        }
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &refs,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish test refs");
+        let args = CompareArgs {
+            base: CommitRev::Commit(base_tip),
+            head: CommitRev::Commit(head_tip),
+            limit: None,
+        };
+        let reply = coord
+            .read(&owner, session, Request::Compare(Box::new(args)), &cancel)
+            .await
+            .expect("compare");
+        let Reply::Compare(compared) = reply else {
+            panic!("compare must answer its own reply");
+        };
+        assert_eq!(compared.bases, vec![root]);
+        assert_eq!((compared.ahead, compared.behind), (1, 1));
+        assert!(compared.exact);
+        let args = CompareArgs {
+            base: CommitRev::Ref(RefName::new("refs/heads/base").expect("ref name")),
+            head: CommitRev::Ref(RefName::new("refs/heads/head").expect("ref name")),
+            limit: Some(PageLimit::new(1).expect("page limit 1")),
+        };
+        let reply = coord
+            .read(&owner, session, Request::Compare(Box::new(args)), &cancel)
+            .await
+            .expect("truncated compare");
+        let Reply::Compare(compared) = reply else {
+            panic!("compare must answer its own reply");
+        };
+        assert!(!compared.exact);
+        assert!(compared.bases.is_empty());
         coord.shutdown();
         runner.abort();
     }

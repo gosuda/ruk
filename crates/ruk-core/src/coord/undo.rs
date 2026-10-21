@@ -60,8 +60,10 @@ pub(crate) fn undone_operation(request: &Request) -> Option<OperationId> {
 
 /// Builds the inverse of `operation` from its stored deltas.
 ///
-/// The inverse holds one store view: deltas, expectations, and the ref
-/// transaction all derive from the same committed snapshot.
+/// Deltas, expectations, and the ref transaction all derive from the
+/// committed operation stream; current keys are re-checked before
+/// anything inverts, so a moved key refuses instead of restoring stale
+/// bytes.
 ///
 /// # Errors
 /// - [`ErrorCode::ENotFound`] when the operation is not retained (never

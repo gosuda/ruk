@@ -1515,49 +1515,27 @@ pub(crate) fn is_ancestor(store: &Store, ancestor: Oid, descendant: Oid) -> Resu
     Ok(false)
 }
 
-/// Finds the first common ancestor of `left` and `right` by breadth-first
-/// paint-down from both tips.
+/// Finds the first common ancestor of `left` and `right` by paint-down
+/// from both tips.
+///
+/// The walk lives in `ruk-core`; this adapter only supplies the
+/// replacement-aware parent lookup. Output is identical by construction:
+/// the local CLI walks unbounded.
 pub(crate) fn merge_base(store: &Store, left: Oid, right: Oid) -> Result<Oid, GitError> {
-    if left == right {
-        return Ok(left);
-    }
-    let left = replace_redirect(store, left);
-    let right = replace_redirect(store, right);
-    let records = Records::new(store);
-    let mut left_seen: HashMap<Oid, bool> = HashMap::new();
-    let mut queue = vec![left];
-    while let Some(oid) = queue.pop() {
-        let oid = replace_redirect(store, oid);
-        if left_seen.contains_key(&oid) {
-            continue;
-        }
-        left_seen.insert(oid, true);
+    let parents = |oid: Oid| -> Result<Vec<Oid>, GitError> {
+        let records = Records::new(store);
         let record = walk_record(store, &records, oid)?;
-        for parent in record.parents() {
-            if let Some(parent_oid) = head_oid_of(parent) {
-                queue.push(parent_oid);
-            }
-        }
-    }
-    let mut queue = vec![right];
-    let mut right_seen: HashMap<Oid, bool> = HashMap::new();
-    while let Some(oid) = queue.pop() {
-        let oid = replace_redirect(store, oid);
-        if left_seen.contains_key(&oid) {
-            return Ok(oid);
-        }
-        if right_seen.contains_key(&oid) {
-            continue;
-        }
-        right_seen.insert(oid, true);
-        let record = walk_record(store, &records, oid)?;
-        for parent in record.parents() {
-            if let Some(parent_oid) = head_oid_of(parent) {
-                queue.push(parent_oid);
-            }
-        }
-    }
-    Err(GitError::NotFound {
+        Ok(record.parents().iter().filter_map(head_oid_of).collect())
+    };
+    let mut budget = u64::MAX;
+    ruk_core::ops::compare::merge_base(
+        &|oid| replace_redirect(store, oid),
+        &parents,
+        &mut budget,
+        left,
+        right,
+    )?
+    .ok_or_else(|| GitError::NotFound {
         detail: "no merge base".to_owned(),
     })
 }

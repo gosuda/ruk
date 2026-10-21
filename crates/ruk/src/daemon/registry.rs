@@ -61,6 +61,8 @@ pub(crate) struct Registry {
     event_retention_seconds: AtomicU64,
     /// Milliseconds a hosted hook callback waits before failing closed.
     hook_timeout_ms: AtomicU64,
+    /// Commit visits each hosted `compare` may spend.
+    compare_max_commits: AtomicU64,
     /// Cap of ref commands accepted per hosted push batch.
     hook_max_commands: AtomicUsize,
     /// Default branch new repositories record in `RepoMeta`.
@@ -117,6 +119,11 @@ impl Registry {
             retention_interval_ms: AtomicU64::new(super::DEFAULT_RETENTION_INTERVAL_MS),
             event_retention_seconds: AtomicU64::new(super::DEFAULT_EVENT_RETENTION_SECONDS),
             hook_timeout_ms: AtomicU64::new(super::DEFAULT_HOOK_TIMEOUT_MS),
+            compare_max_commits: AtomicU64::new(
+                super::DEFAULT_COMPARE_MAX_COMMITS
+                    .try_into()
+                    .expect("compare budget fits u64"),
+            ),
             hook_max_commands: AtomicUsize::new(super::MAX_HOOK_MAX_COMMANDS),
             default_branch: Mutex::new(String::from(super::DEFAULT_DEFAULT_BRANCH)),
         };
@@ -186,6 +193,15 @@ impl Registry {
     pub(crate) fn set_event_retention_seconds(&self, seconds: u64) {
         self.event_retention_seconds
             .store(seconds, Ordering::Relaxed);
+    }
+
+    /// Sets the per-compare commit visit budget.
+    ///
+    /// `serve` calls this once from the daemon configuration before serving;
+    /// each coordinator opened afterwards bounds its compares to this many
+    /// commit visits.
+    pub(crate) fn set_compare_max_commits(&self, commits: u64) {
+        self.compare_max_commits.store(commits, Ordering::Relaxed);
     }
 
     /// Sets the hosted hook callback deadline.
@@ -686,6 +702,7 @@ impl Registry {
         let runner = coordinator.spawn_on(&runtime)?;
         coordinator
             .set_event_retention_seconds(self.event_retention_seconds.load(Ordering::Relaxed));
+        coordinator.set_compare_max_commits(self.compare_max_commits.load(Ordering::Relaxed));
         spawn_retention(&runtime, &coordinator, self.retention_interval_ms());
         entry.coordinator = Some(Arc::clone(&coordinator));
         entry.runner = Some(runner);

@@ -1715,47 +1715,38 @@ pub(crate) fn walk_history_excluding(
 
 /// Finds every merge base of two tips: common ancestors that are not
 /// themselves ancestors of another common ancestor.
+///
+/// The walk lives in `ruk-core`; this adapter only supplies the
+/// replacement-aware graph access. Output is identical by construction:
+/// the local CLI walks unbounded.
 fn merge_bases_all(store: &Store, left: Oid, right: Oid) -> Result<Vec<Oid>, GitError> {
-    if left == right {
-        return Ok(vec![left]);
-    }
-    let left_set: HashSet<Oid> = walk_history(store, &[left], None)?
-        .into_iter()
-        .map(|(oid, _)| oid)
-        .collect();
-    let mut common = Vec::new();
-    for (oid, _) in walk_history(store, &[right], None)? {
-        if left_set.contains(&oid) {
-            common.push(oid);
-        }
-    }
-    minimize_bases(store, common)
+    let parents = |oid: Oid| commit_parents(store, oid);
+    let committer_time = |oid: Oid| Ok(super::state::commit_stamp(&commit_record(store, oid)?));
+    let mut budget = u64::MAX;
+    ruk_core::ops::compare::merge_bases_all(
+        &|oid| replace_redirect(store, oid),
+        &parents,
+        &committer_time,
+        &mut budget,
+        left,
+        right,
+    )
 }
 
 /// Drops duplicate and ancestor-dominated candidates, keeping the minimal
 /// base set in discovery order.
+///
+/// The check lives in `ruk-core`; the local CLI walks unbounded, so the
+/// surviving set matches the previous walk exactly.
 fn minimize_bases(store: &Store, candidates: Vec<Oid>) -> Result<Vec<Oid>, GitError> {
-    let mut seen = HashSet::new();
-    let mut unique = Vec::new();
-    for oid in candidates {
-        if seen.insert(oid) {
-            unique.push(oid);
-        }
-    }
-    let mut bases = Vec::new();
-    for cand in &unique {
-        let mut dominated = false;
-        for other in &unique {
-            if cand != other && is_ancestor(store, *cand, *other)? {
-                dominated = true;
-                break;
-            }
-        }
-        if !dominated {
-            bases.push(*cand);
-        }
-    }
-    Ok(bases)
+    let parents = |oid: Oid| commit_parents(store, oid);
+    let mut budget = u64::MAX;
+    ruk_core::ops::compare::minimize_bases(
+        &|oid| replace_redirect(store, oid),
+        &parents,
+        &mut budget,
+        candidates,
+    )
 }
 
 /// Collects every commit oid behind any ref, for `--all`. Non-commit

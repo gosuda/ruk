@@ -82,7 +82,8 @@ pub(crate) const DEFAULT_DEFAULT_BRANCH: &str = "refs/heads/main";
 pub(crate) const DEFAULT_ARCHIVE_MAX_BYTES: u64 = 1_073_741_824;
 
 /// Default walk budget for `compare` reads.
-pub(crate) const DEFAULT_COMPARE_MAX_COMMITS: usize = 10_000;
+pub(crate) const DEFAULT_COMPARE_MAX_COMMITS: usize =
+    ruk_core::ops::compare::DEFAULT_COMPARE_MAX_COMMITS;
 
 /// Default per-request scan budget for `search` (64 MiB).
 pub(crate) const DEFAULT_SEARCH_MAX_SCAN_BYTES: u64 = 67_108_864;
@@ -535,6 +536,11 @@ impl DaemonConfig {
                 "event_retention_seconds must be nonzero",
             )));
         }
+        if self.compare_max_commits == 0 {
+            return Err(Error::Config(String::from(
+                "compare_max_commits must be nonzero",
+            )));
+        }
         if self.handshake_timeout.is_zero() || self.frame_timeout.is_zero() {
             return Err(Error::Config(String::from(
                 "handshake and frame deadlines must be nonzero",
@@ -981,7 +987,7 @@ pub(crate) fn coord_call_site(method: Method) -> &'static str {
             "HostedCoordinator::open_session/resume_session"
         }
         ruk_core::protocol::MethodKind::Read => {
-            "HostedCoordinator::read (op.log, claim.list, attest.list, refs.list, events.tail, file, show, log, diff, blame, query, status, repo.stat, tree served; other reads name their missing implementation)"
+            "HostedCoordinator::read (op.log, claim.list, attest.list, refs.list, events.tail, file, show, log, diff, blame, query, status, repo.stat, tree, compare served; other reads name their missing implementation)"
         }
         ruk_core::protocol::MethodKind::Mutation => {
             "HostedCoordinator::prepare_for_dispatch plus HostedCoordinator::submit_prepared (ref, new, claim, ws.new, pin, attest, describe, split, rebase, squash, abandon, edit, ws.scope, ws.take, ws.drop, resolve, revert, undo, land.prepare mutations covered; the rest name their missing preparation)"
@@ -1039,6 +1045,12 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
         let registry = Arc::new(Registry::new(config.repo_roots.clone())?);
         registry.set_retention_interval(config.retention_interval);
         registry.set_event_retention_seconds(config.event_retention_seconds);
+        registry.set_compare_max_commits(
+            config
+                .compare_max_commits
+                .try_into()
+                .expect("compare budget fits u64"),
+        );
         registry.set_hook_timeout(config.hook_timeout);
         registry.set_hook_max_commands(config.hook_max_commands);
         registry.set_default_branch(config.default_branch.clone());
