@@ -1107,6 +1107,8 @@ async fn reader_never_blocks_on_a_full_stream() {
             outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
+            task: None,
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
     for _ in 0..STREAM_CHANNEL_BOUND {
@@ -1136,6 +1138,15 @@ async fn reader_never_blocks_on_a_full_stream() {
     let first = writer_rx.try_recv().expect("overflow error frame");
     assert_eq!(first.kind, FrameKind::Error);
     assert_eq!(first.stream_id, 7);
+    // The refusal ends the stream with its own terminal `Exit`: the
+    // aborted task must never emit a second one, and the tripped flag
+    // suppresses any late send from the serve path.
+    let terminal = writer_rx.try_recv().expect("overflow terminal exit");
+    assert_eq!(terminal.kind, FrameKind::Exit);
+    assert_eq!(terminal.stream_id, 7);
+    let report: super::ExitReport =
+        ipc::decode_control(&terminal.payload).expect("exit report decodes");
+    assert_eq!(report.status, 1);
     // A live sibling still receives its frame promptly after the refusal.
     let (sib_tx, mut sib_rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BOUND);
     let (sib_data_tx, _sib_data_parked) = tokio::sync::mpsc::unbounded_channel();
@@ -1147,6 +1158,8 @@ async fn reader_never_blocks_on_a_full_stream() {
             outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
+            task: None,
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
     let sibling = ipc::Frame {
@@ -2863,6 +2876,65 @@ async fn small_stdin_frames_within_window_are_not_refused() {
     assert!(stdout.starts_with(b"PACK"));
     drop(driver);
     task.abort();
+}
+
+/// A chunk past the connection's credit window ends its stream: the
+/// refusal removes the routing entry and emits the terminal `Exit`, so
+/// the parked task cannot later emit a second terminal frame.
+#[tokio::test]
+async fn credit_exhaustion_removes_the_stream() {
+    use super::route_stdin_frame;
+    use std::collections::HashMap;
+    let root = temp_root("credit-exhaustion");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes: 16,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let (tx, _parked) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_BOUND);
+    let (data_tx, _data_parked) = tokio::sync::mpsc::unbounded_channel();
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx,
+            data: data_tx,
+            outstanding: Arc::new(AtomicU64::new(0)),
+            generation: 1,
+            git: true,
+            task: None,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    );
+    let frame = ipc::Frame {
+        kind: FrameKind::Stdin,
+        stream_id: 7,
+        payload: vec![0u8; 100],
+    };
+    let routed = tokio::time::timeout(
+        Duration::from_secs(5),
+        route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+    )
+    .await
+    .expect("credit refusal never blocks");
+    routed.expect("credit refusal reports without error");
+    assert!(
+        !streams.contains_key(&7),
+        "the exhausted stream loses its routing entry"
+    );
+    let first = writer_rx.try_recv().expect("credit error frame");
+    assert_eq!(first.kind, FrameKind::Error);
+    assert_eq!(first.stream_id, 7);
+    let terminal = writer_rx.try_recv().expect("credit terminal exit");
+    assert_eq!(terminal.kind, FrameKind::Exit);
+    assert_eq!(terminal.stream_id, 7);
 }
 
 /// A cancel racing an accepted hook verdict must not report

@@ -1543,30 +1543,25 @@ async fn route_stdin_frame(
     let Some(route) = streams.get(&stream_id) else {
         return Ok(());
     };
+    // The admit is one atomic add: the serving task decrements the same
+    // counter as it consumes, and a load-then-store here would lose that
+    // decrement and drift toward false refusals. The overflow arm below
+    // rolls the width back.
     let admitted = route
         .outstanding
-        .load(Ordering::SeqCst)
+        .fetch_add(width, Ordering::SeqCst)
         .saturating_add(width);
     if admitted > refs.window_bytes {
-        let sink = StreamSink {
-            writer: writer.clone(),
-            stream_id,
-        };
-        send_error_exit(
-            &sink,
-            &Error::Core(CoreError::new(
-                ErrorCode::ELimit,
-                "stream credit window is exhausted",
-            )),
-        )
-        .await?;
-        return Ok(());
+        route.outstanding.fetch_sub(width, Ordering::SeqCst);
+        // Credit exhaustion ends the stream like any other overflow: the
+        // task must not linger to emit a second terminal frame after the
+        // refusal.
+        return refuse_overflowed_stream(writer, streams, stream_id).await;
     }
     // Framing is never free: an empty chunk still occupies queue
     // bookkeeping, so the width above counts at least one byte and an
     // empty-frame flood stops at the window instead of growing the
     // channel without bound.
-    route.outstanding.store(admitted, Ordering::SeqCst);
     match route.data.send(frame) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -1576,28 +1571,56 @@ async fn route_stdin_frame(
     }
 }
 
-/// Ends an overflowed stream with an explicit error exit and drops its
-/// routing entry: the reader never waits for a task that stopped
-/// draining, and the client learns the stream died instead of hanging.
+/// Ends an overflowed stream: trips its cancel flag so a parked blocking
+/// serve stops at its next interrupt check, aborts its task so nothing
+/// later emits a second `Exit` on the dead id, and drops its routing
+/// entry. The error exit is best-effort: a stalled socket must not stall
+/// the reader, so a full writer channel drops the notice instead of
+/// awaiting it.
 #[cfg(unix)]
 async fn refuse_overflowed_stream(
     writer: &mpsc::Sender<OutboundFrame>,
     streams: &mut HashMap<u64, StreamRoute>,
     stream_id: u64,
 ) -> Result<(), Error> {
-    streams.remove(&stream_id);
-    let sink = StreamSink {
-        writer: writer.clone(),
-        stream_id,
+    let Some(route) = streams.remove(&stream_id) else {
+        return Ok(());
     };
-    send_error_exit(
-        &sink,
-        &Error::Core(CoreError::new(
-            ErrorCode::ELimit,
-            "stream input overflowed its bound",
-        )),
-    )
-    .await
+    route.cancel_flag.store(true, Ordering::SeqCst);
+    if let Some(task) = route.task {
+        task.abort();
+    }
+    let report = ErrorReply::from_core(&CoreError::new(
+        ErrorCode::ELimit,
+        "stream input overflowed its bound",
+    ));
+    let error_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(()),
+    };
+    let _ = writer.try_send(OutboundFrame {
+        stream_id,
+        kind: ipc::FrameKind::Error,
+        payload: error_bytes,
+    });
+    let completed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let exit = ExitReport {
+        status: 1,
+        code: ErrorCode::ELimit.as_str().to_string(),
+        outcome: OUTCOME_FAILED.to_string(),
+        completed_at,
+    };
+    if let Ok(bytes) = ipc::encode_control(&exit) {
+        let _ = writer.try_send(OutboundFrame {
+            stream_id,
+            kind: ipc::FrameKind::Exit,
+            payload: bytes,
+        });
+    }
+    Ok(())
 }
 
 /// One stream's routing state: a bounded control channel, an unbounded
@@ -1621,6 +1644,26 @@ struct StreamRoute {
     /// frames stay on the control path and keep the old misplaced-frame
     /// refusal instead of buffering behind a reader that never drains.
     git: bool,
+    /// The stream task, aborted when the stream overflows: a parked serve
+    /// must not keep running, holding its permit, after the reader has
+    /// already ended the stream, and it must never emit a second `Exit`.
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// Trip-on-overflow flag: stops a parked blocking serve at its next
+    /// interrupt check. Dispatch waits keep their own token; the abort
+    /// above stops the async task itself.
+    cancel_flag: Arc<AtomicBool>,
+}
+
+/// One stream's inbound halves plus its shared admission counter.
+///
+/// The control half carries `Cancel`, `WindowUpdate`, and `HookReply`
+/// frames; the data half carries credit-checked `Stdin` and its
+/// terminator. The counter tracks admitted-but-unconsumed bytes so the
+/// reader and the serving task share one bound.
+struct StreamInput {
+    control: mpsc::Receiver<ipc::Frame>,
+    data: mpsc::UnboundedReceiver<ipc::Frame>,
+    outstanding: Arc<AtomicU64>,
 }
 
 /// Spawns one task serving the stream of one `Open` frame. The reader
@@ -1643,15 +1686,25 @@ fn spawn_stream(
     let git = ipc::decode_control::<CommandOpen>(&frame.payload).is_ok();
     let outstanding = Arc::new(AtomicU64::new(0));
     let task_outstanding = Arc::clone(&outstanding);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let task_cancel = Arc::clone(&cancel_flag);
     let route = StreamRoute {
         control: control_tx,
         data: data_tx,
         outstanding,
         generation,
         git,
+        task: None,
+        cancel_flag,
     };
     if let Some(old) = streams.insert(stream_id, route) {
-        drop(old);
+        // Trip first: the replaced task may sit in a blocking serve that
+        // only wakes on its flag, and abort alone would leave that
+        // blocking work detached past its owner.
+        old.cancel_flag.store(true, Ordering::SeqCst);
+        if let Some(task) = old.task {
+            task.abort();
+        }
     }
     let sink = StreamSink {
         writer: writer.clone(),
@@ -1659,19 +1712,20 @@ fn spawn_stream(
     };
     let task_refs = refs.clone();
     let task_done = done.clone();
-    tokio::spawn(async move {
-        serve_stream(
-            control_rx,
-            data_rx,
-            task_outstanding,
-            &sink,
-            frame.payload,
-            &task_refs,
-            peer,
-        )
-        .await;
+    let task = tokio::spawn(async move {
+        let input = StreamInput {
+            control: control_rx,
+            data: data_rx,
+            outstanding: task_outstanding,
+        };
+        serve_stream(input, task_cancel, &sink, frame.payload, &task_refs, peer).await;
         let _ = task_done.try_send((stream_id, generation));
     });
+    if let Some(route) = streams.get_mut(&stream_id) {
+        route.task = Some(task);
+    } else {
+        task.abort();
+    }
 }
 
 /// Serves one stream to its terminal frame: an argv-style command stream
@@ -1679,28 +1733,21 @@ fn spawn_stream(
 /// plus its terminal frame; the connection stays open for other streams.
 #[cfg(unix)]
 async fn serve_stream(
-    mut input: mpsc::Receiver<ipc::Frame>,
-    data: mpsc::UnboundedReceiver<ipc::Frame>,
-    outstanding: Arc<AtomicU64>,
+    mut input: StreamInput,
+    task_cancel: Arc<AtomicBool>,
     sink: &StreamSink,
     open_payload: Vec<u8>,
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
 ) {
     if let Ok(command) = ipc::decode_control::<CommandOpen>(&open_payload) {
-        serve_git_service(
-            &mut input,
-            data,
-            &outstanding,
-            sink,
-            command,
-            refs,
-            peer.uid,
-        )
-        .await;
+        serve_git_service(&mut input, task_cancel, sink, command, refs, peer.uid).await;
         return;
     }
-    let _typed_data_live = data;
+    // Typed invocations never read the data channel, but the receiver
+    // must stay alive: the reader routes `StdinEof` there, and a dropped
+    // receiver would delete a route whose task still runs.
+    let _typed_data_live = input.data;
     let open: InvocationOpen = match ipc::decode_control(&open_payload) {
         Ok(open) => open,
         Err(err) => {
@@ -1708,7 +1755,7 @@ async fn serve_stream(
             return;
         }
     };
-    typed_stream(&mut input, sink, &open, refs, peer).await;
+    typed_stream(&mut input.control, sink, &open, refs, peer).await;
 }
 
 /// Identifiers locating one git-service round for replay dispatch.
@@ -1881,9 +1928,8 @@ async fn store_git_outcome(
 /// over the parsed commands and the effective limits.
 #[cfg(unix)]
 async fn serve_git_service(
-    input: &mut mpsc::Receiver<ipc::Frame>,
-    mut data: mpsc::UnboundedReceiver<ipc::Frame>,
-    outstanding: &AtomicU64,
+    input: &mut StreamInput,
+    cancel_flag: Arc<AtomicBool>,
     sink: &StreamSink,
     req: CommandOpen,
     refs: &ConnectionRefs,
@@ -1893,7 +1939,6 @@ async fn serve_git_service(
     let mut credits = ipc::StreamCredits::new(refs.window_bytes);
     credits.open_stream(stream_id);
     let (cancel_guard, token) = cancellation();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
     let _trip = TripOnDrop {
         flag: Arc::clone(&cancel_flag),
     };
@@ -1987,16 +2032,7 @@ async fn serve_git_service(
     let stdin_bytes = if req.advertise {
         Vec::new()
     } else {
-        match collect_git_stdin(
-            input,
-            &mut data,
-            outstanding,
-            sink,
-            &mut credits,
-            &req.limits,
-        )
-        .await
-        {
+        match collect_git_stdin(input, sink, &mut credits, &req.limits).await {
             GitStdinFate::Ready(bytes) => bytes,
             GitStdinFate::Cancelled => {
                 let report = CommandExitReport::cancelled(&accepted.invocation_id);
@@ -2073,13 +2109,21 @@ async fn serve_git_service(
                 request_id: &request_id,
                 digest: &digest,
             };
-            dispatch_stored_receipt(input, sink, &mut credits, &cancel_guard, ids, &receipt).await;
+            dispatch_stored_receipt(
+                &mut input.control,
+                sink,
+                &mut credits,
+                &cancel_guard,
+                ids,
+                &receipt,
+            )
+            .await;
             return;
         }
     }
     if req.service == GIT_SERVICE_RECEIVE_PACK && !req.advertise {
         serve_hosted_receive(HostedReceive {
-            input,
+            input: &mut input.control,
             sink,
             credits: &mut credits,
             cancel_guard: &cancel_guard,
@@ -2115,7 +2159,7 @@ async fn serve_git_service(
     });
     let Some(outcome) = await_git_round(
         GitRound {
-            input,
+            input: &mut input.control,
             sink,
             credits: &mut credits,
             cancel_guard: &cancel_guard,
@@ -2145,8 +2189,15 @@ async fn serve_git_service(
                     request_id: &request_id,
                     digest: &digest,
                 };
-                dispatch_stored_receipt(input, sink, &mut credits, &cancel_guard, ids, &stored)
-                    .await;
+                dispatch_stored_receipt(
+                    &mut input.control,
+                    sink,
+                    &mut credits,
+                    &cancel_guard,
+                    ids,
+                    &stored,
+                )
+                .await;
                 return;
             }
             Err(store_err) => {
@@ -2166,6 +2217,12 @@ async fn serve_git_service(
             return;
         }
     };
+    // An overflowed stream already ended with its own `Exit` in
+    // `refuse_overflowed_stream`: sending another here would break the
+    // single-terminal-frame rule, so the tripped flag ends the serve.
+    if cancel_flag.load(Ordering::SeqCst) {
+        return;
+    }
     if token.check().is_err() {
         let report = CommandExitReport::cancelled(&invocation);
         let exit_bytes = match ipc::encode_control(&report) {
@@ -2175,7 +2232,15 @@ async fn serve_git_service(
         let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
         return;
     }
-    match write_typed_chunks(sink, input, &mut credits, &cancel_guard, &output).await {
+    match write_typed_chunks(
+        sink,
+        &mut input.control,
+        &mut credits,
+        &cancel_guard,
+        &output,
+    )
+    .await
+    {
         TypedWriteFate::Done => {}
         TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
     }
@@ -2523,9 +2588,7 @@ enum GitStdinFate {
 /// grant back per chunk, so bodies larger than one window keep flowing.
 #[cfg(unix)]
 async fn collect_git_stdin(
-    input: &mut mpsc::Receiver<ipc::Frame>,
-    data: &mut mpsc::UnboundedReceiver<ipc::Frame>,
-    outstanding: &AtomicU64,
+    input: &mut StreamInput,
     sink: &StreamSink,
     credits: &mut ipc::StreamCredits,
     limits: &GitLimits,
@@ -2535,16 +2598,13 @@ async fn collect_git_stdin(
     loop {
         let frame = tokio::select! {
             biased;
-            control = input.recv() => {
+            control = input.control.recv() => {
                 let Some(frame) = control else {
                     return GitStdinFate::Gone;
                 };
-                if frame.kind == ipc::FrameKind::StdinEof {
-                    continue;
-                }
                 Some(frame)
             }
-            chunk = data.recv() => {
+            chunk = input.data.recv() => {
                 chunk
             }
         };
@@ -2584,7 +2644,9 @@ async fn collect_git_stdin(
                 // Release matches the reader's admission width: payload
                 // plus one framing byte, keeping the shared counter exact
                 // while protocol credit stays in payload bytes.
-                outstanding.fetch_sub(width.saturating_add(1), Ordering::SeqCst);
+                input
+                    .outstanding
+                    .fetch_sub(width.saturating_add(1), Ordering::SeqCst);
                 stdin_bytes.extend_from_slice(&frame.payload);
                 if credits.grant_inbound(stream_id, width).is_err() {
                     return GitStdinFate::Rejected(CoreError::new(
