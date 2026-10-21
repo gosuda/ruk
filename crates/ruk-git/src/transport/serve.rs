@@ -476,18 +476,18 @@ pub fn serve_receive_pack<R: Read, W: Write>(
     interrupt: &Interrupt,
     lfs: LfsMode,
 ) -> Result<(), GitError> {
-    serve_receive_pack_with(
+    serve_receive_pack_with(ReceivePackParams {
         reader,
         writer,
         store,
         kind,
         head,
         interrupt,
-        &NoPolicy,
+        policy: &NoPolicy,
         lfs,
-        ReceiveLimits::default(),
-        None,
-    )?;
+        limits: ReceiveLimits::default(),
+        on_behalf_of: None,
+    })?;
     Ok(())
 }
 
@@ -562,6 +562,47 @@ impl Default for ReceiveLimits {
     }
 }
 
+/// Parameters for one `receive-pack` round: the transport streams, the
+/// store and its advertisement, the interrupt flag, the serving policy,
+/// and the envelope limits and provenance.
+///
+/// Grouped so new envelope fields extend the struct instead of
+/// lengthening the serve entry.
+pub struct ReceivePackParams<'a, R: Read, W: Write> {
+    /// Request bytes.
+    pub reader: R,
+    /// Response bytes.
+    pub writer: W,
+    /// Store the pack stages into and the refs publish from.
+    pub store: &'a Store,
+    /// Object format the round serves.
+    pub kind: HashKind,
+    /// Advertisement the round reports.
+    pub head: &'a HeadAdvertisement,
+    /// Cancellation flag the pack stages check.
+    pub interrupt: &'a Interrupt,
+    /// Hook policy the round answers through.
+    pub policy: &'a dyn ReceivePolicy,
+    /// Pointer policy for pushed blobs.
+    pub lfs: LfsMode,
+    /// Pack ingest quotas plus the push-option cap.
+    pub limits: ReceiveLimits,
+    /// Provenance the invocation declared; recorded, never authorized on.
+    pub on_behalf_of: Option<&'a str>,
+}
+
+impl<R: Read, W: Write> std::fmt::Debug for ReceivePackParams<'_, R, W> {
+    /// Formats the identifying parameters: streams and policy do not
+    /// implement [`std::fmt::Debug`], so only the round shape renders.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceivePackParams")
+            .field("kind", &self.kind)
+            .field("lfs", &self.lfs)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Serves one `receive-pack` session with quarantine staging and hook
 /// phases (see [`super::hooks`]): the pack stages unpublished, hooks
 /// observe it through the quarantine directory, staged objects publish
@@ -585,22 +626,21 @@ impl Default for ReceiveLimits {
 /// [`GitError::Corrupt`] for grammar violations, [`GitError::ObjectFormat`]
 /// for store/kind mismatch or foreign OIDs, plus ingest, verification,
 /// store and transport failures.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "public serve entry mirroring serve_receive_pack plus hooks and policy; grouping would ripple to callers"
-)]
 pub fn serve_receive_pack_with<R: Read, W: Write>(
-    reader: R,
-    mut writer: W,
-    store: &Store,
-    kind: HashKind,
-    head: &HeadAdvertisement,
-    interrupt: &Interrupt,
-    policy: &dyn ReceivePolicy,
-    lfs: LfsMode,
-    limits: ReceiveLimits,
-    on_behalf_of: Option<&str>,
+    params: ReceivePackParams<'_, R, W>,
 ) -> Result<Vec<u64>, GitError> {
+    let ReceivePackParams {
+        reader,
+        mut writer,
+        store,
+        kind,
+        head,
+        interrupt,
+        policy,
+        lfs,
+        limits,
+        on_behalf_of,
+    } = params;
     let context = EventContext {
         on_behalf_of: on_behalf_of.map(str::to_owned),
         ..EventContext::default()
@@ -1081,7 +1121,7 @@ pub fn serve_command<R: Read, W: Write>(
         "upload-pack" => serve_upload_pack(reader, writer, store, kind, head, interrupt),
         // No repository directory travels with a bare command dispatch, so
         // no policy file is readable: fail closed to pointer refusal.
-        "receive-pack" => serve_receive_pack_with(
+        "receive-pack" => serve_receive_pack_with(ReceivePackParams {
             reader,
             writer,
             store,
@@ -1089,10 +1129,10 @@ pub fn serve_command<R: Read, W: Write>(
             head,
             interrupt,
             policy,
-            LfsMode::Deny,
-            ReceiveLimits::default(),
-            None,
-        )
+            lfs: LfsMode::Deny,
+            limits: ReceiveLimits::default(),
+            on_behalf_of: None,
+        })
         .map(|_| ()),
         "upload-archive" => {
             super::archive::serve_upload_archive(reader, writer, store, kind, head, interrupt)
@@ -1495,18 +1535,18 @@ mod tests {
         input.extend_from_slice(b"0000");
         input.extend_from_slice(pack);
         let mut out = Vec::new();
-        serve_receive_pack_with(
-            &input[..],
-            &mut out,
-            dest,
+        serve_receive_pack_with(ReceivePackParams {
+            reader: &input[..],
+            writer: &mut out,
+            store: dest,
             kind,
-            &head(),
-            &Interrupt::none(),
-            &NoPolicy,
-            LfsMode::Deny,
+            head: &head(),
+            interrupt: &Interrupt::none(),
+            policy: &NoPolicy,
+            lfs: LfsMode::Deny,
             limits,
-            None,
-        )
+            on_behalf_of: None,
+        })
     }
 
     fn with_ingest(f: impl Fn(IngestLimits) -> IngestLimits) -> ReceiveLimits {
@@ -1687,18 +1727,18 @@ mod tests {
             pre_receive_calls: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut out = Vec::new();
-        serve_receive_pack_with(
-            &input[..],
-            &mut out,
-            &dest,
+        serve_receive_pack_with(ReceivePackParams {
+            reader: &input[..],
+            writer: &mut out,
+            store: &dest,
             kind,
-            &head(),
-            &Interrupt::none(),
-            &policy,
-            LfsMode::Deny,
-            ReceiveLimits::default(),
-            None,
-        )
+            head: &head(),
+            interrupt: &Interrupt::none(),
+            policy: &policy,
+            lfs: LfsMode::Deny,
+            limits: ReceiveLimits::default(),
+            on_behalf_of: None,
+        })
         .expect("atomic refusal stays in-band");
         assert_eq!(
             policy
@@ -1851,18 +1891,18 @@ mod tests {
         input.extend_from_slice(b"0000");
         input.extend_from_slice(pack);
         let mut out = Vec::new();
-        serve_receive_pack_with(
-            &input[..],
-            &mut out,
-            dest,
+        serve_receive_pack_with(ReceivePackParams {
+            reader: &input[..],
+            writer: &mut out,
+            store: dest,
             kind,
-            &head(),
-            &Interrupt::none(),
-            &NoPolicy,
-            mode,
-            ReceiveLimits::default(),
-            None,
-        )
+            head: &head(),
+            interrupt: &Interrupt::none(),
+            policy: &NoPolicy,
+            lfs: mode,
+            limits: ReceiveLimits::default(),
+            on_behalf_of: None,
+        })
         .expect("serve reports refusals in-band");
         report_lines(&out)
     }
@@ -2192,21 +2232,21 @@ mod tests {
             input.extend_from_slice(&middle);
             input.extend_from_slice(&pack);
             let mut out = Vec::new();
-            let result = serve_receive_pack_with(
-                &input[..],
-                &mut out,
-                &dest,
-                HashKind::Sha1,
-                &head(),
-                &Interrupt::none(),
-                &NoPolicy,
-                LfsMode::Deny,
-                ReceiveLimits {
+            let result = serve_receive_pack_with(ReceivePackParams {
+                reader: &input[..],
+                writer: &mut out,
+                store: &dest,
+                kind: HashKind::Sha1,
+                head: &head(),
+                interrupt: &Interrupt::none(),
+                policy: &NoPolicy,
+                lfs: LfsMode::Deny,
+                limits: ReceiveLimits {
                     max_push_options: limit,
                     ..ReceiveLimits::default()
                 },
-                None,
-            );
+                on_behalf_of: None,
+            });
             assert_eq!(
                 result.is_ok(),
                 accepted,
@@ -2242,18 +2282,18 @@ mod tests {
                             input.extend_from_slice(b"0000");
                             input.extend_from_slice(pack_ref);
                             let mut out = Vec::new();
-                            let seqs = serve_receive_pack_with(
-                                &input[..],
-                                &mut out,
-                                dest_ref,
+                            let seqs = serve_receive_pack_with(ReceivePackParams {
+                                reader: &input[..],
+                                writer: &mut out,
+                                store: dest_ref,
                                 kind,
-                                &head(),
-                                &Interrupt::none(),
-                                &NoPolicy,
-                                LfsMode::Deny,
-                                ReceiveLimits::default(),
-                                None,
-                            )
+                                head: &head(),
+                                interrupt: &Interrupt::none(),
+                                policy: &NoPolicy,
+                                lfs: LfsMode::Deny,
+                                limits: ReceiveLimits::default(),
+                                on_behalf_of: None,
+                            })
                             .expect("identical push lands");
                             (seqs, report_lines(&out))
                         })
@@ -2304,18 +2344,18 @@ mod tests {
             input.extend_from_slice(b"0000");
             input.extend_from_slice(pack);
             let mut out = Vec::new();
-            serve_receive_pack_with(
-                &input[..],
-                &mut out,
-                dest_ref,
+            serve_receive_pack_with(ReceivePackParams {
+                reader: &input[..],
+                writer: &mut out,
+                store: dest_ref,
                 kind,
-                &head(),
-                &Interrupt::none(),
-                &NoPolicy,
-                LfsMode::Deny,
-                ReceiveLimits::default(),
-                None,
-            )
+                head: &head(),
+                interrupt: &Interrupt::none(),
+                policy: &NoPolicy,
+                lfs: LfsMode::Deny,
+                limits: ReceiveLimits::default(),
+                on_behalf_of: None,
+            })
             .expect("race serves in-band refusals");
             report_lines(&out)
         };
@@ -2360,18 +2400,18 @@ mod tests {
         input.extend_from_slice(middle);
         input.extend_from_slice(pack);
         let mut out = Vec::new();
-        serve_receive_pack_with(
-            &input[..],
-            &mut out,
-            dest,
+        serve_receive_pack_with(ReceivePackParams {
+            reader: &input[..],
+            writer: &mut out,
+            store: dest,
             kind,
-            &head(),
-            &Interrupt::none(),
+            head: &head(),
+            interrupt: &Interrupt::none(),
             policy,
-            LfsMode::Deny,
-            ReceiveLimits::default(),
-            None,
-        )
+            lfs: LfsMode::Deny,
+            limits: ReceiveLimits::default(),
+            on_behalf_of: None,
+        })
         .expect("serve completes refused pushes in-band");
         report_lines(&out)
     }

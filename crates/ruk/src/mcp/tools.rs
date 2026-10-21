@@ -388,10 +388,10 @@ struct EventsTailResult {
 /// coordinator reports. Provenance stays in the stored row; it is never
 /// surfaced in the tailed events.
 fn tail_events(store: &Store, args: &EventsTailArgs) -> Result<Vec<u8>, CoreError> {
-    if args.wait_ms != Some(0) {
+    if !matches!(args.wait_ms, None | Some(0)) {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
-            "E_UNSUPPORTED_OPERATION: events_tail has no long-poll locally; call with wait_ms 0",
+            "E_UNSUPPORTED_OPERATION: events_tail has no long-poll locally; omit wait_ms or call with wait_ms 0",
         ));
     }
     use ruk_core::store::{FactPageBudget, FactTable};
@@ -578,6 +578,35 @@ mod tests {
         let result: EventsTailResult = sonic_rs::from_slice(&out).expect("result decodes");
         assert!(result.events.is_empty());
         assert!(!result.expired);
+        // The guard accepts an omitted or zero wait on direct calls and
+        // refuses a nonzero one without waiting.
+        let direct = EventsTailArgs {
+            after: 0,
+            limit: None,
+            wait_ms: None,
+            prefix: None,
+        };
+        let out = tail_events(&store, &direct).expect("omitted wait pages");
+        let result: EventsTailResult = sonic_rs::from_slice(&out).expect("result decodes");
+        assert_eq!(result.events.len(), 1);
+        let direct = EventsTailArgs {
+            after: 0,
+            limit: None,
+            wait_ms: Some(0),
+            prefix: None,
+        };
+        let out = tail_events(&store, &direct).expect("zero wait pages");
+        let result: EventsTailResult = sonic_rs::from_slice(&out).expect("result decodes");
+        assert_eq!(result.events.len(), 1);
+        let direct = EventsTailArgs {
+            after: 0,
+            limit: None,
+            wait_ms: Some(30_000),
+            prefix: None,
+        };
+        let err = tail_events(&store, &direct).expect_err("nonzero wait refuses");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        assert!(err.message.contains("E_UNSUPPORTED_OPERATION"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

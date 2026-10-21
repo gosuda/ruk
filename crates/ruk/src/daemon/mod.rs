@@ -2217,16 +2217,18 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
         let interrupt = ruk_git::transport::Interrupt::none().with_cancel(serve_flag);
         let mut out = Vec::new();
         let seqs = ruk_git::transport::serve::serve_receive_pack_with(
-            &stdin[..],
-            &mut out,
-            store,
-            kind,
-            &head,
-            &interrupt,
-            &*serve_policy,
-            lfs,
-            serve_limits,
-            serve_provenance.as_deref(),
+            ruk_git::transport::serve::ReceivePackParams {
+                reader: &stdin[..],
+                writer: &mut out,
+                store,
+                kind,
+                head: &head,
+                interrupt: &interrupt,
+                policy: &*serve_policy,
+                lfs,
+                limits: serve_limits,
+                on_behalf_of: serve_provenance.as_deref(),
+            },
         )?;
         Ok::<_, CoreError>((out, seqs))
     });

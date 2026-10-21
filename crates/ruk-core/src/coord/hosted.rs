@@ -1831,12 +1831,12 @@ impl HostedCoordinator {
                     name: ByteString::from(stored.name),
                     old: stored
                         .old
-                        .map(|bytes| crate::store::decode("event old target", &bytes))
+                        .map(|bytes| crate::store::types::decode_event_target(&bytes))
                         .transpose()
                         .map_err(CoreError::from)?,
                     new: stored
                         .new
-                        .map(|bytes| crate::store::decode("event new target", &bytes))
+                        .map(|bytes| crate::store::types::decode_event_target(&bytes))
                         .transpose()
                         .map_err(CoreError::from)?,
                     at: stored.at,

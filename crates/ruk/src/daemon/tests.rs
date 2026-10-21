@@ -2766,6 +2766,29 @@ async fn duplicate_open_for_live_stream_is_refused() {
     assert_eq!(report.code, ErrorCode::EInvalid);
     assert_eq!(exit.status, 1);
 
+    // The first stream survives the refused duplicate: an empty command
+    // list terminated by a flush completes the push round with an empty
+    // report instead of hanging on a wedged stream. WindowUpdate grants
+    // for the stdin bytes drain here; only the terminal report matters.
+    driver.send(FrameKind::Stdin, 5, b"0000").await;
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    let completed = loop {
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, 5, "unexpected stream {}", frame.stream_id);
+        match frame.kind {
+            FrameKind::Stdout | FrameKind::WindowUpdate => continue,
+            FrameKind::Exit => {
+                break ipc::decode_control::<CommandExitReport>(&frame.payload)
+                    .expect("exit decodes");
+            }
+            other => panic!("unexpected frame {other:?} on stream 5"),
+        }
+    };
+    assert_eq!(
+        completed.outcome, "Completed",
+        "first stream completes after the refused duplicate",
+    );
+
     drop(driver);
     task.abort();
 }
