@@ -14,10 +14,11 @@ use crate::store::{
     EventContext, EventSource, FactExpectation, FactMutation, FactTable, Store, decode, encode,
 };
 
-/// Durable receipt row version. The table was born in the census
-/// revision, so version 1 is the only version on disk; the field keeps
-/// the row forward-compatible.
-pub const SERVICE_RECEIPT_VERSION: u32 = 1;
+/// Durable receipt row version. Version 2 adds the published operation
+/// identities so replayed pushes report the same operations as the live
+/// run; version 1 rows decode through [`ServiceReceiptV1`] and refuse at
+/// the version gate.
+pub const SERVICE_RECEIPT_VERSION: u32 = 2;
 
 /// One completed receive-pack execution, replayable by request id.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -36,6 +37,22 @@ pub struct ServiceReceipt {
     pub error_message: Option<String>,
     /// Wall-clock milliseconds when the run completed.
     pub at: u64,
+    /// Operation identities the run published, in publish order; empty
+    /// when the run landed nothing.
+    pub operation_ids: Vec<u64>,
+}
+
+/// Version-1 receipt row: the shape before operation identities.
+/// Decode-only, for rows written before replays reported operations.
+#[derive(Clone, serde::Deserialize)]
+struct ServiceReceiptV1 {
+    version: u32,
+    digest: String,
+    exit_code: i32,
+    output: Vec<u8>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    at: u64,
 }
 
 /// Builds the composite receipt key. NUL separators are unambiguous:
@@ -52,8 +69,23 @@ pub(crate) fn service_receipt_key(peer_uid: u32, repository: &[u8], request_id: 
 }
 
 fn decode_receipt(bytes: &[u8]) -> Result<(ServiceReceipt, Vec<u8>), CoreError> {
-    let receipt: ServiceReceipt = decode("service receipt", bytes)
-        .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+    let receipt: ServiceReceipt = match decode("service receipt", bytes) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            let old: ServiceReceiptV1 = decode("service receipt", bytes)
+                .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+            ServiceReceipt {
+                version: old.version,
+                digest: old.digest,
+                exit_code: old.exit_code,
+                output: old.output,
+                error_code: old.error_code,
+                error_message: old.error_message,
+                at: old.at,
+                operation_ids: Vec::new(),
+            }
+        }
+    };
     Ok((receipt, bytes.to_vec()))
 }
 
@@ -189,6 +221,7 @@ mod tests {
             error_code: None,
             error_message: None,
             at,
+            operation_ids: Vec::new(),
         }
     }
 

@@ -1555,12 +1555,18 @@ async fn provenance_records_on_behalf_of_and_ignores_it_for_auth() {
     let ReplyBody::Success(Reply::OpLog(log)) = envelope.body else {
         panic!("op.log must answer its own reply");
     };
-    assert_eq!(log.entries.items.len(), 1);
+    assert_eq!(
+        log.entries.items.len(),
+        2,
+        "the journaled claim.acquire joins the tag op in op.log"
+    );
+    assert_eq!(log.entries.items[0].method.as_str(), "tag.set");
     assert_eq!(
         log.entries.items[0].on_behalf_of.as_deref(),
         Some("agent-x"),
         "the op.log entry carries the declared provenance"
     );
+    assert_eq!(log.entries.items[1].method.as_str(), "claim.acquire");
 
     drop(driver);
     task.abort();
@@ -2523,6 +2529,14 @@ async fn receive_replay_same_digest_no_second_publish() {
     assert_eq!(
         events_after, events_before,
         "the replay publishes no second event"
+    );
+    assert!(
+        !first_exit.operation_ids.is_empty(),
+        "the live run names its operations"
+    );
+    assert_eq!(
+        second_exit.operation_ids, first_exit.operation_ids,
+        "the replay reports the same operations as the live run"
     );
 
     drop(driver);
@@ -3952,6 +3966,7 @@ async fn typed_oplog_continuation_pages_through_its_lease() {
 
     let first_args = OpLogArgs {
         session: None,
+        after: None,
         page: PageRequest {
             limit: Some(PageLimit::new(1).expect("page limit 1")),
             cursor: None,
@@ -3974,6 +3989,7 @@ async fn typed_oplog_continuation_pages_through_its_lease() {
 
     let second_args = OpLogArgs {
         session: None,
+        after: None,
         page: PageRequest {
             limit: Some(PageLimit::new(1).expect("page limit 1")),
             cursor: Some(cursor),

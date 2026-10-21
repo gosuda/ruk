@@ -902,7 +902,10 @@ pub(crate) struct CommandExitReport {
     pub cancelled: bool,
     /// The durable outcome: `Completed`, `Failed`, or `CancelledBeforeCommit`.
     pub outcome: String,
-    /// Operation identities of the run; empty for CLI verbs.
+    /// Identities of what the run published; empty when it landed nothing.
+    /// On the git-service path these are the landed ref-event sequences:
+    /// receive-pack publishes outside the operation log, so they are not
+    /// undoable operation ids and must never feed `undo` or `op.log`.
     pub operation_ids: Vec<String>,
     /// The invocation identity, echoing the open's request id.
     pub invocation_id: String,
@@ -1793,7 +1796,12 @@ async fn send_stored_outcome(
         TypedWriteFate::Done => {}
         TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
     }
-    let report = CommandExitReport::success(invocation, code);
+    let mut report = CommandExitReport::success(invocation, code);
+    report.operation_ids = receipt
+        .operation_ids
+        .iter()
+        .map(|seq| seq.to_string())
+        .collect();
     let exit_bytes = match ipc::encode_control(&report) {
         Ok(bytes) => bytes,
         Err(_) => return,
@@ -1860,6 +1868,7 @@ async fn store_git_outcome(
     coordinator: &Arc<HostedCoordinator>,
     locator: &ReceiptLocator,
     outcome: &Result<Vec<u8>, CoreError>,
+    operation_ids: &[u64],
 ) -> Result<Option<ServiceReceipt>, Error> {
     let (exit_code, output, error_code, error_message) = match outcome {
         Ok(output) => (0, output.clone(), None, None),
@@ -1883,6 +1892,7 @@ async fn store_git_outcome(
         error_code,
         error_message,
         at,
+        operation_ids: operation_ids.to_vec(),
     };
     let writer = Arc::clone(coordinator);
     let repository = locator.repository.clone();
@@ -2181,7 +2191,7 @@ async fn serve_git_service(
             request_id: request_id.clone(),
             digest: digest.clone(),
         };
-        match store_git_outcome(refs, &coordinator, &locator, inner).await {
+        match store_git_outcome(refs, &coordinator, &locator, inner, &[]).await {
             Ok(None) => {}
             Ok(Some(stored)) => {
                 let ids = ReplayIds {
@@ -2532,7 +2542,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
         request_id: request_id.clone(),
         digest: digest.clone(),
     };
-    match store_git_outcome(refs, &coordinator, &locator, &Ok(out.clone())).await {
+    match store_git_outcome(refs, &coordinator, &locator, &Ok(out.clone()), &seqs).await {
         Ok(None) => {}
         Ok(Some(stored)) => {
             let ids = ReplayIds {

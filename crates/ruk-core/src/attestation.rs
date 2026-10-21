@@ -56,12 +56,14 @@ mod tests;
 use crate::error::CoreError;
 
 pub use export::{ExportSummary, export, parse_export};
+pub(crate) use layout::{is_order_key, is_statement_key};
 pub use prepare::{Disposition, PreparedAttestations, PreparedRecord, prepare_add, prepare_batch};
 pub use query::{
     AttestationPage, BoundedRequirement, Gap, LandEvaluation, RequirementEvaluation,
     RequirementOutcome, StatementFilter, attested, evaluate_bounded_requirements,
     evaluate_requirements, list, subject_statements,
 };
+pub(crate) use rows::stored_statement_identity;
 pub use verify::{ATTEST_NAMESPACE, VerifiedStatement, verify_statement};
 
 /// Most statements one import may carry.

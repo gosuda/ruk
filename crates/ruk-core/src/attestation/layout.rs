@@ -59,6 +59,19 @@ pub(super) fn statement_key(subject: &Oid, kind: &str, signer: &str, digest: &[u
     key
 }
 
+/// True when `key` names a subject-major statement row rather than an order
+/// index row or an unknown family.
+pub(crate) fn is_statement_key(key: &[u8]) -> bool {
+    key.first() == Some(&STATEMENT_TAG)
+}
+
+/// True when `key` names an order index row. Index values carry the raw
+/// subject, so summaries skip them: the statement row staged beside every
+/// index row already reported the identity.
+pub(crate) fn is_order_key(key: &[u8]) -> bool {
+    key.first() == Some(&ORDER_TAG)
+}
+
 /// The order index rows of one kind.
 pub(super) fn order_kind_prefix(kind: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + kind.len() + 1);

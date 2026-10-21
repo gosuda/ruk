@@ -2174,6 +2174,29 @@ pub struct OpLogArgs {
     /// Paging state; absent starts at the newest operation.
     #[serde(default)]
     pub page: PageRequest,
+    /// Ascending cursor: only operations strictly after this id, oldest
+    /// first. Absent keeps the newest-first walk.
+    #[serde(default)]
+    pub after: Option<OperationId>,
+}
+
+/// One ref moved by an operation: the ref name plus its before and after
+/// targets. Recorded for lane (op-sourced) mutations from the operation's
+/// own ref deltas, so orchestration readers need no stream walk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpRefDelta {
+    pub name: RefName,
+    pub before: Option<RefTarget>,
+    pub after: Option<RefTarget>,
+}
+
+/// One attestation an operation recorded: the attested kind and subject.
+/// Recorded for lane (op-sourced) mutations from the operation's own
+/// attestation rows, so proof lists read subjects without a stream walk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpAttestationSubject {
+    pub kind: AttestKind,
+    pub subject: Oid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2188,6 +2211,12 @@ pub struct OperationEntry {
     /// Provenance the invoking call declared; never an authorization input.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// Per-op ref deltas, in delta order within the operation.
+    #[serde(default)]
+    pub ref_deltas: Vec<OpRefDelta>,
+    /// Attested (kind, subject) pairs this operation recorded, deduplicated.
+    #[serde(default)]
+    pub attestation_subjects: Vec<OpAttestationSubject>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

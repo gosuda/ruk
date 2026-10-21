@@ -640,6 +640,31 @@ struct OperationEntryV0 {
     undoes: Option<OperationId>,
 }
 
+/// Pre-summary operation entry: the [`OperationEntry`] shape before the
+/// trailing per-op `ref_deltas` and `attestation_subjects` fields.
+/// Decode-only, for rows written before summaries existed; they read back
+/// with empty summaries.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OperationEntryV1 {
+    id: OperationId,
+    parent: Option<OperationId>,
+    session: Option<SessionId>,
+    method: Method,
+    committed_at: Timestamp,
+    undoes: Option<OperationId>,
+    on_behalf_of: Option<String>,
+}
+
+/// Pre-summary operation header: part 0 with a [`OperationEntryV1`] entry.
+/// Decode-only, for rows written before summaries existed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OpHeaderV1 {
+    entry: OperationEntryV1,
+    deltas: u64,
+    stream_bytes: u64,
+    parts: u64,
+}
+
 /// Pre-provenance operation header: the [`OpHeader`] shape before the
 /// trailing entry field. Decode-only, for stores written before provenance
 /// existed.
@@ -708,6 +733,27 @@ pub(crate) fn decode_op_header(
         validate_op_header(store, id, &header)?;
         return Ok(header);
     }
+    if let Ok(old) = crate::store::decode("op header", b) {
+        let old: OpHeaderV1 = old;
+        let header = OpHeader {
+            entry: OperationEntry {
+                id: old.entry.id,
+                parent: old.entry.parent,
+                session: old.entry.session,
+                method: old.entry.method,
+                committed_at: old.entry.committed_at,
+                undoes: old.entry.undoes,
+                on_behalf_of: old.entry.on_behalf_of,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
+            },
+            deltas: old.deltas,
+            stream_bytes: old.stream_bytes,
+            parts: old.parts,
+        };
+        validate_op_header(store, id, &header)?;
+        return Ok(header);
+    }
     let old: OpHeaderV0 = match crate::store::decode("op header", b) {
         Ok(old) => old,
         Err(_) => return corrupt(store, "op header", "malformed op header"),
@@ -721,6 +767,8 @@ pub(crate) fn decode_op_header(
             committed_at: old.entry.committed_at,
             undoes: old.entry.undoes,
             on_behalf_of: None,
+            ref_deltas: Vec::new(),
+            attestation_subjects: Vec::new(),
         },
         deltas: old.deltas,
         stream_bytes: old.stream_bytes,
@@ -1164,6 +1212,8 @@ mod tests {
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
             on_behalf_of: None,
+            ref_deltas: Vec::new(),
+            attestation_subjects: Vec::new(),
         };
 
         // Zero deltas count rejected
@@ -1188,6 +1238,9 @@ mod tests {
     // Exact committed byte constants protecting v1 on-disk format compatibility.
     const GOLDEN_COORDINATOR_HEAD: &[u8] = &[0x00; 9];
     const GOLDEN_OP_HEADER: &[u8] = &[
+        1, 0, 1, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 0, 0, 0, 0, 0, 0, 1, 31, 1,
+    ];
+    const GOLDEN_OP_HEADER_V1: &[u8] = &[
         1, 0, 1, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 0, 0, 0, 0, 1, 31, 1,
     ];
     const GOLDEN_OP_HEADER_V0: &[u8] = &[
@@ -1251,6 +1304,8 @@ mod tests {
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
             on_behalf_of: None,
+            ref_deltas: Vec::new(),
+            attestation_subjects: Vec::new(),
         };
         let expected_header = OpHeader {
             entry: expected_entry,
@@ -1261,8 +1316,18 @@ mod tests {
         let decoded_header =
             decode_op_header(&store, OperationId(1), GOLDEN_OP_HEADER).expect("decode header");
         assert_eq!(decoded_header, expected_header);
+        assert_eq!(decoded_header.entry.ref_deltas, Vec::new());
+        assert_eq!(decoded_header.entry.attestation_subjects, Vec::new());
         let header_bytes = encode("op header", &expected_header).expect("encode header");
         assert_eq!(header_bytes.as_slice(), GOLDEN_OP_HEADER);
+
+        // The pre-summary shape decodes with empty summaries, never re-encodes
+        // to its own bytes: it is a compatibility source, not a format.
+        let decoded_v1 = decode_op_header(&store, OperationId(1), GOLDEN_OP_HEADER_V1)
+            .expect("decode v1 header");
+        assert_eq!(decoded_v1, expected_header);
+        assert_eq!(decoded_v1.entry.ref_deltas, Vec::new());
+        assert_eq!(decoded_v1.entry.attestation_subjects, Vec::new());
 
         let decoded_v0 = decode_op_header(&store, OperationId(1), GOLDEN_OP_HEADER_V0)
             .expect("decode v0 header");

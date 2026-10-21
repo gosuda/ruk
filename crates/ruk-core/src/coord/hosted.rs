@@ -2160,13 +2160,19 @@ impl HostedCoordinator {
     }
 
     /// Reads one operation-log page newest-first, paging through a lease.
+    ///
+    /// With `after`, delegates to the ascending reader: same lease binding,
+    /// oldest-first strictly after the cursor.
     fn read_oplog_page(
         &self,
         viewer: SessionId,
         args: &OpLogArgs,
         now: StdInstant,
     ) -> Result<OpLogReply, CoreError> {
-        let query = oplog_query_digest(args.session);
+        if let Some(after) = args.after {
+            return self.read_oplog_page_ascending(viewer, args, after, now);
+        }
+        let query = oplog_query_digest(args.session, None);
         let limit = args.page.effective_limit();
         let Some(cursor) = args.page.cursor.as_ref() else {
             let head = match self.store.fact(FactTable::OpHead, OP_HEAD_KEY)? {
@@ -2247,6 +2253,131 @@ impl HostedCoordinator {
             entries: Page::new(entries, Some(next))?,
         })
     }
+
+    /// Reads one operation-log page oldest-first strictly after `after`.
+    ///
+    /// Consistency: one store view per page; the head bound, headers, and
+    /// session filter all read the same snapshot, and a head that advanced
+    /// since the first page fails the lease binding instead of mixing views.
+    /// Consumers stay idempotent across retries: resuming from the returned
+    /// cursor continues after the last scanned id, so a retried page
+    /// overlaps rather than skipping.
+    ///
+    /// Pruning reports through `E_STALE` on a pruned first-page `after`,
+    /// never through `oldest_retained`: ascending pages leave that field
+    /// empty. A resumed position tolerates prefix pruning by skipping
+    /// missing headers, since a forward-moving position cannot be stranded
+    /// behind the retention boundary.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::EInvalid`] for a malformed continuation position.
+    /// - [`ErrorCode::EStale`] for a first-page `after` the retention
+    ///   boundary pruned.
+    /// - [`ErrorCode::EForbidden`] for a stale view or cursor binding mismatch.
+    /// - [`ErrorCode::ELeaseLost`] for an unknown, retired, or expired lease.
+    fn read_oplog_page_ascending(
+        &self,
+        viewer: SessionId,
+        args: &OpLogArgs,
+        after: OperationId,
+        now: StdInstant,
+    ) -> Result<OpLogReply, CoreError> {
+        let query = oplog_query_digest(args.session, Some(after));
+        let limit = args.page.effective_limit();
+        let head = match self.store.fact(FactTable::OpHead, OP_HEAD_KEY)? {
+            Some(bytes) => decode_head(&self.store, &bytes)?,
+            None => CoordinatorHead::default(),
+        };
+        let view = ViewInfo {
+            store: self.store.store_id(),
+            view: head.last_op.unwrap_or(OperationId(0)),
+        };
+        let Some(cursor) = args.page.cursor.as_ref() else {
+            let Some(start) = after.0.checked_add(1) else {
+                return Ok(OpLogReply {
+                    view,
+                    oldest_retained: None,
+                    entries: Page::new(Vec::new(), None)?,
+                });
+            };
+            let (entries, scanned, exhausted) = walk_oplog_page_ascending(
+                &self.store,
+                head.last_op,
+                start,
+                true,
+                args.session,
+                limit,
+            )?;
+            if exhausted {
+                return Ok(OpLogReply {
+                    view,
+                    oldest_retained: None,
+                    entries: Page::new(entries, None)?,
+                });
+            }
+            let position =
+                encode_oplog_position(scanned.expect("non-exhausted ascending page scanned an id"));
+            let next = self.mint_read_lease(viewer, view.view, query, &position, now)?;
+            return Ok(OpLogReply {
+                view,
+                oldest_retained: None,
+                entries: Page::new(entries, Some(next))?,
+            });
+        };
+        // Malformed positions stay E_INVALID even against a dead lease.
+        if cursor.position.len() != 8 {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "op.log continuation position must be 8 bytes",
+            ));
+        }
+        let resumed = decode_oplog_position(cursor.position.as_bytes())?;
+        let start = resumed.0.saturating_add(1);
+        let view_before = current_view(&self.store)?;
+        let want = CursorWant {
+            store: self.store.store_id(),
+            session: viewer,
+            view: view_before.view,
+            query,
+        };
+        self.leases.check_cursor(cursor, &want, now)?;
+        let (entries, scanned, exhausted) = walk_oplog_page_ascending(
+            &self.store,
+            head.last_op,
+            start,
+            false,
+            args.session,
+            limit,
+        )?;
+        let view_after = current_view(&self.store)?;
+        if view_after.view != cursor.view {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "op.log cursor names a stale view: open a fresh first page",
+            ));
+        }
+        if exhausted {
+            return Ok(OpLogReply {
+                view: view_after,
+                oldest_retained: None,
+                entries: Page::new(entries, None)?,
+            });
+        }
+        let position =
+            encode_oplog_position(scanned.expect("non-exhausted ascending page scanned an id"));
+        let next = PageCursor {
+            store: cursor.store,
+            view: cursor.view,
+            query: cursor.query,
+            lease: cursor.lease,
+            position: ByteString::from(position),
+        };
+        Ok(OpLogReply {
+            view: view_after,
+            oldest_retained: None,
+            entries: Page::new(entries, Some(next))?,
+        })
+    }
 }
 
 fn claim_query_digest(holder: ClaimHolderFilter) -> QueryDigest {
@@ -2291,14 +2422,21 @@ fn attest_query_digest(args: &AttestListArgs) -> QueryDigest {
     QueryDigest::from_bytes(hasher.finalize().into())
 }
 
-fn oplog_query_digest(session: Option<SessionId>) -> QueryDigest {
+fn oplog_query_digest(session: Option<SessionId>, after: Option<OperationId>) -> QueryDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"ruk.op.log/v1\x00");
+    hasher.update(b"ruk.op.log/v2\x00");
     match session {
         None => hasher.update([0x00]),
         Some(id) => {
             hasher.update([0x01]);
             hasher.update(id.as_bytes());
+        }
+    }
+    match after {
+        None => hasher.update([0x00]),
+        Some(id) => {
+            hasher.update([0x01]);
+            hasher.update(id.0.to_be_bytes());
         }
     }
     QueryDigest::from_bytes(hasher.finalize().into())
@@ -2359,6 +2497,76 @@ fn walk_oplog_page(
         }
     }
     Ok((entries, None, oldest, true))
+}
+
+/// One bounded ascending `op.log` scan: entries, last examined id, and end flag.
+type AscendingOplogPage = (
+    Vec<crate::protocol::OperationEntry>,
+    Option<OperationId>,
+    bool,
+);
+
+/// Walks one bounded `op.log` scan from `start` toward `end` oldest-first.
+///
+/// Visits at most `MAX_PAGE_SIZE` headers and collects at most `limit`
+/// matching entries; a short page returns a resume id. The resume position
+/// is the last examined id whether or not its header survived, so a page
+/// over a pruned range still advances instead of stalling. Operation ids
+/// are dense outside the pruned prefix, so on a first page (`strict_gap`)
+/// a gap below the first existing header means the cursor predates
+/// retention and fails `E_STALE`. Resumes skip missing headers instead:
+/// prefix pruning cannot strand a forward-moving position.
+///
+/// # Errors
+/// `E_STALE` when `strict_gap` holds and the first existing header sits
+/// above `start`. `E_CORRUPT` for a damaged header row.
+fn walk_oplog_page_ascending(
+    store: &Store,
+    end: Option<OperationId>,
+    start: u64,
+    strict_gap: bool,
+    filter: Option<SessionId>,
+    limit: usize,
+) -> Result<AscendingOplogPage, CoreError> {
+    let mut entries = Vec::new();
+    let mut scanned: Option<OperationId> = None;
+    let mut found_any = false;
+    let mut visited = 0usize;
+    let Some(end) = end else {
+        return Ok((entries, None, true));
+    };
+    if start > end.0 {
+        return Ok((entries, None, true));
+    }
+    let mut id = start;
+    loop {
+        if entries.len() >= limit || visited >= MAX_PAGE_SIZE {
+            return Ok((entries, scanned, false));
+        }
+        visited += 1;
+        let current = OperationId(id);
+        scanned = Some(current);
+        match read_header(store, current)? {
+            Some(header) => {
+                found_any = true;
+                if filter.is_none_or(|want| header.entry.session == Some(want)) {
+                    entries.push(header.entry);
+                }
+            }
+            None => {
+                if strict_gap && !found_any && entries.is_empty() {
+                    return Err(CoreError::new(
+                        ErrorCode::EStale,
+                        "op.log `after` cursor was pruned: open a fresh first page",
+                    ));
+                }
+            }
+        }
+        if id == end.0 {
+            return Ok((entries, scanned, true));
+        }
+        id += 1;
+    }
 }
 
 impl HostedCoordinator {
@@ -4774,6 +4982,7 @@ mod tests {
             error_code: None,
             error_message: None,
             at: now_millis - 3_600_000,
+            operation_ids: Vec::new(),
         };
         store_service_receipt(coord.store(), 1000, b"/repo", "req-old", &receipt)
             .expect("seed service receipt");
@@ -5232,6 +5441,7 @@ mod tests {
         let limit = PageLimit::new(2).expect("page limit 2");
         let args = OpLogArgs {
             session: None,
+            after: None,
             page: PageRequest {
                 limit: Some(limit),
                 cursor: None,
@@ -5250,6 +5460,7 @@ mod tests {
         let cursor = first.entries.next.clone().expect("first page continues");
         let args = OpLogArgs {
             session: None,
+            after: None,
             page: PageRequest {
                 limit: Some(limit),
                 cursor: Some(cursor),
@@ -5266,6 +5477,219 @@ mod tests {
         assert!(second.entries.next.is_none());
         assert!(second.oldest_retained.is_some());
         assert_ne!(second.entries.items[0].id, first.entries.items[0].id);
+        coord.shutdown();
+        runner.abort();
+    }
+
+    /// Submits one `attest.add` through the lane so the operation log
+    /// records it with its attested subject.
+    async fn publish_attestation(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        subject: Oid,
+        cancel: &Cancel,
+    ) {
+        let statement = AttestStatement {
+            subject,
+            kind: AttestKind::new("review").expect("kind"),
+            result: AttestResult::new("pass").expect("result"),
+            signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
+            supersedes: None,
+        };
+        let args = sign_statement(&attest_key(), statement);
+        let request = Request::AttestAdd(Box::new(WireMutation {
+            request_id: RequestId::generate(),
+            args,
+        }));
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let prepared = match coord
+            .prepare_for_dispatch(session, request, &checkpoint, None)
+            .expect("attest.add prepares")
+        {
+            DispatchReady::Replay(reply) => {
+                panic!("distinct attestations must not replay: {reply:?}")
+            }
+            DispatchReady::Prepared(prepared) => *prepared,
+        };
+        let reply = coord
+            .submit_prepared(owner, prepared, cancel)
+            .await
+            .expect("attest.add publishes");
+        assert!(
+            matches!(reply, Reply::AttestAdd(_)),
+            "attest.add must answer its own reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn oplog_ascending_after_returns_oldest_first_with_summaries() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        publish_tag(&coord, &owner, session, "refs/tags/a1", &cancel).await;
+        publish_tag(&coord, &owner, session, "refs/tags/a2", &cancel).await;
+        let subject = publish_commit(
+            coord.store(),
+            b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nsubject\n",
+        );
+        publish_attestation(&coord, &owner, session, subject, &cancel).await;
+        let limit = PageLimit::new(1).expect("page limit 1");
+        let args = OpLogArgs {
+            session: None,
+            after: Some(OperationId(1)),
+            page: PageRequest {
+                limit: Some(limit),
+                cursor: None,
+            },
+        };
+        let reply = coord
+            .read(&owner, session, Request::OpLog(Box::new(args)), &cancel)
+            .await
+            .expect("ascending first page");
+        let Reply::OpLog(first) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        assert_eq!(first.oldest_retained, None);
+        let ids: Vec<u64> = first.entries.items.iter().map(|entry| entry.id.0).collect();
+        assert_eq!(
+            ids,
+            vec![2],
+            "ascending pages start strictly after the cursor"
+        );
+        let cursor = first
+            .entries
+            .next
+            .clone()
+            .expect("ascending page continues");
+        let tag_entry = &first.entries.items[0];
+        assert_eq!(tag_entry.method, Method::TagSet);
+        assert_eq!(tag_entry.ref_deltas.len(), 1);
+        assert_eq!(
+            tag_entry.ref_deltas[0].name.as_bytes(),
+            b"refs/tags/a2",
+            "the tag op names its moved ref"
+        );
+        assert!(tag_entry.ref_deltas[0].after.is_some());
+        assert!(tag_entry.attestation_subjects.is_empty());
+        let args = OpLogArgs {
+            session: None,
+            after: Some(OperationId(1)),
+            page: PageRequest {
+                limit: Some(limit),
+                cursor: Some(cursor),
+            },
+        };
+        let reply = coord
+            .read(&owner, session, Request::OpLog(Box::new(args)), &cancel)
+            .await
+            .expect("ascending resume");
+        let Reply::OpLog(second) = reply else {
+            panic!("op.log must answer its own reply");
+        };
+        assert!(second.entries.next.is_none());
+        let ids: Vec<u64> = second
+            .entries
+            .items
+            .iter()
+            .map(|entry| entry.id.0)
+            .collect();
+        assert_eq!(ids, vec![3], "the resume continues oldest-first");
+        let attest_entry = &second.entries.items[0];
+        assert_eq!(attest_entry.method, Method::AttestAdd);
+        assert_eq!(attest_entry.attestation_subjects.len(), 1);
+        assert_eq!(attest_entry.attestation_subjects[0].subject, subject);
+        assert_eq!(attest_entry.attestation_subjects[0].kind.as_str(), "review");
+        coord.shutdown();
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn oplog_ascending_after_pruned_fails_stale() {
+        use crate::coord::rows::op_key;
+
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        publish_tag(&coord, &owner, session, "refs/tags/p1", &cancel).await;
+        // Simulate a pruned prefix: the oldest header row is gone while the
+        // head still covers it, so a cursor below the survivor is stale.
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Ops,
+                    key: op_key(OperationId(1), 0).to_vec(),
+                    expected: FactExpectation::Any,
+                    value: None,
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("drop pruned header");
+        let args = OpLogArgs {
+            session: None,
+            after: Some(OperationId(0)),
+            page: PageRequest {
+                limit: None,
+                cursor: None,
+            },
+        };
+        let err = coord
+            .read(&owner, session, Request::OpLog(Box::new(args)), &cancel)
+            .await
+            .expect_err("pruned ascending cursor is stale");
+        assert_eq!(err.code, ErrorCode::EStale);
+        coord.shutdown();
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn undo_of_journaled_attestation_refuses_without_corruption() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let subject = publish_commit(
+            coord.store(),
+            b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\nundo subject\n",
+        );
+        publish_attestation(&coord, &owner, session, subject, &cancel).await;
+        let request = Request::Undo(Box::new(WireMutation {
+            request_id: RequestId::generate(),
+            args: UndoArgs {
+                operation: OperationId(1),
+            },
+        }));
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let err = match coord.prepare_for_dispatch(session, request, &checkpoint, None) {
+            Ok(_) => panic!("undo of an attestation op must refuse"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, ErrorCode::EUndoConflict);
+        assert!(
+            !err.message.contains("corrupt"),
+            "the refusal is policy, not corruption: {}",
+            err.message
+        );
         coord.shutdown();
         runner.abort();
     }
@@ -5366,6 +5790,7 @@ mod tests {
                 first,
                 Request::OpLog(Box::new(OpLogArgs {
                     session: None,
+                    after: None,
                     page: PageRequest {
                         limit: Some(limit),
                         cursor: None,
@@ -5385,6 +5810,7 @@ mod tests {
                 second,
                 Request::OpLog(Box::new(OpLogArgs {
                     session: None,
+                    after: None,
                     page: PageRequest {
                         limit: Some(limit),
                         cursor: Some(log_cursor),
@@ -5459,6 +5885,7 @@ mod tests {
                 session,
                 Request::OpLog(Box::new(OpLogArgs {
                     session: None,
+                    after: None,
                     page: PageRequest {
                         limit: Some(limit),
                         cursor: None,
@@ -5511,6 +5938,7 @@ mod tests {
                 session,
                 Request::OpLog(Box::new(OpLogArgs {
                     session: None,
+                    after: None,
                     page: PageRequest {
                         limit: Some(limit),
                         cursor: Some(log_cursor),
@@ -5654,6 +6082,7 @@ mod tests {
                 session,
                 Request::OpLog(Box::new(OpLogArgs {
                     session: None,
+                    after: None,
                     page: PageRequest {
                         limit: None,
                         cursor: Some(bad),

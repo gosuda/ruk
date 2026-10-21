@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use crate::change::OperationId;
-use crate::coord::oplog::{OpDeltaReader, read_header, tracked};
+use crate::coord::oplog::{OpDeltaReader, journaled, read_header, undoable};
 use crate::coord::rows::{OpHeader, fact_table_from_name};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Method, Request, UndoSummary};
@@ -60,13 +60,16 @@ pub(crate) fn undone_operation(request: &Request) -> Option<OperationId> {
 
 /// Builds the inverse of `operation` from its stored deltas.
 ///
+/// The inverse holds one store view: deltas, expectations, and the ref
+/// transaction all derive from the same committed snapshot.
+///
 /// # Errors
 /// - [`ErrorCode::ENotFound`] when the operation is not retained (never
 ///   committed, or pruned).
 /// - [`ErrorCode::EUndoConflict`] for methods whose effects lie outside the
-///   tracked tables, and for a key that no longer holds the value the operation
-///   left.
-/// - [`ErrorCode::ECorrupt`] for a delta naming an unknown or untracked table.
+///   undoable tables, for a journaled-but-not-undoable delta, and for a key
+///   that no longer holds the value the operation left.
+/// - [`ErrorCode::ECorrupt`] for a delta naming an unknown or unjournaled table.
 /// - Store and stream decoding failures.
 pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<UndoPlan, CoreError> {
     let header = read_header(store, operation)?.ok_or_else(|| {
@@ -257,7 +260,12 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
     ))
 }
 
-/// Resolves a stored table name to a tracked table, refusing anything else.
+/// Resolves a stored table name to an undoable table, refusing anything else.
+///
+/// Journaled-but-not-undoable tables (`Claims`, `Attestations`, `PushPlans`,
+/// `LandPlans`) refuse with `E_UNDO_CONFLICT`: their rows name real operation
+/// state, so failing to invert them is a policy refusal, never corruption.
+/// Anything outside the journaled set is committed damage.
 fn inverse_table(name: &str) -> Result<FactTable, CoreError> {
     let table = fact_table_from_name(name).ok_or_else(|| {
         CoreError::new(
@@ -265,13 +273,19 @@ fn inverse_table(name: &str) -> Result<FactTable, CoreError> {
             format!("operation names unknown table `{name}`"),
         )
     })?;
-    if !tracked(table) {
+    if undoable(table) {
+        return Ok(table);
+    }
+    if journaled(table) {
         return Err(CoreError::new(
-            ErrorCode::ECorrupt,
-            format!("operation names untracked table `{name}`"),
+            ErrorCode::EUndoConflict,
+            format!("operation names journaled table `{name}` that undo cannot invert"),
         ));
     }
-    Ok(table)
+    Err(CoreError::new(
+        ErrorCode::ECorrupt,
+        format!("operation names unjournaled table `{name}`"),
+    ))
 }
 
 /// Refuses the undo when it would restore a workspace row.
@@ -491,7 +505,10 @@ mod tests {
     #[test]
     fn undo_refuses_operations_with_effects_outside_tracked_tables() {
         let fixture = Fixture::new("fetch");
-        let id = fixture.record(Method::Fetch, &[ref_set(b"refs/remotes/origin/main", b"x")]);
+        let id = fixture.record(
+            Method::Fetch,
+            &[ref_set(b"refs/remotes/origin/main", &ref_target(4))],
+        );
         let err = prepare_undo(&fixture.store, id).expect_err("fetch cannot be inverted");
         assert_eq!(err.code, ErrorCode::EUndoConflict);
         assert!(
@@ -504,12 +521,16 @@ mod tests {
     #[test]
     fn undo_refuses_a_key_that_moved_since_the_operation() {
         let fixture = Fixture::new("diverged");
-        let id = fixture.record(Method::BookmarkSet, &[ref_set(b"refs/heads/main", b"new")]);
+        let created = ref_target(5);
+        let id = fixture.record(
+            Method::BookmarkSet,
+            &[ref_set(b"refs/heads/main", &created)],
+        );
         let moved = FactMutation {
             table: FactTable::Refs,
             key: b"refs/heads/main".to_vec(),
-            expected: FactExpectation::Value(b"new".to_vec()),
-            value: Some(b"later".to_vec()),
+            expected: FactExpectation::Value(created),
+            value: Some(ref_target(6)),
         };
         fixture
             .store
