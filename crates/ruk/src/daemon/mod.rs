@@ -2497,6 +2497,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     });
     drop(policy);
     tokio::pin!(serve);
+    let mut deliver = true;
     let outcome: Result<(Vec<u8>, Vec<u64>), CoreError> = loop {
         tokio::select! {
             done = &mut serve => {
@@ -2507,7 +2508,11 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
             }
             frame = input.recv() => {
                 let Some(frame) = frame else {
-                    return;
+                    deliver = false;
+                    break match serve.await {
+                        Ok(inner) => inner,
+                        Err(err) => Err(err),
+                    };
                 };
                 match frame.kind {
                     ipc::FrameKind::Cancel => {
@@ -2584,6 +2589,9 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
             let _ = send_error_exit(sink, &store_err).await;
             return;
         }
+    }
+    if !deliver {
+        return;
     }
     match write_typed_chunks(sink, input, credits, cancel_guard, &out).await {
         TypedWriteFate::Done => {}

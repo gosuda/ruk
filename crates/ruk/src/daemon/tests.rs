@@ -7,6 +7,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3793,6 +3794,90 @@ async fn concurrent_same_request_id_executes_once_and_replays() {
 
     first_task.abort();
     second_task.abort();
+}
+
+#[tokio::test]
+async fn host_disconnect_mid_publish_still_records_receipt() {
+    let root = temp_root("host-gone");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (pack, commit) = hosted_chain_pack(23);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let peer_uid = driver.conn.peer_cred().expect("peer credentials").uid();
+    let session = open_push_session(&mut driver, &store_repo, &["refs/heads/**"]).await;
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!(
+        "{zero} {commit} refs/heads/gone\n",
+        commit = commit.to_hex()
+    )
+    .as_bytes());
+    body.extend_from_slice(&flush());
+    body.extend_from_slice(&pack);
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-hosted-gone-1"),
+    );
+    driver.send(FrameKind::Open, 5, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    driver.send(FrameKind::Stdin, 5, &body).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 5, &[]).await;
+    loop {
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, 5);
+        match frame.kind {
+            FrameKind::HookCall => {
+                let call: HookCall =
+                    ipc::decode_control(&frame.payload).expect("hook call decodes");
+                assert_eq!(call.phase, HookPhase::PreReceive);
+                let reply = accept_all(&call).expect("hook reply answered");
+                let bytes = ipc::encode_control(&reply).expect("hook reply encodes");
+                driver.send(FrameKind::HookReply, 5, &bytes).await;
+                break;
+            }
+            FrameKind::Exit | FrameKind::Error => panic!("push ended before the hook answered"),
+            _ => {}
+        }
+    }
+    drop(driver);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, canonical, coordinator) = registry.open(&store_repo).expect("open coordinator");
+        let landed = ruk_core::refs::StoreRefs::new(coordinator.store())
+            .get(&RefName::new("refs/heads/gone".to_string()).expect("ref name"))
+            .expect("read ref");
+        let receipt = ruk_core::coord::service_receipts::lookup_service_receipt(
+            coordinator.store(),
+            peer_uid,
+            canonical.as_os_str().as_bytes(),
+            "req-hosted-gone-1",
+        )
+        .expect("read receipt");
+        if landed == Some(RefTarget::Direct(commit)) && receipt.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the publish completes and a receipt is recorded after disconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    task.abort();
 }
 
 #[tokio::test]
