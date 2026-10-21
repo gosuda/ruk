@@ -291,17 +291,14 @@ impl Registry {
             .unwrap_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository path is unknown")))
     }
 
-    /// Resolves `requested` to the pinned store directory. `requested` can
-    /// be the repository root, which holds its store in `.ruk`, or the
-    /// store directory itself.
+    /// Resolves `requested` to the pinned store directory. A `.ruk` child
+    /// marks `requested` as a repository root whose store sits inside it;
+    /// its absence means `requested` is already the store.
     ///
     /// # Errors
     /// As for [`Registry::resolve_pinned`].
     fn store_pinned(&self, requested: &Path) -> Result<ruk_core::contained::PinnedDir, CoreError> {
         let pinned = self.resolve_pinned(requested)?;
-        if pinned.path().file_name().is_some_and(|name| name == ".ruk") {
-            return Ok(pinned);
-        }
         let store = pinned.path().join(".ruk");
         if store.is_dir() {
             drop(pinned);
@@ -1682,6 +1679,28 @@ mod tests {
                 .join("new-child")
         );
         assert!(registry.resolve(&fresh).is_err());
+    }
+
+    #[test]
+    fn store_pinned_descends_into_a_repository_named_dot_ruk() {
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let created = registry
+            .create_repo(&init_args(&root, "team/.ruk"))
+            .expect("init creates a repository named .ruk");
+        let pinned = registry
+            .store_pinned(std::path::Path::new(&created.path))
+            .expect("repository root resolves to its store");
+        assert_eq!(
+            pinned.path(),
+            canonical.join("team/.ruk/.ruk").as_path(),
+            "the .ruk store inside the repository wins"
+        );
+        let direct = registry
+            .store_pinned(&canonical.join("team/.ruk/.ruk"))
+            .expect("a store path resolves to itself");
+        assert_eq!(direct.path(), pinned.path());
     }
 
     #[cfg(target_os = "linux")]
