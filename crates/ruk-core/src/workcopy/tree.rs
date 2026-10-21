@@ -52,13 +52,6 @@ impl TreeMode {
     }
 
     /// A blob-backed entry: regular, executable, or symlink.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "unwired snapshot path; consumers land in later changeset rows"
-        )
-    )]
     #[must_use]
     pub(crate) fn is_blob(self) -> bool {
         matches!(
@@ -137,13 +130,6 @@ pub(crate) fn parse_tree(kind: HashKind, mut bytes: &[u8]) -> Result<Vec<TreeIte
 
 /// One `ws_dirs` row: a directory's tree id and its entries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) struct DirRow {
     pub(crate) tree: Oid,
     pub(crate) items: Vec<TreeItem>,
@@ -153,26 +139,12 @@ pub(crate) struct DirRow {
 /// verified store reads. A cache row is used only when its tree id equals
 /// the id being read.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) struct Dirs<'s> {
     store: &'s Store,
     workspace: WorkspaceId,
     loaded: HashMap<Oid, Arc<[TreeItem]>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 impl<'s> Dirs<'s> {
     #[must_use]
     pub(crate) fn new(store: &'s Store, workspace: WorkspaceId) -> Self {
@@ -307,38 +279,17 @@ impl<'s> Dirs<'s> {
 
 /// The new state of one changed path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) enum Leaf {
     File { mode: FileMode, blob: Oid },
     Absent,
 }
 
 #[derive(Default)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 struct Node {
     leaf: Option<Leaf>,
     children: BTreeMap<Vec<u8>, Node>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 impl Node {
     /// Inserts a leaf. A file leaf replaces everything below it, and a path
     /// below a file leaf is dropped: nothing can exist beneath a file. An
@@ -361,13 +312,6 @@ impl Node {
 
 /// The result of one rebuild.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) struct Rebuilt {
     pub(crate) root: Oid,
     /// New tree objects, deduplicated by id.
@@ -386,13 +330,6 @@ pub(crate) struct Rebuilt {
 /// # Errors
 /// Tree read failures, `E_CAPACITY`/`E_LIMIT` from preparation, and
 /// `E_OBJECT_FORMAT` for a leaf of the wrong hash width.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) fn rebuild(
     dirs: &mut Dirs<'_>,
     base: Oid,
@@ -428,13 +365,6 @@ pub(crate) fn rebuild(
     Ok(out)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 fn rebuild_dir(
     dirs: &mut Dirs<'_>,
     node: &Node,
@@ -486,13 +416,6 @@ fn rebuild_dir(
 
 /// Rebuilds the subdirectory `name` of `dir` from its base entry: a tree is
 /// the base, anything else (a file being replaced, nothing) starts empty.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 fn rebuild_child(
     dirs: &mut Dirs<'_>,
     child: &Node,
@@ -516,13 +439,6 @@ fn rebuild_child(
     Ok(sub?.map(|oid| (TreeMode::Tree, oid)))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 fn child_path(dir: &[u8], name: &[u8]) -> Vec<u8> {
     let mut path = dir.to_vec();
     if !path.is_empty() {
@@ -534,13 +450,6 @@ fn child_path(dir: &[u8], name: &[u8]) -> Vec<u8> {
 
 /// Encodes one directory; prepares the object and records its `ws_dirs` row
 /// only when the id differs from `base`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot path; consumers land in later changeset rows"
-    )
-)]
 fn write_tree(
     dirs: &mut Dirs<'_>,
     dir: &[u8],

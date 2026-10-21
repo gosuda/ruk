@@ -3497,7 +3497,8 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
     assert!(attest.records.items.is_empty());
     assert!(attest.records.next.is_none());
 
-    // A read outside the covered subset names its missing implementation.
+    // `status` is now served: without a workspace it names the missing
+    // workspace instead of a missing implementation.
     let payload = Driver::typed_open(
         &repo,
         "status",
@@ -3506,9 +3507,9 @@ async fn typed_dispatch_serves_covered_read_and_mutation() {
         Some(&session),
     );
     let (report, _) = driver.expect_typed_refused(23, &payload).await;
-    assert_eq!(report.code.as_str(), "E_HOSTED");
+    assert_eq!(report.code.as_str(), "E_INVALID");
     assert!(
-        report.message.contains("autosnapshot"),
+        report.message.contains("explicit native workspace"),
         "unexpected message: {}",
         report.message
     );

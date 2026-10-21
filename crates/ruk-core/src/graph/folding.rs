@@ -24,19 +24,11 @@ use crate::graph::segment::{GraphSegment, GraphSegmentWriter, StagedCommit};
 use crate::graph::types::{GlobalPosition, LocalPosition, MAX_GRAPH_POSITIONS};
 use crate::ids::HashKind;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[must_use]
 pub(crate) fn should_fold(child_commits: u32, parent_commits: u32) -> bool {
     (child_commits as u64).saturating_mul(2) >= (parent_commits as u64)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[must_use]
 pub(crate) fn select_folding_chain(
     child_segment: &Arc<GraphSegment>,
@@ -62,10 +54,6 @@ pub(crate) fn select_folding_chain(
     (segments_to_fold, base_parent)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) fn fold_segments(
     segments_oldest_first: &[Arc<GraphSegment>],
     base_parent: Option<&Arc<GraphSegment>>,

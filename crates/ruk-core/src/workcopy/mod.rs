@@ -31,39 +31,11 @@
 //! to edits that forge or exactly reproduce the tuple; explicit
 //! [`write::write`] hashes bytes and is the remedy.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired subsystem; consumers land in later changeset rows"
-    )
-)]
 pub(crate) mod crawl;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired subsystem; consumers land in later changeset rows"
-    )
-)]
 pub(crate) mod ingest;
 pub(crate) mod journal_state;
 pub(crate) mod lfs;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired subsystem; consumers land in later changeset rows"
-    )
-)]
 pub(crate) mod snapshot;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired subsystem; consumers land in later changeset rows"
-    )
-)]
 pub(crate) mod statcache;
 pub(crate) mod tree;
 #[cfg_attr(
@@ -97,54 +69,19 @@ use crate::{CoreError, WorkspaceId};
 
 /// The workspace-internal directory at the worktree root. It and everything
 /// below it are never snapshotted, crawled, or reported.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) const INTERNAL_DIR: &[u8] = b".ruk";
 
 /// Fact-page bounds for prefix scans of the workspace cache tables.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 const PAGE_ROWS: usize = 4096;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 const PAGE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Maps an I/O failure to `E_IO` with what was being done.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) fn io_error(doing: &str, err: &std::io::Error) -> CoreError {
     CoreError::new(crate::ErrorCode::EIo, format!("{doing}: {err}"))
 }
 
 /// Whether `path` (relative, `/`-separated) names the internal directory or
 /// anything inside it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) fn is_internal(path: &[u8]) -> bool {
     path == INTERNAL_DIR
         || (path.len() > INTERNAL_DIR.len()
@@ -154,13 +91,6 @@ pub(crate) fn is_internal(path: &[u8]) -> bool {
 
 /// Whether `path` is in a cone scope either as a file or as a directory the
 /// scope descends into.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) fn in_scope(scope: &Scope, path: &RepoPath) -> bool {
     scope.includes_file(path) || scope.includes_dir(path)
 }
@@ -171,13 +101,6 @@ pub(crate) fn in_scope(scope: &Scope, path: &RepoPath) -> bool {
 /// # Errors
 /// [`CoreModelError::Invalid`] when the result is not a valid [`RepoPath`]
 /// (a `.git` component, an empty or dot component, a NUL byte).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) fn join(dir: &[u8], name: &[u8]) -> Result<RepoPath, CoreModelError> {
     let mut bytes = Vec::with_capacity(dir.len() + 1 + name.len());
     if !dir.is_empty() {
@@ -190,13 +113,6 @@ pub(crate) fn join(dir: &[u8], name: &[u8]) -> Result<RepoPath, CoreModelError> 
 
 /// The cache key of `path` (a file path for `ws_status`, a directory path
 /// for `ws_dirs`; empty for the meta row or the root directory).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) fn cache_key(workspace: WorkspaceId, path: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(16 + path.len());
     key.extend_from_slice(workspace.as_bytes());
@@ -209,13 +125,6 @@ pub(crate) fn cache_key(workspace: WorkspaceId, path: &[u8]) -> Vec<u8> {
 ///
 /// # Errors
 /// Store failures, including quarantine.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) fn scan_prefix(
     store: &Store,
     table: FactTable,
@@ -253,13 +162,6 @@ type FactSetRows = BTreeMap<(FactTable, Vec<u8>), (FactExpectation, Option<Vec<u
 /// Mutations keyed by table and key, so a publication never names one key
 /// twice. A later insertion for the same key replaces the earlier one.
 #[derive(Default)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) struct FactSet(FactSetRows);
 
 impl fmt::Debug for FactSet {
@@ -302,26 +204,12 @@ impl FactSet {
 
 /// Decides which untracked paths a snapshot leaves out. Tracked paths (in
 /// the base tree) are never ignored, and explicit write never consults it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) trait IgnoreRule: Sync + fmt::Debug {
     fn is_ignored(&self, path: &RepoPath) -> bool;
 }
 
 /// Ignores nothing: every untracked in-scope file is snapshotted.
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired snapshot/write path; consumers land in later changeset rows"
-    )
-)]
 pub(crate) struct NoIgnore;
 
 impl IgnoreRule for NoIgnore {

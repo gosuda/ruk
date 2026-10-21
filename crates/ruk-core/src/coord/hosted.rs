@@ -66,12 +66,18 @@ use crate::attestation::Checkpoint;
 use crate::capability::{Capabilities, ReadAccess};
 use crate::change::{LeaseId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
+use crate::heads::Head;
+use crate::ids::Oid;
 use crate::protocol::{
-    AttestListArgs, AttestListReply, ClaimHolderFilter, ClaimListArgs, ClaimListReply,
-    DEFAULT_PAGE_SIZE, EventsTailArgs, EventsTailReply, KeysetPage, MAX_PAGE_SIZE, Method,
-    OpLogArgs, OpLogReply, Page, PageCursor, PageLimit, QueryDigest, ReconnectSecret, RefsListArgs,
-    RefsListReply, Reply, Request, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
-    SessionResumeReply, TailedEvent, Timestamp, ViewInfo,
+    AttestListArgs, AttestListReply, BlameArgs, BlameHunk, BlameReply, ChangeHead,
+    ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitSummary, DEFAULT_PAGE_SIZE, DiffArgs,
+    DiffBlob, DiffBody, DiffKind, DiffReply, EventsTailArgs, EventsTailReply, FileArgs, FileBody,
+    FileDiff, FileReply, KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs,
+    OpLogReply, Page, PageCursor, PageLimit, PathChangeKind, PathSelection, PathStatus, QueryArgs,
+    QueryDigest, QueryMatch, QueryReply, ReconnectSecret, RefsListArgs, RefsListReply, Reply,
+    Request, RevisionRef, SessionAuthority, SessionOpenArgs, SessionResumeArgs, SessionResumeReply,
+    ShowArgs, ShowBody, ShowReply, ShowTarget, SnapshotPolicy, StatusArgs, StatusReply,
+    TailedEvent, Timestamp, TreeEntry, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
@@ -178,6 +184,15 @@ impl core::fmt::Debug for HostedCoordinator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("HostedCoordinator").finish_non_exhaustive()
     }
+}
+
+/// One directory listing target: the tree, its format, and the path
+/// that selected it.
+#[derive(Clone, Debug)]
+struct DirTarget {
+    root: Oid,
+    kind: crate::ids::HashKind,
+    path: Option<crate::index::RepoPath>,
 }
 
 impl HostedCoordinator {
@@ -558,11 +573,12 @@ impl HostedCoordinator {
     /// Loads the session, requires active authority, holds an in-flight guard
     /// across the read, admits it under the interactive class with compute
     /// resources, authorizes it against the session's negotiated capabilities,
-    /// and runs the read implementation. `op.log`, `claim.list`, and
-    /// `attest.list` have implementations; every other read runs the same
-    /// session checks and then names its missing implementation with
-    /// [`ErrorCode::EHosted`], so an unknown session still reports
-    /// `E_FORBIDDEN` rather than a missing-impl error.
+    /// and runs the read implementation. `op.log`, `claim.list`,
+    /// `attest.list`, `refs.list`, `events.tail`, `file`, `show`, `log`,
+    /// `diff`, `blame`, `query`, and `status` have implementations; every
+    /// other read runs the same session checks and then names its missing
+    /// implementation with [`ErrorCode::EHosted`], so an unknown session
+    /// still reports `E_FORBIDDEN` rather than a missing-impl error.
     ///
     /// Capability mapping follows the existing handlers rather than a
     /// blanket table: ordinary reads authorize as [`ReadAccess::Objects`],
@@ -676,6 +692,34 @@ impl HostedCoordinator {
                 let reply = self.read_events_tail(&args, cancel).await?;
                 Ok(Reply::EventsTail(Box::new(reply)))
             }
+            Request::File(args) => {
+                let reply = self.read_file(session, &args, times.mono)?;
+                Ok(Reply::File(Box::new(reply)))
+            }
+            Request::Show(args) => {
+                let reply = self.read_show(&args)?;
+                Ok(Reply::Show(Box::new(reply)))
+            }
+            Request::Log(args) => {
+                let reply = self.read_log(session, &args, times.mono)?;
+                Ok(Reply::Log(Box::new(reply)))
+            }
+            Request::Diff(args) => {
+                let reply = self.read_diff(session, &args, times.mono)?;
+                Ok(Reply::Diff(Box::new(reply)))
+            }
+            Request::Blame(args) => {
+                let reply = self.read_blame(session, &args, times.mono)?;
+                Ok(Reply::Blame(Box::new(reply)))
+            }
+            Request::Query(args) => {
+                let reply = self.read_query(session, &args, times.mono)?;
+                Ok(Reply::Query(Box::new(reply)))
+            }
+            Request::Status(args) => {
+                let reply = self.read_status(session, &args, times.mono)?;
+                Ok(Reply::Status(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -711,6 +755,877 @@ impl HostedCoordinator {
             refs: KeysetPage::new(page.entries, next_after)?,
             as_of: head,
         })
+    }
+
+    /// Serves one `file` read: a blob, symlink, gitlink, directory
+    /// listing, or conflict at a path under the resolved root tree.
+    /// Directory listings page by entry index through a read lease.
+    /// Reads hold no lane and publish nothing.
+    fn read_file(
+        &self,
+        viewer: SessionId,
+        args: &FileArgs,
+        now: StdInstant,
+    ) -> Result<FileReply, CoreError> {
+        use super::reads::{blob_bytes, inline_body};
+        use crate::ops::tree_edit::lookup;
+        let (view, root) = resolve_search_root(&self.store, &args.at)?;
+        let kind = self.store.hash_kind();
+        let body = match args.path.as_ref() {
+            None => FileBody::Directory {
+                entries: self.page_directory(
+                    viewer,
+                    &view,
+                    &DirTarget {
+                        root,
+                        kind,
+                        path: None,
+                    },
+                    &args.page,
+                    now,
+                )?,
+            },
+            Some(path) => {
+                let node = lookup(&self.store, root, path)?
+                    .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "no entry at path"))?;
+                match node.0 {
+                    crate::workcopy::tree::TreeMode::Tree => FileBody::Directory {
+                        entries: self.page_directory(
+                            viewer,
+                            &view,
+                            &DirTarget {
+                                root: node.1,
+                                kind,
+                                path: Some(path.clone()),
+                            },
+                            &args.page,
+                            now,
+                        )?,
+                    },
+                    crate::workcopy::tree::TreeMode::File(mode) => {
+                        use crate::index::FileMode;
+                        match mode {
+                            FileMode::Regular | FileMode::Executable => {
+                                let bytes = blob_bytes(&self.store, node.1)?;
+                                let size = u64::try_from(bytes.len()).map_err(|_| {
+                                    CoreError::new(ErrorCode::EInvalid, "blob size overflows u64")
+                                })?;
+                                FileBody::Blob {
+                                    oid: node.1,
+                                    executable: mode == FileMode::Executable,
+                                    size,
+                                    content: inline_body(bytes)?,
+                                }
+                            }
+                            FileMode::Symlink => {
+                                let bytes = blob_bytes(&self.store, node.1)?;
+                                FileBody::Symlink {
+                                    target: ByteString::from(bytes),
+                                }
+                            }
+                            FileMode::Gitlink => FileBody::Gitlink { commit: node.1 },
+                        }
+                    }
+                }
+            }
+        };
+        Ok(FileReply { view, body })
+    }
+
+    /// Pages one directory in git order by entry index.
+    fn page_directory(
+        &self,
+        viewer: SessionId,
+        view: &ViewInfo,
+        target: &DirTarget,
+        page: &crate::protocol::PageRequest,
+        now: StdInstant,
+    ) -> Result<Page<TreeEntry>, CoreError> {
+        use super::reads::{entry_kind, file_query_digest, tree_items};
+        let limit = page.effective_limit();
+        let items = tree_items(&self.store, target.kind, target.root)?;
+        let start: usize = match page.cursor.as_ref() {
+            None => 0,
+            Some(cursor) => {
+                if cursor.position.len() != 8 {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "file continuation position must be 8 bytes",
+                    ));
+                }
+                let want = CursorWant {
+                    store: self.store.store_id(),
+                    session: viewer,
+                    view: current_view(&self.store)?.view,
+                    query: file_query_digest(target.root, target.path.as_ref()),
+                };
+                self.leases.check_cursor(cursor, &want, now)?;
+                usize::from_be_bytes(cursor.position.as_bytes().try_into().map_err(|_| {
+                    CoreError::new(ErrorCode::EInvalid, "file continuation is not an index")
+                })?)
+            }
+        };
+        let end = start.saturating_add(limit).min(items.len());
+        let entries = items
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .map(|item| TreeEntry {
+                name: ByteString::from(item.name.clone()),
+                oid: item.oid,
+                kind: entry_kind(item.mode),
+            })
+            .collect::<Vec<_>>();
+        if end >= items.len() {
+            return Page::new(entries, None);
+        }
+        let query = file_query_digest(target.root, target.path.as_ref());
+        let position = u64::try_from(end)
+            .map_err(|_| CoreError::new(ErrorCode::EInvalid, "directory index overflows u64"))?;
+        let next = self.mint_read_lease(viewer, view.view, query, &position.to_be_bytes(), now)?;
+        Page::new(entries, Some(next))
+    }
+
+    /// Serves one `show` read: a commit with its record, or one object.
+    /// Reads hold no lane and publish nothing.
+    fn read_show(&self, args: &ShowArgs) -> Result<ShowReply, CoreError> {
+        use super::reads::{change_head, head_commit, inline_body};
+        use crate::store::types::ObjectKind as StoreKind;
+        let view = current_view(&self.store)?;
+        let body = match &args.target {
+            ShowTarget::Head { head } => {
+                let record = head_commit(&self.store, head)?;
+                ShowBody::Commit {
+                    change: Some(record.change_id()),
+                    head: *head,
+                    record: Box::new(record),
+                }
+            }
+            ShowTarget::Change { change } => {
+                let head = change_head(&self.store, change)?;
+                let record = head_commit(&self.store, &head)?;
+                ShowBody::Commit {
+                    change: Some(record.change_id()),
+                    head,
+                    record: Box::new(record),
+                }
+            }
+            ShowTarget::Object { oid } => {
+                let mut object = self.store.read(*oid).map_err(CoreError::from)?;
+                let kind = match object.kind {
+                    StoreKind::Blob => crate::protocol::ObjectKind::Blob,
+                    StoreKind::Tree => crate::protocol::ObjectKind::Tree,
+                    StoreKind::Commit => crate::protocol::ObjectKind::Commit,
+                    StoreKind::Tag => crate::protocol::ObjectKind::Tag,
+                    StoreKind::Conflict => {
+                        return Err(CoreError::new(
+                            ErrorCode::EConflicted,
+                            "conflict objects have no object view",
+                        ));
+                    }
+                };
+                let mut bytes = Vec::new();
+                use std::io::Read as _;
+                object
+                    .bytes
+                    .read_to_end(&mut bytes)
+                    .map_err(|err| CoreError::new(ErrorCode::EIo, err.to_string()))?;
+                let size = u64::try_from(bytes.len()).map_err(|_| {
+                    CoreError::new(ErrorCode::EInvalid, "object size overflows u64")
+                })?;
+                ShowBody::Object {
+                    oid: *oid,
+                    kind,
+                    size,
+                    content: inline_body(bytes)?,
+                }
+            }
+        };
+        Ok(ShowReply { view, body })
+    }
+
+    /// Serves one `log` read: the newest-first page of one revset's matches.
+    ///
+    /// Parses the revset, builds the production graph index, evaluates with
+    /// the stored-statement attestation lookup, and pages through an engine
+    /// offset bound to a 30-second read lease. Reads hold no lane and
+    /// publish nothing.
+    fn read_log(
+        &self,
+        viewer: SessionId,
+        args: &LogArgs,
+        now: StdInstant,
+    ) -> Result<LogReply, CoreError> {
+        use super::reads::{eval_revset_page, revset_query_digest};
+        use crate::revset::eval::RevsetCursor;
+        let limit = args.page.effective_limit();
+        let query = revset_query_digest(b"ruk.log/v1", &args.revset);
+        if let Some(cursor) = args.page.cursor.as_ref() {
+            let view_before = current_view(&self.store)?;
+            let want = CursorWant {
+                store: self.store.store_id(),
+                session: viewer,
+                view: view_before.view,
+                query,
+            };
+            self.leases.check_cursor(cursor, &want, now)?;
+            let offset = RevsetCursor::from_opaque(cursor.position.as_bytes())?;
+            let page = eval_revset_page(&self.store, &args.revset, Some(limit), Some(&offset))?;
+            let view_after = current_view(&self.store)?;
+            if view_after.view != cursor.view {
+                return Err(CoreError::new(
+                    ErrorCode::EForbidden,
+                    "log cursor names a stale view: open a fresh first page",
+                ));
+            }
+            self.log_reply(viewer, query, page, now)
+        } else {
+            let page = eval_revset_page(&self.store, &args.revset, Some(limit), None)?;
+            self.log_reply(viewer, query, page, now)
+        }
+    }
+
+    /// Renders one evaluated log page with its lease-bound continuation.
+    fn log_reply(
+        &self,
+        viewer: SessionId,
+        query: QueryDigest,
+        page: crate::revset::eval::RevsetPage,
+        now: StdInstant,
+    ) -> Result<LogReply, CoreError> {
+        use crate::records::Records;
+        let view = current_view(&self.store)?;
+        let records = Records::new(&self.store);
+        let mut entries = Vec::with_capacity(page.heads.len());
+        for head in &page.heads {
+            let record = records.get_commit(head)?.ok_or_else(|| {
+                CoreError::new(ErrorCode::ECorrupt, "log commit is missing from the store")
+            })?;
+            let divergent = records
+                .get_change(&record.change_id())?
+                .is_some_and(|entry| entry.heads.len() > 1);
+            let message = record.message();
+            let subject = match message.iter().position(|byte| *byte == b'\n') {
+                Some(index) => &message[..index],
+                None => message,
+            };
+            entries.push(CommitSummary {
+                change: Some(record.change_id()),
+                head: *head,
+                parents: record.parents().to_vec(),
+                author: record
+                    .author()
+                    .map_err(|err| CoreError::new(ErrorCode::ECorrupt, err.to_string()))?,
+                committer: record
+                    .committer()
+                    .map_err(|err| CoreError::new(ErrorCode::ECorrupt, err.to_string()))?,
+                subject: ByteString::from(subject.to_vec()),
+                conflicted: matches!(head, crate::heads::Head::Conflicted { .. }),
+                divergent,
+            });
+        }
+        let next = match page.next_cursor {
+            None => None,
+            Some(offset) => {
+                Some(self.mint_read_lease(viewer, view.view, query, &offset.to_opaque(), now)?)
+            }
+        };
+        Ok(LogReply {
+            view,
+            entries: Page::new(entries, next)?,
+        })
+    }
+
+    /// Serves one `query` read: the changes one revset's matches belong to.
+    ///
+    /// Heads sharing a change group into one match carrying every current
+    /// head of the change, so divergence stays visible even when the revset
+    /// names a single head. Paging mirrors [`HostedCoordinator::read_log`].
+    fn read_query(
+        &self,
+        viewer: SessionId,
+        args: &QueryArgs,
+        now: StdInstant,
+    ) -> Result<QueryReply, CoreError> {
+        use super::reads::{eval_revset_page, revset_query_digest};
+        use crate::records::Records;
+        use crate::revset::eval::RevsetCursor;
+        let limit = args.page.effective_limit();
+        let query = revset_query_digest(b"ruk.query/v1", &args.revset);
+        let page = match args.page.cursor.as_ref() {
+            None => eval_revset_page(&self.store, &args.revset, Some(limit), None)?,
+            Some(cursor) => {
+                let view_before = current_view(&self.store)?;
+                let want = CursorWant {
+                    store: self.store.store_id(),
+                    session: viewer,
+                    view: view_before.view,
+                    query,
+                };
+                self.leases.check_cursor(cursor, &want, now)?;
+                let offset = RevsetCursor::from_opaque(cursor.position.as_bytes())?;
+                let page = eval_revset_page(&self.store, &args.revset, Some(limit), Some(&offset))?;
+                let view_after = current_view(&self.store)?;
+                if view_after.view != cursor.view {
+                    return Err(CoreError::new(
+                        ErrorCode::EForbidden,
+                        "query cursor names a stale view: open a fresh first page",
+                    ));
+                }
+                page
+            }
+        };
+        let view = current_view(&self.store)?;
+        let records = Records::new(&self.store);
+        let mut order: Vec<crate::change::ChangeId> = Vec::new();
+        let mut grouped: std::collections::HashMap<crate::change::ChangeId, Vec<Head>> =
+            std::collections::HashMap::new();
+        for head in &page.heads {
+            let record = records.get_commit(head)?.ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "query commit is missing from the store",
+                )
+            })?;
+            let change = record.change_id();
+            if !grouped.contains_key(&change) {
+                order.push(change);
+            }
+            grouped.entry(change).or_default().push(*head);
+        }
+        let mut matches = Vec::with_capacity(order.len());
+        for change in order {
+            let matched = grouped.remove(&change).unwrap_or_default();
+            let heads = match records.get_change(&change)? {
+                Some(entry) => entry.heads.clone(),
+                None => matched,
+            };
+            matches.push(QueryMatch { change, heads });
+        }
+        let next = match page.next_cursor {
+            None => None,
+            Some(offset) => {
+                Some(self.mint_read_lease(viewer, view.view, query, &offset.to_opaque(), now)?)
+            }
+        };
+        Ok(QueryReply {
+            view,
+            matches: Page::new(matches, next)?,
+        })
+    }
+
+    /// Serves one `diff` read: the file changes between two revisions.
+    ///
+    /// Both trees flatten through [`crate::coord::reads::diff_trees`] and
+    /// merge-join over path bytes; every changed blob pair renders a
+    /// unified patch through the cell-capped [`crate::coord::reads::lcs_align`],
+    /// and anything else reports [`DiffBody::Binary`]. Reads hold no lane
+    /// and publish nothing.
+    fn read_diff(
+        &self,
+        viewer: SessionId,
+        args: &DiffArgs,
+        now: StdInstant,
+    ) -> Result<DiffReply, CoreError> {
+        use super::reads::diff_trees;
+        use crate::index::{FileMode, RepoPath};
+        use crate::workcopy::tree::TreeMode;
+        let kind = self.store.hash_kind();
+        let (_, left_root) = resolve_search_root(&self.store, &args.left)?;
+        let (_, right_root) = resolve_search_root(&self.store, &args.right)?;
+        let changes = diff_trees(&self.store, kind, left_root, right_root)?;
+        let mut files = Vec::with_capacity(changes.len().min(args.page.effective_limit()));
+        for change in &changes {
+            let selected = match &args.paths {
+                PathSelection::All => true,
+                PathSelection::Paths(wanted) => wanted.iter().any(|prefix| {
+                    let bytes = prefix.as_bytes();
+                    change.path.as_slice() == bytes
+                        || change.path.starts_with(bytes)
+                            && change.path.get(bytes.len()) == Some(&b'/')
+                }),
+            };
+            if !selected {
+                continue;
+            }
+            let path = RepoPath::new(change.path.clone()).map_err(|err| {
+                CoreError::new(ErrorCode::ECorrupt, format!("diff path is invalid: {err}"))
+            })?;
+            let is_blob = |entry: &(TreeMode, crate::ids::Oid)| {
+                matches!(
+                    entry.0,
+                    TreeMode::File(FileMode::Regular | FileMode::Executable)
+                )
+            };
+            let (kind, old, new, body) = match (&change.old, &change.new) {
+                (None, Some(entry)) => {
+                    let blob = is_blob(entry).then_some(DiffBlob {
+                        oid: entry.1,
+                        executable: matches!(entry.0, TreeMode::File(FileMode::Executable)),
+                    });
+                    let body = self.diff_body(None, Some(entry), &path)?;
+                    (DiffKind::Added, None, blob, body)
+                }
+                (Some(entry), None) => {
+                    let blob = is_blob(entry).then_some(DiffBlob {
+                        oid: entry.1,
+                        executable: matches!(entry.0, TreeMode::File(FileMode::Executable)),
+                    });
+                    let body = self.diff_body(Some(entry), None, &path)?;
+                    (DiffKind::Deleted, blob, None, body)
+                }
+                (Some(old_entry), Some(new_entry)) => {
+                    let old_blob = is_blob(old_entry).then_some(DiffBlob {
+                        oid: old_entry.1,
+                        executable: matches!(old_entry.0, TreeMode::File(FileMode::Executable)),
+                    });
+                    let new_blob = is_blob(new_entry).then_some(DiffBlob {
+                        oid: new_entry.1,
+                        executable: matches!(new_entry.0, TreeMode::File(FileMode::Executable)),
+                    });
+                    let body = self.diff_body(Some(old_entry), Some(new_entry), &path)?;
+                    (DiffKind::Modified, old_blob, new_blob, body)
+                }
+                (None, None) => {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "diff change has neither side",
+                    ));
+                }
+            };
+            files.push(FileDiff {
+                path,
+                old_path: None,
+                kind,
+                old,
+                new,
+                conflicted: false,
+                body,
+            });
+        }
+        let query = self.diff_query_digest(args);
+        let total = files.len();
+        let start = match args.page.cursor.as_ref() {
+            None => 0,
+            Some(cursor) => {
+                let want = CursorWant {
+                    store: self.store.store_id(),
+                    session: viewer,
+                    view: current_view(&self.store)?.view,
+                    query,
+                };
+                self.leases.check_cursor(cursor, &want, now)?;
+                usize::from_be_bytes(cursor.position.as_bytes().try_into().map_err(|_| {
+                    CoreError::new(ErrorCode::EInvalid, "diff continuation is not an index")
+                })?)
+            }
+        };
+        let limit = args.page.effective_limit();
+        let end = start.saturating_add(limit).min(total);
+        let items = files.get(start..end).unwrap_or_default().to_vec();
+        let view = current_view(&self.store)?;
+        let next = if end >= total {
+            None
+        } else {
+            let position = u64::try_from(end)
+                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "diff index overflows u64"))?;
+            Some(self.mint_read_lease(viewer, view.view, query, &position.to_be_bytes(), now)?)
+        };
+        Ok(DiffReply {
+            view,
+            files: Page::new(items, next)?,
+        })
+    }
+
+    /// Renders one changed file's body: a unified patch for two text blobs,
+    /// [`DiffBody::Binary`] for anything else.
+    fn diff_body(
+        &self,
+        old: Option<&(crate::workcopy::tree::TreeMode, crate::ids::Oid)>,
+        new: Option<&(crate::workcopy::tree::TreeMode, crate::ids::Oid)>,
+        path: &crate::index::RepoPath,
+    ) -> Result<DiffBody, CoreError> {
+        use super::reads::{blob_bytes, lcs_align, split_lines, unified_patch};
+        use crate::index::FileMode;
+        use crate::workcopy::tree::TreeMode;
+        let is_text_blob = |entry: &(TreeMode, crate::ids::Oid)| {
+            matches!(
+                entry.0,
+                TreeMode::File(FileMode::Regular | FileMode::Executable)
+            )
+        };
+        let (Some(old_entry), Some(new_entry)) = (old, new) else {
+            let present = match (old, new) {
+                (Some(entry), None) | (None, Some(entry)) => entry,
+                (None, None) => {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "diff body has neither side",
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "diff body sides are ambiguous",
+                    ));
+                }
+            };
+            if !is_text_blob(present) {
+                return Ok(DiffBody::Binary);
+            }
+            let bytes = blob_bytes(&self.store, present.1)?;
+            if bytes.contains(&0) {
+                return Ok(DiffBody::Binary);
+            }
+            let empty: Vec<&[u8]> = Vec::new();
+            let lines = split_lines(&bytes);
+            let (old_lines, new_lines, old_label, new_label) = match old {
+                Some(_) => (
+                    lines.as_slice(),
+                    empty.as_slice(),
+                    format!("a/{}", String::from_utf8_lossy(path.as_bytes())),
+                    String::from("/dev/null"),
+                ),
+                None => (
+                    empty.as_slice(),
+                    lines.as_slice(),
+                    String::from("/dev/null"),
+                    format!("b/{}", String::from_utf8_lossy(path.as_bytes())),
+                ),
+            };
+            let ops = lcs_align(old_lines, new_lines)?;
+            return Ok(DiffBody::Unified {
+                patch: crate::protocol::ByteSource::Inline {
+                    data: ByteString::from(unified_patch(
+                        &old_label, &new_label, old_lines, new_lines, &ops,
+                    )),
+                },
+            });
+        };
+        if !is_text_blob(old_entry) || !is_text_blob(new_entry) {
+            return Ok(DiffBody::Binary);
+        }
+        let old_bytes = blob_bytes(&self.store, old_entry.1)?;
+        let new_bytes = blob_bytes(&self.store, new_entry.1)?;
+        if old_bytes.contains(&0) || new_bytes.contains(&0) {
+            return Ok(DiffBody::Binary);
+        }
+        let old_lines = split_lines(&old_bytes);
+        let new_lines = split_lines(&new_bytes);
+        let ops = lcs_align(&old_lines, &new_lines)?;
+        let label = String::from_utf8_lossy(path.as_bytes()).into_owned();
+        let patch = unified_patch(
+            &format!("a/{label}"),
+            &format!("b/{label}"),
+            &old_lines,
+            &new_lines,
+            &ops,
+        );
+        let inline = super::reads::inline_body(patch)?;
+        Ok(DiffBody::Unified { patch: inline })
+    }
+
+    /// Hashes one diff's revisions and path selection into its lease digest.
+    fn diff_query_digest(&self, args: &DiffArgs) -> QueryDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"ruk.diff/v1\x00");
+        hasher
+            .update(format!("{:?}\x00{:?}\x00{:?}", args.left, args.right, args.paths).as_bytes());
+        QueryDigest::from_bytes(hasher.finalize().into())
+    }
+
+    /// Serves one `blame` read: the per-line commit attribution of a file.
+    ///
+    /// Resolves the revision, attributes every line through
+    /// [`crate::coord::reads::blame_attribute`], folds consecutive lines
+    /// from one commit into hunks, applies the optional line window, and
+    /// pages through an index offset bound to a 30-second read lease. Reads
+    /// hold no lane and publish nothing.
+    fn read_blame(
+        &self,
+        viewer: SessionId,
+        args: &BlameArgs,
+        now: StdInstant,
+    ) -> Result<BlameReply, CoreError> {
+        use super::reads::{blame_attribute, head_tree};
+        use crate::records::Records;
+        let (view, _) = resolve_search_root(&self.store, &args.at)?;
+        let start = match &args.at {
+            RevisionRef::Head { head } => *head,
+            RevisionRef::Change { change } => super::reads::change_head(&self.store, change)?,
+            RevisionRef::Workspace { .. } => {
+                return Err(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "blame over a workspace needs a workcopy crawl",
+                ));
+            }
+        };
+        let _root = head_tree(&self.store, &start)?;
+        let (lines, heads) = blame_attribute(&self.store, &start, &args.path)?;
+        let records = Records::new(&self.store);
+        let mut hunks: Vec<BlameHunk> = Vec::new();
+        for (index, head) in heads.iter().enumerate() {
+            let record = records.get_commit(head)?.ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    "blame commit is missing from the store",
+                )
+            })?;
+            let author = record
+                .author()
+                .map_err(|err| CoreError::new(ErrorCode::ECorrupt, err.to_string()))?;
+            let start_line = u32::try_from(index + 1).map_err(|_| {
+                CoreError::new(ErrorCode::EInvalid, "blame line number overflows u32")
+            })?;
+            match hunks.last_mut() {
+                Some(open)
+                    if open.head == *head && open.start_line + open.line_count == start_line =>
+                {
+                    open.line_count += 1;
+                }
+                _ => {
+                    hunks.push(BlameHunk {
+                        start_line,
+                        line_count: 1,
+                        head: *head,
+                        change: Some(record.change_id()),
+                        original_path: args.path.clone(),
+                        author,
+                    });
+                }
+            }
+        }
+        let _ = lines;
+        if let Some(window) = args.lines {
+            hunks.retain(|hunk| {
+                let last = hunk
+                    .start_line
+                    .saturating_add(hunk.line_count)
+                    .saturating_sub(1);
+                hunk.start_line <= window.end && last >= window.start
+            });
+        }
+        let query = self.blame_query_digest(args);
+        let total = hunks.len();
+        let start_at = match args.page.cursor.as_ref() {
+            None => 0,
+            Some(cursor) => {
+                let want = CursorWant {
+                    store: self.store.store_id(),
+                    session: viewer,
+                    view: current_view(&self.store)?.view,
+                    query,
+                };
+                self.leases.check_cursor(cursor, &want, now)?;
+                usize::from_be_bytes(cursor.position.as_bytes().try_into().map_err(|_| {
+                    CoreError::new(ErrorCode::EInvalid, "blame continuation is not an index")
+                })?)
+            }
+        };
+        let limit = args.page.effective_limit();
+        let end = start_at.saturating_add(limit).min(total);
+        let items = hunks.get(start_at..end).unwrap_or_default().to_vec();
+        let next = if end >= total {
+            None
+        } else {
+            let position = u64::try_from(end)
+                .map_err(|_| CoreError::new(ErrorCode::EInvalid, "blame index overflows u64"))?;
+            Some(self.mint_read_lease(viewer, view.view, query, &position.to_be_bytes(), now)?)
+        };
+        Ok(BlameReply {
+            view,
+            hunks: Page::new(items, next)?,
+        })
+    }
+
+    /// Hashes one blame's revision, path, and line window into its lease digest.
+    fn blame_query_digest(&self, args: &BlameArgs) -> QueryDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"ruk.blame/v1\x00");
+        hasher.update(format!("{:?}\x00{:?}\x00{:?}", args.at, args.path, args.lines).as_bytes());
+        QueryDigest::from_bytes(hasher.finalize().into())
+    }
+
+    /// Serves one `status` read: how the worktree differs from its base tree
+    /// without snapshotting.
+    ///
+    /// Only [`SnapshotPolicy::Skip`] over a native workspace serves: `Auto`
+    /// would snapshot (a publication, not a read), `GitCompat` has no
+    /// workcopy crawl on this path, and a missing workspace names nothing
+    /// to crawl. Each refuses with a named [`ErrorCode::EInvalid`].
+    fn read_status(
+        &self,
+        viewer: SessionId,
+        args: &StatusArgs,
+        now: StdInstant,
+    ) -> Result<StatusReply, CoreError> {
+        use super::reads::head_tree;
+        use crate::coord::rows::{decode_workspace, workspace_key};
+        use crate::store::types::FactTable;
+        use crate::workcopy::NoIgnore;
+        use crate::workcopy::crawl::CrawlLimits;
+        use crate::workcopy::journal_state::NoJournal;
+        use crate::workcopy::snapshot::{SnapshotInput, StatusReport, status as snapshot_status};
+        use crate::workcopy::statcache::StatClock;
+        let workspace = args.workspace.ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "status needs an explicit native workspace",
+            )
+        })?;
+        if !matches!(args.snapshot, SnapshotPolicy::Skip) {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "status serves snapshot skip only: auto-snapshot publishes",
+            ));
+        }
+        let key = workspace_key(workspace);
+        let row_bytes = self
+            .store
+            .fact(FactTable::Workspaces, &key)?
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown workspace"))?;
+        let row = decode_workspace(&self.store, &key, &row_bytes)?;
+        let native = row.state.require_native().map_err(|err| {
+            CoreError::new(
+                ErrorCode::EInvalid,
+                format!("status needs a native workspace: {err}"),
+            )
+        })?;
+        let root = std::str::from_utf8(row.root.as_bytes())
+            .map_err(|_| CoreError::new(ErrorCode::ECorrupt, "workspace root is not UTF-8"))?;
+        if root.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "status needs a workspace with a materialization root",
+            ));
+        }
+        let base_tree = head_tree(&self.store, &native.head)?;
+        let ignore = NoIgnore;
+        let journal = NoJournal;
+        let clock = StatClock::system(StatClock::COARSE_RESOLUTION_NS)?;
+        let input = SnapshotInput {
+            workspace,
+            state: &row.state,
+            root: std::path::Path::new(root),
+            base_tree,
+            watch: None,
+            clock,
+            limits: CrawlLimits::reference(),
+            ignore: &ignore,
+            journal: &journal,
+        };
+        let view = current_view(&self.store)?;
+        let change = Some(ChangeHead {
+            change: native.change,
+            head: native.head,
+        });
+        match snapshot_status(&self.store, &input)? {
+            StatusReport::Materializing(_) => Ok(StatusReply {
+                view,
+                workspace: Some(row.state.clone()),
+                change,
+                applying: true,
+                snapshot_operation: None,
+                paths: Page::new(Vec::new(), None)?,
+            }),
+            StatusReport::Clean => Ok(StatusReply {
+                view,
+                workspace: Some(row.state.clone()),
+                change,
+                applying: false,
+                snapshot_operation: None,
+                paths: Page::new(Vec::new(), None)?,
+            }),
+            StatusReport::Dirty {
+                changed,
+                removed,
+                conflict_edits,
+            } => {
+                use crate::ops::tree_edit::lookup;
+                use crate::workcopy::tree::TreeMode;
+                let conflicts: std::collections::HashSet<&[u8]> = conflict_edits
+                    .iter()
+                    .map(|edit| edit.path.as_bytes())
+                    .collect();
+                let mut paths: Vec<PathStatus> = Vec::new();
+                for path in changed {
+                    let entry = lookup(&self.store, base_tree, &path)?;
+                    let change = match entry {
+                        None => PathChangeKind::Added,
+                        Some((TreeMode::Tree, _)) => PathChangeKind::TypeChanged,
+                        Some(_) => PathChangeKind::Modified,
+                    };
+                    paths.push(PathStatus {
+                        conflicted: conflicts.contains(path.as_bytes()),
+                        path,
+                        change,
+                    });
+                }
+                for path in removed {
+                    paths.push(PathStatus {
+                        conflicted: conflicts.contains(path.as_bytes()),
+                        path,
+                        change: PathChangeKind::Deleted,
+                    });
+                }
+                paths.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+                let query = self.status_query_digest(workspace);
+                let total = paths.len();
+                let start = match args.page.cursor.as_ref() {
+                    None => 0,
+                    Some(cursor) => {
+                        let want = CursorWant {
+                            store: self.store.store_id(),
+                            session: viewer,
+                            view: current_view(&self.store)?.view,
+                            query,
+                        };
+                        self.leases.check_cursor(cursor, &want, now)?;
+                        usize::from_be_bytes(cursor.position.as_bytes().try_into().map_err(
+                            |_| {
+                                CoreError::new(
+                                    ErrorCode::EInvalid,
+                                    "status continuation is not an index",
+                                )
+                            },
+                        )?)
+                    }
+                };
+                let limit = args.page.effective_limit();
+                let end = start.saturating_add(limit).min(total);
+                let items = paths.get(start..end).unwrap_or_default().to_vec();
+                let next = if end >= total {
+                    None
+                } else {
+                    let position = u64::try_from(end).map_err(|_| {
+                        CoreError::new(ErrorCode::EInvalid, "status index overflows u64")
+                    })?;
+                    Some(self.mint_read_lease(
+                        viewer,
+                        view.view,
+                        query,
+                        &position.to_be_bytes(),
+                        now,
+                    )?)
+                };
+                Ok(StatusReply {
+                    view,
+                    workspace: Some(row.state.clone()),
+                    change,
+                    applying: false,
+                    snapshot_operation: None,
+                    paths: Page::new(items, next)?,
+                })
+            }
+        }
+    }
+
+    /// Hashes one status workspace into its lease digest.
+    fn status_query_digest(&self, workspace: WorkspaceId) -> QueryDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"ruk.status/v1\x00");
+        hasher.update(workspace.as_bytes());
+        QueryDigest::from_bytes(hasher.finalize().into())
     }
 
     /// Serves one `events.tail` read: ref events strictly after `after`,
@@ -1630,15 +2545,6 @@ impl HostedCoordinator {
 /// so a caller learns which machinery would serve the method.
 fn read_gap(method: Method) -> &'static str {
     match method {
-        Method::Status => {
-            "status needs a workspace autosnapshot plus a workcopy crawl, and the read path publishes nothing"
-        }
-        Method::Log | Method::Query => {
-            "log and query need a production graph index over store segments, and revset evaluation builds its graph only in tests"
-        }
-        Method::Diff | Method::Show | Method::File | Method::Blame => {
-            "diff, show, file, and blame need tree and object readers over resolved revisions with no pure producer on the coordinator"
-        }
         Method::RepoStat => {
             "repo.stat needs the store id, object format, RepoMeta default branch, and event horizon from the store head"
         }
@@ -1653,8 +2559,17 @@ fn read_gap(method: Method) -> &'static str {
         Method::RemoteRefs => {
             "remote.refs needs an ls-refs round-trip against an explicit remote URL"
         }
-        _ => "only `op.log`, `claim.list`, and `attest.list` are served, with lease-bound paging",
+        _ => "only compare, search, archive, and remote.refs lack hosted read arms",
     }
+}
+
+/// Resolves one revision to its root tree: the shared root every
+/// browsing read serves from. Workspaces name a workcopy, not a tree.
+/// `resolve_search_root` is the helper `search` reuses.
+fn resolve_search_root(store: &Store, at: &RevisionRef) -> Result<(ViewInfo, Oid), CoreError> {
+    let view = current_view(store)?;
+    let root = super::reads::revision_tree(store, at)?;
+    Ok((view, root))
 }
 
 /// Loads the store and operation snapshot one read is served from.
@@ -1886,6 +2801,567 @@ mod tests {
             panic!("refs.list must answer its own reply");
         };
         *page
+    }
+
+    fn read_fixtures(store: &Store) -> (Head, Head, Head) {
+        use crate::workcopy::tree::{TreeItem, TreeMode, encode_tree};
+        let put_blob = |bytes: &[u8]| {
+            let length = u64::try_from(bytes.len()).expect("object length");
+            let prepared = store
+                .prepare(crate::store::types::ObjectKind::Blob, length, bytes, None)
+                .expect("prepare blob");
+            let oid = prepared.oid();
+            store
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish blob");
+            oid
+        };
+        let put_tree = |items: &[(&str, TreeMode, Oid)]| {
+            let encoded = encode_tree(
+                &items
+                    .iter()
+                    .map(|(name, mode, oid)| TreeItem {
+                        name: name.as_bytes().to_vec(),
+                        mode: *mode,
+                        oid: *oid,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let length = u64::try_from(encoded.len()).expect("object length");
+            let prepared = store
+                .prepare(
+                    crate::store::types::ObjectKind::Tree,
+                    length,
+                    encoded.as_slice(),
+                    None,
+                )
+                .expect("prepare tree");
+            let oid = prepared.oid();
+            store
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish tree");
+            oid
+        };
+        let signature = || crate::conflict::Signature {
+            name: ByteString::from("ada"),
+            email: ByteString::from("ada@example.com"),
+            timestamp: 1_700_000_000,
+            offset: crate::conflict::TzOffset::new(false, 0).expect("tz offset"),
+        };
+        let new_commit = |tree: Oid,
+                          parents: Vec<Head>,
+                          message: &str,
+                          change: Option<crate::change::ChangeId>| {
+            crate::ops::new(
+                store,
+                crate::ops::NewRequest {
+                    tree,
+                    parents,
+                    author: signature(),
+                    committer: signature(),
+                    message: ByteString::from(message),
+                    change_id: change,
+                    predecessor: None,
+                    provenance: None,
+                },
+            )
+            .expect("new commit")
+            .head
+        };
+        let file = crate::index::FileMode::Regular;
+        let blob_a = put_blob(b"one\ntwo\n");
+        let tree_a = put_tree(&[("f.txt", TreeMode::File(file), blob_a)]);
+        let head_a = new_commit(tree_a, Vec::new(), "first", None);
+        let blob_b = put_blob(b"one\nTWO\n");
+        let blob_g = put_blob(b"new\n");
+        let tree_b = put_tree(&[
+            ("f.txt", TreeMode::File(file), blob_b),
+            ("g.txt", TreeMode::File(file), blob_g),
+        ]);
+        let change_b = crate::change::ChangeId::from_bytes([7; 16]);
+        let head_b = new_commit(tree_b, vec![head_a], "second", Some(change_b));
+        let head_b2 = new_commit(tree_b, vec![head_a], "second rewrite", Some(change_b));
+        (head_a, head_b, head_b2)
+    }
+
+    fn seed_ref_oid(coord: &HostedCoordinator, name: &str, oid: Oid) {
+        use crate::refdata::{RefChange, RefExpect, RefTransaction, RefUpdate};
+        let transaction = RefTransaction::new(
+            HashKind::Sha1,
+            vec![RefUpdate {
+                name: RefName::new(name).expect("ref name"),
+                expected: RefExpect::Absent,
+                change: RefChange::Set(crate::refdata::RefTarget::Direct(oid)),
+            }],
+        )
+        .expect("ref transaction");
+        let prepared = crate::refs::prepare_checked_transaction(coord.store(), &transaction)
+            .expect("prepare refs");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::ReceivePack,
+                &EventContext::default(),
+            )
+            .expect("publish refs");
+    }
+
+    async fn log_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::LogArgs,
+    ) -> crate::protocol::LogReply {
+        let reply = coord
+            .read(owner, session, Request::Log(Box::new(args)), cancel)
+            .await
+            .expect("log serves");
+        let Reply::Log(page) = reply else {
+            panic!("log must answer its own reply");
+        };
+        *page
+    }
+
+    async fn query_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::QueryArgs,
+    ) -> crate::protocol::QueryReply {
+        let reply = coord
+            .read(owner, session, Request::Query(Box::new(args)), cancel)
+            .await
+            .expect("query serves");
+        let Reply::Query(page) = reply else {
+            panic!("query must answer its own reply");
+        };
+        *page
+    }
+
+    async fn diff_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::DiffArgs,
+    ) -> crate::protocol::DiffReply {
+        let reply = coord
+            .read(owner, session, Request::Diff(Box::new(args)), cancel)
+            .await
+            .expect("diff serves");
+        let Reply::Diff(page) = reply else {
+            panic!("diff must answer its own reply");
+        };
+        *page
+    }
+
+    async fn blame_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::BlameArgs,
+    ) -> crate::protocol::BlameReply {
+        let reply = coord
+            .read(owner, session, Request::Blame(Box::new(args)), cancel)
+            .await
+            .expect("blame serves");
+        let Reply::Blame(page) = reply else {
+            panic!("blame must answer its own reply");
+        };
+        *page
+    }
+
+    async fn status_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::StatusArgs,
+    ) -> crate::protocol::StatusReply {
+        let reply = coord
+            .read(owner, session, Request::Status(Box::new(args)), cancel)
+            .await
+            .expect("status serves");
+        let Reply::Status(page) = reply else {
+            panic!("status must answer its own reply");
+        };
+        *page
+    }
+
+    #[tokio::test]
+    async fn log_serves_newest_first_with_lease_continuation() {
+        use crate::protocol::{LogArgs, PageRequest, RevsetText};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (head_a, head_b, _) = read_fixtures(coord.store());
+        let oid_b = match head_b {
+            Head::Git { oid } => oid,
+            Head::Conflicted { .. } => panic!("fixture head is git"),
+        };
+        seed_ref_oid(&coord, "refs/heads/main", oid_b);
+        let first = log_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            LogArgs {
+                revset: RevsetText::new("ancestors(main)").expect("revset"),
+                page: PageRequest {
+                    limit: Some(page_limit_1()),
+                    cursor: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(first.entries.items.len(), 1);
+        assert_eq!(first.entries.items[0].head, head_b);
+        assert_eq!(first.entries.items[0].subject.as_bytes(), b"second");
+        let cursor = first.entries.next.clone().expect("continuation");
+        let second = log_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            LogArgs {
+                revset: RevsetText::new("ancestors(main)").expect("revset"),
+                page: PageRequest {
+                    limit: Some(page_limit_1()),
+                    cursor: Some(cursor),
+                },
+            },
+        )
+        .await;
+        assert_eq!(second.entries.items.len(), 1);
+        assert_eq!(second.entries.items[0].head, head_a);
+        assert_eq!(second.entries.next, None);
+        let bad = coord
+            .read(
+                &owner,
+                session,
+                Request::Log(Box::new(LogArgs {
+                    revset: RevsetText::new("main |%%").expect("revset"),
+                    page: PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("malformed revset refuses");
+        assert_eq!(bad.code, ErrorCode::EInvalid);
+    }
+
+    #[tokio::test]
+    async fn query_groups_divergent_heads() {
+        use crate::protocol::{PageRequest, QueryArgs, RevsetText};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (_, head_b, head_b2) = read_fixtures(coord.store());
+        let oid_of = |head: Head| match head {
+            Head::Git { oid } => oid,
+            Head::Conflicted { .. } => panic!("fixture head is git"),
+        };
+        seed_ref_oid(&coord, "refs/heads/main", oid_of(head_b));
+        seed_ref_oid(&coord, "refs/heads/feat", oid_of(head_b2));
+        let reply = query_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            QueryArgs {
+                revset: RevsetText::new("main | feat").expect("revset"),
+                page: PageRequest::default(),
+            },
+        )
+        .await;
+        assert_eq!(reply.matches.items.len(), 1);
+        let matched = &reply.matches.items[0];
+        assert!(matched.heads.contains(&head_b), "first head present");
+        assert!(matched.heads.contains(&head_b2), "second head present");
+        assert_eq!(reply.matches.next, None);
+    }
+
+    #[tokio::test]
+    async fn diff_renders_unified_patch_and_pages() {
+        use crate::protocol::{DiffArgs, PageRequest, PathSelection, RevisionRef};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (head_a, head_b, _) = read_fixtures(coord.store());
+        let args = |cursor: Option<PageCursor>| DiffArgs {
+            left: RevisionRef::Head { head: head_a },
+            right: RevisionRef::Head { head: head_b },
+            paths: PathSelection::All,
+            page: PageRequest {
+                limit: Some(page_limit_1()),
+                cursor,
+            },
+        };
+        let first = diff_of(&coord, &owner, session, &cancel, args(None)).await;
+        assert_eq!(first.files.items.len(), 1);
+        let changed = &first.files.items[0];
+        assert_eq!(changed.path.as_bytes(), b"f.txt");
+        assert_eq!(changed.kind, crate::protocol::DiffKind::Modified);
+        let crate::protocol::DiffBody::Unified { patch } = &changed.body else {
+            panic!("text change renders unified");
+        };
+        let crate::protocol::ByteSource::Inline { data } = patch else {
+            panic!("small patch inlines");
+        };
+        let text = String::from_utf8(data.as_bytes().to_vec()).expect("patch is UTF-8");
+        assert!(text.contains("-two\n"), "deletion renders: {text}");
+        assert!(text.contains("+TWO\n"), "insertion renders: {text}");
+        let cursor = first.files.next.clone().expect("continuation");
+        let second = diff_of(&coord, &owner, session, &cancel, args(Some(cursor))).await;
+        assert_eq!(second.files.items.len(), 1);
+        assert_eq!(second.files.items[0].path.as_bytes(), b"g.txt");
+        assert_eq!(second.files.items[0].kind, crate::protocol::DiffKind::Added);
+        assert_eq!(second.files.next, None);
+    }
+
+    #[tokio::test]
+    async fn blame_attributes_each_line() {
+        use crate::index::RepoPath;
+        use crate::protocol::{BlameArgs, LineRange, PageRequest, RevisionRef};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (head_a, head_b, _) = read_fixtures(coord.store());
+        let reply = blame_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            BlameArgs {
+                at: RevisionRef::Head { head: head_b },
+                path: RepoPath::new("f.txt").expect("path"),
+                lines: None,
+                page: PageRequest::default(),
+            },
+        )
+        .await;
+        assert_eq!(reply.hunks.items.len(), 2);
+        assert_eq!(reply.hunks.items[0].head, head_a);
+        assert_eq!(reply.hunks.items[0].start_line, 1);
+        assert_eq!(reply.hunks.items[1].head, head_b);
+        assert_eq!(reply.hunks.items[1].start_line, 2);
+        let windowed = blame_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            BlameArgs {
+                at: RevisionRef::Head { head: head_b },
+                path: RepoPath::new("f.txt").expect("path"),
+                lines: Some(LineRange { start: 2, end: 2 }),
+                page: PageRequest::default(),
+            },
+        )
+        .await;
+        assert_eq!(windowed.hunks.items.len(), 1);
+        assert_eq!(windowed.hunks.items[0].head, head_b);
+        let missing = coord
+            .read(
+                &owner,
+                session,
+                Request::Blame(Box::new(BlameArgs {
+                    at: RevisionRef::Head { head: head_b },
+                    path: RepoPath::new("absent.txt").expect("path"),
+                    lines: None,
+                    page: PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("missing path refuses");
+        assert_eq!(missing.code, ErrorCode::ENotFound);
+    }
+
+    fn publish_workspace_row(
+        coord: &HostedCoordinator,
+        id: WorkspaceId,
+        state: crate::workspace::WorkspaceState,
+        holder: SessionId,
+        root: &str,
+    ) {
+        use crate::store::types::{FactExpectation, FactMutation, FactTable};
+        let row = crate::coord::rows::WorkspaceRow {
+            state,
+            holder,
+            root: ByteString::from(root),
+        };
+        let bytes = postcard::to_allocvec(&row).expect("workspace row encodes");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Workspaces,
+                    key: crate::coord::rows::workspace_key(id).to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish workspace row");
+    }
+
+    #[tokio::test]
+    async fn status_reports_skip_crawl_and_refuses_auto() {
+        use crate::index::RepoPath;
+        use crate::protocol::{PageRequest, SnapshotPolicy, StatusArgs};
+        use crate::workspace::{NativeWorkspace, Scope, WorkspaceState};
+        let (temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (head_a, head_b, _) = read_fixtures(coord.store());
+        let _ = head_a;
+        let change_b = crate::change::ChangeId::from_bytes([7; 16]);
+        let wt = temp.0.join("wt");
+        std::fs::create_dir_all(&wt).expect("worktree dir");
+        std::fs::write(wt.join("f.txt"), b"one\nTWO\nthird\n").expect("write file");
+        std::fs::write(wt.join("h.txt"), b"added\n").expect("write file");
+        let id = WorkspaceId::generate();
+        publish_workspace_row(
+            &coord,
+            id,
+            WorkspaceState::Native(NativeWorkspace::new(change_b, head_b, Scope::Full)),
+            session,
+            wt.to_str().expect("utf8 root"),
+        );
+        let reply = status_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            StatusArgs {
+                workspace: Some(id),
+                snapshot: SnapshotPolicy::Skip,
+                page: PageRequest::default(),
+            },
+        )
+        .await;
+        assert!(!reply.applying);
+        assert_eq!(
+            reply.change,
+            Some(ChangeHead {
+                change: change_b,
+                head: head_b
+            })
+        );
+        let kinds: Vec<(&[u8], crate::protocol::PathChangeKind)> = reply
+            .paths
+            .items
+            .iter()
+            .map(|status| (status.path.as_bytes(), status.change))
+            .collect();
+        assert!(
+            kinds.contains(&(
+                b"f.txt".as_slice(),
+                crate::protocol::PathChangeKind::Modified
+            )),
+            "modified reports: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(
+                b"g.txt".as_slice(),
+                crate::protocol::PathChangeKind::Deleted
+            )),
+            "deleted reports: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(b"h.txt".as_slice(), crate::protocol::PathChangeKind::Added)),
+            "added reports: {kinds:?}"
+        );
+        let auto = coord
+            .read(
+                &owner,
+                session,
+                Request::Status(Box::new(StatusArgs {
+                    workspace: Some(id),
+                    snapshot: SnapshotPolicy::Auto,
+                    page: PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("auto snapshot refuses");
+        assert_eq!(auto.code, ErrorCode::EInvalid);
+        let missing = coord
+            .read(
+                &owner,
+                session,
+                Request::Status(Box::new(StatusArgs {
+                    workspace: None,
+                    snapshot: SnapshotPolicy::Skip,
+                    page: PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("missing workspace refuses");
+        assert_eq!(missing.code, ErrorCode::EInvalid);
+        let unknown = coord
+            .read(
+                &owner,
+                session,
+                Request::Status(Box::new(StatusArgs {
+                    workspace: Some(WorkspaceId::generate()),
+                    snapshot: SnapshotPolicy::Skip,
+                    page: PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown workspace refuses");
+        assert_eq!(unknown.code, ErrorCode::ENotFound);
+        let _ = RepoPath::new("f.txt").expect("path");
     }
 
     #[tokio::test]
@@ -2360,10 +3836,10 @@ mod tests {
         let err = coord
             .read(&owner, session, Request::Status(Box::default()), &cancel)
             .await
-            .expect_err("status names its missing implementation");
-        assert_eq!(err.code, ErrorCode::EHosted);
+            .expect_err("status without a workspace refuses");
+        assert_eq!(err.code, ErrorCode::EInvalid);
         assert!(
-            err.message.contains("autosnapshot"),
+            err.message.contains("explicit native workspace"),
             "unexpected message: {}",
             err.message
         );

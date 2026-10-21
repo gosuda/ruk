@@ -31,10 +31,6 @@ use crate::heads::Head;
 use crate::ids::HashKind;
 
 /// Resumable cursor for multi-segment divergent change queries.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) struct ChangeIdCursor {
     pub(crate) segment_idx: usize,
@@ -53,17 +49,12 @@ pub(crate) struct DivergentPage<T> {
 }
 
 /// Composite graph index spanning chained immutable v1 segments.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[derive(Clone)]
 pub(crate) struct GraphIndex {
     segments_oldest_first: Vec<Arc<GraphSegment>>,
     hash_kind: HashKind,
 }
 
-#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl GraphIndex {
     /// Constructs a composite index from a chain of segments ordered oldest first.
     pub(crate) fn new(
@@ -193,6 +184,10 @@ impl GraphIndex {
     }
 
     /// Resolves `ChangeId` at `pos`.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; reserved for revset callers"
+    )]
     pub(crate) fn pos_to_change_id(&self, pos: GlobalPosition) -> Result<ChangeId, CoreError> {
         let (seg, lpos) = self.find_segment_for_pos(pos)?;
         seg.change_id_at(lpos)
@@ -275,7 +270,11 @@ impl GraphIndex {
         })
     }
 
-    /// Bounded lookup of heads for a change ID, up to `limit`.
+    /// Bounded lookup for heads for a change ID, up to `limit`.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; reserved for revset callers"
+    )]
     pub(crate) fn change_id_to_heads_bounded(
         &self,
         change_id: &ChangeId,
@@ -403,20 +402,12 @@ impl GraphAccess for GraphIndex {
 }
 
 /// Incremental builder that adds commits on top of an existing index.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) struct GraphIndexBuilder {
     base_index: GraphIndex,
     staged: Vec<StagedCommit>,
     staged_heads: std::collections::HashMap<Head, GlobalPosition>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 impl GraphIndexBuilder {
     #[must_use]
     pub(crate) fn new(base_index: GraphIndex) -> Self {

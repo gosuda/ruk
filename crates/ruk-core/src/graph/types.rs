@@ -18,13 +18,9 @@ use crate::heads::Head;
 
 /// Maximum valid commit position in the graph ($2^{31} - 1$).
 /// Total capacity is $2^{31}$ positions (`0` through `0x7FFF_FFFF`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub const MAX_GRAPH_POSITIONS: u32 = 0x8000_0000;
 
@@ -38,46 +34,30 @@ pub const MAX_INDEXED_COMMITS: u64 = 0x8000_0000;
 
 /// Flag indicating that a parent or change entry points to the segment's
 /// overflow table rather than an inlined local/global position.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub const OVERFLOW_FLAG: u32 = 0x8000_0000;
 
 /// Value indicating no parent in an entry slot (e.g. root commit or single parent).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub const NO_PARENT: u32 = 0xFFFF_FFFF;
 
 /// Format version for v1 graph segments.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub const GRAPH_SEGMENT_V1_FORMAT: u32 = 1;
 
 /// Magic bytes identifying a Ruk graph segment file (`b"RUKGRAPH"`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub const GRAPH_SEGMENT_MAGIC: [u8; 8] = *b"RUKGRAPH";
 
@@ -86,20 +66,12 @@ pub const GRAPH_SEGMENT_MAGIC: [u8; 8] = *b"RUKGRAPH";
 /// Invariant: position must be strictly less than `MAX_GRAPH_POSITIONS` ($2^{31}$).
 /// Exceeding this boundary fails with [`ErrorCode::ECapacity`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub struct GlobalPosition(u32);
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 impl GlobalPosition {
     /// Validates and constructs a global position.
     ///
@@ -162,13 +134,9 @@ impl fmt::Display for GlobalPosition {
 ///
 /// Invariant: position must be strictly less than `MAX_GRAPH_POSITIONS` ($2^{31}$).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub struct LocalPosition(u32);
 
@@ -238,13 +206,9 @@ impl fmt::Display for LocalPosition {
 /// Invariant: for every parent $p$ of $c$, $G(p) < G(c)$.
 /// Early pruning: $p$ cannot be an ancestor of $c$ if $G(p) \ge G(c)$.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub struct Generation(u32);
 
@@ -374,13 +338,9 @@ impl ParentPositions {
 ///
 /// Missing shallow evidence must never be coerced into a false negative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub enum ShallowAncestry {
     /// Ancestor is proven to be an ancestor of descendant without crossing
@@ -396,13 +356,9 @@ pub enum ShallowAncestry {
 
 /// Result of evaluating a changed-path Bloom filter for a commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 pub enum BloomMatch {
     /// Bloom filter indicates the path might be changed (or filter is
@@ -415,13 +371,9 @@ pub enum BloomMatch {
 
 /// Three-way prefix resolution outcome for commit IDs and change IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[expect(
     unreachable_pub,
-    reason = "graph is a private mod; surface not yet re-exported"
+    reason = "graph is a private mod; surface not yet reexported"
 )]
 #[expect(
     clippy::enum_variant_names,
@@ -438,13 +390,9 @@ pub enum PrefixResolution<T> {
 
 impl<T: PartialEq> PrefixResolution<T> {
     /// Combines two prefix search results across index segments.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used only in test builds; dead in lib build")
-    )]
     #[expect(
         unreachable_pub,
-        reason = "graph is a private mod; surface not yet re-exported"
+        reason = "graph is a private mod; surface not yet reexported"
     )]
     #[must_use]
     pub fn combine(self, other: Self) -> Self {

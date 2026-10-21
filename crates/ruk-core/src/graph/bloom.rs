@@ -18,36 +18,12 @@ use std::collections::BTreeSet;
 
 use crate::graph::types::BloomMatch;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) const DEFAULT_NUM_HASHES: u32 = 7;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) const DEFAULT_BITS_PER_ENTRY: u32 = 10;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) const DEFAULT_MAX_CHANGED_PATHS: usize = 512;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) const BLOOM_SEED0: u32 = 0x293ae76f;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) const BLOOM_SEED1: u32 = 0x7e646e2c;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[must_use]
 pub(crate) fn murmur3_seeded(seed: u32, data: &[u8]) -> u32 {
     const C1: u32 = 0xcc9e2d51;
@@ -103,10 +79,6 @@ pub(crate) fn murmur3_seeded(seed: u32, data: &[u8]) -> u32 {
     h
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[must_use]
 pub(crate) fn bloom_hashes(key: &[u8]) -> [u32; DEFAULT_NUM_HASHES as usize] {
     let h0 = murmur3_seeded(BLOOM_SEED0, key);
@@ -119,10 +91,6 @@ pub(crate) fn bloom_hashes(key: &[u8]) -> [u32; DEFAULT_NUM_HASHES as usize] {
     out
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) fn expand_path_and_ancestors(path: &[u8], set: &mut BTreeSet<Vec<u8>>) {
     let mut trimmed = path;
     while trimmed.first() == Some(&b'/') {
@@ -147,10 +115,6 @@ pub(crate) fn expand_path_and_ancestors(path: &[u8], set: &mut BTreeSet<Vec<u8>>
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[must_use]
 pub(crate) fn build_bloom_filter(changed_paths: &[&[u8]]) -> Vec<u8> {
     let mut expanded = BTreeSet::new();
@@ -184,10 +148,6 @@ pub(crate) fn build_bloom_filter(changed_paths: &[&[u8]]) -> Vec<u8> {
     filter
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[must_use]
 pub(crate) fn check_bloom_filter(filter_data: &[u8], path: &[u8]) -> BloomMatch {
     if filter_data.is_empty() || (filter_data.len() == 1 && filter_data[0] == 0xFF) {

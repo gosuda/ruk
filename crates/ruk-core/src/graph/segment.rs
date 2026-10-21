@@ -70,15 +70,7 @@ use crate::heads::Head;
 use crate::ids::{CommitKey, HashKind, Oid};
 use crate::store::durability::install_file;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) const HEADER_PREFIX_LEN: usize = 40;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) const COMMIT_ENTRY_LEN: usize = 52;
 #[cfg_attr(
     not(test),
@@ -86,10 +78,6 @@ pub(crate) const COMMIT_ENTRY_LEN: usize = 52;
 )]
 pub(crate) const MAX_SEGMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[inline]
 fn read_u32_at(slice: &[u8], offset: usize) -> Result<u32, CoreError> {
     let end = offset
@@ -110,10 +98,6 @@ fn read_u32_at(slice: &[u8], offset: usize) -> Result<u32, CoreError> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[inline]
 fn read_16_bytes_at(slice: &[u8], offset: usize) -> Result<[u8; 16], CoreError> {
     let end = offset
@@ -134,10 +118,6 @@ fn read_16_bytes_at(slice: &[u8], offset: usize) -> Result<[u8; 16], CoreError> 
 }
 
 /// Fixed-size commit entry inside a segment.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CommitGraphEntry {
     pub(crate) generation: u32,
@@ -148,10 +128,6 @@ pub(crate) struct CommitGraphEntry {
     pub(crate) head_digest: [u8; 32],
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 impl CommitGraphEntry {
     pub(crate) fn decode(bytes: &[u8; COMMIT_ENTRY_LEN]) -> Self {
         let generation = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -206,10 +182,6 @@ impl CommitGraphEntry {
 }
 
 /// Bounded page result for divergent change lookups.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) struct ChangeIdPage<T> {
     pub(crate) items: SmallVec<[T; 16]>,
     pub(crate) total_count: usize,
@@ -980,10 +952,6 @@ impl GraphSegment {
 }
 
 /// Staged commit data used to construct a new immutable graph segment.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[derive(Clone, Debug)]
 pub(crate) struct StagedCommit {
     pub(crate) head: Head,
@@ -994,10 +962,6 @@ pub(crate) struct StagedCommit {
 }
 
 /// Builder that serializes staged commits into an immutable v1 segment.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) struct GraphSegmentWriter {
     hash_kind: HashKind,
     parent_segment_name: String,

@@ -173,13 +173,6 @@ impl StatClock {
     ///
     /// # Errors
     /// `E_INVALID` when the system clock is out of range.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "no caller at this commit; retained for later changeset rows"
-        )
-    )]
     pub(crate) fn system(resolution_ns: u64) -> Result<Self, CoreError> {
         Self::new(system_time(SystemTime::now())?, resolution_ns)
     }

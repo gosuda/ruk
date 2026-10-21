@@ -28,10 +28,6 @@ use crate::error::{CoreError, ErrorCode};
 use crate::graph::types::{Generation, GlobalPosition, ShallowAncestry};
 use crate::heads::Head;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HeapNode {
     generation: Generation,
@@ -60,10 +56,6 @@ pub(crate) struct TraversalPage {
 }
 
 /// Abstract graph access required by traversal algorithms.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) trait GraphAccess {
     fn get_generation(&self, pos: GlobalPosition) -> Result<Generation, CoreError>;
     fn get_parents(&self, pos: GlobalPosition) -> Result<SmallVec<[GlobalPosition; 2]>, CoreError>;
@@ -71,10 +63,6 @@ pub(crate) trait GraphAccess {
 }
 
 /// Resumable bounded ancestor traversal stepper.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) struct AncestorStepper {
     heap: BinaryHeap<HeapNode>,
     visited: HashSet<GlobalPosition>,
@@ -186,10 +174,6 @@ impl AncestorStepper {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) fn is_ancestor(
     graph: &dyn GraphAccess,
     ancestor: GlobalPosition,
@@ -277,10 +261,6 @@ pub(crate) fn is_ancestor(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) fn find_heads(
     graph: &dyn GraphAccess,
     candidates: &[GlobalPosition],
@@ -322,10 +302,6 @@ pub(crate) fn find_heads(
     Ok(result)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used only in test builds; dead in lib build")
-)]
 pub(crate) fn find_roots(
     graph: &dyn GraphAccess,
     candidates: &[GlobalPosition],
