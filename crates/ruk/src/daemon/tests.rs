@@ -4578,55 +4578,71 @@ async fn typed_land_execute_refusal_names_plan() {
 }
 
 #[tokio::test]
-async fn admin_dispatch_gates_before_any_coordinator_call() {
-    use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
+async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
+    use ruk_core::coord::{Principal, cancellation};
 
-    use super::{Caller, InvocationOpen, dispatch_method};
+    use super::{Caller, InvocationOpen, dispatch_admin, registry::Registry};
 
     let root = temp_root("admin-dispatch");
-    seed_store(root.to_str().expect("utf8 root"));
-    let budget = Arc::new(PreparationBudget::reference_defaults());
-    let store = Arc::new(Store::open(&root.join(".ruk"), budget).expect("open store"));
-    let coordinator = Arc::new(
-        HostedCoordinator::open(
-            Arc::clone(&store),
-            Principal::from_peer_uid(1000),
-            root.clone(),
-        )
-        .expect("open coordinator"),
-    );
+    let registry = Registry::new(vec![root.clone()]).expect("registry opens");
+    let root_str = root.to_str().expect("utf8 root").to_owned();
+    let init_args = ruk_core::protocol::RepoInitArgs {
+        root: root_str,
+        path: "acme/hello".to_owned(),
+        object_format: None,
+        default_branch: None,
+    };
     let open = InvocationOpen {
         repo: String::new(),
         method: "repo.init".to_string(),
         request_id: None,
-        args_json: Some("{\"root\":\"default\",\"path\":\"acme/hello\"}".to_string()),
+        args_json: Some(sonic_rs::to_string(&init_args).expect("init args encode")),
         session_id: None,
         on_behalf_of: None,
     };
     let (_handle, cancel) = cancellation();
+    let _ = &cancel;
     let admin = Caller {
         principal: &Principal::from_peer_uid(1000),
         admin_uids: &[1000],
     };
-    let err = dispatch_method(&coordinator, admin, &open, Method::RepoInit, None, &cancel)
+    let bytes = dispatch_admin(&registry, admin, &open, Method::RepoInit)
         .await
-        .expect_err("unserved admin refuses");
-    assert_eq!(err.code, ErrorCode::EHosted);
+        .expect("admin repo.init serves");
+    let envelope: ReplyEnvelope = ipc::decode_control(&bytes).expect("reply decodes");
+    let ReplyBody::Success(Reply::RepoInit(created)) = envelope.body else {
+        panic!("repo.init must answer its own reply");
+    };
+    assert!(created.path.ends_with("acme/hello"));
+    assert_eq!(
+        created.default_branch.as_bytes(),
+        b"refs/heads/main",
+        "daemon default branch records",
+    );
     let outsider = Caller {
         principal: &Principal::from_peer_uid(2000),
         admin_uids: &[1000],
     };
-    let err = dispatch_method(
-        &coordinator,
-        outsider,
-        &open,
-        Method::RepoInit,
-        None,
-        &cancel,
-    )
-    .await
-    .expect_err("non-admin refused");
+    let err = dispatch_admin(&registry, outsider, &open, Method::RepoInit)
+        .await
+        .expect_err("non-admin refused");
     assert_eq!(err.code, ErrorCode::EForbidden);
+    let forked = InvocationOpen {
+        repo: String::new(),
+        method: "repo.fork".to_string(),
+        request_id: None,
+        args_json: Some("{\"source\":\"acme/hello\",\"path\":\"acme/fork\"}".to_string()),
+        session_id: None,
+        on_behalf_of: None,
+    };
+    let admin = Caller {
+        principal: &Principal::from_peer_uid(1000),
+        admin_uids: &[1000],
+    };
+    let err = dispatch_admin(&registry, admin, &forked, Method::RepoFork)
+        .await
+        .expect_err("unserved admin refuses");
+    assert_eq!(err.code, ErrorCode::EHosted);
 }
 
 #[tokio::test]

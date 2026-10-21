@@ -63,6 +63,8 @@ pub(crate) struct Registry {
     hook_timeout_ms: AtomicU64,
     /// Cap of ref commands accepted per hosted push batch.
     hook_max_commands: AtomicUsize,
+    /// Default branch new repositories record in `RepoMeta`.
+    default_branch: Mutex<String>,
 }
 
 impl fmt::Debug for Registry {
@@ -105,7 +107,7 @@ impl Registry {
                 canonical.push(resolved);
             }
         }
-        Ok(Self {
+        let registry = Self {
             roots: canonical,
             inner: Mutex::new(RegistryInner {
                 entries: HashMap::new(),
@@ -116,7 +118,42 @@ impl Registry {
             event_retention_seconds: AtomicU64::new(super::DEFAULT_EVENT_RETENTION_SECONDS),
             hook_timeout_ms: AtomicU64::new(super::DEFAULT_HOOK_TIMEOUT_MS),
             hook_max_commands: AtomicUsize::new(super::MAX_HOOK_MAX_COMMANDS),
-        })
+            default_branch: Mutex::new(String::from(super::DEFAULT_DEFAULT_BRANCH)),
+        };
+        registry.sweep_tombstones();
+        Ok(registry)
+    }
+
+    /// Removes crash-left tombstone directories beneath every root.
+    ///
+    /// A delete that crashes between the tombstone rename and the removal
+    /// leaves the tombstone behind; the next startup sweeps it. Only
+    /// directories carrying the tombstone suffix are removed, and failures
+    /// are reported to stderr without refusing startup.
+    fn sweep_tombstones(&self) {
+        for root in &self.roots {
+            let entries = match std::fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    eprintln!("ruk tombstone: cannot list {}: {err}", root.display());
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                if !is_tombstone(&entry) {
+                    continue;
+                }
+                if let Err(err) = std::fs::remove_dir_all(entry.path()) {
+                    eprintln!(
+                        "ruk tombstone: cannot remove {}: {err}",
+                        entry.path().display()
+                    );
+                }
+            }
+            if let Err(err) = fsync_dir(root) {
+                eprintln!("ruk tombstone: cannot sync {}: {err}", root.display());
+            }
+        }
     }
 
     /// Binds the daemon runtime hosting every lane runner.
@@ -180,6 +217,17 @@ impl Registry {
         self.hook_max_commands.load(Ordering::Relaxed)
     }
 
+    /// Sets the default branch new repositories record in `RepoMeta`.
+    ///
+    /// `serve` calls this once from the daemon configuration before
+    /// serving; every `repo.init` afterwards records this branch unless
+    /// its arguments name one.
+    pub(crate) fn set_default_branch(&self, branch: String) {
+        if let Ok(mut configured) = self.default_branch.lock() {
+            *configured = branch;
+        }
+    }
+
     /// Resolves `requested` to a canonical path beneath a configured root,
     /// refusing escapes and symlink components through `openat2`
     /// containment (see `ruk_core::contained`).
@@ -227,6 +275,299 @@ impl Registry {
             .unwrap_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository path is unknown")))
     }
 
+    /// Creates one repository beneath `args.root` at `args.path`.
+    ///
+    /// The destination must be absent; `Store::create` enforces the same
+    /// for its format files, so a racing init fails instead of merging.
+    /// The default branch comes from the arguments or the daemon
+    /// configuration and is persisted in the `RepoMeta` row, so `repo.stat`
+    /// reports it before any ref exists. The new repository registers its
+    /// handle, so later opens by path resolve without a second lookup.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for an unconfigured root or an unreachable parent,
+    /// `E_FORBIDDEN` outside the configured roots, `E_INVALID` for an
+    /// existing destination, a non-UTF-8 path, or a bad branch name, plus
+    /// store creation and publication failures.
+    pub(crate) fn create_repo(
+        &self,
+        args: &ruk_core::protocol::RepoInitArgs,
+    ) -> Result<ruk_core::protocol::RepoInitReply, CoreError> {
+        use ruk_core::protocol::RepoInitReply;
+        let claimed = std::fs::canonicalize(&args.root)
+            .map_err(|_| CoreError::new(ErrorCode::ENotFound, "repository root is unknown"))?;
+        if !self.roots.contains(&claimed) {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "repository root is not configured",
+            ));
+        }
+        let requested = Path::new(&args.root).join(&args.path);
+        let destination = self.resolve_destination(&requested)?;
+        if !destination.starts_with(&claimed) {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "repository path escapes its root",
+            ));
+        }
+        if destination.exists() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository already exists",
+            ));
+        }
+        let path = destination
+            .to_str()
+            .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
+        let kind = args
+            .object_format
+            .unwrap_or(ruk_core::ids::HashKind::DEFAULT);
+        let branch = match &args.default_branch {
+            Some(branch) => branch.clone(),
+            None => {
+                let configured = self.default_branch.lock().map_err(|_| {
+                    CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+                })?;
+                ruk_core::refdata::RefName::new(configured.clone()).map_err(|err| {
+                    CoreError::new(
+                        ErrorCode::EInvalid,
+                        format!("default branch is not a valid ref name: {err}"),
+                    )
+                })?
+            }
+        };
+        let store = ruk_core::store::Store::create(
+            &destination,
+            kind,
+            Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+        )
+        .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+        store
+            .write_repo_meta(branch.clone())
+            .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+        let store_id = store.store_id();
+        drop(store);
+        self.handle_for_path(&destination)?;
+        Ok(RepoInitReply {
+            path: path.to_owned(),
+            store_id,
+            object_format: kind,
+            default_branch: branch,
+        })
+    }
+
+    /// Deletes one repository after refusing in-flight invocations.
+    ///
+    /// The entry leaves the handle table under the registry lock while no
+    /// invocation holds its coordinator (counted through the shared
+    /// ownership the eviction pass uses), so new opens miss and racing
+    /// deletes serialize. The coordinator shuts down outside the lock,
+    /// then the directory renames to a tombstone and is removed: a crash
+    /// between the two leaves the tombstone for the startup sweep.
+    /// `confirm_path` must name the same repository.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for a missing repository, `E_INVALID` for a
+    /// confirmation mismatch, `E_CONFLICTED` while invocations are in
+    /// flight, plus shutdown and removal failures.
+    pub(crate) fn remove_repo(
+        &self,
+        args: &ruk_core::protocol::RepoDeleteArgs,
+    ) -> Result<ruk_core::protocol::RepoDeleteReply, CoreError> {
+        use ruk_core::protocol::RepoDeleteReply;
+        if args.confirm_path != args.repo {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "confirmation path does not match the repository",
+            ));
+        }
+        let canonical = self.resolve(Path::new(&args.repo))?;
+        let path = canonical
+            .to_str()
+            .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
+        let retired = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+            })?;
+            let taken = take_entry_by_path(&mut inner, &canonical);
+            if let Some((_, entry)) = &taken {
+                let busy = entry
+                    .coordinator
+                    .as_ref()
+                    .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
+                if busy {
+                    if let Some((handle, entry)) = taken {
+                        inner.entries.insert(handle, entry);
+                    }
+                    return Err(CoreError::new(
+                        ErrorCode::EConflicted,
+                        "repository has invocations in flight",
+                    ));
+                }
+            }
+            taken.and_then(|(_, entry)| entry.coordinator)
+        };
+        if let Some(coordinator) = retired {
+            coordinator.shutdown();
+        }
+        let tombstone = tombstone_for(&canonical, self.next_handle.fetch_add(1, Ordering::Relaxed));
+        std::fs::rename(&canonical, &tombstone).map_err(|err| {
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("repository tombstone failed: {err}"),
+            )
+        })?;
+        std::fs::remove_dir_all(&tombstone).map_err(|err| {
+            CoreError::new(ErrorCode::EIo, format!("repository removal failed: {err}"))
+        })?;
+        if let Some(parent) = canonical.parent() {
+            fsync_dir(parent)?;
+        }
+        Ok(RepoDeleteReply {
+            deleted_path: path.to_owned(),
+        })
+    }
+
+    /// Moves one repository within its root, keeping its store id.
+    ///
+    /// Both paths resolve under the same configured root; the destination
+    /// must be absent. An idle open coordinator shuts down and reopens
+    /// lazily under the kept handle; invocations in flight refuse with
+    /// `E_CONFLICTED`. Parents on both sides fsync after the rename.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for a missing repository, `E_FORBIDDEN` across roots,
+    /// `E_INVALID` for an existing destination, `E_CONFLICTED` while
+    /// invocations are in flight, plus rename failures.
+    pub(crate) fn rename_repo(
+        &self,
+        args: &ruk_core::protocol::RepoRenameArgs,
+    ) -> Result<ruk_core::protocol::RepoRenameReply, CoreError> {
+        use ruk_core::protocol::RepoRenameReply;
+        let canonical = self.resolve(Path::new(&args.repo))?;
+        let root = self
+            .roots
+            .iter()
+            .find(|root| canonical.starts_with(root))
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::EForbidden,
+                    "repository escapes the configured roots",
+                )
+            })?;
+        let new_path = Path::new(&args.new_path);
+        let requested = if new_path.is_absolute() {
+            new_path.to_path_buf()
+        } else {
+            root.join(new_path)
+        };
+        let destination = self.resolve_destination(&requested)?;
+        if destination.exists() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository destination already exists",
+            ));
+        }
+        if !destination.starts_with(root) {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "repository rename stays within one root",
+            ));
+        }
+        let previous = canonical
+            .to_str()
+            .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
+        let moved = destination
+            .to_str()
+            .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
+        let retired = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+            })?;
+            if let Some(entry) = entry_by_path_mut(&mut inner, &canonical) {
+                let busy = entry
+                    .coordinator
+                    .as_ref()
+                    .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
+                if busy {
+                    return Err(CoreError::new(
+                        ErrorCode::EConflicted,
+                        "repository has invocations in flight",
+                    ));
+                }
+                let coordinator = entry.coordinator.take();
+                entry.runner.take();
+                entry.path = destination.clone();
+                entry.last_used = Instant::now();
+                coordinator
+            } else {
+                None
+            }
+        };
+        if let Some(coordinator) = retired {
+            coordinator.shutdown();
+        }
+        std::fs::rename(&canonical, &destination).map_err(|err| {
+            CoreError::new(ErrorCode::EIo, format!("repository rename failed: {err}"))
+        })?;
+        if let Some(parent) = canonical.parent() {
+            fsync_dir(parent)?;
+        }
+        if let Some(parent) = destination.parent() {
+            fsync_dir(parent)?;
+        }
+        Ok(RepoRenameReply {
+            path: moved.to_owned(),
+            previous_path: previous.to_owned(),
+        })
+    }
+}
+
+/// Removes and returns the entry bound to `canonical`, if any.
+fn take_entry_by_path(inner: &mut RegistryInner, canonical: &Path) -> Option<(String, RepoEntry)> {
+    let handle = inner
+        .entries
+        .iter()
+        .find(|(_, entry)| entry.path == canonical)
+        .map(|(handle, _)| handle.clone())?;
+    inner.entries.remove_entry(&handle)
+}
+
+/// Returns the entry bound to `canonical`, if any.
+fn entry_by_path_mut<'a>(
+    inner: &'a mut RegistryInner,
+    canonical: &Path,
+) -> Option<&'a mut RepoEntry> {
+    inner
+        .entries
+        .values_mut()
+        .find(|entry| entry.path == canonical)
+}
+
+/// Names the tombstone a deleted repository renames to before removal.
+fn tombstone_for(canonical: &Path, nonce: u64) -> PathBuf {
+    let name = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    canonical.with_file_name(format!("{name}.tombstone-{nonce}"))
+}
+
+/// Whether a directory entry is a delete tombstone.
+fn is_tombstone(entry: &std::fs::DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    name.contains(".tombstone-") && entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+}
+
+/// Persists one directory's entries.
+fn fsync_dir(dir: &Path) -> Result<(), CoreError> {
+    let file = std::fs::File::open(dir)
+        .map_err(|err| CoreError::new(ErrorCode::EIo, format!("directory is not open: {err}")))?;
+    file.sync_all()
+        .map_err(|err| CoreError::new(ErrorCode::EIo, format!("directory is not synced: {err}")))
+}
+
+impl Registry {
     /// Resolves a not-yet-existing destination beneath a configured root:
     /// the nearest existing ancestor is canonicalized and symlink
     /// components below it are refused (see `ruk_core::contained`).
@@ -235,13 +576,6 @@ impl Registry {
     /// `E_NOT_FOUND` when no ancestor exists beneath a root, `E_FORBIDDEN`
     /// for symlink components or paths outside the roots, `E_IO` when the
     /// path is inaccessible.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no creator at this commit; wired in CS-R23/CS-R24 repo lifecycle rows"
-        )
-    )]
     pub(crate) fn resolve_destination(&self, requested: &Path) -> Result<PathBuf, CoreError> {
         let mut refused: Option<CoreError> = None;
         for root in &self.roots {
@@ -662,9 +996,195 @@ mod tests {
         root
     }
 
+    fn init_args(root: &std::path::Path, path: &str) -> ruk_core::protocol::RepoInitArgs {
+        ruk_core::protocol::RepoInitArgs {
+            root: root.to_str().expect("scratch root is UTF-8").to_owned(),
+            path: path.to_owned(),
+            object_format: None,
+            default_branch: None,
+        }
+    }
+
     #[test]
     fn empty_roots_are_rejected() {
         assert!(Registry::new(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn create_repo_persists_default_branch_and_registers() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let created = registry
+            .create_repo(&init_args(&root, "acme/hello"))
+            .expect("init creates");
+        assert_eq!(
+            created.path,
+            canonical.join("acme/hello").to_str().expect("utf8 path")
+        );
+        assert_eq!(created.default_branch.as_bytes(), b"refs/heads/main");
+        let store_id = created.store_id;
+        let meta = ruk_core::store::Store::open(
+            &canonical.join("acme/hello"),
+            std::sync::Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+        )
+        .expect("created store opens")
+        .repo_meta()
+        .expect("repo meta reads")
+        .expect("init persists repo meta");
+        assert_eq!(meta.default_branch.as_bytes(), b"refs/heads/main");
+        let again = registry.create_repo(&init_args(&root, "acme/hello"));
+        let err = again.expect_err("duplicate init refuses");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let custom = {
+            let mut args = init_args(&root, "acme/custom");
+            args.default_branch =
+                Some(ruk_core::refdata::RefName::new("refs/heads/trunk").expect("branch name"));
+            registry.create_repo(&args).expect("custom branch inits")
+        };
+        assert_eq!(custom.default_branch.as_bytes(), b"refs/heads/trunk");
+        assert_ne!(custom.store_id, store_id);
+    }
+
+    #[test]
+    fn remove_repo_refuses_in_flight_and_tombstones() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let created = registry
+            .create_repo(&init_args(&root, "gone"))
+            .expect("init creates");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+        let (_handle, _path, held) = registry.open(&created.path).expect("open coordinates");
+        let refused = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: created.path.clone(),
+                confirm_path: created.path.clone(),
+            })
+            .expect_err("in-flight delete refuses");
+        assert_eq!(refused.code, ErrorCode::EConflicted);
+        drop(held);
+        let deleted = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: created.path.clone(),
+                confirm_path: created.path.clone(),
+            })
+            .expect("idle delete removes");
+        assert_eq!(deleted.deleted_path, created.path);
+        assert!(
+            !canonical.join("gone").exists(),
+            "repository directory is gone"
+        );
+        assert!(
+            std::fs::read_dir(&canonical)
+                .expect("root lists")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tombstone-")),
+            "no tombstone remains"
+        );
+        let missing = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: created.path.clone(),
+                confirm_path: created.path.clone(),
+            })
+            .expect_err("missing delete refuses");
+        assert_eq!(missing.code, ErrorCode::ENotFound);
+        let mismatch = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: "acme/other".to_owned(),
+                confirm_path: "acme/different".to_owned(),
+            })
+            .expect_err("confirmation mismatch refuses");
+        assert_eq!(mismatch.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn rename_repo_moves_within_one_root() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let created = registry
+            .create_repo(&init_args(&root, "acme/old"))
+            .expect("init creates");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+        let renamed = registry
+            .rename_repo(&ruk_core::protocol::RepoRenameArgs {
+                repo: created.path.clone(),
+                new_path: "acme/new".to_owned(),
+            })
+            .expect("rename moves");
+        assert!(renamed.path.ends_with("acme/new"));
+        assert_eq!(renamed.previous_path, created.path);
+        assert!(
+            !canonical.join("acme/old").exists(),
+            "old repository path is gone"
+        );
+        assert!(
+            std::path::Path::new(&renamed.path).exists(),
+            "renamed repository exists"
+        );
+        let reopened = registry
+            .open(&renamed.path)
+            .expect("renamed repository opens");
+        assert_ne!(reopened.0, "", "renamed repository keeps a handle");
+        let store_id = reopened.2.store().store_id();
+        assert_eq!(store_id, created.store_id, "store id survives rename");
+        let clash = registry
+            .rename_repo(&ruk_core::protocol::RepoRenameArgs {
+                repo: renamed.path.clone(),
+                new_path: "acme/new".to_owned(),
+            })
+            .expect_err("existing destination refuses");
+        assert_eq!(clash.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn rename_repo_refuses_other_roots() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let other =
+            std::env::temp_dir().join(format!("ruk-daemon-registry-other-{}", std::process::id()));
+        std::fs::create_dir_all(&other).expect("second root exists");
+        let registry =
+            Registry::new(vec![root.clone(), other.clone()]).expect("roots canonicalize");
+        let created = registry
+            .create_repo(&init_args(&root, "acme/old"))
+            .expect("init creates");
+        let err = registry
+            .rename_repo(&ruk_core::protocol::RepoRenameArgs {
+                repo: created.path.clone(),
+                new_path: other
+                    .join("acme/new")
+                    .to_str()
+                    .expect("utf8 path")
+                    .to_owned(),
+            })
+            .expect_err("cross-root rename refuses");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn startup_sweep_removes_tombstones() {
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        std::fs::create_dir_all(canonical.join("dead.tombstone-7")).expect("tombstone stages");
+        Registry::new(vec![root.clone()]).expect("startup sweeps tombstones");
+        assert!(
+            !canonical.join("dead.tombstone-7").exists(),
+            "tombstone is swept at startup"
+        );
     }
 
     #[test]

@@ -1038,6 +1038,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
         registry.set_event_retention_seconds(config.event_retention_seconds);
         registry.set_hook_timeout(config.hook_timeout);
         registry.set_hook_max_commands(config.hook_max_commands);
+        registry.set_default_branch(config.default_branch.clone());
         let executor = BoundedExecutor::new(config.blocking_pool_size)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -2796,25 +2797,38 @@ async fn typed_stream(
             return;
         }
     };
-    let repo_ref = open.repo.clone();
-    let registry = Arc::clone(&refs.registry);
-    let opened = refs
-        .executor
-        .run(move || registry.open(&repo_ref))
-        .await
-        .map_err(Error::Core);
-    let (handle, _, coordinator) = match opened {
-        Ok(Ok(triple)) => triple,
-        Ok(Err(err)) | Err(Error::Core(err)) => {
-            fail(Error::Core(err)).await;
-            return;
-        }
-        Err(err) => {
-            fail(err).await;
-            return;
-        }
-    };
     let principal = Principal::from_peer_uid(peer.uid);
+    let caller = Caller {
+        principal: &principal,
+        admin_uids: &refs.admin_uids,
+    };
+    // Admin methods dispatch from the registry before any coordinator
+    // call: `repo.init` names a repository that does not exist yet, and
+    // `repo.delete` retires its coordinator, so opening one first would
+    // refuse the very calls the row serves.
+    let (handle, coordinator): (String, Option<Arc<HostedCoordinator>>) =
+        if method.kind() == ruk_core::protocol::MethodKind::Admin {
+            (String::new(), None)
+        } else {
+            let repo_ref = open.repo.clone();
+            let registry = Arc::clone(&refs.registry);
+            let opened = refs
+                .executor
+                .run(move || registry.open(&repo_ref))
+                .await
+                .map_err(Error::Core);
+            match opened {
+                Ok(Ok((handle, _, coordinator))) => (handle, Some(coordinator)),
+                Ok(Err(err)) | Err(Error::Core(err)) => {
+                    fail(Error::Core(err)).await;
+                    return;
+                }
+                Err(err) => {
+                    fail(err).await;
+                    return;
+                }
+            }
+        };
     let accepted = InvocationAccepted {
         stream_id,
         method: method.as_str().to_string(),
@@ -2847,17 +2861,27 @@ async fn typed_stream(
             }
         },
     };
-    let dispatch = dispatch_method(
-        &coordinator,
-        Caller {
-            principal: &principal,
-            admin_uids: &refs.admin_uids,
-        },
-        open,
-        method,
-        session,
-        &cancel,
-    );
+    let dispatch: std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, CoreError>> + Send + '_>> =
+        if method.kind() == ruk_core::protocol::MethodKind::Admin {
+            Box::pin(dispatch_admin(&refs.registry, caller, open, method))
+        } else {
+            let Some(coordinator) = coordinator.as_ref() else {
+                fail(Error::Core(CoreError::new(
+                    ErrorCode::EHosted,
+                    "internal: non-admin method arrived without a coordinator",
+                )))
+                .await;
+                return;
+            };
+            Box::pin(dispatch_method(
+                coordinator,
+                caller,
+                open,
+                method,
+                session,
+                &cancel,
+            ))
+        };
     tokio::pin!(dispatch);
     let mut refused: Option<CoreError> = None;
     let result = loop {
@@ -2932,6 +2956,73 @@ async fn typed_stream(
 /// `E_INVALID` for an unknown shape or a session-bound method without a
 /// session, `E_HOSTED` where no read or preparation path exists, plus the
 /// coordinator's own typed failures.
+/// Dispatches one admin invocation against the registry, before any
+/// coordinator call.
+///
+/// The admin gate runs first: only an admin peer reaches the registry.
+/// `repo.init`, `repo.delete`, and `repo.rename` run here; every other
+/// admin method names its missing dispatch path.
+///
+/// # Errors
+/// `E_FORBIDDEN` for a non-admin peer, `E_INVALID` for malformed
+/// arguments, `E_HOSTED` where no dispatch path serves the method, plus
+/// the registry's own failures.
+pub(crate) async fn dispatch_admin(
+    registry: &Registry,
+    caller: Caller<'_>,
+    open: &InvocationOpen,
+    method: Method,
+) -> Result<Vec<u8>, CoreError> {
+    if !caller.is_admin() {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            format!("method `{}` needs an admin peer", method.as_str()),
+        ));
+    }
+    let request = decode_request_args(
+        method,
+        open.args_json.as_deref(),
+        open.request_id.as_deref(),
+    )?;
+    request.validate()?;
+    dispatch_admin_method(registry, method, &request)
+}
+
+/// Routes one authorized admin request to its registry producer.
+fn dispatch_admin_method(
+    registry: &Registry,
+    method: Method,
+    request: &Request,
+) -> Result<Vec<u8>, CoreError> {
+    match (method, request) {
+        (Method::RepoInit, Request::RepoInit(args)) => {
+            let reply = registry.create_repo(args)?;
+            ipc::encode_control(&ReplyEnvelope::success(
+                None,
+                Reply::RepoInit(Box::new(reply)),
+            ))
+        }
+        (Method::RepoDelete, Request::RepoDelete(args)) => {
+            let reply = registry.remove_repo(args)?;
+            ipc::encode_control(&ReplyEnvelope::success(
+                None,
+                Reply::RepoDelete(Box::new(reply)),
+            ))
+        }
+        (Method::RepoRename, Request::RepoRename(args)) => {
+            let reply = registry.rename_repo(args)?;
+            ipc::encode_control(&ReplyEnvelope::success(
+                None,
+                Reply::RepoRename(Box::new(reply)),
+            ))
+        }
+        _ => Err(method_error(
+            method,
+            "no dispatch path serves this method yet",
+        )),
+    }
+}
+
 pub(crate) async fn dispatch_method(
     coordinator: &Arc<HostedCoordinator>,
     caller: Caller<'_>,
@@ -2995,15 +3086,9 @@ pub(crate) async fn dispatch_method(
             let request = decode_request_args(method, args_json, request_id)?;
             request.validate()?;
             if method.kind() == ruk_core::protocol::MethodKind::Admin {
-                if !caller.is_admin() {
-                    return Err(CoreError::new(
-                        ErrorCode::EForbidden,
-                        format!("method `{}` needs an admin peer", method.as_str()),
-                    ));
-                }
                 return Err(method_error(
                     method,
-                    "no dispatch path serves this method yet",
+                    "admin methods dispatch before any coordinator call",
                 ));
             }
             let Some(session) = session else {

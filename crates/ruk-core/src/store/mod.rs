@@ -87,6 +87,7 @@ use crate::change::StoreId;
 use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
 use crate::physical::{AllocationError as PhysicalAllocationError, PhysicalReservation};
+use crate::refdata::RefName;
 use metadata::{Metadata, PublicationTxn};
 use pinned::{PinnedRoot, segment_rel};
 use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
@@ -1154,6 +1155,29 @@ impl Store {
             None => Ok(None),
             Some(raw) => decode("repo meta", &raw).map(Some),
         }
+    }
+
+    /// Persists the repository metadata row written once at init.
+    ///
+    /// Refuses when the row is already present: init runs once per store.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn write_repo_meta(&self, default_branch: RefName) -> Result<(), StoreError> {
+        let row = RepoMetaRow { default_branch };
+        let bytes = metadata::encode("repo meta", &row)?;
+        self.publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::RepoMeta,
+                key: REPO_META_KEY.to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(bytes),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
+        Ok(())
     }
 
     /// Reads the event horizon: the last assigned sequence, the oldest
