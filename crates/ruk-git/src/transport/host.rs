@@ -466,9 +466,6 @@ impl ReceivePolicy for HostPolicy {
         if landed_commands.is_empty() {
             return;
         }
-        // Stashed, not exchanged: the daemon pumps the advisory
-        // callback after the receipt write and the report delivery,
-        // so a slow or absent answer never delays the push itself.
         *self.pending.lock().expect("hook pending lock") = Some(PendingPost {
             commands: landed_commands,
             push_options: state.push_options,

@@ -2474,11 +2474,6 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     });
     drop(policy);
     tokio::pin!(serve);
-    // The wait ends on connection drop at once. A cancel trips the flag
-    // and the guard, and the loop keeps awaiting the detached serve
-    // instead of reporting at once: the serve stops at its next interrupt
-    // check, so the terminal report names what it actually did and the
-    // receipt below always records a finished push.
     let outcome: Result<(Vec<u8>, Vec<u64>), CoreError> = loop {
         tokio::select! {
             done = &mut serve => {
@@ -2497,9 +2492,6 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
                         cancel_flag.store(true, Ordering::SeqCst);
                     }
                     ipc::FrameKind::WindowUpdate => {
-                        // Grants arriving mid-serve apply at once: the
-                        // output writer needs them after the serve
-                        // completes, and dropping them would stall it.
                         match ipc::decode_control::<WindowCredit>(&frame.payload) {
                             Ok(credit) => {
                                 if route_credit(credits, sink.stream_id, &credit).is_err() {
