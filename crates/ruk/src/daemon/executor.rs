@@ -52,10 +52,26 @@ impl BoundedExecutor {
         self.pool_size
     }
 
+    /// Returns the permits currently free. Test-only introspection: the
+    /// regression test asserts the detached worker still holds its
+    /// permit, and no production caller reads the count.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test-only introspection outside test builds")
+    )]
+    #[must_use]
+    pub(crate) fn available(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
     /// Runs `work` on the blocking pool behind one bulkhead permit.
     ///
-    /// The permit covers the whole run: cancellation while queued reports
-    /// `E_CANCELLED` without running the closure.
+    /// The permit moves into the blocking worker, so it covers the whole
+    /// run even when the awaiting task is cancelled: an aborted `run`
+    /// leaves a detached worker that keeps its permit until it finishes,
+    /// and the bulkhead never admits more workers than it holds permits
+    /// for. A queued-then-cancelled run still executes detached; the
+    /// accounting stays exact at the cost of that wasted work.
     ///
     /// # Errors
     /// `E_CANCELLED` when the queue sheds the request or the worker is
@@ -71,8 +87,11 @@ impl BoundedExecutor {
             .map_err(|_| {
                 CoreError::new(ErrorCode::ECancelled, "blocking pool shed its queued work")
             })?;
-        let outcome = tokio::task::spawn_blocking(work).await;
-        drop(permit);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await;
         match outcome {
             Ok(value) => Ok(value),
             Err(err) if err.is_cancelled() => Err(CoreError::new(

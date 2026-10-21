@@ -4967,3 +4967,49 @@ async fn largest_served_tail_page_fits_control_bound() {
     };
     assert_eq!(tail.events.len(), 1000);
 }
+
+/// Cancelling the task awaiting `run` must not free its bulkhead permit
+/// while the detached worker still runs: the permit belongs to the
+/// worker, not the waiter. Otherwise every aborted stream would hand its
+/// permit to the next waiter while its blocking serve still occupies a
+/// thread, and the bulkhead would admit more workers than it holds
+/// permits for.
+#[tokio::test]
+async fn cancelled_run_keeps_its_permit_until_the_worker_finishes() {
+    use super::executor::BoundedExecutor;
+    let executor = BoundedExecutor::new(1).expect("one permit");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let waiter = tokio::spawn({
+        let executor = executor.clone();
+        async move {
+            executor
+                .run(move || {
+                    started_tx.send(()).expect("test waits for start");
+                    release_rx.blocking_recv().expect("test releases worker");
+                    7u32
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), started_rx)
+        .await
+        .expect("worker starts")
+        .expect("start signal arrives");
+    waiter.abort();
+    let _ = waiter.await;
+    assert_eq!(
+        executor.available(),
+        0,
+        "the detached worker keeps its permit"
+    );
+    release_tx.send(()).expect("release worker");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while executor.available() != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the permit returns after the worker finishes"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
