@@ -3599,21 +3599,30 @@ fn land_prepare_parts(
 ///
 /// The presented candidate must be the plan's primary candidate, and the
 /// policy generation must still match: a `policy.set` after prepare fails
-/// the execution as stale. Only the local leg is served: `remote` must be
-/// absent (this store); a present remote names a transport push the
-/// coordinator does not run.
+/// the execution as stale. The executing session must hold the `land`
+/// capability on the stored target, re-checked here because the executor
+/// may differ from the session that prepared the plan. Only the local leg
+/// is served: `remote` must be absent (this store); a present remote names
+/// a transport push the coordinator does not run.
 ///
 /// # Errors
 /// `E_HOSTED` for a present remote; `E_NOT_FOUND` for an unknown plan;
 /// `E_STALE` for a non-primary candidate, an expired plan, a moved target
 /// tip, a changed land policy, or a lost commit race; `E_POLICY` for a
-/// candidate that misses a requirement; `E_CORRUPT` or `E_IO` from the
-/// store.
+/// candidate that misses a requirement; `E_FORBIDDEN` when the executing
+/// session lacks the `land` grant on the target; `E_CORRUPT` or `E_IO`
+/// from the store.
 fn land_execute_parts(
     ctx: &PrepareContext<'_>,
     request_id: RequestId,
     args: &LandExecuteArgs,
 ) -> Result<Parts, CoreError> {
+    let row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "land.execute",
+            "land.execute checks the executing session's `land` capability, which needs the session identity row this path does not supply",
+        )
+    })?;
     let clock = ctx.clock.ok_or_else(|| {
         uncovered(
             "land.execute",
@@ -3629,6 +3638,7 @@ fn land_execute_parts(
     let now = clock.sample()?.timestamp();
     let (outcome, facts) =
         super::land::prepare_land_execute(ctx.store, args.plan, args.candidate, now, checkpoint)?;
+    row.capabilities.require_land(&outcome.target)?;
     let reply = Reply::LandExecute(Box::new(LandExecuteReply {
         outcome: pending_outcome(ctx.session, request_id),
         plan: outcome.plan,
@@ -4902,6 +4912,56 @@ mod tests {
         )
         .expect_err("a non-primary candidate refuses");
         assert_eq!(err.code, ErrorCode::EStale);
+    }
+
+    #[test]
+    fn land_execute_refuses_without_land_capability() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        // The executing session holds no land grant on the target, even
+        // though the preparing session did.
+        let bare = session_row_caps(None, Capabilities::default());
+        let exec_ctx = full_ctx(
+            &store,
+            session,
+            Some(&bare),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let err = prepare_mutation_with(
+            &exec_ctx,
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: oid,
+                },
+            })),
+        )
+        .expect_err("land.execute without the land grant is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
     }
 
     #[test]
