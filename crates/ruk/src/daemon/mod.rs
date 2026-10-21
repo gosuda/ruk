@@ -3079,7 +3079,7 @@ async fn serve_upload_streaming(upload: StreamingUpload<'_>) {
     let run_flag = Arc::clone(cancel_flag);
     let service = req.service.clone();
     let protocol = req.git_protocol.clone();
-    let run = refs.executor.run(move || {
+    let run = refs.transport.run(move || {
         run_streaming_upload(
             &run_coordinator,
             &service,
