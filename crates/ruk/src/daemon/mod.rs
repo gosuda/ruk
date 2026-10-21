@@ -2521,7 +2521,8 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     // instead would let the pump stop answering a blocked hook
     // exchange: the deadline lives only here, so the serve would hang
     // with its receipt unwritten.
-    let outcome: Option<Result<(Vec<u8>, Vec<u64>), CoreError>> = 'serve: loop {
+    type ServeOutcome = Option<Result<(Vec<u8>, Vec<u64>), CoreError>>;
+    let outcome: ServeOutcome = 'serve: loop {
         tokio::select! {
             done = &mut serve => {
                 break 'serve Some(match done {
