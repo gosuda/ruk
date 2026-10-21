@@ -19,7 +19,7 @@ use crate::graph::composite::GraphIndex;
 use crate::heads::Head;
 use crate::ids::{HashKind, Oid};
 use crate::index::{FileMode, RepoPath};
-use crate::protocol::{ChangeRef, EntryKind, QueryDigest, RevisionRef};
+use crate::protocol::{ChangeRef, EntryKind, QueryDigest, RevisionRef, TreeEntry};
 use crate::records::Records;
 use crate::store::Store;
 use crate::store::types::ObjectKind;
@@ -148,6 +148,38 @@ pub(crate) fn entry_kind(mode: TreeMode) -> EntryKind {
         TreeMode::File(FileMode::Symlink) => EntryKind::Symlink,
         TreeMode::File(FileMode::Gitlink) => EntryKind::Gitlink,
     }
+}
+
+/// Builds one protocol tree entry with its stored blob length.
+///
+/// Trees and gitlinks carry no size. A blob link to a missing object
+/// refuses `E_CORRUPT`: the tree is damaged.
+pub(crate) fn sized_tree_entry(
+    store: &Store,
+    name: Vec<u8>,
+    mode: TreeMode,
+    oid: Oid,
+) -> Result<TreeEntry, CoreError> {
+    let kind = entry_kind(mode);
+    let size = match mode {
+        TreeMode::Tree => None,
+        TreeMode::File(FileMode::Gitlink) => None,
+        TreeMode::File(_) => {
+            let length = store
+                .object_len(oid)
+                .map_err(CoreError::from)?
+                .ok_or_else(|| {
+                    CoreError::new(ErrorCode::ECorrupt, "tree entry links a missing object")
+                })?;
+            Some(length)
+        }
+    };
+    Ok(TreeEntry {
+        name: ByteString::from(name),
+        oid,
+        kind,
+        size,
+    })
 }
 
 /// Query digest binding one file directory page.

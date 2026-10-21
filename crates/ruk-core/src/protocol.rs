@@ -2451,6 +2451,9 @@ pub struct TreeEntry {
     pub name: ByteString,
     pub oid: Oid,
     pub kind: EntryKind,
+    /// Stored object length for blobs; absent for trees and gitlinks.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// One side of a conflicted file.

@@ -70,14 +70,14 @@ use crate::heads::Head;
 use crate::ids::Oid;
 use crate::protocol::{
     AttestListArgs, AttestListReply, BlameArgs, BlameHunk, BlameReply, ChangeHead,
-    ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitSummary, DEFAULT_PAGE_SIZE, DiffArgs,
-    DiffBlob, DiffBody, DiffKind, DiffReply, EventsTailArgs, EventsTailReply, FileArgs, FileBody,
-    FileDiff, FileReply, KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs,
+    ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitRev, CommitSummary, DEFAULT_PAGE_SIZE,
+    DiffArgs, DiffBlob, DiffBody, DiffKind, DiffReply, EventsTailArgs, EventsTailReply, FileArgs,
+    FileBody, FileDiff, FileReply, KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs,
     OpLogReply, Page, PageCursor, PageLimit, PathChangeKind, PathSelection, PathStatus, QueryArgs,
     QueryDigest, QueryMatch, QueryReply, ReconnectSecret, RefsListArgs, RefsListReply, Reply,
     RepoStatReply, Request, RevisionRef, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
     SessionResumeReply, ShowArgs, ShowBody, ShowReply, ShowTarget, SnapshotPolicy, StatusArgs,
-    StatusReply, TailedEvent, Timestamp, TreeEntry, ViewInfo,
+    StatusReply, TailedEvent, Timestamp, TreeArgs, TreeEntry, TreeReply, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
@@ -724,6 +724,10 @@ impl HostedCoordinator {
                 let reply = self.read_repo_stat()?;
                 Ok(Reply::RepoStat(Box::new(reply)))
             }
+            Request::Tree(args) => {
+                let reply = self.read_tree(&args)?;
+                Ok(Reply::Tree(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -767,6 +771,81 @@ impl HostedCoordinator {
             quarantined: self.store.quarantine(),
             oldest,
             head,
+        })
+    }
+
+    /// Resolves one tree revision to its root tree.
+    ///
+    /// A ref name follows symbolic targets (at most 16 hops) to a direct
+    /// commit and reads its recorded tree; a literal object id reads its
+    /// commit directly. Conflicted commits refuse [`ErrorCode::EConflicted`],
+    /// unknown refs and commits refuse `E_NOT_FOUND`.
+    fn resolve_tree_rev(&self, rev: &CommitRev) -> Result<Oid, CoreError> {
+        use crate::records::Records;
+        let oid = match rev {
+            CommitRev::Ref(name) => {
+                let mut target = self
+                    .store
+                    .fact(crate::store::types::FactTable::Refs, name.as_bytes())?
+                    .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+                    .and_then(|raw| {
+                        crate::store::decode("ref target", &raw).map_err(CoreError::from)
+                    })?;
+                let mut oid = None;
+                for _ in 0..16 {
+                    match target {
+                        crate::refdata::RefTarget::Direct(found) => {
+                            oid = Some(found);
+                            break;
+                        }
+                        crate::refdata::RefTarget::Symbolic(next) => {
+                            target = self
+                                .store
+                                .fact(crate::store::types::FactTable::Refs, next.as_bytes())?
+                                .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+                                .and_then(|raw| {
+                                    crate::store::decode("ref target", &raw)
+                                        .map_err(CoreError::from)
+                                })?;
+                        }
+                    }
+                }
+                oid.ok_or_else(|| {
+                    CoreError::new(ErrorCode::EInvalid, "ref is too deeply symbolic")
+                })?
+            }
+            CommitRev::Commit(oid) => *oid,
+        };
+        let record = Records::new(&self.store)
+            .get_commit(&Head::Git { oid })?
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown commit"))?;
+        record
+            .tree()
+            .as_resolved()
+            .copied()
+            .ok_or_else(|| CoreError::new(ErrorCode::EConflicted, "head is conflicted"))
+    }
+
+    /// Serves one `tree` read: one git-order directory listing with
+    /// stateless keyset paging.
+    ///
+    /// Reads hold no lane and publish nothing. Blob paths refuse
+    /// [`ErrorCode::EInvalid`], unknown cursors refuse it too, and
+    /// conflicted heads refuse [`ErrorCode::EConflicted`].
+    fn read_tree(&self, args: &TreeArgs) -> Result<TreeReply, CoreError> {
+        let root = self.resolve_tree_rev(&args.rev)?;
+        let limit = args.limit.map_or(DEFAULT_PAGE_SIZE, PageLimit::get);
+        let entries = crate::tree::list_directory(
+            &self.store,
+            self.store.hash_kind(),
+            root,
+            args.path.as_ref(),
+            limit,
+            args.after.as_ref().map(|name| name.as_bytes()),
+        )?;
+        Ok(TreeReply {
+            view: current_view(&self.store)?,
+            entries,
         })
     }
 
@@ -880,7 +959,7 @@ impl HostedCoordinator {
         page: &crate::protocol::PageRequest,
         now: StdInstant,
     ) -> Result<Page<TreeEntry>, CoreError> {
-        use super::reads::{entry_kind, file_query_digest, tree_items};
+        use super::reads::{file_query_digest, sized_tree_entry, tree_items};
         let limit = page.effective_limit();
         let items = tree_items(&self.store, target.kind, target.root)?;
         let start: usize = match page.cursor.as_ref() {
@@ -905,16 +984,15 @@ impl HostedCoordinator {
             }
         };
         let end = start.saturating_add(limit).min(items.len());
-        let entries = items
-            .get(start..end)
-            .unwrap_or_default()
-            .iter()
-            .map(|item| TreeEntry {
-                name: ByteString::from(item.name.clone()),
-                oid: item.oid,
-                kind: entry_kind(item.mode),
-            })
-            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for item in items.get(start..end).unwrap_or_default() {
+            entries.push(sized_tree_entry(
+                &self.store,
+                item.name.clone(),
+                item.mode,
+                item.oid,
+            )?);
+        }
         if end >= items.len() {
             return Page::new(entries, None);
         }
@@ -1333,13 +1411,9 @@ impl HostedCoordinator {
                 ),
             };
             let ops = lcs_align(old_lines, new_lines)?;
-            return Ok(DiffBody::Unified {
-                patch: crate::protocol::ByteSource::Inline {
-                    data: ByteString::from(unified_patch(
-                        &old_label, &new_label, old_lines, new_lines, &ops,
-                    )),
-                },
-            });
+            let patch = unified_patch(&old_label, &new_label, old_lines, new_lines, &ops);
+            let inline = super::reads::inline_body(patch)?;
+            return Ok(DiffBody::Unified { patch: inline });
         };
         if !is_text_blob(old_entry) || !is_text_blob(new_entry) {
             return Ok(DiffBody::Binary);
@@ -2584,9 +2658,6 @@ impl HostedCoordinator {
 /// so a caller learns which machinery would serve the method.
 fn read_gap(method: Method) -> &'static str {
     match method {
-        Method::Tree => {
-            "tree needs a git-order directory reader over resolved revisions with stateless keyset paging"
-        }
         Method::Compare => "compare needs a merge-base walk with bounded ahead and behind counts",
         Method::Search => {
             "search needs the core-owned search pool plus lease cursors over bounded parallel scans"
@@ -3466,6 +3537,306 @@ mod tests {
             Some(b"refs/heads/main".to_vec())
         );
         assert_eq!(meta.view, coord.view().expect("coordinator view"));
+    }
+
+    async fn tree_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::TreeArgs,
+    ) -> crate::protocol::TreeReply {
+        let reply = coord
+            .read(owner, session, Request::Tree(Box::new(args)), cancel)
+            .await
+            .expect("tree serves");
+        let Reply::Tree(page) = reply else {
+            panic!("tree must answer its own reply");
+        };
+        *page
+    }
+
+    #[tokio::test]
+    async fn tree_lists_root_with_keyset_paging() {
+        use crate::protocol::{CommitRev, PageLimit, TreeArgs};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (_, head_b, _) = read_fixtures(coord.store());
+        let commit = match head_b {
+            Head::Git { oid } => oid,
+            Head::Conflicted { .. } => panic!("fixture head is git"),
+        };
+        let args = |limit: u32, after: Option<&[u8]>| TreeArgs {
+            rev: CommitRev::Commit(commit),
+            path: None,
+            limit: PageLimit::new(limit).ok(),
+            after: after.map(ByteString::from),
+        };
+        let first = tree_of(&coord, &owner, session, &cancel, args(1, None)).await;
+        assert_eq!(first.entries.items.len(), 1);
+        assert_eq!(first.entries.items[0].name.as_bytes(), b"f.txt");
+        assert_eq!(first.entries.items[0].size, Some(8));
+        let next = first.entries.next_after.clone().expect("continuation");
+        let second = tree_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            args(1, Some(next.as_bytes())),
+        )
+        .await;
+        assert_eq!(second.entries.items.len(), 1);
+        assert_eq!(second.entries.items[0].name.as_bytes(), b"g.txt");
+        assert_eq!(second.entries.items[0].size, Some(4));
+        assert_eq!(second.entries.next_after, None);
+        let bad = coord
+            .read(
+                &owner,
+                session,
+                Request::Tree(Box::new(args(1, Some(b"nope")))),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown tree cursor refuses");
+        assert_eq!(bad.code, ErrorCode::EInvalid);
+        let blob_path = coord
+            .read(
+                &owner,
+                session,
+                Request::Tree(Box::new(TreeArgs {
+                    rev: CommitRev::Commit(commit),
+                    path: Some(crate::index::RepoPath::new("f.txt").expect("path")),
+                    limit: None,
+                    after: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("blob path refuses");
+        assert_eq!(blob_path.code, ErrorCode::EInvalid);
+    }
+
+    #[tokio::test]
+    async fn tree_resolves_ref_revisions() {
+        use crate::protocol::{CommitRev, TreeArgs};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (_, head_b, _) = read_fixtures(coord.store());
+        let commit = match head_b {
+            Head::Git { oid } => oid,
+            Head::Conflicted { .. } => panic!("fixture head is git"),
+        };
+        seed_ref_oid(&coord, "refs/heads/main", commit);
+        let reply = tree_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            TreeArgs {
+                rev: CommitRev::Ref(RefName::new("refs/heads/main").expect("ref")),
+                path: None,
+                limit: None,
+                after: None,
+            },
+        )
+        .await;
+        assert_eq!(reply.entries.items.len(), 2);
+        let unknown = coord
+            .read(
+                &owner,
+                session,
+                Request::Tree(Box::new(TreeArgs {
+                    rev: CommitRev::Ref(RefName::new("refs/heads/nope").expect("ref")),
+                    path: None,
+                    limit: None,
+                    after: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown ref refuses");
+        assert_eq!(unknown.code, ErrorCode::ENotFound);
+    }
+
+    #[tokio::test]
+    async fn head_tree_refuses_conflicted_heads() {
+        let (_temp, coord, _owner) = coordinator();
+        let (head_a, _, _) = read_fixtures(coord.store());
+        let tree_a = crate::coord::reads::head_tree(coord.store(), &head_a).expect("tree");
+        let signature = || crate::conflict::Signature {
+            name: ByteString::from("ada"),
+            email: ByteString::from("ada@example.com"),
+            timestamp: 1_700_000_000,
+            offset: crate::conflict::TzOffset::new(false, 0).expect("tz offset"),
+        };
+        let mut preparer = crate::records::Records::new(coord.store()).batch_preparer();
+        let conflicted = preparer
+            .add_native_commit(crate::commit::NativeCommitInput {
+                change_id: crate::change::ChangeId::generate(),
+                tree: crate::merge::Merge::from_vec(vec![tree_a, tree_a, tree_a]),
+                parents: Vec::new(),
+                predecessor: None,
+                author: signature(),
+                committer: signature(),
+                extra_headers: Vec::new(),
+                message: ByteString::from("conflicted"),
+                provenance: None,
+            })
+            .expect("prepare conflicted");
+        let batch = preparer.finish().expect("finish batch");
+        coord
+            .store()
+            .publish(
+                batch.prepared_objects,
+                &batch.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish conflicted");
+        let err = crate::coord::reads::head_tree(coord.store(), &conflicted)
+            .expect_err("conflicted tree refuses");
+        assert_eq!(err.code, ErrorCode::EConflicted);
+    }
+
+    #[tokio::test]
+    async fn hosted_blob_read_refuses_past_bound() {
+        let (_temp, coord, _owner) = coordinator();
+        let big = vec![b'x'; 17_000_000];
+        let length = u64::try_from(big.len()).expect("object length");
+        let prepared = coord
+            .store()
+            .prepare(
+                crate::store::types::ObjectKind::Blob,
+                length,
+                big.as_slice(),
+                None,
+            )
+            .expect("prepare big blob");
+        let oid = prepared.oid();
+        coord
+            .store()
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish big blob");
+        let err = crate::coord::reads::blob_bytes(coord.store(), oid)
+            .expect_err("oversize blob refuses before loading");
+        assert_eq!(err.code, ErrorCode::ELimit);
+    }
+
+    #[tokio::test]
+    async fn diff_added_huge_file_refuses_inline_bound() {
+        use crate::protocol::{DiffArgs, PathSelection, RevisionRef};
+        use crate::workcopy::tree::{TreeItem, TreeMode, encode_tree};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (head_a, _, _) = read_fixtures(coord.store());
+        let big = vec![b'y'; 17_000_000];
+        let length = u64::try_from(big.len()).expect("object length");
+        let prepared = coord
+            .store()
+            .prepare(
+                crate::store::types::ObjectKind::Blob,
+                length,
+                big.as_slice(),
+                None,
+            )
+            .expect("prepare big blob");
+        let blob = prepared.oid();
+        coord
+            .store()
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish big blob");
+        let encoded = encode_tree(&[TreeItem {
+            name: b"big.bin".to_vec(),
+            mode: TreeMode::File(crate::index::FileMode::Regular),
+            oid: blob,
+        }]);
+        let tree_length = u64::try_from(encoded.len()).expect("object length");
+        let prepared = coord
+            .store()
+            .prepare(
+                crate::store::types::ObjectKind::Tree,
+                tree_length,
+                encoded.as_slice(),
+                None,
+            )
+            .expect("prepare big tree");
+        let tree = prepared.oid();
+        coord
+            .store()
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish big tree");
+        let signature = crate::conflict::Signature {
+            name: ByteString::from("ada"),
+            email: ByteString::from("ada@example.com"),
+            timestamp: 1_700_000_000,
+            offset: crate::conflict::TzOffset::new(false, 0).expect("tz offset"),
+        };
+        let head_big = crate::ops::new(
+            coord.store(),
+            crate::ops::NewRequest {
+                tree,
+                parents: vec![head_a],
+                author: signature.clone(),
+                committer: signature,
+                message: ByteString::from("big"),
+                change_id: None,
+                predecessor: None,
+                provenance: None,
+            },
+        )
+        .expect("new commit")
+        .head;
+        let err = coord
+            .read(
+                &owner,
+                session,
+                Request::Diff(Box::new(DiffArgs {
+                    left: RevisionRef::Head { head: head_a },
+                    right: RevisionRef::Head { head: head_big },
+                    paths: PathSelection::All,
+                    page: crate::protocol::PageRequest::default(),
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("huge added file refuses the inline bound");
+        assert_eq!(err.code, ErrorCode::ELimit);
     }
 
     #[tokio::test]

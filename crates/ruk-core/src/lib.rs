@@ -48,6 +48,7 @@ pub mod refs;
 )]
 mod revset;
 pub mod store;
+pub mod tree;
 mod workcopy;
 #[expect(
     dead_code,
