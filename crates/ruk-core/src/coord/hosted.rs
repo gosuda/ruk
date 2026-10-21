@@ -4003,6 +4003,9 @@ mod tests {
         use crate::store::types::{FactExpectation, FactMutation, FactTable, RepoMetaRow};
         let row = RepoMetaRow {
             default_branch: RefName::new(branch).expect("branch name"),
+            land_requirements: Vec::new(),
+            trusted_signers: Vec::new(),
+            policy_generation: 0,
         };
         let bytes = postcard::to_allocvec(&row).expect("repo meta encodes");
         coord

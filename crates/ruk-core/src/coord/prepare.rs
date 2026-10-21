@@ -122,10 +122,11 @@ use crate::protocol::{
     ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
     EditReply, EffectiveIdentity, GitCommitArgs, HeadRewrite, IdentityClaim, IdentitySource,
     LandPrepareArgs, LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply,
-    RebaseArgs, RebaseScope, ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs,
-    SquashArgs, TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs,
-    UnpinReply, Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply,
-    WsNewArgs, WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
+    PolicySetArgs, PolicySetReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
+    RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
+    TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
+    WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs,
+    WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
     Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
@@ -298,6 +299,7 @@ pub(crate) fn prepare_mutation_with(
             ));
         }
         Request::LandPrepare(m) => land_prepare_parts(ctx, m.request_id, &m.args)?,
+        Request::PolicySet(m) => policy_set_parts(ctx, m.request_id, &m.args)?,
         Request::LandExecute(_) => {
             return Err(uncovered(
                 "land.execute",
@@ -3431,15 +3433,76 @@ fn undo_parts(
     })
 }
 
+/// Prepares `policy.set`: replaces the repo-wide landing policy and bumps
+/// the policy generation by one. The write is conditional on the row read,
+/// so a concurrent `policy.set` fails loudly as stale instead of silently
+/// winning. Landing plans prepared under an older generation refuse at
+/// execution with `E_STALE`, so a policy bump invalidates prepared plans.
+///
+/// # Errors
+/// - [`ErrorCode::EHosted`] without the session row (no identity source).
+/// - [`ErrorCode::ELimit`] for a policy larger than the land bounds.
+/// - [`ErrorCode::ENotFound`] when no metadata row exists yet.
+/// - [`ErrorCode::EStale`] when the policy row moved under the call.
+/// - Store failures.
+fn policy_set_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &PolicySetArgs,
+) -> Result<Parts, CoreError> {
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "policy.set",
+            "policy.set checks the session identity row this path does not supply",
+        )
+    })?;
+    crate::attestation::check_land_policy(args.requirements.len(), &args.trusted_signers)?;
+    let key = crate::store::types::REPO_META_KEY.to_vec();
+    let Some((row, raw)) = ctx.store.repo_meta_raw().map_err(CoreError::from)? else {
+        return Err(CoreError::new(
+            ErrorCode::ENotFound,
+            "repo metadata is missing; run repo.init first",
+        ));
+    };
+    let generation = row
+        .policy_generation
+        .checked_add(1)
+        .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "land policy generation overflow"))?;
+    let next = crate::store::types::RepoMetaRow {
+        default_branch: row.default_branch,
+        land_requirements: args.requirements.clone(),
+        trusted_signers: args.trusted_signers.clone(),
+        policy_generation: generation,
+    };
+    let bytes = crate::store::encode("repo meta", &next).map_err(CoreError::from)?;
+    let reply = Reply::PolicySet(Box::new(PolicySetReply {
+        outcome: pending_outcome(ctx.session, request_id),
+        generation,
+    }));
+    Ok(Parts {
+        reply,
+        objects: Vec::new(),
+        facts: vec![crate::store::types::FactMutation {
+            table: crate::store::types::FactTable::RepoMeta,
+            key,
+            expected: crate::store::types::FactExpectation::Value(raw),
+            value: Some(bytes),
+        }],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
 /// Prepares `land.prepare`: freezes the resolved change head as the exact
 /// single-candidate plan over the target's live tip, moving no ref.
 ///
 /// The candidate set derives from the resolved head: one exact commit.
-/// Requirements and trusted signers ship empty with `policy_generation = 0`
-/// because `PrincipalPolicy` carries no land-requirement fields, only `land`
-/// ref patterns and `attest` kinds; a `[land] requirements` policy section is
-/// follow-up work. The target still needs the session's `land` capability,
-/// checked here while the lane re-checks authority at commit time.
+/// Requirements, trusted signers, and the policy generation come from the
+/// repo-wide landing policy (`policy.set`); stores predating the policy
+/// prepare unconstrained at generation zero. The target still needs the
+/// session's `land` capability, checked here while the lane re-checks
+/// authority at commit time.
 ///
 /// # Errors
 /// - [`ErrorCode::EHosted`] without the session row (no capability source),
@@ -3481,16 +3544,25 @@ fn land_prepare_parts(
         ));
     };
     row.capabilities.require_land(&args.target)?;
+    let (requirements, trusted, policy_generation) =
+        match store.repo_meta().map_err(CoreError::from)? {
+            Some(meta) => (
+                meta.land_requirements,
+                meta.trusted_signers,
+                meta.policy_generation,
+            ),
+            None => (Vec::new(), Vec::new(), 0),
+        };
     let (plan, mutation) = prepare_land_plan(
         store,
         LandPrepareRequest {
             change: args.change,
             target: args.target.clone(),
             candidates: vec![*candidate],
-            requirements: Vec::new(),
-            trusted: Vec::new(),
+            requirements,
+            trusted,
             merge: args.merge,
-            policy_generation: 0,
+            policy_generation,
             now: clock.sample()?.timestamp(),
         },
         checkpoint,
@@ -3722,13 +3794,14 @@ mod tests {
     use crate::index::RepoPath;
     use crate::ops::{NewRequest, prepare_new};
     use crate::protocol::{
-        AbandonArgs, AttestAddArgs, AttestSignature, AttestStatement, BookmarkDeleteArgs,
-        ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs,
-        FetchArgs, FetchFilter, FetchRefs, GitCommitArgs, GitCommitRefUpdate, IdentityClaim,
-        LandExecuteArgs, LandPrepareArgs, MergeSelection, Mutation as WireMutation, NewArgs,
-        PathSelection, PinArgs, PushArgs, PushAtomicity, PushReconcileArgs, PushSource, PushUpdate,
-        RebaseArgs, RebaseScope, RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs,
-        SessionAuthority, SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs,
+        AbandonArgs, AttestAddArgs, AttestRequirement, AttestSignature, AttestStatement,
+        BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs, ClaimTtl,
+        DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs, GitCommitArgs,
+        GitCommitRefUpdate, IdentityClaim, LandExecuteArgs, LandPrepareArgs, MergeSelection,
+        Mutation as WireMutation, NewArgs, PathSelection, PinArgs, PolicySetArgs, PushArgs,
+        PushAtomicity, PushReconcileArgs, PushSource, PushUpdate, RebaseArgs, RebaseScope,
+        RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
+        SignerFingerprint, SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs,
         WorkspaceBinding, WorkspaceInit, WsNewArgs,
     };
     use crate::records::codec::encode_change_entry;
@@ -4578,6 +4651,73 @@ mod tests {
             .expect("plan stored");
         assert_eq!(stored.candidate(), Some(oid));
         assert_eq!(stored.base, None);
+    }
+
+    #[test]
+    fn policy_set_bumps_generation_and_land_prepare_inherits_it() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        store
+            .write_repo_meta(RefName::new("refs/heads/main").expect("branch"))
+            .expect("seed repo meta");
+        let requirement = || AttestRequirement {
+            kind: AttestKind::new("ci/build").expect("kind"),
+            result: AttestResult::new("pass").expect("result"),
+            valid_until: None,
+        };
+        let signer =
+            || SignerFingerprint::new(format!("SHA256:{}", "A".repeat(43))).expect("signer");
+        let set = || {
+            Request::PolicySet(Box::new(WireMutation {
+                request_id: request_id(),
+                args: PolicySetArgs {
+                    requirements: vec![requirement()],
+                    trusted_signers: vec![signer()],
+                },
+            }))
+        };
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let first = prepare_mutation_with(&ctx, set()).expect("policy.set serves");
+        let Reply::PolicySet(first_reply) = first.reply else {
+            panic!("policy.set must answer its own reply");
+        };
+        assert_eq!(first_reply.generation, 1);
+        store
+            .publish(
+                first.objects,
+                &first.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish first policy");
+        let second = prepare_mutation_with(&ctx, set()).expect("policy.set serves again");
+        let Reply::PolicySet(second_reply) = second.reply else {
+            panic!("policy.set must answer its own reply");
+        };
+        assert_eq!(second_reply.generation, 2);
+        store
+            .publish(
+                second.objects,
+                &second.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish second policy");
+        let (head, change, _) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        assert_eq!(reply.policy_generation, 2);
+        assert_eq!(reply.requirements, vec![requirement()]);
     }
 
     #[test]

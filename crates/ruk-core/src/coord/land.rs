@@ -388,6 +388,16 @@ pub(super) fn land_execute(
             "land plan expired; re-prepare",
         ));
     }
+    let current_generation = store
+        .repo_meta()
+        .map_err(CoreError::from)?
+        .map_or(0, |meta| meta.policy_generation);
+    if current_generation != plan.policy_generation {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            "land policy changed since prepare; re-prepare",
+        ));
+    }
     let refs = StoreRefs::new(store);
     let resolved = resolve(&refs, &plan.target).map_err(CoreError::from)?;
     if resolved.terminal != plan.target {
@@ -662,6 +672,49 @@ mod tests {
         assert!(
             plan.satisfied_at_prepare,
             "a bound after signing keeps the gate satisfied"
+        );
+    }
+
+    #[test]
+    fn policy_bump_invalidates_prepared_plans() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let plan = land_prepare(&lab.store, lab.request(None), &checkpoint)
+            .expect("prepare records the attempt");
+        assert_eq!(plan.policy_generation, 0);
+        let bumped = crate::store::types::RepoMetaRow {
+            default_branch: crate::refdata::RefName::new("refs/heads/main").expect("branch"),
+            land_requirements: Vec::new(),
+            trusted_signers: Vec::new(),
+            policy_generation: 1,
+        };
+        let bytes = crate::store::encode("repo meta", &bumped).expect("encode policy");
+        lab.store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::RepoMeta,
+                    key: crate::store::types::REPO_META_KEY.to_vec(),
+                    expected: FactExpectation::Any,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("bump the land policy");
+        let err = land_execute(
+            &lab.store,
+            &plan,
+            Timestamp::parse(SIGNED_AT).expect("now"),
+            &checkpoint,
+        )
+        .expect_err("a policy bump invalidates the prepared plan");
+        assert_eq!(err.code, ErrorCode::EStale);
+        assert!(
+            err.message.contains("policy changed"),
+            "names the invalidation: {}",
+            err.message
         );
     }
 }

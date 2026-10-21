@@ -92,7 +92,7 @@ use metadata::{Metadata, PublicationTxn};
 use pinned::{PinnedRoot, segment_rel};
 use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
 use segment::SegmentWriter;
-use types::decode_store_event;
+use types::{RepoMetaRowV0, decode_store_event};
 
 /// Longest delta chain accepted on write and read.
 pub(crate) const MAX_DELTA_DEPTH: u8 = 50;
@@ -1153,9 +1153,15 @@ impl Store {
     /// # Errors
     /// Database failures propagate; quarantine refuses.
     pub fn repo_meta(&self) -> Result<Option<RepoMetaRow>, StoreError> {
+        Ok(self.repo_meta_raw()?.map(|(row, _)| row))
+    }
+
+    /// Reads the repository metadata row with its exact stored bytes.
+    /// Absent rows mean the store predates `repo.init` metadata.
+    pub(crate) fn repo_meta_raw(&self) -> Result<Option<(RepoMetaRow, Vec<u8>)>, StoreError> {
         match self.fact(FactTable::RepoMeta, REPO_META_KEY)? {
             None => Ok(None),
-            Some(raw) => decode("repo meta", &raw).map(Some),
+            Some(raw) => decode_repo_meta(&raw).map(|row| Some((row, raw))),
         }
     }
 
@@ -1166,7 +1172,12 @@ impl Store {
     /// # Errors
     /// Database failures propagate; quarantine refuses.
     pub fn write_repo_meta(&self, default_branch: RefName) -> Result<(), StoreError> {
-        let row = RepoMetaRow { default_branch };
+        let row = RepoMetaRow {
+            default_branch,
+            land_requirements: Vec::new(),
+            trusted_signers: Vec::new(),
+            policy_generation: 0,
+        };
         let bytes = metadata::encode("repo meta", &row)?;
         self.publish(
             Vec::new(),
@@ -1484,6 +1495,23 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Decodes one repository metadata row, accepting the pre-policy shape.
+/// Rows written before `policy.set` existed read back with an empty
+/// landing policy at generation zero.
+fn decode_repo_meta(bytes: &[u8]) -> Result<RepoMetaRow, StoreError> {
+    if let Ok(row) = decode::<RepoMetaRow>("repo meta", bytes) {
+        return Ok(row);
+    }
+    let old: RepoMetaRowV0 = decode("repo meta", bytes)
+        .map_err(|_| StoreError::Corrupt("repo meta: malformed row".to_owned()))?;
+    Ok(RepoMetaRow {
+        default_branch: old.default_branch,
+        land_requirements: Vec::new(),
+        trusted_signers: Vec::new(),
+        policy_generation: 0,
+    })
 }
 
 /// A committed duplicate is compatible when kind and decoded length agree.
@@ -2130,6 +2158,38 @@ mod tests {
 
     fn reopen(temp: &TempRoot) -> Store {
         Store::open(&temp.store_dir(), budget()).expect("open store")
+    }
+
+    #[test]
+    fn repo_meta_reads_pre_policy_rows_with_empty_policy() {
+        #[derive(serde::Serialize)]
+        struct OldRepoMetaRow {
+            default_branch: crate::refdata::RefName,
+        }
+        let temp = TempRoot::new("repo-meta-v0");
+        let store = create(&temp, HashKind::Sha1);
+        let old = OldRepoMetaRow {
+            default_branch: crate::refdata::RefName::new("refs/heads/main").expect("branch"),
+        };
+        let bytes = postcard::to_allocvec(&old).expect("encode old row");
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::RepoMeta,
+                    key: REPO_META_KEY.to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish old row");
+        let row = store.repo_meta().expect("read meta").expect("row present");
+        assert_eq!(row.default_branch.as_bytes(), b"refs/heads/main");
+        assert!(row.land_requirements.is_empty());
+        assert!(row.trusted_signers.is_empty());
+        assert_eq!(row.policy_generation, 0);
     }
 
     #[test]

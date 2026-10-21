@@ -473,11 +473,31 @@ pub struct EventHeadRow {
 pub const EVENT_HEAD_KEY: &[u8] = b"head";
 
 /// The `RepoMeta` row: repository-level metadata written once at init.
-/// `repo.init` persists the default branch here; later rows may extend
-/// this shape with new trailing fields.
+/// `repo.init` persists the default branch here; `policy.set` extends the
+/// row with the landing policy, bumping `policy_generation` every write.
+/// Stores predating the policy fields decode through [`RepoMetaRowV0`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepoMetaRow {
     /// The default branch name recorded at init.
+    pub default_branch: RefName,
+    /// Attestation predicates every landing candidate must carry.
+    /// Empty means landing is unconstrained.
+    #[serde(default)]
+    pub land_requirements: Vec<crate::protocol::AttestRequirement>,
+    /// Signers trusted to meet the landing requirements.
+    #[serde(default)]
+    pub trusted_signers: Vec<crate::protocol::SignerFingerprint>,
+    /// How many `policy.set` writes this row has seen.
+    #[serde(default)]
+    pub policy_generation: u64,
+}
+
+/// Pre-policy repository metadata: the [`RepoMetaRow`] shape before the
+/// trailing landing-policy fields. Decode-only, for stores written before
+/// `policy.set` existed; they read back with an empty policy at
+/// generation zero.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct RepoMetaRowV0 {
     pub default_branch: RefName,
 }
 

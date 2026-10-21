@@ -58,6 +58,7 @@ use crate::error::CoreError;
 pub use export::{ExportSummary, export, parse_export};
 pub(crate) use layout::{is_order_key, is_statement_key};
 pub use prepare::{Disposition, PreparedAttestations, PreparedRecord, prepare_add, prepare_batch};
+pub(crate) use query::check_land_policy;
 pub use query::{
     AttestationPage, BoundedRequirement, Gap, LandEvaluation, RequirementEvaluation,
     RequirementOutcome, StatementFilter, attested, evaluate_bounded_requirements,

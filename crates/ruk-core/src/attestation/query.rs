@@ -367,7 +367,7 @@ pub fn evaluate_bounded_requirements(
 }
 
 /// Rejects over-limit or trustless land evaluations before any store read.
-fn check_land_policy(
+pub(crate) fn check_land_policy(
     requirement_count: usize,
     trusted: &[SignerFingerprint],
 ) -> Result<BTreeSet<&SignerFingerprint>, CoreError> {
