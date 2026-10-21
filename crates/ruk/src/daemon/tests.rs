@@ -1500,6 +1500,7 @@ async fn provenance_records_on_behalf_of_and_ignores_it_for_auth() {
         paths: vec![RepoPath::new("src").expect("test path")],
         ttl: ClaimTtl::new(60).expect("ttl"),
         mode: ClaimMode::Enforce,
+        subject: None,
     };
     let args_json = sonic_rs::to_string(&acquire_args).expect("acquire args encode");
     let payload = Driver::typed_open_obo(
@@ -4194,6 +4195,7 @@ async fn typed_claim_acquire_and_release_round_trip() {
         paths: vec![RepoPath::new("src").expect("test path")],
         ttl: ClaimTtl::new(60).expect("ttl"),
         mode: ClaimMode::Enforce,
+        subject: None,
     };
     let args_json = sonic_rs::to_string(&acquire_args).expect("acquire args encode");
     let payload = Driver::typed_open(

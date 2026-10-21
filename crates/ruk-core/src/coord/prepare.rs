@@ -84,7 +84,7 @@
 //! committed, and the exact fact expectations add point compare-and-swap
 //! as a second layer.
 
-use super::claims::{ClaimClock, canonical_paths, read_record};
+use super::claims::{ClaimClock, canonical_paths, read_record, validate_claim_ttl};
 use super::land::{LandPrepareRequest, prepare_land_plan};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -119,13 +119,14 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
-    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
-    EditReply, EffectiveIdentity, GitCommitArgs, HeadRewrite, IdentityClaim, IdentitySource,
-    LandPrepareArgs, LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply,
-    RebaseArgs, RebaseScope, ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs,
-    SquashArgs, TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs,
-    UnpinReply, Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply,
-    WsNewArgs, WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
+    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, ClaimRenewArgs,
+    ClaimRenewReply, DescribeArgs, EditArgs, EditReply, EffectiveIdentity, GitCommitArgs,
+    HeadRewrite, IdentityClaim, IdentitySource, LandPrepareArgs, LandPrepareReply, MutationOutcome,
+    NewArgs, NewReply, PinArgs, PinReply, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
+    RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
+    TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
+    WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs,
+    WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
     Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
@@ -167,7 +168,10 @@ pub(crate) struct PrepareContext<'a> {
     /// Wall clock for signature timestamps; absent on the legacy path.
     pub(crate) clock: Option<&'a Clock>,
     /// Monotonic claim clock for claim sealing; absent on the legacy path.
-    #[expect(dead_code, reason = "wired in CS-R42 (claim sealing)")]
+    #[expect(
+        dead_code,
+        reason = "reserved for a later row; preparation predicts without sealing"
+    )]
     pub(crate) claim_clock: Option<&'a ClaimClock>,
     /// Admission policy for land preparation; absent on the legacy path.
     #[expect(dead_code, reason = "wired in CS-R38/40/44 (land preparation)")]
@@ -263,6 +267,7 @@ pub(crate) fn prepare_mutation_with(
         Request::GitCommit(m) => git_commit_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimAcquire(m) => claim_acquire_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimRelease(m) => claim_release_parts(ctx, m.request_id, &m.args)?,
+        Request::ClaimRenew(m) => claim_renew_parts(ctx, m.request_id, &m.args)?,
         Request::WsNew(m) => ws_new_parts(ctx, m.request_id, &m.args)?,
         Request::WsScope(m) => ws_scope_parts(ctx, m.request_id, &m.args)?,
         Request::WsTake(m) => ws_take_parts(ctx, m.request_id, &m.args)?,
@@ -1214,6 +1219,7 @@ fn claim_acquire_parts(
     for path in &paths {
         row.capabilities.require_claim(path)?;
     }
+    validate_claim_ttl(args.subject.as_ref(), args.ttl.seconds())?;
     let now = jiff::Timestamp::now();
     let expires_at = Timestamp::new(
         now.checked_add(jiff::SignedDuration::from_secs(i64::from(
@@ -1231,6 +1237,7 @@ fn claim_acquire_parts(
                 mode: args.mode,
                 expires_at,
                 on_behalf_of: ctx.on_behalf_of.clone(),
+                subject: args.subject.clone(),
             },
         })),
         objects: Vec::new(),
@@ -1267,6 +1274,66 @@ fn claim_release_parts(
         reply: Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: pending_outcome(session, request_id),
             released: record,
+        })),
+        objects: Vec::new(),
+        facts: Vec::new(),
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// Prepares `claim.renew` without sealing: reads the stored record for an
+/// early holder and liveness check and predicts the renewed reply. The lane
+/// re-reads and seals authoritatively at commit time and overwrites the
+/// record.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown claim.
+/// - [`ErrorCode::EForbidden`] for another session's claim.
+/// - [`ErrorCode::EStale`] for an expired claim.
+/// - [`ErrorCode::EInvalid`] for a path-only renewal above the hourly ceiling.
+fn claim_renew_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ClaimRenewArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let Some(record) = read_record(ctx.store, args.claim)? else {
+        return Err(CoreError::new(ErrorCode::ENotFound, "claim does not exist"));
+    };
+    if record.holder != session {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            "claim belongs to another session",
+        ));
+    }
+    let now = jiff::Timestamp::now();
+    if record.expires_at <= Timestamp::new(now) {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            "claim has expired; acquire a fresh claim",
+        ));
+    }
+    validate_claim_ttl(record.subject.as_ref(), args.ttl.seconds())?;
+    let expires_at = Timestamp::new(
+        now.checked_add(jiff::SignedDuration::from_secs(i64::from(
+            args.ttl.seconds(),
+        )))
+        .unwrap_or(now),
+    );
+    Ok(Parts {
+        reply: Reply::ClaimRenew(Box::new(ClaimRenewReply {
+            outcome: pending_outcome(session, request_id),
+            claim: ClaimRecord {
+                claim: record.claim,
+                holder: record.holder,
+                paths: record.paths,
+                mode: record.mode,
+                expires_at,
+                on_behalf_of: record.on_behalf_of,
+                subject: record.subject,
+            },
         })),
         objects: Vec::new(),
         facts: Vec::new(),
@@ -4000,6 +4067,7 @@ mod tests {
                 paths: vec![RepoPath::new("src").expect("test path")],
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
         }));
         let err =
@@ -5209,6 +5277,7 @@ mod tests {
                     ],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5240,6 +5309,7 @@ mod tests {
                     paths: vec![RepoPath::new("src").expect("test path")],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5255,6 +5325,7 @@ mod tests {
                     paths: Vec::new(),
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5277,6 +5348,7 @@ mod tests {
                 paths: vec![RepoPath::new("src").expect("test path")],
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
             None,
         )
@@ -5337,6 +5409,134 @@ mod tests {
         )
         .expect_err("foreign claim is forbidden");
         assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn claim_renew_predicts_the_renewed_record() {
+        let (_temp, store, session) = fixture();
+        // The lapsed claim seals first, while no claim-clock fence exists
+        // yet, so the fixed clock anchors it in the past; a later fence
+        // would max the window back to the present.
+        let past = crate::coord::claims::ClaimClock::open(&store, fixed_clock())
+            .expect("past claim clock opens");
+        let lapsed = crate::coord::claims::seal_acquire(
+            &store,
+            &past,
+            session,
+            ClaimId::generate(),
+            ClaimAcquireArgs {
+                paths: vec![RepoPath::new("old").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: None,
+            },
+            None,
+        )
+        .expect("seal lapsed claim");
+        store
+            .publish(
+                Vec::new(),
+                &lapsed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish lapsed claim");
+        let clock = crate::coord::clock::Clock::system();
+        let claims =
+            crate::coord::claims::ClaimClock::open(&store, clock).expect("claim clock opens");
+        let subject = Some(crate::protocol::ClaimSubject::Task(
+            crate::protocol::TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+        ));
+        let sealed = crate::coord::claims::seal_acquire(
+            &store,
+            &claims,
+            session,
+            ClaimId::generate(),
+            ClaimAcquireArgs {
+                paths: vec![RepoPath::new("src").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: subject.clone(),
+            },
+            None,
+        )
+        .expect("seal fixture claim");
+        store
+            .publish(
+                Vec::new(),
+                &sealed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish fixture claim");
+
+        // The legacy path serves renewals: prediction reads the record and
+        // extends its window, and the lane re-seals authoritatively.
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: sealed.record.claim,
+                    ttl: ClaimTtl::new(120).expect("ttl"),
+                },
+            })),
+        )
+        .expect("claim.renew prepares");
+        let Reply::ClaimRenew(reply) = prepared.reply else {
+            panic!("claim.renew must answer its own reply");
+        };
+        assert_eq!(reply.claim.subject, subject);
+        assert_eq!(reply.claim.holder, session);
+        assert_eq!(reply.claim.paths, sealed.record.paths);
+        assert!(prepared.facts.is_empty());
+
+        // An unknown claim is not found.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: ClaimId::generate(),
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("unknown claim is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        // Another session's claim is forbidden.
+        let holder = SessionId::generate();
+        let err = prepare_mutation(
+            &store,
+            holder,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: sealed.record.claim,
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("foreign claim is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        // An expired claim predicts stale, matching the lane seal.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: lapsed.record.claim,
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("expired claim is stale");
+        assert_eq!(err.code, ErrorCode::EStale);
     }
 
     #[test]

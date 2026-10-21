@@ -6,11 +6,11 @@ use super::*;
 use crate::capability::{Capabilities, ReadIntents};
 use crate::coord::leases::{AcquireArgs, CursorWant, LeaseKind, LeaseRegistry};
 use crate::ids::HashKind;
-use crate::protocol::ClaimTtl;
 use crate::protocol::{
     ClaimHolderFilter, ClaimListArgs, EditAction, Mutation, PageCursor, QueryDigest, Request,
     WriteArgs, WriteEdit,
 };
+use crate::protocol::{ClaimSubject, ClaimTtl, TaskKey};
 use crate::store::{EventContext, EventSource, PreparationBudget};
 use crate::{ByteString, OperationId, RequestId, StoreId, WorkspaceId};
 
@@ -92,6 +92,7 @@ fn args(paths: &[&str], mode: ClaimMode) -> ClaimAcquireArgs {
         paths: paths.iter().map(|text| path(text)).collect(),
         ttl: ClaimTtl::new(60).expect("ttl"),
         mode,
+        subject: None,
     }
 }
 fn write_error(result: Result<ClaimCheck, CoreError>) -> ErrorCode {
@@ -105,6 +106,290 @@ fn acquire_error(result: Result<ClaimChange, CoreError>) -> ErrorCode {
         Ok(_) => panic!("acquisition unexpectedly permitted"),
         Err(error) => error.code,
     }
+}
+fn renew_error(result: Result<ClaimChange, CoreError>) -> ErrorCode {
+    match result {
+        Ok(_) => panic!("renewal unexpectedly permitted"),
+        Err(error) => error.code,
+    }
+}
+fn task_subject() -> ClaimSubject {
+    ClaimSubject::Task(TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"))
+}
+fn task_args(paths: &[&str], seconds: u32) -> ClaimAcquireArgs {
+    ClaimAcquireArgs {
+        paths: paths.iter().map(|text| path(text)).collect(),
+        ttl: ClaimTtl::new(seconds).expect("ttl"),
+        mode: ClaimMode::Enforce,
+        subject: Some(task_subject()),
+    }
+}
+fn publish(change: &ClaimChange, fixture: &Fixture) {
+    fixture
+        .store
+        .publish(
+            Vec::new(),
+            &change.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish claim");
+}
+
+#[test]
+fn task_claim_acquire_carries_subject_and_allows_longer_ttl() {
+    let fixture = Fixture::new();
+    let change = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(1),
+        claim(1),
+        task_args(&["src"], 24 * 3600),
+        None,
+    )
+    .expect("task acquire");
+    publish(&change, &fixture);
+    let stored = read_record(&fixture.store, claim(1))
+        .expect("read")
+        .expect("record");
+    assert_eq!(stored.subject, Some(task_subject()));
+    assert_eq!(stored.holder, holder(1));
+    // A subject-less claim cannot take a task-lease lifetime.
+    assert_eq!(
+        acquire_error(seal_acquire(
+            &fixture.store,
+            &fixture.claims,
+            holder(1),
+            claim(2),
+            ClaimAcquireArgs {
+                paths: vec![path("other")],
+                ttl: ClaimTtl::new(3601).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: None,
+            },
+            None,
+        )),
+        ErrorCode::EInvalid
+    );
+}
+
+#[test]
+fn claim_renew_extends_window_and_preserves_subject() {
+    let fixture = Fixture::new();
+    let original = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(1),
+        claim(1),
+        task_args(&["src"], 60),
+        None,
+    )
+    .expect("task acquire");
+    publish(&original, &fixture);
+    fixture
+        .clock
+        .advance_injected(Duration::from_secs(30), None)
+        .expect("advance");
+    let renewed =
+        seal_renew(&fixture.store, &fixture.claims, holder(1), claim(1), 120).expect("renew");
+    assert!(renewed.record.expires_at > original.record.expires_at);
+    assert_eq!(renewed.record.subject, Some(task_subject()));
+    assert_eq!(renewed.record.paths, original.record.paths);
+    assert_eq!(renewed.record.mode, original.record.mode);
+    assert_eq!(renewed.record.holder, original.record.holder);
+    assert_eq!(renewed.record.claim, original.record.claim);
+    publish(&renewed, &fixture);
+    let stored = read_record(&fixture.store, claim(1))
+        .expect("read")
+        .expect("record");
+    assert_eq!(stored.expires_at, renewed.record.expires_at);
+    assert_eq!(stored.subject, Some(task_subject()));
+}
+
+#[test]
+fn claim_renew_refuses_expired_and_foreign_claims() {
+    let fixture = Fixture::new();
+    let change = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(1),
+        claim(1),
+        task_args(&["src"], 60),
+        None,
+    )
+    .expect("task acquire");
+    publish(&change, &fixture);
+    assert_eq!(
+        renew_error(seal_renew(
+            &fixture.store,
+            &fixture.claims,
+            holder(2),
+            claim(1),
+            60
+        )),
+        ErrorCode::EForbidden
+    );
+    fixture
+        .clock
+        .advance_injected(Duration::from_secs(60), None)
+        .expect("expire");
+    assert_eq!(
+        renew_error(seal_renew(
+            &fixture.store,
+            &fixture.claims,
+            holder(1),
+            claim(1),
+            60
+        )),
+        ErrorCode::EStale
+    );
+    assert_eq!(
+        renew_error(seal_renew(
+            &fixture.store,
+            &fixture.claims,
+            holder(1),
+            claim(9),
+            60
+        )),
+        ErrorCode::ENotFound
+    );
+}
+
+#[test]
+fn claim_sweep_removes_only_expired_records() {
+    let fixture = Fixture::new();
+    let first = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(1),
+        claim(1),
+        task_args(&["old"], 60),
+        None,
+    )
+    .expect("first acquire");
+    publish(&first, &fixture);
+    fixture
+        .clock
+        .advance_injected(Duration::from_secs(59), None)
+        .expect("advance");
+    let second = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(1),
+        claim(2),
+        task_args(&["new"], 60),
+        None,
+    )
+    .expect("second acquire");
+    publish(&second, &fixture);
+    fixture
+        .clock
+        .advance_injected(Duration::from_secs(2), None)
+        .expect("expire first");
+    let sweep = sweep_page(
+        &fixture.store,
+        &fixture.claims,
+        None,
+        FactPageBudget::new(10, 4096),
+    )
+    .expect("select sweep");
+    assert!(!sweep.facts.is_empty(), "expired claim must sweep");
+    fixture
+        .store
+        .publish(
+            Vec::new(),
+            &sweep.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish sweep");
+    assert!(
+        read_record(&fixture.store, claim(1))
+            .expect("read")
+            .is_none(),
+        "expired claim must delete"
+    );
+    assert!(
+        read_record(&fixture.store, claim(2))
+            .expect("read")
+            .is_some(),
+        "live claim must survive"
+    );
+    let idle = sweep_page(
+        &fixture.store,
+        &fixture.claims,
+        None,
+        FactPageBudget::new(10, 4096),
+    )
+    .expect("reselect sweep");
+    assert!(
+        idle.facts.is_empty(),
+        "a clean table sweeps nothing, not even the fence"
+    );
+}
+
+#[test]
+fn pre_subject_claim_decodes_with_empty_subject() {
+    let fixture = Fixture::new();
+    let now = fixture.claims.now().expect("now");
+    let then = Timestamp::new(
+        now.instant()
+            .checked_add(jiff::SignedDuration::from_secs(60))
+            .expect("expiry"),
+    );
+    let old = super::ClaimRowV2 {
+        version: 2,
+        created: now,
+        record: super::ClaimRecordV2 {
+            claim: claim(8),
+            holder: holder(1),
+            paths: vec![path("v2")],
+            mode: ClaimMode::Enforce,
+            expires_at: then,
+            on_behalf_of: Some("hook".to_owned()),
+        },
+    };
+    let raw = crate::store::encode("claim", &old).expect("encode v2 row");
+    let row = decode_claim(&fixture.store, &record_key(claim(8)), &raw).expect("v2 decodes");
+    assert_eq!(row.version, super::CLAIM_ROW_VERSION);
+    assert_eq!(row.record.claim, claim(8));
+    assert_eq!(row.record.on_behalf_of, Some("hook".to_owned()));
+    assert_eq!(row.record.subject, None);
+}
+
+#[test]
+fn live_holders_exports_only_live_holders() {
+    let fixture = Fixture::new();
+    for (holder_id, claim_id, paths) in [(1, 1, &["a"][..]), (2, 2, &["b"][..])] {
+        let change = seal_acquire(
+            &fixture.store,
+            &fixture.claims,
+            holder(holder_id),
+            claim(claim_id),
+            task_args(paths, 60),
+            None,
+        )
+        .expect("acquire");
+        publish(&change, &fixture);
+    }
+    fixture
+        .clock
+        .advance_injected(Duration::from_secs(60), None)
+        .expect("expire");
+    let change = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(2),
+        claim(3),
+        task_args(&["c"], 60),
+        None,
+    )
+    .expect("reacquire");
+    publish(&change, &fixture);
+    assert_eq!(
+        live_holders(&fixture.store, &fixture.claims).expect("holders"),
+        vec![holder(2)]
+    );
 }
 
 #[test]

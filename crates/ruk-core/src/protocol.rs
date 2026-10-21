@@ -70,8 +70,10 @@ pub const SCHEMA_MAJOR: u32 = 1;
 /// `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`,
 /// `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`,
 /// `claim.renew`, `policy.set`) and the `Admin` method kind; older readers
-/// refuse its frames as unknown methods.
-pub const SCHEMA_MINOR: u32 = 2;
+/// refuse its frames as unknown methods. Minor 3 appends the task-keyed
+/// claim subject (`ClaimRecord.subject`) and the task-lease lifetime
+/// ceiling; minor-2 readers cannot decode subject-carrying claim rows.
+pub const SCHEMA_MINOR: u32 = 3;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -85,8 +87,15 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// Largest accepted page limit; more is rejected, never clamped.
 pub const MAX_PAGE_SIZE: usize = 1000;
 
-/// Longest claim lifetime in seconds (one hour).
+/// Longest path-only claim lifetime in seconds (one hour). Task-keyed
+/// claims name a subject that outlives one operator session, so they may
+/// use [`MAX_TASK_CLAIM_TTL_SECONDS`] instead.
 pub const MAX_CLAIM_TTL_SECONDS: u32 = 3600;
+
+/// Longest task-keyed claim lifetime in seconds (one day). Only records
+/// carrying a [`ClaimSubject`] may use lifetimes above
+/// [`MAX_CLAIM_TTL_SECONDS`]; the seal enforces the scope.
+pub const MAX_TASK_CLAIM_TTL_SECONDS: u32 = 24 * 3600;
 
 /// Longest accepted revset text.
 pub const MAX_REVSET_BYTES: usize = 64 * 1024;
@@ -855,6 +864,16 @@ bounded_text! {
 }
 
 bounded_text! {
+    /// A rukie task (intent) identity naming one task-keyed claim.
+    pub struct TaskKey {
+        schema: "TaskKey",
+        max: 128,
+        doc: "Task key: 1..=128 bytes without control characters; the subject key renders as `task:<id>`.",
+        check: no_controls,
+    }
+}
+
+bounded_text! {
     /// An armored SSH signature over an attestation payload.
     pub struct AttestSignature {
         schema: "AttestSignature",
@@ -864,7 +883,9 @@ bounded_text! {
     }
 }
 
-/// How long a claim lasts: `1..=`[`MAX_CLAIM_TTL_SECONDS`] seconds.
+/// How long a claim lasts: `1..=`[`MAX_TASK_CLAIM_TTL_SECONDS`] seconds.
+/// Lifetimes above [`MAX_CLAIM_TTL_SECONDS`] are task-lease scope only; the
+/// claim seal refuses them on records without a [`ClaimSubject`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
 pub struct ClaimTtl(u32);
@@ -873,12 +894,12 @@ impl ClaimTtl {
     /// Validates a lifetime in seconds.
     ///
     /// # Errors
-    /// Zero, or longer than one hour.
+    /// Zero, or longer than one day.
     pub fn new(seconds: u32) -> Result<Self, CoreModelError> {
-        if seconds == 0 || seconds > MAX_CLAIM_TTL_SECONDS {
+        if seconds == 0 || seconds > MAX_TASK_CLAIM_TTL_SECONDS {
             return Err(model_invalid(
                 "claim ttl",
-                format!("{seconds} is outside 1..={MAX_CLAIM_TTL_SECONDS} seconds"),
+                format!("{seconds} is outside 1..={MAX_TASK_CLAIM_TTL_SECONDS} seconds"),
             ));
         }
         Ok(Self(seconds))
@@ -914,8 +935,8 @@ impl JsonSchema for ClaimTtl {
         json_schema!({
             "type": "integer",
             "minimum": 1,
-            "maximum": MAX_CLAIM_TTL_SECONDS,
-            "description": "Claim lifetime in seconds, at most one hour."
+            "maximum": MAX_TASK_CLAIM_TTL_SECONDS,
+            "description": "Claim lifetime in seconds, at most one day for task-keyed claims."
         })
     }
 }
@@ -1758,6 +1779,33 @@ pub enum ClaimMode {
     Advise,
 }
 
+/// What a claim is held for: the task/change subject key alongside paths.
+///
+/// A task-keyed claim carries `task:<id>` so one record covers the intent's
+/// declared paths across rukie restarts; a change-keyed claim names the Ruk
+/// change under review. Path-only claims carry no subject and stay capped
+/// at [`MAX_CLAIM_TTL_SECONDS`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimSubject {
+    /// A rukie task (intent); the subject key renders as `task:<id>`.
+    Task(TaskKey),
+    /// The Ruk change under review; the subject key is the change id.
+    Change(ChangeId),
+}
+
+impl ClaimSubject {
+    /// The canonical subject-key string rukie correlates against:
+    /// `task:<id>` for tasks, the change id for changes.
+    #[must_use]
+    pub fn subject_key(&self) -> String {
+        match self {
+            Self::Task(task) => format!("task:{task}"),
+            Self::Change(change) => change.to_string(),
+        }
+    }
+}
+
 /// `claim.acquire`: each path claims itself and everything below it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimAcquireArgs {
@@ -1765,6 +1813,11 @@ pub struct ClaimAcquireArgs {
     pub ttl: ClaimTtl,
     #[serde(default)]
     pub mode: ClaimMode,
+    /// Task/change subject for task-keyed claims; absent for path-only
+    /// claims. Only subject-carrying acquisitions may use task-lease
+    /// lifetimes above [`MAX_CLAIM_TTL_SECONDS`].
+    #[serde(default)]
+    pub subject: Option<ClaimSubject>,
 }
 
 /// A held claim.
@@ -1779,6 +1832,11 @@ pub struct ClaimRecord {
     /// authorization input.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// Task/change subject for task-keyed claims; absent for path-only
+    /// claims. Renewals preserve it; releases and sweeps drop the record
+    /// with it.
+    #[serde(default)]
+    pub subject: Option<ClaimSubject>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -4170,6 +4228,7 @@ pub fn model_schema_json() -> Schema {
             "page_default": DEFAULT_PAGE_SIZE,
             "page_max": MAX_PAGE_SIZE,
             "claim_ttl_seconds": MAX_CLAIM_TTL_SECONDS,
+            "task_claim_ttl_seconds": MAX_TASK_CLAIM_TTL_SECONDS,
         },
         "framing": {
             "length_prefix_bytes": FRAME_PREFIX_BYTES,
@@ -4982,13 +5041,15 @@ mod tests {
     }
 
     #[test]
-    fn claim_lifetimes_are_between_one_second_and_one_hour() {
+    fn claim_lifetimes_are_between_one_second_and_one_day() {
         assert!(ClaimTtl::new(1).is_ok());
         assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS).is_ok());
+        assert!(ClaimTtl::new(MAX_TASK_CLAIM_TTL_SECONDS).is_ok());
         assert!(ClaimTtl::new(0).is_err());
-        assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS + 1).is_err());
+        assert!(ClaimTtl::new(MAX_TASK_CLAIM_TTL_SECONDS + 1).is_err());
         assert!(sonic_rs::from_str::<ClaimTtl>("3600").is_ok());
-        assert!(sonic_rs::from_str::<ClaimTtl>("3601").is_err());
+        assert!(sonic_rs::from_str::<ClaimTtl>("86400").is_ok());
+        assert!(sonic_rs::from_str::<ClaimTtl>("86401").is_err());
         let acquire = |paths: Vec<RepoPath>| {
             Request::ClaimAcquire(mutation(
                 1,
@@ -4996,6 +5057,7 @@ mod tests {
                     paths,
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::default(),
+                    subject: None,
                 },
             ))
             .validate()
@@ -5004,6 +5066,31 @@ mod tests {
         assert!(acquire(vec![]).is_err());
         assert!(acquire(vec![path("src"), path("src")]).is_err());
         assert_eq!(ClaimMode::default(), ClaimMode::Enforce);
+    }
+
+    #[test]
+    fn claim_subject_keys_render_canonically() {
+        let task = ClaimSubject::Task(TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task"));
+        assert_eq!(task.subject_key(), "task:01JATASKKEYEXAMPLE000000001");
+        let change = ClaimSubject::Change(ChangeId::from_bytes([7; 16]));
+        assert_eq!(
+            change.subject_key(),
+            ChangeId::from_bytes([7; 16]).to_string()
+        );
+        assert!(TaskKey::new("has\0nul").is_err());
+        assert!(TaskKey::new("has\nnewline").is_err());
+        let wired = sonic_rs::to_value(&ClaimAcquireArgs {
+            paths: vec![path("src")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+            subject: Some(task),
+        })
+        .expect("subject args encode");
+        let back: ClaimAcquireArgs = sonic_rs::from_value(&wired).expect("subject args decode");
+        assert_eq!(
+            back.subject.expect("subject").subject_key(),
+            "task:01JATASKKEYEXAMPLE000000001"
+        );
     }
 
     #[test]
@@ -5496,6 +5583,9 @@ mod tests {
             mode: ClaimMode::Advise,
             expires_at: timestamp("2026-10-17T13:00:00Z"),
             on_behalf_of: None,
+            subject: Some(ClaimSubject::Task(
+                TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+            )),
         };
         let release = Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: sample_outcome(),
@@ -5947,6 +6037,7 @@ mod tests {
         assert_eq!(doc["limits"]["page_default"], 100);
         assert_eq!(doc["limits"]["page_max"], 1000);
         assert_eq!(doc["limits"]["claim_ttl_seconds"], 3600);
+        assert_eq!(doc["limits"]["task_claim_ttl_seconds"], 24 * 3600);
         assert_eq!(doc["framing"]["length_prefix_bytes"], 4);
         let registry = doc["error_codes"].as_array().expect("error codes");
         assert_eq!(registry.len(), ErrorCode::ALL.len());
