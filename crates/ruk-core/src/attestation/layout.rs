@@ -44,6 +44,16 @@ pub(super) fn subject_kind_prefix(subject: &Oid, kind: &str) -> Vec<u8> {
     key
 }
 
+/// The statement rows of one subject whose kind starts with `prefix`: the
+/// subject bytes plus the raw prefix, with no terminator, so the scan
+/// covers every longer kind. Kinds cannot contain NUL, so byte order keeps
+/// the range exact; per-row checks still confirm the prefix.
+pub(super) fn subject_kind_prefix_scan(subject: &Oid, prefix: &str) -> Vec<u8> {
+    let mut key = subject_prefix(subject);
+    key.extend_from_slice(prefix.as_bytes());
+    key
+}
+
 /// One `(subject, kind, signer)` group: every statement a signer made about one
 /// object for one kind.
 pub(super) fn group_prefix(subject: &Oid, kind: &str, signer: &str) -> Vec<u8> {
@@ -64,6 +74,15 @@ pub(super) fn order_kind_prefix(kind: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + kind.len() + 1);
     key.push(ORDER_TAG);
     push_text(&mut key, kind);
+    key
+}
+
+/// The order index rows whose kind starts with `prefix`: the tag plus the
+/// raw prefix, with no terminator. Per-row checks still confirm the prefix.
+pub(super) fn order_kind_prefix_scan(prefix: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + prefix.len());
+    key.push(ORDER_TAG);
+    key.extend_from_slice(prefix.as_bytes());
     key
 }
 

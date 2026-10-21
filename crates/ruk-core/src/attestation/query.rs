@@ -19,8 +19,9 @@ use crate::protocol::{
 use crate::store::{FactRow, Store};
 
 use super::layout::{
-    ORDER_PREFIX, group_prefix, order_group_prefix, order_kind_prefix, parse_order_key,
-    parse_statement_key, subject_kind_prefix, subject_prefix,
+    ORDER_PREFIX, group_prefix, order_group_prefix, order_kind_prefix, order_kind_prefix_scan,
+    parse_order_key, parse_statement_key, subject_kind_prefix, subject_kind_prefix_scan,
+    subject_prefix,
 };
 use super::rows::{corrupt, decode_row, load_group, read_statement};
 use super::status;
@@ -39,10 +40,33 @@ pub struct StatementFilter {
     pub subject: Option<Oid>,
     /// Only statements of this kind.
     pub kind: Option<AttestKind>,
+    /// Only statements whose kind starts with this prefix. Combines with
+    /// `kind`: a statement matches when its kind equals `kind` and starts
+    /// with `kind_prefix`.
+    pub kind_prefix: Option<AttestKind>,
     /// Only statements by this signer.
     pub signer: Option<SignerFingerprint>,
     /// Whether superseded statements are returned, with their status.
     pub include_superseded: bool,
+}
+
+/// Whether a scanned statement's kind passes the filter's kind selectors.
+fn kind_matches(filter: &StatementFilter, kind: &str) -> bool {
+    if filter
+        .kind
+        .as_ref()
+        .is_some_and(|exact| exact.as_str() != kind)
+    {
+        return false;
+    }
+    if filter
+        .kind_prefix
+        .as_ref()
+        .is_some_and(|prefix| !kind.starts_with(prefix.as_str()))
+    {
+        return false;
+    }
+    true
 }
 
 /// One page of statements.
@@ -465,6 +489,7 @@ enum Source {
 /// The family a filter scans and the prefix that bounds the scan. Filters that
 /// the prefix cannot express are checked per row.
 fn plan(filter: &StatementFilter) -> (Source, Vec<u8>) {
+    let prefix = filter.kind_prefix.as_ref().map(|prefix| prefix.as_str());
     match (&filter.subject, &filter.kind, &filter.signer) {
         (Some(subject), Some(kind), Some(signer)) => (
             Source::Statements,
@@ -474,13 +499,26 @@ fn plan(filter: &StatementFilter) -> (Source, Vec<u8>) {
             Source::Statements,
             subject_kind_prefix(subject, kind.as_str()),
         ),
-        (Some(subject), None, _) => (Source::Statements, subject_prefix(subject)),
+        (Some(subject), None, _) => match prefix {
+            Some(prefix) => (
+                Source::Statements,
+                subject_kind_prefix_scan(subject, prefix),
+            ),
+            None => (Source::Statements, subject_prefix(subject)),
+        },
         (None, Some(kind), Some(signer)) => (
             Source::Order,
             order_group_prefix(kind.as_str(), signer.as_str()),
         ),
         (None, Some(kind), None) => (Source::Order, order_kind_prefix(kind.as_str())),
-        (None, None, _) => (Source::Order, ORDER_PREFIX.to_vec()),
+        (None, None, Some(_)) => match prefix {
+            Some(prefix) => (Source::Order, order_kind_prefix_scan(prefix)),
+            None => (Source::Order, ORDER_PREFIX.to_vec()),
+        },
+        (None, None, None) => match prefix {
+            Some(prefix) => (Source::Order, order_kind_prefix_scan(prefix)),
+            None => (Source::Order, ORDER_PREFIX.to_vec()),
+        },
     }
 }
 
@@ -508,6 +546,9 @@ fn resolve_statement_row(
     let Some((_, fields)) = parse_statement_key(&row.key, store.hash_kind().oid_len()) else {
         return corrupt(store, "statement row key is malformed");
     };
+    if !kind_matches(filter, fields.kind) {
+        return Ok(None);
+    }
     if filter
         .signer
         .as_ref()
@@ -528,6 +569,9 @@ fn resolve_order_row(
     let Some(fields) = parse_order_key(&row.key) else {
         return corrupt(store, "order index key is malformed");
     };
+    if !kind_matches(filter, fields.kind) {
+        return Ok(None);
+    }
     if filter
         .signer
         .as_ref()

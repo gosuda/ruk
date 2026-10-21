@@ -1892,6 +1892,11 @@ pub struct AttestAddReply {
 }
 
 /// `attest.list`.
+///
+/// `kind` selects one exact kind; `kind_prefix` selects every kind starting
+/// with the prefix, for CI dashboards scanning `ci/` verdicts. Both set
+/// filters combine: a statement matches when its kind equals `kind` and
+/// starts with `kind_prefix`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestListArgs {
     #[serde(default)]
@@ -1904,6 +1909,11 @@ pub struct AttestListArgs {
     pub include_superseded: bool,
     #[serde(default)]
     pub page: PageRequest,
+    /// Only kinds starting with this prefix. Appended last so the postcard
+    /// encoding of every earlier field is unchanged; the field is optional,
+    /// so older JSON without it decodes to no prefix filter.
+    #[serde(default)]
+    pub kind_prefix: Option<AttestKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
