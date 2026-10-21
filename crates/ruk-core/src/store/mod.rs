@@ -79,8 +79,8 @@ pub use spool::{BudgetLimits, PreparationBudget, Spool};
 pub use stream::{ChunkDecision, StreamMeta};
 pub use types::{
     EVENT_HEAD_KEY, Encoding, EventContext, EventHeadRow, EventSource, FactExpectation,
-    FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject, Publication, ReadObject,
-    RefEvent, SegmentManifest, StoreEvent, StoreFormat,
+    FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject, Publication,
+    REPO_META_KEY, ReadObject, RefEvent, RepoMetaRow, SegmentManifest, StoreEvent, StoreFormat,
 };
 
 use crate::change::StoreId;
@@ -1141,6 +1141,19 @@ impl Store {
     pub fn event_head(&self) -> Result<(u64, u64), StoreError> {
         let (head, oldest, _) = self.read_event_head()?;
         Ok((head, oldest))
+    }
+
+    /// Reads the repository metadata row written at init. Absent rows mean
+    /// the store predates `repo.init` metadata and carries no default
+    /// branch.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn repo_meta(&self) -> Result<Option<RepoMetaRow>, StoreError> {
+        match self.fact(FactTable::RepoMeta, REPO_META_KEY)? {
+            None => Ok(None),
+            Some(raw) => decode("repo meta", &raw).map(Some),
+        }
     }
 
     /// Reads the event horizon: the last assigned sequence, the oldest

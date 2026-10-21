@@ -18,7 +18,7 @@
 
 use crate::change::{OperationId, SessionId, StoreId};
 use crate::ids::{HashKind, Oid};
-use crate::refdata::RefTarget;
+use crate::refdata::{RefName, RefTarget};
 use crate::store::spool::Spool;
 use serde::de::{self, Deserialize, Deserializer};
 
@@ -471,6 +471,18 @@ pub struct EventHeadRow {
 
 /// The `EventHead` row key.
 pub const EVENT_HEAD_KEY: &[u8] = b"head";
+
+/// The `RepoMeta` row: repository-level metadata written once at init.
+/// `repo.init` persists the default branch here; later rows may extend
+/// this shape with new trailing fields.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoMetaRow {
+    /// The default branch name recorded at init.
+    pub default_branch: RefName,
+}
+
+/// The `RepoMeta` row key.
+pub const REPO_META_KEY: &[u8] = b"meta";
 
 /// Conditional application of one fact mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -3116,8 +3116,9 @@ impl Validate for BlameArgs {
 // Hosted forge methods (minor 2)
 // ---------------------------------------------------------------------------
 
-/// `repo.stat`: store identity, object format, default branch, and the
-/// event horizon. Served from the store head; counts no refs.
+/// `repo.stat`: store identity, object format, default branch, quarantine
+/// latch, and the event horizon. Served from the store head; counts no
+/// refs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepoStatArgs {}
 
@@ -3128,6 +3129,12 @@ pub struct RepoStatReply {
     pub object_format: HashKind,
     #[serde(default)]
     pub default_branch: Option<RefName>,
+    /// Whether committed corruption latched quarantine in this session.
+    pub quarantined: bool,
+    /// The oldest retained event sequence.
+    pub oldest: u64,
+    /// The last assigned event sequence.
+    pub head: u64,
 }
 
 /// `tree`: one directory listing with stateless keyset paging.

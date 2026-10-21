@@ -75,9 +75,9 @@ use crate::protocol::{
     FileDiff, FileReply, KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs,
     OpLogReply, Page, PageCursor, PageLimit, PathChangeKind, PathSelection, PathStatus, QueryArgs,
     QueryDigest, QueryMatch, QueryReply, ReconnectSecret, RefsListArgs, RefsListReply, Reply,
-    Request, RevisionRef, SessionAuthority, SessionOpenArgs, SessionResumeArgs, SessionResumeReply,
-    ShowArgs, ShowBody, ShowReply, ShowTarget, SnapshotPolicy, StatusArgs, StatusReply,
-    TailedEvent, Timestamp, TreeEntry, ViewInfo,
+    RepoStatReply, Request, RevisionRef, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
+    SessionResumeReply, ShowArgs, ShowBody, ShowReply, ShowTarget, SnapshotPolicy, StatusArgs,
+    StatusReply, TailedEvent, Timestamp, TreeEntry, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
@@ -720,6 +720,10 @@ impl HostedCoordinator {
                 let reply = self.read_status(session, &args, times.mono)?;
                 Ok(Reply::Status(Box::new(reply)))
             }
+            Request::RepoStat(_) => {
+                let reply = self.read_repo_stat()?;
+                Ok(Reply::RepoStat(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -729,6 +733,41 @@ impl HostedCoordinator {
                 ),
             )),
         }
+    }
+
+    /// Returns the store and operation snapshot reads are served from.
+    ///
+    /// Mirrors the head load of [`read_oplog`] so adapters report the same
+    /// view of the same head without opening a session.
+    ///
+    /// # Errors
+    /// `E_CORRUPT` for a damaged head row.
+    pub fn view(&self) -> Result<ViewInfo, CoreError> {
+        current_view(&self.store)
+    }
+
+    /// Serves one `repo.stat` read: store identity, object format, default
+    /// branch, quarantine latch, and the event horizon.
+    ///
+    /// The default branch comes from the `RepoMeta` row `repo.init` writes;
+    /// stores predating that metadata report no default branch. Whole-ref
+    /// counts are never computed. Reads hold no lane and publish nothing.
+    fn read_repo_stat(&self) -> Result<RepoStatReply, CoreError> {
+        let default_branch = self
+            .store
+            .repo_meta()
+            .map_err(CoreError::from)?
+            .map(|row| row.default_branch);
+        let (head, oldest) = self.store.event_head().map_err(CoreError::from)?;
+        Ok(RepoStatReply {
+            view: current_view(&self.store)?,
+            store_id: self.store.store_id(),
+            object_format: self.store.hash_kind(),
+            default_branch,
+            quarantined: self.store.quarantine(),
+            oldest,
+            head,
+        })
     }
 
     /// Serves one `refs.list` page with prefix and inclusive-start seek.
@@ -2545,9 +2584,6 @@ impl HostedCoordinator {
 /// so a caller learns which machinery would serve the method.
 fn read_gap(method: Method) -> &'static str {
     match method {
-        Method::RepoStat => {
-            "repo.stat needs the store id, object format, RepoMeta default branch, and event horizon from the store head"
-        }
         Method::Tree => {
             "tree needs a git-order directory reader over resolved revisions with stateless keyset paging"
         }
@@ -3362,6 +3398,74 @@ mod tests {
             .expect_err("unknown workspace refuses");
         assert_eq!(unknown.code, ErrorCode::ENotFound);
         let _ = RepoPath::new("f.txt").expect("path");
+    }
+
+    fn publish_repo_meta(coord: &HostedCoordinator, branch: &str) {
+        use crate::store::types::{FactExpectation, FactMutation, FactTable, RepoMetaRow};
+        let row = RepoMetaRow {
+            default_branch: RefName::new(branch).expect("branch name"),
+        };
+        let bytes = postcard::to_allocvec(&row).expect("repo meta encodes");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::RepoMeta,
+                    key: crate::store::types::REPO_META_KEY.to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish repo meta");
+    }
+
+    async fn stat_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+    ) -> crate::protocol::RepoStatReply {
+        let reply = coord
+            .read(owner, session, Request::RepoStat(Box::default()), cancel)
+            .await
+            .expect("repo.stat serves");
+        let Reply::RepoStat(page) = reply else {
+            panic!("repo.stat must answer its own reply");
+        };
+        *page
+    }
+
+    #[tokio::test]
+    async fn repo_stat_serves_store_snapshot() {
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let bare = stat_of(&coord, &owner, session, &cancel).await;
+        assert_eq!(bare.store_id, coord.store().store_id());
+        assert_eq!(bare.object_format, coord.store().hash_kind());
+        assert_eq!(bare.default_branch, None);
+        assert!(!bare.quarantined);
+        assert_eq!(bare.view, coord.view().expect("coordinator view"));
+        let (head, oldest) = coord.store().event_head().expect("event head");
+        assert_eq!((bare.head, bare.oldest), (head, oldest));
+        publish_repo_meta(&coord, "refs/heads/main");
+        let meta = stat_of(&coord, &owner, session, &cancel).await;
+        assert_eq!(
+            meta.default_branch
+                .as_ref()
+                .map(|name| name.as_bytes().to_vec()),
+            Some(b"refs/heads/main".to_vec())
+        );
+        assert_eq!(meta.view, coord.view().expect("coordinator view"));
     }
 
     #[tokio::test]
