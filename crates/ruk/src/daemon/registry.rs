@@ -291,6 +291,25 @@ impl Registry {
             .unwrap_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository path is unknown")))
     }
 
+    /// Resolves `requested` to the pinned store directory. `requested` can
+    /// be the repository root, which holds its store in `.ruk`, or the
+    /// store directory itself.
+    ///
+    /// # Errors
+    /// As for [`Registry::resolve_pinned`].
+    fn store_pinned(&self, requested: &Path) -> Result<ruk_core::contained::PinnedDir, CoreError> {
+        let pinned = self.resolve_pinned(requested)?;
+        if pinned.path().file_name().is_some_and(|name| name == ".ruk") {
+            return Ok(pinned);
+        }
+        let store = pinned.path().join(".ruk");
+        if store.is_dir() {
+            drop(pinned);
+            return self.resolve_pinned(&store);
+        }
+        Ok(pinned)
+    }
+
     /// Creates one repository beneath `args.root` at `args.path`.
     ///
     /// The destination must be absent; `Store::create` enforces the same
@@ -352,8 +371,9 @@ impl Registry {
                 })?
             }
         };
+        let store_dir = destination.join(".ruk");
         let store = ruk_core::store::Store::create(
-            &destination,
+            &store_dir,
             kind,
             Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
         )
@@ -363,7 +383,9 @@ impl Registry {
             .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
         let store_id = store.store_id();
         drop(store);
-        self.handle_for_path(&destination)?;
+        let store_canonical = std::fs::canonicalize(&store_dir)
+            .map_err(|err| CoreError::new(ErrorCode::EIo, err.to_string()))?;
+        self.handle_for_path(&store_canonical)?;
         Ok(RepoInitReply {
             path: path.to_owned(),
             store_id,
@@ -405,7 +427,7 @@ impl Registry {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
-            let taken = take_entry_by_path(&mut inner, &canonical);
+            let taken = take_entry_by_path(&mut inner, &canonical.join(".ruk"));
             if let Some((_, entry)) = &taken {
                 let busy = entry
                     .coordinator
@@ -500,7 +522,7 @@ impl Registry {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
-            if let Some(entry) = entry_by_path_mut(&mut inner, &canonical) {
+            if let Some(entry) = entry_by_path_mut(&mut inner, &canonical.join(".ruk")) {
                 let busy = entry
                     .coordinator
                     .as_ref()
@@ -513,7 +535,7 @@ impl Registry {
                 }
                 let coordinator = entry.coordinator.take();
                 entry.runner.take();
-                entry.path = destination.clone();
+                entry.path = destination.join(".ruk");
                 entry.last_used = Instant::now();
                 coordinator
             } else {
@@ -626,12 +648,12 @@ impl Registry {
         repo_ref: &str,
     ) -> Result<(String, PathBuf, Arc<HostedCoordinator>), CoreError> {
         let (handle, pinned) = if repo_ref.starts_with('/') {
-            let pinned = self.resolve_pinned(Path::new(repo_ref))?;
+            let pinned = self.store_pinned(Path::new(repo_ref))?;
             let handle = self.handle_for_path(pinned.path())?;
             (handle, pinned)
         } else {
             let stored = self.open_by_handle(repo_ref)?;
-            let pinned = self.resolve_pinned(&stored)?;
+            let pinned = self.store_pinned(&stored)?;
             (repo_ref.to_string(), pinned)
         };
         let path = pinned.path().to_path_buf();
@@ -1043,7 +1065,7 @@ mod tests {
         assert_eq!(created.default_branch.as_bytes(), b"refs/heads/main");
         let store_id = created.store_id;
         let meta = ruk_core::store::Store::open(
-            &canonical.join("acme/hello"),
+            &canonical.join("acme/hello").join(".ruk"),
             std::sync::Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
         )
         .expect("created store opens")
