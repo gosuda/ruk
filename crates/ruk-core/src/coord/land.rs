@@ -50,7 +50,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::attestation::{
-    Checkpoint, MAX_LAND_REQUIREMENTS, MAX_TRUSTED_SIGNERS, evaluate_requirements,
+    BoundedRequirement, Checkpoint, MAX_LAND_REQUIREMENTS, MAX_TRUSTED_SIGNERS,
+    evaluate_bounded_requirements,
 };
 use crate::change::PlanId;
 use crate::error::{CoreError, ErrorCode};
@@ -136,7 +137,7 @@ impl LandPlan {
     ///
     /// The plan stays valid at exactly `expires_at` and refuses after it.
     #[must_use]
-    #[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
     pub(super) fn is_expired(&self, now: Timestamp) -> bool {
         now.instant() > self.expires_at.instant()
     }
@@ -144,7 +145,7 @@ impl LandPlan {
 
 /// The local publish leg of one executed land plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
 pub(super) struct LandOutcome {
     /// The executed plan.
     pub plan: PlanId,
@@ -253,10 +254,18 @@ pub(super) fn prepare_land_plan(
     }
     let mut satisfied_at_prepare = true;
     for candidate in &candidates {
-        let evaluation = evaluate_requirements(
+        let bounded: Vec<BoundedRequirement> = request
+            .requirements
+            .iter()
+            .map(|requirement| BoundedRequirement {
+                requirement: requirement.clone(),
+                valid_until: requirement.valid_until,
+            })
+            .collect();
+        let evaluation = evaluate_bounded_requirements(
             store,
             candidate,
-            &request.requirements,
+            &bounded,
             &request.trusted,
             checkpoint,
         )?;
@@ -323,7 +332,7 @@ pub(super) fn prepare_land_plan(
 /// of the wrong hash width; `E_NOT_FOUND` for a candidate with no stored
 /// object; `E_POLICY` for requirements with no trusted signer; `E_STALE`
 /// for a plan identity collision; `E_CORRUPT` or `E_IO` from the store.
-#[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
 pub(super) fn land_prepare(
     store: &Store,
     request: LandPrepareRequest,
@@ -352,7 +361,7 @@ pub(super) fn land_prepare(
 /// stored plan that differs from `plan`, a moved target tip, or a lost
 /// commit race; `E_POLICY` for a candidate that misses a requirement;
 /// `E_CORRUPT` or `E_IO` from the store.
-#[expect(dead_code, reason = "wired in CS-R43/CS-R44")]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
 pub(super) fn land_execute(
     store: &Store,
     plan: &LandPlan,
@@ -394,13 +403,16 @@ pub(super) fn land_execute(
         ));
     }
     for candidate in &plan.candidates {
-        let evaluation = evaluate_requirements(
-            store,
-            candidate,
-            &plan.requirements,
-            &plan.trusted,
-            checkpoint,
-        )?;
+        let bounded: Vec<BoundedRequirement> = plan
+            .requirements
+            .iter()
+            .map(|requirement| BoundedRequirement {
+                requirement: requirement.clone(),
+                valid_until: requirement.valid_until,
+            })
+            .collect();
+        let evaluation =
+            evaluate_bounded_requirements(store, candidate, &bounded, &plan.trusted, checkpoint)?;
         if !evaluation.satisfied {
             return Err(CoreError::new(
                 ErrorCode::EPolicy,
@@ -449,4 +461,207 @@ pub(super) fn land_execute(
         candidates: plan.candidates.clone(),
         expires_at: plan.expires_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attestation::Progress;
+    use crate::capability::{AttestKind, AttestResult};
+    use crate::change::ChangeId;
+    use crate::ids::HashKind;
+    use crate::store::PreparationBudget;
+    use std::sync::Arc;
+
+    const SIGNED_AT: &str = "2026-10-17T12:00:00Z";
+
+    fn test_store(tag: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-land-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let store = Store::create(&dir, HashKind::Sha1, budget).expect("test store");
+        (dir, store)
+    }
+
+    fn publish_object(store: &Store, kind: crate::store::ObjectKind, body: &[u8]) -> Oid {
+        let length = u64::try_from(body.len()).expect("object length fits u64");
+        let prepared = store
+            .prepare(kind, length, body, None)
+            .expect("prepare object");
+        let oid = prepared.oid();
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish object");
+        oid
+    }
+
+    fn commit_body(tree: &str, parents: &[Oid], timestamp: &str, message: &str) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let mut body = format!("tree {tree}\n");
+        for parent in parents {
+            writeln!(body, "parent {}", parent.to_hex()).expect("parent line");
+        }
+        write!(
+            body,
+            "author Land <land@test.invalid> {timestamp} +0000\n\
+             committer Land <land@test.invalid> {timestamp} +0000\n\n{message}\n"
+        )
+        .expect("ident lines");
+        body.into_bytes()
+    }
+
+    struct Lab {
+        _dir: std::path::PathBuf,
+        store: Store,
+        candidate: Oid,
+        signer: SignerFingerprint,
+    }
+
+    impl Lab {
+        fn new() -> Self {
+            let (_dir, store) = test_store("bounded");
+            let empty = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+            let candidate = publish_object(
+                &store,
+                crate::store::ObjectKind::Commit,
+                &commit_body(empty, &[], SIGNED_AT, "candidate"),
+            );
+            let key =
+                ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[0x33; 32]));
+            let statement = crate::protocol::AttestStatement {
+                subject: candidate,
+                kind: AttestKind::new("review").expect("kind"),
+                result: AttestResult::new("pass").expect("result"),
+                signed_at: Timestamp::parse(SIGNED_AT).expect("timestamp"),
+                supersedes: None,
+            };
+            let payload = statement
+                .canonical_payload_v1(HashKind::Sha1)
+                .expect("payload");
+            let signature = key
+                .sign(
+                    crate::attestation::ATTEST_NAMESPACE,
+                    ssh_key::HashAlg::Sha256,
+                    &payload,
+                )
+                .expect("sign");
+            let armor = signature.to_pem(ssh_key::LineEnding::LF).expect("armor");
+            let args = crate::protocol::AttestAddArgs {
+                statement,
+                signature: crate::protocol::AttestSignature::new(armor).expect("armored signature"),
+            };
+            let open = |_: Progress| Ok::<(), CoreError>(());
+            let prepared =
+                crate::attestation::prepare_add(&store, &args, &open).expect("prepare attestation");
+            assert!(!prepared.mutations.is_empty());
+            store
+                .publish(
+                    Vec::new(),
+                    &prepared.mutations,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish attestation");
+            let verified = crate::attestation::verify_statement(crate::ids::HashKind::Sha1, &args)
+                .expect("verify attestation");
+            let signer = verified.signer().clone();
+            Self {
+                _dir,
+                store,
+                candidate,
+                signer,
+            }
+        }
+
+        fn request(&self, valid_until: Option<Timestamp>) -> LandPrepareRequest {
+            LandPrepareRequest {
+                change: ChangeRef {
+                    change: ChangeId::generate(),
+                    head: Some(crate::heads::Head::Git {
+                        oid: self.candidate,
+                    }),
+                },
+                target: RefName::new("refs/heads/main").expect("target"),
+                candidates: vec![self.candidate],
+                requirements: vec![AttestRequirement {
+                    kind: AttestKind::new("review").expect("kind"),
+                    result: AttestResult::new("pass").expect("result"),
+                    valid_until,
+                }],
+                trusted: vec![self.signer.clone()],
+                merge: MergeSelection::default(),
+                policy_generation: 0,
+                now: Timestamp::parse(SIGNED_AT).expect("timestamp"),
+            }
+        }
+
+        fn open_target(&self) {
+            let target = crate::store::encode(
+                "ref target",
+                &crate::refdata::RefTarget::Direct(self.candidate),
+            )
+            .expect("encode target");
+            self.store
+                .publish(
+                    Vec::new(),
+                    &[FactMutation {
+                        table: FactTable::Refs,
+                        key: b"refs/heads/main".to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(target),
+                    }],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish target ref");
+        }
+    }
+
+    #[test]
+    fn expired_evidence_fails_the_land_gate() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let before_signing =
+            Timestamp::parse("2026-10-17T11:00:00Z").expect("bound before signing");
+        let plan = land_prepare(&lab.store, lab.request(Some(before_signing)), &checkpoint)
+            .expect("prepare records the attempt");
+        assert!(
+            !plan.satisfied_at_prepare,
+            "a bound before signing leaves the gate unsatisfied"
+        );
+        let err = land_execute(
+            &lab.store,
+            &plan,
+            Timestamp::parse(SIGNED_AT).expect("now"),
+            &checkpoint,
+        )
+        .expect_err("expired evidence refuses execution");
+        assert_eq!(err.code, ErrorCode::EPolicy);
+    }
+
+    #[test]
+    fn fresh_evidence_satisfies_the_land_gate() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let after_signing = Timestamp::parse("2026-10-17T13:00:00Z").expect("bound after signing");
+        let plan = land_prepare(&lab.store, lab.request(Some(after_signing)), &checkpoint)
+            .expect("prepare records the attempt");
+        assert!(
+            plan.satisfied_at_prepare,
+            "a bound after signing keeps the gate satisfied"
+        );
+    }
 }

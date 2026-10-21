@@ -61,8 +61,9 @@ impl ExpiryLab {
             requirement: AttestRequirement {
                 kind: kind("review"),
                 result: result("pass"),
+                valid_until: Some(Timestamp::parse(bound).expect("bound")),
             },
-            valid_until: Timestamp::parse(bound).expect("bound"),
+            valid_until: Some(Timestamp::parse(bound).expect("bound")),
         }
     }
 }
@@ -127,6 +128,7 @@ fn legacy_evaluation_ignores_validity_bounds() {
     let required = [AttestRequirement {
         kind: kind("review"),
         result: result("pass"),
+        valid_until: None,
     }];
 
     let evaluation = evaluate_requirements(

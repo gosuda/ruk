@@ -2095,6 +2095,10 @@ pub struct LandPrepareArgs {
 pub struct AttestRequirement {
     pub kind: AttestKind,
     pub result: AttestResult,
+    /// The latest `signed_at` this requirement accepts; absent never
+    /// expires. A later-signed match reports `Gap::Expired`.
+    #[serde(default)]
+    pub valid_until: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -83,6 +83,7 @@ fn requirement(kind_text: &str, result_text: &str) -> AttestRequirement {
     AttestRequirement {
         kind: kind(kind_text),
         result: result(result_text),
+        valid_until: None,
     }
 }
 
