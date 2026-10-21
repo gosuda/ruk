@@ -481,13 +481,6 @@ impl BoundSession {
 
     /// Evaluates current authority.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no caller at this commit; retained for later changeset rows"
-        )
-    )]
     pub(crate) fn current_authority(&self, times: &Times) -> Authority {
         self.session.current_authority(times)
     }

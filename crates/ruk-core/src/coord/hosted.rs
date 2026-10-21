@@ -59,7 +59,7 @@ use super::rows::{
     session_key,
 };
 use super::service_receipts::sweep_service_receipts_page;
-use super::session::{Authority, ResumeOutcome, SessionTable, prepare_open};
+use super::session::{Authority, BoundSession, ResumeOutcome, SessionTable, prepare_open};
 use crate::ByteString;
 use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::attestation::Checkpoint;
@@ -211,10 +211,29 @@ impl HostedCoordinator {
         owner: Principal,
         store_root: PathBuf,
     ) -> Result<Self, CoreError> {
+        Self::open_with_limits(
+            store,
+            owner,
+            store_root,
+            AdmissionLimits::reference_profile(),
+        )
+    }
+
+    /// Opens the coordinator under an explicit admission profile.
+    /// [`Self::open`] passes the reference profile; tests pass tighter ones.
+    ///
+    /// # Errors
+    /// The same refusals as [`Self::open`].
+    pub(crate) fn open_with_limits(
+        store: Arc<Store>,
+        owner: Principal,
+        store_root: PathBuf,
+        limits: AdmissionLimits,
+    ) -> Result<Self, CoreError> {
         let policies = Arc::new(PolicySource::open(&store_root, owner));
         let clock = Clock::system();
         let sessions = SessionTable::new(clock.clone());
-        let admission = Admission::new(AdmissionLimits::reference_profile())?;
+        let admission = Admission::new(limits)?;
         let repo = admission.repo()?;
         let (lane, runner) = create_publication_lane(
             Arc::clone(&store),
@@ -651,20 +670,18 @@ impl HostedCoordinator {
         }
         let bound = self.sessions.bind(&live)?;
         let _in_flight = bound.start_in_flight()?;
-        let _admitted = self
-            .admission
-            .admit(
-                &self.repo,
-                AdmissionRequest {
-                    class: RequestClass::Interactive,
-                    resources: WorkResources::Compute,
-                    payload_bytes: 0,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                },
-                cancel,
-            )
-            .await?;
-        bound.authorize_read(ReadAccess::Objects)?;
+        // A long poll admits and rechecks authority once per scan inside
+        // `read_events_tail`, never across its wait: a parked poll holds no
+        // interactive slot, and a session that lost authority cannot finish.
+        let tails = matches!(request, Request::EventsTail(_));
+        let _admitted = if tails {
+            None
+        } else {
+            Some(self.admit_read(cancel).await?)
+        };
+        if !tails {
+            bound.authorize_read(ReadAccess::Objects)?;
+        }
         // Expire read leases at entry: fire cancellation on lapsed authority
         // and drop the guards whose 30-second interactive lifetime ended so
         // the bounded table cannot fill with dead slots.
@@ -689,7 +706,7 @@ impl HostedCoordinator {
                 Ok(Reply::RefsList(Box::new(reply)))
             }
             Request::EventsTail(args) => {
-                let reply = self.read_events_tail(&args, cancel).await?;
+                let reply = self.read_events_tail(&args, cancel, &bound).await?;
                 Ok(Reply::EventsTail(Box::new(reply)))
             }
             Request::File(args) => {
@@ -1741,6 +1758,34 @@ impl HostedCoordinator {
         QueryDigest::from_bytes(hasher.finalize().into())
     }
 
+    /// One interactive compute admission for one scan of a read.
+    async fn admit_read(&self, cancel: &Cancel) -> Result<Admitted, CoreError> {
+        self.admission
+            .admit(
+                &self.repo,
+                AdmissionRequest {
+                    class: RequestClass::Interactive,
+                    resources: WorkResources::Compute,
+                    payload_bytes: 0,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+                cancel,
+            )
+            .await
+    }
+
+    /// Rechecks that a bound session still holds active authority to read.
+    fn check_read_authority(&self, bound: &BoundSession) -> Result<(), CoreError> {
+        let times = self.clock.sample()?;
+        if bound.current_authority(&times) != Authority::Active {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "session lacks active authority",
+            ));
+        }
+        bound.authorize_read(ReadAccess::Objects)
+    }
+
     /// Serves one `events.tail` read: ref events strictly after `after`,
     /// long-polled up to `wait_ms`. Reports `expired` when `after + 1`
     /// predates the oldest retained sequence; the caller then resnapshots
@@ -1764,6 +1809,7 @@ impl HostedCoordinator {
         &self,
         args: &EventsTailArgs,
         cancel: &Cancel,
+        bound: &BoundSession,
     ) -> Result<EventsTailReply, CoreError> {
         let limit = args.limit.map_or(DEFAULT_PAGE_SIZE, PageLimit::get);
         let wait_ms = u64::from(args.wait_ms.unwrap_or(0));
@@ -1774,6 +1820,8 @@ impl HostedCoordinator {
         let mut scanned = args.after;
         loop {
             cancel.check()?;
+            let grant = self.admit_read(cancel).await?;
+            self.check_read_authority(bound)?;
             let (head, oldest) = self.store.event_head().map_err(CoreError::from)?;
             if Self::tail_expired(args.after, oldest) {
                 return Ok(EventsTailReply {
@@ -1795,6 +1843,8 @@ impl HostedCoordinator {
                     expired: true,
                 });
             }
+            // The grant ends with the scan: the wait below holds no slot.
+            drop(grant);
             if !events.is_empty() || tokio::time::Instant::now() >= deadline {
                 return Ok(EventsTailReply {
                     view: current_view(&self.store)?,
@@ -2804,6 +2854,128 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// One interactive slot, so a second interactive read of the repository
+    /// can only be admitted while the first has released its slot.
+    fn one_interactive_slot() -> AdmissionLimits {
+        let mut limits = AdmissionLimits::reference_profile();
+        limits.interactive.slots = 1;
+        limits.storage.interactive = 1;
+        limits.repo.ordinary = 7;
+        limits
+    }
+
+    fn coordinator_with_limits(
+        limits: AdmissionLimits,
+    ) -> (TempRoot, HostedCoordinator, Principal) {
+        let temp = TempRoot::new("read-limits");
+        let store = Arc::new(
+            Store::create(
+                &temp.0,
+                HashKind::Sha1,
+                Arc::new(PreparationBudget::reference_defaults()),
+            )
+            .expect("create store"),
+        );
+        let owner = Principal::from_peer_uid(1000);
+        let coord =
+            HostedCoordinator::open_with_limits(store, owner.clone(), temp.0.clone(), limits)
+                .expect("open coordinator");
+        (temp, coord, owner)
+    }
+
+    fn poll_args(wait_ms: u32) -> crate::protocol::EventsTailArgs {
+        tail_query(0, None, Some(wait_ms))
+    }
+
+    /// A parked long poll must not hold its interactive slot across the
+    /// wait: with one slot, a `refs.list` of the same repository is admitted
+    /// during the poll instead of refused after its admission wait.
+    #[tokio::test]
+    async fn parked_poll_releases_its_admission_slot_between_scans() {
+        let (_temp, coord, owner) = coordinator_with_limits(one_interactive_slot());
+        let coord = Arc::new(coord);
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let poll = tokio::spawn({
+            let coord = Arc::clone(&coord);
+            let owner = owner.clone();
+            let cancel = cancel.clone();
+            async move {
+                coord
+                    .read(
+                        &owner,
+                        session,
+                        Request::EventsTail(Box::new(poll_args(1500))),
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let _listed = refs_list(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            crate::protocol::RefsListArgs {
+                prefix: None,
+                after: None,
+                limit: None,
+            },
+        )
+        .await;
+        let parked = poll.await.expect("poll joins").expect("poll serves");
+        assert!(
+            matches!(parked, Reply::EventsTail(_)),
+            "poll answers its own reply"
+        );
+    }
+
+    /// A parked long poll rechecks its session when the wait ends: a session
+    /// closed during the wait cannot finish a poll it was parked on.
+    #[tokio::test]
+    async fn parked_poll_refuses_a_session_that_lost_authority() {
+        let (_temp, coord, owner) = coordinator();
+        let coord = Arc::new(coord);
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let poll = tokio::spawn({
+            let coord = Arc::clone(&coord);
+            let owner = owner.clone();
+            let cancel = cancel.clone();
+            async move {
+                coord
+                    .read(
+                        &owner,
+                        session,
+                        Request::EventsTail(Box::new(poll_args(1500))),
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        coord
+            .close_session(session, &cancel)
+            .await
+            .expect("close session");
+        let outcome = poll.await.expect("poll joins");
+        let err = outcome.expect_err("a closed session must not finish the poll");
+        assert_eq!(err.code, ErrorCode::EForbidden);
     }
 
     fn coordinator() -> (TempRoot, HostedCoordinator, Principal) {
