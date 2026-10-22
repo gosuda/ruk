@@ -1024,22 +1024,21 @@ fn push_pack_inner(
     pktline::encode_flush(&mut out);
     plan.begin_send()?;
     push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
-    let mut entries = push::push_closure(store, kind, &live, interrupt)?;
-    push::pair_thin_bases(store, kind, &live, &mut entries, interrupt)?;
-    if !entries.is_empty() {
-        let pack_entries: Vec<super::pack::PackEntry<'_>> =
-            entries.iter().map(|entry| entry.as_entry()).collect();
-        interrupt.check("sending the pack")?;
-        if entries.iter().any(|entry| entry.base.is_some()) {
-            super::pack::write_thin_pack(&mut out, kind, &pack_entries, interrupt)?;
-        } else {
-            super::pack::write_pack(&mut out, kind, &pack_entries, interrupt)?;
-        }
-    }
-    // Closes the stateless round after the pack (`git/send-pack.c`
-    // appends it the same way); the server reads the pack to the end of
-    // the POST body and this flush stays unread.
-    pktline::encode_flush(&mut out);
+    let mut plans = push::push_closure_plans(
+        store,
+        kind,
+        &live,
+        &super::private::PrivateFilter::empty(),
+        interrupt,
+    )?;
+    push::pair_thin_base_oids(
+        store,
+        kind,
+        &live,
+        &super::private::PrivateFilter::empty(),
+        &mut plans,
+        interrupt,
+    )?;
     let url = rpc_url(base, SmartService::ReceivePack);
     let request_type = SmartService::ReceivePack.request_type();
     let result_type = SmartService::ReceivePack.result_type();
@@ -1052,8 +1051,72 @@ fn push_pack_inner(
         ],
         extra_headers,
     );
-    let (mut reader, status, reply) =
-        http::post_open(&url, &borrow(&owned), &out, egress, tls_roots)?;
+    // Commands first so the CAS precheck runs before any pack bytes move,
+    // then the pack streams entry by entry: only one object is resident
+    // at a time no matter how large the first sync is.
+    let mut upload = http::post_open_chunked(&url, &borrow(&owned), egress, tls_roots)?;
+    {
+        use std::io::Write as _;
+        upload.write_all(&out).map_err(|err| GitError::Io {
+            detail: format!("cannot send push commands: {err}"),
+        })?;
+    }
+    let pack_outcome: Result<(), GitError> = (|| {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        interrupt.check("sending the pack")?;
+        let thin = plans.iter().any(|plan| plan.base.is_some());
+        let mut writer =
+            super::pack::PackStreamWriter::begin(&mut upload, kind, plans.len(), thin)?;
+        for plan_entry in &plans {
+            let (_, bytes) =
+                super::read_object(store, plan_entry.oid, super::push::WALK_OBJECT_BYTES)?;
+            let base = match plan_entry.base {
+                Some(base_oid) => {
+                    let (_, base_bytes) =
+                        super::read_object(store, base_oid, super::push::WALK_OBJECT_BYTES)?;
+                    Some((base_oid, base_bytes))
+                }
+                None => None,
+            };
+            let entry = super::pack::PackEntry {
+                oid: plan_entry.oid,
+                kind: plan_entry.kind,
+                bytes: &bytes,
+                base: base.as_ref().map(|(oid, bytes)| (*oid, bytes.as_slice())),
+            };
+            writer.entry(&entry, interrupt)?;
+        }
+        writer.finish()?;
+        Ok(())
+    })();
+    // Closes the stateless round after the pack (`git/send-pack.c`
+    // appends it the same way); the server reads the pack to the end of
+    // the POST body and this flush stays unread.
+    {
+        use std::io::Write as _;
+        upload.write_all(b"0000").map_err(|err| GitError::Io {
+            detail: format!("cannot close the push round: {err}"),
+        })?;
+    }
+    let (mut reader, status, reply) = match pack_outcome {
+        Ok(()) => upload.finish()?,
+        Err(pack_err) => {
+            match pack_err {
+                GitError::Io { .. } => match upload.abort_to_response() {
+                    Ok((_reader, status, _)) if http::is_success(status) => {
+                        return Err(GitError::PushUncertain {
+                        detail: "push body may have reached the server; the connection closed mid-send".to_owned(),
+                    });
+                    }
+                    Ok(response) => response,
+                    Err(_) => return Err(pack_err),
+                },
+                other => return Err(other),
+            }
+        }
+    };
     if let Err(status_err) = check_post_status(&url, &mut reader, status, &reply, auth) {
         match status_err {
             GitError::Http { status, .. } if status < 500 => {
@@ -1723,15 +1786,48 @@ mod tests {
             }
         }
         let text = String::from_utf8_lossy(&head).into_owned();
-        let length = text
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut body = vec![0_u8; length];
-        if length > 0 {
-            reader.read_exact(&mut body).expect("request body");
+        let chunked = text.lines().any(|line| match line.split_once(':') {
+            Some((name, value)) => {
+                name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value.trim().eq_ignore_ascii_case("chunked")
+            }
+            None => false,
+        });
+        let mut body = Vec::new();
+        if chunked {
+            loop {
+                let mut line = Vec::new();
+                use std::io::BufRead as _;
+                reader.read_until(b'\n', &mut line).expect("chunk size");
+                let size = u64::from_str_radix(String::from_utf8_lossy(&line).trim_end(), 16)
+                    .expect("hex chunk size");
+                if size == 0 {
+                    let mut crlf = [0u8; 2];
+                    use std::io::Read as _;
+                    reader.read_exact(&mut crlf).expect("terminal chunk");
+                    break;
+                }
+                let mut chunk = vec![0u8; usize::try_from(size).expect("chunk fits the test heap")];
+                {
+                    use std::io::Read as _;
+                    reader.read_exact(&mut chunk).expect("chunk bytes");
+                    let mut crlf = [0u8; 2];
+                    reader.read_exact(&mut crlf).expect("chunk end");
+                }
+                body.extend_from_slice(&chunk);
+            }
+        } else {
+            let length = text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            body.resize(length, 0);
+            if length > 0 {
+                use std::io::Read as _;
+                reader.read_exact(&mut body).expect("request body");
+            }
         }
         (text, body)
     }
@@ -2457,7 +2553,15 @@ mod tests {
         assert!(reason.contains("403"), "{reason:?}");
         assert!(!reason.contains("CANARY-tok"), "{reason:?}");
         assert_eq!(plan.state, super::push::PushState::Rejected);
-        server.join().expect("server");
+        let requests = server.join().expect("server");
+        assert!(
+            requests[0]
+                .head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "pack must stream, not buffer: {:?}",
+            requests[0].head
+        );
     }
 
     #[test]

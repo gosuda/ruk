@@ -52,6 +52,10 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// A streamed GET outcome: the final status and headers plus the URL that
+/// produced them after following redirects.
+pub type GetOutcome = (u16, Vec<(String, String)>, String);
+
 /// Whether `status` is a 2xx success.
 #[must_use]
 pub fn is_success(status: u16) -> bool {
@@ -511,7 +515,7 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, GitError> {
         }
     }
     let bytes = text.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(GitError::Invalid {
             detail: "tls trust bundle body length is not base64".to_owned(),
         });
@@ -1144,6 +1148,168 @@ pub fn post_open(
     Ok((HttpBodyReader { reader, framing }, status, headers))
 }
 
+/// One chunked POST body: the head is already sent with
+/// `Transfer-Encoding: chunked`, and each flushed window leaves as its
+/// own chunk, so a multi-gigabyte pack never sits in one buffer.
+pub struct ChunkedUpload {
+    stream: Stream,
+    buf: Vec<u8>,
+}
+
+impl std::fmt::Debug for ChunkedUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkedUpload")
+            .field("buffered_bytes", &self.buf.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bytes buffered before one chunk leaves: large enough to keep framing
+/// overhead negligible, small enough to bound memory.
+const CHUNK_WINDOW: usize = 65536;
+
+impl ChunkedUpload {
+    fn emit(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        self.stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())?;
+        self.stream.write_all(chunk)?;
+        self.stream.write_all(b"\r\n")?;
+        Ok(())
+    }
+
+    /// Abandons the body after a write failure and reads whatever status
+    /// the server already sent: an early refusal (auth, moved, missing)
+    /// reports honestly instead of surfacing as a broken pipe. Used only
+    /// for [`GitError::Io`] write failures; anything else propagates at
+    /// once so cancellation stays responsive.
+    ///
+    /// # Errors
+    /// Routing, framing, and transport failures as [`GitError`].
+    pub fn abort_to_response(self) -> Result<OpenResponse, GitError> {
+        let mut reader = BufReader::new(self.stream);
+        let (status, headers) = read_head(&mut reader)?;
+        let framing = open_framing(&headers)?;
+        Ok((HttpBodyReader { reader, framing }, status, headers))
+    }
+
+    /// Closes the chunk stream and reads the response, exactly as
+    /// [`post_open`] does once its buffered body is sent. When the close
+    /// itself fails (the server hung up first), the pending response is
+    /// still read: a refusal standing by reports honestly instead of
+    /// surfacing as a broken pipe. A 2xx standing by is ambiguous — the
+    /// body may have landed without its terminator — so callers must
+    /// treat a response that follows a failed close as uncertain, never
+    /// as success.
+    ///
+    /// # Errors
+    /// Routing, framing, and transport failures as [`GitError`].
+    pub fn finish(self) -> Result<OpenResponse, GitError> {
+        use std::io::Write as _;
+        let mut this = self;
+        let closed = (|| -> std::io::Result<()> {
+            this.flush()?;
+            this.stream.write_all(b"0\r\n\r\n")?;
+            this.stream.flush()?;
+            Ok(())
+        })();
+        let mut reader = BufReader::new(this.stream);
+        let head = read_head(&mut reader);
+        let (status, headers) = match (closed, head) {
+            (Ok(()), Ok(head)) => head,
+            (Ok(()), Err(read_err)) => return Err(read_err),
+            (Err(_), Ok((status, headers))) if !is_success(status) => (status, headers),
+            (Err(_), Ok(_)) => {
+                return Err(GitError::Io {
+                    detail: "cannot finish chunked upload: connection closed mid-send".to_owned(),
+                });
+            }
+            (Err(close_err), Err(_)) => {
+                return Err(GitError::Io {
+                    detail: format!("cannot finish chunked upload: {close_err}"),
+                });
+            }
+        };
+        let framing = open_framing(&headers)?;
+        Ok((HttpBodyReader { reader, framing }, status, headers))
+    }
+}
+
+impl std::io::Write for ChunkedUpload {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        while self.buf.len() >= CHUNK_WINDOW {
+            let chunk: Vec<u8> = self.buf.drain(..CHUNK_WINDOW).collect();
+            self.emit(&chunk)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            self.emit(&chunk)?;
+        }
+        self.stream.flush()
+    }
+}
+
+/// POSTs with a streamed body: sends the head with
+/// `Transfer-Encoding: chunked` and hands back the body writer. The
+/// caller writes the commands first (the CAS precheck reads them before
+/// the pack), then streams the pack, then finishes for the response.
+/// Single-shot like [`post_open`]: smart RPC endpoints never redirect a
+/// POST, so a 3xx status surfaces for the caller to report.
+///
+/// # Errors
+/// Routing, framing, and transport failures as [`GitError`].
+pub fn post_open_chunked(
+    url: &str,
+    headers: &[(&str, &str)],
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
+) -> Result<ChunkedUpload, GitError> {
+    let parsed = parse_url(url)?;
+    let mut stream = connect(&parsed, policy, tls_roots)?;
+    send_chunked_head(&mut stream, "POST", &parsed, headers)?;
+    Ok(ChunkedUpload {
+        stream,
+        buf: Vec::new(),
+    })
+}
+
+/// Writes one HTTP/1.1 request head with chunked framing: method line,
+/// Host, `Connection: close`, caller headers, then
+/// `Transfer-Encoding: chunked`.
+fn send_chunked_head(
+    stream: &mut Stream,
+    method: &str,
+    parsed: &Url,
+    headers: &[(&str, &str)],
+) -> Result<(), GitError> {
+    let what = format!("{method} {}", parsed.path);
+    let mut head = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        parsed.path, parsed.host
+    );
+    for (name, value) in headers {
+        if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+            return Err(GitError::Invalid {
+                detail: format!("header {name:?} carries a line break"),
+            });
+        }
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("Transfer-Encoding: chunked\r\n\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot send {what}: {err}"),
+        })?;
+    stream.flush().map_err(|err| GitError::Io {
+        detail: format!("cannot flush {what}: {err}"),
+    })
+}
+
 /// Picks the body framing for one open response from its headers: chunked
 /// wins over `Content-Length`, an absent length reads to EOF.
 ///
@@ -1256,7 +1422,7 @@ pub fn get_to_writer(
     sink: &mut dyn Write,
     policy: &super::net::EgressPolicy,
     tls_roots: Option<&[u8]>,
-) -> Result<(u16, Vec<(String, String)>, String), GitError> {
+) -> Result<GetOutcome, GitError> {
     let mut current = url.to_owned();
     let mut owned: Vec<(String, String)> = headers
         .iter()
@@ -2237,5 +2403,118 @@ mod tests {
             .is_err()
         );
         assert!(parse_pem_certs(b"caf\xe9").is_err());
+    }
+
+    #[test]
+    fn chunked_refusal_without_drain_still_reports_status() {
+        // The server answers 403 from the head alone and hangs up without
+        // consuming the body: the client must surface the refusal, not a
+        // broken pipe, no matter how much body was already buffered.
+        let (port, server) = fake_server(vec![(403, vec![], b"no".to_vec())]);
+        let mut upload = post_open_chunked(
+            &format!("http://127.0.0.1:{port}/up"),
+            &[("Content-Type", "application/x-git-test")],
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect("chunked open");
+        {
+            use std::io::Write as _;
+            upload.write_all(&vec![b'x'; 5 << 20]).unwrap_or_default();
+        }
+        let (mut reader, status, _) = upload.finish().expect("refusal reports");
+        assert_eq!(status, 403);
+        let mut body = Vec::new();
+        {
+            use std::io::Read as _;
+            reader.read_to_end(&mut body).expect("refusal body");
+        }
+        assert_eq!(body, b"no");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn chunked_upload_frames_lengths_and_terminates() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut reader = BufReader::new(socket.try_clone().expect("split"));
+            let mut head = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).expect("head line");
+                head.extend_from_slice(&line);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head_text = String::from_utf8_lossy(&head).into_owned();
+            assert!(
+                head_text
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked"),
+                "{head_text:?}"
+            );
+            assert!(
+                !head_text.to_ascii_lowercase().contains("content-length:"),
+                "{head_text:?}"
+            );
+            let mut body = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).expect("chunk size");
+                let text = String::from_utf8(line).expect("size utf8");
+                let size = u64::from_str_radix(text.trim_end(), 16).expect("hex size");
+                if size == 0 {
+                    let mut crlf = [0u8; 2];
+                    use std::io::Read as _;
+                    reader.read_exact(&mut crlf).expect("terminal crlf");
+                    break;
+                }
+                let mut chunk = vec![0u8; usize::try_from(size).expect("chunk fits")];
+                {
+                    use std::io::Read as _;
+                    reader.read_exact(&mut chunk).expect("chunk bytes");
+                    let mut crlf = [0u8; 2];
+                    reader.read_exact(&mut crlf).expect("chunk crlf");
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let mut socket = reader.into_inner();
+            use std::io::Write as _;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("reply");
+            body
+        });
+        let mut upload = post_open_chunked(
+            &format!("http://127.0.0.1:{port}/up"),
+            &[("Content-Type", "application/x-git-test")],
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect("chunked open");
+        let payload = b"hello world".to_vec();
+        let big = vec![b'x'; 70000];
+        {
+            use std::io::Write as _;
+            upload.write_all(&payload).expect("first write");
+            upload.write_all(&big).expect("second write");
+        }
+        let (mut reader, status, _) = upload.finish().expect("finish");
+        assert_eq!(status, 200);
+        let mut reply = Vec::new();
+        use std::io::Read as _;
+        reader.read_to_end(&mut reply).expect("reply body");
+        assert_eq!(reply, b"ok");
+        let mut expected = payload;
+        expected.extend_from_slice(&big);
+        assert_eq!(server.join().expect("server"), expected);
     }
 }
