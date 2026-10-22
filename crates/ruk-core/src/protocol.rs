@@ -2706,6 +2706,44 @@ pub enum ErrorDetail {
         state: PushState,
         refs: BoundedList<PushRefOutcome>,
     },
+    /// An HTTP failure with the facts a caller needs to classify it: the
+    /// status, the `Retry-After` delay when the server sent one, the
+    /// redirect target for 3xx, and a scrubbed body preview capped at 512
+    /// bytes. Appended after `Push`, so existing encodings are unchanged.
+    Http {
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        location: Option<String>,
+        body_preview: String,
+    },
+    /// A detail this build does not model: tolerated so newer writers do
+    /// not break older readers. Never constructed locally.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ErrorDetail {
+    /// Builds the [`ErrorDetail::Http`] variant, truncating `preview` to
+    /// 512 bytes on a character boundary. The caller scrubs `preview` and
+    /// `location` first; this only bounds the size.
+    #[must_use]
+    pub fn http_detail(
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        location: Option<String>,
+        preview: &str,
+    ) -> Self {
+        let mut end = preview.len().min(512);
+        while !preview.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self::Http {
+            status,
+            retry_after_seconds,
+            location,
+            body_preview: preview[..end].to_owned(),
+        }
+    }
 }
 
 /// The error body of a failed request. Callers branch on `code`.
@@ -2725,7 +2763,7 @@ pub struct ErrorReply {
 }
 
 impl ErrorReply {
-    /// The wire form of a core error, with no fixes or detail attached.
+    /// The wire form of a core error, preserving its detail when present.
     #[must_use]
     pub fn from_core(error: &CoreError) -> Self {
         Self {
@@ -2733,7 +2771,7 @@ impl ErrorReply {
             message: error.message.clone(),
             hints: error.hints.clone(),
             fixes: Vec::new(),
-            detail: None,
+            detail: error.detail.as_deref().cloned(),
         }
     }
 

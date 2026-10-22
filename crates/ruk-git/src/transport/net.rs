@@ -21,7 +21,7 @@
 //! (git:// request shape), `git/builtin/ls-remote.c` (discovery).
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -206,6 +206,224 @@ pub fn dumb_http_gap(url: &str) -> GitError {
     }
 }
 
+/// Which addresses one remote dial may open: an explicit per-call
+/// allowlist over a default-deny of non-public addresses. Every dial
+/// re-resolves and re-checks, so a rebinding answer is refused even when
+/// an earlier answer for the same host passed.
+#[derive(Clone, Debug, Default)]
+pub struct EgressPolicy {
+    allowed: Vec<AllowedNet>,
+}
+
+/// One allowlist entry: an exact address or a CIDR prefix.
+#[derive(Clone, Debug)]
+enum AllowedNet {
+    Addr(IpAddr),
+    Cidr(IpAddr, u8),
+}
+
+impl EgressPolicy {
+    /// Default-deny: only globally public addresses dial, with no
+    /// allowlist entries.
+    #[must_use]
+    pub fn deny_private() -> Self {
+        Self::default()
+    }
+
+    /// Allows one exact address (loopback test servers, pinned intranet
+    /// mirrors) alongside the public ranges.
+    #[must_use]
+    pub fn allow(mut self, addr: IpAddr) -> Self {
+        self.allowed.push(AllowedNet::Addr(addr));
+        self
+    }
+
+    /// Allows the loopback addresses explicitly dialed by tests and local
+    /// development servers.
+    #[must_use]
+    pub fn allow_loopback(mut self) -> Self {
+        self.allowed
+            .push(AllowedNet::Addr(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        self.allowed
+            .push(AllowedNet::Addr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        self
+    }
+
+    /// Allows one CIDR prefix (`10.0.0.0/8`) for intranet mirrors whose
+    /// addresses resolve dynamically.
+    ///
+    /// # Errors
+    /// [`GitError::Invalid`] for an unparsable prefix or width.
+    pub fn allow_cidr(mut self, cidr: &str) -> Result<Self, GitError> {
+        let (net, bits) = cidr.split_once('/').ok_or_else(|| GitError::Invalid {
+            detail: format!("egress allowlist entry is not CIDR: {cidr:?}"),
+        })?;
+        let net: IpAddr = net.parse().map_err(|_| GitError::Invalid {
+            detail: format!("egress allowlist entry has no address: {cidr:?}"),
+        })?;
+        let bits: u8 = bits.parse().map_err(|_| GitError::Invalid {
+            detail: format!("egress allowlist entry has no width: {cidr:?}"),
+        })?;
+        let max = match net {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if bits > max {
+            return Err(GitError::Invalid {
+                detail: format!("egress allowlist width exceeds /{max}: {cidr:?}"),
+            });
+        }
+        self.allowed.push(AllowedNet::Cidr(net, bits));
+        Ok(self)
+    }
+
+    /// Whether `ip` may be dialed: allowlisted, or globally public.
+    /// IPv4 embeddings (mapped, 6to4, Teredo, NAT64) are judged by the
+    /// inner address, so a public-looking wrapper around a private target
+    /// never passes.
+    #[must_use]
+    pub fn allows(&self, ip: IpAddr) -> bool {
+        if self.allowed.iter().any(|entry| match entry {
+            AllowedNet::Addr(addr) => *addr == ip,
+            AllowedNet::Cidr(net, bits) => cidr_contains(*net, *bits, ip),
+        }) {
+            return true;
+        }
+        public_ip(ip)
+    }
+
+    /// Keeps the dialable subset of one resolution answer, refusing when
+    /// every answer is denied. Runs on every dial, including redirect
+    /// hops, so DNS rebinding cannot smuggle a private target past an
+    /// earlier public answer.
+    ///
+    /// # Errors
+    /// [`GitError::Invalid`] when no answer survives the policy.
+    pub fn filter_addrs(
+        &self,
+        label: &str,
+        addrs: &[SocketAddr],
+    ) -> Result<Vec<SocketAddr>, GitError> {
+        let kept: Vec<SocketAddr> = addrs
+            .iter()
+            .copied()
+            .filter(|addr| self.allows(addr.ip()))
+            .collect();
+        if kept.is_empty() {
+            let refused: Vec<String> = addrs.iter().map(|addr| addr.ip().to_string()).collect();
+            return Err(GitError::Invalid {
+                detail: format!("egress policy refuses {label}: {}", refused.join(", ")),
+            });
+        }
+        Ok(kept)
+    }
+}
+
+/// Whether `net/bits` contains `ip` (same family only).
+fn cidr_contains(net: IpAddr, bits: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) if bits <= 32 => {
+            if bits == 0 {
+                return true;
+            }
+            let shift = 32 - bits;
+            (u32::from(net) >> shift) == (u32::from(ip) >> shift)
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) if bits <= 128 => {
+            if bits == 0 {
+                return true;
+            }
+            let shift = 128 - bits;
+            (u128::from(net) >> shift) == (u128::from(ip) >> shift)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ip` is globally dialable: nothing loopback, private,
+/// link-local, unspecified, broadcast, multicast, documentation,
+/// reserved, benchmarking, or carrier-grade shared.
+fn public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => public_v4(addr),
+        IpAddr::V6(addr) => match embedded_v4(addr) {
+            Some(inner) => public_v4(inner),
+            None => public_v6(addr),
+        },
+    }
+}
+
+fn public_v4(addr: Ipv4Addr) -> bool {
+    let [first, second, third, _] = addr.octets();
+    if first == 0
+        || first == 10
+        || first == 100 && (second & 0xc0) == 0x40
+        || first == 127
+        || first == 169 && second == 254
+        || first == 172 && (second & 0xf0) == 0x10
+        || first == 192 && second == 0 && (third == 0 || third == 2)
+        || first == 192 && second == 88 && third == 99
+        || first == 192 && second == 168
+        || first == 198 && (second & 0xfe) == 0x12
+        || first == 198 && second == 51 && third == 100
+        || first == 203 && second == 0 && third == 113
+        || first & 0xf0 == 0xe0
+        || first & 0xf0 == 0xf0
+    {
+        return false;
+    }
+    !addr.is_loopback()
+        && !addr.is_private()
+        && !addr.is_link_local()
+        && !addr.is_unspecified()
+        && !addr.is_broadcast()
+        && !addr.is_multicast()
+}
+
+/// Unwraps the IPv4 a v6 address embeds: mapped (`::ffff:0:0/96`), 6to4
+/// (`2002::/16`), Teredo (`2001::/32`), and well-known NAT64
+/// (`64:ff9b::/96`).
+fn embedded_v4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = addr.segments();
+    let octets = addr.octets();
+    if octets[..10] == [0; 10] && octets[10..12] == [0xff, 0xff] {
+        return Some(Ipv4Addr::from(
+            u32::from(segments[6]) << 16 | u32::from(segments[7]),
+        ));
+    }
+    if segments[0] == 0x2002 {
+        let [a, b] = segments[1].to_be_bytes();
+        let [c, d] = segments[2].to_be_bytes();
+        return Some(Ipv4Addr::new(a, b, c, d));
+    }
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        let obfuscated = u32::from(segments[6]) << 16 | u32::from(segments[7]);
+        return Some(Ipv4Addr::from(!obfuscated));
+    }
+    if segments[0] == 0x64 && segments[1] == 0xff9b && segments[2] == 0 {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        return Some(Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
+fn public_v6(addr: Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    let [first, second, ..] = segments;
+    if first & 0xff00 == 0xff00
+        || first & 0xffc0 == 0xfe80
+        || first & 0xfe00 == 0xfc00
+        || first == 0x2001 && second == 0x0db8
+        || first == 0x2001 && second & 0xfe00 == 0
+        || addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+    {
+        return false;
+    }
+    true
+}
 /// Single-quotes `text` for a remote shell: safe for paths starting with
 /// `-`, which then cannot mask as command-line arguments.
 fn shell_quote(text: &str) -> String {
@@ -485,12 +703,47 @@ pub fn git_connect(
     port: Option<u16>,
     service: Service,
     path: &str,
+    policy: &EgressPolicy,
 ) -> Result<TcpStream, GitError> {
-    let stream = TcpStream::connect((host, port.unwrap_or(GIT_DAEMON_PORT))).map_err(|err| {
-        GitError::Io {
-            detail: format!("cannot reach git://{host}: {err}"),
+    let effective = port.unwrap_or(GIT_DAEMON_PORT);
+    let label = format!("git://{host}:{effective}");
+    let resolved: Vec<SocketAddr> = (host, effective)
+        .to_socket_addrs()
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot resolve {label}: {err}"),
+        })?
+        .collect();
+    if resolved.is_empty() {
+        return Err(GitError::Io {
+            detail: format!("cannot resolve {label}: no addresses"),
+        });
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last_err = String::from("no addresses tried");
+    let mut dialed = None;
+    for addr in policy.filter_addrs(&label, &resolved)? {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            last_err = String::from("egress dial budget exhausted");
+            break;
         }
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(stream) => {
+                dialed = Some(stream);
+                break;
+            }
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    let stream = dialed.ok_or_else(|| GitError::Io {
+        detail: format!("cannot reach {label} within 30s: {last_err}"),
     })?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .and(stream.set_write_timeout(Some(std::time::Duration::from_secs(30))))
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot arm timeouts on {label}: {err}"),
+        })?;
     let request = git_request(service, host, port, path);
     (&stream as &TcpStream)
         .write_all(&request)
@@ -534,16 +787,23 @@ impl Write for Stream {
     }
 }
 
-/// Opens one duplex stream to a network endpoint: SSH spawns, git dials.
+/// Opens one duplex stream to a network endpoint: SSH spawns, git dials
+/// under the egress policy.
 ///
 /// Smart-http never opens a duplex stream: its stateless request/response
 /// pairs run through [`super::smart_http`], so an HTTP endpoint here is
-/// an internal routing error, not a gap.
+/// an internal routing error, not a gap. The policy gates git-daemon
+/// dials; SSH spawns keep their existing trust (host keys, user config),
+/// since the child performs its own dials.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
 /// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
-pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitError> {
+pub fn open_stream(
+    endpoint: &Endpoint,
+    service: Service,
+    policy: &EgressPolicy,
+) -> Result<Stream, GitError> {
     match endpoint {
         Endpoint::Ssh {
             host,
@@ -557,9 +817,9 @@ pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitE
             service,
             path,
         )?)),
-        Endpoint::Git { host, port, path } => {
-            Ok(Stream::Tcp(git_connect(host, *port, service, path)?))
-        }
+        Endpoint::Git { host, port, path } => Ok(Stream::Tcp(git_connect(
+            host, *port, service, path, policy,
+        )?)),
         Endpoint::Local { .. } => Err(GitError::Invalid {
             detail: "local endpoints need no network stream".to_owned(),
         }),
@@ -610,6 +870,8 @@ pub fn discover_endpoint(
     service: Service,
     kind: HashKind,
     auth: &super::credentials::AuthPolicy,
+    policy: &EgressPolicy,
+    tls_roots: Option<&[u8]>,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
     match endpoint {
         Endpoint::Http { url, .. } => {
@@ -619,9 +881,21 @@ pub fn discover_endpoint(
                 Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
                 Service::UploadArchive => super::smart_http::SmartService::UploadArchive,
             };
-            Ok(super::smart_http::discover(&base, smart, kind, &[], auth)?.refs)
+            Ok(super::smart_http::discover(
+                &base,
+                smart,
+                kind,
+                super::smart_http::RpcCall {
+                    extra: &[],
+                    auth,
+                    egress: policy,
+                    tls_roots,
+                    interrupt: &super::Interrupt::none(),
+                },
+            )?
+            .refs)
         }
-        _ => discover(open_stream(endpoint, service)?, kind),
+        _ => discover(open_stream(endpoint, service, policy)?, kind),
     }
 }
 
@@ -634,8 +908,8 @@ pub fn discover_endpoint(
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
 /// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
-pub fn open_archive_stream(endpoint: &Endpoint) -> Result<Stream, GitError> {
-    open_stream(endpoint, Service::UploadArchive)
+pub fn open_archive_stream(endpoint: &Endpoint, policy: &EgressPolicy) -> Result<Stream, GitError> {
+    open_stream(endpoint, Service::UploadArchive, policy)
 }
 
 /// Runs one `upload-archive` session over an open stream: sends the
@@ -768,9 +1042,12 @@ mod tests {
         }
         // Local endpoints route to the store, never to a stream.
         assert!(
-            open_archive_stream(&Endpoint::Local {
-                path: PathBuf::from("/srv/a.git"),
-            })
+            open_archive_stream(
+                &Endpoint::Local {
+                    path: PathBuf::from("/srv/a.git"),
+                },
+                &EgressPolicy::deny_private(),
+            )
             .is_err(),
             "local archive needs no stream"
         );
@@ -1175,6 +1452,8 @@ mod tests {
                 &crate::transport::credentials::AuthPolicy::explicit(
                     crate::transport::credentials::TransportAuth::none(),
                 ),
+                &EgressPolicy::deny_private().allow_loopback(),
+                None,
             )
             .expect("discover"),
         )
@@ -1260,8 +1539,14 @@ mod tests {
             .expect("serve");
         });
         let dest = test_store(kind);
-        let stream =
-            git_connect("127.0.0.1", Some(port), Service::UploadPack, "/srv/a.git").expect("dial");
+        let stream = git_connect(
+            "127.0.0.1",
+            Some(port),
+            Service::UploadPack,
+            "/srv/a.git",
+            &EgressPolicy::deny_private().allow_loopback(),
+        )
+        .expect("dial");
         let request = fetch::FetchWireRequest {
             wants: vec![sha1(FOUR)],
             haves: Vec::new(),
@@ -1343,8 +1628,14 @@ mod tests {
         };
         let mut plan =
             PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
-        let stream =
-            git_connect("127.0.0.1", Some(port), Service::ReceivePack, "/srv/a.git").expect("dial");
+        let stream = git_connect(
+            "127.0.0.1",
+            Some(port),
+            Service::ReceivePack,
+            "/srv/a.git",
+            &EgressPolicy::deny_private().allow_loopback(),
+        )
+        .expect("dial");
         let outcomes = push_over(
             stream,
             &client,
@@ -1392,5 +1683,105 @@ mod tests {
         .expect("map");
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].target, RefTarget::Direct(tip));
+    }
+
+    #[test]
+    fn egress_denies_non_public_addresses() {
+        let policy = EgressPolicy::deny_private();
+        for denied in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:192.168.1.1",
+            "::ffff:127.0.0.1",
+            "2002:c0a8:101::",
+            "64:ff9b::c0a8:101",
+        ] {
+            let ip: IpAddr = denied.parse().expect("test address parses");
+            assert!(!policy.allows(ip), "{denied} must not dial");
+        }
+        for allowed in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2001:4860:4860::8888",
+            "::ffff:808:808",
+        ] {
+            let ip: IpAddr = allowed.parse().expect("test address parses");
+            assert!(policy.allows(ip), "{allowed} must dial");
+        }
+    }
+
+    #[test]
+    fn egress_unwraps_embedded_ipv4() {
+        let policy = EgressPolicy::deny_private();
+        let teredo_private = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0xffff, 0x3fff, 0xfdfd);
+        assert!(
+            !policy.allows(IpAddr::V6(teredo_private)),
+            "teredo wrapping private space must not dial"
+        );
+        let teredo_public = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0xffff, 0xf7f7, 0xf7f7);
+        assert!(
+            policy.allows(IpAddr::V6(teredo_public)),
+            "teredo wrapping public space must dial"
+        );
+    }
+
+    #[test]
+    fn egress_allowlist_permits_listed_ranges() {
+        let policy = EgressPolicy::deny_private()
+            .allow("127.0.0.1".parse().expect("loopback parses"))
+            .allow_cidr("10.0.0.0/8")
+            .expect("cidr parses");
+        assert!(policy.allows("127.0.0.1".parse().expect("ip")));
+        assert!(policy.allows("10.20.30.40".parse().expect("ip")));
+        assert!(policy.allows("10.255.255.255".parse().expect("ip")));
+        assert!(policy.allows("11.0.0.1".parse().expect("public stays dialable")));
+        assert!(!policy.allows("192.168.1.1".parse().expect("ip")));
+        assert!(
+            EgressPolicy::deny_private()
+                .allow_cidr("not-a-cidr")
+                .is_err()
+        );
+        assert!(
+            EgressPolicy::deny_private()
+                .allow_cidr("10.0.0.0/33")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn egress_refuses_rebinding_answers() {
+        let policy = EgressPolicy::deny_private();
+        let public: SocketAddr = "93.184.215.14:80".parse().expect("public addr");
+        let rebound: SocketAddr = "127.0.0.1:80".parse().expect("loopback addr");
+        assert_eq!(
+            policy.filter_addrs("host", &[public]).expect("first"),
+            [public]
+        );
+        assert_eq!(
+            policy
+                .filter_addrs("host", &[public, rebound])
+                .expect("mixed"),
+            [public]
+        );
+        assert!(
+            policy.filter_addrs("host", &[rebound]).is_err(),
+            "a rebound loopback answer must not dial"
+        );
     }
 }

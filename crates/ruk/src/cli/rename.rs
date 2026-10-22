@@ -317,6 +317,7 @@ mod tests {
             bare: false,
             cli_config: Vec::new(),
             stderr: Vec::new(),
+            egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
         }
     }
 
@@ -332,6 +333,7 @@ mod tests {
             bare: false,
             cli_config: Vec::new(),
             stderr: Vec::new(),
+            egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
         };
         super::super::verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
         let root = base.join("repo");

@@ -1423,7 +1423,12 @@ mod tests {
         let entries = push_closure(src, kind, &live, &Interrupt::none()).expect("closure");
         let pack_entries = entries
             .iter()
-            .map(super::super::push::ClosureObject::as_entry)
+            .map(|entry| super::super::pack::PackEntry {
+                oid: entry.oid,
+                kind: entry.kind,
+                bytes: &entry.bytes,
+                base: None,
+            })
             .collect::<Vec<_>>();
         let mut pack = Vec::new();
         write_pack(&mut pack, kind, &pack_entries, &Interrupt::none()).expect("pack");
@@ -3111,7 +3116,12 @@ printf '0000'
         let entries = push_closure(src, kind, &live, &Interrupt::none()).expect("closure");
         let pack_entries = entries
             .iter()
-            .map(super::super::push::ClosureObject::as_entry)
+            .map(|entry| super::super::pack::PackEntry {
+                oid: entry.oid,
+                kind: entry.kind,
+                bytes: &entry.bytes,
+                base: None,
+            })
             .collect::<Vec<_>>();
         let mut pack = Vec::new();
         write_pack(&mut pack, kind, &pack_entries, &Interrupt::none()).expect("pack");

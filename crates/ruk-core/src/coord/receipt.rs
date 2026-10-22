@@ -86,10 +86,14 @@ pub(crate) fn lookup(
 /// committed attempt — so a retry would fail `E_STALE`/`E_INVALID` before
 /// ever reaching the lane. The dispatch path calls this before preparing.
 ///
+/// The hosted push transport jobs (`push`, `push.reconcile`) also call this
+/// before touching the network: a retried push must return the stored reply
+/// instead of re-sending bytes to the remote.
+///
 /// # Errors
 /// - [`ErrorCode::ERequestReused`] if the request id was used with a different digest.
 /// - [`ErrorCode::ECorrupt`] if committed receipt bytes fail decode or invariant validation.
-pub(crate) fn replay_if_committed(
+pub fn replay_if_committed(
     store: &Store,
     session: SessionId,
     request: &Request,

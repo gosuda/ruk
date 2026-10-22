@@ -32,14 +32,14 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::types::ObjectKind;
 use ruk_core::store::{EventContext, EventSource, FactExpectation, FactMutation, FactTable, Store};
 
-use super::pack::{PackEntry, object_links, write_pack, write_thin_pack};
+use super::pack::{PackEntry, PackStreamWriter, object_links};
 use super::pktline::{self, Packet, PktReader, SidebandReader, send};
 use super::private::PrivateFilter;
 use super::{Interrupt, has_object, promisor_row, read_object};
 use crate::GitError;
 
 /// Largest object pulled through the push closure walk.
-const WALK_OBJECT_BYTES: u64 = 512 << 20;
+pub(crate) const WALK_OBJECT_BYTES: u64 = 512 << 20;
 
 /// One ref update the client asks the server to perform.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +122,24 @@ pub enum RefResult {
     },
 }
 
+/// Scrubs userinfo from every rejection reason a remote reported, before the
+/// outcome is stored on a durable plan row.
+fn scrub_outcomes(outcomes: Vec<RefOutcome>) -> Vec<RefOutcome> {
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            let RefOutcome { name, result } = outcome;
+            let result = match result {
+                RefResult::Ok => RefResult::Ok,
+                RefResult::Rejected { reason } => RefResult::Rejected {
+                    reason: super::credentials::scrub_userinfo(&reason),
+                },
+            };
+            RefOutcome { name, result }
+        })
+        .collect()
+}
+
 /// A durable push plan: state machine plus its `push_plans` row codec.
 ///
 /// Row layout, versioned: `01 | state:u8 | hash:u8 | atomic:u8 |
@@ -152,7 +170,7 @@ impl PushPlanRecord {
     pub fn prepare(id: PlanId, remote: Vec<u8>, atomic: bool, updates: Vec<PushUpdate>) -> Self {
         Self {
             id,
-            remote,
+            remote: super::credentials::scrub_userinfo_bytes(&remote),
             atomic,
             state: PushState::Prepared,
             updates,
@@ -186,7 +204,7 @@ impl PushPlanRecord {
             });
         }
         let ok = outcomes.iter().all(|o| o.result == RefResult::Ok);
-        self.outcomes = outcomes;
+        self.outcomes = scrub_outcomes(outcomes);
         self.state = if ok {
             PushState::Confirmed
         } else {
@@ -206,7 +224,7 @@ impl PushPlanRecord {
                 detail: "push plan can be refused only from Prepared".to_owned(),
             });
         }
-        self.outcomes = outcomes;
+        self.outcomes = scrub_outcomes(outcomes);
         self.state = PushState::Rejected;
         Ok(())
     }
@@ -307,11 +325,11 @@ impl PushPlanRecord {
         }
         Ok(Self {
             id,
-            remote: remote.to_vec(),
+            remote: super::credentials::scrub_userinfo_bytes(remote),
             atomic: *atomic != 0,
             state,
             updates,
-            outcomes,
+            outcomes: scrub_outcomes(outcomes),
         })
     }
 }
@@ -628,11 +646,20 @@ fn push_over_inner<R: Read + Write>(
     let caps = &adv.capabilities;
     let report_v2 = caps.has("report-status-v2");
     if !report_v2 && !caps.has("report-status") {
-        plan.begin_send()?;
+        let outcomes: Vec<RefOutcome> = req
+            .updates
+            .iter()
+            .map(|update| RefOutcome {
+                name: update.name.clone(),
+                result: RefResult::Rejected {
+                    reason: "server reports no push status; outcomes cannot be confirmed"
+                        .to_owned(),
+                },
+            })
+            .collect();
+        plan.refuse_locally(outcomes.clone())?;
         persist(store, plan, kind, current_encoding(store, plan)?)?;
-        return Err(GitError::PushUncertain {
-            detail: "server reports no push status; outcomes cannot be confirmed".to_owned(),
-        });
+        return Ok(outcomes);
     }
     let zero = kind.zero_oid();
     if req.updates.iter().any(|u| u.new == zero) && !caps.has("delete-refs") {
@@ -742,17 +769,32 @@ fn push_over_inner<R: Read + Write>(
     plan.begin_send()?;
     persist(store, plan, kind, current_encoding(store, plan)?)?;
     send(pkt.get_mut(), &out)?;
-    let mut entries = push_closure_filtered(store, kind, &live, filter, interrupt)?;
-    pair_thin_bases_filtered(store, kind, &live, filter, &mut entries, interrupt)?;
-    if !entries.is_empty() {
-        let pack_entries: Vec<PackEntry<'_>> =
-            entries.iter().map(ClosureObject::as_entry).collect();
+    let mut plans = push_closure_plans(store, kind, &live, filter, interrupt)?;
+    pair_thin_base_oids(store, kind, &live, filter, &mut plans, interrupt)?;
+    if !plans.is_empty() {
         interrupt.check("sending the pack")?;
-        if entries.iter().any(|e| e.base.is_some()) {
-            write_thin_pack(pkt.get_mut(), kind, &pack_entries, interrupt)?;
-        } else {
-            write_pack(pkt.get_mut(), kind, &pack_entries, interrupt)?;
+        let thin = plans.iter().any(|plan| plan.base.is_some());
+        let mut writer = PackStreamWriter::begin(pkt.get_mut(), kind, plans.len(), thin)?;
+        for plan_entry in &plans {
+            let (_, bytes) = read_object(store, plan_entry.oid, WALK_OBJECT_BYTES)?;
+            let base = match plan_entry.base {
+                Some(base_oid) => {
+                    let (_, base_bytes) = read_object(store, base_oid, WALK_OBJECT_BYTES)?;
+                    Some((base_oid, base_bytes))
+                }
+                None => None,
+            };
+            writer.entry(
+                &PackEntry {
+                    oid: plan_entry.oid,
+                    kind: plan_entry.kind,
+                    bytes: &bytes,
+                    base: base.as_ref().map(|(oid, bytes)| (*oid, bytes.as_slice())),
+                },
+                interrupt,
+            )?;
         }
+        writer.finish()?;
     }
     let server = read_report(&mut pkt, sideband)?;
     check_report_covers_live(&live, &server)?;
@@ -783,20 +825,6 @@ pub struct ClosureObject {
     pub bytes: Vec<u8>,
     /// Permitted thin base, set only by [`pair_thin_bases`].
     pub base: Option<(Oid, Vec<u8>)>,
-}
-
-impl ClosureObject {
-    pub(crate) fn as_entry(&self) -> PackEntry<'_> {
-        PackEntry {
-            oid: self.oid,
-            kind: self.kind,
-            bytes: &self.bytes,
-            base: self
-                .base
-                .as_ref()
-                .map(|(oid, bytes)| (*oid, bytes.as_slice())),
-        }
-    }
 }
 
 /// Computes wants-minus-haves: objects reachable from the new tips minus
@@ -895,72 +923,6 @@ pub(crate) fn push_closure_filtered(
     }
     entries.sort_by_key(|a| a.oid);
     Ok(entries)
-}
-
-/// Pairs same-path blobs between each updated ref's old and new trees so
-/// thin deltas name only permitted bases (reachable from advertised tips).
-/// A missing or non-commit side disables pairing for that ref; the pack
-/// stays complete either way. Callers with private state use
-/// [`pair_thin_bases_filtered`].
-pub(crate) fn pair_thin_bases(
-    store: &Store,
-    kind: HashKind,
-    live: &[&PushUpdate],
-    entries: &mut [ClosureObject],
-    interrupt: &Interrupt,
-) -> Result<(), GitError> {
-    pair_thin_bases_filtered(
-        store,
-        kind,
-        live,
-        &PrivateFilter::empty(),
-        entries,
-        interrupt,
-    )
-}
-
-/// Pairs thin bases while never naming a private or promised base.
-///
-/// An excluded base disables pairing for that blob only; the pack carries
-/// the complete object instead, so privacy never corrupts the transfer.
-pub(crate) fn pair_thin_bases_filtered(
-    store: &Store,
-    kind: HashKind,
-    live: &[&PushUpdate],
-    filter: &PrivateFilter,
-    entries: &mut [ClosureObject],
-    interrupt: &Interrupt,
-) -> Result<(), GitError> {
-    let zero = kind.zero_oid();
-    let by_oid: HashMap<Oid, usize> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.oid, i))
-        .collect();
-    for update in live {
-        interrupt.check("pairing thin bases")?;
-        if update.old == zero || update.new == zero {
-            continue;
-        }
-        let (Some(old_tree), Some(new_tree)) = (
-            commit_tree(store, update.old)?,
-            commit_tree(store, update.new)?,
-        ) else {
-            continue;
-        };
-        for (new_oid, base_oid) in pair_trees(store, kind, old_tree, new_tree, interrupt)? {
-            if let Some(&index) = by_oid.get(&new_oid) {
-                if filter.is_excluded(store, base_oid)? {
-                    continue;
-                }
-                if has_object(store, base_oid)? {
-                    let (_, base_bytes) = read_object(store, base_oid, WALK_OBJECT_BYTES)?;
-                    entries[index].base = Some((base_oid, base_bytes));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn commit_tree(store: &Store, oid: Oid) -> Result<Option<Oid>, GitError> {
@@ -1081,6 +1043,140 @@ fn pair_trees(
     Ok(pairs)
 }
 
+/// One push-closure entry without its bytes: the pack writer loads each
+/// object as it streams, so only one entry is resident at a time. The
+/// walk mirrors [`push_closure_filtered`]; that function keeps its own
+/// walk so local, LFS, and serve paths never re-read objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClosurePlan {
+    /// Identity.
+    pub oid: Oid,
+    /// Git kind.
+    pub kind: ObjectKind,
+    /// Permitted thin base, set by [`pair_thin_base_oids`].
+    pub base: Option<Oid>,
+}
+
+/// Computes wants-minus-haves as identities alone: history the server
+/// already holds never enters the pack, and no object bytes are retained.
+/// Pair [`pair_thin_base_oids`] on top, then stream each entry through the
+/// pack writer with a per-entry object read.
+pub(crate) fn push_closure_plans(
+    store: &Store,
+    kind: HashKind,
+    live: &[&PushUpdate],
+    filter: &PrivateFilter,
+    interrupt: &Interrupt,
+) -> Result<Vec<ClosurePlan>, GitError> {
+    let zero = kind.zero_oid();
+    let mut uninteresting = HashSet::new();
+    for update in live {
+        if update.old != zero {
+            uninteresting.insert(update.old);
+        }
+    }
+    let mut frontier: VecDeque<Oid> = uninteresting.iter().copied().collect();
+    while let Some(oid) = frontier.pop_front() {
+        interrupt.check("computing the push closure")?;
+        let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
+            Ok((ObjectKind::Commit, bytes)) => bytes,
+            Ok(_) => continue,
+            Err(GitError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
+        };
+        for parent in &object_links(ObjectKind::Commit, &bytes, kind)?.parents {
+            if uninteresting.insert(*parent) {
+                frontier.push_back(*parent);
+            }
+        }
+    }
+    let mut plans = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue: VecDeque<Oid> = VecDeque::new();
+    for update in live {
+        if update.new != zero {
+            queue.push_back(update.new);
+        }
+    }
+    while let Some(oid) = queue.pop_front() {
+        interrupt.check("computing the push closure")?;
+        if !visited.insert(oid) || uninteresting.contains(&oid) || filter.contains(oid) {
+            continue;
+        }
+        if promisor_row(store, oid)?.is_some() {
+            continue;
+        }
+        let (kind, bytes) = match read_object(store, oid, WALK_OBJECT_BYTES) {
+            Ok(found) => found,
+            Err(GitError::NotFound { .. }) => {
+                return Err(GitError::NotFound {
+                    detail: format!("push needs local object {oid} which is absent"),
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        let links = object_links(kind, &bytes, store.hash_kind())?;
+        if let Some(tree) = links.tree {
+            queue.push_back(tree);
+        }
+        queue.extend(links.parents.iter().copied());
+        queue.extend(links.entries.iter().map(|(oid, _)| *oid));
+        if let Some((target, _)) = links.tag_target {
+            queue.push_back(target);
+        }
+        plans.push(ClosurePlan {
+            oid,
+            kind,
+            base: None,
+        });
+    }
+    plans.sort_by_key(|a| a.oid);
+    Ok(plans)
+}
+
+/// Pairs thin bases as oids alone: same-path blobs name permitted bases
+/// without loading them, so the pack writer reads each base once while
+/// streaming. A missing or non-commit side disables pairing for that
+/// ref; the pack stays complete either way.
+pub(crate) fn pair_thin_base_oids(
+    store: &Store,
+    kind: HashKind,
+    live: &[&PushUpdate],
+    filter: &PrivateFilter,
+    plans: &mut [ClosurePlan],
+    interrupt: &Interrupt,
+) -> Result<(), GitError> {
+    let zero = kind.zero_oid();
+    let mut by_oid: HashMap<Oid, usize> = HashMap::new();
+    for (index, plan) in plans.iter().enumerate() {
+        by_oid.insert(plan.oid, index);
+    }
+    for update in live {
+        interrupt.check("pairing thin bases")?;
+        if update.old == zero || update.new == zero {
+            continue;
+        }
+        let (Some(old_tree), Some(new_tree)) = (
+            commit_tree(store, update.old)?,
+            commit_tree(store, update.new)?,
+        ) else {
+            continue;
+        };
+        for (new_oid, base_oid) in pair_trees(store, kind, old_tree, new_tree, interrupt)? {
+            let Some(&index) = by_oid.get(&new_oid) else {
+                continue;
+            };
+            if filter.is_excluded(store, base_oid)? {
+                continue;
+            }
+            if has_object(store, base_oid)? {
+                plans[index].base = Some(base_oid);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads a report-status(-v2) response: demultiplexed when the server
 /// negotiated side-band, raw otherwise.
 ///
@@ -1173,6 +1269,57 @@ fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_rows_store_no_userinfo_from_label_or_reasons() {
+        let mut plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://ada:CANARY-s3cret@host.x/r.git".to_vec(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(plan.remote, b"https://host.x/r.git".to_vec());
+        plan.begin_send().expect("prepared plan sends");
+        plan.finalize(vec![RefOutcome {
+            name: b"refs/heads/x".to_vec(),
+            result: RefResult::Rejected {
+                reason: "remote said https://ada:CANARY-s3cret@host.x refused".to_owned(),
+            },
+        }])
+        .expect("sending plan finalizes");
+        let encoded = plan.encode(HashKind::Sha1).expect("plan encodes");
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(!text.contains("CANARY-s3cret"), "{text:?}");
+        assert!(text.contains("https://host.x refused"), "{text:?}");
+    }
+
+    #[test]
+    fn legacy_rows_decode_without_userinfo() {
+        let id = PlanId::generate();
+        let dirty = PushPlanRecord {
+            id,
+            remote: b"https://ada:CANARY-s3cret@host.x/r.git".to_vec(),
+            atomic: false,
+            state: PushState::Rejected,
+            updates: Vec::new(),
+            outcomes: vec![RefOutcome {
+                name: b"refs/heads/x".to_vec(),
+                result: RefResult::Rejected {
+                    reason: "remote said https://ada:CANARY-s3cret@host.x refused".to_owned(),
+                },
+            }],
+        };
+        let encoded = dirty.encode(HashKind::Sha1).expect("legacy row encodes");
+        let decoded = PushPlanRecord::decode(id, HashKind::Sha1, &encoded).expect("row decodes");
+        assert_eq!(decoded.remote, b"https://host.x/r.git".to_vec());
+        let [outcome] = &decoded.outcomes[..] else {
+            panic!("one outcome: {decoded:?}");
+        };
+        assert!(
+            matches!(&outcome.result, RefResult::Rejected { reason } if !reason.contains("CANARY-s3cret") && reason.contains("https://host.x refused")),
+            "{outcome:?}"
+        );
+    }
 
     fn update(name: &[u8], old: &str, new: &str) -> PushUpdate {
         PushUpdate {

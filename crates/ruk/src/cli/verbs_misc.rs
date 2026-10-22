@@ -3376,6 +3376,7 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
                 bare: false,
                 cli_config: Vec::new(),
                 stderr: Vec::new(),
+                egress: ctx.egress.clone(),
             }
         } else {
             let store = match ruk_core::store::Store::open(
@@ -3400,6 +3401,7 @@ pub(crate) fn for_each_repo(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, G
                 bare: false,
                 cli_config: Vec::new(),
                 stderr: Vec::new(),
+                egress: ctx.egress.clone(),
             }
         };
         match (verb.run)(&mut sub, verb_args) {
@@ -3695,6 +3697,7 @@ mod tests {
             bare: false,
             cli_config: Vec::new(),
             stderr: Vec::new(),
+            egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
         }
     }
 
@@ -3710,6 +3713,7 @@ mod tests {
             bare: false,
             cli_config: Vec::new(),
             stderr: Vec::new(),
+            egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
         };
         verbs_repo::init(&mut boot, &["repo".to_owned()]).expect("init");
         let root = base.join("repo");

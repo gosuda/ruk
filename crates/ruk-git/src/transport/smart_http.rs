@@ -229,14 +229,20 @@ pub fn policy_headers(
 
 /// The per-call controls every smart-http RPC takes together: the resolved
 /// `http.extraHeader` rows for the base, the credential policy the call
-/// authenticates under, and the cancellation/deadline interrupt. No `Debug`:
-/// the extra rows can carry credentials, so the context never prints.
+/// authenticates under, the egress policy every dial must satisfy, and the
+/// cancellation/deadline interrupt. No credential values print: the extra
+/// rows can carry credentials, so the context never prints them.
 #[derive(Clone, Copy)]
 pub struct RpcCall<'a> {
     /// Resolved `http.extraHeader` rows for the base.
     pub extra: &'a [(String, String)],
     /// The credential policy this call authenticates under.
     pub auth: &'a credentials::AuthPolicy,
+    /// The egress policy every dial this call opens must satisfy.
+    pub egress: &'a super::net::EgressPolicy,
+    /// Optional PEM trust bundle replacing the Mozilla roots for this
+    /// call's TLS handshakes (private-CA servers).
+    pub tls_roots: Option<&'a [u8]>,
     /// Deadline and cancellation shared by the call's transfer steps.
     pub interrupt: &'a Interrupt,
 }
@@ -247,6 +253,11 @@ impl std::fmt::Debug for RpcCall<'_> {
             .debug_struct("RpcCall")
             .field("extra", &format_args!("<{} rows>", self.extra.len()))
             .field("auth", self.auth)
+            .field("egress", self.egress)
+            .field(
+                "tls_roots",
+                &self.tls_roots.as_ref().map(|roots| roots.len()),
+            )
             .field("interrupt", self.interrupt)
             .finish()
     }
@@ -260,19 +271,124 @@ fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// Maps a non-2xx RPC status the way the LFS verbs do: the endpoint
-/// refused, so the remote is offline. A 404 names the missing repository
-/// and a 401/403 names the auth failure; anything else echoes the status.
-fn check_status(url: &str, status: u16) -> Result<(), GitError> {
+/// The injected credential this call authenticates with, if any: a server
+/// echoing it back in an error body must not leak it into the refusal.
+fn auth_secrets(auth: &credentials::AuthPolicy) -> Vec<String> {
+    match auth {
+        credentials::AuthPolicy::Explicit { auth } if !auth.credential.is_empty() => {
+            vec![auth.credential.clone()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Scrubs one raw response body for refusal text: userinfo shapes first,
+/// then the call's own credential, capped at 512 bytes on a boundary.
+fn scrubbed_preview(preview: &[u8], secrets: &[String]) -> String {
+    let scrubbed = credentials::scrub_secrets(&credentials::scrub_userinfo_bytes(preview), secrets);
+    let text = String::from_utf8_lossy(&scrubbed);
+    let mut end = text.len().min(512);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// The honest refusal behind one non-2xx RPC status: 401/403 forbid
+/// (rotate the token), 404 misses, 429 limits, 3xx moves, anything else is
+/// offline. The status classifies the [`GitError::Http`] code, and the
+/// scrubbed facts travel into the core error detail for reply builders.
+fn http_failure(
+    url: &str,
+    status: u16,
+    retry_after_seconds: Option<u64>,
+    location: Option<String>,
+    preview_text: &str,
+) -> GitError {
+    let detail = match status {
+        401 | 403 => format!("{url}: authentication failed with status {status}"),
+        404 => format!("{url}: repository not found"),
+        429 => match retry_after_seconds {
+            Some(secs) => format!("{url}: rate limited with status 429, retry after {secs}s"),
+            None => format!("{url}: rate limited with status 429"),
+        },
+        300..=399 => match &location {
+            Some(target) => format!("{url}: remote moved to {target}"),
+            None => format!("{url}: redirect without a location"),
+        },
+        _ => format!("{url}: smart-http endpoint refused status {status}"),
+    };
+    let detail = if preview_text.is_empty() {
+        detail
+    } else {
+        format!("{detail}; body: {preview_text}")
+    };
+    GitError::Http {
+        detail,
+        status,
+        retry_after_seconds,
+        location,
+        body_preview: preview_text.to_owned(),
+    }
+}
+
+/// Reads the retry delay and redirect target off one refusal's headers.
+/// The target is scrubbed like a body: a redirect may echo the credential.
+fn refusal_facts(reply: &[(String, String)], secrets: &[String]) -> (Option<u64>, Option<String>) {
+    let retry_after_seconds =
+        http::header(reply, "retry-after").and_then(|value| value.trim().parse::<u64>().ok());
+    let location = http::header(reply, "location").map(|target| {
+        String::from_utf8_lossy(&credentials::scrub_secrets(
+            credentials::scrub_userinfo_bytes(target.as_bytes()).as_slice(),
+            secrets,
+        ))
+        .into_owned()
+    });
+    (retry_after_seconds, location)
+}
+
+/// Maps a non-2xx RPC status to its honest error: 401/403 forbid (rotate
+/// the token), 404 misses, 429 limits, 3xx moves, anything else is offline.
+/// GET responses carry no body, so the preview is empty there.
+fn check_status(
+    url: &str,
+    status: u16,
+    reply: &[(String, String)],
+    auth: &credentials::AuthPolicy,
+) -> Result<(), GitError> {
     if http::is_success(status) {
         return Ok(());
     }
-    let detail = match status {
-        404 => format!("{url}: repository not found"),
-        401 | 403 => format!("{url}: authentication failed with status {status}"),
-        _ => format!("{url}: smart-http endpoint refused status {status}"),
-    };
-    Err(GitError::Offline { detail })
+    let (retry_after_seconds, location) = refusal_facts(reply, &auth_secrets(auth));
+    Err(http_failure(url, status, retry_after_seconds, location, ""))
+}
+
+/// Maps a non-2xx POST status, draining a bounded body preview first so
+/// the refusal can name what the server said. The drain is one capped
+/// read scrubbed against the call's own credential; framing errors yield
+/// an empty preview rather than a failure.
+fn check_post_status(
+    url: &str,
+    reader: &mut http::HttpBodyReader,
+    status: u16,
+    reply: &[(String, String)],
+    auth: &credentials::AuthPolicy,
+) -> Result<(), GitError> {
+    if http::is_success(status) {
+        return Ok(());
+    }
+    let mut raw = [0u8; 1024];
+    let len = reader.read(&mut raw).unwrap_or(0);
+    let secrets = auth_secrets(auth);
+    let preview = scrubbed_preview(&raw[..len], &secrets);
+    let (retry_after_seconds, location) = refusal_facts(reply, &secrets);
+    Err(http_failure(
+        url,
+        status,
+        retry_after_seconds,
+        location,
+        &preview,
+    ))
 }
 
 /// Discovers one smart-http endpoint's refs: GETs the advertisement and
@@ -289,14 +405,21 @@ pub fn discover(
     base: &str,
     service: SmartService,
     kind: HashKind,
-    extra_headers: &[(String, String)],
-    auth: &credentials::AuthPolicy,
+    call: RpcCall<'_>,
 ) -> Result<Advertisement, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        egress,
+        tls_roots,
+        ..
+    } = call;
     let url = refs_url(base, service);
     let owned = policy_headers(&url, auth, &[("Accept", "*/*")], extra_headers);
     let mut body = Vec::new();
-    let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
-    check_status(&url, status)?;
+    let (status, reply, _) =
+        http::get_to_writer(&url, &borrow(&owned), &mut body, egress, tls_roots)?;
+    check_status(&url, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(service.advertisement_type().as_str()) {
         return Err(net::dumb_http_gap(&url));
     }
@@ -337,9 +460,15 @@ pub fn discover_versioned(
     base: &str,
     service: SmartService,
     kind: HashKind,
-    extra_headers: &[(String, String)],
-    auth: &credentials::AuthPolicy,
+    call: RpcCall<'_>,
 ) -> Result<VersionedDiscovery, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        egress,
+        tls_roots,
+        ..
+    } = call;
     let url = refs_url(base, service);
     let owned = policy_headers(
         &url,
@@ -354,8 +483,9 @@ pub fn discover_versioned(
         extra_headers,
     );
     let mut body = Vec::new();
-    let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
-    check_status(&url, status)?;
+    let (status, reply, _) =
+        http::get_to_writer(&url, &borrow(&owned), &mut body, egress, tls_roots)?;
+    check_status(&url, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(service.advertisement_type().as_str()) {
         return Err(net::dumb_http_gap(&url));
     }
@@ -383,6 +513,8 @@ pub fn ls_refs_v2(
     let RpcCall {
         extra: extra_headers,
         auth,
+        egress,
+        tls_roots,
         interrupt,
     } = call;
     let body = proto_v2::ls_refs_request(
@@ -408,8 +540,9 @@ pub fn ls_refs_v2(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &body, egress, tls_roots)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
             detail: format!("{url}: ls-refs RPC answered a non-pack content type"),
@@ -441,6 +574,8 @@ pub fn fetch_pack_v2(
     let RpcCall {
         extra: extra_headers,
         auth,
+        egress,
+        tls_roots,
         interrupt,
     } = call;
     if req.wants.is_empty() {
@@ -496,8 +631,9 @@ pub fn fetch_pack_v2(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &body, egress, tls_roots)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
             detail: format!("{url}: fetch RPC answered a non-pack content type"),
@@ -555,6 +691,8 @@ pub fn fetch_pack(
     let RpcCall {
         extra: extra_headers,
         auth,
+        egress,
+        tls_roots,
         interrupt,
     } = call;
     if req.wants.is_empty() {
@@ -644,8 +782,9 @@ pub fn fetch_pack(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &out, egress, tls_roots)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(SmartService::UploadPack.result_type().as_str())
     {
         return Err(GitError::Corrupt {
@@ -758,17 +897,28 @@ fn push_pack_inner(
     let RpcCall {
         extra: extra_headers,
         auth,
+        egress,
+        tls_roots,
         interrupt,
     } = call;
     let kind = store.hash_kind();
     let caps = &adv.capabilities;
     let report_v2 = caps.has("report-status-v2");
     if !report_v2 && !caps.has("report-status") {
-        plan.begin_send()?;
+        let outcomes: Vec<RefOutcome> = req
+            .updates
+            .iter()
+            .map(|update| RefOutcome {
+                name: update.name.clone(),
+                result: super::push::RefResult::Rejected {
+                    reason: "server reports no push status; outcomes cannot be confirmed"
+                        .to_owned(),
+                },
+            })
+            .collect();
+        plan.refuse_locally(outcomes.clone())?;
         push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
-        return Err(GitError::PushUncertain {
-            detail: "server reports no push status; outcomes cannot be confirmed".to_owned(),
-        });
+        return Ok(outcomes);
     }
     let zero = kind.zero_oid();
     if req.updates.iter().any(|u| u.new == zero) && !caps.has("delete-refs") {
@@ -874,22 +1024,21 @@ fn push_pack_inner(
     pktline::encode_flush(&mut out);
     plan.begin_send()?;
     push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
-    let mut entries = push::push_closure(store, kind, &live, interrupt)?;
-    push::pair_thin_bases(store, kind, &live, &mut entries, interrupt)?;
-    if !entries.is_empty() {
-        let pack_entries: Vec<super::pack::PackEntry<'_>> =
-            entries.iter().map(|entry| entry.as_entry()).collect();
-        interrupt.check("sending the pack")?;
-        if entries.iter().any(|entry| entry.base.is_some()) {
-            super::pack::write_thin_pack(&mut out, kind, &pack_entries, interrupt)?;
-        } else {
-            super::pack::write_pack(&mut out, kind, &pack_entries, interrupt)?;
-        }
-    }
-    // Closes the stateless round after the pack (`git/send-pack.c`
-    // appends it the same way); the server reads the pack to the end of
-    // the POST body and this flush stays unread.
-    pktline::encode_flush(&mut out);
+    let mut plans = push::push_closure_plans(
+        store,
+        kind,
+        &live,
+        &super::private::PrivateFilter::empty(),
+        interrupt,
+    )?;
+    push::pair_thin_base_oids(
+        store,
+        kind,
+        &live,
+        &super::private::PrivateFilter::empty(),
+        &mut plans,
+        interrupt,
+    )?;
     let url = rpc_url(base, SmartService::ReceivePack);
     let request_type = SmartService::ReceivePack.request_type();
     let result_type = SmartService::ReceivePack.result_type();
@@ -902,8 +1051,89 @@ fn push_pack_inner(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
-    check_status(&url, status)?;
+    // Commands first so the CAS precheck runs before any pack bytes move,
+    // then the pack streams entry by entry: only one object is resident
+    // at a time no matter how large the first sync is.
+    let mut upload = http::post_open_chunked(&url, &borrow(&owned), egress, tls_roots)?;
+    {
+        use std::io::Write as _;
+        upload.write_all(&out).map_err(|err| GitError::Io {
+            detail: format!("cannot send push commands: {err}"),
+        })?;
+    }
+    let pack_outcome: Result<(), GitError> = (|| {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        interrupt.check("sending the pack")?;
+        let thin = plans.iter().any(|plan| plan.base.is_some());
+        let mut writer =
+            super::pack::PackStreamWriter::begin(&mut upload, kind, plans.len(), thin)?;
+        for plan_entry in &plans {
+            let (_, bytes) =
+                super::read_object(store, plan_entry.oid, super::push::WALK_OBJECT_BYTES)?;
+            let base = match plan_entry.base {
+                Some(base_oid) => {
+                    let (_, base_bytes) =
+                        super::read_object(store, base_oid, super::push::WALK_OBJECT_BYTES)?;
+                    Some((base_oid, base_bytes))
+                }
+                None => None,
+            };
+            let entry = super::pack::PackEntry {
+                oid: plan_entry.oid,
+                kind: plan_entry.kind,
+                bytes: &bytes,
+                base: base.as_ref().map(|(oid, bytes)| (*oid, bytes.as_slice())),
+            };
+            writer.entry(&entry, interrupt)?;
+        }
+        writer.finish()?;
+        Ok(())
+    })();
+    // Closes the stateless round after the pack (`git/send-pack.c`
+    // appends it the same way); the server reads the pack to the end of
+    // the POST body and this flush stays unread.
+    {
+        use std::io::Write as _;
+        upload.write_all(b"0000").map_err(|err| GitError::Io {
+            detail: format!("cannot close the push round: {err}"),
+        })?;
+    }
+    let (mut reader, status, reply) = match pack_outcome {
+        Ok(()) => upload.finish()?,
+        Err(pack_err) => {
+            match pack_err {
+                GitError::Io { .. } => match upload.abort_to_response() {
+                    Ok((_reader, status, _)) if http::is_success(status) => {
+                        return Err(GitError::PushUncertain {
+                        detail: "push body may have reached the server; the connection closed mid-send".to_owned(),
+                    });
+                    }
+                    Ok(response) => response,
+                    Err(_) => return Err(pack_err),
+                },
+                other => return Err(other),
+            }
+        }
+    };
+    if let Err(status_err) = check_post_status(&url, &mut reader, status, &reply, auth) {
+        match status_err {
+            GitError::Http { status, .. } if status < 500 => {
+                let mut refused = outcomes;
+                refused.extend(live.iter().map(|update| RefOutcome {
+                    name: update.name.clone(),
+                    result: super::push::RefResult::Rejected {
+                        reason: status_err.to_string(),
+                    },
+                }));
+                plan.finalize(refused.clone())?;
+                push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
+                return Ok(refused);
+            }
+            other => return Err(other),
+        }
+    }
     if http::header(&reply, "content-type")
         != Some(SmartService::ReceivePack.result_type().as_str())
     {
@@ -978,10 +1208,15 @@ pub struct ArchiveOutput {
 pub fn fetch_archive(
     base: &str,
     req: &ArchiveWireRequest,
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
-    auth: &credentials::AuthPolicy,
+    call: RpcCall<'_>,
 ) -> Result<ArchiveOutput, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        egress,
+        tls_roots,
+        interrupt,
+    } = call;
     let body = archive_request_body(&req.rev)?;
     let url = rpc_url(base, SmartService::UploadArchive);
     let request_type = SmartService::UploadArchive.request_type();
@@ -995,8 +1230,9 @@ pub fn fetch_archive(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &body, egress, tls_roots)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
             detail: format!("{url}: upload-archive RPC answered a non-archive content type"),
@@ -1177,8 +1413,19 @@ mod tests {
             credential: "injected".to_owned(),
             origin,
         });
-        discover(&base, SmartService::UploadPack, HashKind::Sha1, &[], &auth)
-            .expect("authed discover");
+        discover(
+            &base,
+            SmartService::UploadPack,
+            HashKind::Sha1,
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("authed discover");
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
         let auth_lines: Vec<&str> = requests[0]
@@ -1232,13 +1479,26 @@ mod tests {
             RpcCall {
                 extra: &[],
                 auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
         .expect_err("a 500 refuses the POST");
-        assert!(
-            matches!(err, GitError::Offline { .. }),
-            "unexpected {err:?}"
+        assert_eq!(err.code(), ruk_core::error::ErrorCode::EOffline);
+        let GitError::Http {
+            status,
+            retry_after_seconds,
+            location,
+            body_preview,
+            ..
+        } = err
+        else {
+            panic!("a 500 is an HTTP refusal: {err:?}");
+        };
+        assert_eq!(
+            (status, retry_after_seconds, location, body_preview),
+            (500, None, None, String::new())
         );
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
@@ -1250,6 +1510,154 @@ mod tests {
             requests[0].head
         );
         assert_only_injected_auth(&requests[0].head);
+    }
+
+    #[test]
+    fn status_matrix_maps_honest_codes_with_scrubbed_detail() {
+        use super::super::session::test_support::test_store;
+
+        let adv = || Advertisement {
+            version: super::super::refadv::ProtocolVersion::V0,
+            capabilities: super::super::refadv::Capabilities::default(),
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        };
+        let req = || FetchWireRequest {
+            wants: vec![oid(FOUR)],
+            haves: Vec::new(),
+            filter: None,
+            depth: None,
+            shallow: Vec::new(),
+            list_refs: false,
+            ref_prefixes: Vec::new(),
+        };
+        let post = |base: &str, auth: &credentials::AuthPolicy| {
+            let dest = test_store(HashKind::Sha1);
+            fetch_pack(
+                base,
+                &adv(),
+                &dest,
+                &req(),
+                IngestLimits::default(),
+                RpcCall {
+                    extra: &[],
+                    auth,
+                    egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
+                    interrupt: &Interrupt::none(),
+                },
+            )
+            .expect_err("refusal")
+        };
+        struct StatusCase {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+            code: ruk_core::error::ErrorCode,
+            retry: Option<u64>,
+            location: Option<&'static str>,
+        }
+        let cases = vec![
+            StatusCase {
+                status: 401,
+                headers: Vec::new(),
+                body: b"token CANARY-tok expired; see https://ada:sect@host/x".to_vec(),
+                code: ruk_core::error::ErrorCode::EForbidden,
+                retry: None,
+                location: None,
+            },
+            StatusCase {
+                status: 403,
+                headers: Vec::new(),
+                body: Vec::new(),
+                code: ruk_core::error::ErrorCode::EForbidden,
+                retry: None,
+                location: None,
+            },
+            StatusCase {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+                code: ruk_core::error::ErrorCode::ENotFound,
+                retry: None,
+                location: None,
+            },
+            StatusCase {
+                status: 429,
+                headers: vec![("Retry-After".to_owned(), "120".to_owned())],
+                body: b"slow down".to_vec(),
+                code: ruk_core::error::ErrorCode::ELimit,
+                retry: Some(120),
+                location: None,
+            },
+            StatusCase {
+                status: 301,
+                headers: vec![(
+                    "Location".to_owned(),
+                    "https://new.example/r.git".to_owned(),
+                )],
+                body: Vec::new(),
+                code: ruk_core::error::ErrorCode::ERemoteMoved,
+                retry: None,
+                location: Some("https://new.example/r.git"),
+            },
+            StatusCase {
+                status: 500,
+                headers: Vec::new(),
+                body: b"boom https://root:pw@internal/x".to_vec(),
+                code: ruk_core::error::ErrorCode::EOffline,
+                retry: None,
+                location: None,
+            },
+        ];
+        for case in cases {
+            let StatusCase {
+                status,
+                headers,
+                body,
+                code,
+                retry,
+                location,
+            } = case;
+            let (base, server) = fake_smart_server(vec![(status, headers, body, false)]);
+            let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+                kind: credentials::TransportAuthKind::Bearer,
+                credential: "CANARY-tok".to_owned(),
+                origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
+            });
+            let err = post(&base, &auth);
+            assert_eq!(err.code(), code, "status {status}");
+            assert!(
+                !err.to_string().contains("CANARY-tok"),
+                "status {status}: {err}"
+            );
+            assert!(
+                matches!(&err, GitError::Http { status: s, .. } if *s == status),
+                "status {status} is an HTTP refusal: {err:?}"
+            );
+            let core = ruk_core::error::CoreError::from(err);
+            assert_eq!(core.code, code, "status {status}");
+            assert!(!core.message.contains("CANARY-tok"), "status {status}");
+            let ruk_core::protocol::ErrorReply { detail, .. } =
+                ruk_core::protocol::ErrorReply::from_core(&core);
+            let Some(ruk_core::protocol::ErrorDetail::Http {
+                status: detail_status,
+                retry_after_seconds: detail_retry,
+                location: detail_location,
+                body_preview,
+            }) = detail
+            else {
+                panic!("status {status} keeps its detail through the reply");
+            };
+            assert_eq!(detail_status, status);
+            assert_eq!(detail_retry, retry, "status {status}");
+            assert_eq!(detail_location.as_deref(), location, "status {status}");
+            for secret in ["CANARY-tok", "ada:sect@", "root:pw@"] {
+                assert!(!body_preview.contains(secret), "status {status}");
+            }
+            assert!(body_preview.len() <= 512, "status {status}");
+            server.join().expect("server");
+        }
     }
 
     #[test]
@@ -1268,8 +1676,19 @@ mod tests {
             credential: "injected".to_owned(),
             origin: "https://elsewhere.x:443".to_owned(),
         });
-        discover(&base, SmartService::UploadPack, HashKind::Sha1, &[], &auth)
-            .expect("discover succeeds without the credential");
+        discover(
+            &base,
+            SmartService::UploadPack,
+            HashKind::Sha1,
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("discover succeeds without the credential");
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
         assert!(
@@ -1367,15 +1786,48 @@ mod tests {
             }
         }
         let text = String::from_utf8_lossy(&head).into_owned();
-        let length = text
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut body = vec![0_u8; length];
-        if length > 0 {
-            reader.read_exact(&mut body).expect("request body");
+        let chunked = text.lines().any(|line| match line.split_once(':') {
+            Some((name, value)) => {
+                name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value.trim().eq_ignore_ascii_case("chunked")
+            }
+            None => false,
+        });
+        let mut body = Vec::new();
+        if chunked {
+            loop {
+                let mut line = Vec::new();
+                use std::io::BufRead as _;
+                reader.read_until(b'\n', &mut line).expect("chunk size");
+                let size = u64::from_str_radix(String::from_utf8_lossy(&line).trim_end(), 16)
+                    .expect("hex chunk size");
+                if size == 0 {
+                    let mut crlf = [0u8; 2];
+                    use std::io::Read as _;
+                    reader.read_exact(&mut crlf).expect("terminal chunk");
+                    break;
+                }
+                let mut chunk = vec![0u8; usize::try_from(size).expect("chunk fits the test heap")];
+                {
+                    use std::io::Read as _;
+                    reader.read_exact(&mut chunk).expect("chunk bytes");
+                    let mut crlf = [0u8; 2];
+                    reader.read_exact(&mut crlf).expect("chunk end");
+                }
+                body.extend_from_slice(&chunk);
+            }
+        } else {
+            let length = text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            body.resize(length, 0);
+            if length > 0 {
+                use std::io::Read as _;
+                reader.read_exact(&mut body).expect("request body");
+            }
         }
         (text, body)
     }
@@ -1423,8 +1875,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &no_auth(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("discover");
         assert!(adv.capabilities.has("side-band-64k"));
@@ -1468,8 +1925,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &configured,
-            &no_auth(),
+            RpcCall {
+                extra: &configured,
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("discover");
         let requests = server.join().expect("server");
@@ -1500,8 +1962,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &no_auth(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect_err("dumb");
         assert!(
@@ -1548,8 +2015,19 @@ mod tests {
                 true,
             ),
         ]);
-        let adv =
-            discover(&base, SmartService::UploadPack, kind, &[], &no_auth()).expect("discover");
+        let adv = discover(
+            &base,
+            SmartService::UploadPack,
+            kind,
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("discover");
         let dest = test_store(kind);
         let req = FetchWireRequest {
             wants: vec![oid(FOUR)],
@@ -1569,6 +2047,8 @@ mod tests {
             RpcCall {
                 extra: &[],
                 auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -1655,10 +2135,19 @@ mod tests {
                 false,
             ),
         ]);
-        let VersionedDiscovery::V2(probed) =
-            discover_versioned(&base, SmartService::UploadPack, kind, &[], &no_auth())
-                .expect("probe")
-        else {
+        let VersionedDiscovery::V2(probed) = discover_versioned(
+            &base,
+            SmartService::UploadPack,
+            kind,
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("probe") else {
             panic!("expected v2");
         };
         assert!(probed.feature("fetch", "filter"));
@@ -1670,6 +2159,8 @@ mod tests {
             RpcCall {
                 extra: &[],
                 auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -1738,8 +2229,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &no_auth(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("v0") else {
             panic!("expected v0");
@@ -1799,6 +2295,8 @@ mod tests {
             RpcCall {
                 extra: &[],
                 auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -1882,8 +2380,19 @@ mod tests {
         ]);
         // The test drives discovery itself so the advertisement (with its
         // capabilities) reaches the push half the way the verbs pass it.
-        let adv =
-            discover(&base, SmartService::ReceivePack, kind, &[], &no_auth()).expect("discover");
+        let adv = discover(
+            &base,
+            SmartService::ReceivePack,
+            kind,
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("discover");
         let updates = vec![PushUpdate {
             name: b"refs/heads/x".to_vec(),
             old: zero,
@@ -1904,6 +2413,8 @@ mod tests {
             RpcCall {
                 extra: &[],
                 auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -1934,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn push_without_report_status_is_uncertain() {
+    fn push_without_report_status_is_rejected() {
         use super::super::push::{PushUpdate, PushWireRequest};
         use super::super::session::test_support::test_store;
         use ruk_core::change::PlanId;
@@ -1959,6 +2470,58 @@ mod tests {
             refs: Vec::new(),
             shallow: Vec::new(),
         };
+        let outcomes = push_pack(
+            "http://127.0.0.1:9/a.git",
+            &adv,
+            &store,
+            &mut plan,
+            &req,
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("no report-status refuses locally");
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(&outcomes[0].result, super::push::RefResult::Rejected { .. }),
+            "unexpected {outcomes:?}"
+        );
+        assert_eq!(plan.state, super::push::PushState::Rejected);
+    }
+
+    #[test]
+    fn push_cancel_trips_to_uncertain() {
+        use super::super::push::{PushUpdate, PushWireRequest};
+        use super::super::session::test_support::store_with_pack;
+        use ruk_core::change::PlanId;
+
+        let kind = HashKind::Sha1;
+        let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let zero = kind.zero_oid();
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/x".to_vec(),
+            old: zero,
+            new: oid(FOUR),
+        }];
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let mut adv = Advertisement {
+            version: super::super::refadv::ProtocolVersion::V0,
+            capabilities: super::super::refadv::Capabilities::default(),
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        };
+        adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let interrupt = super::super::Interrupt::none().with_cancel(std::sync::Arc::clone(&cancel));
         let err = push_pack(
             "http://127.0.0.1:9/a.git",
             &adv,
@@ -1968,13 +2531,84 @@ mod tests {
             RpcCall {
                 extra: &[],
                 auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &interrupt,
+            },
+        )
+        .expect_err("tripped cancel fails the push");
+        assert_eq!(err.code(), ruk_core::error::ErrorCode::ECancelled);
+        assert_eq!(plan.state, super::push::PushState::Uncertain);
+    }
+
+    #[test]
+    fn push_post_forbidden_is_rejected_not_uncertain() {
+        use super::super::push::{PushUpdate, PushWireRequest};
+        use super::super::session::test_support::store_with_pack;
+        use ruk_core::change::PlanId;
+
+        let (base, server) = fake_smart_server(vec![(
+            403,
+            vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+            b"token CANARY-tok expired".to_vec(),
+            false,
+        )]);
+        let kind = HashKind::Sha1;
+        let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let zero = kind.zero_oid();
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/x".to_vec(),
+            old: zero,
+            new: oid(FOUR),
+        }];
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let mut adv = Advertisement {
+            version: super::super::refadv::ProtocolVersion::V0,
+            capabilities: super::super::refadv::Capabilities::default(),
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        };
+        adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
+        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: "CANARY-tok".to_owned(),
+            origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
+        });
+        let outcomes = push_pack(
+            &base,
+            &adv,
+            &store,
+            &mut plan,
+            &req,
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
-        .expect_err("no report-status");
+        .expect("a 403 refuses before any report");
+        assert_eq!(outcomes.len(), 1);
+        let super::push::RefResult::Rejected { reason } = &outcomes[0].result else {
+            panic!("a 403 rejects: {outcomes:?}");
+        };
+        assert!(reason.contains("403"), "{reason:?}");
+        assert!(!reason.contains("CANARY-tok"), "{reason:?}");
+        assert_eq!(plan.state, super::push::PushState::Rejected);
+        let requests = server.join().expect("server");
         assert!(
-            matches!(err, GitError::PushUncertain { .. }),
-            "unexpected {err:?}"
+            requests[0]
+                .head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "pack must stream, not buffer: {:?}",
+            requests[0].head
         );
     }
 
@@ -2027,9 +2661,13 @@ mod tests {
             &ArchiveWireRequest {
                 rev: "HEAD".to_owned(),
             },
-            &Interrupt::none(),
-            &[],
-            &no_auth(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("archive");
         assert_eq!(out.tar, tar);
@@ -2089,9 +2727,13 @@ mod tests {
             &ArchiveWireRequest {
                 rev: "nope".to_owned(),
             },
-            &Interrupt::none(),
-            &[],
-            &no_auth(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect_err("unknown revision");
         assert!(

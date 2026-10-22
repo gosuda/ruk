@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ruk_core::change::PlanId;
 use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::search::{SearchPool, SearchPoolConfig};
@@ -44,6 +45,14 @@ struct RepoEntry {
 struct RegistryInner {
     /// Opaque handle to repository entry.
     entries: HashMap<String, RepoEntry>,
+    /// Refs blocked by an unresolved push plan: `(canonical repo path,
+    /// ref name)` to the `Uncertain` plan that owns the block. A new push
+    /// to a blocked ref refuses with `E_PUSH_UNCERTAIN` until the owning
+    /// plan reaches a terminal `Confirmed`/`Rejected` state or a reconcile
+    /// observes the remote and clears the block. In-memory only: a daemon
+    /// restart drops every block, so a restarted daemon may push over a ref
+    /// whose prior plan is still `Uncertain` elsewhere.
+    uncertain_pushes: HashMap<(PathBuf, Vec<u8>), PlanId>,
 }
 
 /// The hosted repository registry of one daemon process.
@@ -120,6 +129,7 @@ impl Registry {
             roots: canonical,
             inner: Mutex::new(RegistryInner {
                 entries: HashMap::new(),
+                uncertain_pushes: HashMap::new(),
             }),
             next_handle: AtomicU64::new(1),
             runtime: Mutex::new(None),
@@ -282,6 +292,84 @@ impl Registry {
     /// ceiling with a cursor instead of refusing.
     pub(crate) fn set_search_max_scan_bytes(&self, bytes: u64) {
         self.search_max_scan_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Refuses a push whose ref is blocked by an unresolved plan: returns
+    /// the owning `Uncertain` plan when any of `refs` is blocked for
+    /// `repo`, so the job fails `E_PUSH_UNCERTAIN` before sending.
+    ///
+    /// # Errors
+    /// `E_PUSH_UNCERTAIN` naming the blocking plan, `E_IO` when the guard
+    /// lock is poisoned.
+    pub(crate) fn push_guard_check(&self, repo: &Path, refs: &[Vec<u8>]) -> Result<(), CoreError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
+        for name in refs {
+            if let Some(plan) = inner
+                .uncertain_pushes
+                .get(&(repo.to_path_buf(), name.clone()))
+            {
+                let noun = String::from_utf8_lossy(name);
+                return Err(CoreError::new(
+                    ErrorCode::EPushUncertain,
+                    format!("ref {noun} is blocked by uncertain push plan {plan}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the terminal state of one push plan on the guard: an
+    /// `Uncertain` plan blocks its refs, while `Confirmed`/`Rejected`
+    /// clears the entries that plan owns so the next push may proceed.
+    ///
+    /// # Errors
+    /// `E_IO` when the guard lock is poisoned.
+    pub(crate) fn note_push_terminal(
+        &self,
+        repo: &Path,
+        plan: PlanId,
+        refs: &[Vec<u8>],
+        uncertain: bool,
+    ) -> Result<(), CoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
+        for name in refs {
+            let key = (repo.to_path_buf(), name.clone());
+            if uncertain {
+                inner.uncertain_pushes.insert(key, plan);
+            } else if inner.uncertain_pushes.get(&key) == Some(&plan) {
+                inner.uncertain_pushes.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears the guard for `refs` after a reconcile observed the remote:
+    /// the observation resolves the uncertainty the block stood for, so a
+    /// follow-up push may proceed on the observed state.
+    ///
+    /// # Errors
+    /// `E_IO` when the guard lock is poisoned.
+    pub(crate) fn note_push_reconciled(
+        &self,
+        repo: &Path,
+        refs: &[Vec<u8>],
+    ) -> Result<(), CoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
+        for name in refs {
+            inner
+                .uncertain_pushes
+                .remove(&(repo.to_path_buf(), name.clone()));
+        }
+        Ok(())
     }
 
     /// Resolves `requested` to a canonical path beneath a configured root,
