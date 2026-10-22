@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn entries_carry_direct_tips() {
-        let oid = Oid::from_bytes(&vec![7u8; 32]).expect("oid parses");
+        let oid = Oid::from_bytes(&[7u8; 32]).expect("oid parses");
         let rows = map_entries(&[advertised(b"refs/heads/main", Some(oid))]).expect("maps");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name.as_bytes(), b"refs/heads/main");
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn malformed_advertised_name_fails_corrupt() {
-        let oid = Oid::from_bytes(&vec![7u8; 32]).expect("oid parses");
+        let oid = Oid::from_bytes(&[7u8; 32]).expect("oid parses");
         let err = map_entries(&[advertised(b"refs/heads/../escape", Some(oid))])
             .expect_err("bad name refuses");
         assert_eq!(err.code, ruk_core::error::ErrorCode::ECorrupt);

@@ -267,7 +267,7 @@ impl<'a> PushJob<'a> {
             outcome: pending_outcome(self.session, request_id),
             plan: plan_id,
             state: plan_state,
-            observations: BoundedList::complete(observations).map_err(CoreError::from)?,
+            observations: BoundedList::complete(observations)?,
         }));
         let stored = self
             .coordinator
@@ -327,7 +327,7 @@ impl<'a> PushJob<'a> {
             outcome: pending_outcome(self.session, RequestId::generate()),
             plan: plan.id,
             state: PushState::Prepared,
-            refs: BoundedList::complete(Vec::new()).map_err(CoreError::from)?,
+            refs: BoundedList::complete(Vec::new())?,
         }));
         self.coordinator
             .submit_prepared(
@@ -566,7 +566,7 @@ impl BlockingJob {
                 outcome: pending_outcome(self.session, RequestId::generate()),
                 plan: plan.id,
                 state,
-                refs: BoundedList::complete(refs).map_err(CoreError::from)?,
+                refs: BoundedList::complete(refs)?,
             },
             terminal_fact,
             state,
@@ -944,7 +944,7 @@ mod tests {
     }
 
     fn oid_fill(byte: u8) -> Oid {
-        Oid::from_bytes(&vec![byte; 32]).expect("filled oid parses")
+        Oid::from_bytes(&[byte; 32]).expect("filled oid parses")
     }
 
     #[test]
@@ -1071,31 +1071,31 @@ mod tests {
         let registry = Registry::new(vec![root.clone()]).expect("registry builds");
         let name = b"refs/heads/main".to_vec();
         registry
-            .push_guard_check(&root, &[name.clone()])
+            .push_guard_check(&root, std::slice::from_ref(&name))
             .expect("clean ref passes");
         let blocking = PlanId::generate();
         registry
-            .note_push_terminal(&root, blocking, &[name.clone()], true)
+            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), true)
             .expect("uncertain records");
         let err = registry
-            .push_guard_check(&root, &[name.clone()])
+            .push_guard_check(&root, std::slice::from_ref(&name))
             .expect_err("uncertain blocks");
         assert_eq!(err.code, ErrorCode::EPushUncertain);
         assert!(err.to_string().contains(&blocking.to_string()));
         registry
-            .note_push_terminal(&root, blocking, &[name.clone()], false)
+            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), false)
             .expect("confirmed clears");
         registry
-            .push_guard_check(&root, &[name.clone()])
+            .push_guard_check(&root, std::slice::from_ref(&name))
             .expect("confirmed passes");
         registry
-            .note_push_terminal(&root, blocking, &[name.clone()], true)
+            .note_push_terminal(&root, blocking, std::slice::from_ref(&name), true)
             .expect("uncertain records again");
         registry
-            .note_push_reconciled(&root, &[name.clone()])
+            .note_push_reconciled(&root, std::slice::from_ref(&name))
             .expect("reconcile clears");
         registry
-            .push_guard_check(&root, &[name.clone()])
+            .push_guard_check(&root, std::slice::from_ref(&name))
             .expect("reconciled passes");
     }
 }
