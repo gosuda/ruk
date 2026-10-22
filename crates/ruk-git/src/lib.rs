@@ -15,6 +15,7 @@ pub mod transport;
 
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::ids::{HashKind, Oid};
+use ruk_core::protocol::ErrorDetail;
 use thiserror::Error;
 
 /// Failures of the Git compatibility layer.
@@ -130,6 +131,27 @@ pub enum GitError {
         /// The displaced expectation.
         detail: String,
     },
+    /// The remote refused the credential: rotate the token.
+    #[error("forbidden: {detail}")]
+    Forbidden {
+        /// The rejected endpoint.
+        detail: String,
+    },
+    /// An HTTP refusal with its facts: the status classifies the code,
+    /// and the facts travel into the core error detail for reply builders.
+    #[error("http: {detail}")]
+    Http {
+        /// The scrubbed refusal text naming the endpoint and status.
+        detail: String,
+        /// The numeric status that classifies this failure's code.
+        status: u16,
+        /// The `Retry-After` delay, when the server sent delta-seconds.
+        retry_after_seconds: Option<u64>,
+        /// The scrubbed redirect target for 3xx refusals.
+        location: Option<String>,
+        /// The scrubbed response preview, capped at 512 bytes.
+        body_preview: String,
+    },
     /// The caller cancelled the operation.
     #[error("cancelled: {detail}")]
     Cancelled {
@@ -157,9 +179,17 @@ impl GitError {
             Self::Stale { .. } => ErrorCode::EStale,
             Self::Offline { .. } => ErrorCode::EOffline,
             Self::Shallow { .. } => ErrorCode::EShallow,
-            Self::PushRejected { .. } | Self::PushUncertain { .. } | Self::RemoteMoved { .. } => {
-                ErrorCode::EStale
-            }
+            Self::PushRejected { .. } => ErrorCode::EPushRejected,
+            Self::PushUncertain { .. } => ErrorCode::EPushUncertain,
+            Self::RemoteMoved { .. } => ErrorCode::ERemoteMoved,
+            Self::Forbidden { .. } => ErrorCode::EForbidden,
+            Self::Http { status, .. } => match status {
+                401 | 403 => ErrorCode::EForbidden,
+                404 => ErrorCode::ENotFound,
+                429 => ErrorCode::ELimit,
+                300..=399 => ErrorCode::ERemoteMoved,
+                _ => ErrorCode::EOffline,
+            },
             Self::Cancelled { .. } => ErrorCode::ECancelled,
         }
     }
@@ -176,13 +206,33 @@ impl GitError {
         self.code().exit_code()
     }
 
-    /// The [`CoreError`] form, preserving the closed code.
+    /// The [`CoreError`] form, preserving the closed code. HTTP refusals
+    /// additionally carry their facts as the error detail; the preview and
+    /// location were scrubbed when the refusal was built.
     #[must_use]
     pub fn to_core_error(&self) -> CoreError {
-        CoreError::new(
-            self.code(),
-            transport::credentials::scrub_userinfo(&self.to_string()),
-        )
+        match self {
+            Self::Http {
+                status,
+                retry_after_seconds,
+                location,
+                body_preview,
+                ..
+            } => CoreError::new(
+                self.code(),
+                transport::credentials::scrub_userinfo(&self.to_string()),
+            )
+            .with_detail(ErrorDetail::http_detail(
+                *status,
+                *retry_after_seconds,
+                location.clone(),
+                body_preview,
+            )),
+            _ => CoreError::new(
+                self.code(),
+                transport::credentials::scrub_userinfo(&self.to_string()),
+            ),
+        }
     }
 }
 
@@ -205,6 +255,10 @@ impl From<CoreError> for GitError {
             ErrorCode::EStale => Self::Stale { detail },
             ErrorCode::EOffline => Self::Offline { detail },
             ErrorCode::EShallow => Self::Shallow { detail },
+            ErrorCode::EPushRejected => Self::PushRejected { detail },
+            ErrorCode::EPushUncertain => Self::PushUncertain { detail },
+            ErrorCode::ERemoteMoved => Self::RemoteMoved { detail },
+            ErrorCode::EForbidden => Self::Forbidden { detail },
             ErrorCode::ECancelled => Self::Cancelled { detail },
             ErrorCode::EObjectFormat => Self::ObjectFormat { detail },
             code => Self::Io {

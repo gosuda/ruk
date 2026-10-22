@@ -13,6 +13,8 @@ use core::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::protocol::ErrorDetail;
+
 /// The one closed error-code registry. The serde and schema form is the
 /// contract spelling (`E_STALE`), identical to [`ErrorCode::as_str`].
 #[derive(
@@ -261,6 +263,7 @@ pub struct CoreError {
     pub code: ErrorCode,
     pub message: String,
     pub hints: Vec<String>,
+    pub detail: Option<Box<ErrorDetail>>,
 }
 
 impl CoreError {
@@ -270,12 +273,19 @@ impl CoreError {
             code,
             message: message.into(),
             hints: Vec::new(),
+            detail: None,
         }
     }
 
     #[must_use]
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hints.push(hint.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_detail(mut self, detail: ErrorDetail) -> Self {
+        self.detail = Some(Box::new(detail));
         self
     }
 }

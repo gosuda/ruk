@@ -260,19 +260,124 @@ fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// Maps a non-2xx RPC status the way the LFS verbs do: the endpoint
-/// refused, so the remote is offline. A 404 names the missing repository
-/// and a 401/403 names the auth failure; anything else echoes the status.
-fn check_status(url: &str, status: u16) -> Result<(), GitError> {
+/// The injected credential this call authenticates with, if any: a server
+/// echoing it back in an error body must not leak it into the refusal.
+fn auth_secrets(auth: &credentials::AuthPolicy) -> Vec<String> {
+    match auth {
+        credentials::AuthPolicy::Explicit { auth } if !auth.credential.is_empty() => {
+            vec![auth.credential.clone()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Scrubs one raw response body for refusal text: userinfo shapes first,
+/// then the call's own credential, capped at 512 bytes on a boundary.
+fn scrubbed_preview(preview: &[u8], secrets: &[String]) -> String {
+    let scrubbed = credentials::scrub_secrets(&credentials::scrub_userinfo_bytes(preview), secrets);
+    let text = String::from_utf8_lossy(&scrubbed);
+    let mut end = text.len().min(512);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// The honest refusal behind one non-2xx RPC status: 401/403 forbid
+/// (rotate the token), 404 misses, 429 limits, 3xx moves, anything else is
+/// offline. The status classifies the [`GitError::Http`] code, and the
+/// scrubbed facts travel into the core error detail for reply builders.
+fn http_failure(
+    url: &str,
+    status: u16,
+    retry_after_seconds: Option<u64>,
+    location: Option<String>,
+    preview_text: &str,
+) -> GitError {
+    let detail = match status {
+        401 | 403 => format!("{url}: authentication failed with status {status}"),
+        404 => format!("{url}: repository not found"),
+        429 => match retry_after_seconds {
+            Some(secs) => format!("{url}: rate limited with status 429, retry after {secs}s"),
+            None => format!("{url}: rate limited with status 429"),
+        },
+        300..=399 => match &location {
+            Some(target) => format!("{url}: remote moved to {target}"),
+            None => format!("{url}: redirect without a location"),
+        },
+        _ => format!("{url}: smart-http endpoint refused status {status}"),
+    };
+    let detail = if preview_text.is_empty() {
+        detail
+    } else {
+        format!("{detail}; body: {preview_text}")
+    };
+    GitError::Http {
+        detail,
+        status,
+        retry_after_seconds,
+        location,
+        body_preview: preview_text.to_owned(),
+    }
+}
+
+/// Reads the retry delay and redirect target off one refusal's headers.
+/// The target is scrubbed like a body: a redirect may echo the credential.
+fn refusal_facts(reply: &[(String, String)], secrets: &[String]) -> (Option<u64>, Option<String>) {
+    let retry_after_seconds =
+        http::header(reply, "retry-after").and_then(|value| value.trim().parse::<u64>().ok());
+    let location = http::header(reply, "location").map(|target| {
+        String::from_utf8_lossy(&credentials::scrub_secrets(
+            credentials::scrub_userinfo_bytes(target.as_bytes()).as_slice(),
+            secrets,
+        ))
+        .into_owned()
+    });
+    (retry_after_seconds, location)
+}
+
+/// Maps a non-2xx RPC status to its honest error: 401/403 forbid (rotate
+/// the token), 404 misses, 429 limits, 3xx moves, anything else is offline.
+/// GET responses carry no body, so the preview is empty there.
+fn check_status(
+    url: &str,
+    status: u16,
+    reply: &[(String, String)],
+    auth: &credentials::AuthPolicy,
+) -> Result<(), GitError> {
     if http::is_success(status) {
         return Ok(());
     }
-    let detail = match status {
-        404 => format!("{url}: repository not found"),
-        401 | 403 => format!("{url}: authentication failed with status {status}"),
-        _ => format!("{url}: smart-http endpoint refused status {status}"),
-    };
-    Err(GitError::Offline { detail })
+    let (retry_after_seconds, location) = refusal_facts(reply, &auth_secrets(auth));
+    Err(http_failure(url, status, retry_after_seconds, location, ""))
+}
+
+/// Maps a non-2xx POST status, draining a bounded body preview first so
+/// the refusal can name what the server said. The drain is one capped
+/// read scrubbed against the call's own credential; framing errors yield
+/// an empty preview rather than a failure.
+fn check_post_status(
+    url: &str,
+    reader: &mut http::HttpBodyReader,
+    status: u16,
+    reply: &[(String, String)],
+    auth: &credentials::AuthPolicy,
+) -> Result<(), GitError> {
+    if http::is_success(status) {
+        return Ok(());
+    }
+    let mut raw = [0u8; 1024];
+    let len = reader.read(&mut raw).unwrap_or(0);
+    let secrets = auth_secrets(auth);
+    let preview = scrubbed_preview(&raw[..len], &secrets);
+    let (retry_after_seconds, location) = refusal_facts(reply, &secrets);
+    Err(http_failure(
+        url,
+        status,
+        retry_after_seconds,
+        location,
+        &preview,
+    ))
 }
 
 /// Discovers one smart-http endpoint's refs: GETs the advertisement and
@@ -296,7 +401,7 @@ pub fn discover(
     let owned = policy_headers(&url, auth, &[("Accept", "*/*")], extra_headers);
     let mut body = Vec::new();
     let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
-    check_status(&url, status)?;
+    check_status(&url, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(service.advertisement_type().as_str()) {
         return Err(net::dumb_http_gap(&url));
     }
@@ -355,7 +460,7 @@ pub fn discover_versioned(
     );
     let mut body = Vec::new();
     let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
-    check_status(&url, status)?;
+    check_status(&url, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(service.advertisement_type().as_str()) {
         return Err(net::dumb_http_gap(&url));
     }
@@ -408,8 +513,8 @@ pub fn ls_refs_v2(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
             detail: format!("{url}: ls-refs RPC answered a non-pack content type"),
@@ -496,8 +601,8 @@ pub fn fetch_pack_v2(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
             detail: format!("{url}: fetch RPC answered a non-pack content type"),
@@ -644,8 +749,8 @@ pub fn fetch_pack(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(SmartService::UploadPack.result_type().as_str())
     {
         return Err(GitError::Corrupt {
@@ -902,8 +1007,8 @@ fn push_pack_inner(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &out)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type")
         != Some(SmartService::ReceivePack.result_type().as_str())
     {
@@ -995,8 +1100,8 @@ pub fn fetch_archive(
         ],
         extra_headers,
     );
-    let (reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
-    check_status(&url, status)?;
+    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &body)?;
+    check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
             detail: format!("{url}: upload-archive RPC answered a non-archive content type"),
@@ -1236,9 +1341,20 @@ mod tests {
             },
         )
         .expect_err("a 500 refuses the POST");
-        assert!(
-            matches!(err, GitError::Offline { .. }),
-            "unexpected {err:?}"
+        assert_eq!(err.code(), ruk_core::error::ErrorCode::EOffline);
+        let GitError::Http {
+            status,
+            retry_after_seconds,
+            location,
+            body_preview,
+            ..
+        } = err
+        else {
+            panic!("a 500 is an HTTP refusal: {err:?}");
+        };
+        assert_eq!(
+            (status, retry_after_seconds, location, body_preview),
+            (500, None, None, String::new())
         );
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
@@ -1250,6 +1366,152 @@ mod tests {
             requests[0].head
         );
         assert_only_injected_auth(&requests[0].head);
+    }
+
+    #[test]
+    fn status_matrix_maps_honest_codes_with_scrubbed_detail() {
+        use super::super::session::test_support::test_store;
+
+        let adv = || Advertisement {
+            version: super::super::refadv::ProtocolVersion::V0,
+            capabilities: super::super::refadv::Capabilities::default(),
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        };
+        let req = || FetchWireRequest {
+            wants: vec![oid(FOUR)],
+            haves: Vec::new(),
+            filter: None,
+            depth: None,
+            shallow: Vec::new(),
+            list_refs: false,
+            ref_prefixes: Vec::new(),
+        };
+        let post = |base: &str, auth: &credentials::AuthPolicy| {
+            let dest = test_store(HashKind::Sha1);
+            fetch_pack(
+                base,
+                &adv(),
+                &dest,
+                &req(),
+                IngestLimits::default(),
+                RpcCall {
+                    extra: &[],
+                    auth,
+                    interrupt: &Interrupt::none(),
+                },
+            )
+            .expect_err("refusal")
+        };
+        struct StatusCase {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+            code: ruk_core::error::ErrorCode,
+            retry: Option<u64>,
+            location: Option<&'static str>,
+        }
+        let cases = vec![
+            StatusCase {
+                status: 401,
+                headers: Vec::new(),
+                body: b"token CANARY-tok expired; see https://ada:sect@host/x".to_vec(),
+                code: ruk_core::error::ErrorCode::EForbidden,
+                retry: None,
+                location: None,
+            },
+            StatusCase {
+                status: 403,
+                headers: Vec::new(),
+                body: Vec::new(),
+                code: ruk_core::error::ErrorCode::EForbidden,
+                retry: None,
+                location: None,
+            },
+            StatusCase {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+                code: ruk_core::error::ErrorCode::ENotFound,
+                retry: None,
+                location: None,
+            },
+            StatusCase {
+                status: 429,
+                headers: vec![("Retry-After".to_owned(), "120".to_owned())],
+                body: b"slow down".to_vec(),
+                code: ruk_core::error::ErrorCode::ELimit,
+                retry: Some(120),
+                location: None,
+            },
+            StatusCase {
+                status: 301,
+                headers: vec![(
+                    "Location".to_owned(),
+                    "https://new.example/r.git".to_owned(),
+                )],
+                body: Vec::new(),
+                code: ruk_core::error::ErrorCode::ERemoteMoved,
+                retry: None,
+                location: Some("https://new.example/r.git"),
+            },
+            StatusCase {
+                status: 500,
+                headers: Vec::new(),
+                body: b"boom https://root:pw@internal/x".to_vec(),
+                code: ruk_core::error::ErrorCode::EOffline,
+                retry: None,
+                location: None,
+            },
+        ];
+        for case in cases {
+            let StatusCase {
+                status,
+                headers,
+                body,
+                code,
+                retry,
+                location,
+            } = case;
+            let (base, server) = fake_smart_server(vec![(status, headers, body, false)]);
+            let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+                kind: credentials::TransportAuthKind::Bearer,
+                credential: "CANARY-tok".to_owned(),
+                origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
+            });
+            let err = post(&base, &auth);
+            assert_eq!(err.code(), code, "status {status}");
+            assert!(
+                !err.to_string().contains("CANARY-tok"),
+                "status {status}: {err}"
+            );
+            assert!(
+                matches!(&err, GitError::Http { status: s, .. } if *s == status),
+                "status {status} is an HTTP refusal: {err:?}"
+            );
+            let core = ruk_core::error::CoreError::from(err);
+            assert_eq!(core.code, code, "status {status}");
+            assert!(!core.message.contains("CANARY-tok"), "status {status}");
+            let ruk_core::protocol::ErrorReply { detail, .. } =
+                ruk_core::protocol::ErrorReply::from_core(&core);
+            let Some(ruk_core::protocol::ErrorDetail::Http {
+                status: detail_status,
+                retry_after_seconds: detail_retry,
+                location: detail_location,
+                body_preview,
+            }) = detail
+            else {
+                panic!("status {status} keeps its detail through the reply");
+            };
+            assert_eq!(detail_status, status);
+            assert_eq!(detail_retry, retry, "status {status}");
+            assert_eq!(detail_location.as_deref(), location, "status {status}");
+            for secret in ["CANARY-tok", "ada:sect@", "root:pw@"] {
+                assert!(!body_preview.contains(secret), "status {status}");
+            }
+            assert!(body_preview.len() <= 512, "status {status}");
+            server.join().expect("server");
+        }
     }
 
     #[test]
