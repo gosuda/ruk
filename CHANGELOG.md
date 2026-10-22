@@ -6,6 +6,8 @@ Entries describe implemented, unreleased functionality.
 
 ### Added
 
+- Receive-pack closure verification stops at existing direct ref tips whose closures were verified when published. Newly introduced commits and their own trees, links, and parents remain fully verified; unrelated committed objects are not accepted as exclusion roots.
+
 - Protocol schema minor 4 adds `release.freeze.set` and `release.freeze.clear`, bringing the method count to 63. A release owner can freeze a tag at one target and clear its marker. Tag mutations, imports, CLI ref writes, undo, and pushes refuse frozen tags with the owner named. Marker guards publish atomically with ref changes; an atomic push refuses every sibling when any tag is frozen.
 
 - Protocol schema minor 3: `repo.fork` serves a staged fork. Sealed segments hardlink into the fork (a cross-device link copies and is reported), tail objects re-publish base-first, and facts copy under full CAS revalidation. The destination carries the forked generation, the default branch, and the refs the `refs` selection keeps; freeze markers, attestations, and live coordination state stay behind.

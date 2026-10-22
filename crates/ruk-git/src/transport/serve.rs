@@ -52,7 +52,7 @@ use ruk_core::refs::StoreRefs;
 use ruk_core::store::types::ObjectKind;
 use ruk_core::store::{EventContext, EventSource, FactMutation, Store};
 
-use super::fetch::{commit_record_facts, verify_closure};
+use super::fetch::{ClosureScope, commit_record_facts, existing_ref_tips, verify_closure_in_scope};
 use super::hooks::stage_quarantine;
 use super::lfs::refusals_for_live;
 use super::pack::{IngestLimits, PackEntry, StagedPack, ingest_pack, write_pack};
@@ -417,7 +417,12 @@ fn ingest_and_verify<R: Read>(
     interrupt: &Interrupt,
 ) -> Result<(StagedPack, Vec<FactMutation>), GitError> {
     let staged = ingest_pack(reader, kind, store, limits, interrupt)?;
-    verify_closure(store, &staged, news, None, &[], interrupt)?;
+    let roots = existing_ref_tips(store)?;
+    let scope = ClosureScope {
+        roots: &roots,
+        server_shallow: &[],
+    };
+    verify_closure_in_scope(store, &staged, news, scope, None, interrupt)?;
     let facts = commit_record_facts(store, &staged)?;
     Ok((staged, facts))
 }
@@ -1156,6 +1161,7 @@ pub fn serve_command<R: Read, W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::fetch::verify_closure;
     use super::super::hooks::ReceiveHooks;
     use super::super::policy::{
         LandedRefs, NoPolicy, ReceiveBatch, ReceivePolicy, RefVerdict, ScriptPolicy,
