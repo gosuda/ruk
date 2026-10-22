@@ -36,9 +36,10 @@ use super::admission::{
     WorkResources, run_blocking,
 };
 pub use super::cancel::{Cancel, CancelHandle, cancellation};
+use super::claims::sweep_page as sweep_claims_page;
 use super::claims::{
-    ClaimClock, LeasedClaimPage, authorize_claim_list_args, list_page, list_page_raw,
-    next_claim_cursor,
+    ClaimClock, LeasedClaimPage, authorize_claim_list_args, is_record_key, list_page,
+    list_page_raw, live_holders, next_claim_cursor,
 };
 use super::clock::Clock;
 use super::lane::{
@@ -180,6 +181,11 @@ pub struct HostedCoordinator {
     /// only: a restart re-scans from the first key, which delays but
     /// never breaks convergence, and no head-schema change is needed.
     receipt_sweep_cursor: Mutex<Option<Vec<u8>>>,
+    /// Resume key for the claim sweep rotation. In memory only, like the
+    /// service-receipt cursor: a restart re-scans from the first record,
+    /// which delays but never breaks convergence, and the `OpHead`
+    /// encoding stays untouched.
+    claim_sweep_cursor: Mutex<Option<Vec<u8>>>,
 }
 
 impl core::fmt::Debug for HostedCoordinator {
@@ -274,6 +280,7 @@ impl HostedCoordinator {
             event_retention_seconds: AtomicU64::new(DEFAULT_EVENT_RETENTION_SECONDS),
             compare_max_commits,
             receipt_sweep_cursor: Mutex::new(None),
+            claim_sweep_cursor: Mutex::new(None),
         })
     }
 
@@ -2887,6 +2894,10 @@ pub struct RetentionReport {
     pub service_receipts_examined: usize,
     /// Expired service receipt rows deleted through the lane in this pass.
     pub service_receipts_deleted: usize,
+    /// Expired claim records deleted through the lane in this pass. Each
+    /// record also removes its holder and path indexes; those index
+    /// deletions and the clock fence are facts, not counted rows.
+    pub claims_deleted: usize,
 }
 
 impl RetentionReport {
@@ -2897,6 +2908,7 @@ impl RetentionReport {
             && self.sessions_deleted == 0
             && self.events_deleted == 0
             && self.service_receipts_deleted == 0
+            && self.claims_deleted == 0
             && self.leases_expired == 0
     }
 }
@@ -2907,12 +2919,15 @@ impl HostedCoordinator {
     /// Loads the persisted `head.sweep` cursors from the `OpHead` singleton
     /// (the same `decode_head` load path `read_oplog` uses; no second cursor
     /// store exists), evaluates `sweep_page` for receipts then sessions under
-    /// the coordinator's conservative [`RetentionClock`], and publishes the
+    /// the coordinator's conservative [`RetentionClock`], sweeps one bounded
+    /// claim page through the claim rotation cursor, spares the sessions of
+    /// live claim holders so task claims survive restarts, and publishes the
     /// exact-CAS deletions plus the merged next cursors as one
     /// `InternalPayload::Sweep` candidate admitted under
     /// [`RequestClass::Maintenance`]. The lane commit installs the cursors
     /// into `head.sweep` under sole publication ownership and adjusts the
-    /// retention ledger through `apply_facts`.
+    /// retention ledger through `apply_facts` (claim facts are untracked and
+    /// pass through).
     ///
     /// Idle passes (no deletions and cursors unchanged) skip lane publication
     /// entirely so the head row is not rewritten every interval.
@@ -2933,12 +2948,35 @@ impl HostedCoordinator {
             None => CoordinatorHead::default(),
         };
         let receipts_page = sweep_page(&self.store, SweepTable::Receipts, loaded.sweep, now)?;
-        let sessions_page = sweep_page(
+        let mut sessions_page = sweep_page(
             &self.store,
             SweepTable::Sessions,
             receipts_page.cursors,
             now,
         )?;
+        // Claim sweep: one bounded page per pass through the lane, advancing
+        // the in-memory rotation cursor. Without this caller expired claim
+        // rows and their indexes would accumulate toward `E_LIMIT`.
+        let claim_clock = ClaimClock::open(&self.store, self.clock.clone())?;
+        let claim_after = self
+            .claim_sweep_cursor
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "claim sweep cursor is poisoned"))?
+            .clone();
+        let claims_sweep = sweep_claims_page(
+            &self.store,
+            &claim_clock,
+            claim_after.as_deref(),
+            FactPageBudget::new(128, 256 * 1024),
+        )?;
+        // Holder guard: sessions holding unexpired claims stay resumable so
+        // task claims survive restarts. The guard reads live holders after
+        // the claim sweep is selected but before anything publishes, and it
+        // fails the pass rather than sweeping unguarded.
+        let holders = live_holders(&self.store, &claim_clock)?;
+        sessions_page
+            .deletions
+            .retain(|deletion| !session_holds_live_claim(&holders, &deletion.key));
         // In-memory read leases expire here as well as at read entry. The
         // sweep fires cancellation on lapsed authority; dropping the expired
         // owner guards retires the slots without touching any fact table.
@@ -2981,6 +3019,11 @@ impl HostedCoordinator {
             })? = next_after;
             Ok(())
         }
+        let claims_deleted = claims_sweep
+            .facts
+            .iter()
+            .filter(|fact| fact.table == FactTable::Claims && is_record_key(&fact.key))
+            .count();
         let report = RetentionReport {
             receipts_examined: receipts_page.examined_rows,
             receipts_deleted: receipts_page.deletions.len(),
@@ -2991,21 +3034,26 @@ impl HostedCoordinator {
             leases_expired,
             service_receipts_examined: receipt_sweep.examined,
             service_receipts_deleted: receipt_sweep.deletions.len(),
+            claims_deleted,
         };
         // Lease expiry never publishes: it frees in-memory guards only. The
-        // lane commit runs only when durable receipts/sessions/events need it.
+        // lane commit runs only when durable receipts/sessions/events/claims
+        // need it.
         let durable_empty = report.receipts_deleted == 0
             && report.sessions_deleted == 0
             && report.events_deleted == 0
-            && report.service_receipts_deleted == 0;
+            && report.service_receipts_deleted == 0
+            && report.claims_deleted == 0;
         if durable_empty && sessions_page.cursors == loaded.sweep {
             advance_receipt_cursor(self, receipt_sweep.next_after)?;
+            advance_claim_cursor(self, claims_sweep.next)?;
             return Ok(report);
         }
         let mut facts = receipts_page.deletions;
         facts.extend(sessions_page.deletions);
         facts.extend(event_deletions);
         facts.extend(receipt_sweep.deletions);
+        facts.extend(claims_sweep.facts);
         let mut payload_bytes: usize = 0;
         for fact in &facts {
             payload_bytes = payload_bytes.saturating_add(fact.key.len());
@@ -3022,6 +3070,7 @@ impl HostedCoordinator {
         )?;
         self.lane.submit_internal(candidate).await?;
         advance_receipt_cursor(self, receipt_sweep.next_after)?;
+        advance_claim_cursor(self, claims_sweep.next)?;
         Ok(report)
     }
 
@@ -3068,6 +3117,31 @@ impl HostedCoordinator {
         self.lane.submit_internal(candidate).await?;
         Ok(stats)
     }
+}
+
+/// Advances the in-memory claim sweep rotation cursor. A finished rotation
+/// (`None`) restarts from the first record on the next pass.
+fn advance_claim_cursor(
+    coordinator: &HostedCoordinator,
+    next_after: Option<Vec<u8>>,
+) -> Result<(), CoreError> {
+    *coordinator
+        .claim_sweep_cursor
+        .lock()
+        .map_err(|_| CoreError::new(ErrorCode::EIo, "claim sweep cursor is poisoned"))? =
+        next_after;
+    Ok(())
+}
+
+/// True when a session-sweep deletion names a holder of a live claim.
+///
+/// Session keys are 16 raw UUID bytes; anything else is not a holder and
+/// stays deletable.
+fn session_holds_live_claim(holders: &[SessionId], key: &[u8]) -> bool {
+    let Ok(id): Result<[u8; 16], _> = key.try_into() else {
+        return false;
+    };
+    holders.contains(&SessionId::from_bytes(id))
 }
 
 /// Names the missing read path of one uncovered method for its refusal.
@@ -5072,6 +5146,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_sweep_deletes_expired_task_claims_and_spares_live_holders() {
+        let (_temp, coord, _) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+
+        // An expired task-keyed claim from two hours ago: the sweep must
+        // delete its record and indexes through the lane. It seeds first,
+        // while no claim-clock fence exists yet, so the injected past clock
+        // anchors the seal in the past; a later fence would max the window
+        // back to the present.
+        let past_wall = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(2))
+            .expect("past wall");
+        let past = ClaimClock::open(
+            coord.store(),
+            crate::coord::clock::Clock::injected(past_wall, std::time::Instant::now()),
+        )
+        .expect("past claim clock");
+        let dead = seal_acquire(
+            coord.store(),
+            &past,
+            SessionId::from_bytes([0xCC; 16]),
+            ClaimId::from_bytes([9; 16]),
+            crate::protocol::ClaimAcquireArgs {
+                paths: vec![RepoPath::new("old").expect("valid path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: Some(crate::protocol::ClaimSubject::Task(
+                    crate::protocol::TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+                )),
+            },
+            None,
+        )
+        .expect("seal expired task claim");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &dead.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("seed expired claim");
+
+        // A live path-only claim: the sweep must keep its record and, by
+        // keeping its holder listed, spare the holder's session row below.
+        let holder = SessionId::from_bytes([0xBB; 16]);
+        seed_claims(&coord, holder, &[(3, "live")]);
+
+        // The holder's session already lapsed past its horizon, exactly the
+        // row the session sweep would delete without the holder guard.
+        let session_key_bytes = session_key(holder);
+        let session_row = SessionRow {
+            principal: Principal::from_peer_uid(1000),
+            identity: None,
+            claims: ProvenanceClaims::default(),
+            capabilities: Capabilities::default(),
+            secret_hash: [0x55; 32],
+            authority: SessionAuthority::ReceiptsOnly {
+                receipts_until: Timestamp::new(past_wall),
+            },
+        };
+        let encoded_session = encode("session row", &session_row).expect("encode session");
+        let stored_bytes = u64::try_from(session_key_bytes.len() + encoded_session.len())
+            .expect("session row size fits u64");
+        let seeded = CoordinatorHead {
+            last_op: None,
+            retained: Retained {
+                receipts: Usage::default(),
+                sessions: Usage {
+                    rows: 1,
+                    stored_bytes,
+                },
+                ops: Usage::default(),
+            },
+            sweep: SweepCursors {
+                receipts: None,
+                sessions: Some([0x00; 16]),
+            },
+        };
+        let encoded_head = encode("coordinator head", &seeded).expect("encode head");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[
+                    FactMutation {
+                        table: FactTable::Sessions,
+                        key: session_key_bytes.to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(encoded_session),
+                    },
+                    FactMutation {
+                        table: FactTable::OpHead,
+                        key: OP_HEAD_KEY.to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(encoded_head),
+                    },
+                ],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("seed lapsed session and ledger");
+
+        let report = coord
+            .retention_sweep(&cancel)
+            .await
+            .expect("sweep publishes through the lane");
+        assert_eq!(
+            report.claims_deleted, 1,
+            "exactly the expired task claim record sweeps, got {report:?}"
+        );
+        assert_eq!(
+            report.sessions_deleted, 0,
+            "the live claim holder must survive the session sweep"
+        );
+        assert!(
+            crate::coord::claims::read_record(coord.store(), ClaimId::from_bytes([9; 16]))
+                .expect("read dead")
+                .is_none(),
+            "expired task claim must delete through the lane"
+        );
+        assert!(
+            crate::coord::claims::read_record(coord.store(), ClaimId::from_bytes([3; 16]))
+                .expect("read live")
+                .is_some(),
+            "live claim must survive its own sweep"
+        );
+        assert!(
+            coord
+                .store()
+                .fact(FactTable::Sessions, &session_key_bytes)
+                .expect("read session")
+                .is_some(),
+            "a session holding a live claim must survive the sweep"
+        );
+
+        coord.shutdown();
+        runner.abort();
+    }
+
+    #[tokio::test]
     async fn retention_sweep_prunes_service_receipts_at_configured_horizon() {
         let (_temp, coord, _) = coordinator();
         let runner = coord
@@ -5285,6 +5503,7 @@ mod tests {
                     paths: vec![path],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
                 None,
             )
@@ -6787,6 +7006,10 @@ mod tests {
             },
             RetentionReport {
                 service_receipts_deleted: 1,
+                ..RetentionReport::default()
+            },
+            RetentionReport {
+                claims_deleted: 1,
                 ..RetentionReport::default()
             },
             RetentionReport {

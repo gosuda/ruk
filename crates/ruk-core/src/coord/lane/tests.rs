@@ -1203,6 +1203,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 paths: paths.clone(),
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
         }));
         let reply = Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
@@ -1229,6 +1230,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 mode: ClaimMode::Enforce,
                 expires_at: Timestamp::new(jiff::Timestamp::now()),
                 on_behalf_of: None,
+                subject: None,
             },
         }));
         let (handle, cancel) = cancellation();

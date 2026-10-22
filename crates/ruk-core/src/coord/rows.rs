@@ -483,8 +483,9 @@ struct LegacyClaimReleaseReply {
 /// `E_CORRUPT` (quarantine latched) unless `b` is exactly a legacy
 /// `claim.acquire` or `claim.release` receipt.
 fn decode_legacy_claim_receipt(store: &Store, b: &[u8]) -> Result<Reply, CoreError> {
-    let mut extended = Vec::with_capacity(b.len() + 1);
+    let mut extended = Vec::with_capacity(b.len() + 2);
     extended.extend_from_slice(b);
+    extended.push(0x00);
     extended.push(0x00);
     let staged: Reply = decode(store, "receipt row", &extended)?;
     let method = staged.method();
@@ -538,6 +539,7 @@ fn decode_legacy_claim_receipt(store: &Store, b: &[u8]) -> Result<Reply, CoreErr
         mode: legacy.mode,
         expires_at: legacy.expires_at,
         on_behalf_of: None,
+        subject: None,
     };
     match method {
         Method::ClaimAcquire => {
@@ -1299,10 +1301,12 @@ mod tests {
             mode: ClaimMode::Enforce,
             expires_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             on_behalf_of: None,
+            subject: None,
         };
         let key = receipt_key(s, r);
-        // New-shape bytes end in the trailing None discriminant; stripping
-        // it yields the exact pre-field encoding postcard wrote before.
+        // New-shape bytes end in two trailing None discriminants
+        // (on_behalf_of then subject); stripping both yields the exact
+        // pre-field encoding postcard wrote before.
         for reply in [
             Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
                 outcome: outcome.clone(),
@@ -1315,6 +1319,7 @@ mod tests {
         ] {
             let mut legacy = crate::store::encode("receipt row", &reply).expect("encode reply");
             assert_eq!(legacy.pop(), Some(0x00), "trailing None is one byte");
+            assert_eq!(legacy.pop(), Some(0x00), "second trailing None is one byte");
             let ReceiptRow(decoded) =
                 decode_receipt(&store, &key, &legacy).expect("legacy claim receipt decodes");
             assert_eq!(decoded.method(), reply.method());
@@ -1363,19 +1368,28 @@ mod tests {
             mode: ClaimMode::Enforce,
             expires_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             on_behalf_of: Some("provenance".to_owned()),
+            subject: None,
         };
         let reply = Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
             outcome,
             claim: record,
         }));
         let full = crate::store::encode("receipt row", &reply).expect("encode reply");
+        // The subject's trailing None discriminant sits after the provenance
+        // string; strip it before the length check on the provenance tail.
+        let mut without_subject = full;
+        assert_eq!(
+            without_subject.pop(),
+            Some(0x00),
+            "subject None is one byte"
+        );
         assert!(
-            full.ends_with(b"\x0aprovenance"),
+            without_subject.ends_with(b"\x0aprovenance"),
             "postcard strings are length-prefixed"
         );
         // Tear the provenance string off, leaving a bare Some discriminant:
         // a naive retry with a restored None byte would decode Some("").
-        let mut torn = full;
+        let mut torn = without_subject;
         torn.truncate(torn.len() - "provenance".len() - 1);
         let key = receipt_key(s, r);
         let err = decode_receipt(&store, &key, &torn).expect_err("torn provenance stays corrupt");

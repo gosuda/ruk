@@ -246,12 +246,15 @@ pub(crate) fn commit_batch(
                     // keep dropping both, as before.
                     if matches!(
                         m.candidate.request,
-                        Request::ClaimAcquire(_) | Request::ClaimRelease(_)
+                        Request::ClaimAcquire(_)
+                            | Request::ClaimRelease(_)
+                            | Request::ClaimRenew(_)
                     ) {
                         if let Some(record) = record {
                             match &mut m.candidate.mut_reply {
                                 Reply::ClaimAcquire(reply) => reply.claim = record,
                                 Reply::ClaimRelease(reply) => reply.released = record,
+                                Reply::ClaimRenew(reply) => reply.claim = record,
                                 _ => {}
                             }
                         }

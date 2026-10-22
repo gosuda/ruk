@@ -186,7 +186,7 @@ impl BatchItem {
             Self::Mutation { candidate, .. } => {
                 if matches!(
                     candidate.request,
-                    Request::ClaimAcquire(_) | Request::ClaimRelease(_)
+                    Request::ClaimAcquire(_) | Request::ClaimRelease(_) | Request::ClaimRenew(_)
                 ) {
                     return true;
                 }
