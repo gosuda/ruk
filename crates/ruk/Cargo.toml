@@ -22,6 +22,7 @@ sonic-rs.workspace = true
 regex.workspace = true
 
 tokio.workspace = true
+tracing.workspace = true
 toml.workspace = true
 zip.workspace = true
 

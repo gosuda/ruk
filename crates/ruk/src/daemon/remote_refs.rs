@@ -132,6 +132,20 @@ mod tests {
     }
 
     #[test]
+    fn entries_carry_symbolic_targets() {
+        let target =
+            ruk_core::refdata::RefName::new(b"refs/heads/main".to_vec()).expect("ref name parses");
+        let entry = AdvertisedLocalRef {
+            name: b"refs/heads/alias".to_vec(),
+            target: RefTarget::Symbolic(target),
+        };
+        let rows = map_entries(&[entry]).expect("symbolic rows map");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name.as_bytes(), b"refs/heads/alias");
+        assert!(matches!(rows[0].target, RefTarget::Symbolic(_)));
+    }
+
+    #[test]
     fn malformed_advertised_name_fails_corrupt() {
         let oid = Oid::from_bytes(&[7u8; 32]).expect("oid parses");
         let err = map_entries(&[advertised(b"refs/heads/../escape", Some(oid))])

@@ -2473,6 +2473,7 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "toml",
+ "tracing",
  "zip",
 ]
 

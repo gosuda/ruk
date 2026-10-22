@@ -542,7 +542,14 @@ impl BlockingJob {
                 if plan.state == PlanState::Prepared {
                     return Err(err);
                 }
-                eprintln!("ruk push: send failed after first persist: {err}");
+                tracing::warn!(error = %err, "ruk push: send failed after first persist");
+                // Every ref whose update may have moved a byte reports
+                // Uncertain so the caller can reconcile; the local
+                // refusals in `early` keep their verdicts.
+                early.extend(wire.updates.iter().map(|update| RefOutcome {
+                    name: update.name.clone(),
+                    result: RefResult::Ok,
+                }));
                 let (state, refs) = map_outcomes(plan.state, &early)?;
                 self.finish_send(plan, state, refs)
             }
@@ -782,8 +789,10 @@ fn plan_remote(plan: &PushPlanRecord) -> Result<String, CoreError> {
 }
 
 /// Maps transport outcomes plus the terminal plan state to reply rows: an
-/// `Uncertain` plan marks every ref uncertain, otherwise each ref reports
-/// its own server verdict.
+/// `Uncertain` plan marks every ref without a verdict uncertain, while a
+/// rejection keeps its verdict — under `Uncertain` the only rejections
+/// are local refusals that moved no bytes, since the transport clears
+/// server outcomes when it marks the plan.
 fn map_outcomes(
     state: PlanState,
     outcomes: &[RefOutcome],
@@ -797,15 +806,12 @@ fn map_outcomes(
                 format!("push outcome carries a malformed ref name: {err}"),
             )
         })?;
-        let status = if state == PlanState::Uncertain {
-            PushRefStatus::Uncertain
-        } else {
-            match &outcome.result {
-                RefResult::Ok => PushRefStatus::Confirmed { new: None },
-                RefResult::Rejected { reason } => PushRefStatus::Rejected {
-                    reason: reason.clone(),
-                },
-            }
+        let status = match &outcome.result {
+            RefResult::Rejected { reason } => PushRefStatus::Rejected {
+                reason: reason.clone(),
+            },
+            RefResult::Ok if state == PlanState::Uncertain => PushRefStatus::Uncertain,
+            RefResult::Ok => PushRefStatus::Confirmed { new: None },
         };
         refs.push(PushRefOutcome { remote_ref, status });
     }
@@ -1010,6 +1016,126 @@ mod tests {
         }];
         let (_, refs) = map_outcomes(PlanState::Uncertain, &outcomes).expect("maps");
         assert!(matches!(refs[0].status, PushRefStatus::Uncertain));
+    }
+
+    #[test]
+    fn map_outcomes_uncertain_preserves_local_rejections() {
+        let outcomes = vec![
+            RefOutcome {
+                name: b"refs/heads/sent".to_vec(),
+                result: RefResult::Ok,
+            },
+            RefOutcome {
+                name: b"refs/heads/refused".to_vec(),
+                result: RefResult::Rejected {
+                    reason: "non-fast-forward".to_owned(),
+                },
+            },
+        ];
+        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes).expect("maps");
+        assert_eq!(state, PushState::Uncertain);
+        assert!(matches!(refs[0].status, PushRefStatus::Uncertain));
+        assert!(matches!(refs[1].status, PushRefStatus::Rejected { .. }));
+    }
+
+    #[test]
+    fn map_outcomes_malformed_ref_fails_corrupt() {
+        let outcomes = vec![
+            RefOutcome {
+                name: b"refs/heads/fine".to_vec(),
+                result: RefResult::Ok,
+            },
+            RefOutcome {
+                name: b"refs/../escaped".to_vec(),
+                result: RefResult::Ok,
+            },
+        ];
+        let err = map_outcomes(PlanState::Confirmed, &outcomes)
+            .expect_err("a malformed outcome name refuses the whole row");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
+    }
+
+    #[test]
+    fn plan_remote_rejects_non_utf8_remote() {
+        let plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://mirror.example/\xff".to_vec(),
+            false,
+            Vec::new(),
+        );
+        let err = plan_remote(&plan).expect_err("non-UTF-8 remote refuses");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
+    }
+
+    #[test]
+    fn discover_advertised_refuses_local_paths() {
+        let root = std::env::temp_dir().join(format!("ruk-push-local-{}", std::process::id()));
+        let budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
+        let store =
+            Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates");
+        let auth = AuthPolicy::ambient_in(hermetic_vars());
+        let egress = EgressPolicy::deny_private();
+        let interrupt = Interrupt::none();
+        for url in ["/tmp/elsewhere/repo", &root.display().to_string()] {
+            let err = discover_advertised(&store, url, &auth, &egress, &interrupt)
+                .expect_err("a local path refuses before any dial");
+            assert_eq!(err.code, ErrorCode::EInvalid);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_bridge_trips_interrupt_on_cancel() {
+        let (handle, cancel) = ruk_core::coord::cancellation();
+        let open = test_open(TransportAuth::none());
+        let bridge = CancelBridge::arm(&cancel, &open);
+        bridge.interrupt.check("probe").expect("untripped");
+        handle.cancel();
+        for _ in 0..100 {
+            if bridge.interrupt.check("probe").is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("interrupt never observed the cancellation");
+    }
+
+    #[test]
+    fn map_observations_moved_when_remote_loses_the_ref() {
+        let kind = HashKind::Sha256;
+        let old = oid_fill(1);
+        let new = oid_fill(2);
+        let plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://mirror.example/r.git".to_vec(),
+            false,
+            vec![PushUpdate {
+                name: b"refs/heads/gone".to_vec(),
+                old,
+                new,
+            }],
+        );
+        let observations = map_observations(kind, &plan, &[]).expect("maps");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].verdict, ReconcileVerdict::Moved);
+        assert_eq!(observations[0].observed, None);
+    }
+
+    #[test]
+    fn map_observations_malformed_plan_ref_fails_corrupt() {
+        let kind = HashKind::Sha256;
+        let plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"origin".to_vec(),
+            false,
+            vec![PushUpdate {
+                name: b"refs/../escaped".to_vec(),
+                old: oid_fill(1),
+                new: oid_fill(2),
+            }],
+        );
+        let err = map_observations(kind, &plan, &[])
+            .expect_err("a malformed plan ref refuses the whole row");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
     }
 
     #[test]
