@@ -605,4 +605,53 @@ mod tests {
         let err = prepare_undo(&fixture.store, OperationId(7)).expect_err("no such operation");
         assert_eq!(err.code, ErrorCode::ENotFound);
     }
+
+    #[test]
+    fn undo_publish_fails_when_freeze_lands_after_prepare() {
+        let fixture = Fixture::new("undo-freeze-race");
+        let tag = b"refs/tags/v1";
+        let created = ref_target(1);
+        let id = fixture.record(Method::TagSet, &[ref_set(tag, &created)]);
+        let plan = prepare_undo(&fixture.store, id).expect("undo prepares");
+        assert!(!plan.facts.is_empty(), "undo carries facts");
+        let target_oid = Oid::from_hex(&format!("{:040x}", 1)).expect("test oid");
+        let name = RefName::new(tag).expect("tag name");
+        let marker = crate::refs::ReleasedTagMarker {
+            owner_release_id: "rel-1".to_owned(),
+            target_oid,
+            frozen_at: crate::protocol::Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+        };
+        let freezes = crate::refs::prepare_release_freeze(&fixture.store, &name, &marker)
+            .expect("freeze lands between prepare and publish");
+        fixture
+            .store
+            .publish(
+                Vec::new(),
+                &freezes,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish freeze");
+        let err = fixture
+            .store
+            .publish(
+                Vec::new(),
+                &plan.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect_err("the landed freeze stales the undo publish");
+        assert_eq!(err.code(), ErrorCode::EStale);
+        assert_eq!(
+            fixture.store.fact(FactTable::Refs, tag).expect("read tag"),
+            Some(created),
+            "a refused undo publishes nothing"
+        );
+        assert!(
+            crate::refs::released_tag_marker(&fixture.store, &name)
+                .expect("read marker")
+                .is_some(),
+            "the freeze stays while the undo fails"
+        );
+    }
 }

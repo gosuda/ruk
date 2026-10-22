@@ -701,9 +701,11 @@ pub fn page_reflogs(
 }
 
 /// One frozen release tag: the `ReleasedTags` row at key
-/// `refs/tags/<name>`, written when its release publishes and removed on
-/// delete, discard, compensation, or repair. The freeze gate (a later row)
-/// refuses every tag mutation path while a live marker exists.
+/// `refs/tags/<name>`, written by `release.freeze.set` once the tag exists
+/// at the pinned target. The row is removed only by owner-checked
+/// `release.freeze.clear`: every tag mutation path (including delete) is
+/// refused while a live marker exists, and repository deletion drops the
+/// whole store instead of clearing rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReleasedTagMarker {
     /// The release that owns the freeze.
@@ -791,23 +793,35 @@ pub fn tag_freeze_guards(
     Ok(guards)
 }
 
-/// Lowers a freeze of `name` to a create-if-absent CAS on its marker row.
+/// Lowers a freeze of `name` to a `Refs` guard plus a create-if-absent CAS
+/// on its marker row.
 ///
-/// An identical row (same owner and target) makes a retry a rewrite of the
-/// same bytes guarded by those bytes, so a row cleared between the check and
-/// the publish still fails it. Any other row refuses: a retry must not move
-/// the pinned target, and another release must not take the tag over.
+/// The tag must already exist at the pinned target: the live `Refs` row is
+/// read, an absent tag or a tag at another target is refused eagerly, and
+/// the returned vector pins that exact row (`expected: Value` of the stored
+/// serialized [`RefTarget`] bytes, `value: Some` of those same bytes) ahead
+/// of the marker create, so a tag that moves between this check and the
+/// publish fails that publish with `E_STALE`. The guard carries the stored
+/// row bytes, never the raw oid: `Refs` values are serialized [`RefTarget`]
+/// rows, including the `Direct` framing.
+///
+/// An identical marker row (same owner and target) makes a retry a
+/// marker-only rewrite of the same stored bytes guarded by those bytes, so
+/// a row cleared between the check and the publish still fails it. Any
+/// other row refuses: a retry must not move the pinned target, and another
+/// release must not take the tag over.
 ///
 /// # Errors
-/// `E_INVALID` for a name outside `refs/tags/`; `E_FORBIDDEN` naming the
-/// existing owner when the row belongs to another release or pins another
-/// target; `E_LIMIT` when the row exceeds the bound; `E_CORRUPT` for a
-/// damaged row.
+/// `E_INVALID` for a name outside `refs/tags/`; `E_STALE` naming the live
+/// tag state when no tag exists or its target differs from the pinned
+/// target; `E_FORBIDDEN` naming the existing owner when the marker row
+/// belongs to another release or pins another target; `E_LIMIT` when the
+/// row exceeds the bound; `E_CORRUPT` for a damaged row.
 pub fn prepare_release_freeze(
     store: &Store,
     name: &RefName,
     marker: &ReleasedTagMarker,
-) -> Result<FactMutation, CoreError> {
+) -> Result<Vec<FactMutation>, CoreError> {
     if !is_tag_name(name) {
         return Err(CoreError::new(
             ErrorCode::EInvalid,
@@ -819,6 +833,29 @@ pub fn prepare_release_freeze(
         .target_oid
         .expect_kind(store.hash_kind(), "released tag marker")?;
     let key = name.as_bytes().to_vec();
+    let Some(ref_bytes) = store.fact(FactTable::Refs, name.as_bytes())? else {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            format!(
+                "tag `{name}` does not exist; freeze needs the live tag at `{}`",
+                marker.target_oid
+            ),
+        ));
+    };
+    let live = decode_stored_target(store, name, &ref_bytes)?;
+    if live != RefTarget::Direct(marker.target_oid) {
+        let live_desc = match &live {
+            RefTarget::Direct(oid) => oid.to_string(),
+            RefTarget::Symbolic(target) => format!("symbolic ref `{target}`"),
+        };
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            format!(
+                "tag `{name}` is live as {live_desc}, not `{}`; freeze follows the live tag",
+                marker.target_oid
+            ),
+        ));
+    }
     let Some(bytes) = store.fact(FactTable::ReleasedTags, name.as_bytes())? else {
         let encoded = crate::store::encode("released tag marker", marker)?;
         if key.len().saturating_add(encoded.len()) > MAX_CONTROL_FRAME_BYTES {
@@ -827,12 +864,20 @@ pub fn prepare_release_freeze(
                 format!("released tag marker for {name} exceeds 16 MiB bound"),
             ));
         }
-        return Ok(FactMutation {
-            table: FactTable::ReleasedTags,
-            key,
-            expected: FactExpectation::Absent,
-            value: Some(encoded),
-        });
+        return Ok(vec![
+            FactMutation {
+                table: FactTable::Refs,
+                key: name.as_bytes().to_vec(),
+                expected: FactExpectation::Value(ref_bytes.clone()),
+                value: Some(ref_bytes),
+            },
+            FactMutation {
+                table: FactTable::ReleasedTags,
+                key,
+                expected: FactExpectation::Absent,
+                value: Some(encoded),
+            },
+        ]);
     };
     let stored = decode_stored_marker(store, &bytes)?;
     if stored.owner_release_id != marker.owner_release_id {
@@ -853,15 +898,16 @@ pub fn prepare_release_freeze(
             ),
         ));
     }
-    Ok(FactMutation {
+    Ok(vec![FactMutation {
         table: FactTable::ReleasedTags,
         key: name.as_bytes().to_vec(),
         expected: FactExpectation::Value(bytes.clone()),
         value: Some(bytes),
-    })
+    }])
 }
 
-/// Lowers a clear of `name` to an owner-checked removal of its marker row.
+/// Lowers a clear of `name` to an owner-checked removal of its marker row,
+/// the sole path that removes a live marker.
 ///
 /// No row is a no-op success guarded by absence: a row written between the
 /// check and the publish fails that publish with `E_STALE`. A present row is

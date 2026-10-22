@@ -2531,10 +2531,12 @@ async fn host_unauthorized_ref_refused_before_callback() {
     task.abort();
 }
 
-/// Writes a live released-tag marker for `name` under `repo_dir`.
+/// Writes the tag `name` at `target` plus a live released-tag marker for the
+/// same target under `repo_dir`: `release.freeze.set` needs the tag present.
 fn seed_released_tag(repo_dir: &Path, name: &str, owner: &str, target: Oid) {
     use ruk_core::protocol::Timestamp;
     use ruk_core::refs::{ReleasedTagMarker, prepare_release_freeze};
+    seed_ref(repo_dir, name, target);
     let budget = Arc::new(PreparationBudget::reference_defaults());
     let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
     let marker = ReleasedTagMarker {
@@ -2547,7 +2549,7 @@ fn seed_released_tag(repo_dir: &Path, name: &str, owner: &str, target: Oid) {
     store
         .publish(
             Vec::new(),
-            &[freeze],
+            &freeze,
             EventSource::LocalPush,
             &EventContext::default(),
         )
@@ -2576,8 +2578,8 @@ async fn git_push_cannot_bypass_a_released_tag_freeze() {
     let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
     let session = opened.session.to_string();
 
-    let zero = "0".repeat(40);
     let hex = commit.to_hex();
+    let zero = "0".repeat(40);
     let mut body = pkt(format!("{hex} {zero} refs/tags/v1\n").as_bytes());
     body.extend_from_slice(&flush());
     let payload = git_open_payload(
@@ -2603,7 +2605,7 @@ async fn git_push_cannot_bypass_a_released_tag_freeze() {
         .store()
         .fact(FactTable::Refs, b"refs/tags/v1")
         .expect("read tag");
-    assert!(tag.is_none(), "the frozen tag was not created");
+    assert!(tag.is_some(), "the frozen tag remains at its target");
 
     drop(driver);
     task.abort();

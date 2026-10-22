@@ -28,6 +28,7 @@ Entries describe implemented, unreleased functionality.
 
 ### Changed
 
+- **Breaking:** `release.freeze.set` now requires the tag to exist at the pinned target: an absent tag or a tag at another target is refused with `E_STALE` naming the live tag. A fresh freeze publishes a `Refs` guard (exact serialized `RefTarget` bytes, never the raw oid) alongside the marker create, so a tag that moves after prepare fails the freeze publish with `E_STALE`; a retry with the same owner and target stays a marker-only rewrite of the stored bytes. A live marker is removed only by owner-checked `release.freeze.clear`.
 - **Breaking:** renamed `ruk forgejo serve` to `ruk serve`. No alias or shim remains.
 - **Breaking:** unknown daemon config keys now refuse startup. Every key in the daemon config must be known.
 - **Breaking:** an empty `allowed_uids` now refuses hosted startup and denies every peer. At least one authorized peer uid is required.

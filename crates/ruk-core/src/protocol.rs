@@ -3644,9 +3644,12 @@ pub struct PolicySetReply {
 }
 
 /// `release.freeze.set`: writes the released-tag marker that freezes one tag
-/// to a target for one release. A different owner, or the same owner at a
-/// different target, is refused; the same owner at the same target is a
-/// no-op success.
+/// at its live target for one release. The tag must already exist at the
+/// pinned target: an absent tag or a tag at another target is refused with
+/// `E_STALE` naming the live tag, and the freeze publishes a `Refs` guard
+/// with the marker so a tag that moves after prepare fails the publish with
+/// `E_STALE`. A different owner, or the same owner at a different target,
+/// is refused; the same owner at the same target is a no-op success.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReleaseFreezeSetArgs {
     pub name: RefName,
@@ -3665,8 +3668,8 @@ pub struct ReleaseFreezeSetReply {
 }
 
 /// `release.freeze.clear`: removes the released-tag marker of one tag when
-/// the named release owns it. No marker is a no-op success; another owner is
-/// refused.
+/// the named release owns it, the sole path that removes a live marker. No
+/// marker is a no-op success; another owner is refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReleaseFreezeClearArgs {
     pub name: RefName,

@@ -1229,6 +1229,23 @@ mod tests {
         let kind = HashKind::Sha1;
         let dest = test_store(kind);
         let name = RefName::new("refs/tags/v1").expect("tag");
+        let seed = RefTransaction::new(
+            kind,
+            vec![RefUpdate {
+                name: name.clone(),
+                expected: RefExpect::Absent,
+                change: RefChange::Set(RefTarget::Direct(oid(FOUR))),
+            }],
+        )
+        .expect("seed tag transaction");
+        let prepared = prepare_checked_transaction(&dest, &seed).expect("prepare seed tag");
+        dest.publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed tag");
         let freeze = prepare_release_freeze(
             &dest,
             &name,
@@ -1241,7 +1258,7 @@ mod tests {
         .expect("freeze");
         dest.publish(
             Vec::new(),
-            &[freeze],
+            &freeze,
             EventSource::LocalPush,
             &EventContext::default(),
         )

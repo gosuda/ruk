@@ -863,7 +863,7 @@ fn release_freeze_set_parts(
         target_oid: args.target_oid,
         frozen_at: args.frozen_at,
     };
-    let facts = vec![prepare_release_freeze(store, &args.name, &marker)?];
+    let facts = prepare_release_freeze(store, &args.name, &marker)?;
     Ok(Parts {
         reply: Reply::ReleaseFreezeSet(Box::new(ReleaseFreezeSetReply {
             outcome: pending_outcome(session, request_id),
@@ -4517,6 +4517,14 @@ mod tests {
         let (_temp, store, session) = fixture();
         let (_, _, target) = seed_commit(&store, None);
 
+        let tag = prepare_mutation(
+            &store,
+            session,
+            plain_tag_set_request("refs/tags/v1", target),
+        )
+        .expect("the frozen tag exists before release.freeze.set");
+        publish_prepared(&store, &tag.facts);
+
         let frozen = prepare_mutation(
             &store,
             session,
@@ -4524,6 +4532,11 @@ mod tests {
         )
         .expect("release.freeze.set prepares");
         assert!(matches!(frozen.reply, Reply::ReleaseFreezeSet(_)));
+        assert_eq!(
+            frozen.facts.len(),
+            2,
+            "a fresh freeze pins the live tag row plus the marker row"
+        );
         publish_prepared(&store, &frozen.facts);
 
         let retry = prepare_mutation(
@@ -4593,7 +4606,15 @@ mod tests {
         let unfrozen = prepare_mutation(
             &store,
             session,
-            plain_tag_set_request("refs/tags/v1", target),
+            Request::TagSet(Box::new(WireMutation {
+                request_id: request_id(),
+                args: TagSetArgs {
+                    name: name("refs/tags/v1"),
+                    target,
+                    annotation: None,
+                    expected: RefExpect::Present(RefTarget::Direct(target)),
+                },
+            })),
         )
         .expect("tag.set prepares once the marker is gone");
         assert!(
