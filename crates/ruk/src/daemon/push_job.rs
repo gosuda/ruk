@@ -526,8 +526,13 @@ impl BlockingJob {
             .map_err(to_core),
             None => {
                 let endpoint = net::parse_endpoint(&plan_remote(&plan)?).map_err(to_core)?;
-                let stream = net::open_stream(&endpoint, Service::ReceivePack, &bridge.egress)
-                    .map_err(to_core)?;
+                let stream = net::open_stream(
+                    &endpoint,
+                    Service::ReceivePack,
+                    &bridge.egress,
+                    &bridge.interrupt,
+                )
+                .map_err(to_core)?;
                 push::push_over(stream, store, kind, &mut plan, &wire, &bridge.interrupt)
                     .map_err(to_core)
             }
@@ -725,9 +730,19 @@ pub(crate) fn discover_advertised(
             net::to_local_refs(adv.refs.clone()).map_err(to_core)
         }
         _ => {
-            let refs =
-                net::discover_endpoint(&endpoint, Service::ReceivePack, kind, auth, egress, None)
-                    .map_err(to_core)?;
+            let refs = net::discover_endpoint(
+                &endpoint,
+                Service::ReceivePack,
+                kind,
+                smart_http::RpcCall {
+                    extra: &[],
+                    auth,
+                    egress,
+                    tls_roots: None,
+                    interrupt,
+                },
+            )
+            .map_err(to_core)?;
             net::to_local_refs(refs).map_err(to_core)
         }
     }
@@ -1114,6 +1129,7 @@ mod tests {
     #[test]
     fn discover_advertised_refuses_local_paths() {
         let root = std::env::temp_dir().join(format!("ruk-push-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
         let store =
             Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates");
@@ -1125,6 +1141,7 @@ mod tests {
                 .expect_err("a local path refuses before any dial");
             assert_eq!(err.code, ErrorCode::EInvalid);
         }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

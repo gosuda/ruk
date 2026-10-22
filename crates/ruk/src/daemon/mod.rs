@@ -409,7 +409,7 @@ impl DaemonConfig {
     /// disables periodic retention sweeps), `hook_timeout_ms`,
     /// `hook_max_commands`, `default_branch`, `event_retention_seconds`,
     /// `archive_max_bytes`, `compare_max_commits`, `search_max_scan_bytes`,
-    /// `search_pool_size`.
+    /// `search_pool_size`, `egress_allow`.
     ///
     /// # Errors
     /// `Error::Config` on malformed TOML, missing required keys, unknown

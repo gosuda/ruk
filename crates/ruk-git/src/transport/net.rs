@@ -798,12 +798,17 @@ impl Write for Stream {
 ///
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
-/// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
+/// those elsewhere), [`GitError::Cancelled`] when the interrupt is
+/// already tripped, [`GitError::Io`] when the peer cannot be reached.
+/// The dial itself does not observe the flag mid-connect; `git_connect`
+/// bounds it with timeouts.
 pub fn open_stream(
     endpoint: &Endpoint,
     service: Service,
     policy: &EgressPolicy,
+    interrupt: &Interrupt,
 ) -> Result<Stream, GitError> {
+    interrupt.check("connecting to the remote")?;
     match endpoint {
         Endpoint::Ssh {
             host,
@@ -836,12 +841,14 @@ pub fn open_stream(
 /// this sends one too, on both the v0 and v2 arms.
 ///
 /// # Errors
-/// Grammar failures are [`GitError::Corrupt`].
+/// [`GitError::Cancelled`] when the interrupt trips mid-read, grammar
+/// failures are [`GitError::Corrupt`].
 pub fn discover<R: Read + Write>(
     stream: R,
     kind: HashKind,
+    interrupt: &Interrupt,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
-    let mut pkt = PktReader::new(stream, Interrupt::none());
+    let mut pkt = PktReader::new(stream, interrupt.clone());
     let refs = match refadv::read_initial(&mut pkt, kind)? {
         Initial::Refs(advertisement) => advertisement.refs,
         Initial::V2(caps) => {
@@ -863,15 +870,14 @@ pub fn discover<R: Read + Write>(
 /// advertisement, hangs up.
 ///
 /// # Errors
-/// Routing errors from [`open_stream`], grammar failures from [`discover`]
-/// or the smart-http advertisement parse.
+/// Routing errors from [`open_stream`], cancellation from `call`'s
+/// interrupt, grammar failures from [`discover`] or the smart-http
+/// advertisement parse.
 pub fn discover_endpoint(
     endpoint: &Endpoint,
     service: Service,
     kind: HashKind,
-    auth: &super::credentials::AuthPolicy,
-    policy: &EgressPolicy,
-    tls_roots: Option<&[u8]>,
+    call: super::smart_http::RpcCall<'_>,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
     match endpoint {
         Endpoint::Http { url, .. } => {
@@ -881,21 +887,13 @@ pub fn discover_endpoint(
                 Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
                 Service::UploadArchive => super::smart_http::SmartService::UploadArchive,
             };
-            Ok(super::smart_http::discover(
-                &base,
-                smart,
-                kind,
-                super::smart_http::RpcCall {
-                    extra: &[],
-                    auth,
-                    egress: policy,
-                    tls_roots,
-                    interrupt: &super::Interrupt::none(),
-                },
-            )?
-            .refs)
+            Ok(super::smart_http::discover(&base, smart, kind, call)?.refs)
         }
-        _ => discover(open_stream(endpoint, service, policy)?, kind),
+        _ => discover(
+            open_stream(endpoint, service, call.egress, call.interrupt)?,
+            kind,
+            call.interrupt,
+        ),
     }
 }
 
@@ -908,8 +906,12 @@ pub fn discover_endpoint(
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
 /// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
-pub fn open_archive_stream(endpoint: &Endpoint, policy: &EgressPolicy) -> Result<Stream, GitError> {
-    open_stream(endpoint, Service::UploadArchive, policy)
+pub fn open_archive_stream(
+    endpoint: &Endpoint,
+    policy: &EgressPolicy,
+    interrupt: &Interrupt,
+) -> Result<Stream, GitError> {
+    open_stream(endpoint, Service::UploadArchive, policy, interrupt)
 }
 
 /// Runs one `upload-archive` session over an open stream: sends the
@@ -1047,10 +1049,28 @@ mod tests {
                     path: PathBuf::from("/srv/a.git"),
                 },
                 &EgressPolicy::deny_private(),
+                &Interrupt::none(),
             )
             .is_err(),
             "local archive needs no stream"
         );
+
+        // A tripped interrupt fails before any dial: an unroutable host
+        // would otherwise hold the call on its connect timeout.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interrupt = Interrupt::none().with_cancel(std::sync::Arc::clone(&flag));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = open_archive_stream(
+            &Endpoint::Git {
+                host: "unroutable.invalid".to_owned(),
+                port: None,
+                path: "/srv/a.git".to_owned(),
+            },
+            &EgressPolicy::deny_private(),
+            &interrupt,
+        )
+        .expect_err("a tripped interrupt stops the dial");
+        assert!(matches!(err, GitError::Cancelled { .. }), "got {err:?}");
         let stream = ssh_connect_with(
             "far.test",
             None,
@@ -1297,7 +1317,9 @@ mod tests {
             Some(script.to_str().expect("utf8")),
         )
         .expect("spawn");
-        let refs = to_local_refs(discover(stream, HashKind::Sha1).expect("discover")).expect("map");
+        let refs =
+            to_local_refs(discover(stream, HashKind::Sha1, &Interrupt::none()).expect("discover"))
+                .expect("map");
         assert!(refs.iter().any(|entry| entry.name == b"refs/heads/main"
             && entry.target == RefTarget::Direct(sha1(tip))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1449,11 +1471,15 @@ mod tests {
                 &endpoint,
                 Service::UploadPack,
                 HashKind::Sha1,
-                &crate::transport::credentials::AuthPolicy::explicit(
-                    crate::transport::credentials::TransportAuth::none(),
-                ),
-                &EgressPolicy::deny_private().allow_loopback(),
-                None,
+                super::super::smart_http::RpcCall {
+                    extra: &[],
+                    auth: &crate::transport::credentials::AuthPolicy::explicit(
+                        crate::transport::credentials::TransportAuth::none(),
+                    ),
+                    egress: &EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
+                    interrupt: &Interrupt::none(),
+                },
             )
             .expect("discover"),
         )

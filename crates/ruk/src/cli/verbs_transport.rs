@@ -494,9 +494,13 @@ pub(crate) fn run_fetch(
                     &endpoint,
                     Service::UploadPack,
                     dest_kind,
-                    &plan.auth,
-                    &ctx.egress,
-                    tls_roots.as_deref(),
+                    ruk_git::transport::smart_http::RpcCall {
+                        extra: &[],
+                        auth: &plan.auth,
+                        egress: &ctx.egress,
+                        tls_roots: tls_roots.as_deref(),
+                        interrupt: &ruk_git::transport::Interrupt::none(),
+                    },
                 )?)?;
                 (
                     FetchSource::Net {
@@ -735,7 +739,12 @@ fn fetch_pack_net(
             detail: "network fetch needs a network source".to_owned(),
         });
     };
-    let stream = net::open_stream(endpoint, Service::UploadPack, egress)?;
+    let stream = net::open_stream(
+        endpoint,
+        Service::UploadPack,
+        egress,
+        &ruk_git::transport::Interrupt::none(),
+    )?;
     let received = fetch::receive(
         stream,
         dest.hash_kind(),
@@ -1652,9 +1661,13 @@ fn push_net(
                 endpoint,
                 Service::ReceivePack,
                 kind,
-                &flags.auth,
-                &ctx.egress,
-                tls_roots.as_deref(),
+                ruk_git::transport::smart_http::RpcCall {
+                    extra: &[],
+                    auth: &flags.auth,
+                    egress: &ctx.egress,
+                    tls_roots: tls_roots.as_deref(),
+                    interrupt: &ruk_git::transport::Interrupt::none(),
+                },
             )?)?,
         };
         let remote: Vec<(Vec<u8>, Oid)> = advertised
@@ -1743,7 +1756,12 @@ fn push_net(
             },
         )?,
         None => {
-            let stream = net::open_stream(endpoint, Service::ReceivePack, &ctx.egress)?;
+            let stream = net::open_stream(
+                endpoint,
+                Service::ReceivePack,
+                &ctx.egress,
+                &ruk_git::transport::Interrupt::none(),
+            )?;
             ruk_git::transport::push::push_over(
                 stream,
                 store,
@@ -2294,7 +2312,11 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
                     out.tar
                 }
                 endpoint @ (Endpoint::Ssh { .. } | Endpoint::Git { .. }) => {
-                    let stream = net::open_archive_stream(&endpoint, &ctx.egress)?;
+                    let stream = net::open_archive_stream(
+                        &endpoint,
+                        &ctx.egress,
+                        &ruk_git::transport::Interrupt::none(),
+                    )?;
                     net::fetch_archive_stream(stream, &rev)?
                 }
             }
@@ -4374,9 +4396,13 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                     &endpoint,
                     Service::UploadPack,
                     ctx.kind()?,
-                    &auth,
-                    &ctx.egress,
-                    tls_roots.as_deref(),
+                    ruk_git::transport::smart_http::RpcCall {
+                        extra: &[],
+                        auth: &auth,
+                        egress: &ctx.egress,
+                        tls_roots: tls_roots.as_deref(),
+                        interrupt: &ruk_git::transport::Interrupt::none(),
+                    },
                 )?,
             };
             net::to_local_refs(refs)?
