@@ -2141,6 +2141,81 @@ fn push_over_smart_http_reports_status() {
 }
 
 #[test]
+fn push_isolates_diverged_refs_per_ref() {
+    const FOREIGN: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+    let mut adv = pkt_frame(b"# service=git-receive-pack\n");
+    adv.extend_from_slice(b"0000");
+    adv.extend_from_slice(&pkt_frame(
+        format!("{FOREIGN} refs/heads/main\0report-status report-status-v2 side-band-64k delete-refs ofs-delta object-format=sha1\n")
+            .as_bytes(),
+    ));
+    adv.extend_from_slice(b"0000");
+    let mut report = pkt_frame(b"\x01unpack ok\n");
+    report.extend_from_slice(&pkt_frame(b"\x01ok refs/heads/other\n"));
+    report.extend_from_slice(b"0000");
+    let (base, log) = smart_http_server(vec![
+        (adv, "application/x-git-receive-pack-advertisement"),
+        (report, "application/x-git-receive-pack-result"),
+    ]);
+    let (root, env) = seeded_repo("ffisolate", "p.txt", b"p\n");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(
+        verbs_transport::push,
+        &mut ctx,
+        &[
+            &base,
+            "refs/heads/main:refs/heads/main",
+            "refs/heads/main:refs/heads/other",
+        ],
+    )
+    .expect_err("diverged ref fails the push");
+    let text = format!("ruk: {err}");
+    assert!(text.contains("rejected refs/heads/main"), "{text}");
+    assert!(text.contains("non-fast-forward"), "{text}");
+    assert!(text.contains("ok refs/heads/other"), "{text}");
+    let requests = log
+        .recv_timeout(Duration::from_secs(30))
+        .expect("server finished both RPCs");
+    assert_eq!(requests.len(), 2);
+    let (head, body) = &requests[1];
+    assert!(
+        head.starts_with("POST /a.git/git-receive-pack HTTP/1.1\r\n"),
+        "{head:?}"
+    );
+    assert!(
+        body.windows(b"refs/heads/other".len())
+            .any(|w| w == b"refs/heads/other"),
+        "live ref missing from commands"
+    );
+    assert!(
+        !body
+            .windows(b"refs/heads/main".len())
+            .any(|w| w == b"refs/heads/main"),
+        "diverged ref must not be sent"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn push_refuses_hidden_deletes_before_any_post() {
+    let (root, env) = seeded_repo("hiddendel", "p.txt", b"p\n");
+    let (droot, _) = seeded_repo("hiddendeldst", "d.txt", b"d\n");
+    let mut ctx = repo_ctx(&root, env);
+    let target = droot.to_str().expect("utf8 root").to_owned();
+    let err = run(
+        verbs_transport::push,
+        &mut ctx,
+        &["--delete", &target, "refs/pull/1/head"],
+    )
+    .expect_err("hidden delete must fail");
+    assert!(
+        err.to_string().contains("refusing to delete hidden"),
+        "unexpected {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
 fn ls_remote_over_dumb_http_reads_info_refs() {
     const TIP: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
     let dumb = format!("{TIP}\trefs/heads/main\n");

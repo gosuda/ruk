@@ -2196,10 +2196,13 @@ mod tests {
 
     #[test]
     fn pem_splits_blocks_and_decodes_bodies() {
-                let bundle = "-----BEGIN CERTIFICATE-----\nTWE=\n-----END CERTIFICATE-----\n-----BEGIN FOO-----\nignored\n-----END FOO-----\n-----BEGIN CERTIFICATE-----\nTQ==\n-----END CERTIFICATE-----\n";
+        let bundle = "-----BEGIN CERTIFICATE-----\nTWE=\n-----END CERTIFICATE-----\n-----BEGIN FOO-----\nignored\n-----END FOO-----\n-----BEGIN CERTIFICATE-----\nTQ==\n-----END CERTIFICATE-----\n";
         let certs = parse_pem_certs(bundle.as_bytes()).expect("bundle parses");
         assert_eq!(
-            certs.iter().map(|cert| cert.as_ref().to_vec()).collect::<Vec<_>>(),
+            certs
+                .iter()
+                .map(|cert| cert.as_ref().to_vec())
+                .collect::<Vec<_>>(),
             vec![vec![b'M', b'a'], vec![b'M']]
         );
         assert!(parse_pem_certs(b"").expect("empty parses").is_empty());

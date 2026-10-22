@@ -646,11 +646,20 @@ fn push_over_inner<R: Read + Write>(
     let caps = &adv.capabilities;
     let report_v2 = caps.has("report-status-v2");
     if !report_v2 && !caps.has("report-status") {
-        plan.begin_send()?;
+        let outcomes: Vec<RefOutcome> = req
+            .updates
+            .iter()
+            .map(|update| RefOutcome {
+                name: update.name.clone(),
+                result: RefResult::Rejected {
+                    reason: "server reports no push status; outcomes cannot be confirmed"
+                        .to_owned(),
+                },
+            })
+            .collect();
+        plan.refuse_locally(outcomes.clone())?;
         persist(store, plan, kind, current_encoding(store, plan)?)?;
-        return Err(GitError::PushUncertain {
-            detail: "server reports no push status; outcomes cannot be confirmed".to_owned(),
-        });
+        return Ok(outcomes);
     }
     let zero = kind.zero_oid();
     if req.updates.iter().any(|u| u.new == zero) && !caps.has("delete-refs") {

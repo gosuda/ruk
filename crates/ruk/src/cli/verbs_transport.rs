@@ -41,7 +41,7 @@ use ruk_git::transport::fetch::{self, FetchWireRequest};
 use ruk_git::transport::mirror::{prune_for_spec, push_mirror_updates};
 use ruk_git::transport::net::{self, Endpoint};
 use ruk_git::transport::pack::IngestLimits;
-use ruk_git::transport::push::{PushUpdate, PushWireRequest};
+use ruk_git::transport::push::{PushUpdate, PushWireRequest, RefOutcome, RefResult};
 use ruk_git::transport::refadv::{AdvertisedRef, Capabilities};
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
 use ruk_git::transport::serve_v2::{git_protocol_requests_v2, serve_upload_pack_v2};
@@ -1440,7 +1440,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             }
             // Scoped borrows: the store borrow ends before the LFS upload
             // reborrows `ctx` mutably for stderr.
-            let updates = {
+            let (updates, early) = {
                 let store = ctx.store()?;
                 build_push_updates(
                     store,
@@ -1451,6 +1451,18 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                     &|name| peel_dest_oid(&dest, name),
                 )?
             };
+            if flags.atomic && !early.is_empty() {
+                let mut all = early;
+                for update in &updates {
+                    all.push(RefOutcome {
+                        name: update.name.clone(),
+                        result: RefResult::Rejected {
+                            reason: "atomic push withheld: a sibling ref diverged".to_owned(),
+                        },
+                    });
+                }
+                return push_outcomes(all);
+            }
             if !flags.no_verify {
                 let url = ctx
                     .config_get(&format!("remote.{target}.url"))
@@ -1468,7 +1480,9 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 push_lfs_upload(ctx, &updates, &remote_label)?;
             }
             let store = ctx.store()?;
-            push_local(store, &dest, target, kind, flags.atomic, updates)
+            let mut outcomes = push_local(store, &dest, target, kind, flags.atomic, updates)?;
+            outcomes.extend(early);
+            push_outcomes(outcomes)
         }
         Target::Net(endpoint) => {
             push_net(ctx, &endpoint, target, &spec_texts, &flags, &remote_label)
@@ -1492,9 +1506,10 @@ fn default_push_specs(store: &Store) -> Result<Vec<String>, GitError> {
     }
 }
 
-/// Builds push updates from refspecs: deletes resolve the destination name
-/// and zero the tip, sets resolve the source rev locally and check
-/// fast-forward against the destination tip `peel` reports.
+/// Builds the requested updates plus the locally refused ones, isolated
+/// per ref: a diverged spec reports `rejected: non-fast-forward` for its
+/// own ref while the batch proceeds, instead of aborting the sync.
+/// Explicit deletes of hidden refs are refused before any plan exists.
 fn build_push_updates(
     src: &Store,
     dwell: &Store,
@@ -1502,10 +1517,11 @@ fn build_push_updates(
     delete: bool,
     force_all: bool,
     peel: &dyn Fn(&RefName) -> Result<Option<Oid>, GitError>,
-) -> Result<Vec<PushUpdate>, GitError> {
+) -> Result<(Vec<PushUpdate>, Vec<RefOutcome>), GitError> {
     let kind = src.hash_kind();
     let zero = kind.zero_oid();
     let mut updates = Vec::new();
+    let mut refused = Vec::new();
     for spec_text in spec_texts {
         let (force, rest) = spec_text
             .strip_prefix('+')
@@ -1515,9 +1531,18 @@ fn build_push_updates(
             .map_or((rest, rest), |(left, right)| (left, right));
         if delete {
             let name = dwell_dest(dwell, dst_text)?;
+            let bytes = name.as_bytes().to_vec();
+            if ruk_git::transport::mirror::is_mirror_hidden(&bytes) {
+                return Err(GitError::Invalid {
+                    detail: format!(
+                        "refusing to delete hidden {}",
+                        name.to_utf8().unwrap_or_default()
+                    ),
+                });
+            }
             let old = peel(&name)?.unwrap_or(zero);
             updates.push(PushUpdate {
-                name: name.as_bytes().to_vec(),
+                name: bytes,
                 old,
                 new: zero,
             });
@@ -1527,12 +1552,16 @@ fn build_push_updates(
         let name = dwell_dest(dwell, dst_text)?;
         let old = peel(&name)?.unwrap_or(zero);
         if old != zero && !force && !force_all && !is_ancestor(src, old, new)? {
-            return Err(GitError::PushRejected {
-                detail: format!(
-                    "non-fast-forward push to {}",
-                    name.to_utf8().unwrap_or_default()
-                ),
+            refused.push(RefOutcome {
+                name: name.as_bytes().to_vec(),
+                result: RefResult::Rejected {
+                    reason: format!(
+                        "non-fast-forward push to {}",
+                        name.to_utf8().unwrap_or_default()
+                    ),
+                },
             });
+            continue;
         }
         updates.push(PushUpdate {
             name: name.as_bytes().to_vec(),
@@ -1540,7 +1569,7 @@ fn build_push_updates(
             new,
         });
     }
-    Ok(updates)
+    Ok((updates, refused))
 }
 
 /// Pushes prebuilt updates to a local destination through a persisted plan.
@@ -1551,7 +1580,7 @@ fn push_local(
     kind: HashKind,
     atomic: bool,
     updates: Vec<PushUpdate>,
-) -> Result<Vec<u8>, GitError> {
+) -> Result<Vec<ruk_git::transport::push::RefOutcome>, GitError> {
     let request = PushWireRequest {
         updates: updates.clone(),
         atomic,
@@ -1562,14 +1591,7 @@ fn push_local(
         atomic,
         updates,
     );
-    push_outcomes(local_push(
-        dest,
-        src,
-        kind,
-        &mut plan,
-        &request,
-        &Interrupt::none(),
-    )?)
+    local_push(dest, src, kind, &mut plan, &request, &Interrupt::none())
 }
 
 /// Pushes to a network endpoint: discovers the remote tips for CAS
@@ -1590,7 +1612,7 @@ fn push_net(
     let tls_roots = tls_roots_for(ctx)?;
     // Discovery plus the update list under one scoped store borrow, so the
     // LFS upload below can reborrow `ctx` mutably for stderr.
-    let (updates, http_adv) = {
+    let (updates, early, http_adv) = {
         let store = ctx.store()?;
         // HTTP discovery keeps the full advertisement: the POST half reuses
         // its capabilities, while the other transports only need the refs.
@@ -1637,8 +1659,11 @@ fn push_net(
                 RefTarget::Symbolic(_) => None,
             })
             .collect();
-        let updates = if flags.mirror {
-            mirror_push_updates(kind, &direct_tips(store)?, &remote)
+        let (updates, early) = if flags.mirror {
+            (
+                mirror_push_updates(kind, &direct_tips(store)?, &remote),
+                Vec::new(),
+            )
         } else {
             build_push_updates(
                 store,
@@ -1649,7 +1674,19 @@ fn push_net(
                 &|name| peel_advertised(&advertised, name),
             )?
         };
-        (updates, http_adv)
+        if flags.atomic && !early.is_empty() {
+            let mut all = early;
+            for update in &updates {
+                all.push(RefOutcome {
+                    name: update.name.clone(),
+                    result: RefResult::Rejected {
+                        reason: "atomic push withheld: a sibling ref diverged".to_owned(),
+                    },
+                });
+            }
+            return push_outcomes(all);
+        }
+        (updates, early, http_adv)
     };
     if !flags.no_verify {
         let url = ctx
@@ -1685,35 +1722,35 @@ fn push_net(
         flags.atomic,
         updates,
     );
-    match &http_adv {
-        Some((base, adv, extra_headers)) => {
-            push_outcomes(ruk_git::transport::smart_http::push_pack(
-                base,
-                adv,
-                store,
-                &mut plan,
-                &request,
-                ruk_git::transport::smart_http::RpcCall {
-                    extra: extra_headers,
-                    auth: &flags.auth,
-                    egress: &ctx.egress,
-                    tls_roots: tls_roots.as_deref(),
-                    interrupt: &Interrupt::none(),
-                },
-            )?)
-        }
+    let mut outcomes = match &http_adv {
+        Some((base, adv, extra_headers)) => ruk_git::transport::smart_http::push_pack(
+            base,
+            adv,
+            store,
+            &mut plan,
+            &request,
+            ruk_git::transport::smart_http::RpcCall {
+                extra: extra_headers,
+                auth: &flags.auth,
+                egress: &ctx.egress,
+                tls_roots: tls_roots.as_deref(),
+                interrupt: &Interrupt::none(),
+            },
+        )?,
         None => {
             let stream = net::open_stream(endpoint, Service::ReceivePack, &ctx.egress)?;
-            push_outcomes(ruk_git::transport::push::push_over(
+            ruk_git::transport::push::push_over(
                 stream,
                 store,
                 kind,
                 &mut plan,
                 &request,
                 &Interrupt::none(),
-            )?)
+            )?
         }
-    }
+    };
+    outcomes.extend(early);
+    push_outcomes(outcomes)
 }
 
 /// Reads the advertised tip behind one destination ref, if it exists: the
@@ -1811,12 +1848,17 @@ fn mirror_push_updates(
 }
 
 /// Direct ref tips of one store as `(name, oid)` pairs; symbolic refs
-/// never enter a mirror update.
+/// never enter a mirror update, and hidden namespaces never leave the
+/// store.
 fn direct_tips(store: &Store) -> Result<Vec<(Vec<u8>, ruk_core::ids::Oid)>, GitError> {
     let mut tips = Vec::new();
     for (name, target) in list_refs(store)? {
         if let RefTarget::Direct(oid) = target {
-            tips.push((name.as_bytes().to_vec(), oid));
+            let bytes = name.as_bytes().to_vec();
+            if ruk_git::transport::mirror::is_mirror_hidden(&bytes) {
+                continue;
+            }
+            tips.push((bytes, oid));
         }
     }
     Ok(tips)

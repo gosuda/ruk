@@ -905,11 +905,20 @@ fn push_pack_inner(
     let caps = &adv.capabilities;
     let report_v2 = caps.has("report-status-v2");
     if !report_v2 && !caps.has("report-status") {
-        plan.begin_send()?;
+        let outcomes: Vec<RefOutcome> = req
+            .updates
+            .iter()
+            .map(|update| RefOutcome {
+                name: update.name.clone(),
+                result: super::push::RefResult::Rejected {
+                    reason: "server reports no push status; outcomes cannot be confirmed"
+                        .to_owned(),
+                },
+            })
+            .collect();
+        plan.refuse_locally(outcomes.clone())?;
         push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
-        return Err(GitError::PushUncertain {
-            detail: "server reports no push status; outcomes cannot be confirmed".to_owned(),
-        });
+        return Ok(outcomes);
     }
     let zero = kind.zero_oid();
     if req.updates.iter().any(|u| u.new == zero) && !caps.has("delete-refs") {
@@ -1045,7 +1054,23 @@ fn push_pack_inner(
     );
     let (mut reader, status, reply) =
         http::post_open(&url, &borrow(&owned), &out, egress, tls_roots)?;
-    check_post_status(&url, &mut reader, status, &reply, auth)?;
+    if let Err(status_err) = check_post_status(&url, &mut reader, status, &reply, auth) {
+        match status_err {
+            GitError::Http { status, .. } if status < 500 => {
+                let mut refused = outcomes;
+                refused.extend(live.iter().map(|update| RefOutcome {
+                    name: update.name.clone(),
+                    result: super::push::RefResult::Rejected {
+                        reason: status_err.to_string(),
+                    },
+                }));
+                plan.finalize(refused.clone())?;
+                push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
+                return Ok(refused);
+            }
+            other => return Err(other),
+        }
+    }
     if http::header(&reply, "content-type")
         != Some(SmartService::ReceivePack.result_type().as_str())
     {
@@ -2324,7 +2349,7 @@ mod tests {
     }
 
     #[test]
-    fn push_without_report_status_is_uncertain() {
+    fn push_without_report_status_is_rejected() {
         use super::super::push::{PushUpdate, PushWireRequest};
         use super::super::session::test_support::test_store;
         use ruk_core::change::PlanId;
@@ -2349,7 +2374,7 @@ mod tests {
             refs: Vec::new(),
             shallow: Vec::new(),
         };
-        let err = push_pack(
+        let outcomes = push_pack(
             "http://127.0.0.1:9/a.git",
             &adv,
             &store,
@@ -2363,11 +2388,76 @@ mod tests {
                 interrupt: &Interrupt::none(),
             },
         )
-        .expect_err("no report-status");
+        .expect("no report-status refuses locally");
+        assert_eq!(outcomes.len(), 1);
         assert!(
-            matches!(err, GitError::PushUncertain { .. }),
-            "unexpected {err:?}"
+            matches!(&outcomes[0].result, super::push::RefResult::Rejected { .. }),
+            "unexpected {outcomes:?}"
         );
+        assert_eq!(plan.state, super::push::PushState::Rejected);
+    }
+
+    #[test]
+    fn push_post_forbidden_is_rejected_not_uncertain() {
+        use super::super::push::{PushUpdate, PushWireRequest};
+        use super::super::session::test_support::store_with_pack;
+        use ruk_core::change::PlanId;
+
+        let (base, server) = fake_smart_server(vec![(
+            403,
+            vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+            b"token CANARY-tok expired".to_vec(),
+            false,
+        )]);
+        let kind = HashKind::Sha1;
+        let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let zero = kind.zero_oid();
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/x".to_vec(),
+            old: zero,
+            new: oid(FOUR),
+        }];
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let mut adv = Advertisement {
+            version: super::super::refadv::ProtocolVersion::V0,
+            capabilities: super::super::refadv::Capabilities::default(),
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        };
+        adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
+        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: "CANARY-tok".to_owned(),
+            origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
+        });
+        let outcomes = push_pack(
+            &base,
+            &adv,
+            &store,
+            &mut plan,
+            &req,
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("a 403 refuses before any report");
+        assert_eq!(outcomes.len(), 1);
+        let super::push::RefResult::Rejected { reason } = &outcomes[0].result else {
+            panic!("a 403 rejects: {outcomes:?}");
+        };
+        assert!(reason.contains("403"), "{reason:?}");
+        assert!(!reason.contains("CANARY-tok"), "{reason:?}");
+        assert_eq!(plan.state, super::push::PushState::Rejected);
+        server.join().expect("server");
     }
 
     #[test]

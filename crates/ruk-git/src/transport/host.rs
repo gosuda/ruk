@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ruk_core::capability::Capabilities;
+use ruk_core::refdata::RefName;
 use tokio::sync::{mpsc, oneshot};
 
 use super::policy::{LandedRefs, ReceiveBatch, ReceivePolicy, RefVerdict};
@@ -258,10 +259,7 @@ impl HostPolicy {
 
     /// Whether the session may push this ref.
     fn authorized(&self, name: &[u8]) -> bool {
-        self.capabilities
-            .push_refs
-            .iter()
-            .any(|pattern| pattern.matches(name))
+        RefName::new(name).is_ok_and(|refname| self.capabilities.require_push(&refname).is_ok())
     }
 
     /// Takes the deferred advisory post-receive callback the serve
