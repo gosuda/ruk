@@ -6248,6 +6248,57 @@ async fn outbound_credit_gap_errors_within_the_bound() {
     task.abort();
 }
 
+/// End-to-end counterpart to the seam probes above: a driver opens a
+/// streaming upload, sends `Stdin`, cancels, and closes, and the
+/// connection task ends promptly. A deterministic feed park is not
+/// constructible through the driver (a live serve drains the pipe as fast
+/// as the task feeds it; only a held read end parks it), so the parked
+/// proof lives in `stalled_serve_feed_returns_within_its_timeout` and the
+/// teardown proof in `teardown_unparks_stream_and_worker_and_returns_the_permit`;
+/// this test pins the composed choreography instead.
+#[tokio::test]
+async fn streaming_cancel_after_stdin_ends_connection_promptly() {
+    let root = temp_root("streaming-cancel-drop");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 1);
+
+    // Partial negotiation: the serve blocks waiting for `done` while the
+    // stream task feeds and idles. The grants and the NAK fit the buffers,
+    // so nothing here needs draining before the cancel.
+    let frames = [
+        pkt(format!("want {}\n", commit.to_hex()).as_bytes()),
+        flush(),
+        pkt(b"have 0000000000000000000000000000000000000000\n"),
+        flush(),
+    ];
+    for frame in &frames {
+        driver.send(FrameKind::Stdin, 1, frame).await;
+    }
+    driver.send(FrameKind::Cancel, 1, &[]).await;
+    drop(driver);
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the connection ends promptly after cancel and close");
+}
+
 #[test]
 fn injected_auth_never_enters_the_service_digest() {
     use ruk_git::transport::credentials::{TransportAuth, TransportAuthKind};
