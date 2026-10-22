@@ -1982,16 +1982,7 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
                 }
             }
             let text = String::from_utf8_lossy(&head).into_owned();
-            let length = text
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if length > 0 {
-                let mut discard = vec![0_u8; length];
-                reader.read_exact(&mut discard).expect("request body");
-            }
+            let _discard = read_http_body(&mut reader, &text);
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -2036,6 +2027,73 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
 /// request head plus body and delivering the log once all replies
 /// are served. The receiver bounds the wait: a client that stops
 /// early fails the test instead of hanging the suite.
+/// Reads one request body by Content-Length, or decodes it as
+/// `Transfer-Encoding: chunked` when the client streams.
+fn read_http_body(reader: &mut BufReader<std::net::TcpStream>, head: &str) -> Vec<u8> {
+    let chunked = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding"))
+        .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("chunked"));
+    if chunked {
+        read_chunked_body(reader)
+    } else {
+        read_length_body(reader, head)
+    }
+}
+
+/// Reads `length` bytes under a Content-Length head.
+fn read_length_body(reader: &mut BufReader<std::net::TcpStream>, head: &str) -> Vec<u8> {
+    let length = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; length];
+    if length > 0 {
+        reader.read_exact(&mut body).expect("request body");
+    }
+    body
+}
+
+/// Decodes size-prefixed blocks ending in a zero chunk plus trailers.
+fn read_chunked_body(reader: &mut BufReader<std::net::TcpStream>) -> Vec<u8> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = Vec::new();
+        reader
+            .read_until(b'\n', &mut size_line)
+            .expect("chunk size");
+        let size_text = String::from_utf8_lossy(&size_line);
+        let size = usize::from_str_radix(size_text.trim().split(';').next().unwrap_or(""), 16)
+            .expect("chunk size parses as hex");
+        if size == 0 {
+            skip_trailers(reader);
+            return body;
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader.read_exact(&mut body[start..]).expect("chunk bytes");
+        let mut end = [0_u8; 2];
+        reader.read_exact(&mut end).expect("chunk terminator");
+        assert_eq!(&end, b"\r\n", "chunk ends with CRLF");
+    }
+}
+
+/// Consumes trailer lines through the blank line that ends the message.
+fn skip_trailers(reader: &mut BufReader<std::net::TcpStream>) {
+    loop {
+        let mut trailer = Vec::new();
+        reader
+            .read_until(b'\n', &mut trailer)
+            .expect("trailer line");
+        if trailer == b"\r\n" || trailer == b"\n" || trailer.is_empty() {
+            return;
+        }
+    }
+}
+
 fn smart_http_server(
     replies: Vec<(Vec<u8>, &'static str)>,
 ) -> (String, std::sync::mpsc::Receiver<HttpRequests>) {
@@ -2065,16 +2123,7 @@ fn smart_http_server(
                 }
             }
             let text = String::from_utf8_lossy(&head).into_owned();
-            let length = text
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            let mut request_body = vec![0_u8; length];
-            if length > 0 {
-                reader.read_exact(&mut request_body).expect("request body");
-            }
+            let request_body = read_http_body(&mut reader, &text);
             requests.push((text, request_body));
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n",
