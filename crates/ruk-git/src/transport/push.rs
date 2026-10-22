@@ -506,7 +506,10 @@ pub fn push_over<R: Read + Write>(
             });
         }
     }
-    persist(store, plan, kind, None)?;
+    // The daemon lane persists Prepared before dispatching the send, so
+    // this write chains on the stored row rather than asserting Absent;
+    // a bare CLI push still sees None and writes Absent as before.
+    persist(store, plan, kind, current_encoding(store, plan)?)?;
     let outcome = push_over_inner(
         stream,
         store,
@@ -1407,6 +1410,46 @@ mod tests {
         assert_eq!(plan.state, PushState::Uncertain);
         plan.mark_uncertain();
         assert_eq!(plan.state, PushState::Uncertain);
+    }
+
+    #[test]
+    fn pre_persisted_plan_pushes_past_the_prepared_row() {
+        use crate::transport::pktline as pkt;
+        use crate::transport::session::test_support::{ScriptedPeer, store_with_pack};
+
+        let kind = HashKind::Sha1;
+        let four = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+        let zero = Z;
+        let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let mut script = Vec::new();
+        pkt::encode_data(
+            &mut script,
+            format!("{zero} capabilities^{{}}\0report-status delete-refs ofs-delta atomic object-format=sha1\n").as_bytes(),
+        )
+        .expect("frame");
+        pkt::encode_flush(&mut script);
+        pkt::encode_data(&mut script, b"unpack ok\n").expect("frame");
+        pkt::encode_data(&mut script, b"ok refs/heads/main\n").expect("frame");
+        pkt::encode_flush(&mut script);
+        let mut peer = ScriptedPeer::new(script);
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/main".to_vec(),
+            old: Oid::from_hex(zero).expect("hex"),
+            new: Oid::from_hex(four).expect("hex"),
+        }];
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        // The daemon lane commits the Prepared row before dispatching the
+        // send; the transport's first persist must chain on it, not
+        // assert Absent.
+        persist(&store, &plan, kind, None).expect("lane persist");
+        let outcomes = push_over(&mut peer, &store, kind, &mut plan, &req, &Interrupt::none())
+            .expect("push chains on the stored row");
+        assert_eq!(outcomes.len(), 1);
     }
 
     #[test]

@@ -874,7 +874,10 @@ pub fn push_pack(
         }
     }
     let kind = store.hash_kind();
-    push::persist(store, plan, kind, None)?;
+    // The daemon lane persists Prepared before dispatching the send, so
+    // this write chains on the stored row rather than asserting Absent;
+    // a bare CLI push still sees None and writes Absent as before.
+    push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
     let outcome = push_pack_inner(base, adv, store, plan, req, call);
     match outcome {
         Ok(outcomes) => Ok(outcomes),
