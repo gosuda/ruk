@@ -3,6 +3,7 @@
 //! supersession-cycle checks. No verification path is mocked; fixtures
 //! document their provenance in `fixtures`.
 
+mod compat;
 mod crypto;
 mod cycles;
 mod expiry;

@@ -2200,6 +2200,7 @@ impl HostedCoordinator {
         let filter = crate::attestation::StatementFilter {
             subject: args.subject,
             kind: args.kind.clone(),
+            kind_prefix: args.kind_prefix.clone(),
             signer: args.signer.clone(),
             include_superseded: args.include_superseded,
         };
@@ -2493,7 +2494,7 @@ fn claim_query_digest(holder: ClaimHolderFilter) -> QueryDigest {
 
 fn attest_query_digest(args: &AttestListArgs) -> QueryDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"ruk.attest.list/v1\x00");
+    hasher.update(b"ruk.attest.list/v2\x00");
     match args.subject {
         None => hasher.update([0x00]),
         Some(oid) => {
@@ -2508,6 +2509,14 @@ fn attest_query_digest(args: &AttestListArgs) -> QueryDigest {
         Some(kind) => {
             hasher.update([0x01]);
             hasher.update(kind.as_str().as_bytes());
+            hasher.update([0x00]);
+        }
+    }
+    match args.kind_prefix.as_ref() {
+        None => hasher.update([0x00]),
+        Some(prefix) => {
+            hasher.update([0x01]);
+            hasher.update(prefix.as_str().as_bytes());
             hasher.update([0x00]);
         }
     }
@@ -5344,6 +5353,7 @@ mod tests {
                 result: AttestResult::new("pass").expect("result"),
                 signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
                 supersedes: None,
+                evidence: None,
             };
             let args = sign_statement(&key, statement);
             let open = |_: crate::attestation::Progress| Ok::<(), CoreError>(());
@@ -5600,6 +5610,7 @@ mod tests {
             result: AttestResult::new("pass").expect("result"),
             signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
             supersedes: None,
+            evidence: None,
         };
         let args = sign_statement(&attest_key(), statement);
         let request = Request::AttestAdd(Box::new(WireMutation {

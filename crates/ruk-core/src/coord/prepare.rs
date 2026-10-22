@@ -4587,6 +4587,7 @@ mod tests {
             result: AttestResult::new("pass").expect("result"),
             signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
             supersedes: None,
+            evidence: None,
         };
         let payload = statement
             .canonical_payload_v1(HashKind::Sha1)

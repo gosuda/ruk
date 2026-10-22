@@ -553,6 +553,7 @@ mod tests {
                 result: AttestResult::new("pass").expect("result"),
                 signed_at: Timestamp::parse(SIGNED_AT).expect("timestamp"),
                 supersedes: None,
+                evidence: None,
             };
             let payload = statement
                 .canonical_payload_v1(HashKind::Sha1)

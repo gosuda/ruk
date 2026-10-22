@@ -141,6 +141,24 @@ pub(super) fn statement(
         result: result(result_text),
         signed_at: Timestamp::parse(signed_at).expect("timestamp"),
         supersedes,
+        evidence: None,
+    }
+}
+
+pub(super) fn evidenced(
+    subject: Oid,
+    kind_text: &str,
+    result_text: &str,
+    signed_at: &str,
+    evidence: Option<StatementDigest>,
+) -> AttestStatement {
+    AttestStatement {
+        subject,
+        kind: kind(kind_text),
+        result: result(result_text),
+        signed_at: Timestamp::parse(signed_at).expect("timestamp"),
+        supersedes: None,
+        evidence,
     }
 }
 
@@ -156,7 +174,7 @@ pub(super) fn sign(key: &PrivateKey, statement: AttestStatement) -> AttestAddArg
     )
 }
 
-/// Signs the canonical payload of `statement` for `format`, in `namespace`,
+/// Signs the canonical v2 payload of `statement` for `format`, in `namespace`,
 /// with `hash`.
 pub(super) fn sign_for(
     format: HashKind,
@@ -166,9 +184,25 @@ pub(super) fn sign_for(
     hash: HashAlg,
 ) -> AttestAddArgs {
     let payload = statement
-        .canonical_payload_v1(format)
+        .canonical_payload_v2(format)
         .expect("canonical payload");
     let signature = key.sign(namespace, hash, &payload).expect("sign");
+    let armor = signature.to_pem(LineEnding::LF).expect("armor");
+    AttestAddArgs {
+        statement,
+        signature: AttestSignature::new(armor).expect("armored signature"),
+    }
+}
+
+/// Signs the canonical v1 payload of `statement`: pre-evidence signatures stay
+/// verifiable, so compatibility tests sign here and nowhere else.
+pub(super) fn sign_v1(key: &PrivateKey, statement: AttestStatement) -> AttestAddArgs {
+    let payload = statement
+        .canonical_payload_v1(HashKind::Sha1)
+        .expect("canonical payload");
+    let signature = key
+        .sign(ATTEST_NAMESPACE, HashAlg::Sha256, &payload)
+        .expect("sign");
     let armor = signature.to_pem(LineEnding::LF).expect("armor");
     AttestAddArgs {
         statement,

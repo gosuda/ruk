@@ -69,6 +69,12 @@ impl VerifiedStatement {
 
 /// Verifies one signed statement against the repository's object format.
 ///
+/// New signatures cover the v2 payload. A statement without evidence whose
+/// signature does not match v2 is retried against the v1 payload, so
+/// pre-evidence signatures stay verifiable. A statement carrying evidence
+/// verifies under v2 only: v1 cannot bind evidence, and falling back would
+/// let a stripped statement pass under an old signature.
+///
 /// # Errors
 /// - `E_OBJECT_FORMAT`: the subject's width is not `format`'s.
 /// - `E_INVALID`: malformed armor or SSHSIG encoding, a tampered payload or key,
@@ -80,7 +86,33 @@ pub fn verify_statement(
     format: HashKind,
     args: &AttestAddArgs,
 ) -> Result<VerifiedStatement, CoreError> {
-    let payload = args.statement.canonical_payload_v1(format)?;
+    if args.statement.evidence.is_some() {
+        let payload = args.statement.canonical_payload_v2(format)?;
+        return verify_over_payload(format, args, &payload);
+    }
+    match args.statement.canonical_payload_v2(format) {
+        Ok(payload) => match verify_over_payload(format, args, &payload) {
+            Ok(verified) => Ok(verified),
+            Err(_) => {
+                let fallback = args.statement.canonical_payload_v1(format)?;
+                verify_over_payload(format, args, &fallback)
+            }
+        },
+        Err(err) => Err(err),
+    }
+}
+
+/// Verifies `args.signature` over an already-built canonical `payload` and
+/// derives the signer and the payload digest from the verified key.
+///
+/// # Errors
+/// As for [`verify_statement`].
+fn verify_over_payload(
+    format: HashKind,
+    args: &AttestAddArgs,
+    payload: &[u8],
+) -> Result<VerifiedStatement, CoreError> {
+    let _ = format;
     let signature = args
         .signature
         .as_str()
@@ -103,7 +135,7 @@ pub fn verify_statement(
         return Err(policy("SSHSIG reserved bytes must be empty"));
     }
     PublicKey::from(key.clone())
-        .verify(ATTEST_NAMESPACE, &payload, &signature)
+        .verify(ATTEST_NAMESPACE, payload, &signature)
         .map_err(|err| ssh_error(&err))?;
 
     let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
@@ -114,7 +146,7 @@ pub fn verify_statement(
         )
     })?;
     let mut digest = [0_u8; 32];
-    digest.copy_from_slice(&Sha256::digest(&payload));
+    digest.copy_from_slice(&Sha256::digest(payload));
     Ok(VerifiedStatement {
         statement: args.statement.clone(),
         signer,

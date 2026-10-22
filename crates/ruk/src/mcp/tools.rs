@@ -361,6 +361,7 @@ fn query_attestations(store: &Store, request: AttestListArgs) -> Result<Vec<u8>,
     let filter = StatementFilter {
         subject: request.subject,
         kind: request.kind,
+        kind_prefix: request.kind_prefix,
         signer: request.signer,
         include_superseded: request.include_superseded,
     };
