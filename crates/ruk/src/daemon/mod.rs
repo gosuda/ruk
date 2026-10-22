@@ -1243,25 +1243,40 @@ async fn serve_async(
     Ok(())
 }
 
-/// Ends every live stream of a dead connection: trips each cancel flag so a
-/// parked blocking serve observes the end at its next interrupt check,
-/// shuts each task socket down so a serve parked in its socket read
-/// unblocks, and aborts each spawned task so nothing later emits on the
-/// dead connection. Channel drops alone cannot reach a task parked in its
-/// feed write or a worker parked in its socket read; without the halt and
-/// the abort both strand, and the stranded worker keeps its executor
-/// permit forever.
+/// Ends every stranded stream of a dead connection: trips its cancel flag
+/// so a parked blocking serve observes the end at its next interrupt
+/// check, shuts its task socket down so a serve parked in its socket read
+/// unblocks, and aborts its spawned task so nothing later emits on the
+/// dead connection.
+///
+/// Only socketpair streams (a published shutdown handle) strand past a
+/// channel close: a task parked in its feed write and a worker parked in
+/// its socket read are both unreachable through the dropped senders, so
+/// without the halt and the abort both strand, and the stranded worker
+/// keeps its executor permit forever. Every other stream already ends
+/// through the channel close — a channel wait returns `None`, and a
+/// collected serve is awaited to completion — and tripping those would
+/// change healthy behavior: a receive-pack publish disconnected mid-flight
+/// must still land and record its receipt, which an early trip would
+/// abort. Those routes are left for their own paths.
 #[cfg(unix)]
 fn teardown_streams(streams: &HashMap<u64, StreamRoute>) {
     for route in streams.values() {
-        route.cancel_flag.store(true, Ordering::SeqCst);
-        if let Ok(slot) = route.shutdown.lock()
-            && let Some(sock) = slot.as_ref()
-        {
-            let _ = sock.shutdown(std::net::Shutdown::Both);
-        }
-        if let Some(task) = route.task.as_ref() {
-            task.abort();
+        let stranded = if let Ok(slot) = route.shutdown.lock() {
+            if let Some(sock) = slot.as_ref() {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if stranded {
+            route.cancel_flag.store(true, Ordering::SeqCst);
+            if let Some(task) = route.task.as_ref() {
+                task.abort();
+            }
         }
     }
 }
