@@ -24,6 +24,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1242,6 +1243,29 @@ async fn serve_async(
     Ok(())
 }
 
+/// Ends every live stream of a dead connection: trips each cancel flag so a
+/// parked blocking serve observes the end at its next interrupt check,
+/// shuts each task socket down so a serve parked in its socket read
+/// unblocks, and aborts each spawned task so nothing later emits on the
+/// dead connection. Channel drops alone cannot reach a task parked in its
+/// feed write or a worker parked in its socket read; without the halt and
+/// the abort both strand, and the stranded worker keeps its executor
+/// permit forever.
+#[cfg(unix)]
+fn teardown_streams(streams: &HashMap<u64, StreamRoute>) {
+    for route in streams.values() {
+        route.cancel_flag.store(true, Ordering::SeqCst);
+        if let Ok(slot) = route.shutdown.lock()
+            && let Some(sock) = slot.as_ref()
+        {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(task) = route.task.as_ref() {
+            task.abort();
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn serve_connection(
     mut stream: tokio::net::UnixStream,
@@ -1281,6 +1305,7 @@ async fn serve_connection(
         let frame = match ipc::read_frame(&mut read_half, frame_deadline).await {
             Ok(frame) => frame,
             Err(err) => {
+                teardown_streams(&streams);
                 drop(streams);
                 drop(writer_tx);
                 return Err(Error::Core(err));
@@ -1707,6 +1732,15 @@ async fn refuse_overflowed_stream(
         return Ok(());
     };
     route.cancel_flag.store(true, Ordering::SeqCst);
+    // Halt the serve socket before aborting the task: the trip stops the
+    // worker at its next interrupt check, but a worker parked in its
+    // socket read only unblocks through the shutdown, and without it the
+    // detached worker keeps its executor permit past its owner.
+    if let Ok(slot) = route.shutdown.lock()
+        && let Some(sock) = slot.as_ref()
+    {
+        let _ = sock.shutdown(std::net::Shutdown::Both);
+    }
     if let Some(task) = route.task {
         task.abort();
     }
@@ -1758,6 +1792,7 @@ async fn refuse_overflowed_stream(
 struct StreamRoute {
     control: mpsc::Sender<ipc::Frame>,
     data: mpsc::UnboundedSender<ipc::Frame>,
+    shutdown: Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
     outstanding: Arc<AtomicU64>,
     /// Admitted-but-unconsumed `Stdin` frame count: bounds the
     /// empty-frame floods that carry no payload credit against the byte
@@ -1788,6 +1823,7 @@ struct StreamRoute {
 struct StreamInput {
     control: mpsc::Receiver<ipc::Frame>,
     data: mpsc::UnboundedReceiver<ipc::Frame>,
+    shutdown: Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
     outstanding: Arc<AtomicU64>,
     outstanding_frames: Arc<AtomicU64>,
 }
@@ -1814,11 +1850,14 @@ fn spawn_stream(
     let task_outstanding = Arc::clone(&outstanding);
     let outstanding_frames = Arc::new(AtomicU64::new(0));
     let task_outstanding_frames = Arc::clone(&outstanding_frames);
+    let shutdown: Arc<Mutex<Option<std::os::unix::net::UnixStream>>> = Arc::new(Mutex::new(None));
+    let task_shutdown = Arc::clone(&shutdown);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let task_cancel = Arc::clone(&cancel_flag);
     let route = StreamRoute {
         control: control_tx,
         data: data_tx,
+        shutdown,
         outstanding,
         outstanding_frames,
         generation,
@@ -1829,8 +1868,15 @@ fn spawn_stream(
     if let Some(old) = streams.insert(stream_id, route) {
         // Trip first: the replaced task may sit in a blocking serve that
         // only wakes on its flag, and abort alone would leave that
-        // blocking work detached past its owner.
+        // blocking work detached past its owner. The halt unblocks a
+        // worker parked in its socket read, which neither the trip nor
+        // the abort reaches.
         old.cancel_flag.store(true, Ordering::SeqCst);
+        if let Ok(slot) = old.shutdown.lock()
+            && let Some(sock) = slot.as_ref()
+        {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(task) = old.task {
             task.abort();
         }
@@ -1845,6 +1891,7 @@ fn spawn_stream(
         let input = StreamInput {
             control: control_rx,
             data: data_rx,
+            shutdown: task_shutdown,
             outstanding: task_outstanding,
             outstanding_frames: task_outstanding_frames,
         };
@@ -1896,17 +1943,30 @@ struct ReplayIds<'a> {
     digest: &'a str,
 }
 
+/// The halves one stored-receipt replay serves on: the stream channel, the
+/// sink, the credit windows, the cancel token, and the bound a grant wait
+/// honors. `dispatch_stored_receipt` and `send_stored_outcome` travel
+/// together, so the bundle keeps both signatures short.
+#[cfg(unix)]
+struct StoredReplay<'a> {
+    input: &'a mut mpsc::Receiver<ipc::Frame>,
+    sink: &'a StreamSink,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    frame_timeout: Duration,
+}
+
 /// Sends one stored receipt as if the run just completed it: the recorded
 /// output bytes plus the recorded exit, or the recorded error.
 #[cfg(unix)]
-async fn send_stored_outcome(
-    input: &mut mpsc::Receiver<ipc::Frame>,
-    sink: &StreamSink,
-    credits: &mut ipc::StreamCredits,
-    cancel_guard: &CancelHandle,
-    invocation: &str,
-    receipt: &ServiceReceipt,
-) {
+async fn send_stored_outcome(replay: StoredReplay<'_>, invocation: &str, receipt: &ServiceReceipt) {
+    let StoredReplay {
+        input,
+        sink,
+        credits,
+        cancel_guard,
+        frame_timeout,
+    } = replay;
     if receipt.error_code.is_some() || receipt.error_message.is_some() {
         let code = receipt
             .error_code
@@ -1919,7 +1979,16 @@ async fn send_stored_outcome(
         return;
     }
     let code = u8::try_from(receipt.exit_code).unwrap_or(1);
-    match write_typed_chunks(sink, input, credits, cancel_guard, &receipt.output).await {
+    match write_typed_chunks(
+        sink,
+        input,
+        credits,
+        cancel_guard,
+        &receipt.output,
+        frame_timeout,
+    )
+    .await
+    {
         TypedWriteFate::Done => {}
         TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
     }
@@ -1941,13 +2010,11 @@ async fn send_stored_outcome(
 /// is corrupt and refuses rather than overwriting a newer row.
 #[cfg(unix)]
 async fn dispatch_stored_receipt(
-    input: &mut mpsc::Receiver<ipc::Frame>,
-    sink: &StreamSink,
-    credits: &mut ipc::StreamCredits,
-    cancel_guard: &CancelHandle,
+    replay: StoredReplay<'_>,
     ids: ReplayIds<'_>,
     receipt: &ServiceReceipt,
 ) {
+    let sink = replay.sink;
     if receipt.version != SERVICE_RECEIPT_VERSION {
         let _ = send_error_exit(
             sink,
@@ -1961,7 +2028,7 @@ async fn dispatch_stored_receipt(
         )
         .await;
     } else if receipt.digest == ids.digest {
-        send_stored_outcome(input, sink, credits, cancel_guard, ids.invocation, receipt).await;
+        send_stored_outcome(replay, ids.invocation, receipt).await;
     } else {
         let _ = send_error_exit(
             sink,
@@ -2287,10 +2354,13 @@ async fn serve_git_service(
                 digest: &digest,
             };
             dispatch_stored_receipt(
-                &mut input.control,
-                sink,
-                &mut credits,
-                &cancel_guard,
+                StoredReplay {
+                    input: &mut input.control,
+                    sink,
+                    credits: &mut credits,
+                    cancel_guard: &cancel_guard,
+                    frame_timeout: refs.frame_timeout,
+                },
                 ids,
                 &receipt,
             )
@@ -2367,10 +2437,13 @@ async fn serve_git_service(
                     digest: &digest,
                 };
                 dispatch_stored_receipt(
-                    &mut input.control,
-                    sink,
-                    &mut credits,
-                    &cancel_guard,
+                    StoredReplay {
+                        input: &mut input.control,
+                        sink,
+                        credits: &mut credits,
+                        cancel_guard: &cancel_guard,
+                        frame_timeout: refs.frame_timeout,
+                    },
                     ids,
                     &stored,
                 )
@@ -2415,6 +2488,7 @@ async fn serve_git_service(
         &mut credits,
         &cancel_guard,
         &output,
+        refs.frame_timeout,
     )
     .await
     {
@@ -2714,7 +2788,18 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
                 request_id: &request_id,
                 digest: &digest,
             };
-            dispatch_stored_receipt(input, sink, credits, cancel_guard, ids, &stored).await;
+            dispatch_stored_receipt(
+                StoredReplay {
+                    input,
+                    sink,
+                    credits,
+                    cancel_guard,
+                    frame_timeout: refs.frame_timeout,
+                },
+                ids,
+                &stored,
+            )
+            .await;
             return;
         }
         Err(store_err) => {
@@ -2725,7 +2810,7 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     if !deliver {
         return;
     }
-    match write_typed_chunks(sink, input, credits, cancel_guard, &out).await {
+    match write_typed_chunks(sink, input, credits, cancel_guard, &out, refs.frame_timeout).await {
         TypedWriteFate::Done => {}
         TypedWriteFate::Cancelled | TypedWriteFate::Gone => return,
     }
@@ -3077,6 +3162,47 @@ fn halt_stream(flag: &Arc<AtomicBool>, shutdown: &std::os::unix::net::UnixStream
     let _ = shutdown.shutdown(std::net::Shutdown::Both);
 }
 
+/// The end of one serve-pipe feed write.
+#[cfg(unix)]
+enum FeedFate {
+    /// The bytes reached the serve.
+    Fed,
+    /// The serve is gone; its read end closed.
+    Broken,
+    /// The write would have parked past the frame timeout, or a halt
+    /// landed first: the caller stops feeding.
+    Stalled,
+}
+
+/// Feeds one `Stdin` chunk to the blocking serve without parking the
+/// stream task: a serve that stops reading (parked on a full reply window
+/// the client never grants) would stall a bare `write_all` past every
+/// `Cancel`, so the write is bounded by the frame timeout and abandoned
+/// when the halt flag is already tripped. A timed-out feed shuts the write
+/// side down so the worker observes `EOF` instead of parking on its read
+/// forever; the caller keeps draining the data channel and discards the
+/// rest.
+#[cfg(unix)]
+async fn feed_serve_stdin(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    payload: &[u8],
+    cancel_flag: &Arc<AtomicBool>,
+    shutdown: &std::os::unix::net::UnixStream,
+    feed_timeout: Duration,
+) -> FeedFate {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return FeedFate::Stalled;
+    }
+    match tokio::time::timeout(feed_timeout, write.write_all(payload)).await {
+        Ok(Ok(())) => FeedFate::Fed,
+        Ok(Err(_)) => FeedFate::Broken,
+        Err(_) => {
+            let _ = shutdown.shutdown(std::net::Shutdown::Write);
+            FeedFate::Stalled
+        }
+    }
+}
+
 /// Sends the terminal frame of one cancelled streaming round.
 #[cfg(unix)]
 async fn exit_cancelled(sink: &StreamSink, invocation: &str) {
@@ -3160,6 +3286,7 @@ async fn forward_stripped(
     credits: &mut ipc::StreamCredits,
     cancel_guard: &CancelHandle,
     bytes: &[u8],
+    frame_timeout: Duration,
 ) -> bool {
     let forward = match strip.feed(bytes) {
         Ok(bytes) => bytes,
@@ -3171,7 +3298,16 @@ async fn forward_stripped(
     if forward.is_empty() {
         return true;
     }
-    match write_typed_chunks(sink, control, credits, cancel_guard, &forward).await {
+    match write_typed_chunks(
+        sink,
+        control,
+        credits,
+        cancel_guard,
+        &forward,
+        frame_timeout,
+    )
+    .await
+    {
         TypedWriteFate::Done => true,
         TypedWriteFate::Cancelled | TypedWriteFate::Gone => false,
     }
@@ -3225,6 +3361,21 @@ async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
             return;
         }
     };
+    // Publish the task-side socket for connection teardown: a worker
+    // parked in its socket read only unblocks through this handle once
+    // the reader is gone, and the stream task itself may be parked past
+    // any channel close. Teardown trips, halts, then aborts.
+    match shutdown_handle.try_clone() {
+        Ok(clone) => {
+            if let Ok(mut slot) = input.shutdown.lock() {
+                slot.replace(clone);
+            }
+        }
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Io(err)).await;
+            return;
+        }
+    }
     let task_sock = match tokio::net::UnixStream::from_std(task_end) {
         Ok(sock) => sock,
         Err(err) => {
@@ -3347,9 +3498,14 @@ async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
                 }
                 match frame.kind {
                     ipc::FrameKind::Stdin => {
-                        if eof_sent || pipe_broken {
-                            continue;
-                        }
+                        // The widths below mirror the reader's admission:
+                        // every data-channel chunk was admitted against the
+                        // shared counters, so a discarded chunk releases its
+                        // admission instead of inflating them toward a
+                        // spurious overflow refusal on a stream that is
+                        // already ending. No grant goes back: the stream is
+                        // ending, and replenishing credit would only invite
+                        // bytes nobody consumes.
                         let Ok(width) = u64::try_from(frame.payload.len()) else {
                             refuse_stream(
                                 sink,
@@ -3362,6 +3518,11 @@ async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
                             halt_stream(&cancel_flag, &shutdown_handle);
                             return;
                         };
+                        if eof_sent || pipe_broken {
+                            input.outstanding.fetch_sub(width, Ordering::SeqCst);
+                            input.outstanding_frames.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
                         let Some(total) =
                             check_stdin_quota(sink, stdin_total, width, limits.max_stdin_bytes)
                                 .await
@@ -3384,8 +3545,24 @@ async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
                             return;
                         }
                         retained.extend_from_slice(&frame.payload);
-                        if task_write.write_all(&frame.payload).await.is_err() {
-                            pipe_broken = true;
+                        // A bare `write_all` parks the whole stream task
+                        // past every `Cancel` when the serve stops reading;
+                        // the bounded feed returns instead, and the stalled
+                        // stream stops feeding while the shutdown below lets
+                        // the worker observe `EOF`.
+                        match feed_serve_stdin(
+                            &mut task_write,
+                            &frame.payload,
+                            &cancel_flag,
+                            &shutdown_handle,
+                            refs.frame_timeout,
+                        )
+                        .await
+                        {
+                            FeedFate::Fed => {}
+                            FeedFate::Broken | FeedFate::Stalled => {
+                                pipe_broken = true;
+                            }
                         }
                     }
                     ipc::FrameKind::StdinEof => {
@@ -3424,6 +3601,7 @@ async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
                     credits,
                     cancel_guard,
                     &pipe_buf[..n],
+                    refs.frame_timeout,
                 )
                 .await
                 {
@@ -3460,6 +3638,7 @@ async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
                 credits,
                 cancel_guard,
                 &pipe_buf[..n],
+                refs.frame_timeout,
             )
             .await
             {
@@ -3641,15 +3820,31 @@ enum CreditFate {
 /// Reads one stream channel until its client grants outbound credit,
 /// shared by git-service output and typed replies. Late stdin endings are
 /// ignored; a `Cancel` frame triggers the stream token.
+///
+/// The wait is bounded by the frame timeout: a client that stops granting
+/// would otherwise park the stream task forever, ending the body in a
+/// silent truncation. Past the deadline the waiter reports a refusal, and
+/// every caller ends the stream with a terminal `Error` frame, so the
+/// client sees a protocol error instead.
 #[cfg(unix)]
 async fn wait_outbound_credit(
     input: &mut mpsc::Receiver<ipc::Frame>,
     stream_id: u64,
     credits: &mut ipc::StreamCredits,
     cancel: &CancelHandle,
+    frame_timeout: Duration,
 ) -> CreditFate {
     loop {
-        let Some(frame) = input.recv().await else {
+        let frame = match tokio::time::timeout(frame_timeout, input.recv()).await {
+            Ok(frame) => frame,
+            Err(_) => {
+                return CreditFate::Rejected(CoreError::new(
+                    ErrorCode::EIo,
+                    "outbound credit grant timed out",
+                ));
+            }
+        };
+        let Some(frame) = frame else {
             return CreditFate::InputClosed;
         };
         if frame.stream_id != stream_id {
@@ -3923,7 +4118,16 @@ async fn typed_stream(
     }
     match result {
         Ok(stdout) => {
-            match write_typed_chunks(sink, input, &mut credits, &cancel_guard, &stdout).await {
+            match write_typed_chunks(
+                sink,
+                input,
+                &mut credits,
+                &cancel_guard,
+                &stdout,
+                refs.frame_timeout,
+            )
+            .await
+            {
                 TypedWriteFate::Done => {
                     let _ = send_exit(sink, 0, "OK", "Completed").await;
                 }
@@ -4048,19 +4252,37 @@ enum ArchivePumpOutcome {
     Failed(CoreError),
 }
 
+/// The archive half one stream pumps on: the sink, the channel, the credit
+/// windows, the cancel token, the walk interrupt, and the bound a grant
+/// wait honors. Threaded as one object so the grant-wait bound does not
+/// push the pump past a short signature.
+#[cfg(unix)]
+struct ArchivePump<'a> {
+    sink: &'a StreamSink,
+    input: &'a mut mpsc::Receiver<ipc::Frame>,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    interrupt_flag: &'a Arc<AtomicBool>,
+    frame_timeout: Duration,
+}
+
 /// Pumps walked tar chunks as `Stdout` frames under the reply credit
 /// window. A chunk waits for outbound credit instead of refusing, so the
 /// body streams in 64 KiB frames; a `Cancel` frame interrupts the walk and
 /// ends the pump.
 #[cfg(unix)]
 async fn pump_archive_body(
-    sink: &StreamSink,
-    input: &mut mpsc::Receiver<ipc::Frame>,
-    credits: &mut ipc::StreamCredits,
-    cancel_guard: &CancelHandle,
-    interrupt_flag: &Arc<AtomicBool>,
+    pump: ArchivePump<'_>,
     rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> ArchivePumpOutcome {
+    let ArchivePump {
+        sink,
+        input,
+        credits,
+        cancel_guard,
+        interrupt_flag,
+        frame_timeout,
+    } = pump;
     let stream_id = sink.stream_id;
     let mut pending: Option<Vec<u8>> = None;
     loop {
@@ -4100,7 +4322,7 @@ async fn pump_archive_body(
             continue;
         }
         pending = Some(bytes);
-        match wait_outbound_credit(input, stream_id, credits, cancel_guard).await {
+        match wait_outbound_credit(input, stream_id, credits, cancel_guard, frame_timeout).await {
             CreditFate::Granted => {}
             CreditFate::Cancelled => {
                 interrupt_flag.store(true, Ordering::SeqCst);
@@ -4342,6 +4564,7 @@ async fn serve_typed_archive(stream: ArchiveStream<'_>) {
         credits,
         cancel_guard,
         interrupt_flag: &interrupt_flag,
+        frame_timeout: refs.frame_timeout,
         coordinator,
         executor: &refs.executor,
         plan,
@@ -4365,6 +4588,7 @@ struct ArchiveBody<'a> {
     credits: &'a mut ipc::StreamCredits,
     cancel_guard: &'a CancelHandle,
     interrupt_flag: &'a Arc<AtomicBool>,
+    frame_timeout: Duration,
     coordinator: &'a Arc<HostedCoordinator>,
     executor: &'a BoundedExecutor,
     plan: ArchivePlan,
@@ -4389,6 +4613,7 @@ where
         credits,
         cancel_guard,
         interrupt_flag,
+        frame_timeout,
         coordinator,
         executor,
         plan,
@@ -4413,8 +4638,18 @@ where
             Err(outer) => Err(outer),
         }
     });
-    let outcome =
-        pump_archive_body(sink, input, credits, cancel_guard, interrupt_flag, &mut rx).await;
+    let outcome = pump_archive_body(
+        ArchivePump {
+            sink,
+            input,
+            credits,
+            cancel_guard,
+            interrupt_flag,
+            frame_timeout,
+        },
+        &mut rx,
+    )
+    .await;
     interrupt_flag.store(true, Ordering::SeqCst);
     drop(rx);
     let walked = match walk.await {
@@ -4857,6 +5092,7 @@ async fn write_typed_chunks(
     credits: &mut ipc::StreamCredits,
     cancel: &CancelHandle,
     bytes: &[u8],
+    frame_timeout: Duration,
 ) -> TypedWriteFate {
     let stream_id = sink.stream_id;
     let mut offset = 0;
@@ -4886,7 +5122,7 @@ async fn write_typed_chunks(
             offset = end;
             continue;
         }
-        match wait_outbound_credit(input, stream_id, credits, cancel).await {
+        match wait_outbound_credit(input, stream_id, credits, cancel, frame_timeout).await {
             CreditFate::Granted => {}
             CreditFate::Cancelled => {
                 let _ = send_exit(

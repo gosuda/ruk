@@ -576,6 +576,17 @@ fn spawn_pair_with_window(
     root: &Path,
     window_bytes: u64,
 ) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
+    spawn_pair_with_window_and_frame_timeout(root, window_bytes, Duration::from_secs(15))
+}
+
+/// Spawns `serve_connection` on a socket pair with one stream window size
+/// and one frame timeout, so credit tests can force the daemon to wait for
+/// grants without waiting out the production deadline.
+fn spawn_pair_with_window_and_frame_timeout(
+    root: &Path,
+    window_bytes: u64,
+    frame_timeout: Duration,
+) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
     let registry = Arc::new(Registry::new(vec![root.to_path_buf()]).expect("registry"));
     registry.set_runtime(tokio::runtime::Handle::current());
     let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
@@ -588,7 +599,7 @@ fn spawn_pair_with_window(
         transport: BoundedExecutor::new(4).expect("transport executor"),
         window_bytes,
         handshake_timeout: Duration::from_secs(10),
-        frame_timeout: Duration::from_secs(15),
+        frame_timeout,
         allowed_uids: vec![uid],
         admin_uids: Vec::new(),
     };
@@ -1206,6 +1217,7 @@ async fn reader_never_blocks_on_a_full_stream() {
             outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -1258,6 +1270,7 @@ async fn reader_never_blocks_on_a_full_stream() {
             outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -3331,6 +3344,7 @@ async fn credit_exhaustion_removes_the_stream() {
             outstanding_frames: Arc::new(AtomicU64::new(0)),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -3394,6 +3408,7 @@ async fn exact_window_stdin_frame_is_admitted() {
             outstanding_frames: Arc::clone(&outstanding_frames),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -3464,6 +3479,7 @@ async fn full_window_fill_with_parked_consumer_is_not_refused() {
             outstanding_frames: Arc::clone(&outstanding_frames),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -3579,6 +3595,7 @@ async fn empty_stdin_frame_flood_is_refused() {
             outstanding_frames: Arc::clone(&outstanding_frames),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -5917,6 +5934,318 @@ async fn cancelled_run_keeps_its_permit_until_the_worker_finishes() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// A feed write past a parked serve reader returns instead of parking the
+/// stream task: the peer sips once, then never reads again, so any payload
+/// past the pipe buffer would park a bare `write_all` forever. The bounded
+/// feed reports `Stalled` within its timeout, a closed peer reports
+/// `Broken`, and a tripped flag reports `Stalled` without touching the
+/// pipe. The joins below bound the whole probe so a regression to an
+/// unbounded write fails instead of hanging the suite.
+#[tokio::test]
+async fn stalled_serve_feed_returns_within_its_timeout() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    use super::{FeedFate, feed_serve_stdin};
+
+    let (task_end, peer_end) = StdUnixStream::pair().expect("socket pair");
+    let shutdown = task_end.try_clone().expect("shutdown handle");
+    // A reader that sips once, then parks forever: the pipe stays full for
+    // any payload past the buffer, so a bare `write_all` below would never
+    // return.
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut peer_end = peer_end;
+        let mut sip = [0u8; 4096];
+        let _ = peer_end.read_exact(&mut sip);
+        std::thread::sleep(Duration::from_secs(60));
+    });
+    task_end
+        .set_nonblocking(true)
+        .expect("nonblocking task socket");
+    let task_sock = tokio::net::UnixStream::from_std(task_end).expect("tokio wrap");
+    let (_, mut task_write) = task_sock.into_split();
+    let flag = Arc::new(AtomicBool::new(false));
+    let payload = vec![0xAB; 8 << 20];
+    let started = Instant::now();
+    let feed = tokio::spawn(async move {
+        feed_serve_stdin(
+            &mut task_write,
+            &payload,
+            &flag,
+            &shutdown,
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    let fate = tokio::time::timeout(Duration::from_secs(10), feed)
+        .await
+        .expect("the bounded feed never parks the task")
+        .expect("the feed task runs");
+    assert!(
+        matches!(fate, FeedFate::Stalled),
+        "a parked reader stalls the feed instead of completing it"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "the stall surfaces at the timeout, proving the write really parked"
+    );
+
+    // A closed peer fails the feed at once instead of parking it.
+    let (closed_end, gone_end) = StdUnixStream::pair().expect("socket pair");
+    drop(gone_end);
+    let closed_shutdown = closed_end.try_clone().expect("shutdown handle");
+    closed_end
+        .set_nonblocking(true)
+        .expect("nonblocking closed socket");
+    let closed_sock = tokio::net::UnixStream::from_std(closed_end).expect("tokio wrap");
+    let (_, mut closed_write) = closed_sock.into_split();
+    let closed_flag = Arc::new(AtomicBool::new(false));
+    let fate = tokio::time::timeout(
+        Duration::from_secs(10),
+        feed_serve_stdin(
+            &mut closed_write,
+            &[0xAB; 1],
+            &closed_flag,
+            &closed_shutdown,
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("a broken feed never parks");
+    assert!(
+        matches!(fate, FeedFate::Broken),
+        "a closed peer breaks the feed instead of stalling it"
+    );
+
+    // A tripped flag stalls the feed before it touches the pipe: the byte
+    // below would fit the empty buffer, so only the halt explains the
+    // stall.
+    let (live_end, _live_peer) = StdUnixStream::pair().expect("socket pair");
+    let live_shutdown = live_end.try_clone().expect("shutdown handle");
+    live_end
+        .set_nonblocking(true)
+        .expect("nonblocking live socket");
+    let live_sock = tokio::net::UnixStream::from_std(live_end).expect("tokio wrap");
+    let (_, mut live_write) = live_sock.into_split();
+    let tripped = Arc::new(AtomicBool::new(true));
+    let fate = tokio::time::timeout(
+        Duration::from_secs(10),
+        feed_serve_stdin(
+            &mut live_write,
+            &[0xAB; 1],
+            &tripped,
+            &live_shutdown,
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("a halted feed never parks");
+    assert!(
+        matches!(fate, FeedFate::Stalled),
+        "a tripped flag stalls the feed without writing"
+    );
+}
+
+/// Killing the connection reader ends every live stream and returns its
+/// executor permit: the teardown trips each cancel flag, halts each task
+/// socket so a worker parked in its socket read unblocks, and aborts each
+/// spawned task. The worker below and the feed below park against each
+/// other on one socketpair full in both directions — the one park a
+/// channel close cannot reach — so dropping the routes without the halt
+/// and the abort would strand both and keep the permit forever.
+#[tokio::test]
+async fn teardown_unparks_stream_and_worker_and_returns_the_permit() {
+    use std::collections::HashMap;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::sync::atomic::AtomicBool;
+
+    use super::{feed_serve_stdin, teardown_streams};
+
+    let executor = BoundedExecutor::new(1).expect("one permit");
+    let (task_end, worker_end) = StdUnixStream::pair().expect("socket pair");
+    let slot_sock = task_end.try_clone().expect("teardown handle");
+    let feed_halt = task_end.try_clone().expect("feed halt handle");
+    task_end
+        .set_nonblocking(true)
+        .expect("nonblocking task socket");
+    let task_sock = tokio::net::UnixStream::from_std(task_end).expect("tokio wrap");
+    let (_, mut task_write) = task_sock.into_split();
+    let slot = Arc::new(std::sync::Mutex::new(Some(slot_sock)));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    // The worker sips the request, then floods a response nobody drains:
+    // it parks once the task stops reading, while the task below parks
+    // once the worker stops reading.
+    let worker_executor = executor.clone();
+    let worker = tokio::spawn(async move {
+        worker_executor
+            .run(move || {
+                use std::io::{Read as _, Write as _};
+                let mut worker_end = worker_end;
+                let mut sip = [0u8; 4096];
+                worker_end
+                    .read_exact(&mut sip)
+                    .expect("request sip arrives");
+                let flood = vec![7u8; 8 << 20];
+                let _ = worker_end.write_all(&flood);
+            })
+            .await
+    });
+    // The stream task floods a request the worker stops reading: it parks
+    // once the pipe fills. The long helper bound proves the teardown (not
+    // the timeout) is what unparks it.
+    let feed_flag = Arc::clone(&cancel_flag);
+    let task = tokio::spawn(async move {
+        let flood = vec![3u8; 8 << 20];
+        let _ = feed_serve_stdin(
+            &mut task_write,
+            &flood,
+            &feed_flag,
+            &feed_halt,
+            Duration::from_secs(60),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !task.is_finished(),
+        "the feed parks against the full pipe before teardown"
+    );
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+    let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut streams = HashMap::new();
+    streams.insert(
+        7u64,
+        super::StreamRoute {
+            control: control_tx,
+            data: data_tx,
+            shutdown: Arc::clone(&slot),
+            outstanding: Arc::new(AtomicU64::new(0)),
+            outstanding_frames: Arc::new(AtomicU64::new(0)),
+            generation: 1,
+            git: true,
+            task: Some(task),
+            cancel_flag: Arc::clone(&cancel_flag),
+        },
+    );
+    teardown_streams(&streams);
+    assert!(
+        cancel_flag.load(Ordering::SeqCst),
+        "teardown trips every live stream"
+    );
+    let task = streams
+        .get_mut(&7)
+        .expect("route survives teardown")
+        .task
+        .take()
+        .expect("stream task");
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("teardown ends the parked stream task promptly");
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("the halted worker finishes promptly")
+        .expect("the worker task runs")
+        .expect("the worker reports");
+    assert_eq!(
+        executor.available(),
+        1,
+        "the detached worker returned its permit"
+    );
+    let probe = tokio::time::timeout(Duration::from_secs(10), executor.run(|| 7u32))
+        .await
+        .expect("the pool accepts new work after teardown")
+        .expect("the probe runs");
+    assert_eq!(probe, 7);
+}
+
+/// A client that never grants outbound credit sees a terminal `Error`
+/// instead of a silent truncation: the schema reply dwarfs the window, so
+/// the first chunk waits at once, the grant wait hits the frame timeout,
+/// and the stream ends with `Error` plus its terminal `Exit`. The frame
+/// reads below bound the whole probe: an unbounded wait fails at the
+/// fifteen-second frame deadline instead of hanging the suite.
+#[tokio::test]
+async fn outbound_credit_gap_errors_within_the_bound() {
+    let root = temp_root("credit-deadline");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    // The window is smaller than one chunk of the schema reply, so the
+    // first write waits at once; the driver never grants.
+    let (mut driver, task) =
+        spawn_pair_with_window_and_frame_timeout(&root, 1024, Duration::from_secs(1));
+    handshake(&mut driver).await;
+    let typed = Driver::typed_open(&store_repo, "schema", None, None, None);
+    let started = std::time::Instant::now();
+    driver.send(FrameKind::Open, 3, &typed).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 3);
+    // The connection reader reaps a silent connection after one frame
+    // timeout — the same bound as the grant wait — so bare silence would
+    // race the two and prove nothing. Keepalive credit updates on an
+    // unknown stream hold the connection open without granting the stalled
+    // stream anything, so the stream's own bound is what ends it.
+    let keepalive = r#"{"credit_bytes":1,"direction":"stdout"}"#;
+    let mut saw_error = false;
+    let mut saw_exit = false;
+    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(400), driver.recv()).await {
+                Ok(frame) => match (frame.stream_id, frame.kind) {
+                    (3, FrameKind::Error) => {
+                        let reply: ErrorReply =
+                            ipc::decode_control(&frame.payload).expect("error decodes");
+                        assert_eq!(reply.code, ErrorCode::EIo);
+                        saw_error = true;
+                    }
+                    (3, FrameKind::Exit) => {
+                        let report: ExitReport =
+                            ipc::decode_control(&frame.payload).expect("exit decodes");
+                        assert_eq!(report.status, 1);
+                        assert_eq!(report.outcome, "Failed");
+                        saw_exit = true;
+                    }
+                    (3, FrameKind::Stdout) => {
+                        panic!("no body byte precedes the grant error")
+                    }
+                    (9, FrameKind::Error | FrameKind::Exit) => {}
+                    (id, kind) => panic!("unexpected frame {kind:?} on stream {id}"),
+                },
+                Err(_) => {
+                    driver
+                        .send(FrameKind::WindowUpdate, 9, keepalive.as_bytes())
+                        .await;
+                }
+            }
+            if saw_error && saw_exit {
+                break;
+            }
+        }
+    })
+    .await;
+    ended.expect("the grant gap ends the stream instead of hanging the suite");
+    assert!(
+        saw_error && saw_exit,
+        "the grant gap errors instead of truncating"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the gap surfaces at the frame timeout, not past it"
+    );
+    drop(driver);
+    task.abort();
 }
 
 #[test]
