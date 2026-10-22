@@ -35,6 +35,7 @@ use ruk_core::store::{
 use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
+use ruk_git::transport::credentials::{AuthPolicy, TransportAuth};
 use ruk_git::transport::fetch::{self, FetchWireRequest};
 use ruk_git::transport::mirror::{prune_for_spec, push_mirror_updates};
 use ruk_git::transport::net::{self, Endpoint};
@@ -53,7 +54,7 @@ use super::state::{
     is_ancestor, list_refs, load_or_default, open_store_at, remote_fetch_specs, remote_root,
     resolve_rev, scan_index, walk_history,
 };
-use super::{Ctx, FlagSpec, collect, line};
+use super::{Collected, Ctx, FlagSpec, collect, line};
 
 /// Downloads objects and refs from a local repository.
 ///
@@ -94,8 +95,14 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
     let remote_label = configured_name(ctx, target).unwrap_or_else(|| target.to_owned());
     let spec_texts: Vec<String> = if opts.positionals.len() > 1 {
@@ -117,6 +124,7 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         depth,
         fetch_tags: opts.is_set("tags"),
         prune: opts.is_set("prune"),
+        auth,
     };
     let (out, tips) = run_fetch(ctx, &remote_label, &spec_texts, plan)?;
     // Mirror LFS sync, after the refs moved: walks the newly-arrived tips
@@ -145,6 +153,8 @@ pub(crate) struct PushFlags {
     pub(crate) want_lfs: bool,
     /// Skip the `pre-push` hook.
     pub(crate) no_verify: bool,
+    /// Credential policy for the network legs, from `--auth-stdin`.
+    pub(crate) auth: AuthPolicy,
 }
 
 /// How a fetch updates refs. Data, not selectors: one plan per invocation.
@@ -157,6 +167,8 @@ pub(crate) struct FetchPlan {
     pub(crate) fetch_tags: bool,
     /// Delete remote-tracking refs whose upstream counterpart is gone.
     pub(crate) prune: bool,
+    /// Credential policy for the network legs, from `--auth-stdin`.
+    pub(crate) auth: AuthPolicy,
 }
 
 /// Where a fetch/push/ls-remote target points: a local repository root or
@@ -204,6 +216,8 @@ enum FetchSource {
         /// Resolved `http.extraHeader` rows for the base, reused by the
         /// fetch POST (stateless, so no connection is held).
         extra_headers: Vec<(String, String)>,
+        /// Credential policy for the fetch POST, carried from discovery.
+        auth: AuthPolicy,
     },
     /// A smart-http v2 base plus its capability advertisement: refs came
     /// from one `ls-refs` RPC and the fetch POSTs `command=fetch`
@@ -215,6 +229,8 @@ enum FetchSource {
         caps: Capabilities,
         /// Resolved `http.extraHeader` rows for the base.
         extra_headers: Vec<(String, String)>,
+        /// Credential policy for the fetch POST, carried from discovery.
+        auth: AuthPolicy,
     },
     /// A dumb-http base: the smart advertisement was absent, so discovery
     /// fell back to the text `info/refs` file (the same fallback `git`
@@ -224,6 +240,8 @@ enum FetchSource {
         base: String,
         /// Resolved `http.extraHeader` rows for the base.
         extra_headers: Vec<(String, String)>,
+        /// Credential policy for the dumb fetch reads, carried from discovery.
+        auth: AuthPolicy,
     },
 }
 
@@ -290,6 +308,23 @@ fn http_extra_headers(ctx: &Ctx, url: &str) -> Vec<(String, String)> {
     http::extra_headers_for_url(url, &rows)
 }
 
+/// Resolves the transport credential policy for one network verb:
+/// `--auth-stdin` carries a JSON [`TransportAuth`] record on stdin and
+/// yields the Explicit policy (fail closed on a malformed record), while
+/// its absence yields the Ambient policy over the captured environment
+/// map, so helpers and config resolve hermetically under test.
+fn invocation_auth(ctx: &Ctx, opts: &Collected) -> Result<AuthPolicy, GitError> {
+    if opts.is_set("auth-stdin") {
+        let bytes = super::read_stdin_bytes(&ctx.env)?;
+        let auth: TransportAuth = sonic_rs::from_slice(&bytes).map_err(|_| GitError::Invalid {
+            detail: "--auth-stdin needs a JSON TransportAuth record".to_owned(),
+        })?;
+        auth.validate()?;
+        return Ok(AuthPolicy::explicit(auth));
+    }
+    Ok(AuthPolicy::ambient_in(ctx.env.vars.clone()))
+}
+
 /// Expands refspecs, negotiates the pack, and updates refs.
 ///
 /// `remote update` shares this path: it passes the remote's configured
@@ -334,6 +369,7 @@ pub(crate) fn run_fetch(
                     ruk_git::transport::smart_http::SmartService::UploadPack,
                     dest_kind,
                     &extra_headers,
+                    &plan.auth,
                 ) {
                     Ok(ruk_git::transport::smart_http::VersionedDiscovery::V2(caps)) => {
                         let refs = ruk_git::transport::smart_http::ls_refs_v2(
@@ -341,8 +377,11 @@ pub(crate) fn run_fetch(
                             &caps,
                             dest_kind,
                             &[],
-                            &Interrupt::none(),
-                            &extra_headers,
+                            ruk_git::transport::smart_http::RpcCall {
+                                extra: &extra_headers,
+                                auth: &plan.auth,
+                                interrupt: &Interrupt::none(),
+                            },
                         )?;
                         let advertised = net::to_local_refs(refs)?;
                         (
@@ -350,6 +389,7 @@ pub(crate) fn run_fetch(
                                 base,
                                 caps,
                                 extra_headers,
+                                auth: plan.auth.clone(),
                             },
                             advertised,
                         )
@@ -361,6 +401,7 @@ pub(crate) fn run_fetch(
                                 base,
                                 adv,
                                 extra_headers,
+                                auth: plan.auth.clone(),
                             },
                             advertised,
                         )
@@ -369,13 +410,18 @@ pub(crate) fn run_fetch(
                         let adv = ruk_git::transport::dumb_http::discover(
                             &base,
                             dest_kind,
-                            &extra_headers,
+                            ruk_git::transport::smart_http::RpcCall {
+                                extra: &extra_headers,
+                                auth: &plan.auth,
+                                interrupt: &Interrupt::none(),
+                            },
                         )?;
                         let advertised = net::to_local_refs(adv.refs.clone())?;
                         (
                             FetchSource::DumbHttp {
                                 base,
                                 extra_headers,
+                                auth: plan.auth.clone(),
                             },
                             advertised,
                         )
@@ -388,6 +434,7 @@ pub(crate) fn run_fetch(
                     &endpoint,
                     Service::UploadPack,
                     dest_kind,
+                    &plan.auth,
                 )?)?;
                 (FetchSource::Net(endpoint), advertised)
             }
@@ -652,6 +699,7 @@ fn fetch_pack_http(
         base,
         adv,
         extra_headers,
+        auth,
     } = source
     else {
         return Err(GitError::Invalid {
@@ -664,8 +712,11 @@ fn fetch_pack_http(
         dest,
         request,
         IngestLimits::default(),
-        &Interrupt::none(),
-        extra_headers,
+        ruk_git::transport::smart_http::RpcCall {
+            extra: extra_headers,
+            auth,
+            interrupt: &Interrupt::none(),
+        },
     )?;
     publish_received(
         dest,
@@ -695,6 +746,7 @@ fn fetch_pack_http_v2(
         base,
         caps,
         extra_headers,
+        auth,
     } = source
     else {
         return Err(GitError::Invalid {
@@ -707,8 +759,11 @@ fn fetch_pack_http_v2(
         dest,
         request,
         IngestLimits::default(),
-        &Interrupt::none(),
-        extra_headers,
+        ruk_git::transport::smart_http::RpcCall {
+            extra: extra_headers,
+            auth,
+            interrupt: &Interrupt::none(),
+        },
     )?;
     publish_received(
         dest,
@@ -738,6 +793,7 @@ fn fetch_pack_dumb(
     let FetchSource::DumbHttp {
         base,
         extra_headers,
+        auth,
     } = source
     else {
         return Err(GitError::Invalid {
@@ -749,8 +805,11 @@ fn fetch_pack_dumb(
         dest,
         request,
         IngestLimits::default(),
-        &Interrupt::none(),
-        extra_headers,
+        ruk_git::transport::smart_http::RpcCall {
+            extra: extra_headers,
+            auth,
+            interrupt: &Interrupt::none(),
+        },
     )?;
     publish_received(
         dest,
@@ -1147,12 +1206,20 @@ fn configured_name(ctx: &Ctx, target: &str) -> Option<String> {
 ///
 /// Oracle: `git/builtin/pull.c`.
 pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [FlagSpec {
-        long: "ff-only",
-        short: None,
-        takes_value: false,
-    }];
+    let specs = [
+        FlagSpec {
+            long: "ff-only",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
+    ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     ctx.require_worktree()?;
     let (target, branch_arg) = match opts.positionals.as_slice() {
         [] => ("origin", None),
@@ -1186,6 +1253,7 @@ pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         depth: None,
         fetch_tags: false,
         prune: false,
+        auth,
     };
     let (_, _) = run_fetch(ctx, &remote_label, &[spec], plan)?;
     let tip = resolve_rev(
@@ -1242,8 +1310,14 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     let kind = ctx.kind()?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
     // Mirror force: the oracle's `--mirror` forces every ref update, the
@@ -1256,6 +1330,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         mirror: opts.is_set("mirror"),
         want_lfs: opts.is_set("lfs"),
         no_verify: opts.is_set("no-verify"),
+        auth,
     };
     let remote_label = configured_name(ctx, target).unwrap_or_else(|| target.to_owned());
     if flags.mirror && opts.positionals.len() > 1 {
@@ -1449,6 +1524,7 @@ fn push_net(
                         ruk_git::transport::smart_http::SmartService::ReceivePack,
                         kind,
                         &extra_headers,
+                        &flags.auth,
                     )?,
                     extra_headers,
                 ))
@@ -1461,6 +1537,7 @@ fn push_net(
                 endpoint,
                 Service::ReceivePack,
                 kind,
+                &flags.auth,
             )?)?,
         };
         let remote: Vec<(Vec<u8>, Oid)> = advertised
@@ -1526,8 +1603,11 @@ fn push_net(
                 store,
                 &mut plan,
                 &request,
-                &Interrupt::none(),
-                extra_headers,
+                ruk_git::transport::smart_http::RpcCall {
+                    extra: extra_headers,
+                    auth: &flags.auth,
+                    interrupt: &Interrupt::none(),
+                },
             )?)
         }
         None => {
@@ -1974,8 +2054,14 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
             short: Some('o'),
             takes_value: true,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     let format = opts.single("format")?.unwrap_or_else(|| "tar".to_owned());
     let zipped = match format.as_str() {
         "tar" => false,
@@ -2058,6 +2144,7 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
                         &ruk_git::transport::smart_http::ArchiveWireRequest { rev },
                         &Interrupt::none(),
                         &extra_headers,
+                        &auth,
                     )?;
                     out.tar
                 }
@@ -4224,8 +4311,14 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
     if opts.positionals.len() > 2 {
         return Err(GitError::Invalid {
@@ -4261,6 +4354,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                         ruk_git::transport::smart_http::SmartService::UploadPack,
                         ctx.kind()?,
                         &extra_headers,
+                        &auth,
                     ) {
                         Ok(ruk_git::transport::smart_http::VersionedDiscovery::V2(caps)) => {
                             ruk_git::transport::smart_http::ls_refs_v2(
@@ -4268,8 +4362,11 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                                 &caps,
                                 ctx.kind()?,
                                 &[],
-                                &Interrupt::none(),
-                                &extra_headers,
+                                ruk_git::transport::smart_http::RpcCall {
+                                    extra: &extra_headers,
+                                    auth: &auth,
+                                    interrupt: &Interrupt::none(),
+                                },
                             )?
                         }
                         Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => adv.refs,
@@ -4277,7 +4374,11 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             let adv = ruk_git::transport::dumb_http::discover(
                                 &base,
                                 ctx.kind()?,
-                                &extra_headers,
+                                ruk_git::transport::smart_http::RpcCall {
+                                    extra: &extra_headers,
+                                    auth: &auth,
+                                    interrupt: &Interrupt::none(),
+                                },
                             )?;
                             // Dumb `info/refs` carries no symref: the
                             // oracle reads the `HEAD` text file for the
@@ -4292,7 +4393,11 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                                 && let Some(pointed) =
                                     ruk_git::transport::dumb_http::fetch_head_symref(
                                         &base,
-                                        &extra_headers,
+                                        ruk_git::transport::smart_http::RpcCall {
+                                            extra: &extra_headers,
+                                            auth: &auth,
+                                            interrupt: &Interrupt::none(),
+                                        },
                                     )?
                             {
                                 refs.push(AdvertisedRef {
@@ -4308,7 +4413,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                         Err(err) => return Err(err),
                     }
                 }
-                _ => net::discover_endpoint(&endpoint, Service::UploadPack, ctx.kind()?)?,
+                _ => net::discover_endpoint(&endpoint, Service::UploadPack, ctx.kind()?, &auth)?,
             };
             net::to_local_refs(refs)?
         }

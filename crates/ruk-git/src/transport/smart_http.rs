@@ -19,11 +19,10 @@
 //! break on the first verdict to send `done`; there is no second round
 //! here.
 //!
-//! Auth tries the git credential helper first
-//! ([`crate::transport::credentials::auth_header_for_url`]: `git credential
-//! fill` for the endpoint, non-fatal to anonymous attempts), then Bearer
-//! from `GIT_AUTH_TOKEN`, else Basic from `GIT_AUTH_USER` plus
-//! `GIT_AUTH_PASSWORD` (see [`crate::transport::http::git_auth_header`]).
+//! Auth follows the per-call [`credentials::AuthPolicy`] every RPC takes:
+//! `Explicit` sends only the injected credential inside its origin and
+//! never consults a helper or the environment, while `Ambient` resolves
+//! the helper chain from the caller map, then that map's Bearer/Basic.
 //! `http.<url>.extraHeader` lines join every request: the caller resolves
 //! them from config for the base through
 //! [`extra_headers_for_url`](crate::transport::http::extra_headers_for_url)
@@ -198,13 +197,59 @@ pub fn request_headers_with(
     out
 }
 
-/// Collects the process environment for [`request_headers`].
-fn live_headers(
+/// Builds owned request headers under `auth`: the `Explicit` policy sends
+/// only the injected credential inside its origin and never consults a
+/// helper or the environment, while `Ambient` resolves the helper chain
+/// from its own vars map, then falls back to that map's Bearer/Basic.
+#[must_use]
+pub fn policy_headers(
     url: &str,
+    auth: &credentials::AuthPolicy,
     extra: &[(&str, &str)],
     extra_headers: &[(String, String)],
 ) -> Vec<(String, String)> {
-    request_headers(url, &std::env::vars().collect(), extra, extra_headers)
+    match auth {
+        credentials::AuthPolicy::Explicit { auth } => {
+            let mut out: Vec<(String, String)> = extra_headers.to_vec();
+            out.extend(
+                extra
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+            );
+            if let Some(header) = auth.header_for(url) {
+                out.push(header);
+            }
+            out
+        }
+        credentials::AuthPolicy::Ambient { vars } => {
+            credentials::ambient_headers_for_url(url, vars, extra, extra_headers)
+        }
+    }
+}
+
+/// The per-call controls every smart-http RPC takes together: the resolved
+/// `http.extraHeader` rows for the base, the credential policy the call
+/// authenticates under, and the cancellation/deadline interrupt. No `Debug`:
+/// the extra rows can carry credentials, so the context never prints.
+#[derive(Clone, Copy)]
+pub struct RpcCall<'a> {
+    /// Resolved `http.extraHeader` rows for the base.
+    pub extra: &'a [(String, String)],
+    /// The credential policy this call authenticates under.
+    pub auth: &'a credentials::AuthPolicy,
+    /// Deadline and cancellation shared by the call's transfer steps.
+    pub interrupt: &'a Interrupt,
+}
+
+impl std::fmt::Debug for RpcCall<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RpcCall")
+            .field("extra", &format_args!("<{} rows>", self.extra.len()))
+            .field("auth", self.auth)
+            .field("interrupt", self.interrupt)
+            .finish()
+    }
 }
 
 /// Borrows owned headers for the HTTP client.
@@ -245,9 +290,10 @@ pub fn discover(
     service: SmartService,
     kind: HashKind,
     extra_headers: &[(String, String)],
+    auth: &credentials::AuthPolicy,
 ) -> Result<Advertisement, GitError> {
     let url = refs_url(base, service);
-    let owned = live_headers(&url, &[("Accept", "*/*")], extra_headers);
+    let owned = policy_headers(&url, auth, &[("Accept", "*/*")], extra_headers);
     let mut body = Vec::new();
     let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body)?;
     check_status(&url, status)?;
@@ -292,10 +338,12 @@ pub fn discover_versioned(
     service: SmartService,
     kind: HashKind,
     extra_headers: &[(String, String)],
+    auth: &credentials::AuthPolicy,
 ) -> Result<VersionedDiscovery, GitError> {
     let url = refs_url(base, service);
-    let owned = live_headers(
+    let owned = policy_headers(
         &url,
+        auth,
         &[
             ("Accept", "*/*"),
             (
@@ -330,9 +378,13 @@ pub fn ls_refs_v2(
     caps: &Capabilities,
     kind: HashKind,
     prefixes: &[&[u8]],
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        interrupt,
+    } = call;
     let body = proto_v2::ls_refs_request(
         caps,
         kind,
@@ -343,8 +395,9 @@ pub fn ls_refs_v2(
     let url = rpc_url(base, SmartService::UploadPack);
     let request_type = SmartService::UploadPack.request_type();
     let result_type = SmartService::UploadPack.result_type();
-    let owned = live_headers(
+    let owned = policy_headers(
         &url,
+        auth,
         &[
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
@@ -383,9 +436,13 @@ pub fn fetch_pack_v2(
     store: &Store,
     req: &FetchWireRequest,
     limits: IngestLimits,
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<ReceivedPack, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        interrupt,
+    } = call;
     if req.wants.is_empty() {
         return Err(GitError::Invalid {
             detail: "fetch needs at least one want".to_owned(),
@@ -426,8 +483,9 @@ pub fn fetch_pack_v2(
     let url = rpc_url(base, SmartService::UploadPack);
     let request_type = SmartService::UploadPack.request_type();
     let result_type = SmartService::UploadPack.result_type();
-    let owned = live_headers(
+    let owned = policy_headers(
         &url,
+        auth,
         &[
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
@@ -492,9 +550,13 @@ pub fn fetch_pack(
     store: &Store,
     req: &FetchWireRequest,
     limits: IngestLimits,
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<ReceivedPack, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        interrupt,
+    } = call;
     if req.wants.is_empty() {
         return Err(GitError::Invalid {
             detail: "fetch needs at least one want".to_owned(),
@@ -573,8 +635,9 @@ pub fn fetch_pack(
     let url = rpc_url(base, SmartService::UploadPack);
     let request_type = SmartService::UploadPack.request_type();
     let result_type = SmartService::UploadPack.result_type();
-    let owned = live_headers(
+    let owned = policy_headers(
         &url,
+        auth,
         &[
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
@@ -652,8 +715,7 @@ pub fn push_pack(
     store: &Store,
     plan: &mut PushPlanRecord,
     req: &PushWireRequest,
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<Vec<RefOutcome>, GitError> {
     if req.updates.is_empty() {
         return Err(GitError::Invalid {
@@ -674,7 +736,7 @@ pub fn push_pack(
     }
     let kind = store.hash_kind();
     push::persist(store, plan, kind, None)?;
-    let outcome = push_pack_inner(base, adv, store, plan, req, interrupt, extra_headers);
+    let outcome = push_pack_inner(base, adv, store, plan, req, call);
     match outcome {
         Ok(outcomes) => Ok(outcomes),
         Err(err) => {
@@ -691,9 +753,13 @@ fn push_pack_inner(
     store: &Store,
     plan: &mut PushPlanRecord,
     req: &PushWireRequest,
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<Vec<RefOutcome>, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        interrupt,
+    } = call;
     let kind = store.hash_kind();
     let caps = &adv.capabilities;
     let report_v2 = caps.has("report-status-v2");
@@ -827,8 +893,9 @@ fn push_pack_inner(
     let url = rpc_url(base, SmartService::ReceivePack);
     let request_type = SmartService::ReceivePack.request_type();
     let result_type = SmartService::ReceivePack.result_type();
-    let owned = live_headers(
+    let owned = policy_headers(
         &url,
+        auth,
         &[
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
@@ -913,13 +980,15 @@ pub fn fetch_archive(
     req: &ArchiveWireRequest,
     interrupt: &Interrupt,
     extra_headers: &[(String, String)],
+    auth: &credentials::AuthPolicy,
 ) -> Result<ArchiveOutput, GitError> {
     let body = archive_request_body(&req.rev)?;
     let url = rpc_url(base, SmartService::UploadArchive);
     let request_type = SmartService::UploadArchive.request_type();
     let result_type = SmartService::UploadArchive.result_type();
-    let owned = live_headers(
+    let owned = policy_headers(
         &url,
+        auth,
         &[
             ("Content-Type", request_type.as_str()),
             ("Accept", result_type.as_str()),
@@ -977,6 +1046,10 @@ mod tests {
 
     fn oid(hex: &str) -> Oid {
         Oid::from_hex(hex).expect("hex")
+    }
+
+    fn no_auth() -> credentials::AuthPolicy {
+        credentials::AuthPolicy::explicit(credentials::TransportAuth::none())
     }
 
     #[test]
@@ -1082,6 +1155,130 @@ mod tests {
                 "authorization".to_owned(),
                 "Basic YWxpY2U6czNjcmV0".to_owned()
             )]
+        );
+    }
+
+    #[test]
+    fn explicit_auth_sends_exactly_one_header() {
+        let tip = "0123456789abcdef0123456789abcdef01234567";
+        let (base, server) = fake_smart_server(vec![(
+            200,
+            vec![(
+                "Content-Type".to_owned(),
+                SmartService::UploadPack.advertisement_type(),
+            )],
+            advertisement_bytes(tip, "side-band-64k"),
+            false,
+        )]);
+        let origin =
+            credentials::TransportAuth::origin_of(&base).expect("loopback base has an origin");
+        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: "injected".to_owned(),
+            origin,
+        });
+        discover(&base, SmartService::UploadPack, HashKind::Sha1, &[], &auth)
+            .expect("authed discover");
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        let auth_lines: Vec<&str> = requests[0]
+            .head
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .collect();
+        assert_eq!(auth_lines, ["authorization: Bearer injected"]);
+    }
+
+    fn assert_only_injected_auth(head: &str) {
+        let auth_lines: Vec<&str> = head
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .collect();
+        assert_eq!(auth_lines, ["authorization: Bearer injected"], "{head:?}");
+    }
+
+    #[test]
+    fn explicit_auth_sends_one_header_on_a_smart_post() {
+        use super::super::session::test_support::test_store;
+
+        let (base, server) = fake_smart_server(vec![(500, Vec::new(), Vec::new(), false)]);
+        let adv = Advertisement {
+            version: super::super::refadv::ProtocolVersion::V0,
+            capabilities: super::super::refadv::Capabilities::default(),
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        };
+        let dest = test_store(HashKind::Sha1);
+        let req = FetchWireRequest {
+            wants: vec![oid(FOUR)],
+            haves: Vec::new(),
+            filter: None,
+            depth: None,
+            shallow: Vec::new(),
+            list_refs: false,
+            ref_prefixes: Vec::new(),
+        };
+        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: "injected".to_owned(),
+            origin: credentials::TransportAuth::origin_of(&base).expect("loopback origin"),
+        });
+        let err = fetch_pack(
+            &base,
+            &adv,
+            &dest,
+            &req,
+            IngestLimits::default(),
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect_err("a 500 refuses the POST");
+        assert!(
+            matches!(err, GitError::Offline { .. }),
+            "unexpected {err:?}"
+        );
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .head
+                .starts_with("POST /a.git/git-upload-pack HTTP/1.1\r\n"),
+            "{:?}",
+            requests[0].head
+        );
+        assert_only_injected_auth(&requests[0].head);
+    }
+
+    #[test]
+    fn explicit_auth_refuses_a_cross_origin_endpoint() {
+        let (base, server) = fake_smart_server(vec![(
+            200,
+            vec![(
+                "Content-Type".to_owned(),
+                SmartService::UploadPack.advertisement_type(),
+            )],
+            advertisement_bytes(FOUR, "side-band-64k"),
+            false,
+        )]);
+        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: "injected".to_owned(),
+            origin: "https://elsewhere.x:443".to_owned(),
+        });
+        discover(&base, SmartService::UploadPack, HashKind::Sha1, &[], &auth)
+            .expect("discover succeeds without the credential");
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0]
+                .head
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "{:?}",
+            requests[0].head
         );
     }
 
@@ -1222,7 +1419,14 @@ mod tests {
             body,
             false,
         )]);
-        let adv = discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect("discover");
+        let adv = discover(
+            &base,
+            SmartService::UploadPack,
+            HashKind::Sha1,
+            &[],
+            &no_auth(),
+        )
+        .expect("discover");
         assert!(adv.capabilities.has("side-band-64k"));
         assert_eq!(adv.refs.len(), 2);
         assert_eq!(adv.refs[0].oid, Some(oid(FOUR)));
@@ -1260,7 +1464,14 @@ mod tests {
             ("X-Token".to_owned(), "Bearer scoped-token".to_owned()),
             ("X-Empty".to_owned(), String::new()),
         ];
-        discover(&base, SmartService::UploadPack, HashKind::Sha1, &configured).expect("discover");
+        discover(
+            &base,
+            SmartService::UploadPack,
+            HashKind::Sha1,
+            &configured,
+            &no_auth(),
+        )
+        .expect("discover");
         let requests = server.join().expect("server");
         assert_eq!(requests.len(), 1);
         assert!(
@@ -1285,7 +1496,14 @@ mod tests {
             format!("{FOUR}\trefs/heads/main\n").into_bytes(),
             false,
         )]);
-        let err = discover(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect_err("dumb");
+        let err = discover(
+            &base,
+            SmartService::UploadPack,
+            HashKind::Sha1,
+            &[],
+            &no_auth(),
+        )
+        .expect_err("dumb");
         assert!(
             matches!(err, GitError::Unsupported { .. }),
             "unexpected {err:?}"
@@ -1330,7 +1548,8 @@ mod tests {
                 true,
             ),
         ]);
-        let adv = discover(&base, SmartService::UploadPack, kind, &[]).expect("discover");
+        let adv =
+            discover(&base, SmartService::UploadPack, kind, &[], &no_auth()).expect("discover");
         let dest = test_store(kind);
         let req = FetchWireRequest {
             wants: vec![oid(FOUR)],
@@ -1347,8 +1566,11 @@ mod tests {
             &dest,
             &req,
             IngestLimits::default(),
-            &Interrupt::none(),
-            &[],
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("fetch");
         assert!(received.warnings.is_empty());
@@ -1434,12 +1656,24 @@ mod tests {
             ),
         ]);
         let VersionedDiscovery::V2(probed) =
-            discover_versioned(&base, SmartService::UploadPack, kind, &[]).expect("probe")
+            discover_versioned(&base, SmartService::UploadPack, kind, &[], &no_auth())
+                .expect("probe")
         else {
             panic!("expected v2");
         };
         assert!(probed.feature("fetch", "filter"));
-        let refs = ls_refs_v2(&base, &probed, kind, &[], &Interrupt::none(), &[]).expect("ls-refs");
+        let refs = ls_refs_v2(
+            &base,
+            &probed,
+            kind,
+            &[],
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("ls-refs");
         assert_eq!(refs.len(), 2);
         assert_eq!(
             refs[0].symref_target.as_deref(),
@@ -1500,9 +1734,14 @@ mod tests {
             body,
             false,
         )]);
-        let VersionedDiscovery::V0(adv) =
-            discover_versioned(&base, SmartService::UploadPack, HashKind::Sha1, &[]).expect("v0")
-        else {
+        let VersionedDiscovery::V0(adv) = discover_versioned(
+            &base,
+            SmartService::UploadPack,
+            HashKind::Sha1,
+            &[],
+            &no_auth(),
+        )
+        .expect("v0") else {
             panic!("expected v0");
         };
         assert_eq!(adv.refs.len(), 2);
@@ -1557,8 +1796,11 @@ mod tests {
             &dest,
             &req,
             IngestLimits::default(),
-            &Interrupt::none(),
-            &[],
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("fetch");
         verify_closure(
@@ -1640,7 +1882,8 @@ mod tests {
         ]);
         // The test drives discovery itself so the advertisement (with its
         // capabilities) reaches the push half the way the verbs pass it.
-        let adv = discover(&base, SmartService::ReceivePack, kind, &[]).expect("discover");
+        let adv =
+            discover(&base, SmartService::ReceivePack, kind, &[], &no_auth()).expect("discover");
         let updates = vec![PushUpdate {
             name: b"refs/heads/x".to_vec(),
             old: zero,
@@ -1658,8 +1901,11 @@ mod tests {
             &store,
             &mut plan,
             &req,
-            &Interrupt::none(),
-            &[],
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("push");
         assert_eq!(outcomes.len(), 1);
@@ -1719,8 +1965,11 @@ mod tests {
             &store,
             &mut plan,
             &req,
-            &Interrupt::none(),
-            &[],
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect_err("no report-status");
         assert!(
@@ -1780,6 +2029,7 @@ mod tests {
             },
             &Interrupt::none(),
             &[],
+            &no_auth(),
         )
         .expect("archive");
         assert_eq!(out.tar, tar);
@@ -1841,6 +2091,7 @@ mod tests {
             },
             &Interrupt::none(),
             &[],
+            &no_auth(),
         )
         .expect_err("unknown revision");
         assert!(
