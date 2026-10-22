@@ -95,7 +95,8 @@ fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
 fn get(url: &str, call: RpcCall<'_>) -> Result<(u16, Vec<u8>), GitError> {
     let owned = policy_headers(url, call.auth, &[("Accept", "*/*")], call.extra);
     let mut body = Vec::new();
-    let (status, _) = http::get_to_writer(url, &borrow(&owned), &mut body, call.egress)?;
+    let (status, _, _) =
+        http::get_to_writer(url, &borrow(&owned), &mut body, call.egress, call.tls_roots)?;
     Ok((status, body))
 }
 
@@ -549,6 +550,7 @@ mod tests {
             RpcCall {
                 extra: &[],
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 auth: &auth,
                 interrupt: &Interrupt::none(),
             },
@@ -849,6 +851,7 @@ mod tests {
             RpcCall {
                 extra: &[],
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 auth: &AuthPolicy::explicit(TransportAuth::none()),
                 interrupt: &Interrupt::none(),
             },
@@ -875,6 +878,7 @@ mod tests {
             RpcCall {
                 extra: &[],
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 auth: &AuthPolicy::explicit(TransportAuth::none()),
                 interrupt: &Interrupt::none(),
             },
@@ -949,6 +953,7 @@ mod tests {
             RpcCall {
                 extra: &[],
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 auth: &AuthPolicy::explicit(TransportAuth::none()),
                 interrupt: &Interrupt::none(),
             },

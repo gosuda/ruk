@@ -240,6 +240,9 @@ pub struct RpcCall<'a> {
     pub auth: &'a credentials::AuthPolicy,
     /// The egress policy every dial this call opens must satisfy.
     pub egress: &'a super::net::EgressPolicy,
+    /// Optional PEM trust bundle replacing the Mozilla roots for this
+    /// call's TLS handshakes (private-CA servers).
+    pub tls_roots: Option<&'a [u8]>,
     /// Deadline and cancellation shared by the call's transfer steps.
     pub interrupt: &'a Interrupt,
 }
@@ -251,6 +254,10 @@ impl std::fmt::Debug for RpcCall<'_> {
             .field("extra", &format_args!("<{} rows>", self.extra.len()))
             .field("auth", self.auth)
             .field("egress", self.egress)
+            .field(
+                "tls_roots",
+                &self.tls_roots.as_ref().map(|roots| roots.len()),
+            )
             .field("interrupt", self.interrupt)
             .finish()
     }
@@ -398,14 +405,20 @@ pub fn discover(
     base: &str,
     service: SmartService,
     kind: HashKind,
-    extra_headers: &[(String, String)],
-    auth: &credentials::AuthPolicy,
-    egress: &super::net::EgressPolicy,
+    call: RpcCall<'_>,
 ) -> Result<Advertisement, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        egress,
+        tls_roots,
+        ..
+    } = call;
     let url = refs_url(base, service);
     let owned = policy_headers(&url, auth, &[("Accept", "*/*")], extra_headers);
     let mut body = Vec::new();
-    let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body, egress)?;
+    let (status, reply, _) =
+        http::get_to_writer(&url, &borrow(&owned), &mut body, egress, tls_roots)?;
     check_status(&url, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(service.advertisement_type().as_str()) {
         return Err(net::dumb_http_gap(&url));
@@ -447,10 +460,15 @@ pub fn discover_versioned(
     base: &str,
     service: SmartService,
     kind: HashKind,
-    extra_headers: &[(String, String)],
-    auth: &credentials::AuthPolicy,
-    egress: &super::net::EgressPolicy,
+    call: RpcCall<'_>,
 ) -> Result<VersionedDiscovery, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        egress,
+        tls_roots,
+        ..
+    } = call;
     let url = refs_url(base, service);
     let owned = policy_headers(
         &url,
@@ -465,7 +483,8 @@ pub fn discover_versioned(
         extra_headers,
     );
     let mut body = Vec::new();
-    let (status, reply) = http::get_to_writer(&url, &borrow(&owned), &mut body, egress)?;
+    let (status, reply, _) =
+        http::get_to_writer(&url, &borrow(&owned), &mut body, egress, tls_roots)?;
     check_status(&url, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(service.advertisement_type().as_str()) {
         return Err(net::dumb_http_gap(&url));
@@ -495,6 +514,7 @@ pub fn ls_refs_v2(
         extra: extra_headers,
         auth,
         egress,
+        tls_roots,
         interrupt,
     } = call;
     let body = proto_v2::ls_refs_request(
@@ -520,7 +540,8 @@ pub fn ls_refs_v2(
         ],
         extra_headers,
     );
-    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &body, egress)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &body, egress, tls_roots)?;
     check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
@@ -554,6 +575,7 @@ pub fn fetch_pack_v2(
         extra: extra_headers,
         auth,
         egress,
+        tls_roots,
         interrupt,
     } = call;
     if req.wants.is_empty() {
@@ -609,7 +631,8 @@ pub fn fetch_pack_v2(
         ],
         extra_headers,
     );
-    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &body, egress)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &body, egress, tls_roots)?;
     check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
@@ -669,6 +692,7 @@ pub fn fetch_pack(
         extra: extra_headers,
         auth,
         egress,
+        tls_roots,
         interrupt,
     } = call;
     if req.wants.is_empty() {
@@ -758,7 +782,8 @@ pub fn fetch_pack(
         ],
         extra_headers,
     );
-    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &out, egress)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &out, egress, tls_roots)?;
     check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(SmartService::UploadPack.result_type().as_str())
     {
@@ -873,6 +898,7 @@ fn push_pack_inner(
         extra: extra_headers,
         auth,
         egress,
+        tls_roots,
         interrupt,
     } = call;
     let kind = store.hash_kind();
@@ -1017,7 +1043,8 @@ fn push_pack_inner(
         ],
         extra_headers,
     );
-    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &out, egress)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &out, egress, tls_roots)?;
     check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type")
         != Some(SmartService::ReceivePack.result_type().as_str())
@@ -1093,11 +1120,15 @@ pub struct ArchiveOutput {
 pub fn fetch_archive(
     base: &str,
     req: &ArchiveWireRequest,
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
-    auth: &credentials::AuthPolicy,
-    egress: &super::net::EgressPolicy,
+    call: RpcCall<'_>,
 ) -> Result<ArchiveOutput, GitError> {
+    let RpcCall {
+        extra: extra_headers,
+        auth,
+        egress,
+        tls_roots,
+        interrupt,
+    } = call;
     let body = archive_request_body(&req.rev)?;
     let url = rpc_url(base, SmartService::UploadArchive);
     let request_type = SmartService::UploadArchive.request_type();
@@ -1111,7 +1142,8 @@ pub fn fetch_archive(
         ],
         extra_headers,
     );
-    let (mut reader, status, reply) = http::post_open(&url, &borrow(&owned), &body, egress)?;
+    let (mut reader, status, reply) =
+        http::post_open(&url, &borrow(&owned), &body, egress, tls_roots)?;
     check_post_status(&url, &mut reader, status, &reply, auth)?;
     if http::header(&reply, "content-type") != Some(result_type.as_str()) {
         return Err(GitError::Corrupt {
@@ -1297,9 +1329,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &auth,
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("authed discover");
         let requests = server.join().expect("server");
@@ -1356,6 +1392,7 @@ mod tests {
                 extra: &[],
                 auth: &auth,
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -1418,6 +1455,7 @@ mod tests {
                     extra: &[],
                     auth,
                     egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
                     interrupt: &Interrupt::none(),
                 },
             )
@@ -1554,9 +1592,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &auth,
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("discover succeeds without the credential");
         let requests = server.join().expect("server");
@@ -1712,9 +1754,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("discover");
         assert!(adv.capabilities.has("side-band-64k"));
@@ -1758,9 +1804,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &configured,
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &configured,
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("discover");
         let requests = server.join().expect("server");
@@ -1791,9 +1841,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect_err("dumb");
         assert!(
@@ -1844,9 +1898,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             kind,
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("discover");
         let dest = test_store(kind);
@@ -1869,6 +1927,7 @@ mod tests {
                 extra: &[],
                 auth: &no_auth(),
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -1959,9 +2018,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             kind,
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("probe") else {
             panic!("expected v2");
@@ -1976,6 +2039,7 @@ mod tests {
                 extra: &[],
                 auth: &no_auth(),
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -2044,9 +2108,13 @@ mod tests {
             &base,
             SmartService::UploadPack,
             HashKind::Sha1,
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("v0") else {
             panic!("expected v0");
@@ -2107,6 +2175,7 @@ mod tests {
                 extra: &[],
                 auth: &no_auth(),
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -2194,9 +2263,13 @@ mod tests {
             &base,
             SmartService::ReceivePack,
             kind,
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("discover");
         let updates = vec![PushUpdate {
@@ -2220,6 +2293,7 @@ mod tests {
                 extra: &[],
                 auth: &no_auth(),
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -2285,6 +2359,7 @@ mod tests {
                 extra: &[],
                 auth: &no_auth(),
                 egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
                 interrupt: &Interrupt::none(),
             },
         )
@@ -2344,10 +2419,13 @@ mod tests {
             &ArchiveWireRequest {
                 rev: "HEAD".to_owned(),
             },
-            &Interrupt::none(),
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("archive");
         assert_eq!(out.tar, tar);
@@ -2407,10 +2485,13 @@ mod tests {
             &ArchiveWireRequest {
                 rev: "nope".to_owned(),
             },
-            &Interrupt::none(),
-            &[],
-            &no_auth(),
-            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect_err("unknown revision");
         assert!(

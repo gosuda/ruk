@@ -871,6 +871,7 @@ pub fn discover_endpoint(
     kind: HashKind,
     auth: &super::credentials::AuthPolicy,
     policy: &EgressPolicy,
+    tls_roots: Option<&[u8]>,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
     match endpoint {
         Endpoint::Http { url, .. } => {
@@ -880,7 +881,19 @@ pub fn discover_endpoint(
                 Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
                 Service::UploadArchive => super::smart_http::SmartService::UploadArchive,
             };
-            Ok(super::smart_http::discover(&base, smart, kind, &[], auth, policy)?.refs)
+            Ok(super::smart_http::discover(
+                &base,
+                smart,
+                kind,
+                super::smart_http::RpcCall {
+                    extra: &[],
+                    auth,
+                    egress: policy,
+                    tls_roots,
+                    interrupt: &super::Interrupt::none(),
+                },
+            )?
+            .refs)
         }
         _ => discover(open_stream(endpoint, service, policy)?, kind),
     }
@@ -1440,6 +1453,7 @@ mod tests {
                     crate::transport::credentials::TransportAuth::none(),
                 ),
                 &EgressPolicy::deny_private().allow_loopback(),
+                None,
             )
             .expect("discover"),
         )
