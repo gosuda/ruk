@@ -33,12 +33,14 @@
 //! one send attempt: no retries inside the job, the client retries under
 //! its idempotency key.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ruk_core::change::{PlanId, RequestId, SessionId};
-use ruk_core::coord::{Cancel, HostedCoordinator, PreparedMutation, Principal, receipt};
+use ruk_core::coord::{
+    Cancel, HostedCoordinator, PreparedMutation, Principal, cancellation, receipt,
+};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::heads::Head;
 use ruk_core::protocol::{
@@ -65,6 +67,7 @@ use ruk_git::transport::refadv::Advertisement;
 use ruk_git::transport::session::{AdvertisedLocalRef, Service};
 use ruk_git::transport::smart_http::{self, RpcCall};
 
+use super::registry::{PushKeyClaim, PushKeyWorkerHalf, Registry};
 use super::{ConnectionRefs, InvocationOpen, decode_request_args};
 use crate::cli::state::is_ancestor;
 use crate::daemon::ipc;
@@ -105,8 +108,9 @@ impl<'a> PushJob<'a> {
     /// # Errors
     /// Session, replay, translation, transport, and lane failures.
     pub(crate) async fn push(self, open: &InvocationOpen) -> Result<Vec<u8>, CoreError> {
-        self.coordinator
-            .check_session(self.principal, self.session, self.cancel)
+        let capabilities = self
+            .coordinator
+            .git_push_capabilities(self.principal, self.session, self.cancel)
             .await?;
         let request = decode_request_args(
             Method::Push,
@@ -126,9 +130,62 @@ impl<'a> PushJob<'a> {
                 "push needs a request id for its receipt",
             )
         })?;
+        for update in &args.args.updates {
+            capabilities.require_push(&update.remote_ref)?;
+        }
         if let Some(reply) = self.replay_committed(&request)? {
             return encode_reply(Some(request_id), reply);
         }
+        // Reserve the caller's idempotency key before any discovery or
+        // dial: the first claimant owns the send, and a concurrent
+        // duplicate waits for the owner's terminal receipt instead of
+        // sending twice, so matching in-flight pushes coalesce under one
+        // key. A mismatched digest still refuses `E_REQUEST_REUSED` at
+        // replay, exactly as a sequential retry would.
+        let _key_guard = loop {
+            match self
+                .refs
+                .registry
+                .claim_push_request(self.session, request_id)?
+            {
+                PushKeyClaim::Owner(guard) => break guard,
+                PushKeyClaim::Wait(notify) => {
+                    let notified = notify.notified();
+                    // The owner may have finished between the claim and
+                    // this wait; re-check before sleeping so no wakeup is
+                    // missed.
+                    if let PushKeyClaim::Owner(guard) = self
+                        .refs
+                        .registry
+                        .claim_push_request(self.session, request_id)?
+                    {
+                        // The owner releases only after its terminal
+                        // attempt: a committed receipt answers this push
+                        // without a second send.
+                        if let Some(reply) = self.replay_committed(&request)? {
+                            return encode_reply(Some(request_id), reply);
+                        }
+                        break guard;
+                    }
+                    let mut cancelled = self.cancel.clone();
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = cancelled.cancelled() => {
+                            return Err(CoreError::new(
+                                ErrorCode::ECancelled,
+                                "operation cancelled",
+                            ));
+                        }
+                    }
+                    // The owner committed or failed: a committed terminal
+                    // receipt answers this push without a second send, and
+                    // a miss lets this caller claim the key and run.
+                    if let Some(reply) = self.replay_committed(&request)? {
+                        return encode_reply(Some(request_id), reply);
+                    }
+                }
+            }
+        };
 
         let url = push_url(&args.args.remote)?;
         let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
@@ -156,10 +213,14 @@ impl<'a> PushJob<'a> {
             .transport
             .run(move || job.discover_and_translate(&url_owned, &updates, atomicity, &bridge))
             .await??;
-        let plan_id = prepared.plan.id;
         self.commit_prepare(open, &request, &prepared.plan).await?;
 
-        let job = self.snapshot();
+        let mut job = self.snapshot();
+        job.key_half = Some(
+            self.refs
+                .registry
+                .add_push_holder(self.session, request_id)?,
+        );
         let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
         let sent = self
             .refs
@@ -167,6 +228,11 @@ impl<'a> PushJob<'a> {
             .run(move || job.send_updates(prepared, &bridge))
             .await??;
         let reply = Reply::Push(Box::new(sent.reply));
+        // The send already moved bytes: terminal bookkeeping runs on a
+        // detached token, so invocation cancellation cannot lose an
+        // `Uncertain` plan's guard and unblock the next push. The worker
+        // half records the guard even if this future is dropped.
+        let (_terminal_hold, terminal_cancel) = cancellation();
         let stored = self
             .coordinator
             .submit_prepared(
@@ -183,15 +249,9 @@ impl<'a> PushJob<'a> {
                     ref_dependencies: Vec::new(),
                     on_behalf_of: open.on_behalf_of.clone(),
                 },
-                self.cancel,
+                &terminal_cancel,
             )
             .await?;
-        self.refs.registry.note_push_terminal(
-            self.repo_path,
-            plan_id,
-            &ref_names,
-            sent.state == PushState::Uncertain,
-        )?;
         encode_reply(Some(request_id), stored)
     }
 
@@ -308,6 +368,9 @@ impl<'a> PushJob<'a> {
         BlockingJob {
             coordinator: Arc::clone(self.coordinator),
             session: self.session,
+            registry: Arc::clone(&self.refs.registry),
+            repo: self.repo_path.to_path_buf(),
+            key_half: None,
         }
     }
 
@@ -352,11 +415,16 @@ impl<'a> PushJob<'a> {
 }
 
 /// The blocking-safe half of a push job: everything a bulkhead closure
-/// may touch.
-#[derive(Clone)]
+/// may touch. The optional key half pins the push's idempotency claim
+/// across the send: without `Clone`, the send closure owns it outright,
+/// so a dropped invocation cannot release the key while its orphaned
+/// worker still sends.
 struct BlockingJob {
     coordinator: Arc<HostedCoordinator>,
     session: SessionId,
+    registry: Arc<Registry>,
+    repo: PathBuf,
+    key_half: Option<PushKeyWorkerHalf>,
 }
 
 impl BlockingJob {
@@ -503,10 +571,18 @@ impl BlockingJob {
             return self.finish_send(plan, state, refs);
         }
         if wire.updates.is_empty() {
-            return Err(CoreError::new(
-                ErrorCode::EInvalid,
-                "push needs at least one update",
-            ));
+            if early.is_empty() {
+                return Err(CoreError::new(
+                    ErrorCode::EInvalid,
+                    "push needs at least one update",
+                ));
+            }
+            // Every update refused locally: no bytes moved, so finalize
+            // the prepared plan as locally rejected with its per-ref
+            // reasons instead of stranding it without a receipt.
+            plan.refuse_locally(early.clone()).map_err(to_core)?;
+            let (state, refs) = map_outcomes(plan.state, &early)?;
+            return self.finish_send(plan, state, refs);
         }
         let outcome = match http {
             Some(HttpAdv { base, adv }) => smart_http::push_pack(
@@ -565,8 +641,22 @@ impl BlockingJob {
     ) -> Result<SentPush, CoreError> {
         let store = self.coordinator.store();
         let kind = store.hash_kind();
-        let current = store.fact(FactTable::PushPlans, plan.id.as_bytes())?;
+        let plan_id = plan.id;
+        let names: Vec<Vec<u8>> = refs
+            .iter()
+            .map(|row| row.remote_ref.as_bytes().to_vec())
+            .collect();
+        let current = store.fact(FactTable::PushPlans, plan_id.as_bytes())?;
         let terminal_fact = plan.persist_mutation(kind, current).map_err(to_core)?;
+        // Record the guard on the worker: the invocation future may be
+        // dropped while this closure still runs, and an `Uncertain`
+        // plan's block must not depend on the lane half surviving.
+        self.registry.note_push_terminal(
+            &self.repo,
+            plan_id,
+            &names,
+            state == PushState::Uncertain,
+        )?;
         Ok(SentPush {
             reply: PushReply {
                 outcome: pending_outcome(self.session, RequestId::generate()),
@@ -575,7 +665,6 @@ impl BlockingJob {
                 refs: BoundedList::complete(refs)?,
             },
             terminal_fact,
-            state,
         })
     }
 
@@ -951,7 +1040,6 @@ struct HttpAdv {
 struct SentPush {
     reply: PushReply,
     terminal_fact: ruk_core::store::FactMutation,
-    state: PushState,
 }
 
 #[cfg(test)]
@@ -1030,6 +1118,19 @@ mod tests {
         assert_eq!(state, PushState::Confirmed);
         assert!(matches!(refs[0].status, PushRefStatus::Confirmed { .. }));
         assert!(matches!(refs[1].status, PushRefStatus::Rejected { .. }));
+    }
+
+    #[test]
+    fn map_outcomes_rejected_reports_local_refusals() {
+        let outcomes = vec![RefOutcome {
+            name: b"refs/heads/a".to_vec(),
+            result: RefResult::Rejected {
+                reason: "rejected a (non-fast-forward)".to_owned(),
+            },
+        }];
+        let (state, refs) = map_outcomes(PlanState::Rejected, &outcomes).expect("maps");
+        assert_eq!(state, PushState::Rejected);
+        assert!(matches!(refs[0].status, PushRefStatus::Rejected { .. }));
     }
 
     #[test]

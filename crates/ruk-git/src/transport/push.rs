@@ -1297,6 +1297,35 @@ mod tests {
     }
 
     #[test]
+    fn refuse_locally_finalizes_all_local_refusals() {
+        let mut plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://host.x/r.git".to_vec(),
+            false,
+            Vec::new(),
+        );
+        plan.refuse_locally(vec![RefOutcome {
+            name: b"refs/heads/a".to_vec(),
+            result: RefResult::Rejected {
+                reason: "rejected a (non-fast-forward)".to_owned(),
+            },
+        }])
+        .expect("prepared plan refuses locally");
+        assert_eq!(plan.state, PushState::Rejected);
+        let mut sending = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://host.x/r.git".to_vec(),
+            false,
+            Vec::new(),
+        );
+        sending.begin_send().expect("prepared plan sends");
+        assert!(
+            sending.refuse_locally(Vec::new()).is_err(),
+            "a plan past Prepared cannot refuse locally"
+        );
+    }
+
+    #[test]
     fn legacy_rows_decode_without_userinfo() {
         let id = PlanId::generate();
         let dirty = PushPlanRecord {

@@ -1422,7 +1422,7 @@ impl HostedCoordinator {
     /// Serves one `show` read: a commit with its record, or one object.
     /// Reads hold no lane and publish nothing.
     fn read_show(&self, args: &ShowArgs) -> Result<ShowReply, CoreError> {
-        use super::reads::{change_head, head_commit, inline_body};
+        use super::reads::{bounded_object_bytes, change_head, head_commit, inline_body};
         use crate::store::types::ObjectKind as StoreKind;
         let view = current_view(&self.store)?;
         let body = match &args.target {
@@ -1444,8 +1444,11 @@ impl HostedCoordinator {
                 }
             }
             ShowTarget::Object { oid } => {
-                let mut object = self.store.read(*oid).map_err(CoreError::from)?;
-                let kind = match object.kind {
+                // The length check runs before the object loads: a
+                // multi-gibibyte blob must refuse before allocating a
+                // body the control frame could never carry.
+                let (store_kind, bytes) = bounded_object_bytes(&self.store, *oid)?;
+                let kind = match store_kind {
                     StoreKind::Blob => crate::protocol::ObjectKind::Blob,
                     StoreKind::Tree => crate::protocol::ObjectKind::Tree,
                     StoreKind::Commit => crate::protocol::ObjectKind::Commit,
@@ -1457,12 +1460,6 @@ impl HostedCoordinator {
                         ));
                     }
                 };
-                let mut bytes = Vec::new();
-                use std::io::Read as _;
-                object
-                    .bytes
-                    .read_to_end(&mut bytes)
-                    .map_err(|err| CoreError::new(ErrorCode::EIo, err.to_string()))?;
                 let size = u64::try_from(bytes.len()).map_err(|_| {
                     CoreError::new(ErrorCode::EInvalid, "object size overflows u64")
                 })?;

@@ -55,7 +55,7 @@ use ruk_git::transport::archive::{
     ArchivePlan, TarSink, count_commit_tar, plan_commit_archive, stream_commit_tar,
 };
 use ruk_git::transport::credentials::TransportAuth;
-use ruk_git::transport::host::{HookCall, HookReply, HostPolicy, hook_bridge};
+use ruk_git::transport::host::{HookCall, HookReply, HookServer, HostPolicy, hook_bridge};
 use ruk_git::transport::net::EgressPolicy;
 
 use crate::archive_zip::ZipTranscoder;
@@ -2621,6 +2621,46 @@ async fn pump_one_exchange(
     .unwrap_or_else(|_| HookReply::reject_all("hook deadline elapsed"))
 }
 
+/// Awaits a serve worker after its stream closed, draining hook
+/// exchanges with fail-closed refusals.
+///
+/// The worker blocks in `HookClient::exchange` until the pump relays a
+/// reply; once the stream closes nobody relays, so awaiting the worker
+/// directly would hang its transport permit whenever an exchange is
+/// queued or lands after the disconnect. Each drained exchange refuses
+/// the whole push closed, matching the exchange's own fallback for a
+/// departed pump.
+#[cfg(unix)]
+pub(crate) async fn drain_disconnected_serve(
+    serve: impl Future<Output = Result<Result<(Vec<u8>, Vec<u64>), CoreError>, CoreError>>,
+    server: &mut HookServer,
+) -> Result<(Vec<u8>, Vec<u64>), CoreError> {
+    tokio::pin!(serve);
+    loop {
+        tokio::select! {
+            done = &mut serve => {
+                return match done {
+                    Ok(inner) => inner,
+                    Err(err) => Err(err),
+                };
+            }
+            exchange = server.recv() => {
+                let Some(exchange) = exchange else {
+                    // The policy is gone, so the serve task owns the
+                    // outcome now; await it directly.
+                    return match serve.await {
+                        Ok(inner) => inner,
+                        Err(err) => Err(err),
+                    };
+                };
+                let _ = exchange
+                    .reply
+                    .send(HookReply::reject_all("hook stream closed"));
+            }
+        }
+    }
+}
+
 /// Serves one hosted receive-pack round through hook callbacks: session
 /// capabilities authorize each command, the sync serve judges through a
 /// [`HostPolicy`] on the transport bulkhead while this task pumps hook
@@ -2730,10 +2770,13 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
             frame = input.recv() => {
                 let Some(frame) = frame else {
                     deliver = false;
-                    break match serve.await {
-                        Ok(inner) => inner,
-                        Err(err) => Err(err),
-                    };
+                    // The stream closed: the serve worker may be parked
+                    // in `HookClient::exchange` waiting for a reply this
+                    // pump will never relay. Keep draining exchanges
+                    // with fail-closed refusals until the worker
+                    // finishes, so the disconnect releases its
+                    // transport permit instead of hanging it.
+                    break drain_disconnected_serve(serve, &mut server).await;
                 };
                 match frame.kind {
                     ipc::FrameKind::Cancel => {
@@ -4876,6 +4919,15 @@ pub(crate) async fn dispatch_method(
                     ipc::encode_control(&ReplyEnvelope::success(None, reply))
                 }
                 ruk_core::protocol::MethodKind::Mutation => {
+                    // Repo-wide landing policy is an admin function, like
+                    // the repo.* methods: a session alone must not rewrite
+                    // it, so the check runs before any preparation.
+                    if method == Method::PolicySet && !caller.is_admin() {
+                        return Err(CoreError::new(
+                            ErrorCode::EForbidden,
+                            format!("method `{}` needs an admin peer", method.as_str()),
+                        ));
+                    }
                     coordinator
                         .check_session(caller.principal, session, cancel)
                         .await?;

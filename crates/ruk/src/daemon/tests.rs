@@ -5724,6 +5724,108 @@ async fn typed_land_execute_refusal_names_plan() {
 }
 
 #[tokio::test]
+async fn disconnected_serve_drains_queued_hook_exchange() {
+    use ruk_core::capability::{Capabilities, RefPattern};
+    use ruk_git::transport::host::{HostPolicy, hook_bridge};
+    use ruk_git::transport::policy::{ReceiveBatch, ReceiveCommand, ReceivePolicy, RefVerdict};
+
+    let caps = Capabilities {
+        push_refs: vec![RefPattern::parse("refs/heads/**").expect("pattern parses")],
+        ..Capabilities::default()
+    };
+    let (client, mut server) = hook_bridge();
+    let policy = std::sync::Arc::new(HostPolicy::new(
+        caps,
+        std::time::Duration::from_secs(30),
+        client,
+    ));
+    let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+    // The worker judges on its own thread and parks in `exchange`,
+    // exactly as the bulkhead serve does; nothing here relays hook
+    // frames, so the queued exchange would hang a bare `serve.await`.
+    std::thread::spawn(move || {
+        let kind = ruk_core::ids::HashKind::Sha256;
+        let tip = Oid::from_bytes(&[1u8; 32]).expect("tip parses");
+        let commands = [ReceiveCommand {
+            name: b"refs/heads/main".to_vec(),
+            old: kind.zero_oid(),
+            new: tip,
+            live: true,
+        }];
+        let batch = ReceiveBatch {
+            commands: &commands,
+            push_options: &[],
+            push_options_negotiated: false,
+            quarantine: None,
+            kind,
+            atomic: false,
+            interrupt: &Interrupt::none(),
+            new_commits: vec![tip],
+            new_commits_truncated: false,
+            pack_bytes: 0,
+        };
+        let verdicts = policy.pre_receive(&batch);
+        let _ = verdict_tx.send(verdicts);
+    });
+    // The serve half completes once the worker observes the drained
+    // refusal; the assertions below run on that completion.
+    let serve = async move {
+        let verdicts = verdict_rx
+            .await
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "hook worker died"))?;
+        assert!(
+            matches!(verdicts.as_slice(), [RefVerdict::RejectPush { .. }]),
+            "drained exchange fails the push closed: {verdicts:?}"
+        );
+        Ok::<_, CoreError>(Ok((vec![7u8], vec![3u64])))
+    };
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        super::drain_disconnected_serve(serve, &mut server),
+    )
+    .await
+    .expect("drain finishes instead of hanging")
+    .expect("serve outcome relays");
+    assert_eq!(out, (vec![7u8], vec![3u64]));
+}
+
+#[tokio::test]
+async fn policy_set_needs_an_admin_peer() {
+    let root = temp_root("policy-admin");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(1, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let args = sonic_rs::to_string(&ruk_core::protocol::PolicySetArgs {
+        requirements: Vec::new(),
+        trusted_signers: Vec::new(),
+    })
+    .expect("policy args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "policy.set",
+        Some(&RequestId::generate().to_string()),
+        Some(args),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(3, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
     use ruk_core::coord::{Principal, cancellation};
 
