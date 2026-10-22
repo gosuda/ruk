@@ -125,6 +125,9 @@ pub(crate) struct Ctx {
     /// Advisory bytes for standard error (e.g. `Switched to branch ...`),
     /// kept off the stdout return the way git splits its descriptors.
     pub(crate) stderr: Vec<u8>,
+    /// The egress policy every network dial this command opens must
+    /// satisfy: default-deny, with loopback allowed in the test harness.
+    pub(crate) egress: ruk_git::transport::net::EgressPolicy,
 }
 
 impl Ctx {
@@ -206,14 +209,18 @@ pub(crate) struct CliOutcome {
 /// Success carries the verb's stdout bytes with code zero; failure renders
 /// the same `ruk: {err}` line [`run`] would print, with the error's native
 /// exit status.
-pub(crate) fn run_captured(argv: Vec<String>, env: CliEnv) -> CliOutcome {
+pub(crate) fn run_captured(
+    argv: Vec<String>,
+    env: CliEnv,
+    egress: ruk_git::transport::net::EgressPolicy,
+) -> CliOutcome {
     let secrets = captured_secrets(&argv, &env);
     let scrub = |bytes: &[u8]| {
         ruk_git::transport::credentials::scrub_userinfo_bytes(
             &ruk_git::transport::credentials::scrub_secrets(bytes, &secrets),
         )
     };
-    match run_inner(&argv, env) {
+    match run_inner(&argv, env, egress) {
         Ok((stdout, stderr)) => CliOutcome {
             stdout,
             stderr: scrub(&stderr),
@@ -265,7 +272,11 @@ pub(crate) fn read_stdin_text(env: &CliEnv) -> Result<String, GitError> {
 
 #[must_use]
 pub(crate) fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
-    let outcome = run_captured(argv, env);
+    let outcome = run_captured(
+        argv,
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private(),
+    );
     if !outcome.stdout.is_empty() {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
@@ -327,7 +338,11 @@ fn serve_verb_for_dashed(name: &str) -> Option<&'static str> {
 }
 
 /// Parses globals, discovers the repository, and dispatches the verb.
-pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8>), GitError> {
+pub(crate) fn run_inner(
+    argv: &[String],
+    env: CliEnv,
+    egress: ruk_git::transport::net::EgressPolicy,
+) -> Result<(Vec<u8>, Vec<u8>), GitError> {
     let rest = argv.first().map_or(&[][..], |_| &argv[1.min(argv.len())..]);
     let (globals, verb, verb_args) = split_globals(rest)?;
     let mut env = env;
@@ -371,7 +386,7 @@ pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8
     // commit lane. It stays out of the advertised table (and its count) the
     // way git keeps its dashed server commands off `git help`.
     if verb == "coordinator" {
-        let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, false)?;
+        let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, false, egress)?;
         let stdout = coordinator::serve(&mut ctx, &verb_args)?;
         return Ok((stdout, std::mem::take(&mut ctx.stderr)));
     }
@@ -381,7 +396,15 @@ pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8
     if verb_args.iter().any(|arg| arg == "--help") {
         return Ok((dispatch::help_text(Some(entry)), Vec::new()));
     }
-    let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, entry.needs_repo)?;
+    let mut ctx = open_ctx(
+        env,
+        git_dir,
+        work_tree,
+        bare,
+        cli_config,
+        entry.needs_repo,
+        egress,
+    )?;
     let stdout = (entry.run)(&mut ctx, &verb_args)?;
     Ok((stdout, std::mem::take(&mut ctx.stderr)))
 }
@@ -498,6 +521,7 @@ fn open_ctx(
     bare: bool,
     cli_config: Vec<(String, String)>,
     needs_repo: bool,
+    egress: ruk_git::transport::net::EgressPolicy,
 ) -> Result<Ctx, GitError> {
     let budget = || Arc::new(PreparationBudget::reference_defaults());
     if !needs_repo {
@@ -516,6 +540,7 @@ fn open_ctx(
             bare,
             cli_config,
             stderr: Vec::new(),
+            egress,
         });
     }
     let root = find_root(&env.cwd, git_dir.as_deref(), bare)?;
@@ -538,6 +563,7 @@ fn open_ctx(
         bare,
         cli_config,
         stderr: Vec::new(),
+        egress,
     })
 }
 
@@ -550,7 +576,15 @@ pub(crate) fn lfs_payload_sync_native(
 ) -> Result<Vec<u8>, GitError> {
     let mut env = CliEnv::capture();
     env.cwd = repo;
-    let mut ctx = open_ctx(env, None, None, false, Vec::new(), true)?;
+    let mut ctx = open_ctx(
+        env,
+        None,
+        None,
+        false,
+        Vec::new(),
+        true,
+        ruk_git::transport::net::EgressPolicy::deny_private(),
+    )?;
     let mut args = from.map_or_else(Vec::new, |dir| vec!["--from".to_owned(), dir]);
     if upload {
         args.push("--upload".to_owned());

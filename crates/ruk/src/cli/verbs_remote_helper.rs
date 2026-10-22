@@ -372,6 +372,7 @@ fn helper_ctx(session: &HelperSession, store: Store) -> Result<Ctx, GitError> {
         bare: true,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private(),
     })
 }
 

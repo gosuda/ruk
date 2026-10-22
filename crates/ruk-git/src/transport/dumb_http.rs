@@ -95,7 +95,7 @@ fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
 fn get(url: &str, call: RpcCall<'_>) -> Result<(u16, Vec<u8>), GitError> {
     let owned = policy_headers(url, call.auth, &[("Accept", "*/*")], call.extra);
     let mut body = Vec::new();
-    let (status, _) = http::get_to_writer(url, &borrow(&owned), &mut body)?;
+    let (status, _) = http::get_to_writer(url, &borrow(&owned), &mut body, call.egress)?;
     Ok((status, body))
 }
 
@@ -548,6 +548,7 @@ mod tests {
             HashKind::Sha1,
             RpcCall {
                 extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
                 auth: &auth,
                 interrupt: &Interrupt::none(),
             },
@@ -847,6 +848,7 @@ mod tests {
             kind,
             RpcCall {
                 extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
                 auth: &AuthPolicy::explicit(TransportAuth::none()),
                 interrupt: &Interrupt::none(),
             },
@@ -872,6 +874,7 @@ mod tests {
             IngestLimits::default(),
             RpcCall {
                 extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
                 auth: &AuthPolicy::explicit(TransportAuth::none()),
                 interrupt: &Interrupt::none(),
             },
@@ -945,6 +948,7 @@ mod tests {
             IngestLimits::default(),
             RpcCall {
                 extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
                 auth: &AuthPolicy::explicit(TransportAuth::none()),
                 interrupt: &Interrupt::none(),
             },

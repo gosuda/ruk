@@ -441,7 +441,7 @@ pub fn same_origin(a: &str, b: &str) -> Result<bool, GitError> {
 /// # Errors
 /// [`GitError::Invalid`] for an unusable server name, [`GitError::Io`]
 /// when no address resolves or none connects within the timeout.
-fn connect(parsed: &Url) -> Result<Stream, GitError> {
+fn connect(parsed: &Url, policy: &super::net::EgressPolicy) -> Result<Stream, GitError> {
     let label = format!("{}:{}", parsed.host, parsed.port);
     let addrs: Vec<std::net::SocketAddr> = (parsed.host.as_str(), parsed.port)
         .to_socket_addrs()
@@ -454,6 +454,7 @@ fn connect(parsed: &Url) -> Result<Stream, GitError> {
             detail: format!("cannot resolve {label}: no addresses"),
         });
     }
+    let addrs = policy.filter_addrs(&label, &addrs)?;
     let mut last_err = String::from("no addresses tried");
     let mut socket = None;
     for addr in addrs {
@@ -806,9 +807,10 @@ fn request_head(
     method: &str,
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
+    policy: &super::net::EgressPolicy,
 ) -> Result<ResponseHead, GitError> {
     let parsed = parse_url(url)?;
-    let mut stream = connect(&parsed)?;
+    let mut stream = connect(&parsed, policy)?;
     send_request(&mut stream, method, &parsed, headers, body)?;
     let mut reader = BufReader::new(stream);
     let (status, headers) = read_head(&mut reader)?;
@@ -824,8 +826,9 @@ pub fn post_json(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
+    policy: &super::net::EgressPolicy,
 ) -> Result<HttpResponse, GitError> {
-    let (mut reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
+    let (mut reader, status, headers) = request_head(url, "POST", headers, Some(body), policy)?;
     let mut reply = Vec::new();
     read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
     Ok(HttpResponse {
@@ -984,8 +987,9 @@ pub fn post_open(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
+    policy: &super::net::EgressPolicy,
 ) -> Result<OpenResponse, GitError> {
-    let (reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
+    let (reader, status, headers) = request_head(url, "POST", headers, Some(body), policy)?;
     let framing = open_framing(&headers)?;
     Ok((HttpBodyReader { reader, framing }, status, headers))
 }
@@ -1025,8 +1029,9 @@ pub fn put_bytes(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
+    policy: &super::net::EgressPolicy,
 ) -> Result<HttpResponse, GitError> {
-    let (mut reader, status, headers) = request_head(url, "PUT", headers, Some(body))?;
+    let (mut reader, status, headers) = request_head(url, "PUT", headers, Some(body), policy)?;
     let mut reply = Vec::new();
     read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
     Ok(HttpResponse {
@@ -1051,9 +1056,10 @@ pub fn put_stream(
     headers: &[(&str, &str)],
     len: u64,
     body: &mut dyn Read,
+    policy: &super::net::EgressPolicy,
 ) -> Result<HttpResponse, GitError> {
     let parsed = parse_url(url)?;
-    let mut stream = connect(&parsed)?;
+    let mut stream = connect(&parsed, policy)?;
     send_head(&mut stream, "PUT", &parsed, headers, Some(len))?;
     let sent = std::io::copy(&mut body.take(len), &mut stream).map_err(|err| GitError::Io {
         detail: format!("cannot send PUT {} body: {err}", parsed.path),
@@ -1092,6 +1098,7 @@ pub fn get_to_writer(
     url: &str,
     headers: &[(&str, &str)],
     sink: &mut dyn Write,
+    policy: &super::net::EgressPolicy,
 ) -> Result<(u16, Vec<(String, String)>), GitError> {
     let mut current = url.to_owned();
     let mut owned: Vec<(String, String)> = headers
@@ -1103,7 +1110,7 @@ pub fn get_to_writer(
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        let (mut reader, status, reply) = request_head(&current, "GET", &borrowed, None)?;
+        let (mut reader, status, reply) = request_head(&current, "GET", &borrowed, None, policy)?;
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             let next = header(&reply, "location")
                 .ok_or_else(|| GitError::Invalid {
@@ -1130,15 +1137,20 @@ pub fn get_to_writer(
 ///
 /// # Errors
 /// Routing, framing, and transport failures as [`GitError`].
-pub fn get(url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, GitError> {
+pub fn get(
+    url: &str,
+    headers: &[(&str, &str)],
+    policy: &super::net::EgressPolicy,
+) -> Result<HttpResponse, GitError> {
     let mut body = Vec::new();
-    let (status, headers) =
-        request_head(url, "GET", headers, None).and_then(|(mut reader, status, headers)| {
+    let (status, headers) = request_head(url, "GET", headers, None, policy).and_then(
+        |(mut reader, status, headers)| {
             if is_success(status) {
                 read_body(&mut reader, &headers, &mut body, Some(MAX_BUFFERED_BYTES))?;
             }
             Ok((status, headers))
-        })?;
+        },
+    )?;
     Ok(HttpResponse {
         status,
         headers,
@@ -1570,6 +1582,7 @@ mod tests {
                 ("Authorization", "Bearer tok"),
             ],
             b"{\"operation\":\"download\"}",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("post");
         assert_eq!(reply.status, 200);
@@ -1595,9 +1608,13 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
         ]);
         let mut sunk = Vec::new();
-        let (status, _) =
-            get_to_writer(&format!("http://127.0.0.1:{port}/payload"), &[], &mut sunk)
-                .expect("get");
+        let (status, _) = get_to_writer(
+            &format!("http://127.0.0.1:{port}/payload"),
+            &[],
+            &mut sunk,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+        )
+        .expect("get");
         assert_eq!(status, 200);
         assert_eq!(sunk, b"hello world");
         let requests = server.join().expect("server");
@@ -1646,6 +1663,7 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[("Content-Type", "application/x-git-upload-pack-request")],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1670,6 +1688,7 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1690,6 +1709,7 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1710,6 +1730,7 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1717,6 +1738,45 @@ mod tests {
         body.read_to_end(&mut decoded).expect("read");
         assert_eq!(decoded, b"0008NAK\n0000");
         server.join().expect("server");
+    }
+
+    #[test]
+    fn egress_denies_loopback_dial() {
+        let (port, _server) = fake_server(vec![(200, vec![], b"payload".to_vec())]);
+        let mut sunk = Vec::new();
+        let err = get_to_writer(
+            &format!("http://127.0.0.1:{port}/payload"),
+            &[],
+            &mut sunk,
+            &super::super::net::EgressPolicy::deny_private(),
+        )
+        .expect_err("loopback must not dial under default-deny");
+        assert!(
+            err.to_string().contains("egress policy refuses 127.0.0.1"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn egress_rechecks_every_redirect_hop() {
+        let (first_port, first) = fake_server(vec![(
+            302,
+            vec![("Location".to_owned(), "http://10.9.9.9:1/real".to_owned())],
+            b"moved".to_vec(),
+        )]);
+        let mut sunk = Vec::new();
+        let err = get_to_writer(
+            &format!("http://127.0.0.1:{first_port}/start"),
+            &[],
+            &mut sunk,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+        )
+        .expect_err("redirect to private space must not dial");
+        assert!(
+            err.to_string().contains("egress policy refuses 10.9.9.9"),
+            "{err:?}"
+        );
+        first.join().expect("first server");
     }
 
     #[test]
@@ -1737,6 +1797,7 @@ mod tests {
             &format!("http://127.0.0.1:{first_port}/signed"),
             &[("Authorization", "Bearer tok")],
             &mut sunk,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("get");
         assert_eq!(status, 200);
@@ -1884,6 +1945,7 @@ mod tests {
             &url,
             &[("Content-Type", "application/octet-stream")],
             b"payload-bytes",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("put");
         assert_eq!(reply.status, 200);
@@ -1908,6 +1970,7 @@ mod tests {
             &[("Content-Type", "application/octet-stream")],
             u64::try_from(payload.len()).expect("payload fits"),
             &mut body,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
         )
         .expect("put");
         assert_eq!(reply.status, 200);

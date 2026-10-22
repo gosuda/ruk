@@ -100,6 +100,7 @@ fn repo_ctx(root: &Path, mut env: CliEnv) -> Ctx {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     }
 }
 
@@ -116,6 +117,7 @@ fn seeded_repo(case: &str, file: &str, body: &[u8]) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -786,6 +788,7 @@ fn clone_fetch_push_local_cycle() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(
         verbs_repo::clone,
@@ -1157,6 +1160,7 @@ fn indexed_repo(case: &str, pack: Vec<u8>) -> (PathBuf, CliEnv, Ctx) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(verbs_repo::init, &mut init_ctx, &["dst"]).expect("init");
     let root = base.join("dst");
@@ -1463,7 +1467,12 @@ fn upload_archive_argv_reaches_serve_half() {
         "upload-archive".to_owned(),
         root.to_str().expect("utf8 root").to_owned(),
     ];
-    let (stdout, _) = super::run_inner(&argv, env).expect("upload-archive routes");
+    let (stdout, _) = super::run_inner(
+        &argv,
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    )
+    .expect("upload-archive routes");
     assert!(
         stdout.starts_with(b"0008ACK\n0000"),
         "argv reaches serve_upload_archive: {stdout:?}"
@@ -1532,7 +1541,12 @@ fn dashed_upload_archive_argv_reaches_serve_half() {
         "git-upload-archive".to_owned(),
         root.to_str().expect("utf8 root").to_owned(),
     ];
-    let (stdout, _) = super::run_inner(&argv, env).expect("dashed routes");
+    let (stdout, _) = super::run_inner(
+        &argv,
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    )
+    .expect("dashed routes");
     assert!(
         stdout.starts_with(b"0008ACK\n0000"),
         "dashed argv reaches serve_upload_archive: {stdout:?}"
@@ -1622,6 +1636,7 @@ fn walk_orders_merge_topology_by_committer_date() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -1708,6 +1723,7 @@ fn log_excluding_skips_branch_in_date_order() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -2286,7 +2302,11 @@ fn captured_errors_scrub_userinfo_from_stderr() {
     let (root, mut env) = seeded_repo("captured-canary", "a.txt", b"a\n");
     env.cwd = root;
     let url = format!("http://ada:CANARY-s3cret@127.0.0.1:{port}/a.git");
-    let outcome = super::run_captured(vec!["ruk".to_owned(), "fetch".to_owned(), url], env);
+    let outcome = super::run_captured(
+        vec!["ruk".to_owned(), "fetch".to_owned(), url],
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    );
     server.join().expect("server");
     assert_ne!(outcome.code, 0, "a 401 fails the verb");
     let stderr = String::from_utf8_lossy(&outcome.stderr);
@@ -2757,6 +2777,7 @@ fn lfs_pointer_repo(case: &str) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -3426,6 +3447,7 @@ fn bundle_create_verify_unbundle_round_trip() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(verbs_repo::init, &mut naked, &["repo2"]).expect("init");
     let root2 = base.join("repo2");
@@ -3483,6 +3505,7 @@ fn bundle_clone_from_file_plants_refs() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     let out =
         String::from_utf8(run(verbs_repo::clone, &mut naked, &[&bundle, "cloned"]).expect("clone"))
@@ -4051,6 +4074,7 @@ fn blame_repo(case: &str) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     (base.join("repo"), env)
@@ -4780,6 +4804,7 @@ fn submodule_case(case: &str) -> (PathBuf, CliEnv, PathBuf, String) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["parent".to_owned()]).expect("init");
     let root = base.join("parent");
@@ -4935,6 +4960,7 @@ fn plumbing_repo(case: &str, files: &[(&str, &[u8])]) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -4971,6 +4997,7 @@ fn file_ctx(base: &Path, env: CliEnv) -> Ctx {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     }
 }
 
@@ -5780,6 +5807,7 @@ fn fastio_import_creates_branch_history() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -5840,6 +5868,7 @@ fn fastio_export_import_roundtrip() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut dest_ctx, &["repo".to_owned()]).expect("init");
     let dest_root = dest_base.join("repo");
@@ -6438,6 +6467,7 @@ fn log_boundary_ignores_disjoint_root() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -8085,6 +8115,7 @@ fn wave_k_remote_helper_export_round_trip() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx_init, &["repo".to_owned()]).expect("init");
     let root_b = base_b.join("repo");
@@ -8137,6 +8168,7 @@ fn wave_k_remote_helper_verb_entry() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     let url = root.display().to_string();
     let out = run(
@@ -8998,6 +9030,7 @@ fn hooks_pre_push_blocks_local_push() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(
         verbs_repo::init,
@@ -9111,6 +9144,7 @@ fn wave_l_stat_cache_clean_repo_reports_empty_status() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -9157,6 +9191,7 @@ fn wave_l_stat_cache_old_files_trust_without_rehash() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
