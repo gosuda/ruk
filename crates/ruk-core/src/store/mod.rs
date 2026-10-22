@@ -1424,16 +1424,20 @@ impl Store {
         let mut kept: Option<u64> = None;
         for row in &page.rows {
             let event: StoreEvent = decode_store_event(&row.value)?;
-            if event.at < cutoff_millis {
-                out.push(FactMutation {
-                    table: FactTable::Events,
-                    key: row.key.clone(),
-                    expected: FactExpectation::Value(row.value.clone()),
-                    value: None,
-                });
-            } else if kept.is_none() {
+            if event.at >= cutoff_millis {
+                // The first kept row ends the prunable prefix. `at` is wall
+                // clock: after a backward step a later row can carry an old
+                // stamp, and pruning it would leave a hole above `oldest`
+                // that a follower skips with no expired signal.
                 kept = Some(Self::seq_from_event_key(&row.key)?);
+                break;
             }
+            out.push(FactMutation {
+                table: FactTable::Events,
+                key: row.key.clone(),
+                expected: FactExpectation::Value(row.value.clone()),
+                value: None,
+            });
         }
         if out.is_empty() {
             return Ok(Vec::new());
@@ -4210,6 +4214,77 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, 2);
         assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 2 });
+    }
+
+    /// Seeds events `(seq, at)` with head and oldest, for sweep tests.
+    fn seed_stamped_events(store: &Store, stamps: &[(u64, u64)], head: u64) {
+        let mut facts: Vec<FactMutation> = stamps
+            .iter()
+            .map(|&(seq, at)| {
+                let event = StoreEvent {
+                    name: format!("refs/heads/e{seq}").into_bytes(),
+                    old: None,
+                    new: Some(b"v1".to_vec()),
+                    at,
+                    source: EventSource::Lane,
+                    operation: None,
+                    request_id: None,
+                    session: None,
+                    on_behalf_of: None,
+                };
+                FactMutation {
+                    table: FactTable::Events,
+                    key: seq.to_be_bytes().to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(encode("event", &event).expect("encode")),
+                }
+            })
+            .collect();
+        facts.push(FactMutation {
+            table: FactTable::EventHead,
+            key: EVENT_HEAD_KEY.to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(encode("event head", &EventHeadRow { head, oldest: 1 }).expect("encode")),
+        });
+        store
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("seed events");
+    }
+
+    /// The sweep prunes only the leading run of expired events and stops at
+    /// the first kept one. A later row whose stamp is old (a backward clock
+    /// step) must survive, or a follower resuming below it skips it silently.
+    #[test]
+    fn events_sweep_stops_at_the_first_kept_event() {
+        let leading_kept = TempRoot::new("events-sweep-leading-kept");
+        let store = create(&leading_kept, HashKind::Sha1);
+        seed_stamped_events(&store, &[(1, 9_000), (2, 1_000), (3, 1_000)], 3);
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        assert!(
+            deletions.is_empty(),
+            "a kept leading row prunes nothing, got {} mutations",
+            deletions.len()
+        );
+
+        let old_kept_old = TempRoot::new("events-sweep-old-kept-old");
+        let store = create(&old_kept_old, HashKind::Sha1);
+        seed_stamped_events(&store, &[(1, 1_000), (2, 9_000), (3, 1_000)], 3);
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        let pruned: Vec<Vec<u8>> = deletions
+            .iter()
+            .filter(|mutation| mutation.table == FactTable::Events)
+            .map(|mutation| mutation.key.clone())
+            .collect();
+        assert_eq!(
+            pruned,
+            vec![1_u64.to_be_bytes().to_vec()],
+            "only the leading expired row goes; row 3 above the kept row stays"
+        );
     }
 
     #[test]
