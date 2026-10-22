@@ -47,6 +47,7 @@ pub mod refs;
     reason = "unwired subsystem; public surface not yet re-exported"
 )]
 mod revset;
+pub mod search;
 pub mod store;
 pub mod tree;
 mod workcopy;

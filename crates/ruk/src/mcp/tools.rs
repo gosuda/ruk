@@ -8,19 +8,20 @@
 //! shape.
 //!
 //! The nine change operations run against the store exactly as the CLI's
-//! `New` and `Describe` commands do. The four read tools that need
+//! `New` and `Describe` commands do. The five read tools that need
 //! coordinator state degrade to the local semantics documented on
 //! [`crate::mcp`]: `revset_eval` reports `E_UNSUPPORTED_OPERATION`,
 //! `refs_list` pages without enforcing cursor binding,
-//! `attestation_query` reads with an allow-all checkpoint, and
-//! `events_tail` answers one non-waiting page with no lane view.
+//! `attestation_query` reads with an allow-all checkpoint,
+//! `events_tail` answers one non-waiting page with no lane view, and
+//! `content_search` scans serially with stateless continuations.
 
 use ruk_core::attestation::{Progress, StatementFilter};
 use ruk_core::bytes::ByteString;
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::protocol::{
     AttestListArgs, AttestationRecord, EventsTailArgs, PageLimit, PageRequest, QueryArgs,
-    TailedEvent,
+    ScanExhaustion, SearchArgs, SearchHit, TailedEvent,
 };
 use ruk_core::store::Store;
 use ruk_core::store::types::{decode_event_target, decode_store_event};
@@ -69,6 +70,9 @@ pub(crate) const TOOL_ATTESTATION_QUERY: &str = "attestation_query";
 /// The wire name of the `events_tail` tool.
 pub(crate) const TOOL_EVENTS_TAIL: &str = "events_tail";
 
+/// The wire name of the `content_search` tool.
+pub(crate) const TOOL_CONTENT_SEARCH: &str = "content_search";
+
 /// One exposed tool: its wire name, what it does, and the existing Rust
 /// request type its arguments decode as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +85,7 @@ pub(crate) struct ToolInfo {
     pub params_type: &'static str,
 }
 
-/// The full tool table in wire order: nine change operations, then the four
+/// The full tool table in wire order: nine change operations, then the five
 /// degraded reads.
 pub(crate) const TOOL_TABLE: &[ToolInfo] = &[
     ToolInfo {
@@ -149,6 +153,11 @@ pub(crate) const TOOL_TABLE: &[ToolInfo] = &[
         description: "Page ref events after a sequence with no waiting; long-poll is forced to zero locally.",
         params_type: "ruk_core::protocol::EventsTailArgs",
     },
+    ToolInfo {
+        name: TOOL_CONTENT_SEARCH,
+        description: "Search one revision tree serially; cursor binding is not enforced locally and continuations are stateless.",
+        params_type: "ruk_core::protocol::SearchArgs",
+    },
 ];
 
 /// Typed identity of one tool in [`TOOL_TABLE`].
@@ -180,6 +189,8 @@ pub(crate) enum Tool {
     AttestationQuery,
     /// Pages ref events after a sequence with no waiting.
     EventsTail,
+    /// Searches one revision tree serially without a coordinator.
+    ContentSearch,
 }
 
 impl Tool {
@@ -202,6 +213,7 @@ impl Tool {
             TOOL_REFS_LIST => Ok(Self::RefsList),
             TOOL_ATTESTATION_QUERY => Ok(Self::AttestationQuery),
             TOOL_EVENTS_TAIL => Ok(Self::EventsTail),
+            TOOL_CONTENT_SEARCH => Ok(Self::ContentSearch),
             _ => Err(CoreError::new(
                 ErrorCode::ENotFound,
                 format!("unknown MCP tool `{name}`"),
@@ -233,6 +245,7 @@ impl Tool {
             Self::RefsList => TOOL_REFS_LIST,
             Self::AttestationQuery => TOOL_ATTESTATION_QUERY,
             Self::EventsTail => TOOL_EVENTS_TAIL,
+            Self::ContentSearch => TOOL_CONTENT_SEARCH,
         }
     }
 }
@@ -310,7 +323,45 @@ pub(crate) fn call_on_store(
             request.wait_ms = Some(0);
             tail_events(store, &request)
         }
+        Tool::ContentSearch => {
+            let request: SearchArgs = decode_args(args_json)?;
+            search_content(store, &request)
+        }
     }
+}
+
+/// The local answer of the `content_search` tool: the coordinator reply
+/// without lease binding, plus a stateless resume position.
+#[derive(Debug, serde::Serialize)]
+struct ContentSearchResult {
+    hits: Vec<SearchHit>,
+    truncated: bool,
+    exhausted: ScanExhaustion,
+    scanned_blobs: u64,
+    scanned_bytes: u64,
+    skipped_blobs: u64,
+    /// Resume position; pass these bytes back as the next request's cursor
+    /// position inside any `PageCursor`. The cursor's store, view, query,
+    /// and lease fields are ignored locally: only the position resumes.
+    next: Option<ByteString>,
+}
+
+/// Searches one revision tree serially with stateless continuations: the
+/// cursor position resumes, cursor binding is not enforced locally, and
+/// the view is the revision the arguments resolve. To continue a
+/// truncated page, set the next request's cursor position to the returned
+/// `next` bytes; other cursor fields may carry any values.
+fn search_content(store: &Store, args: &SearchArgs) -> Result<Vec<u8>, CoreError> {
+    let page = ruk_core::search::search_content_local(store, args)?;
+    render(&ContentSearchResult {
+        hits: page.hits,
+        truncated: page.truncated,
+        exhausted: page.exhausted,
+        scanned_blobs: page.scanned_blobs,
+        scanned_bytes: page.scanned_bytes,
+        skipped_blobs: page.skipped_blobs,
+        next: page.next,
+    })
 }
 
 /// Decodes tool arguments into the tool's existing request type.
@@ -487,7 +538,7 @@ mod tests {
 
     #[test]
     fn tool_names_round_trip_through_the_table() {
-        assert_eq!(TOOL_TABLE.len(), 13);
+        assert_eq!(TOOL_TABLE.len(), 14);
         for info in TOOL_TABLE {
             let tool = Tool::from_name(info.name).expect("table names resolve");
             assert_eq!(tool.name(), info.name);

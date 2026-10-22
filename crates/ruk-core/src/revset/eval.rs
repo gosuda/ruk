@@ -1414,7 +1414,7 @@ fn symdiff(a: &BTreeMap<Vec<u8>, Vec<u8>>, b: &BTreeMap<Vec<u8>, Vec<u8>>) -> BT
 
 /// Byte-level glob: `*` spans a segment, `?` is one byte, `**` spans
 /// segments; the pattern must match the whole path. `[` is literal.
-fn glob_match(pattern: &[u8], path: &[u8]) -> bool {
+pub(crate) fn glob_match(pattern: &[u8], path: &[u8]) -> bool {
     if pattern.is_empty() || path.is_empty() {
         return false;
     }

@@ -3318,27 +3318,144 @@ pub struct CompareReply {
     pub exact: bool,
 }
 
-/// `search`: minimal contract; the dedicated search row defines budgets,
-/// pools, and lease cursors.
+/// Longest `search` needle or regex, in bytes.
+pub const SEARCH_PATTERN_MAX_BYTES: usize = 4096;
+
+/// Most include plus exclude globs one `search` request carries.
+pub const SEARCH_MAX_GLOBS: usize = 32;
+
+/// Longest single `search` glob, in bytes.
+pub const SEARCH_GLOB_MAX_BYTES: usize = 1024;
+
+/// Decoded blob bytes one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_MAX_BYTES_SCANNED: u64 = 268_435_456;
+
+/// Most decoded blob bytes one `search` page scans; over-cap budgets refuse.
+pub const SEARCH_MAX_BYTES_SCANNED: u64 = 1_073_741_824;
+
+/// Unique blobs one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_MAX_BLOBS: u32 = 100_000;
+
+/// Milliseconds one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_DEADLINE_MS: u64 = 5_000;
+
+/// Most milliseconds one `search` page scans; over-cap budgets refuse.
+pub const SEARCH_MAX_DEADLINE_MS: u64 = 30_000;
+
+/// Blobs larger than this skip the scan without payload reads.
+pub const SEARCH_SKIP_BLOB_BYTES: u64 = 524_288;
+
+/// Longest match preview a `search` hit carries, in bytes.
+pub const SEARCH_PREVIEW_MAX_BYTES: usize = 1024;
+
+/// `search`: byte-exact or regex code search over one revision's tree,
+/// served from the core-owned search pool with lease-bound cursors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SearchArgs {
-    pub pattern: String,
-    #[serde(default)]
-    pub limit: Option<PageLimit>,
+#[serde(rename_all = "lowercase")]
+pub enum SearchPattern {
+    /// Byte-exact needle; empty needles refuse.
+    Literal(ByteString),
+    /// Rust regex syntax over raw line bytes; empty patterns refuse.
+    Regex(String),
 }
 
+/// Scan budget of one `search` page: every field optional wire-wise, absent
+/// means the default. Over-cap values refuse; they never clamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchBudget {
+    /// Decoded blob bytes scanned before the page seals.
+    #[serde(default)]
+    pub max_bytes_scanned: Option<u64>,
+    /// Unique blobs scanned before the page seals.
+    #[serde(default)]
+    pub max_blobs: Option<u32>,
+    /// Milliseconds before the page seals.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+}
+
+impl SearchBudget {
+    /// The decoded-byte bound the scan enforces.
+    #[must_use]
+    pub fn effective_max_bytes(&self) -> u64 {
+        self.max_bytes_scanned
+            .unwrap_or(SEARCH_DEFAULT_MAX_BYTES_SCANNED)
+    }
+
+    /// The unique-blob bound the scan enforces.
+    #[must_use]
+    pub fn effective_max_blobs(&self) -> u32 {
+        self.max_blobs.unwrap_or(SEARCH_DEFAULT_MAX_BLOBS)
+    }
+
+    /// The millisecond bound the scan enforces.
+    #[must_use]
+    pub fn effective_deadline_ms(&self) -> u64 {
+        self.deadline_ms.unwrap_or(SEARCH_DEFAULT_DEADLINE_MS)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// Head or change revision; a workspace revision refuses.
+    pub at: RevisionRef,
+    /// Byte-exact needle or regex over raw line bytes.
+    pub pattern: SearchPattern,
+    /// Fold ASCII case before matching.
+    #[serde(default)]
+    pub case_insensitive: bool,
+    /// Which tree paths the scan visits.
+    pub paths: PathSelection,
+    /// Include globs; empty searches every selected path.
+    #[serde(default)]
+    pub globs: Vec<String>,
+    /// Exclude globs; any match drops the path.
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
+    /// Scan budget; absent fields take the defaults.
+    #[serde(default)]
+    pub budget: SearchBudget,
+    /// Rows wanted and the lease-bound continuation.
+    #[serde(default)]
+    pub page: PageRequest,
+}
+
+/// One matching line: 1-based line and byte-column numbers with the first
+/// kibibyte of the line. Lines past the preview bound carry a trailing
+/// `...` marker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SearchHit {
     pub path: RepoPath,
-    pub line: u64,
-    pub excerpt: ByteString,
+    pub line: u32,
+    pub column: u32,
+    pub preview: ByteString,
+    pub blob: Oid,
 }
 
+/// Why a `search` page sealed before covering its tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanExhaustion {
+    /// The page covers its tree; no budget ran out.
+    None,
+    /// The byte or blob budget ran out at the sealed frontier.
+    Budget,
+    /// The deadline passed at the sealed frontier.
+    Deadline,
+}
+
+/// `search`: one path-ordered page of matching lines with lease-bound
+/// continuation. `truncated` mirrors `hits.next.is_some()`; exhaustion
+/// seals the page with a cursor instead of refusing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SearchReply {
     pub view: ViewInfo,
-    pub hits: Vec<SearchHit>,
+    pub hits: Page<SearchHit>,
     pub truncated: bool,
+    pub exhausted: ScanExhaustion,
+    pub scanned_blobs: u64,
+    pub scanned_bytes: u64,
+    pub skipped_blobs: u64,
 }
 
 /// The archive payloads the daemon streams.
@@ -3534,13 +3651,52 @@ fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
 
 impl Validate for SearchArgs {
     fn validate(&self) -> Result<(), CoreError> {
-        let bytes = self.pattern.len();
-        if bytes == 0 || bytes > 4096 {
+        let raw: &[u8] = match &self.pattern {
+            SearchPattern::Literal(needle) => needle.as_bytes(),
+            SearchPattern::Regex(pattern) => pattern.as_bytes(),
+        };
+        if raw.is_empty() || raw.len() > SEARCH_PATTERN_MAX_BYTES {
             return Err(invalid(format!(
-                "search pattern is 1..=4096 bytes, got {bytes}"
+                "search pattern is 1..={SEARCH_PATTERN_MAX_BYTES} bytes, got {}",
+                raw.len()
             )));
         }
-        Ok(())
+        if let SearchPattern::Regex(pattern) = &self.pattern {
+            regex::bytes::RegexBuilder::new(pattern)
+                .case_insensitive(self.case_insensitive)
+                .build()
+                .map_err(|err| invalid(format!("search regex is invalid: {err}")))?;
+        }
+        let globs = self.globs.len().saturating_add(self.exclude_globs.len());
+        if globs > SEARCH_MAX_GLOBS {
+            return Err(invalid(format!(
+                "search carries at most {SEARCH_MAX_GLOBS} globs, got {globs}"
+            )));
+        }
+        for glob in self.globs.iter().chain(self.exclude_globs.iter()) {
+            if glob.is_empty() || glob.len() > SEARCH_GLOB_MAX_BYTES {
+                return Err(invalid(format!(
+                    "search globs are 1..={SEARCH_GLOB_MAX_BYTES} bytes, got {}",
+                    glob.len()
+                )));
+            }
+        }
+        if let Some(max) = self.budget.max_bytes_scanned
+            && max > SEARCH_MAX_BYTES_SCANNED
+        {
+            return Err(invalid(format!(
+                "search scans at most {SEARCH_MAX_BYTES_SCANNED} bytes, got {max}"
+            )));
+        }
+        if let Some(deadline) = self.budget.deadline_ms
+            && deadline > SEARCH_MAX_DEADLINE_MS
+        {
+            return Err(invalid(format!(
+                "search waits at most {SEARCH_MAX_DEADLINE_MS} ms, got {deadline}"
+            )));
+        }
+        self.paths.validate()?;
+        self.page.validate()
     }
 }
 

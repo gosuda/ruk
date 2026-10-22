@@ -644,6 +644,7 @@ fn invalid_new_config_values_name_the_key() {
         ("default_branch", "default_branch = \"main\"\n"),
         ("event_retention_seconds", "event_retention_seconds = 0\n"),
         ("search_pool_size", "search_pool_size = 0\n"),
+        ("search_pool_size", "search_pool_size = 65\n"),
     ];
     for (key, extra) in cases {
         let err =

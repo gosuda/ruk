@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
+use ruk_core::search::{SearchPool, SearchPoolConfig};
 use ruk_core::store::{PreparationBudget, Store};
 
 /// One registered repository: its canonical path, its hosted coordinator
@@ -67,6 +68,10 @@ pub(crate) struct Registry {
     hook_max_commands: AtomicUsize,
     /// Default branch new repositories record in `RepoMeta`.
     default_branch: Mutex<String>,
+    /// Permits of the search worker pool new coordinators scan with.
+    search_pool_size: AtomicUsize,
+    /// Decoded bytes new coordinators scan per `search` page.
+    search_max_scan_bytes: AtomicU64,
 }
 
 impl fmt::Debug for Registry {
@@ -126,6 +131,8 @@ impl Registry {
             ),
             hook_max_commands: AtomicUsize::new(super::MAX_HOOK_MAX_COMMANDS),
             default_branch: Mutex::new(String::from(super::DEFAULT_DEFAULT_BRANCH)),
+            search_pool_size: AtomicUsize::new(super::DEFAULT_SEARCH_POOL_SIZE),
+            search_max_scan_bytes: AtomicU64::new(super::DEFAULT_SEARCH_MAX_SCAN_BYTES),
         };
         registry.sweep_tombstones();
         Ok(registry)
@@ -243,6 +250,23 @@ impl Registry {
         if let Ok(mut configured) = self.default_branch.lock() {
             *configured = branch;
         }
+    }
+
+    /// Sets the permits of the search worker pool.
+    ///
+    /// `serve` calls this once from the daemon configuration before
+    /// serving; each coordinator opened afterwards scans with this pool.
+    pub(crate) fn set_search_pool_size(&self, permits: usize) {
+        self.search_pool_size.store(permits, Ordering::Relaxed);
+    }
+
+    /// Sets the decoded bytes new coordinators scan per `search` page.
+    ///
+    /// `serve` calls this once from the daemon configuration before
+    /// serving; each coordinator opened afterwards seals pages at this
+    /// ceiling with a cursor instead of refusing.
+    pub(crate) fn set_search_max_scan_bytes(&self, bytes: u64) {
+        self.search_max_scan_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Resolves `requested` to a canonical path beneath a configured root,
@@ -806,7 +830,15 @@ impl Registry {
             Some(uid) => Principal::from_peer_uid(uid),
             None => Self::repository_owner(&canonical)?,
         };
-        let coordinator = Arc::new(HostedCoordinator::open(Arc::new(store), owner, canonical)?);
+        let pool = SearchPool::new(SearchPoolConfig {
+            permits: u32::try_from(self.search_pool_size.load(Ordering::Relaxed)).map_err(
+                |_| CoreError::new(ErrorCode::EInvalid, "search pool size overflows u32"),
+            )?,
+        })?;
+        let coordinator = Arc::new(
+            HostedCoordinator::open(Arc::new(store), owner, canonical)?.with_search_pool(pool),
+        );
+        coordinator.set_search_max_scan_bytes(self.search_max_scan_bytes.load(Ordering::Relaxed));
         let runner = coordinator.spawn_on(&runtime)?;
         coordinator
             .set_event_retention_seconds(self.event_retention_seconds.load(Ordering::Relaxed));
