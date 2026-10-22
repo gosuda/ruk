@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ruk_core::change::PlanId;
+use ruk_core::change::{PlanId, RequestId, SessionId};
 use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::search::{SearchPool, SearchPoolConfig};
@@ -54,6 +54,13 @@ struct RegistryInner {
     /// restart drops every block, so a restarted daemon may push over a ref
     /// whose prior plan is still `Uncertain` elsewhere.
     uncertain_pushes: HashMap<(PathBuf, Vec<u8>), PlanId>,
+    /// Push idempotency keys with a job past replay: `(session, request
+    /// id)` to the entry its waiters sleep on. A duplicate waits for
+    /// the owner's terminal receipt instead of sending twice, so two
+    /// concurrent pushes coalesce under one key. In-memory only, like
+    /// the uncertain blocks above: the terminal receipt answers retries
+    /// once the first job commits it.
+    inflight_pushes: HashMap<(SessionId, RequestId), InFlightPush>,
 }
 
 /// The hosted repository registry of one daemon process.
@@ -135,6 +142,7 @@ impl Registry {
             inner: Mutex::new(RegistryInner {
                 entries: HashMap::new(),
                 uncertain_pushes: HashMap::new(),
+                inflight_pushes: HashMap::new(),
             }),
             next_handle: AtomicU64::new(1),
             runtime: Mutex::new(None),
@@ -392,6 +400,101 @@ impl Registry {
                 .remove(&(repo.to_path_buf(), name.clone()));
         }
         Ok(())
+    }
+
+    /// Reserves one push's idempotency key before discovery or dial: the
+    /// first claimant owns the send, and a concurrent duplicate waits for
+    /// the owner's terminal receipt instead of sending twice, so matching
+    /// in-flight pushes coalesce under one key.
+    ///
+    /// # Errors
+    /// `E_IO` when the guard lock is poisoned.
+    pub(crate) fn claim_push_request(
+        &self,
+        session: SessionId,
+        request: RequestId,
+    ) -> Result<PushKeyClaim<'_>, CoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
+        let key = (session, request);
+        if let Some(entry) = inner.inflight_pushes.get(&key) {
+            return Ok(PushKeyClaim::Wait(Arc::clone(&entry.notify)));
+        }
+        inner.inflight_pushes.insert(
+            key,
+            InFlightPush {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                holders: 1,
+            },
+        );
+        Ok(PushKeyClaim::Owner(PushKeyGuard {
+            registry: self,
+            session,
+            request,
+        }))
+    }
+
+    /// Adds the bulkhead worker's half of one claimed key: the send
+    /// closure owns it, so a dropped invocation cannot release the key
+    /// while its orphaned worker still sends. The lane half releases at
+    /// the invocation's end; the key frees only once both halves drop.
+    ///
+    /// # Errors
+    /// `E_IO` when the guard lock is poisoned or the key is unclaimed.
+    pub(crate) fn add_push_holder(
+        self: &Arc<Self>,
+        session: SessionId,
+        request: RequestId,
+    ) -> Result<PushKeyWorkerHalf, CoreError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
+        let Some(entry) = inner.inflight_pushes.get_mut(&(session, request)) else {
+            return Err(CoreError::new(
+                ErrorCode::EIo,
+                "push key released under its owner",
+            ));
+        };
+        entry.holders = entry.holders.saturating_add(1);
+        Ok(PushKeyWorkerHalf {
+            registry: Arc::clone(self),
+            session,
+            request,
+        })
+    }
+
+    /// Drops one half of a push key's claim: the key frees, waking its
+    /// waiters, only once the last half drops. A committed receipt
+    /// answers the waiters; a miss lets one waiter claim the key and run
+    /// the push itself. Lock poison skips the release; the waiters still
+    /// observe cancellation on their own tokens.
+    fn release_push_request(&self, session: SessionId, request: RequestId) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let key = (session, request);
+            let last = inner.inflight_pushes.get_mut(&key).is_some_and(|entry| {
+                entry.holders = entry.holders.saturating_sub(1);
+                entry.holders == 0
+            });
+            if last && let Some(entry) = inner.inflight_pushes.remove(&key) {
+                entry.notify.notify_waiters();
+            }
+        }
+    }
+
+    /// Restores one rename's source binding after its filesystem move
+    /// fails. The entry is found by its destination path: a concurrent
+    /// rename that moved it elsewhere misses the lookup and keeps its
+    /// newer binding, while lock poison leaves the stale destination in
+    /// place and the error below still reports the failed move.
+    fn restore_rename_binding(&self, updated: &Path, prior: PathBuf) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(entry) = entry_by_path_mut(&mut inner, updated)
+        {
+            entry.path = prior;
+        }
     }
 
     /// Resolves `requested` to a canonical path beneath a configured root,
@@ -735,7 +838,15 @@ impl Registry {
         let moved = destination
             .to_str()
             .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
-        let retired = {
+        // The entry moves to the destination before the filesystem does,
+        // so a failed rename must restore the source binding: the source
+        // directory is untouched and the old handle must keep resolving.
+        let updated = if store == repo_root {
+            destination.clone()
+        } else {
+            destination.join(".ruk")
+        };
+        let (retired, prior) = {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
@@ -752,23 +863,25 @@ impl Registry {
                 }
                 let coordinator = entry.coordinator.take();
                 entry.runner.take();
-                entry.path = if store == repo_root {
-                    destination.clone()
-                } else {
-                    destination.join(".ruk")
-                };
+                let prior = std::mem::replace(&mut entry.path, updated.clone());
                 entry.last_used = Instant::now();
-                coordinator
+                (coordinator, Some(prior))
             } else {
-                None
+                (None, None)
             }
         };
         if let Some(coordinator) = retired {
             coordinator.shutdown();
         }
-        std::fs::rename(&repo_root, &destination).map_err(|err| {
-            CoreError::new(ErrorCode::EIo, format!("repository rename failed: {err}"))
-        })?;
+        if let Err(err) = std::fs::rename(&repo_root, &destination) {
+            if let Some(prior) = prior {
+                self.restore_rename_binding(&updated, prior);
+            }
+            return Err(CoreError::new(
+                ErrorCode::EIo,
+                format!("repository rename failed: {err}"),
+            ));
+        }
         if let Some(parent) = repo_root.parent() {
             fsync_dir(parent)?;
         }
@@ -837,12 +950,30 @@ impl Registry {
                 )
             })?;
         let new_path = Path::new(&args.path);
+        if new_path.components().any(|component| match component {
+            std::path::Component::Normal(name) => is_tombstone_name(&name.to_string_lossy()),
+            _ => false,
+        }) {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository name is reserved",
+            ));
+        }
         let requested = if new_path.is_absolute() {
             new_path.to_path_buf()
         } else {
             root.join(new_path)
         };
         let destination = self.resolve_destination(&requested)?;
+        if destination
+            .file_name()
+            .is_some_and(|name| is_tombstone_name(&name.to_string_lossy()))
+        {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository name is reserved",
+            ));
+        }
         if !destination.starts_with(root) {
             return Err(CoreError::new(
                 ErrorCode::EForbidden,
@@ -1614,6 +1745,59 @@ fn take_entry_by_path(inner: &mut RegistryInner, canonical: &Path) -> Option<(St
     inner.entries.remove_entry(&handle)
 }
 
+/// One claimed push idempotency key: the wakeup its waiters sleep on
+/// plus the halves outstanding against it. The lane half releases at
+/// the invocation's end and the worker half when the send closure
+/// returns; the key frees only once both halves drop, so a dropped
+/// invocation cannot hand the key to a waiter while its orphaned
+/// worker still sends.
+struct InFlightPush {
+    notify: Arc<tokio::sync::Notify>,
+    holders: u32,
+}
+
+/// One push idempotency key's claim state: the first claimant owns the
+/// send, and a concurrent duplicate waits for the owner's terminal
+/// receipt instead of sending twice.
+pub(crate) enum PushKeyClaim<'a> {
+    /// This caller owns the send and releases the lane half on drop.
+    Owner(PushKeyGuard<'a>),
+    /// Another job owns the send; sleep on this wakeup, then replay.
+    Wait(Arc<tokio::sync::Notify>),
+}
+
+/// One push's lane-half ownership of its idempotency key: dropping the
+/// guard releases the lane half, and the key frees once the worker
+/// half drops too, waking the waiters.
+pub(crate) struct PushKeyGuard<'a> {
+    registry: &'a Registry,
+    session: SessionId,
+    request: RequestId,
+}
+
+impl Drop for PushKeyGuard<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .release_push_request(self.session, self.request);
+    }
+}
+
+/// One push's worker-half ownership of its idempotency key: the send
+/// closure owns it, so the key survives a dropped invocation until
+/// the orphaned worker finishes. `'static`, unlike the lane half.
+pub(crate) struct PushKeyWorkerHalf {
+    registry: Arc<Registry>,
+    session: SessionId,
+    request: RequestId,
+}
+
+impl Drop for PushKeyWorkerHalf {
+    fn drop(&mut self) {
+        self.registry
+            .release_push_request(self.session, self.request);
+    }
+}
+
 /// Returns the entry bound to `canonical`, if any.
 fn entry_by_path_mut<'a>(
     inner: &'a mut RegistryInner,
@@ -2086,7 +2270,7 @@ impl Drop for Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::Registry;
+    use super::{PushKeyClaim, Registry};
     use std::io::Read;
     use std::path::Path;
     use std::sync::Arc;
@@ -2458,6 +2642,117 @@ mod tests {
             })
             .expect_err("reserved rename destination refuses");
         assert_eq!(clash.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn repo_fork_refuses_tombstone_destination() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let seed = seed_fork_source(&registry, &root, "acme/hello");
+        for dest in [
+            root.join(".tombstone-1-evil"),
+            root.join("acme/.tombstone-2-evil"),
+        ] {
+            let err = registry
+                .fork_repo(&fork_args(&seed.canonical, &dest, None))
+                .expect_err("tombstone destination refuses");
+            assert_eq!(err.code, ErrorCode::EInvalid);
+            assert!(!dest.exists(), "no staging survives the refused fork");
+        }
+    }
+
+    #[test]
+    fn repo_rename_restores_binding_when_the_move_fails() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+        let created = registry
+            .create_repo(&init_args(&root, "acme/hello"))
+            .expect("repo inits");
+        // A destination beneath a missing parent resolves but cannot
+        // move: the error below proves the failure reaches the rename.
+        let err = registry
+            .rename_repo(&ruk_core::protocol::RepoRenameArgs {
+                repo: created.path.clone(),
+                new_path: "missing-parent/new-name".to_owned(),
+            })
+            .expect_err("rename to a missing parent fails");
+        assert_eq!(err.code, ErrorCode::EIo);
+        let reopened = registry
+            .open(&created.path)
+            .expect("the old handle still resolves");
+        assert!(
+            reopened.1.ends_with("acme/hello/.ruk"),
+            "the old handle still resolves: {}",
+            reopened.1.display()
+        );
+        drop(reopened);
+        let moved = registry
+            .rename_repo(&ruk_core::protocol::RepoRenameArgs {
+                repo: created.path.clone(),
+                new_path: "acme/world".to_owned(),
+            })
+            .expect("a later rename still moves");
+        assert!(moved.path.ends_with("acme/world"));
+    }
+
+    #[tokio::test]
+    async fn push_key_claim_coalesces_duplicates() {
+        use ruk_core::change::{RequestId, SessionId};
+        let root = scratch_root();
+        let registry = Arc::new(Registry::new(vec![root]).expect("scratch root canonicalizes"));
+        let session = SessionId::generate();
+        let request = RequestId::generate();
+        let guard = match registry
+            .claim_push_request(session, request)
+            .expect("first claimant owns the key")
+        {
+            PushKeyClaim::Owner(guard) => guard,
+            PushKeyClaim::Wait(_) => panic!("first claimant must not wait"),
+        };
+        let notify = match registry
+            .claim_push_request(session, request)
+            .expect("duplicate claim resolves")
+        {
+            PushKeyClaim::Wait(notify) => notify,
+            PushKeyClaim::Owner(_) => panic!("duplicate must wait for the owner"),
+        };
+        // An unrelated key stays free while the first is held.
+        assert!(matches!(
+            registry
+                .claim_push_request(session, RequestId::generate())
+                .expect("other key resolves"),
+            PushKeyClaim::Owner(_)
+        ));
+        // The worker half pins the key past the lane half's drop: no
+        // wakeup fires until the send closure returns too.
+        let worker = registry
+            .add_push_holder(session, request)
+            .expect("worker half splits");
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(100), notify.notified())
+            .await
+            .expect_err("lane-half drop alone wakes nobody");
+        // The waiter future predates the release: `notify_waiters`
+        // stores no permit, so creating it afterwards would miss the
+        // wakeup the production path avoids with its claim re-check.
+        let wake = notify.notified();
+        drop(worker);
+        tokio::time::timeout(Duration::from_secs(5), wake)
+            .await
+            .expect("release wakes the waiter");
+        assert!(matches!(
+            registry
+                .claim_push_request(session, request)
+                .expect("released key resolves"),
+            PushKeyClaim::Owner(_)
+        ));
     }
 
     #[test]
