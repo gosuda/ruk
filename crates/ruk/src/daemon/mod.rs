@@ -1603,13 +1603,18 @@ async fn route_frame_try_send(
 /// Routes one `Stdin` chunk to its stream's data channel, admitting it
 /// against the connection's inbound credit window first.
 ///
-/// The admitted total must fit the window the daemon configured for the
-/// connection: a chunk past it refuses with `E_LIMIT` instead of
-/// queueing, so only credit-valid bytes ever wait on a parked task. Past
-/// admission the data channel never refuses: tiny frames inside a valid
-/// window always route, no matter how far behind the task has fallen. The
-/// serving task releases bytes as it consumes them. A closed channel
-/// drops the entry; the task is already gone.
+/// Two bounds guard the queue. The admitted payload total must fit the
+/// window the daemon configured for the connection: a chunk past it
+/// refuses with `E_LIMIT` instead of queueing, so only credit-valid
+/// bytes ever wait on a parked task. The admitted-but-unconsumed frame
+/// count must separately fit [`stdin_frame_limit`]: empty chunks carry
+/// no payload credit, so the frame bound — not the byte window — is what
+/// stops an empty-frame flood from growing the channel without bound.
+/// Past admission the data channel never refuses: small frames inside
+/// both bounds always route, no matter how far behind the task has
+/// fallen. The serving task releases payload bytes and one frame count
+/// as it consumes each chunk. A closed channel drops the entry; the
+/// task is already gone.
 #[cfg(unix)]
 async fn route_stdin_frame(
     writer: &mpsc::Sender<OutboundFrame>,
@@ -1618,25 +1623,24 @@ async fn route_stdin_frame(
     stream_id: u64,
     frame: ipc::Frame,
 ) -> Result<(), Error> {
-    // The admitted width counts the payload plus one framing byte, so an
-    // empty chunk still occupies queue bookkeeping and an empty-frame
-    // flood stops at the window. The task releases the same width on
-    // consume, keeping the counter exact.
-    let width = u64::try_from(frame.payload.len())
-        .map_err(|_| {
-            Error::Core(CoreError::new(
-                ErrorCode::ELimit,
-                "stdin chunk exceeds its bound",
-            ))
-        })?
-        .saturating_add(1);
+    // The admitted width is the payload alone, matching the protocol
+    // credit the client spends (`CommandAccepted.stdin_credit` and every
+    // `StdinGrant` count payload bytes): a client that fills its window
+    // exactly must route, not refuse. Frame flooding stays bounded
+    // through the separate frame count below, not through a margin here.
+    let width = u64::try_from(frame.payload.len()).map_err(|_| {
+        Error::Core(CoreError::new(
+            ErrorCode::ELimit,
+            "stdin chunk exceeds its bound",
+        ))
+    })?;
     let Some(route) = streams.get(&stream_id) else {
         return Ok(());
     };
-    // The admit is one atomic add: the serving task decrements the same
-    // counter as it consumes, and a load-then-store here would lose that
-    // decrement and drift toward false refusals. The overflow arm below
-    // rolls the width back.
+    // Each admit is one atomic add: the serving task decrements the same
+    // counters as it consumes, and a load-then-store here would lose that
+    // decrement and drift toward false refusals. Each overflow arm below
+    // rolls its own add back.
     let admitted = route
         .outstanding
         .fetch_add(width, Ordering::SeqCst)
@@ -1648,10 +1652,21 @@ async fn route_stdin_frame(
         // refusal.
         return refuse_overflowed_stream(writer, streams, stream_id).await;
     }
-    // Framing is never free: an empty chunk still occupies queue
-    // bookkeeping, so the width above counts at least one byte and an
-    // empty-frame flood stops at the window instead of growing the
-    // channel without bound.
+    // Empty chunks carry no payload credit, so the byte window above
+    // cannot bound them: the frame count stops an empty-frame flood
+    // while staying far above what a compliant chunked body needs.
+    let frames = route
+        .outstanding_frames
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    if frames > stdin_frame_limit(refs.window_bytes) {
+        route.outstanding.fetch_sub(width, Ordering::SeqCst);
+        route.outstanding_frames.fetch_sub(1, Ordering::SeqCst);
+        // A frame flood ends the stream like any other overflow: the
+        // task must not linger to emit a second terminal frame after
+        // the refusal.
+        return refuse_overflowed_stream(writer, streams, stream_id).await;
+    }
     match route.data.send(frame) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -1659,6 +1674,21 @@ async fn route_stdin_frame(
             Ok(())
         }
     }
+}
+
+/// Maximum `Stdin` frames one stream may hold admitted-but-unconsumed.
+///
+/// A full-size frame carries [`ipc::MAX_DATA_CHUNK_BYTES`] payload
+/// bytes, so a full window holds at most `window_bytes /
+/// MAX_DATA_CHUNK_BYTES` full frames; the `+ 64` slack leaves room for
+/// a final partial frame plus a compliant small-chunk burst — a sender
+/// may split a body into 1-byte chunks, and the suite pins a 63-frame
+/// burst that must route even when the consumer has not drained a
+/// single frame yet. The byte window alone cannot bound an empty-frame
+/// flood, so this count is checked alongside it on the same route.
+#[cfg(unix)]
+fn stdin_frame_limit(window_bytes: u64) -> u64 {
+    window_bytes / ipc::MAX_DATA_CHUNK_BYTES as u64 + 64
 }
 
 /// Ends an overflowed stream: trips its cancel flag so a parked blocking
@@ -1714,20 +1744,25 @@ async fn refuse_overflowed_stream(
 }
 
 /// One stream's routing state: a bounded control channel, an unbounded
-/// data channel, and the admitted-but-unconsumed byte count.
+/// data channel, and the admitted-but-unconsumed byte and frame counts.
 ///
 /// Control frames (`Cancel`, `WindowUpdate`, `HookReply`) stay on the
 /// bounded channel with `try_send`: they are low-volume and idempotent,
 /// so a full control channel refuses the stream instead of stalling the
-/// reader. `Stdin` bytes ride the data channel, whose bound follows the
-/// inbound credit window instead of a frame count: the reader admits a
-/// chunk only while the admitted total fits the window, and the serving
-/// task releases bytes as it consumes them. `StdinEof` rides the data
+/// reader. `Stdin` bytes ride the data channel, whose two bounds mirror
+/// the protocol credit: the reader admits a chunk only while the
+/// admitted payload total fits the inbound credit window and the
+/// admitted frame count fits [`stdin_frame_limit`], and the serving task
+/// releases both as it consumes each chunk. `StdinEof` rides the data
 /// channel too, so the terminator never overtakes its bytes.
 struct StreamRoute {
     control: mpsc::Sender<ipc::Frame>,
     data: mpsc::UnboundedSender<ipc::Frame>,
     outstanding: Arc<AtomicU64>,
+    /// Admitted-but-unconsumed `Stdin` frame count: bounds the
+    /// empty-frame floods that carry no payload credit against the byte
+    /// window.
+    outstanding_frames: Arc<AtomicU64>,
     generation: u64,
     /// Whether the stream runs a git service (and consumes `Stdin`).
     /// Typed invocations never read the data channel, so their `Stdin`
@@ -1744,16 +1779,17 @@ struct StreamRoute {
     cancel_flag: Arc<AtomicBool>,
 }
 
-/// One stream's inbound halves plus its shared admission counter.
+/// One stream's inbound halves plus its shared admission counters.
 ///
 /// The control half carries `Cancel`, `WindowUpdate`, and `HookReply`
 /// frames; the data half carries credit-checked `Stdin` and its
-/// terminator. The counter tracks admitted-but-unconsumed bytes so the
-/// reader and the serving task share one bound.
+/// terminator. The counters track admitted-but-unconsumed payload bytes
+/// and frames so the reader and the serving task share both bounds.
 struct StreamInput {
     control: mpsc::Receiver<ipc::Frame>,
     data: mpsc::UnboundedReceiver<ipc::Frame>,
     outstanding: Arc<AtomicU64>,
+    outstanding_frames: Arc<AtomicU64>,
 }
 
 /// Spawns one task serving the stream of one `Open` frame. The reader
@@ -1776,12 +1812,15 @@ fn spawn_stream(
     let git = ipc::decode_control::<CommandOpen>(&frame.payload).is_ok();
     let outstanding = Arc::new(AtomicU64::new(0));
     let task_outstanding = Arc::clone(&outstanding);
+    let outstanding_frames = Arc::new(AtomicU64::new(0));
+    let task_outstanding_frames = Arc::clone(&outstanding_frames);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let task_cancel = Arc::clone(&cancel_flag);
     let route = StreamRoute {
         control: control_tx,
         data: data_tx,
         outstanding,
+        outstanding_frames,
         generation,
         git,
         task: None,
@@ -1807,6 +1846,7 @@ fn spawn_stream(
             control: control_rx,
             data: data_rx,
             outstanding: task_outstanding,
+            outstanding_frames: task_outstanding_frames,
         };
         serve_stream(input, task_cancel, &sink, frame.payload, &task_refs, peer).await;
         let _ = task_done.try_send((stream_id, generation));
@@ -2778,12 +2818,12 @@ async fn collect_git_stdin(
                         "stream credit window is exhausted",
                     ));
                 }
-                // Release matches the reader's admission width: payload
-                // plus one framing byte, keeping the shared counter exact
-                // while protocol credit stays in payload bytes.
-                input
-                    .outstanding
-                    .fetch_sub(width.saturating_add(1), Ordering::SeqCst);
+                // Release matches the reader's admission: payload bytes
+                // against the byte counter and one frame against the
+                // frame counter, keeping both exact while protocol
+                // credit stays in payload bytes.
+                input.outstanding.fetch_sub(width, Ordering::SeqCst);
+                input.outstanding_frames.fetch_sub(1, Ordering::SeqCst);
                 stdin_bytes.extend_from_slice(&frame.payload);
                 if credits.grant_inbound(stream_id, width).is_err() {
                     return GitStdinFate::Rejected(CoreError::new(
@@ -3065,14 +3105,16 @@ async fn check_stdin_quota(sink: &StreamSink, total: u64, width: u64, max: u64) 
 }
 
 /// Admits one `Stdin` chunk against the inbound window and grants it back
-/// once consumed, mirroring [`collect_git_stdin`]. Refuses the stream when
-/// credit is exhausted or untracked.
+/// once consumed, mirroring [`collect_git_stdin`]: payload bytes against
+/// the byte counter, one frame against the frame counter. Refuses the
+/// stream when credit is exhausted or untracked.
 #[cfg(unix)]
 async fn admit_stdin_chunk(
     sink: &StreamSink,
     credits: &mut ipc::StreamCredits,
     stream_id: u64,
     outstanding: &Arc<AtomicU64>,
+    outstanding_frames: &Arc<AtomicU64>,
     width: u64,
 ) -> bool {
     if credits.consume_inbound(stream_id, width).is_err() {
@@ -3083,7 +3125,8 @@ async fn admit_stdin_chunk(
         .await;
         return false;
     }
-    outstanding.fetch_sub(width.saturating_add(1), Ordering::SeqCst);
+    outstanding.fetch_sub(width, Ordering::SeqCst);
+    outstanding_frames.fetch_sub(1, Ordering::SeqCst);
     if credits.grant_inbound(stream_id, width).is_err() {
         refuse_stream(
             sink,
@@ -3332,6 +3375,7 @@ async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
                             credits,
                             stream_id,
                             &input.outstanding,
+                            &input.outstanding_frames,
                             width,
                         )
                         .await

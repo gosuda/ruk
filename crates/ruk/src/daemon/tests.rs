@@ -1203,6 +1203,7 @@ async fn reader_never_blocks_on_a_full_stream() {
             control: tx.clone(),
             data: _data_tx,
             outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
             task: None,
@@ -1254,6 +1255,7 @@ async fn reader_never_blocks_on_a_full_stream() {
             control: sib_tx,
             data: sib_data_tx,
             outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
             task: None,
@@ -3326,6 +3328,7 @@ async fn credit_exhaustion_removes_the_stream() {
             control: tx,
             data: data_tx,
             outstanding: Arc::new(AtomicU64::new(0)),
+            outstanding_frames: Arc::new(AtomicU64::new(0)),
             generation: 1,
             git: true,
             task: None,
@@ -3352,6 +3355,266 @@ async fn credit_exhaustion_removes_the_stream() {
     assert_eq!(first.kind, FrameKind::Error);
     assert_eq!(first.stream_id, 7);
     let terminal = writer_rx.try_recv().expect("credit terminal exit");
+    assert_eq!(terminal.kind, FrameKind::Exit);
+    assert_eq!(terminal.stream_id, 7);
+}
+/// A `Stdin` frame that fills its window exactly is admitted: payload
+/// credit counts payload bytes, so an exact fill routes instead of
+/// refusing. Pre-fix the `+1` admission margin turned this exact fill
+/// into `E_LIMIT`.
+#[tokio::test]
+async fn exact_window_stdin_frame_is_admitted() {
+    use super::{route_stdin_frame, stdin_frame_limit};
+    use std::collections::HashMap;
+    let root = temp_root("exact-window");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes: 65_536,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    assert_eq!(stdin_frame_limit(65_536), 65);
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let (tx, _parked) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_BOUND);
+    let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outstanding = Arc::new(AtomicU64::new(0));
+    let outstanding_frames = Arc::new(AtomicU64::new(0));
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx,
+            data: data_tx,
+            outstanding: Arc::clone(&outstanding),
+            outstanding_frames: Arc::clone(&outstanding_frames),
+            generation: 1,
+            git: true,
+            task: None,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    );
+    let frame = ipc::Frame {
+        kind: FrameKind::Stdin,
+        stream_id: 7,
+        payload: vec![0u8; 65_536],
+    };
+    let routed = tokio::time::timeout(
+        Duration::from_secs(5),
+        route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+    )
+    .await
+    .expect("exact-window admission never blocks");
+    routed.expect("exact-window admission reports without error");
+    assert!(
+        streams.contains_key(&7),
+        "an exact window fill keeps its routing entry"
+    );
+    assert_eq!(outstanding.load(Ordering::SeqCst), 65_536);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 1);
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "no refusal is queued for an exact fill"
+    );
+    let queued = data_rx.try_recv().expect("admitted chunk queues");
+    assert_eq!(queued.payload.len(), 65_536);
+}
+
+/// A parked stream that fills its window exactly across many frames is
+/// not refused, and serve-side consume returns both counters so the
+/// window recycles. Eight 32 KiB frames fill a 256 KiB window exactly —
+/// the live signature from the defect. Pre-fix the per-chunk `+1`
+/// margin refused the final frame once the parked total crossed the
+/// window.
+#[tokio::test]
+async fn full_window_fill_with_parked_consumer_is_not_refused() {
+    use super::{admit_stdin_chunk, route_stdin_frame};
+    use std::collections::HashMap;
+    let window_bytes = 8 * 32 * 1024;
+    let root = temp_root("full-window");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let (tx, _parked) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_BOUND);
+    // Parked consumer: the receiver lives but never drains until every
+    // frame arrives.
+    let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outstanding = Arc::new(AtomicU64::new(0));
+    let outstanding_frames = Arc::new(AtomicU64::new(0));
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx,
+            data: data_tx,
+            outstanding: Arc::clone(&outstanding),
+            outstanding_frames: Arc::clone(&outstanding_frames),
+            generation: 1,
+            git: true,
+            task: None,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    );
+    for _ in 0..8 {
+        let frame = ipc::Frame {
+            kind: FrameKind::Stdin,
+            stream_id: 7,
+            payload: vec![0u8; 32 * 1024],
+        };
+        let routed = tokio::time::timeout(
+            Duration::from_secs(5),
+            route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+        )
+        .await
+        .expect("full-window admission never blocks");
+        routed.expect("full-window admission reports without error");
+    }
+    assert!(
+        streams.contains_key(&7),
+        "an exact multi-frame fill keeps its routing entry"
+    );
+    assert_eq!(outstanding.load(Ordering::SeqCst), window_bytes);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 8);
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "no refusal is queued for an exact fill"
+    );
+    // Serve-side consume spends protocol credit and releases both
+    // admission counters, emitting one grant per chunk.
+    let mut credits = ipc::StreamCredits::new(window_bytes);
+    credits.open_stream(7);
+    let sink = super::StreamSink {
+        writer: writer_tx.clone(),
+        stream_id: 7,
+    };
+    for _ in 0..8 {
+        let admitted = admit_stdin_chunk(
+            &sink,
+            &mut credits,
+            7,
+            &outstanding,
+            &outstanding_frames,
+            32 * 1024,
+        )
+        .await;
+        assert!(admitted, "consume grants each admitted chunk back");
+    }
+    assert_eq!(outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 0);
+    for _ in 0..8 {
+        let queued = data_rx.try_recv().expect("admitted chunks queue");
+        assert_eq!(queued.payload.len(), 32 * 1024);
+    }
+    for _ in 0..8 {
+        let grant = writer_rx.try_recv().expect("one grant per chunk");
+        assert_eq!(grant.kind, FrameKind::WindowUpdate);
+        assert_eq!(grant.stream_id, 7);
+    }
+    // The recycled window admits again.
+    let frame = ipc::Frame {
+        kind: FrameKind::Stdin,
+        stream_id: 7,
+        payload: vec![0u8; 32 * 1024],
+    };
+    let routed = tokio::time::timeout(
+        Duration::from_secs(5),
+        route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+    )
+    .await
+    .expect("recycled-window admission never blocks");
+    routed.expect("recycled-window admission reports without error");
+    assert!(
+        streams.contains_key(&7),
+        "the recycled window keeps its routing entry"
+    );
+}
+
+/// An empty-frame flood is refused once the admitted-but-unconsumed
+/// frame count passes the frame bound, even though empty chunks carry no
+/// payload credit against the byte window.
+#[tokio::test]
+async fn empty_stdin_frame_flood_is_refused() {
+    use super::{route_stdin_frame, stdin_frame_limit};
+    use std::collections::HashMap;
+    let window_bytes = 65_536;
+    // One full-size frame per window plus the documented slack of 64.
+    assert_eq!(stdin_frame_limit(window_bytes), 65);
+    let root = temp_root("empty-flood");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let (tx, _parked) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_BOUND);
+    let (data_tx, _data_parked) = tokio::sync::mpsc::unbounded_channel();
+    let outstanding = Arc::new(AtomicU64::new(0));
+    let outstanding_frames = Arc::new(AtomicU64::new(0));
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx,
+            data: data_tx,
+            outstanding: Arc::clone(&outstanding),
+            outstanding_frames: Arc::clone(&outstanding_frames),
+            generation: 1,
+            git: true,
+            task: None,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    );
+    let mut refused_at = None;
+    for index in 0..80 {
+        let frame = ipc::Frame {
+            kind: FrameKind::Stdin,
+            stream_id: 7,
+            payload: Vec::new(),
+        };
+        let routed = tokio::time::timeout(
+            Duration::from_secs(5),
+            route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+        )
+        .await
+        .expect("flood admission never blocks");
+        routed.expect("flood admission reports without error");
+        if !streams.contains_key(&7) {
+            refused_at = Some(index);
+            break;
+        }
+    }
+    assert_eq!(
+        refused_at,
+        Some(65),
+        "the 66th empty frame trips the bound of 65"
+    );
+    // The refused chunk rolls both counters back; the byte counter never
+    // moved because empty chunks carry no payload credit.
+    assert_eq!(outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 65);
+    let first = writer_rx.try_recv().expect("flood error frame");
+    assert_eq!(first.kind, FrameKind::Error);
+    assert_eq!(first.stream_id, 7);
+    let terminal = writer_rx.try_recv().expect("flood terminal exit");
     assert_eq!(terminal.kind, FrameKind::Exit);
     assert_eq!(terminal.stream_id, 7);
 }
