@@ -434,54 +434,19 @@ impl BlockingJob {
         })
     }
 
-    /// Advertised direct tips for one remote: HTTP goes through the
-    /// smart-http discovery the POST half reuses, other transports
-    /// through the endpoint discovery.
+    /// Advertised refs of one remote, in the local rows the verbs map.
     fn discover(
         &self,
         url: &str,
         bridge: &CancelBridge,
     ) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
-        let store = self.coordinator.store();
-        let kind = store.hash_kind();
-        let endpoint = net::parse_endpoint(url).map_err(to_core)?;
-        if matches!(endpoint, Endpoint::Local { .. }) {
-            return Err(CoreError::new(
-                ErrorCode::EInvalid,
-                "push serves network remotes; local paths stay out of the daemon job",
-            ));
-        }
-        match &endpoint {
-            Endpoint::Http { url: http_url, .. } => {
-                let base = smart_http::normalize_base(http_url).map_err(to_core)?;
-                let adv = smart_http::discover(
-                    &base,
-                    smart_http::SmartService::ReceivePack,
-                    kind,
-                    RpcCall {
-                        extra: &[],
-                        auth: &bridge.auth,
-                        egress: &bridge.egress,
-                        tls_roots: None,
-                        interrupt: &bridge.interrupt,
-                    },
-                )
-                .map_err(to_core)?;
-                net::to_local_refs(adv.refs.clone()).map_err(to_core)
-            }
-            _ => {
-                let refs = net::discover_endpoint(
-                    &endpoint,
-                    Service::ReceivePack,
-                    kind,
-                    &bridge.auth,
-                    &bridge.egress,
-                    None,
-                )
-                .map_err(to_core)?;
-                net::to_local_refs(refs).map_err(to_core)
-            }
-        }
+        discover_advertised(
+            self.coordinator.store(),
+            url,
+            &bridge.auth,
+            &bridge.egress,
+            &bridge.interrupt,
+        )
     }
 
     /// The HTTP advertisement for the POST half, discovered with the same
@@ -698,8 +663,9 @@ impl BlockingJob {
 /// The credential policy of one transport job: the injected record when
 /// the invocation carries one, else the hermetic ambient map, which
 /// resolves no config files and reads no process environment behind the
-/// caller's back.
-fn job_auth(open: &InvocationOpen) -> AuthPolicy {
+/// caller's back. Shared with the `remote.refs` read, which authenticates
+/// the same way and never stores what it learns.
+pub(crate) fn job_auth(open: &InvocationOpen) -> AuthPolicy {
     if open.transport_auth.kind != TransportAuthKind::None {
         AuthPolicy::explicit(open.transport_auth.clone())
     } else {
@@ -719,14 +685,61 @@ fn push_url(remote: &RemoteSpec) -> Result<&str, CoreError> {
     }
 }
 
+/// Advertised refs of one remote: HTTP goes through the smart-http
+/// discovery the POST half reuses, other transports through the endpoint
+/// discovery. Local paths refuse: daemon jobs serve network remotes, and
+/// a local path would resolve against the server's filesystem, not the
+/// caller's. Shared with the `remote.refs` read.
+pub(crate) fn discover_advertised(
+    store: &Store,
+    url: &str,
+    auth: &AuthPolicy,
+    egress: &EgressPolicy,
+    interrupt: &Interrupt,
+) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
+    let kind = store.hash_kind();
+    let endpoint = net::parse_endpoint(url).map_err(to_core)?;
+    if matches!(endpoint, Endpoint::Local { .. }) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "daemon jobs serve network remotes; local paths stay out",
+        ));
+    }
+    match &endpoint {
+        Endpoint::Http { url: http_url, .. } => {
+            let base = smart_http::normalize_base(http_url).map_err(to_core)?;
+            let adv = smart_http::discover(
+                &base,
+                smart_http::SmartService::ReceivePack,
+                kind,
+                RpcCall {
+                    extra: &[],
+                    auth,
+                    egress,
+                    tls_roots: None,
+                    interrupt,
+                },
+            )
+            .map_err(to_core)?;
+            net::to_local_refs(adv.refs.clone()).map_err(to_core)
+        }
+        _ => {
+            let refs =
+                net::discover_endpoint(&endpoint, Service::ReceivePack, kind, auth, egress, None)
+                    .map_err(to_core)?;
+            net::to_local_refs(refs).map_err(to_core)
+        }
+    }
+}
+
 /// The invocation's interrupt plus the policy one send runs under. The
 /// watcher trips the shared flag when the lease or the connection goes,
 /// so in-flight transfers observe cancellation at their next check; the
 /// guard aborts the watcher once the send no longer needs it.
-struct CancelBridge {
-    interrupt: Interrupt,
-    auth: AuthPolicy,
-    egress: EgressPolicy,
+pub(crate) struct CancelBridge {
+    pub(crate) interrupt: Interrupt,
+    pub(crate) auth: AuthPolicy,
+    pub(crate) egress: EgressPolicy,
     watcher: tokio::task::JoinHandle<()>,
 }
 
@@ -734,7 +747,7 @@ impl CancelBridge {
     /// Arms one phase: the policy comes from the invocation, the flag
     /// trips on lease or connection loss, and dropping the bridge aborts
     /// a watcher whose phase already ended.
-    fn arm(cancel: &Cancel, open: &InvocationOpen) -> Self {
+    pub(crate) fn arm(cancel: &Cancel, open: &InvocationOpen) -> Self {
         let flag = Arc::new(AtomicBool::new(false));
         let tripped = Arc::clone(&flag);
         let mut cancelled = cancel.clone();
@@ -888,7 +901,7 @@ fn encode_reply(id: Option<RequestId>, reply: Reply) -> Result<Vec<u8>, CoreErro
     ipc::encode_control(&ReplyEnvelope::success(id, reply))
 }
 
-fn to_core(err: GitError) -> CoreError {
+pub(crate) fn to_core(err: GitError) -> CoreError {
     CoreError::new(err.code(), err.to_string())
 }
 

@@ -13,6 +13,7 @@ pub(crate) mod executor;
 pub(crate) mod ipc;
 mod push_job;
 pub(crate) mod registry;
+mod remote_refs;
 
 #[cfg(test)]
 mod tests;
@@ -3242,6 +3243,19 @@ async fn typed_stream(
                 } else {
                     Box::pin(job.reconcile(open))
                 }
+            } else if method == Method::RemoteRefs {
+                let Some(session) = session else {
+                    fail(Error::Core(refuse_sessionless(method, None))).await;
+                    return;
+                };
+                Box::pin(remote_refs::run_remote_refs(
+                    coordinator,
+                    caller.principal,
+                    session,
+                    open,
+                    refs,
+                    &cancel,
+                ))
             } else {
                 Box::pin(dispatch_method(
                     coordinator,
