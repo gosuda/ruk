@@ -25,6 +25,7 @@ use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::search::{SearchPool, SearchPoolConfig};
 use ruk_core::store::{PreparationBudget, Store};
+use ruk_git::transport::net::EgressPolicy;
 
 /// One registered repository: its canonical path, its hosted coordinator
 /// once opened, and its last-use instant for idle eviction.
@@ -83,6 +84,10 @@ pub(crate) struct Registry {
     search_pool_size: AtomicUsize,
     /// Decoded bytes new coordinators scan per `search` page.
     search_max_scan_bytes: AtomicU64,
+    /// Operator allowlist widening outbound dials past the default-deny
+    /// of private and loopback addresses; set once from the daemon
+    /// configuration before serving.
+    egress_policy: Mutex<EgressPolicy>,
 }
 
 impl fmt::Debug for Registry {
@@ -146,6 +151,7 @@ impl Registry {
             default_branch: Mutex::new(String::from(super::DEFAULT_DEFAULT_BRANCH)),
             search_pool_size: AtomicUsize::new(super::DEFAULT_SEARCH_POOL_SIZE),
             search_max_scan_bytes: AtomicU64::new(super::DEFAULT_SEARCH_MAX_SCAN_BYTES),
+            egress_policy: Mutex::new(EgressPolicy::deny_private()),
         };
         registry.sweep_tombstones();
         Ok(registry)
@@ -240,6 +246,22 @@ impl Registry {
     /// Reads the hosted hook callback deadline.
     pub(crate) fn hook_timeout(&self) -> Duration {
         Duration::from_millis(self.hook_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// Sets the outbound dial allowlist from the daemon configuration.
+    ///
+    /// `serve` calls this once before serving; a `Registry` built for
+    /// tests keeps the default-deny.
+    pub(crate) fn set_egress_policy(&self, policy: EgressPolicy) {
+        *self.egress_policy.lock().expect("egress policy lock") = policy;
+    }
+
+    /// The outbound dial allowlist transport jobs run under.
+    pub(crate) fn egress_policy(&self) -> EgressPolicy {
+        self.egress_policy
+            .lock()
+            .expect("egress policy lock")
+            .clone()
     }
 
     /// Sets the cap of ref commands accepted per hosted push batch.

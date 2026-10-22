@@ -56,7 +56,7 @@ pub(crate) async fn run_remote_refs(
         ));
     };
     let url = args.url.as_str();
-    let bridge = CancelBridge::arm(cancel, open);
+    let bridge = CancelBridge::arm(cancel, open, refs.registry.egress_policy());
     refuse_url_userinfo(url, &bridge.auth).map_err(to_core)?;
     let coordinator_job = Arc::clone(coordinator);
     let url_owned = url.to_owned();

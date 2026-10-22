@@ -663,6 +663,28 @@ fn invalid_new_config_values_name_the_key() {
 }
 
 #[test]
+fn egress_allow_widens_only_the_listed_addresses() {
+    use std::net::{IpAddr, Ipv4Addr};
+    let parsed = DaemonConfig::from_toml(&config_doc(
+        "egress_allow = [\"127.0.0.0/8\", \"10.20.30.40\"]\n",
+    ))
+    .expect("egress allowlist parses");
+    let policy = parsed.egress_policy().expect("policy builds");
+    assert!(policy.allows(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    assert!(policy.allows(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40))));
+    assert!(!policy.allows(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    assert!(!policy.allows(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+
+    let default = DaemonConfig::from_toml(&config_doc("")).expect("default parses");
+    let strict = default.egress_policy().expect("policy builds");
+    assert!(!strict.allows(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+    let err = DaemonConfig::from_toml(&config_doc("egress_allow = [\"not-an-ip\"]\n"))
+        .expect_err("malformed allowlist entry must refuse");
+    assert!(err.to_string().contains("egress_allow"));
+}
+
+#[test]
 fn hook_max_commands_accepts_only_1_through_4096() {
     for valid in ["hook_max_commands = 1\n", "hook_max_commands = 4096\n"] {
         DaemonConfig::from_toml(&config_doc(valid)).expect("boundary must parse");

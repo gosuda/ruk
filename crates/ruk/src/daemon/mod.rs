@@ -53,6 +53,7 @@ use ruk_git::transport::archive::{
 };
 use ruk_git::transport::credentials::TransportAuth;
 use ruk_git::transport::host::{HookCall, HookReply, HostPolicy, hook_bridge};
+use ruk_git::transport::net::EgressPolicy;
 
 use crate::archive_zip::ZipTranscoder;
 use ruk_git::transport::pack::IngestLimits;
@@ -147,6 +148,11 @@ pub(crate) struct DaemonConfig {
     /// Interval between periodic retention sweeps of every opened
     /// coordinator; zero disables them.
     retention_interval: Duration,
+    /// Operator allowlist widening outbound dials past the default-deny
+    /// of private, loopback, and link-local addresses: each entry is an
+    /// exact IP or a CIDR prefix, permitting LAN mirrors without lifting
+    /// the guard for everyone else.
+    egress_allow: Vec<String>,
 }
 
 impl DaemonConfig {
@@ -172,6 +178,7 @@ impl DaemonConfig {
             frame_timeout: Duration::from_millis(DEFAULT_FRAME_TIMEOUT_MS),
             stream_window_bytes: ipc::INITIAL_STREAM_WINDOW_BYTES,
             retention_interval: Duration::from_millis(DEFAULT_RETENTION_INTERVAL_MS),
+            egress_allow: Vec::new(),
         }
     }
 
@@ -432,6 +439,8 @@ impl DaemonConfig {
             compare_max_commits: Option<usize>,
             search_max_scan_bytes: Option<u64>,
             search_pool_size: Option<usize>,
+            #[serde(default)]
+            egress_allow: Vec<String>,
         }
         let text = std::str::from_utf8(doc)
             .map_err(|err| Error::Config(format!("config is not UTF-8: {err}")))?;
@@ -485,6 +494,7 @@ impl DaemonConfig {
         if let Some(v) = doc.search_pool_size {
             cfg = cfg.with_search_pool_size(v);
         }
+        cfg.egress_allow = doc.egress_allow;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -565,7 +575,30 @@ impl DaemonConfig {
                 "stream window must fit the maximum window",
             )));
         }
+        self.egress_policy()?;
         Ok(())
+    }
+
+    /// The operator allowlist widening outbound dials: every entry must
+    /// parse as an exact IP or a CIDR prefix, and `validate` runs the same
+    /// build before startup so malformed entries refuse the process.
+    ///
+    /// # Errors
+    /// `Error::Config` naming `egress_allow` on a malformed entry.
+    pub(crate) fn egress_policy(&self) -> Result<EgressPolicy, Error> {
+        let mut policy = EgressPolicy::deny_private();
+        for entry in &self.egress_allow {
+            if let Ok(addr) = entry.parse::<std::net::IpAddr>() {
+                policy = policy.allow(addr);
+                continue;
+            }
+            policy = policy.allow_cidr(entry).map_err(|err| {
+                Error::Config(format!(
+                    "egress_allow {entry:?} is not an IP or CIDR: {err}"
+                ))
+            })?;
+        }
+        Ok(policy)
     }
 }
 
@@ -1087,6 +1120,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
                 .try_into()
                 .expect("compare budget fits u64"),
         );
+        registry.set_egress_policy(config.egress_policy()?);
         registry.set_hook_timeout(config.hook_timeout);
         registry.set_hook_max_commands(config.hook_max_commands);
         registry.set_archive_max_bytes(config.archive_max_bytes);

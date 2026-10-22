@@ -131,7 +131,7 @@ impl<'a> PushJob<'a> {
         }
 
         let url = push_url(&args.args.remote)?;
-        let bridge = CancelBridge::arm(self.cancel, open);
+        let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
         refuse_url_userinfo(url, &bridge.auth).map_err(to_core)?;
         let ref_names: Vec<Vec<u8>> = args
             .args
@@ -160,7 +160,7 @@ impl<'a> PushJob<'a> {
         self.commit_prepare(open, &request, &prepared.plan).await?;
 
         let job = self.snapshot();
-        let bridge = CancelBridge::arm(self.cancel, open);
+        let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
         let sent = self
             .refs
             .transport
@@ -243,7 +243,7 @@ impl<'a> PushJob<'a> {
             )
         })?;
 
-        let bridge = CancelBridge::arm(self.cancel, open);
+        let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
         refuse_url_userinfo(&remote, &bridge.auth).map_err(to_core)?;
         let kind = self.coordinator.store().hash_kind();
         // The closure below moves the plan record in; pin the wire state
@@ -747,8 +747,9 @@ pub(crate) struct CancelBridge {
 impl CancelBridge {
     /// Arms one phase: the policy comes from the invocation, the flag
     /// trips on lease or connection loss, and dropping the bridge aborts
-    /// a watcher whose phase already ended.
-    pub(crate) fn arm(cancel: &Cancel, open: &InvocationOpen) -> Self {
+    /// a watcher whose phase already ended. `egress` is the daemon's
+    /// configured dial allowlist.
+    pub(crate) fn arm(cancel: &Cancel, open: &InvocationOpen, egress: EgressPolicy) -> Self {
         let flag = Arc::new(AtomicBool::new(false));
         let tripped = Arc::clone(&flag);
         let mut cancelled = cancel.clone();
@@ -759,7 +760,7 @@ impl CancelBridge {
         Self {
             interrupt: Interrupt::none().with_cancel(flag),
             auth: job_auth(open),
-            egress: EgressPolicy::deny_private(),
+            egress,
             watcher,
         }
     }
@@ -1130,7 +1131,7 @@ mod tests {
     async fn cancel_bridge_trips_interrupt_on_cancel() {
         let (handle, cancel) = ruk_core::coord::cancellation();
         let open = test_open(TransportAuth::none());
-        let bridge = CancelBridge::arm(&cancel, &open);
+        let bridge = CancelBridge::arm(&cancel, &open, EgressPolicy::deny_private());
         bridge.interrupt.check("probe").expect("untripped");
         handle.cancel();
         for _ in 0..100 {
