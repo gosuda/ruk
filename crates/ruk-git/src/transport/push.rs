@@ -122,6 +122,24 @@ pub enum RefResult {
     },
 }
 
+/// Scrubs userinfo from every rejection reason a remote reported, before the
+/// outcome is stored on a durable plan row.
+fn scrub_outcomes(outcomes: Vec<RefOutcome>) -> Vec<RefOutcome> {
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            let RefOutcome { name, result } = outcome;
+            let result = match result {
+                RefResult::Ok => RefResult::Ok,
+                RefResult::Rejected { reason } => RefResult::Rejected {
+                    reason: super::credentials::scrub_userinfo(&reason),
+                },
+            };
+            RefOutcome { name, result }
+        })
+        .collect()
+}
+
 /// A durable push plan: state machine plus its `push_plans` row codec.
 ///
 /// Row layout, versioned: `01 | state:u8 | hash:u8 | atomic:u8 |
@@ -152,7 +170,7 @@ impl PushPlanRecord {
     pub fn prepare(id: PlanId, remote: Vec<u8>, atomic: bool, updates: Vec<PushUpdate>) -> Self {
         Self {
             id,
-            remote,
+            remote: super::credentials::scrub_userinfo_bytes(&remote),
             atomic,
             state: PushState::Prepared,
             updates,
@@ -186,7 +204,7 @@ impl PushPlanRecord {
             });
         }
         let ok = outcomes.iter().all(|o| o.result == RefResult::Ok);
-        self.outcomes = outcomes;
+        self.outcomes = scrub_outcomes(outcomes);
         self.state = if ok {
             PushState::Confirmed
         } else {
@@ -206,7 +224,7 @@ impl PushPlanRecord {
                 detail: "push plan can be refused only from Prepared".to_owned(),
             });
         }
-        self.outcomes = outcomes;
+        self.outcomes = scrub_outcomes(outcomes);
         self.state = PushState::Rejected;
         Ok(())
     }
@@ -307,11 +325,11 @@ impl PushPlanRecord {
         }
         Ok(Self {
             id,
-            remote: remote.to_vec(),
+            remote: super::credentials::scrub_userinfo_bytes(remote),
             atomic: *atomic != 0,
             state,
             updates,
-            outcomes,
+            outcomes: scrub_outcomes(outcomes),
         })
     }
 }
@@ -1173,6 +1191,57 @@ fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_rows_store_no_userinfo_from_label_or_reasons() {
+        let mut plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://ada:CANARY-s3cret@host.x/r.git".to_vec(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(plan.remote, b"https://host.x/r.git".to_vec());
+        plan.begin_send().expect("prepared plan sends");
+        plan.finalize(vec![RefOutcome {
+            name: b"refs/heads/x".to_vec(),
+            result: RefResult::Rejected {
+                reason: "remote said https://ada:CANARY-s3cret@host.x refused".to_owned(),
+            },
+        }])
+        .expect("sending plan finalizes");
+        let encoded = plan.encode(HashKind::Sha1).expect("plan encodes");
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(!text.contains("CANARY-s3cret"), "{text:?}");
+        assert!(text.contains("https://host.x refused"), "{text:?}");
+    }
+
+    #[test]
+    fn legacy_rows_decode_without_userinfo() {
+        let id = PlanId::generate();
+        let dirty = PushPlanRecord {
+            id,
+            remote: b"https://ada:CANARY-s3cret@host.x/r.git".to_vec(),
+            atomic: false,
+            state: PushState::Rejected,
+            updates: Vec::new(),
+            outcomes: vec![RefOutcome {
+                name: b"refs/heads/x".to_vec(),
+                result: RefResult::Rejected {
+                    reason: "remote said https://ada:CANARY-s3cret@host.x refused".to_owned(),
+                },
+            }],
+        };
+        let encoded = dirty.encode(HashKind::Sha1).expect("legacy row encodes");
+        let decoded = PushPlanRecord::decode(id, HashKind::Sha1, &encoded).expect("row decodes");
+        assert_eq!(decoded.remote, b"https://host.x/r.git".to_vec());
+        let [outcome] = &decoded.outcomes[..] else {
+            panic!("one outcome: {decoded:?}");
+        };
+        assert!(
+            matches!(&outcome.result, RefResult::Rejected { reason } if !reason.contains("CANARY-s3cret") && reason.contains("https://host.x refused")),
+            "{outcome:?}"
+        );
+    }
 
     fn update(name: &[u8], old: &str, new: &str) -> PushUpdate {
         PushUpdate {

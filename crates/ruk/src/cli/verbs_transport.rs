@@ -361,6 +361,7 @@ pub(crate) fn run_fetch(
         }
         Target::Net(endpoint) => match endpoint {
             Endpoint::Http { url, .. } => {
+                ruk_git::transport::credentials::refuse_url_userinfo(&url, &plan.auth)?;
                 let base = ruk_git::transport::smart_http::normalize_base(&url)?;
                 let extra_headers = http_extra_headers(ctx, &base);
                 // Highest protocol first: one `Git-Protocol` GET parses
@@ -1516,6 +1517,7 @@ fn push_net(
         // Stateless, so no connection is held between the two round trips.
         let http_adv = match endpoint {
             Endpoint::Http { url, .. } => {
+                ruk_git::transport::credentials::refuse_url_userinfo(url, &flags.auth)?;
                 let base = ruk_git::transport::smart_http::normalize_base(url)?;
                 let extra_headers = http_extra_headers(ctx, &base);
                 Some((
@@ -2138,6 +2140,7 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
                     archive_local(&store, kind, &rev)?
                 }
                 Endpoint::Http { url, .. } => {
+                    ruk_git::transport::credentials::refuse_url_userinfo(&url, &auth)?;
                     let base = ruk_git::transport::smart_http::normalize_base(&url)?;
                     let extra_headers = http_extra_headers(ctx, &base);
                     let out = ruk_git::transport::smart_http::fetch_archive(
@@ -4096,6 +4099,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             // `run_fetch` makes.
             let refs = match &endpoint {
                 Endpoint::Http { url, .. } => {
+                    ruk_git::transport::credentials::refuse_url_userinfo(url, &auth)?;
                     let base = ruk_git::transport::smart_http::normalize_base(url)?;
                     let extra_headers = http_extra_headers(ctx, &base);
                     match ruk_git::transport::smart_http::discover_versioned(

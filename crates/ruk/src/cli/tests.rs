@@ -2262,6 +2262,43 @@ fn credential_fill_approve_reject_round_trip() {
 }
 
 #[test]
+fn captured_errors_scrub_userinfo_from_stderr() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if socket.read(&mut byte).expect("read head") == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("reply");
+    });
+    let (root, mut env) = seeded_repo("captured-canary", "a.txt", b"a\n");
+    env.cwd = root;
+    let url = format!("http://ada:CANARY-s3cret@127.0.0.1:{port}/a.git");
+    let outcome = super::run_captured(vec!["ruk".to_owned(), "fetch".to_owned(), url], env);
+    server.join().expect("server");
+    assert_ne!(outcome.code, 0, "a 401 fails the verb");
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    assert!(
+        stderr.contains("authentication failed with status 401"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("127.0.0.1"), "{stderr}");
+    assert!(!stderr.contains("CANARY-s3cret"), "{stderr}");
+}
+
+#[test]
 fn archive_over_smart_http_streams_tar() {
     let tar = b"fake-tar-bytes".to_vec();
     let mut body = pkt_frame(b"ACK\n");

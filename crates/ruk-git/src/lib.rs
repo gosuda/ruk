@@ -179,7 +179,10 @@ impl GitError {
     /// The [`CoreError`] form, preserving the closed code.
     #[must_use]
     pub fn to_core_error(&self) -> CoreError {
-        CoreError::new(self.code(), self.to_string())
+        CoreError::new(
+            self.code(),
+            transport::credentials::scrub_userinfo(&self.to_string()),
+        )
     }
 }
 
@@ -289,6 +292,21 @@ mod tests {
         let sha256 = parse_oid(SHA256_HEX).expect("sha256 parses");
         assert_eq!(sha256.kind(), HashKind::Sha256);
         assert_eq!(sha256.to_hex(), SHA256_HEX);
+    }
+
+    #[test]
+    fn core_error_message_carries_no_userinfo() {
+        let err = GitError::Offline {
+            detail: "cannot reach https://ada:CANARY-s3cret@host.x/r.git".to_owned(),
+        };
+        let core = err.to_core_error();
+        assert_eq!(core.code, ErrorCode::EOffline);
+        assert!(!core.message.contains("CANARY-s3cret"), "{}", core.message);
+        assert!(
+            core.message.contains("https://host.x/r.git"),
+            "{}",
+            core.message
+        );
     }
 
     #[test]

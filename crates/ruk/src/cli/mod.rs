@@ -207,17 +207,38 @@ pub(crate) struct CliOutcome {
 /// the same `ruk: {err}` line [`run`] would print, with the error's native
 /// exit status.
 pub(crate) fn run_captured(argv: Vec<String>, env: CliEnv) -> CliOutcome {
+    let secrets = captured_secrets(&argv, &env);
+    let scrub = |bytes: &[u8]| {
+        ruk_git::transport::credentials::scrub_userinfo_bytes(
+            &ruk_git::transport::credentials::scrub_secrets(bytes, &secrets),
+        )
+    };
     match run_inner(&argv, env) {
         Ok((stdout, stderr)) => CliOutcome {
             stdout,
-            stderr,
+            stderr: scrub(&stderr),
             code: 0,
         },
         Err(err) => CliOutcome {
             stdout: Vec::new(),
-            stderr: format!("ruk: {err}\n").into_bytes(),
+            stderr: scrub(format!("ruk: {err}\n").as_bytes()),
             code: err.exit_code(),
         },
+    }
+}
+
+/// The injected credential a captured invocation carries on `--auth-stdin`,
+/// read from its captured stdin, so its output can be scrubbed.
+fn captured_secrets(argv: &[String], env: &CliEnv) -> Vec<String> {
+    if !argv.iter().any(|arg| arg == "--auth-stdin") {
+        return Vec::new();
+    }
+    let Some(bytes) = env.stdin.as_deref() else {
+        return Vec::new();
+    };
+    match sonic_rs::from_slice::<ruk_git::transport::credentials::TransportAuth>(bytes) {
+        Ok(auth) => vec![auth.credential],
+        Err(_) => Vec::new(),
     }
 }
 
@@ -255,7 +276,8 @@ pub(crate) fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
     if !outcome.stderr.is_empty() {
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
-        let _ = lock.write_all(&outcome.stderr);
+        let scrubbed = ruk_git::transport::credentials::scrub_userinfo_bytes(&outcome.stderr);
+        let _ = lock.write_all(&scrubbed);
     }
     ExitCode::from(outcome.code)
 }

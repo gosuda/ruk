@@ -948,6 +948,94 @@ pub fn resolve_auth_header(
     }
 }
 
+/// Whether `url` carries userinfo (`user[:password]@`) in its authority.
+#[must_use]
+pub fn url_has_userinfo(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+/// Refuses a remote URL that embeds credentials under an explicit injected
+/// credential: userinfo is never parsed as a credential (C18). The error
+/// names the cause and never echoes the URL, so the embedded secret cannot
+/// leave through it. Ambient calls keep their historical behavior.
+///
+/// # Errors
+/// [`crate::GitError::Invalid`] for userinfo under [`AuthPolicy::Explicit`].
+pub fn refuse_url_userinfo(url: &str, policy: &AuthPolicy) -> Result<(), crate::GitError> {
+    if matches!(policy, AuthPolicy::Explicit { .. }) && url_has_userinfo(url) {
+        return Err(crate::GitError::Invalid {
+            detail: "remote URL embeds credentials; pass them through --auth-stdin".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Replaces every `scheme://user[:password]@` in free bytes with `scheme://`,
+/// so a credential pasted into a URL never reaches stderr or a stored row.
+/// Works on bytes: non-UTF-8 content passes through unchanged, and every cut
+/// ends at an ASCII delimiter, so UTF-8 validity is preserved.
+#[must_use]
+pub fn scrub_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(index) = rest.windows(3).position(|window| window == b"://") {
+        let (head, tail) = rest.split_at(index + 3);
+        out.extend_from_slice(head);
+        let end = tail
+            .iter()
+            .position(|byte| {
+                matches!(byte, b'/' | b'?' | b'#' | b'"' | b'\'') || byte.is_ascii_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let (authority, after) = tail.split_at(end);
+        match authority.iter().rposition(|byte| *byte == b'@') {
+            Some(at) => out.extend_from_slice(&authority[at + 1..]),
+            None => out.extend_from_slice(authority),
+        }
+        rest = after;
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// Text form of [`scrub_userinfo_bytes`].
+#[must_use]
+pub fn scrub_userinfo(text: &str) -> String {
+    String::from_utf8_lossy(&scrub_userinfo_bytes(text.as_bytes())).into_owned()
+}
+
+/// Replaces every occurrence of each non-empty `secret` in `bytes` with
+/// `[redacted]`: an injected credential's value must never reach stderr or
+/// an error string, even when a server echoes it back.
+#[must_use]
+pub fn scrub_secrets(bytes: &[u8], secrets: &[String]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        out = replace_all(&out, secret.as_bytes(), b"[redacted]");
+    }
+    out
+}
+
+fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            out.extend_from_slice(with);
+            index += needle.len();
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
 /// How one call authenticates to a remote. `None` sends nothing; any other
 /// kind sends exactly one `Authorization` header and never consults helpers
 /// or the environment (H4b fail closed). SSH key injection stays deferred.
@@ -1545,6 +1633,56 @@ mod tests {
             "userinfo in the URL never widens the scope"
         );
         assert_eq!(TransportAuth::none().header_for("https://host.x/a"), None);
+    }
+
+    #[test]
+    fn scrub_userinfo_drops_every_userinfo_form() {
+        assert_eq!(
+            scrub_userinfo("fetch https://ada:CANARY@host.x/r.git failed"),
+            "fetch https://host.x/r.git failed"
+        );
+        assert_eq!(scrub_userinfo("ssh://git@host/x"), "ssh://host/x");
+        assert_eq!(
+            scrub_userinfo("https://host.x/a?u=p@q"),
+            "https://host.x/a?u=p@q"
+        );
+        assert_eq!(scrub_userinfo("no url here"), "no url here");
+        assert_eq!(
+            scrub_userinfo_bytes(b"\xff://u:p@h/\xfe"),
+            b"\xff://h/\xfe".to_vec(),
+            "non-UTF-8 bytes pass through unchanged"
+        );
+        assert_eq!(
+            scrub_userinfo_bytes(b"x https://ada:CANARY@h/r"),
+            b"x https://h/r".to_vec()
+        );
+    }
+
+    #[test]
+    fn explicit_auth_refuses_url_userinfo_without_echoing_it() {
+        let explicit = AuthPolicy::explicit(TransportAuth::none());
+        let err = refuse_url_userinfo("https://ada:CANARY-s3cret@host.x/r.git", &explicit)
+            .expect_err("explicit auth refuses userinfo");
+        assert!(!err.to_string().contains("CANARY-s3cret"), "{err}");
+        assert!(refuse_url_userinfo("https://host.x/r.git", &explicit).is_ok());
+        assert!(
+            refuse_url_userinfo(
+                "https://ada:CANARY@host.x/r.git",
+                &AuthPolicy::ambient_in(HashMap::new()),
+            )
+            .is_ok(),
+            "ambient calls keep their historical behavior"
+        );
+    }
+
+    #[test]
+    fn scrub_secrets_redacts_every_occurrence_and_ignores_empty() {
+        let secrets = vec!["CANARY-tok".to_owned(), String::new()];
+        assert_eq!(
+            scrub_secrets(b"Bearer CANARY-tok and CANARY-tok", &secrets),
+            b"Bearer [redacted] and [redacted]".to_vec()
+        );
+        assert_eq!(scrub_secrets(b"no secret", &secrets), b"no secret".to_vec());
     }
 
     #[test]
