@@ -341,15 +341,19 @@ pub(crate) fn build_search_matcher(
     pattern: &SearchPattern,
     case_insensitive: bool,
 ) -> Result<Regex, CoreError> {
-    let source: String = match pattern {
+    let (source, unicode): (String, bool) = match pattern {
         SearchPattern::Literal(needle) => match core::str::from_utf8(needle.as_bytes()) {
-            Ok(text) => regex::escape(text),
-            Err(_) => escape_bytes(needle.as_bytes()),
+            Ok(text) => (regex::escape(text), true),
+            // A non-UTF-8 literal must match raw bytes: in Unicode mode
+            // an escaped `\xff` would mean U+00FF and match its two-byte
+            // UTF-8 encoding instead of the byte itself.
+            Err(_) => (escape_bytes(needle.as_bytes()), false),
         },
-        SearchPattern::Regex(pattern) => pattern.clone(),
+        SearchPattern::Regex(pattern) => (pattern.clone(), true),
     };
     RegexBuilder::new(&source)
         .case_insensitive(case_insensitive)
+        .unicode(unicode)
         .build()
         .map_err(|err| CoreError::new(ErrorCode::EInvalid, format!("search regex: {err}")))
 }
@@ -552,7 +556,10 @@ pub(crate) fn scan_search_shard(store: &Store, job: &ShardScan) -> Result<ShardO
         }
         out.end_path = Some(path.clone());
         if StdInstant::now() >= job.deadline {
+            // The page seals at this completed path: scanning further
+            // blobs would only hold the search permit past its deadline.
             out.deadline_hit = true;
+            break;
         }
     }
     Ok(out)
@@ -1044,6 +1051,49 @@ mod tests {
         let dot = build_search_matcher(&literal("a.c"), false).expect("dot literal compiles");
         assert!(dot.find(b"a.c").is_some());
         assert!(dot.find(b"axc").is_none());
+    }
+
+    #[test]
+    fn non_utf8_literal_matches_raw_bytes() {
+        let needle = SearchPattern::Literal(ByteString::from(vec![0xff]));
+        let matcher = build_search_matcher(&needle, false).expect("byte literal compiles");
+        assert!(matcher.find(b"\xff").is_some());
+        // U+00FF in UTF-8 is two bytes; a byte-mode literal must not
+        // match them.
+        assert!(matcher.find("ÿ".as_bytes()).is_none());
+        let utf8 = build_search_matcher(&literal("ÿ"), false).expect("literal compiles");
+        assert!(utf8.find("ÿ".as_bytes()).is_some());
+        assert!(utf8.find(b"\xff").is_none());
+    }
+
+    #[test]
+    fn expired_deadline_stops_at_the_completed_path() {
+        let (_temp, store) = test_store("deadline");
+        let first = put_blob(&store, b"needle one\n");
+        let second = put_blob(&store, b"needle two\n");
+        let third = put_blob(&store, b"needle three\n");
+        let matcher = build_search_matcher(&literal("needle"), false).expect("matcher compiles");
+        let (_guard, cancel) = crate::coord::cancellation();
+        let job = ShardScan {
+            shard: vec![
+                (b"a.txt".to_vec(), first),
+                (b"b.txt".to_vec(), second),
+                (b"c.txt".to_vec(), third),
+            ],
+            matcher,
+            row_cap: 100,
+            skip_before: (Vec::new(), 0),
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel,
+            deadline: StdInstant::now() - Duration::from_secs(1),
+        };
+        let out = scan_search_shard(&store, &job).expect("shard scans");
+        assert!(out.deadline_hit);
+        // The seal names the completed path so the next page resumes
+        // after it instead of rescanning or skipping.
+        assert_eq!(out.end_path, Some(b"a.txt".to_vec()));
+        assert_eq!(out.scanned_blobs, 1);
+        assert_eq!(out.rows.len(), 1);
     }
 
     #[test]
