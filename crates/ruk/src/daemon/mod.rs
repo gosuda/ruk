@@ -11,6 +11,7 @@
 
 pub(crate) mod executor;
 pub(crate) mod ipc;
+mod push_job;
 pub(crate) mod registry;
 
 #[cfg(test)]
@@ -1106,7 +1107,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
 
 /// Shared handles of one connection task.
 #[derive(Clone)]
-struct ConnectionRefs {
+pub(crate) struct ConnectionRefs {
     /// The authorizing registry.
     registry: Arc<Registry>,
     /// The shared blocking pool.
@@ -3114,29 +3115,34 @@ async fn typed_stream(
     // call: `repo.init` names a repository that does not exist yet, and
     // `repo.delete` retires its coordinator, so opening one first would
     // refuse the very calls the row serves.
-    let (handle, coordinator): (String, Option<Arc<HostedCoordinator>>) =
-        if method.kind() == ruk_core::protocol::MethodKind::Admin {
-            (String::new(), None)
-        } else {
-            let repo_ref = open.repo.clone();
-            let registry = Arc::clone(&refs.registry);
-            let opened = refs
-                .executor
-                .run(move || registry.open(&repo_ref))
-                .await
-                .map_err(Error::Core);
-            match opened {
-                Ok(Ok((handle, _, coordinator))) => (handle, Some(coordinator)),
-                Ok(Err(err)) | Err(Error::Core(err)) => {
-                    fail(Error::Core(err)).await;
-                    return;
-                }
-                Err(err) => {
-                    fail(err).await;
-                    return;
-                }
+    let (handle, repo_path, coordinator): (
+        String,
+        Option<std::path::PathBuf>,
+        Option<Arc<HostedCoordinator>>,
+    ) = if method.kind() == ruk_core::protocol::MethodKind::Admin {
+        (String::new(), None, None)
+    } else {
+        let repo_ref = open.repo.clone();
+        let registry = Arc::clone(&refs.registry);
+        let opened = refs
+            .executor
+            .run(move || registry.open(&repo_ref))
+            .await
+            .map_err(Error::Core);
+        match opened {
+            Ok(Ok((handle, repo_path, coordinator))) => {
+                (handle, Some(repo_path), Some(coordinator))
             }
-        };
+            Ok(Err(err)) | Err(Error::Core(err)) => {
+                fail(Error::Core(err)).await;
+                return;
+            }
+            Err(err) => {
+                fail(err).await;
+                return;
+            }
+        }
+    };
     if method == Method::Archive {
         let Some(coordinator) = coordinator.as_ref() else {
             fail(Error::Core(CoreError::new(
@@ -3206,14 +3212,46 @@ async fn typed_stream(
                 .await;
                 return;
             };
-            Box::pin(dispatch_method(
-                coordinator,
-                caller,
-                open,
-                method,
-                session,
-                &cancel,
-            ))
+            // R28: hosted push methods run as transport jobs, not lane
+            // mutations. The coordinator owns no network path, so the job
+            // replays, persists the plan, sends off the lane, and commits
+            // the terminal state before the reply goes out.
+            if method == Method::Push || method == Method::PushReconcile {
+                let Some(session) = session else {
+                    fail(Error::Core(refuse_sessionless(method, None))).await;
+                    return;
+                };
+                let Some(repo_path) = repo_path.as_ref() else {
+                    fail(Error::Core(CoreError::new(
+                        ErrorCode::EHosted,
+                        "internal: push arrived without a repository path",
+                    )))
+                    .await;
+                    return;
+                };
+                let job = push_job::PushJob::bind(
+                    coordinator,
+                    caller.principal,
+                    session,
+                    repo_path,
+                    refs,
+                    &cancel,
+                );
+                if method == Method::Push {
+                    Box::pin(job.push(open))
+                } else {
+                    Box::pin(job.reconcile(open))
+                }
+            } else {
+                Box::pin(dispatch_method(
+                    coordinator,
+                    caller,
+                    open,
+                    method,
+                    session,
+                    &cancel,
+                ))
+            }
         };
     tokio::pin!(dispatch);
     let mut refused: Option<CoreError> = None;

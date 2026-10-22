@@ -2465,6 +2465,7 @@ name = "ruk"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "jiff",
  "regex",
  "ruk-core",
  "ruk-git",
