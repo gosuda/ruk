@@ -543,14 +543,8 @@ impl BlockingJob {
                     return Err(err);
                 }
                 tracing::warn!(error = %err, "ruk push: send failed after first persist");
-                // Every ref whose update may have moved a byte reports
-                // Uncertain so the caller can reconcile; the local
-                // refusals in `early` keep their verdicts.
-                early.extend(wire.updates.iter().map(|update| RefOutcome {
-                    name: update.name.clone(),
-                    result: RefResult::Ok,
-                }));
-                let (state, refs) = map_outcomes(plan.state, &early)?;
+                let outcomes = send_failure_outcomes(early, &wire);
+                let (state, refs) = map_outcomes(plan.state, &outcomes)?;
                 self.finish_send(plan, state, refs)
             }
         }
@@ -786,6 +780,20 @@ fn plan_remote(plan: &PushPlanRecord) -> Result<String, CoreError> {
             "stored push plan carries a non-UTF-8 remote",
         )
     })
+}
+
+/// Outcome rows for a send that failed after the first persist: every
+/// ref whose update may have moved a byte gets a verdict-less row, which
+/// `map_outcomes` reports `Uncertain` under the plan's state, while the
+/// local refusals in `early` keep their verdicts — the transport clears
+/// server outcomes when it marks the plan, so nothing here lies about a
+/// remote answer.
+fn send_failure_outcomes(mut early: Vec<RefOutcome>, wire: &PushWireRequest) -> Vec<RefOutcome> {
+    early.extend(wire.updates.iter().map(|update| RefOutcome {
+        name: update.name.clone(),
+        result: RefResult::Ok,
+    }));
+    early
 }
 
 /// Maps transport outcomes plus the terminal plan state to reply rows: an
@@ -1036,6 +1044,41 @@ mod tests {
         assert_eq!(state, PushState::Uncertain);
         assert!(matches!(refs[0].status, PushRefStatus::Uncertain));
         assert!(matches!(refs[1].status, PushRefStatus::Rejected { .. }));
+    }
+
+    #[test]
+    fn send_failure_outcomes_names_every_sent_ref() {
+        let early = vec![RefOutcome {
+            name: b"refs/heads/refused".to_vec(),
+            result: RefResult::Rejected {
+                reason: "non-fast-forward".to_owned(),
+            },
+        }];
+        let wire = PushWireRequest {
+            atomic: true,
+            updates: vec![
+                PushUpdate {
+                    name: b"refs/heads/a".to_vec(),
+                    old: oid_fill(1),
+                    new: oid_fill(2),
+                },
+                PushUpdate {
+                    name: b"refs/heads/b".to_vec(),
+                    old: oid_fill(1),
+                    new: oid_fill(2),
+                },
+            ],
+        };
+        let outcomes = send_failure_outcomes(early, &wire);
+        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes).expect("maps");
+        assert_eq!(state, PushState::Uncertain);
+        assert_eq!(refs.len(), 3);
+        assert!(matches!(refs[0].status, PushRefStatus::Rejected { .. }));
+        assert!(
+            refs[1..]
+                .iter()
+                .all(|row| { matches!(row.status, PushRefStatus::Uncertain) })
+        );
     }
 
     #[test]
