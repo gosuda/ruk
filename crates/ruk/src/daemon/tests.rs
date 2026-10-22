@@ -39,8 +39,8 @@ use ruk_core::protocol::{
     FetchFilter, FetchRefs, Fix, IdentityClaim, LandExecuteArgs, Method, Mutation, NewArgs,
     OpLogArgs, PageCursor, PageLimit, PageRequest, PathSelection, PinArgs, PushRefOutcome,
     PushRefStatus, PushState, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope,
-    Request, SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
-    TagSetArgs, UndoArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
+    RepoForkArgs, Request, SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs,
+    TagAnnotation, TagSetArgs, UndoArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
 use ruk_core::store::{EventContext, EventSource, FactTable, ObjectKind, PreparationBudget, Store};
@@ -5324,7 +5324,18 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         repo: String::new(),
         method: "repo.fork".to_string(),
         request_id: None,
-        args_json: Some("{\"source\":\"acme/hello\",\"path\":\"acme/fork\"}".to_string()),
+        args_json: Some(
+            sonic_rs::to_string(&RepoForkArgs {
+                source: created.path.clone(),
+                path: root
+                    .join("acme/fork")
+                    .to_str()
+                    .expect("utf8 path")
+                    .to_owned(),
+                refs: None,
+            })
+            .expect("fork args encode"),
+        ),
         session_id: None,
         on_behalf_of: None,
         transport_auth: TransportAuth::default(),
@@ -5333,10 +5344,15 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         principal: &Principal::from_peer_uid(1000),
         admin_uids: &[1000],
     };
-    let err = dispatch_admin(&registry, admin, &forked, Method::RepoFork)
+    let bytes = dispatch_admin(&registry, admin, &forked, Method::RepoFork)
         .await
-        .expect_err("unserved admin refuses");
-    assert_eq!(err.code, ErrorCode::EHosted);
+        .expect("admin repo.fork serves");
+    let envelope: ReplyEnvelope = ipc::decode_control(&bytes).expect("reply decodes");
+    let ReplyBody::Success(Reply::RepoFork(forked)) = envelope.body else {
+        panic!("repo.fork must answer its own reply");
+    };
+    assert!(forked.path.ends_with("acme/fork"));
+    assert_ne!(forked.store_id, created.store_id);
 }
 
 #[tokio::test]

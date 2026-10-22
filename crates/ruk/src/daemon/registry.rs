@@ -670,6 +670,820 @@ impl Registry {
             previous_path: previous.to_owned(),
         })
     }
+
+    /// Copies one repository into a fresh store id through a staging sibling.
+    ///
+    /// The source resolves beneath the configured roots and the destination
+    /// stays within the source root. A staging sibling holds the fresh
+    /// store: sealed segments hardlink (a cross-device link copies
+    /// instead), the sealed snapshot installs with the forked generation,
+    /// tail objects re-publish by content in base-first order, validated
+    /// fact rows follow, and verified LFS payloads relink. The staging
+    /// handles close, both parents fsync, the staging directory renames
+    /// atomically into the destination, and only the destination-rooted
+    /// store opens and registers: a staging-rooted handle never registers
+    /// and never survives the rename. Any failure before the rename removes
+    /// the staging directory best-effort; a leftover staging directory
+    /// never blocks a retry, which mints a fresh name. Released-tag freeze
+    /// markers, attestations, and all other live coordination state stay
+    /// behind; the default branch carries over.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for an unknown source, `E_FORBIDDEN` outside the
+    /// roots, `E_INVALID` for an existing destination, `E_STALE` when the
+    /// source moves under the photograph, plus store and I/O failures.
+    pub(crate) fn fork_repo(
+        &self,
+        args: &ruk_core::protocol::RepoForkArgs,
+    ) -> Result<ruk_core::protocol::RepoForkReply, CoreError> {
+        self.fork_repo_with_link(
+            args,
+            &|from, to| std::fs::hard_link(from, to),
+            &staging_sibling,
+        )
+    }
+
+    /// Serves `repo.fork` with an injectable segment link: production passes
+    /// the filesystem hard link, and the cross-device fallback copies.
+    ///
+    /// # Errors
+    /// As for [`Registry::fork_repo`].
+    fn fork_repo_with_link(
+        &self,
+        args: &ruk_core::protocol::RepoForkArgs,
+        link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+        mint: &dyn Fn(&Path) -> PathBuf,
+    ) -> Result<ruk_core::protocol::RepoForkReply, CoreError> {
+        use ruk_core::protocol::ForkRefs;
+        let (repo_root, source_store_dir) = self.resolve_repo_and_store(Path::new(&args.source))?;
+        let root = self
+            .roots
+            .iter()
+            .find(|root| repo_root.starts_with(root))
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::EForbidden,
+                    "repository escapes the configured roots",
+                )
+            })?;
+        let new_path = Path::new(&args.path);
+        let requested = if new_path.is_absolute() {
+            new_path.to_path_buf()
+        } else {
+            root.join(new_path)
+        };
+        let destination = self.resolve_destination(&requested)?;
+        if !destination.starts_with(root) {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "repository fork stays within one root",
+            ));
+        }
+        if destination.exists() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository already exists",
+            ));
+        }
+        let fallback = self
+            .default_branch
+            .lock()
+            .map(|guard| guard.clone().into_bytes())
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        let live = {
+            let inner = self.inner.lock().map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+            })?;
+            inner
+                .entries
+                .values()
+                .find(|entry| entry.path == source_store_dir)
+                .and_then(|entry| entry.coordinator.clone())
+        };
+        let source = match live {
+            Some(coordinator) => ForkSource::Live(coordinator),
+            None => {
+                let store = Store::open(
+                    &source_store_dir,
+                    Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+                )
+                .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+                ForkSource::Cold(Box::new(store))
+            }
+        };
+        let mode = args.refs.unwrap_or(ForkRefs::All);
+        let _fork_pin = source.store().pin_for_fork();
+        let snapshot = Self::photograph_fork_source(source.store(), mode, &fallback)?;
+        let (container, staging, staging_store) =
+            Self::stage_fork_store(&destination, snapshot.kind, mint)?;
+        let destination_store = destination.join(".ruk");
+        let install = ForkInstall {
+            source: source.store(),
+            source_store: &source_store_dir,
+            destination: &destination,
+            destination_store: &destination_store,
+            container: &container,
+            staging: &staging,
+            link,
+        };
+        let outcome = self.finish_fork(&install, staging_store, &snapshot);
+        drop(source);
+        if outcome.is_err() {
+            let _ = std::fs::remove_dir_all(&container);
+        }
+        outcome
+    }
+
+    /// Photographs one fork snapshot with full CAS revalidation: the source
+    /// generation plus every copied fact row must read back unchanged, and
+    /// the copied key sets must match a fresh page, otherwise the source
+    /// moved and the attempt retries. Three attempts fail with `E_STALE`.
+    ///
+    /// # Errors
+    /// `E_STALE` when the source moves under the photograph, plus store
+    /// failures.
+    fn photograph_fork_source(
+        store: &Store,
+        mode: ruk_core::protocol::ForkRefs,
+        fallback_default: &[u8],
+    ) -> Result<ForkSnapshot, CoreError> {
+        use ruk_core::protocol::ForkRefs;
+        use ruk_core::store::{FactTable, REPO_META_KEY};
+        let map_err =
+            |err: ruk_core::store::StoreError| CoreError::new(err.code(), err.to_string());
+        for _ in 0..3 {
+            let generation = store.generation().map_err(map_err)?;
+            let default_branch = store
+                .default_branch()
+                .map_err(map_err)?
+                .map(|name| name.as_bytes().to_vec())
+                .unwrap_or_else(|| fallback_default.to_vec());
+            let manifests = store.all_manifests().map_err(map_err)?;
+            let mut sealed_manifests: Vec<ruk_core::store::SegmentManifest> = manifests
+                .into_iter()
+                .filter(|manifest| manifest.sealed && !manifest.retired)
+                .collect();
+            sealed_manifests.sort_by_key(|manifest| manifest.id);
+            let sealed_ids: std::collections::HashSet<u64> = sealed_manifests
+                .iter()
+                .map(|manifest| manifest.id)
+                .collect();
+            let mut sealed = Vec::new();
+            let mut tail = Vec::new();
+            for (oid, location) in store.all_object_locations().map_err(map_err)? {
+                if sealed_ids.contains(&location.segment) {
+                    sealed.push((oid, location));
+                } else {
+                    tail.push((oid, location));
+                }
+            }
+            sealed.sort_by_key(|(oid, _)| *oid);
+            tail.sort_by(|left, right| {
+                left.1
+                    .depth
+                    .cmp(&right.1.depth)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            let mut rows: Vec<(FactTable, Vec<u8>, Vec<u8>)> =
+                Self::page_fork_table(store, FactTable::Commits, map_err)?;
+            rows.extend(Self::page_fork_table(store, FactTable::Changes, map_err)?);
+            rows.extend(Self::page_fork_table(
+                store,
+                FactTable::ChangeHistory,
+                map_err,
+            )?);
+            rows.extend(Self::page_fork_table(
+                store,
+                FactTable::ImportedChanges,
+                map_err,
+            )?);
+            rows.extend(Self::page_fork_table(
+                store,
+                FactTable::LfsObjects,
+                map_err,
+            )?);
+            for row in Self::page_fork_table(store, FactTable::Refs, map_err)? {
+                let (_, key, _) = &row;
+                let keep = match mode {
+                    ForkRefs::All => true,
+                    ForkRefs::None => false,
+                    ForkRefs::DefaultAndTags => {
+                        key.as_slice() == default_branch.as_slice()
+                            || key.starts_with(b"refs/tags/")
+                    }
+                };
+                if keep {
+                    rows.push(row);
+                }
+            }
+            if let Some(raw) = store
+                .fact(FactTable::RepoMeta, REPO_META_KEY)
+                .map_err(map_err)?
+            {
+                rows.push((FactTable::RepoMeta, REPO_META_KEY.to_vec(), raw));
+            }
+            if Self::fork_snapshot_moved(store, mode, &default_branch, generation, &rows, map_err)?
+            {
+                continue;
+            }
+            let refs_copied = fork_count(
+                rows.iter()
+                    .filter(|(table, _, _)| *table == FactTable::Refs)
+                    .count(),
+            )?;
+            return Ok(ForkSnapshot {
+                kind: store.hash_kind(),
+                generation,
+                sealed_manifests,
+                sealed,
+                tail,
+                rows,
+                refs_copied,
+                mode,
+                default_branch,
+            });
+        }
+        Err(CoreError::new(
+            ErrorCode::EStale,
+            "source moved during fork; retry",
+        ))
+    }
+
+    /// Pages one whole fact table in bounded pages for the fork snapshot.
+    ///
+    /// # Errors
+    /// Store failures mapped to [`CoreError`].
+    fn page_fork_table(
+        store: &Store,
+        table: ruk_core::store::FactTable,
+        map_err: impl Fn(ruk_core::store::StoreError) -> CoreError + Copy,
+    ) -> Result<ForkRows, CoreError> {
+        use ruk_core::store::FactPageBudget;
+        let mut out = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = store
+                .fact_page(
+                    table,
+                    after.as_deref(),
+                    FactPageBudget::new(1024, 4 * 1024 * 1024),
+                )
+                .map_err(map_err)?;
+            let more = page.more;
+            let last = page.rows.last().map(|row| row.key.clone());
+            out.extend(page.rows.into_iter().map(|row| (table, row.key, row.value)));
+            if !more {
+                return Ok(out);
+            }
+            match last {
+                Some(key) => after = Some(key),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// Whether the source moved under a fork snapshot: the generation must
+    /// still match, every photographed fact row must read back unchanged,
+    /// and the copied key sets must match a fresh page. Facts-only source
+    /// publications never advance the locator generation, so the
+    /// generation check alone cannot catch them.
+    ///
+    /// # Errors
+    /// Store failures mapped to [`CoreError`].
+    fn fork_snapshot_moved(
+        store: &Store,
+        mode: ruk_core::protocol::ForkRefs,
+        default_branch: &[u8],
+        generation: u64,
+        rows: &ForkRows,
+        map_err: impl Fn(ruk_core::store::StoreError) -> CoreError + Copy,
+    ) -> Result<bool, CoreError> {
+        if store.generation().map_err(map_err)? != generation {
+            return Ok(true);
+        }
+        for (table, key, value) in rows {
+            match store.fact(*table, key).map_err(map_err)? {
+                Some(current) if current == *value => {}
+                _ => return Ok(true),
+            }
+        }
+        if !Self::fork_key_sets_match(store, mode, default_branch, rows, map_err)? {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Whether the photographed rows still match a fresh page of every
+    /// copied table: an inserted or removed row outside the point-checked
+    /// keys counts as movement.
+    ///
+    /// # Errors
+    /// Store failures mapped to [`CoreError`].
+    fn fork_key_sets_match(
+        store: &Store,
+        mode: ruk_core::protocol::ForkRefs,
+        default_branch: &[u8],
+        rows: &ForkRows,
+        map_err: impl Fn(ruk_core::store::StoreError) -> CoreError + Copy,
+    ) -> Result<bool, CoreError> {
+        use ruk_core::protocol::ForkRefs;
+        use ruk_core::store::FactTable;
+        let mut fresh: Vec<(FactTable, Vec<u8>)> = Vec::new();
+        for table in [
+            FactTable::Commits,
+            FactTable::Changes,
+            FactTable::ChangeHistory,
+            FactTable::ImportedChanges,
+            FactTable::LfsObjects,
+        ] {
+            for (row_table, key, _) in Self::page_fork_table(store, table, map_err)? {
+                fresh.push((row_table, key));
+            }
+        }
+        for (_, key, _) in Self::page_fork_table(store, FactTable::Refs, map_err)? {
+            let keep = match mode {
+                ForkRefs::All => true,
+                ForkRefs::None => false,
+                ForkRefs::DefaultAndTags => {
+                    key.as_slice() == default_branch || key.starts_with(b"refs/tags/")
+                }
+            };
+            if keep {
+                fresh.push((FactTable::Refs, key));
+            }
+        }
+        fresh.sort();
+        let mut staged: Vec<(FactTable, Vec<u8>)> = rows
+            .iter()
+            .filter(|(table, _, _)| *table != FactTable::RepoMeta)
+            .map(|(table, key, _)| (*table, key.clone()))
+            .collect();
+        staged.sort();
+        Ok(fresh == staged)
+    }
+
+    /// Creates one staging sibling holding a fresh store, minting a fresh
+    /// name on every attempt so a leftover staging directory never blocks a
+    /// retry.
+    ///
+    /// # Errors
+    /// `E_IO` when no staging name stays free, plus store creation
+    /// failures.
+    fn stage_fork_store(
+        destination: &Path,
+        kind: ruk_core::ids::HashKind,
+        mint: &dyn Fn(&Path) -> PathBuf,
+    ) -> Result<(PathBuf, PathBuf, Store), CoreError> {
+        for _ in 0..8 {
+            let container = mint(destination);
+            if container.exists() {
+                continue;
+            }
+            std::fs::create_dir(&container).map_err(|err| {
+                CoreError::new(
+                    ErrorCode::EIo,
+                    format!("fork staging directory is not created: {err}"),
+                )
+            })?;
+            let staging = container.join("store");
+            return match Store::create(
+                &staging,
+                kind,
+                Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+            ) {
+                Ok(store) => Ok((container, staging, store)),
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&container);
+                    Err(CoreError::new(err.code(), err.to_string()))
+                }
+            };
+        }
+        Err(CoreError::new(
+            ErrorCode::EIo,
+            "fork staging is never free; retry",
+        ))
+    }
+
+    /// Installs the snapshot into staging, closes the staging handles,
+    /// fsyncs, renames into the destination, then opens, verifies, and
+    /// registers the destination-rooted store.
+    ///
+    /// # Errors
+    /// `E_STALE` when the source moves under the tail copy, plus link,
+    /// store, and I/O failures. The caller removes the staging directory
+    /// best-effort on any error.
+    fn finish_fork(
+        &self,
+        install: &ForkInstall<'_>,
+        staging_store: Store,
+        snapshot: &ForkSnapshot,
+    ) -> Result<ruk_core::protocol::RepoForkReply, CoreError> {
+        use ruk_core::store::{
+            EventContext, EventSource, FactExpectation, FactMutation, FactTable,
+        };
+        let map_err =
+            |err: ruk_core::store::StoreError| CoreError::new(err.code(), err.to_string());
+        let stale = |detail: &str| CoreError::new(ErrorCode::EStale, detail.to_owned());
+        let mut linked = Vec::new();
+        let mut copied = Vec::new();
+        for manifest in &snapshot.sealed_manifests {
+            let from = install.source.segment_path(manifest.id);
+            let to = staging_store.segment_path(manifest.id);
+            match link_or_copy(install.link, &from, &to) {
+                Ok(LinkOutcome::Linked) => linked.push(manifest.id),
+                Ok(LinkOutcome::Copied) => copied.push(manifest.id),
+                Err(err) => {
+                    return Err(CoreError::new(
+                        ErrorCode::EIo,
+                        format!("fork links segment {}: {err}", manifest.id),
+                    ));
+                }
+            }
+        }
+        let tail_oids: Vec<ruk_core::ids::Oid> =
+            snapshot.tail.iter().map(|(oid, _)| *oid).collect();
+        staging_store
+            .import_sealed_snapshot(
+                &snapshot.sealed_manifests,
+                &snapshot.sealed,
+                &tail_oids,
+                snapshot.generation,
+            )
+            .map_err(map_err)?;
+        if install.source.generation().map_err(map_err)? != snapshot.generation {
+            return Err(stale("source moved during fork; retry"));
+        }
+        let mut committed: std::collections::HashSet<ruk_core::ids::Oid> =
+            snapshot.sealed.iter().map(|(oid, _)| *oid).collect();
+        let mut pending: std::collections::HashSet<ruk_core::ids::Oid> =
+            std::collections::HashSet::new();
+        let mut batch = Vec::new();
+        for (oid, location) in &snapshot.tail {
+            let read = install.source.read(*oid).map_err(|err| {
+                if err.code() == ErrorCode::ENotFound {
+                    stale("source moved during fork; retry")
+                } else {
+                    map_err(err)
+                }
+            })?;
+            if read.kind != location.kind || read.bytes.len() != location.decoded_len {
+                return Err(stale("source moved during fork; retry"));
+            }
+            // A delta reads its base from the staging store, so a base still
+            // in the pending batch must commit before this object prepares.
+            let predecessor = match location.base {
+                Some(base) if pending.contains(&base) => {
+                    flush_fork_batch(&staging_store, &mut batch, &mut committed, &mut pending)?;
+                    Some(base)
+                }
+                Some(base) if committed.contains(&base) => Some(base),
+                Some(base) => {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        format!("tail object {oid} names base {base} absent from the fork"),
+                    ));
+                }
+                None => None,
+            };
+            let object = staging_store
+                .prepare(read.kind, read.bytes.len(), read.bytes, predecessor)
+                .map_err(map_err)?;
+            if object.oid() != *oid {
+                return Err(CoreError::new(
+                    ErrorCode::ECorrupt,
+                    format!("tail object {oid} re-hashes to {}", object.oid()),
+                ));
+            }
+            pending.insert(*oid);
+            batch.push(object);
+            if batch.len() >= 256 {
+                flush_fork_batch(&staging_store, &mut batch, &mut committed, &mut pending)?;
+            }
+        }
+        flush_fork_batch(&staging_store, &mut batch, &mut committed, &mut pending)?;
+        if Self::fork_snapshot_moved(
+            install.source,
+            snapshot.mode,
+            &snapshot.default_branch,
+            snapshot.generation,
+            &snapshot.rows,
+            map_err,
+        )? {
+            return Err(stale("source moved during fork; retry"));
+        }
+        let mut facts = Vec::new();
+        let mut lfs_linked = 0u64;
+        for (table, key, value) in &snapshot.rows {
+            let mut publish = true;
+            if *table == FactTable::LfsObjects {
+                publish = link_lfs_payload(install, key, value)?;
+                if publish {
+                    lfs_linked += 1;
+                }
+            }
+            if publish {
+                facts.push(FactMutation {
+                    table: *table,
+                    key: key.clone(),
+                    expected: FactExpectation::Absent,
+                    value: Some(value.clone()),
+                });
+            }
+        }
+        for chunk in facts.chunks(512) {
+            staging_store
+                .publish(
+                    Vec::new(),
+                    chunk,
+                    EventSource::Fork,
+                    &EventContext::default(),
+                )
+                .map_err(map_err)?;
+        }
+        if snapshot
+            .rows
+            .iter()
+            .all(|(table, _, _)| *table != FactTable::RepoMeta)
+        {
+            let fallback = self
+                .default_branch
+                .lock()
+                .map(|guard| guard.clone())
+                .map_err(|_| {
+                    CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+                })?;
+            let branch = ruk_core::refdata::RefName::new(fallback).map_err(|err| {
+                CoreError::new(
+                    ErrorCode::EInvalid,
+                    format!("default branch is not a valid ref name: {err}"),
+                )
+            })?;
+            staging_store.write_repo_meta(branch).map_err(map_err)?;
+        }
+        let generation = staging_store.generation().map_err(map_err)?;
+        staging_store.close().map_err(map_err)?;
+        drop(staging_store);
+        fsync_dir(install.staging)?;
+        if let Some(parent) = install.staging.parent() {
+            fsync_dir(parent)?;
+        }
+        std::fs::create_dir(install.destination).map_err(|err| {
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("repository fork root is not created: {err}"),
+            )
+        })?;
+        std::fs::rename(install.staging, install.destination_store).map_err(|err| {
+            CoreError::new(ErrorCode::EIo, format!("repository fork failed: {err}"))
+        })?;
+        let _ = std::fs::remove_dir(install.container);
+        let verified = (|| {
+            if let Some(parent) = install.destination.parent() {
+                fsync_dir(parent)?;
+            }
+            Self::verify_fork_destination(self, install)
+        })();
+        let store_id = match verified {
+            Ok(store_id) => store_id,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(install.destination);
+                return Err(err);
+            }
+        };
+        let sealed_objects = fork_count(snapshot.sealed.len())?;
+        let tail_objects = fork_count(snapshot.tail.len())?;
+        let objects = sealed_objects
+            .checked_add(tail_objects)
+            .ok_or_else(|| CoreError::new(ErrorCode::EIo, "fork object count overflows u64"))?;
+        Ok(ruk_core::protocol::RepoForkReply {
+            path: install
+                .destination
+                .to_str()
+                .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?
+                .to_owned(),
+            store_id,
+            source_generation: snapshot.generation,
+            objects,
+            sealed_objects,
+            tail_objects,
+            refs_copied: snapshot.refs_copied,
+            segments_linked: linked,
+            segments_copied: copied,
+            lfs_linked,
+            generation,
+        })
+    }
+
+    /// Opens the renamed destination to run the standard recovery and
+    /// verification pass, then registers its destination-rooted handle.
+    /// The caller removes the destination best-effort when this fails, so
+    /// a failed open never leaves an unverified destination behind.
+    ///
+    /// # Errors
+    /// Store failures mapped to [`CoreError`], plus handle registration
+    /// failures.
+    fn verify_fork_destination(
+        &self,
+        install: &ForkInstall<'_>,
+    ) -> Result<ruk_core::change::StoreId, CoreError> {
+        let dest = Store::open(
+            install.destination_store,
+            Arc::new(ruk_core::store::PreparationBudget::reference_defaults()),
+        )
+        .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+        let store_id = dest.store_id();
+        dest.close()
+            .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+        drop(dest);
+        let store_canonical = std::fs::canonicalize(install.destination_store)
+            .map_err(|err| CoreError::new(ErrorCode::EIo, err.to_string()))?;
+        self.handle_for_path(&store_canonical)?;
+        Ok(store_id)
+    }
+}
+
+/// One fork install: the validated snapshot plus the staging container, the
+/// staged store path inside it, and the link it installs through. The
+/// staging store travels by value so the install drops it before the
+/// rename: no staging-rooted handle survives the rename into the
+/// destination.
+struct ForkInstall<'a> {
+    source: &'a Store,
+    source_store: &'a Path,
+    destination: &'a Path,
+    destination_store: &'a Path,
+    container: &'a Path,
+    staging: &'a Path,
+    link: &'a dyn Fn(&Path, &Path) -> std::io::Result<()>,
+}
+
+/// Publishes the pending tail batch into the staging store and records its
+/// identities as committed, so later deltas may name them as bases.
+///
+/// # Errors
+/// Publication failures mapped to [`CoreError`].
+fn flush_fork_batch(
+    staging: &Store,
+    batch: &mut Vec<ruk_core::store::PreparedObject>,
+    committed: &mut std::collections::HashSet<ruk_core::ids::Oid>,
+    pending: &mut std::collections::HashSet<ruk_core::ids::Oid>,
+) -> Result<(), CoreError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let publishing = std::mem::take(batch);
+    staging
+        .publish(
+            publishing,
+            &[],
+            ruk_core::store::EventSource::Fork,
+            &ruk_core::store::EventContext::default(),
+        )
+        .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+    committed.extend(pending.drain());
+    Ok(())
+}
+
+/// Counts fork items for the reply without a truncating cast.
+fn fork_count(items: usize) -> Result<u64, CoreError> {
+    u64::try_from(items).map_err(|_| CoreError::new(ErrorCode::EIo, "fork count overflows u64"))
+}
+
+/// One fork source: the live coordinator's store when the repository is
+/// open, or a short-lived directly opened store otherwise.
+enum ForkSource {
+    Live(Arc<HostedCoordinator>),
+    Cold(Box<Store>),
+}
+
+impl ForkSource {
+    /// The source store fork reads observe.
+    fn store(&self) -> &Store {
+        match self {
+            Self::Live(coordinator) => coordinator.store(),
+            Self::Cold(store) => store,
+        }
+    }
+}
+
+/// One fork snapshot's validated fact rows: the table, key, and value of
+/// every copied row.
+type ForkRows = Vec<(ruk_core::store::FactTable, Vec<u8>, Vec<u8>)>;
+
+/// One validated fork snapshot: the forked generation, the partitioned
+/// locator sets, the CAS-revalidated fact rows, and the ref filter they
+/// were photographed under for revalidation after the tail copy.
+struct ForkSnapshot {
+    kind: ruk_core::ids::HashKind,
+    generation: u64,
+    sealed_manifests: Vec<ruk_core::store::SegmentManifest>,
+    sealed: Vec<(ruk_core::ids::Oid, ruk_core::store::ObjectLocation)>,
+    tail: Vec<(ruk_core::ids::Oid, ruk_core::store::ObjectLocation)>,
+    rows: ForkRows,
+    refs_copied: u64,
+    mode: ruk_core::protocol::ForkRefs,
+    default_branch: Vec<u8>,
+}
+
+/// Whether a fork byte-share linked or copied.
+enum LinkOutcome {
+    Linked,
+    Copied,
+}
+
+/// Hardlinks one sealed segment or verified LFS payload, copying when the
+/// link crosses devices. Only a cross-device link falls back to a copy;
+/// every other link failure fails the fork closed.
+///
+/// The Unix cross-device errno is `EXDEV` (18): hard links never span
+/// filesystems, so the copy keeps the same bytes under a fresh inode.
+fn link_or_copy(
+    link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<LinkOutcome> {
+    match link(source, destination) {
+        Ok(()) => Ok(LinkOutcome::Linked),
+        Err(err) if is_cross_device(&err) => {
+            std::fs::copy(source, destination).map(|_| LinkOutcome::Copied)?;
+            Ok(LinkOutcome::Copied)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether an I/O error names a cross-device link.
+fn is_cross_device(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(18)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Links one verified complete LFS payload into staging: hardlinks (or
+/// copies cross-device) the sidecar file, reporting whether the presence
+/// row travels into the fork. Incomplete, undecodable, or unverified rows
+/// never travel: the fork re-resolves them lazily.
+///
+/// # Errors
+/// Staging and link I/O failures.
+fn link_lfs_payload(
+    install: &ForkInstall<'_>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<bool, CoreError> {
+    let Some(record) = ruk_core::store::lfs::decode_record(value) else {
+        return Ok(false);
+    };
+    if !record.complete {
+        return Ok(false);
+    }
+    let Ok(hex) = std::str::from_utf8(key) else {
+        return Ok(false);
+    };
+    if !ruk_core::store::lfs::sidecar_verified(install.source_store, hex, record.size) {
+        return Ok(false);
+    }
+    let Some(from) = ruk_core::store::lfs::sidecar_path(install.source_store, hex) else {
+        return Ok(false);
+    };
+    let Some(to) = ruk_core::store::lfs::sidecar_path(install.staging, hex) else {
+        return Ok(false);
+    };
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            CoreError::new(
+                ErrorCode::EIo,
+                format!("fork stages lfs payload {hex}: {err}"),
+            )
+        })?;
+    }
+    link_or_copy(install.link, &from, &to).map_err(|err| {
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("fork links lfs payload {hex}: {err}"),
+        )
+    })?;
+    Ok(true)
+}
+
+/// One fork staging sibling for `destination`: the file name plus a fresh
+/// random uuid, so every attempt mints a fresh name and a leftover staging
+/// directory never blocks a retry.
+fn staging_sibling(destination: &Path) -> PathBuf {
+    let file = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    destination.with_file_name(format!(
+        "{file}.fork-{}",
+        ruk_core::change::StoreId::generate()
+    ))
 }
 
 /// Removes and returns the entry bound to `canonical`, if any.
@@ -1155,8 +1969,21 @@ impl Drop for Registry {
 #[cfg(test)]
 mod tests {
     use super::Registry;
+    use std::io::Read;
+    use std::path::Path;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    use ruk_core::ids::Oid;
+    use ruk_core::protocol::{ForkRefs, RepoForkArgs};
+    use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
+    use ruk_core::refs::prepare_checked_transaction;
+    use ruk_core::store::lfs;
+    use ruk_core::store::{
+        EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable,
+        ObjectKind, PreparationBudget, Store,
+    };
 
     static SIBLING: AtomicU64 = AtomicU64::new(1);
 
@@ -2026,5 +2853,407 @@ mod tests {
             1
         );
         assert!(registry.is_empty().expect("registry lock holds"));
+    }
+
+    /// One seeded fork source: two blobs, three refs, one verified plus
+    /// one known-absent LFS payload, and planted freeze, attestation, and
+    /// claim rows that a fork must leave behind.
+    struct ForkSeed {
+        canonical: std::path::PathBuf,
+        store_id: ruk_core::change::StoreId,
+        blob_a: Oid,
+        blob_b: Oid,
+        main_raw: Vec<u8>,
+        tag_raw: Vec<u8>,
+        feature_raw: Vec<u8>,
+        generation: u64,
+    }
+
+    fn seed_fork_source(registry: &Registry, root: &Path, path: &str) -> ForkSeed {
+        use ruk_core::store::lfs::LfsObjectRecord;
+        let created = registry
+            .create_repo(&init_args(root, path))
+            .expect("seed source creates");
+        let canonical = std::path::PathBuf::from(&created.path);
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let store = Store::open(&canonical.join(".ruk"), budget).expect("seed store opens");
+        let prepared_a = store
+            .prepare(ObjectKind::Blob, 10, &b"hello fork"[..], None)
+            .expect("blob prepares");
+        let blob_a = prepared_a.oid();
+        let prepared_b = store
+            .prepare(ObjectKind::Blob, 18, &b"second fork object"[..], None)
+            .expect("blob prepares");
+        let blob_b = prepared_b.oid();
+        store
+            .publish(
+                vec![prepared_a, prepared_b],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("blobs publish");
+        let updates = vec![
+            RefUpdate {
+                name: RefName::new("refs/heads/main").expect("branch name"),
+                expected: RefExpect::Absent,
+                change: RefChange::Set(RefTarget::Direct(blob_a)),
+            },
+            RefUpdate {
+                name: RefName::new("refs/heads/feature").expect("branch name"),
+                expected: RefExpect::Absent,
+                change: RefChange::Set(RefTarget::Direct(blob_b)),
+            },
+            RefUpdate {
+                name: RefName::new("refs/tags/v1").expect("tag name"),
+                expected: RefExpect::Absent,
+                change: RefChange::Set(RefTarget::Direct(blob_a)),
+            },
+        ];
+        let transaction = RefTransaction::new(store.hash_kind(), updates).expect("ref transaction");
+        let prepared = prepare_checked_transaction(&store, &transaction).expect("refs prepare");
+        store
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("refs publish");
+        let main_raw = store
+            .fact(FactTable::Refs, b"refs/heads/main")
+            .expect("ref reads")
+            .expect("main stored");
+        let tag_raw = store
+            .fact(FactTable::Refs, b"refs/tags/v1")
+            .expect("ref reads")
+            .expect("tag stored");
+        let feature_raw = store
+            .fact(FactTable::Refs, b"refs/heads/feature")
+            .expect("ref reads")
+            .expect("branch stored");
+        store
+            .publish(
+                Vec::new(),
+                &[
+                    FactMutation {
+                        table: FactTable::ReleasedTags,
+                        key: b"refs/tags/v1".to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(b"frozen".to_vec()),
+                    },
+                    FactMutation {
+                        table: FactTable::Attestations,
+                        key: b"planted-attestation".to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(b"attested".to_vec()),
+                    },
+                    FactMutation {
+                        table: FactTable::Claims,
+                        key: b"planted-claim".to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(b"claimed".to_vec()),
+                    },
+                ],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("liveness plants");
+        let lfs_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let sidecar =
+            lfs::sidecar_path(&canonical.join(".ruk"), lfs_hex).expect("lfs path resolves");
+        std::fs::create_dir_all(sidecar.parent().expect("sidecar has a parent"))
+            .expect("lfs dirs create");
+        std::fs::write(&sidecar, b"").expect("empty payload stages");
+        assert!(lfs::sidecar_verified(&canonical.join(".ruk"), lfs_hex, 0));
+        let absent_hex = "ab".repeat(32);
+        store
+            .publish(
+                Vec::new(),
+                &[
+                    FactMutation {
+                        table: FactTable::LfsObjects,
+                        key: lfs::record_key(lfs_hex),
+                        expected: FactExpectation::Absent,
+                        value: Some(lfs::encode_record(&LfsObjectRecord {
+                            size: 0,
+                            complete: true,
+                        })),
+                    },
+                    FactMutation {
+                        table: FactTable::LfsObjects,
+                        key: lfs::record_key(absent_hex.as_str()),
+                        expected: FactExpectation::Absent,
+                        value: Some(lfs::encode_record(&LfsObjectRecord {
+                            size: 7,
+                            complete: false,
+                        })),
+                    },
+                ],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("lfs rows publish");
+        let seed = ForkSeed {
+            canonical,
+            store_id: store.store_id(),
+            blob_a,
+            blob_b,
+            main_raw,
+            tag_raw,
+            feature_raw,
+            generation: store.generation().expect("generation reads"),
+        };
+        drop(store);
+        seed
+    }
+
+    fn fork_args(source: &Path, dest: &Path, refs: Option<ForkRefs>) -> RepoForkArgs {
+        RepoForkArgs {
+            source: source.to_str().expect("utf8 source").to_owned(),
+            path: dest.to_str().expect("utf8 dest").to_owned(),
+            refs,
+        }
+    }
+
+    fn read_blob(store: &Store, oid: Oid) -> Vec<u8> {
+        let mut read = store.read(oid).expect("object reads");
+        let mut bytes = Vec::new();
+        read.bytes.read_to_end(&mut bytes).expect("object decodes");
+        bytes
+    }
+
+    #[test]
+    fn repo_fork_copies_all_heads_and_tags() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let seed = seed_fork_source(&registry, &root, "acme/hello");
+        let dest = root.join("acme/fork");
+        let reply = registry
+            .fork_repo(&fork_args(&seed.canonical, &dest, None))
+            .expect("fork serves");
+        assert_eq!(reply.source_generation, seed.generation);
+        assert!(reply.generation >= reply.source_generation);
+        assert_eq!(reply.objects, reply.sealed_objects + reply.tail_objects);
+        assert_eq!(reply.sealed_objects, 0);
+        assert_eq!(reply.tail_objects, 2);
+        assert_eq!(reply.refs_copied, 3);
+        assert_ne!(reply.store_id, seed.store_id);
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let forked = Store::open(&dest.join(".ruk"), budget).expect("fork opens");
+        assert_eq!(
+            forked
+                .default_branch()
+                .expect("meta reads")
+                .expect("meta present")
+                .as_bytes(),
+            b"refs/heads/main"
+        );
+        for (key, want) in [
+            ("refs/heads/main".as_bytes(), &seed.main_raw),
+            ("refs/tags/v1".as_bytes(), &seed.tag_raw),
+            ("refs/heads/feature".as_bytes(), &seed.feature_raw),
+        ] {
+            assert_eq!(
+                &forked
+                    .fact(FactTable::Refs, key)
+                    .expect("ref reads")
+                    .expect("ref present"),
+                want
+            );
+        }
+        assert_eq!(read_blob(&forked, seed.blob_a), b"hello fork");
+        assert_eq!(read_blob(&forked, seed.blob_b), b"second fork object");
+        for table in [
+            FactTable::ReleasedTags,
+            FactTable::Attestations,
+            FactTable::Claims,
+        ] {
+            let page = forked
+                .fact_page(table, None, FactPageBudget::new(16, 65536))
+                .expect("table pages");
+            assert!(page.rows.is_empty());
+        }
+        let lfs_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let sidecar =
+            lfs::sidecar_path(&dest.join(".ruk"), lfs_hex).expect("forked sidecar resolves");
+        assert_eq!(
+            std::fs::read(&sidecar).expect("payload links"),
+            b"",
+            "verified payload hardlinks"
+        );
+        assert!(
+            forked
+                .fact(
+                    FactTable::LfsObjects,
+                    &lfs::record_key("ab".repeat(32).as_str())
+                )
+                .expect("lfs reads")
+                .is_none(),
+            "known-absent payloads stay behind"
+        );
+        drop(forked);
+        let tags_dest = root.join("acme/fork-tags");
+        let tags_reply = registry
+            .fork_repo(&fork_args(
+                &seed.canonical,
+                &tags_dest,
+                Some(ForkRefs::DefaultAndTags),
+            ))
+            .expect("filtered fork serves");
+        assert_eq!(tags_reply.refs_copied, 2);
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let tags_only = Store::open(&tags_dest.join(".ruk"), budget).expect("filtered fork opens");
+        assert!(
+            tags_only
+                .fact(FactTable::Refs, b"refs/heads/main")
+                .expect("ref reads")
+                .is_some()
+        );
+        assert!(
+            tags_only
+                .fact(FactTable::Refs, b"refs/tags/v1")
+                .expect("ref reads")
+                .is_some()
+        );
+        assert!(
+            tags_only
+                .fact(FactTable::Refs, b"refs/heads/feature")
+                .expect("ref reads")
+                .is_none()
+        );
+        drop(tags_only);
+        let none_dest = root.join("acme/fork-none");
+        let none_reply = registry
+            .fork_repo(&fork_args(
+                &seed.canonical,
+                &none_dest,
+                Some(ForkRefs::None),
+            ))
+            .expect("ref-free fork serves");
+        assert_eq!(none_reply.refs_copied, 0);
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let ref_free = Store::open(&none_dest.join(".ruk"), budget).expect("ref-free fork opens");
+        let page = ref_free
+            .fact_page(FactTable::Refs, None, FactPageBudget::new(16, 65536))
+            .expect("refs page");
+        assert!(page.rows.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_fork_exdev_falls_back_to_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch_root();
+        let a = root.join("seg-a");
+        let b = root.join("seg-b");
+        std::fs::write(&a, b"segment bytes").expect("fixture writes");
+        match super::link_or_copy(&|from, to| std::fs::hard_link(from, to), &a, &b)
+            .expect("link works")
+        {
+            super::LinkOutcome::Linked => {}
+            super::LinkOutcome::Copied => panic!("same-device link must not copy"),
+        }
+        assert_eq!(
+            std::fs::metadata(&a).expect("meta reads").ino(),
+            std::fs::metadata(&b).expect("meta reads").ino()
+        );
+        std::fs::remove_file(&b).expect("fixture resets");
+        let exdev = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(18))
+        };
+        match super::link_or_copy(&exdev, &a, &b).expect("fallback copies") {
+            super::LinkOutcome::Copied => {}
+            super::LinkOutcome::Linked => panic!("cross-device link must copy"),
+        }
+        assert_ne!(
+            std::fs::metadata(&a).expect("meta reads").ino(),
+            std::fs::metadata(&b).expect("meta reads").ino()
+        );
+        assert_eq!(std::fs::read(&b).expect("copy reads"), b"segment bytes");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let seed = seed_fork_source(&registry, &root, "acme/exdev");
+        let dest = root.join("acme/exdev-fork");
+        let reply = registry
+            .fork_repo_with_link(
+                &fork_args(&seed.canonical, &dest, None),
+                &exdev,
+                &super::staging_sibling,
+            )
+            .expect("fork serves");
+        assert_eq!(reply.lfs_linked, 1);
+        assert!(reply.segments_copied.is_empty());
+        let lfs_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let from =
+            lfs::sidecar_path(&seed.canonical.join(".ruk"), lfs_hex).expect("source path resolves");
+        let to = lfs::sidecar_path(&dest.join(".ruk"), lfs_hex).expect("dest path resolves");
+        assert_ne!(
+            std::fs::metadata(&from).expect("meta reads").ino(),
+            std::fs::metadata(&to).expect("meta reads").ino()
+        );
+        assert_eq!(std::fs::read(&to).expect("payload reads"), b"");
+        assert_eq!(
+            read_blob(
+                &Store::open(
+                    &dest.join(".ruk"),
+                    Arc::new(PreparationBudget::reference_defaults())
+                )
+                .expect("fork opens"),
+                seed.blob_a
+            ),
+            b"hello fork"
+        );
+    }
+
+    #[test]
+    fn repo_fork_staging_crash_retry_mints_fresh_name() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let seed = seed_fork_source(&registry, &root, "acme/retry");
+        let dest = root.join("acme/fork");
+        let stale = root.join("acme/fork.fork-stale");
+        let fresh = root.join("acme/fork.fork-fresh");
+        std::fs::create_dir_all(&stale).expect("stale staging stages");
+        std::fs::write(stale.join("marker"), b"crash leftover").expect("marker writes");
+        let mints = std::cell::Cell::new(0_u32);
+        // The first mint collides with the leftover; only a retry that
+        // mints again reaches the fresh name.
+        let mint = |_destination: &Path| {
+            let call = mints.get();
+            mints.set(call + 1);
+            if call == 0 {
+                stale.clone()
+            } else {
+                fresh.clone()
+            }
+        };
+        let reply = registry
+            .fork_repo_with_link(
+                &fork_args(&seed.canonical, &dest, Some(ForkRefs::None)),
+                &|from, to| std::fs::hard_link(from, to),
+                &mint,
+            )
+            .expect("retry serves");
+        assert_eq!(mints.get(), 2, "the colliding first name forces one retry");
+        assert_eq!(reply.refs_copied, 0);
+        assert_eq!(
+            std::fs::read(stale.join("marker")).expect("marker survives"),
+            b"crash leftover"
+        );
+        let mut leftovers = Vec::new();
+        for entry in std::fs::read_dir(root.join("acme")).expect("parent lists") {
+            let name = entry
+                .expect("entry reads")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if name.contains(".fork-") {
+                leftovers.push(name);
+            }
+        }
+        assert_eq!(leftovers, vec!["fork.fork-stale".to_owned()]);
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let forked = Store::open(&dest.join(".ruk"), budget).expect("fork opens");
+        assert_eq!(read_blob(&forked, seed.blob_a), b"hello fork");
     }
 }

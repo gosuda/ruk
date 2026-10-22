@@ -3806,8 +3806,8 @@ fn cancelled(err: &CoreError) -> bool {
 /// coordinator call.
 ///
 /// The admin gate runs first: only an admin peer reaches the registry.
-/// `repo.init`, `repo.delete`, and `repo.rename` run here; every other
-/// admin method names its missing dispatch path.
+/// `repo.init`, `repo.delete`, `repo.rename`, and `repo.fork` run here;
+/// every other admin method names its missing dispatch path.
 ///
 /// # Errors
 /// `E_FORBIDDEN` for a non-admin peer, `E_INVALID` for malformed
@@ -3860,6 +3860,13 @@ fn dispatch_admin_method(
             ipc::encode_control(&ReplyEnvelope::success(
                 None,
                 Reply::RepoRename(Box::new(reply)),
+            ))
+        }
+        (Method::RepoFork, Request::RepoFork(args)) => {
+            let reply = registry.fork_repo(args)?;
+            ipc::encode_control(&ReplyEnvelope::success(
+                None,
+                Reply::RepoFork(Box::new(reply)),
             ))
         }
         _ => Err(method_error(

@@ -73,10 +73,12 @@ pub const SCHEMA_MAJOR: u32 = 1;
 /// refuse its frames as unknown methods. Minor 3 appends the task-keyed
 /// claim subject (`ClaimRecord.subject`) and the task-lease lifetime
 /// ceiling; minor-2 readers cannot decode subject-carrying claim rows.
-/// It also adds the `result` field to the `archive` invocation's `Accepted`
+/// It adds the `result` field to the `archive` invocation's `Accepted`
 /// frame (commit, format, content type). The field is serde-defaulted, so
 /// minor-2 readers decode the frame unchanged and simply ignore the
-/// metadata.
+/// metadata. It also gives `repo.fork` its served reply: the forked
+/// generation, sealed and tail object counts, the hardlinked and copied
+/// segment ids, and the linked LFS payload count.
 pub const SCHEMA_MINOR: u32 = 3;
 
 /// Bytes in a control-frame length prefix.
@@ -3641,7 +3643,9 @@ pub enum ForkRefs {
     None,
 }
 
-/// `repo.fork`: copies one repository to a fresh store id.
+/// `repo.fork`: copies one repository to a fresh store id. Sealed segments
+/// hardlink into the fork (a cross-device link copies and is reported);
+/// tail objects re-publish base-first; facts copy under full revalidation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepoForkArgs {
     pub source: String,
@@ -3654,7 +3658,15 @@ pub struct RepoForkArgs {
 pub struct RepoForkReply {
     pub path: String,
     pub store_id: StoreId,
+    pub source_generation: u64,
+    pub objects: u64,
+    pub sealed_objects: u64,
+    pub tail_objects: u64,
     pub refs_copied: u64,
+    pub segments_linked: Vec<u64>,
+    pub segments_copied: Vec<u64>,
+    pub lfs_linked: u64,
+    pub generation: u64,
 }
 
 fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
