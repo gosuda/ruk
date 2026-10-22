@@ -68,18 +68,19 @@ use crate::capability::{Capabilities, ReadAccess};
 use crate::change::{LeaseId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
-use crate::ids::Oid;
+use crate::ids::{HashKind, Oid};
 use crate::protocol::{
-    AttestListArgs, AttestListReply, BlameArgs, BlameHunk, BlameReply, ChangeHead,
-    ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitRev, CommitSummary, CompareArgs,
-    CompareReply, DEFAULT_PAGE_SIZE, DiffArgs, DiffBlob, DiffBody, DiffKind, DiffReply,
-    EventsTailArgs, EventsTailReply, FileArgs, FileBody, FileDiff, FileReply, KeysetPage, LogArgs,
-    LogReply, MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor, PageLimit,
-    PathChangeKind, PathSelection, PathStatus, QueryArgs, QueryDigest, QueryMatch, QueryReply,
-    ReconnectSecret, RefsListArgs, RefsListReply, Reply, RepoStatReply, Request, RevisionRef,
-    ScanExhaustion, SearchArgs, SearchReply, SessionAuthority, SessionOpenArgs, SessionResumeArgs,
-    SessionResumeReply, ShowArgs, ShowBody, ShowReply, ShowTarget, SnapshotPolicy, StatusArgs,
-    StatusReply, TailedEvent, Timestamp, TreeArgs, TreeEntry, TreeReply, ViewInfo,
+    ArchiveArgs, ArchiveFormat, ArchiveReply, AttestListArgs, AttestListReply, BlameArgs,
+    BlameHunk, BlameReply, ChangeHead, ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitRev,
+    CommitSummary, CompareArgs, CompareReply, DEFAULT_PAGE_SIZE, DiffArgs, DiffBlob, DiffBody,
+    DiffKind, DiffReply, EventsTailArgs, EventsTailReply, FileArgs, FileBody, FileDiff, FileReply,
+    KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor,
+    PageLimit, PathChangeKind, PathSelection, PathStatus, QueryArgs, QueryDigest, QueryMatch,
+    QueryReply, ReconnectSecret, RefsListArgs, RefsListReply, Reply, RepoStatReply, Request,
+    RevisionRef, ScanExhaustion, SearchArgs, SearchReply, SessionAuthority, SessionOpenArgs,
+    SessionResumeArgs, SessionResumeReply, ShowArgs, ShowBody, ShowReply, ShowTarget,
+    SnapshotPolicy, StatusArgs, StatusReply, TailedEvent, Timestamp, TreeArgs, TreeEntry,
+    TreeReply, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
@@ -91,7 +92,8 @@ use crate::search::{
 use crate::store::CompactionStats;
 use crate::store::FactPageBudget;
 use crate::store::Store;
-use crate::store::types::{FactMutation, FactTable, PreparedObject, StoreEvent};
+use crate::store::StoreError;
+use crate::store::types::{FactMutation, FactTable, ObjectKind, PreparedObject, StoreEvent};
 use crate::workspace::WorkspaceStamp;
 
 /// What [`HostedCoordinator::prepare_for_dispatch`] returns: either the stored
@@ -801,6 +803,10 @@ impl HostedCoordinator {
                 let reply = self.read_compare(&args)?;
                 Ok(Reply::Compare(Box::new(reply)))
             }
+            Request::Archive(args) => {
+                let reply = self.read_archive(&args)?;
+                Ok(Reply::Archive(Box::new(reply)))
+            }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
                 format!(
@@ -982,6 +988,38 @@ impl HostedCoordinator {
         })
     }
 
+    /// Follows one ref's symbolic targets to the direct object they name.
+    ///
+    /// At most 16 hops: deeper chains refuse as too symbolic. Unknown refs
+    /// refuse `E_NOT_FOUND`. The tree and archive resolvers share this
+    /// chase so a symbolic fix lands once.
+    fn resolve_named_oid(&self, name: &RefName) -> Result<Oid, CoreError> {
+        let mut target = self
+            .store
+            .fact(crate::store::types::FactTable::Refs, name.as_bytes())?
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+            .and_then(|raw| crate::store::decode("ref target", &raw).map_err(CoreError::from))?;
+        let mut oid = None;
+        for _ in 0..16 {
+            match target {
+                crate::refdata::RefTarget::Direct(found) => {
+                    oid = Some(found);
+                    break;
+                }
+                crate::refdata::RefTarget::Symbolic(next) => {
+                    target = self
+                        .store
+                        .fact(crate::store::types::FactTable::Refs, next.as_bytes())?
+                        .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+                        .and_then(|raw| {
+                            crate::store::decode("ref target", &raw).map_err(CoreError::from)
+                        })?;
+                }
+            }
+        }
+        oid.ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "ref is too deeply symbolic"))
+    }
+
     /// Resolves one ref to the commit it names, chasing symbolic links.
     ///
     /// # Errors
@@ -1057,6 +1095,94 @@ impl HostedCoordinator {
             view: current_view(&self.store)?,
             entries,
         })
+    }
+
+    /// Serves one `archive` read: the metadata of the streamed payload.
+    ///
+    /// The daemon streams the tar or zip body itself as `Stdout` frames
+    /// under the reply credit window; this reply carries the pinned commit,
+    /// the negotiated format, and the media type the `Accepted` frame
+    /// echoes. Only commits archive: refs chase symbols to a commit and
+    /// object ids peel through tags to one, so the commit the body walks
+    /// is pinned before the first byte. Reads hold no lane and publish
+    /// nothing.
+    fn read_archive(&self, args: &ArchiveArgs) -> Result<ArchiveReply, CoreError> {
+        let commit = self.resolve_archive_rev(&args.rev)?;
+        let format = args.format.unwrap_or(ArchiveFormat::Tar);
+        Ok(ArchiveReply {
+            view: current_view(&self.store)?,
+            commit,
+            format,
+            content_type: format.content_type().to_string(),
+        })
+    }
+
+    /// Resolves one archive revision to its commit.
+    ///
+    /// A ref follows symbolic targets to a direct object; a literal object
+    /// id peels through tags to the commit behind them. Bare trees, blobs,
+    /// and conflicts refuse: the typed archive names its commit, so only
+    /// commits (reached directly or through tags) resolve.
+    fn resolve_archive_rev(&self, rev: &CommitRev) -> Result<Oid, CoreError> {
+        let mut current = match rev {
+            CommitRev::Ref(name) => self.resolve_named_oid(name).map_err(|err| {
+                if err.code == ErrorCode::ENotFound {
+                    CoreError::new(ErrorCode::ENotFound, "unknown revision")
+                } else {
+                    err
+                }
+            })?,
+            CommitRev::Commit(oid) => {
+                oid.expect_kind(self.store.hash_kind(), "archive revision")
+                    .map_err(CoreError::from)?;
+                *oid
+            }
+        };
+        for _ in 0..32 {
+            let mut object = self.store.read(current).map_err(|err| match err {
+                StoreError::NotFound(_) => CoreError::new(ErrorCode::ENotFound, "unknown revision"),
+                other => CoreError::from(other),
+            })?;
+            let width = usize::try_from(object.bytes.len()).map_err(|_| {
+                CoreError::new(
+                    ErrorCode::ELimit,
+                    "archive revision object exceeds the read bound",
+                )
+            })?;
+            if width > MAX_CONTROL_FRAME_BYTES {
+                return Err(CoreError::new(
+                    ErrorCode::ELimit,
+                    "archive revision object exceeds the read bound",
+                ));
+            }
+            use std::io::Read as _;
+            let mut bytes = Vec::new();
+            object.bytes.read_to_end(&mut bytes).map_err(|err| {
+                CoreError::new(ErrorCode::EIo, format!("reading archive object: {err}"))
+            })?;
+            match object.kind {
+                ObjectKind::Commit => return Ok(current),
+                ObjectKind::Tag => {
+                    current = tag_target_oid(current, &bytes, self.store.hash_kind())?;
+                }
+                ObjectKind::Tree => {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "typed archive names a commit; this revision is a tree",
+                    ));
+                }
+                _ => {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "typed archive names a commit; this revision is not one",
+                    ));
+                }
+            }
+        }
+        Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            "tag chain behind the archive revision does not end",
+        ))
     }
 
     /// Resolves one compare revision to its commit.
@@ -3318,13 +3444,35 @@ fn session_holds_live_claim(holders: &[SessionId], key: &[u8]) -> bool {
 /// so a caller learns which machinery would serve the method.
 fn read_gap(method: Method) -> &'static str {
     match method {
-        Method::Compare => "compare needs a merge-base walk with bounded ahead and behind counts",
-        Method::Archive => "archive needs a streaming body writer under the reply credit window",
         Method::RemoteRefs => {
             "remote.refs needs an ls-refs round-trip against an explicit remote URL"
         }
-        _ => "only compare, archive, and remote.refs lack hosted read arms",
+        _ => "this method has no hosted read implementation",
     }
+}
+
+/// Reads the peeled target out of a tag object: the `object <hex>` line.
+/// Anything else is a damaged tag, never a silent miss.
+fn tag_target_oid(tag: Oid, bytes: &[u8], kind: HashKind) -> Result<Oid, CoreError> {
+    let line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let hex = line
+        .strip_prefix(b"object ")
+        .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, format!("tag {tag} names no target")))?;
+    Oid::from_bytes_hex(hex)
+        .map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("tag {tag} names an unparsable target: {err}"),
+            )
+        })
+        .and_then(|oid| {
+            oid.expect_kind(kind, "archive tag target")
+                .map_err(CoreError::from)?;
+            Ok(oid)
+        })
 }
 
 /// Resolves one revision to its root tree: the shared root every
@@ -4454,6 +4602,162 @@ mod tests {
         assert_eq!(unknown.code, ErrorCode::ENotFound);
     }
 
+    async fn archive_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::ArchiveArgs,
+    ) -> crate::protocol::ArchiveReply {
+        let reply = coord
+            .read(owner, session, Request::Archive(Box::new(args)), cancel)
+            .await
+            .expect("archive serves");
+        let Reply::Archive(meta) = reply else {
+            panic!("archive must answer its own reply");
+        };
+        *meta
+    }
+
+    #[tokio::test]
+    async fn archive_resolves_commit_ref_and_tag_revisions() {
+        use crate::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (_, head_b, _) = read_fixtures(coord.store());
+        let commit = match head_b {
+            Head::Git { oid } => oid,
+            Head::Conflicted { .. } => panic!("fixture head is git"),
+        };
+        seed_ref_oid(&coord, "refs/heads/main", commit);
+        let by_commit = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Commit(commit),
+                format: None,
+            },
+        )
+        .await;
+        assert_eq!(by_commit.commit, commit);
+        assert_eq!(by_commit.format, ArchiveFormat::Tar);
+        assert_eq!(by_commit.content_type, "application/x-tar");
+        let by_ref = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Ref(RefName::new("refs/heads/main").expect("ref")),
+                format: Some(ArchiveFormat::Zip),
+            },
+        )
+        .await;
+        assert_eq!(by_ref.commit, commit);
+        assert_eq!(by_ref.format, ArchiveFormat::Zip);
+        assert_eq!(by_ref.content_type, "application/zip");
+        let mut tag_bytes = Vec::new();
+        tag_bytes.extend_from_slice(b"object ");
+        tag_bytes.extend_from_slice(commit.to_hex().as_bytes());
+        tag_bytes.extend_from_slice(
+            b"\ntype commit\ntag v1\ntagger ada <ada@example.com> 1700000000 +0000\n\nrelease\n",
+        );
+        let length = u64::try_from(tag_bytes.len()).expect("object length");
+        let prepared = coord
+            .store()
+            .prepare(
+                crate::store::types::ObjectKind::Tag,
+                length,
+                tag_bytes.as_slice(),
+                None,
+            )
+            .expect("prepare tag");
+        let tag = prepared.oid();
+        coord
+            .store()
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tag");
+        seed_ref_oid(&coord, "refs/tags/v1", tag);
+        let by_tag = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Ref(RefName::new("refs/tags/v1").expect("ref")),
+                format: None,
+            },
+        )
+        .await;
+        assert_eq!(by_tag.commit, commit, "tags peel to their commit");
+        let by_tag_oid = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Commit(tag),
+                format: None,
+            },
+        )
+        .await;
+        assert_eq!(by_tag_oid.commit, commit);
+        let unknown = coord
+            .read(
+                &owner,
+                session,
+                Request::Archive(Box::new(ArchiveArgs {
+                    rev: CommitRev::Ref(RefName::new("refs/heads/nope").expect("ref")),
+                    format: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown ref refuses");
+        assert_eq!(unknown.code, ErrorCode::ENotFound);
+        let missing = Oid::from_bytes(&[0xab; 20]).expect("fixture oid");
+        let absent = coord
+            .read(
+                &owner,
+                session,
+                Request::Archive(Box::new(ArchiveArgs {
+                    rev: CommitRev::Commit(missing),
+                    format: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown commit refuses");
+        assert_eq!(absent.code, ErrorCode::ENotFound);
+        let tree = crate::coord::reads::head_tree(coord.store(), &head_b).expect("tree");
+        let bare = coord
+            .read(
+                &owner,
+                session,
+                Request::Archive(Box::new(ArchiveArgs {
+                    rev: CommitRev::Commit(tree),
+                    format: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("bare tree refuses: the typed archive names a commit");
+        assert_eq!(bare.code, ErrorCode::EInvalid);
+    }
     #[tokio::test]
     async fn head_tree_refuses_conflicted_heads() {
         let (_temp, coord, _owner) = coordinator();

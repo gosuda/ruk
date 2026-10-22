@@ -180,7 +180,7 @@ pub fn serve_upload_archive<R: Read, W: Write>(
         store,
         kind,
         tar: TarWriter {
-            band: BandWriter {
+            sink: BandWriter {
                 writer,
                 pending: Vec::new(),
             },
@@ -188,14 +188,16 @@ pub fn serve_upload_archive<R: Read, W: Write>(
         },
         pending: Vec::new(),
         interrupt,
+        measure: false,
+        zip_bound: 0,
     };
     if let Some(commit) = commit
         && let Err(err) = walk.tar.emit_global(commit)
     {
-        return stream_failed(walk, err);
+        return Err(stream_failed(walk, err));
     }
     if let Err(err) = walk.walk_tree(root, b"") {
-        return stream_failed(walk, err);
+        return Err(stream_failed(walk, err));
     }
     // A still-pending directory had no file beneath it; like the oracle's
     // end-of-walk free loop, it leaves no record. `walk` drops it here.
@@ -203,9 +205,215 @@ pub fn serve_upload_archive<R: Read, W: Write>(
 }
 
 /// Reports a mid-stream failure on band 3 and returns the original error.
-fn stream_failed<W: Write>(mut walk: TreeWalk<'_, W>, err: GitError) -> Result<(), GitError> {
-    let _ = walk.tar.band.fail(&sanitize(&err.to_string()));
-    Err(err)
+fn stream_failed<S: TarSink>(mut walk: TreeWalk<'_, S>, err: GitError) -> GitError {
+    let _ = walk.tar.sink.fail(&sanitize(&err.to_string()));
+    err
+}
+
+/// The pinned inputs one archived commit streams from: the commit the
+/// `Accepted` frame names, its tree, and its committer timestamp. The
+/// count and the streaming walk share one plan, so the streamed body always
+/// matches the announced metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchivePlan {
+    /// The archived commit, named by the stream's global header.
+    pub commit: Oid,
+    /// The commit's tree, walked in stored order.
+    pub tree: Oid,
+    /// The commit's committer timestamp, stamped on every record.
+    pub mtime: u64,
+}
+
+/// Plans the stream behind one commit: its tree plus its committer
+/// timestamp, mirroring the oracle's commit-date archive time.
+///
+/// # Errors
+/// [`GitError::NotFound`] for an unpublished object, [`GitError::Corrupt`]
+/// for a commit without a tree or timestamp, or a non-commit behind the id.
+pub fn plan_commit_archive(
+    store: &Store,
+    kind: HashKind,
+    commit: Oid,
+) -> Result<ArchivePlan, GitError> {
+    let (obj_kind, bytes) = read_object(store, commit, WALK_OBJECT_BYTES)?;
+    if obj_kind != ObjectKind::Commit {
+        return Err(corrupt(format!("archive commit {commit} is not a commit")));
+    }
+    let links = object_links(obj_kind, &bytes, kind)?;
+    let tree = links
+        .tree
+        .ok_or_else(|| corrupt(format!("archive commit {commit} has no tree")))?;
+    Ok(ArchivePlan {
+        commit,
+        tree,
+        mtime: commit_mtime(&bytes, commit)?,
+    })
+}
+
+/// Writes `len` zero bytes to `sink` in fixed-size slices. A counting pass
+/// charges a body's length this way without reading the body.
+fn write_zeros<S: TarSink>(sink: &mut S, len: u64) -> Result<(), GitError> {
+    static ZEROS: [u8; SIDEBAND_CHUNK] = [0; SIDEBAND_CHUNK];
+    let chunk = u64::try_from(ZEROS.len()).expect("slice length fits in u64");
+    let mut left = len;
+    while left > 0 {
+        let take = left.min(chunk);
+        let width = usize::try_from(take).expect("take is at most the slice length");
+        sink.write_tar(&ZEROS[..width])?;
+        left -= take;
+    }
+    Ok(())
+}
+
+/// Zip bytes one entry adds beyond its payload: a 30-byte local header, a
+/// 24-byte data descriptor, a 46-byte central-directory record, and up to 40
+/// bytes of zip64 or extended-timestamp extra data in each record.
+const ZIP_ENTRY_FIXED: u64 = 30 + 24 + 40 + 46 + 40;
+
+/// Zip bytes the archive's end records add: the end of central directory
+/// (22), a zip64 end record (56), and its locator (20).
+const ZIP_END_FIXED: u64 = 22 + 56 + 20;
+
+/// Smallest payload a non-final deflate block carries under the flate2
+/// miniz backend the zip writer uses: miniz flushes a block once its input
+/// passes 31 KiB (`total_bytes > 31 * 1024` in miniz_oxide's deflate core).
+/// A stored block costs at most five bytes of framing, so the block count is
+/// at most payload / this + 1.
+const DEFLATE_MIN_BLOCK_PAYLOAD: u64 = 31 * 1024;
+
+/// Slack for deflate block framing beyond the stored-block fallback.
+const DEFLATE_SLACK: u64 = 16;
+
+/// Upper bound on the zip bytes one entry adds: its fixed records, the name
+/// (written in both the local and central records), and a payload bounded by
+/// the deflate stored-block worst case. An empty payload is stored, so it
+/// adds no payload bytes.
+fn zip_entry_bound(name_len: u64, data_len: u64) -> u64 {
+    let data = if data_len == 0 {
+        0
+    } else {
+        data_len + DEFLATE_SLACK + 5 * (data_len / DEFLATE_MIN_BLOCK_PAYLOAD + 1)
+    };
+    ZIP_ENTRY_FIXED + 2 * name_len + data
+}
+
+/// What one archived commit weighs in each format, measured before the first
+/// byte is emitted.
+///
+/// `tar` is the exact byte count the streaming walk emits.
+///
+/// `zip` is an upper bound on the zip the transcoder produces for the same
+/// commit: the sum over entries of `ZIP_ENTRY_FIXED + 2·name + payload`, where
+/// a non-empty payload adds `payload + 16 + 5·(payload/31744 + 1)` bytes, plus
+/// `ZIP_END_FIXED`. Exact zip size is unknowable without a full deflate pass,
+/// which per request would be a CPU amplifier under the byte cap. The bound
+/// exceeds the true size by at most 180 bytes per entry, about five bytes per
+/// 31 KiB of payload, and 98 bytes for the end records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveSize {
+    /// Exact tar bytes the stream emits.
+    pub tar: u64,
+    /// Upper bound on the zip bytes the transcode emits.
+    pub zip: u64,
+}
+
+/// Counts tar bytes without emitting them: every header, body, pax record,
+/// and closing zero block is tallied, and no payload is read.
+struct CountSink {
+    count: u64,
+}
+
+impl TarSink for CountSink {
+    fn write_tar(&mut self, bytes: &[u8]) -> Result<(), GitError> {
+        let width = u64::try_from(bytes.len()).map_err(|_| GitError::Limit {
+            detail: "archive chunk does not fit the byte count".to_owned(),
+        })?;
+        self.count = self.count.saturating_add(width);
+        Ok(())
+    }
+
+    fn fail(&mut self, _message: &str) -> Result<(), GitError> {
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), GitError> {
+        Ok(())
+    }
+}
+
+/// Measures the stream one archived commit produces, without emitting any
+/// byte. Blob bodies are charged by `object_len` and never read; the walk
+/// reads only trees and symlink targets. The daemon compares the figure for
+/// the requested format against `archive_max_bytes` before the first frame.
+///
+/// # Errors
+/// The walk's own failures: unpublished objects, corrupt trees, interrupts.
+pub fn count_commit_tar(
+    store: &Store,
+    kind: HashKind,
+    plan: &ArchivePlan,
+    interrupt: &Interrupt,
+) -> Result<ArchiveSize, GitError> {
+    let mut walk = TreeWalk {
+        store,
+        kind,
+        tar: TarWriter {
+            sink: CountSink { count: 0 },
+            mtime: plan.mtime,
+        },
+        pending: Vec::new(),
+        interrupt,
+        measure: true,
+        zip_bound: 0,
+    };
+    if let Err(err) = walk.tar.emit_global(plan.commit) {
+        return Err(stream_failed(walk, err));
+    }
+    if let Err(err) = walk.walk_tree(plan.tree, b"") {
+        return Err(stream_failed(walk, err));
+    }
+    walk.tar.sink.write_tar(&[0u8; 1024])?;
+    let tar = walk.tar.sink.count;
+    let zip = walk.zip_bound.saturating_add(ZIP_END_FIXED);
+    walk.tar.sink.finish()?;
+    Ok(ArchiveSize { tar, zip })
+}
+
+/// Streams the tar bytes of one archived commit through `sink`, chunked by
+/// the sink: the git wire frames sideband bands while the daemon emits
+/// bounded raw chunks.
+///
+/// Callers count first with [`count_commit_tar`] and refuse past their cap
+/// before the first byte.
+///
+/// # Errors
+/// The walk's own failures, reported through the sink before returning.
+pub fn stream_commit_tar<S: TarSink>(
+    store: &Store,
+    kind: HashKind,
+    plan: &ArchivePlan,
+    interrupt: &Interrupt,
+    sink: S,
+) -> Result<(), GitError> {
+    let mut walk = TreeWalk {
+        store,
+        kind,
+        tar: TarWriter {
+            sink,
+            mtime: plan.mtime,
+        },
+        pending: Vec::new(),
+        interrupt,
+        measure: false,
+        zip_bound: 0,
+    };
+    if let Err(err) = walk.tar.emit_global(plan.commit) {
+        return Err(stream_failed(walk, err));
+    }
+    if let Err(err) = walk.walk_tree(plan.tree, b"") {
+        return Err(stream_failed(walk, err));
+    }
+    walk.finish()
 }
 
 /// Reads `argument` lines up to the terminating flush.
@@ -458,15 +666,20 @@ struct PendingDir {
     mode: u32,
 }
 
-struct TreeWalk<'s, W: Write> {
+struct TreeWalk<'s, S: TarSink> {
     store: &'s Store,
     kind: HashKind,
-    tar: TarWriter<W>,
+    tar: TarWriter<S>,
     pending: Vec<PendingDir>,
     interrupt: &'s Interrupt,
+    /// Counting pass: blob bodies are charged by their `object_len` instead
+    /// of being read, so sizing an archive costs no payload I/O.
+    measure: bool,
+    /// Counting pass: the running zip upper bound over entries seen so far.
+    zip_bound: u64,
 }
 
-impl<W: Write> TreeWalk<'_, W> {
+impl<S: TarSink> TreeWalk<'_, S> {
     /// Walks one tree depth-first in stored order. Directories queue their
     /// record and recurse; ascending past a still-queued directory drops it,
     /// which is how childless directories leave no record.
@@ -497,9 +710,21 @@ impl<W: Write> TreeWalk<'_, W> {
         Ok(())
     }
 
+    /// Charges one entry to the zip bound. Only the counting pass measures;
+    /// the streaming walk pays nothing.
+    fn charge_zip(&mut self, name_len: usize, data_len: u64) {
+        if self.measure {
+            let name = u64::try_from(name_len).expect("usize fits in u64");
+            self.zip_bound = self
+                .zip_bound
+                .saturating_add(zip_entry_bound(name, data_len));
+        }
+    }
+
     /// Writes every queued directory record, outermost first.
     fn flush_pending(&mut self) -> Result<(), GitError> {
         for dir in std::mem::take(&mut self.pending) {
+            self.charge_zip(dir.path.len(), 0);
             self.tar.emit_dir(dir.oid, &dir.path, dir.mode)?;
         }
         Ok(())
@@ -513,6 +738,7 @@ impl<W: Write> TreeWalk<'_, W> {
                 // Gitlinks become plain directory records and are never
                 // descended into, exactly like the oracle.
                 path.push(b'/');
+                self.charge_zip(path.len(), 0);
                 self.tar.emit_dir(entry.oid, &path, entry.mode)?;
             }
             0o120000 => {
@@ -522,9 +748,14 @@ impl<W: Write> TreeWalk<'_, W> {
                 }
                 self.tar
                     .emit_symlink(entry.oid, &path, entry.mode, &target)?;
+                self.charge_zip(
+                    path.len(),
+                    u64::try_from(target.len()).expect("usize fits in u64"),
+                );
             }
             0o100000 => {
                 let len = self.blob_len(entry.oid)?;
+                self.charge_zip(path.len(), len);
                 self.tar.begin_file(entry.oid, &path, entry.mode, len)?;
                 self.stream_blob(entry.oid, len)?;
                 self.tar.end_body(len)?;
@@ -556,6 +787,9 @@ impl<W: Write> TreeWalk<'_, W> {
     /// from [`Self::blob_len`], and the closed stream proves the same
     /// byte count arrived verified.
     fn stream_blob(&mut self, oid: Oid, len: u64) -> Result<(), GitError> {
+        if self.measure {
+            return write_zeros(&mut self.tar.sink, len);
+        }
         let store = self.store;
         let tar = &mut self.tar;
         let interrupt = self.interrupt;
@@ -565,7 +799,7 @@ impl<W: Write> TreeWalk<'_, W> {
                 failure = Some(err);
                 return Ok(ChunkDecision::Stop);
             }
-            match tar.band.write_tar(chunk) {
+            match tar.sink.write_tar(chunk) {
                 Ok(()) => Ok(ChunkDecision::Continue),
                 Err(err) => {
                     failure = Some(err);
@@ -590,8 +824,8 @@ impl<W: Write> TreeWalk<'_, W> {
 
     /// Ends the stream with the two zero blocks and the flush terminator.
     fn finish(mut self) -> Result<(), GitError> {
-        self.tar.band.write_tar(&[0u8; 1024])?;
-        self.tar.band.finish()
+        self.tar.sink.write_tar(&[0u8; 1024])?;
+        self.tar.sink.finish()
     }
 }
 
@@ -700,14 +934,37 @@ fn ustar_header(
     header
 }
 
-struct TarWriter<W: Write> {
-    band: BandWriter<W>,
+/// The sink a tar walk writes through: sideband frames on the git wire,
+/// raw chunks for the daemon's streamed reads. The daemon's sink emits
+/// one bounded chunk per call and never buffers the archive.
+pub trait TarSink {
+    /// Appends tar bytes to the sink.
+    ///
+    /// # Errors
+    /// [`GitError::Limit`] when the sink's cap rejects the bytes, plus the
+    /// sink's own transport failures.
+    fn write_tar(&mut self, bytes: &[u8]) -> Result<(), GitError>;
+
+    /// Reports a mid-stream failure the way the sink's framing demands.
+    /// Sinks without an error channel report success and let the caller
+    /// return the original error instead.
+    fn fail(&mut self, message: &str) -> Result<(), GitError>;
+
+    /// Closes the stream after the two zero blocks are written.
+    ///
+    /// # Errors
+    /// The sink's own transport failures.
+    fn finish(&mut self) -> Result<(), GitError>;
+}
+
+struct TarWriter<S: TarSink> {
+    sink: S,
     mtime: u64,
 }
 
-impl<W: Write> TarWriter<W> {
+impl<S: TarSink> TarWriter<S> {
     fn write_raw(&mut self, bytes: &[u8]) -> Result<(), GitError> {
-        self.band.write_tar(bytes)
+        self.sink.write_tar(bytes)
     }
 
     fn write_padded(&mut self, bytes: &[u8]) -> Result<(), GitError> {
@@ -838,23 +1095,13 @@ struct BandWriter<W: Write> {
     pending: Vec<u8>,
 }
 
-impl<W: Write> BandWriter<W> {
+impl<W: Write> TarSink for BandWriter<W> {
     fn write_tar(&mut self, bytes: &[u8]) -> Result<(), GitError> {
         self.pending.extend_from_slice(bytes);
         while self.pending.len() >= SIDEBAND_CHUNK {
             self.emit_frame(SIDEBAND_CHUNK)?;
         }
         Ok(())
-    }
-
-    fn emit_frame(&mut self, len: usize) -> Result<(), GitError> {
-        let mut frame = Vec::with_capacity(len + 1);
-        frame.push(1u8);
-        frame.extend_from_slice(&self.pending[..len]);
-        self.pending.drain(..len);
-        let mut out = Vec::with_capacity(len + 5);
-        encode_data(&mut out, &frame)?;
-        send(&mut self.writer, &out)
     }
 
     fn fail(&mut self, message: &str) -> Result<(), GitError> {
@@ -873,6 +1120,18 @@ impl<W: Write> BandWriter<W> {
         }
         let mut out = Vec::new();
         encode_flush(&mut out);
+        send(&mut self.writer, &out)
+    }
+}
+
+impl<W: Write> BandWriter<W> {
+    fn emit_frame(&mut self, len: usize) -> Result<(), GitError> {
+        let mut frame = Vec::with_capacity(len + 1);
+        frame.push(1u8);
+        frame.extend_from_slice(&self.pending[..len]);
+        self.pending.drain(..len);
+        let mut out = Vec::with_capacity(len + 5);
+        encode_data(&mut out, &frame)?;
         send(&mut self.writer, &out)
     }
 }
@@ -1407,6 +1666,47 @@ mod tests {
             assert!(matches!(err, GitError::Corrupt { .. }), "{what}: {err:?}");
             assert!(out.windows(4).any(|w| w == b"NACK"), "{what}: no NACK");
         }
+    }
+
+    /// Appends every emitted byte to a caller-owned buffer.
+    struct Collect<'a>(&'a mut Vec<u8>);
+
+    impl TarSink for Collect<'_> {
+        fn write_tar(&mut self, bytes: &[u8]) -> Result<(), GitError> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn fail(&mut self, _message: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn measured_count_matches_streamed_bytes() {
+        let fx = fixture();
+        let plan = plan_commit_archive(&fx.store, fx.kind, fx.commit).expect("plan");
+        let counted =
+            count_commit_tar(&fx.store, fx.kind, &plan, &Interrupt::none()).expect("count");
+        let mut streamed = Vec::new();
+        stream_commit_tar(
+            &fx.store,
+            fx.kind,
+            &plan,
+            &Interrupt::none(),
+            Collect(&mut streamed),
+        )
+        .expect("stream");
+        assert!(counted.tar > 0, "the fixture archive has bytes");
+        assert_eq!(
+            counted.tar,
+            u64::try_from(streamed.len()).expect("length fits in u64"),
+            "the count pass charges exactly the bytes the stream emits"
+        );
     }
 
     #[test]

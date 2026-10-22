@@ -73,6 +73,10 @@ pub const SCHEMA_MAJOR: u32 = 1;
 /// refuse its frames as unknown methods. Minor 3 appends the task-keyed
 /// claim subject (`ClaimRecord.subject`) and the task-lease lifetime
 /// ceiling; minor-2 readers cannot decode subject-carrying claim rows.
+/// It also adds the `result` field to the `archive` invocation's `Accepted`
+/// frame (commit, format, content type). The field is serde-defaulted, so
+/// minor-2 readers decode the frame unchanged and simply ignore the
+/// metadata.
 pub const SCHEMA_MINOR: u32 = 3;
 
 /// Bytes in a control-frame length prefix.
@@ -3464,6 +3468,17 @@ pub struct SearchReply {
 pub enum ArchiveFormat {
     Tar,
     Zip,
+}
+
+impl ArchiveFormat {
+    /// The media type of the streamed payload.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Tar => "application/x-tar",
+            Self::Zip => "application/zip",
+        }
+    }
 }
 
 /// `archive`: metadata for the streamed payload; bytes ride `Stdout`
