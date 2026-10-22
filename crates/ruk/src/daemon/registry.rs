@@ -1149,6 +1149,14 @@ impl Registry {
             if container.exists() {
                 continue;
             }
+            if let Some(parent) = container.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    CoreError::new(
+                        ErrorCode::EIo,
+                        format!("fork staging parent is not created: {err}"),
+                    )
+                })?;
+            }
             std::fs::create_dir(&container).map_err(|err| {
                 CoreError::new(
                     ErrorCode::EIo,
@@ -3131,6 +3139,19 @@ mod tests {
         let mut bytes = Vec::new();
         read.bytes.read_to_end(&mut bytes).expect("object decodes");
         bytes
+    }
+
+    #[test]
+    fn repo_fork_stages_when_the_destination_parent_is_absent() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let seed = seed_fork_source(&registry, &root, "acme/hello");
+        let dest = root.join("fresh-owner/nested/fork");
+        let reply = registry
+            .fork_repo(&fork_args(&seed.canonical, &dest, None))
+            .expect("fork stages without the parent directory");
+        assert!(reply.refs_copied >= 1);
+        assert!(dest.join(".ruk").join("format").exists());
     }
 
     #[test]
