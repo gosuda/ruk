@@ -903,6 +903,78 @@ async fn git_service_request_matches_oracle_objects() {
 }
 
 #[tokio::test]
+async fn git_service_upload_pack_answers_before_eof() {
+    let root = temp_root("upload-before-eof");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 1);
+
+    // A multi-batch negotiation: the client waits for ACKs before it sends
+    // `done`, so the serve must answer the haves flush without waiting for
+    // `StdinEof`. A collect-then-serve round stalls here until the frame
+    // timeout kills the connection.
+    let frames = [
+        pkt(format!("want {}\n", commit.to_hex()).as_bytes()),
+        flush(),
+        pkt(b"have 0000000000000000000000000000000000000000\n"),
+        flush(),
+    ];
+    for frame in &frames {
+        driver.send(FrameKind::Stdin, 1, frame).await;
+    }
+    let mut stdout = Vec::new();
+    let mut grants = 0usize;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = driver.recv().await;
+            assert_eq!(frame.stream_id, 1);
+            match frame.kind {
+                FrameKind::Stdout => stdout.extend_from_slice(&frame.payload),
+                FrameKind::WindowUpdate => grants += 1,
+                other => panic!("unexpected frame {other:?} before done"),
+            }
+            if grants == frames.len() && stdout.windows(3).any(|w| w == b"NAK") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the daemon answers the haves flush without waiting for EOF");
+
+    driver.send(FrameKind::Stdin, 1, &pkt(b"done\n")).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 1, &[]).await;
+    let (rest, _, exit) = driver.recv_exit(1).await;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.outcome, "Completed");
+    assert!(
+        rest.starts_with(b"PACK"),
+        "the round ends with a packfile past the NAK"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn git_service_unknown_service_refused() {
     let root = temp_root("unknown-service");
     let repo_dir = root.join("repo");

@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 pub(crate) use executor::BoundedExecutor;
@@ -2136,6 +2138,23 @@ async fn serve_git_service(
     {
         return;
     }
+    if req.service == GIT_SERVICE_UPLOAD_PACK && !req.advertise {
+        serve_streaming_upload(StreamingUpload {
+            input,
+            sink,
+            credits: &mut credits,
+            cancel_guard: &cancel_guard,
+            token,
+            cancel_flag: Arc::clone(&cancel_flag),
+            refs,
+            coordinator: Arc::clone(&coordinator),
+            git_protocol: req.git_protocol.clone(),
+            limits: req.limits.clone(),
+            request_id: req.request_id.clone().unwrap_or_default(),
+        })
+        .await;
+        return;
+    }
     let stdin_bytes = if req.advertise {
         Vec::new()
     } else {
@@ -2983,6 +3002,528 @@ fn run_git_service(
         }
     }
     Ok(out)
+}
+
+/// One streaming `upload-pack` round: every input the stream task needs,
+/// grouped so the entry point takes a single argument. The stream task
+/// owns the only mutable borrows; the blocking serve owns its socket end.
+#[cfg(unix)]
+struct StreamingUpload<'a> {
+    input: &'a mut StreamInput,
+    sink: &'a StreamSink,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    token: Cancel,
+    cancel_flag: Arc<AtomicBool>,
+    refs: &'a ConnectionRefs,
+    coordinator: Arc<HostedCoordinator>,
+    git_protocol: String,
+    limits: GitLimits,
+    request_id: String,
+}
+
+/// Ends one streaming round with an error frame plus its terminal frame.
+#[cfg(unix)]
+async fn refuse_stream(sink: &StreamSink, err: CoreError) {
+    let _ = send_error_exit(sink, &Error::Core(err)).await;
+}
+
+/// Trips the blocking serve and unblocks its socket read after a terminal
+/// event the serve itself did not observe: connection loss, refusal, or a
+/// client cancel. The trip fires again on return through [`TripOnDrop`].
+#[cfg(unix)]
+fn halt_stream(flag: &Arc<AtomicBool>, shutdown: &std::os::unix::net::UnixStream) {
+    flag.store(true, Ordering::SeqCst);
+    let _ = shutdown.shutdown(std::net::Shutdown::Both);
+}
+
+/// Sends the terminal frame of one cancelled streaming round.
+#[cfg(unix)]
+async fn exit_cancelled(sink: &StreamSink, invocation: &str) {
+    let report = CommandExitReport::cancelled(invocation);
+    let exit_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+}
+
+/// Checks one `Stdin` chunk of the given width against the envelope quota,
+/// refusing the stream past it. Returns the new running total on success.
+#[cfg(unix)]
+async fn check_stdin_quota(sink: &StreamSink, total: u64, width: u64, max: u64) -> Option<u64> {
+    let grown = total.saturating_add(width);
+    if grown > max {
+        refuse_stream(
+            sink,
+            CoreError::new(ErrorCode::ELimit, "request body exceeds its bound"),
+        )
+        .await;
+        return None;
+    }
+    Some(grown)
+}
+
+/// Admits one `Stdin` chunk against the inbound window and grants it back
+/// once consumed, mirroring [`collect_git_stdin`]. Refuses the stream when
+/// credit is exhausted or untracked.
+#[cfg(unix)]
+async fn admit_stdin_chunk(
+    sink: &StreamSink,
+    credits: &mut ipc::StreamCredits,
+    stream_id: u64,
+    outstanding: &Arc<AtomicU64>,
+    width: u64,
+) -> bool {
+    if credits.consume_inbound(stream_id, width).is_err() {
+        refuse_stream(
+            sink,
+            CoreError::new(ErrorCode::ELimit, "stream credit window is exhausted"),
+        )
+        .await;
+        return false;
+    }
+    outstanding.fetch_sub(width.saturating_add(1), Ordering::SeqCst);
+    if credits.grant_inbound(stream_id, width).is_err() {
+        refuse_stream(
+            sink,
+            CoreError::new(ErrorCode::EInvalid, "git-service stream is not tracked"),
+        )
+        .await;
+        return false;
+    }
+    let grant = StdinGrant {
+        direction: "stdin".to_string(),
+        bytes: width,
+    };
+    let grant_bytes = match ipc::encode_control(&grant) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    send_frame(sink, ipc::FrameKind::WindowUpdate, &grant_bytes)
+        .await
+        .is_ok()
+}
+
+/// Forwards freshly read serve output past the advertisement stripper as
+/// credit-gated `Stdout` frames. Returns false when the stream ended
+/// (cancel, connection loss, or refusal), in which case the terminal frame
+/// is already queued and the caller stops without sending another.
+#[cfg(unix)]
+async fn forward_stripped(
+    strip: &mut AdvertStrip,
+    sink: &StreamSink,
+    control: &mut mpsc::Receiver<ipc::Frame>,
+    credits: &mut ipc::StreamCredits,
+    cancel_guard: &CancelHandle,
+    bytes: &[u8],
+) -> bool {
+    let forward = match strip.feed(bytes) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            refuse_stream(sink, err).await;
+            return false;
+        }
+    };
+    if forward.is_empty() {
+        return true;
+    }
+    match write_typed_chunks(sink, control, credits, cancel_guard, &forward).await {
+        TypedWriteFate::Done => true,
+        TypedWriteFate::Cancelled | TypedWriteFate::Gone => false,
+    }
+}
+
+/// Serves one non-advertise `upload-pack` round with the request streamed
+/// in and the response streamed out. Fetch-pack pipelines its negotiation
+/// (wants, haves, `done`) and then waits for pack bytes without
+/// half-closing, and multi-batch negotiations wait for ACKs before they
+/// send `done`, so a collect-then-serve round would wait for a `StdinEof`
+/// that never arrives until the frame timeout kills the connection. The
+/// blocking serve reads requests from a socket the stream task feeds as
+/// `Stdin` frames arrive and writes responses the task forwards as
+/// credit-gated `Stdout` frames, reusing the serve logic shared with the
+/// collected path.
+#[cfg(unix)]
+async fn serve_streaming_upload(upload: StreamingUpload<'_>) {
+    let StreamingUpload {
+        input,
+        sink,
+        credits,
+        cancel_guard,
+        token,
+        cancel_flag,
+        refs,
+        coordinator,
+        git_protocol,
+        limits,
+        request_id,
+    } = upload;
+    let stream_id = sink.stream_id;
+    if token.check().is_err() {
+        exit_cancelled(sink, &upload_invocation(&request_id, &[], &limits)).await;
+        return;
+    }
+    let (serve_end, task_end) = match std::os::unix::net::UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Io(err)).await;
+            return;
+        }
+    };
+    if let Err(err) = task_end.set_nonblocking(true) {
+        let _ = send_error_exit(sink, &Error::Io(err)).await;
+        return;
+    }
+    let shutdown_handle = match task_end.try_clone() {
+        Ok(clone) => clone,
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Io(err)).await;
+            return;
+        }
+    };
+    let task_sock = match tokio::net::UnixStream::from_std(task_end) {
+        Ok(sock) => sock,
+        Err(err) => {
+            let _ = send_error_exit(sink, &Error::Io(err)).await;
+            return;
+        }
+    };
+    let (mut task_read, mut task_write) = task_sock.into_split();
+    let run_flag = Arc::clone(&cancel_flag);
+    let run = refs.executor.run(move || {
+        let reader = match serve_end.try_clone() {
+            Ok(reader) => reader,
+            Err(err) => {
+                return Err(CoreError::new(
+                    ErrorCode::EIo,
+                    format!("upload-pack stream socket: {err}"),
+                ));
+            }
+        };
+        let store = coordinator.store();
+        let kind = store.hash_kind();
+        let head = crate::cli::verbs_transport::serve_head(store)?;
+        let interrupt = ruk_git::transport::Interrupt::none().with_cancel(run_flag);
+        if ruk_git::transport::serve_v2::git_protocol_requests_v2(Some(&git_protocol)) {
+            ruk_git::transport::serve_v2::serve_upload_pack_v2(
+                reader, serve_end, store, kind, &head, &interrupt,
+            )?;
+        } else {
+            ruk_git::transport::serve::serve_upload_pack(
+                reader, serve_end, store, kind, &head, &interrupt,
+            )?;
+        }
+        Ok(())
+    });
+    tokio::pin!(run);
+    let mut retained: Vec<u8> = Vec::new();
+    let mut stdin_total: u64 = 0;
+    let mut eof_sent = false;
+    let mut pipe_done = false;
+    let mut pipe_broken = false;
+    let mut strip = AdvertStrip::new();
+    let mut pipe_buf = vec![0u8; ipc::MAX_DATA_CHUNK_BYTES];
+    let outcome: Result<Result<(), CoreError>, CoreError> = loop {
+        tokio::select! {
+            out = &mut run => break out,
+            control = input.control.recv() => {
+                let Some(frame) = control else {
+                    halt_stream(&cancel_flag, &shutdown_handle);
+                    return;
+                };
+                if frame.stream_id != stream_id {
+                    refuse_stream(
+                        sink,
+                        CoreError::new(
+                            ErrorCode::EInvalid,
+                            "stream received a frame of another stream",
+                        ),
+                    )
+                    .await;
+                    halt_stream(&cancel_flag, &shutdown_handle);
+                    return;
+                }
+                match frame.kind {
+                    ipc::FrameKind::Cancel => {
+                        cancel_guard.cancel();
+                        halt_stream(&cancel_flag, &shutdown_handle);
+                        exit_cancelled(
+                            sink,
+                            &upload_invocation(&request_id, &retained, &limits),
+                        )
+                        .await;
+                        return;
+                    }
+                    ipc::FrameKind::WindowUpdate => {
+                        let credit: WindowCredit =
+                            match ipc::decode_control(&frame.payload) {
+                                Ok(credit) => credit,
+                                Err(err) => {
+                                    refuse_stream(sink, err).await;
+                                    halt_stream(&cancel_flag, &shutdown_handle);
+                                    return;
+                                }
+                            };
+                        if let Err(err) = route_credit(credits, stream_id, &credit) {
+                            refuse_stream(sink, err).await;
+                            halt_stream(&cancel_flag, &shutdown_handle);
+                            return;
+                        }
+                    }
+                    _ => {
+                        refuse_stream(
+                            sink,
+                            CoreError::new(
+                                ErrorCode::EInvalid,
+                                "frame kind is misplaced on this stream",
+                            ),
+                        )
+                        .await;
+                        halt_stream(&cancel_flag, &shutdown_handle);
+                        return;
+                    }
+                }
+            }
+            data = input.data.recv() => {
+                let Some(frame) = data else {
+                    halt_stream(&cancel_flag, &shutdown_handle);
+                    return;
+                };
+                if frame.stream_id != stream_id {
+                    refuse_stream(
+                        sink,
+                        CoreError::new(
+                            ErrorCode::EInvalid,
+                            "stream received a frame of another stream",
+                        ),
+                    )
+                    .await;
+                    halt_stream(&cancel_flag, &shutdown_handle);
+                    return;
+                }
+                match frame.kind {
+                    ipc::FrameKind::Stdin => {
+                        if eof_sent || pipe_broken {
+                            continue;
+                        }
+                        let Ok(width) = u64::try_from(frame.payload.len()) else {
+                            refuse_stream(
+                                sink,
+                                CoreError::new(
+                                    ErrorCode::ELimit,
+                                    "stdin chunk exceeds its bound",
+                                ),
+                            )
+                            .await;
+                            halt_stream(&cancel_flag, &shutdown_handle);
+                            return;
+                        };
+                        let Some(total) =
+                            check_stdin_quota(sink, stdin_total, width, limits.max_stdin_bytes)
+                                .await
+                        else {
+                            halt_stream(&cancel_flag, &shutdown_handle);
+                            return;
+                        };
+                        stdin_total = total;
+                        if !admit_stdin_chunk(
+                            sink,
+                            credits,
+                            stream_id,
+                            &input.outstanding,
+                            width,
+                        )
+                        .await
+                        {
+                            halt_stream(&cancel_flag, &shutdown_handle);
+                            return;
+                        }
+                        retained.extend_from_slice(&frame.payload);
+                        if task_write.write_all(&frame.payload).await.is_err() {
+                            pipe_broken = true;
+                        }
+                    }
+                    ipc::FrameKind::StdinEof => {
+                        if !eof_sent {
+                            eof_sent = true;
+                            let _ = shutdown_handle.shutdown(std::net::Shutdown::Write);
+                        }
+                    }
+                    _ => {
+                        refuse_stream(
+                            sink,
+                            CoreError::new(
+                                ErrorCode::EInvalid,
+                                "frame kind is misplaced on this stream",
+                            ),
+                        )
+                        .await;
+                        halt_stream(&cancel_flag, &shutdown_handle);
+                        return;
+                    }
+                }
+            }
+            read = task_read.read(&mut pipe_buf), if !pipe_done => {
+                let Ok(n) = read else {
+                    pipe_done = true;
+                    continue;
+                };
+                if n == 0 {
+                    pipe_done = true;
+                    continue;
+                }
+                if !forward_stripped(
+                    &mut strip,
+                    sink,
+                    &mut input.control,
+                    credits,
+                    cancel_guard,
+                    &pipe_buf[..n],
+                )
+                .await
+                {
+                    halt_stream(&cancel_flag, &shutdown_handle);
+                    return;
+                }
+            }
+        }
+    };
+    let flattened = match outcome {
+        Err(err) | Ok(Err(err)) => Err(err),
+        Ok(Ok(())) => Ok(()),
+    };
+    if let Err(run_err) = flattened {
+        let _ = send_error_exit(sink, &Error::Core(run_err)).await;
+        return;
+    }
+    if token.check().is_err() {
+        exit_cancelled(sink, &upload_invocation(&request_id, &retained, &limits)).await;
+        return;
+    }
+    if cancel_flag.load(Ordering::SeqCst) {
+        return;
+    }
+    if !pipe_done {
+        while let Ok(n) = task_read.read(&mut pipe_buf).await {
+            if n == 0 {
+                break;
+            }
+            if !forward_stripped(
+                &mut strip,
+                sink,
+                &mut input.control,
+                credits,
+                cancel_guard,
+                &pipe_buf[..n],
+            )
+            .await
+            {
+                halt_stream(&cancel_flag, &shutdown_handle);
+                return;
+            }
+        }
+    }
+    if !strip.stripped() {
+        refuse_stream(
+            sink,
+            CoreError::new(
+                ErrorCode::EInvalid,
+                "serve round carries no advertisement prefix",
+            ),
+        )
+        .await;
+        return;
+    }
+    let report = CommandExitReport::success(&upload_invocation(&request_id, &retained, &limits), 0);
+    let exit_bytes = match ipc::encode_control(&report) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let _ = send_frame(sink, ipc::FrameKind::Exit, &exit_bytes).await;
+}
+
+/// Names the invocation of one streaming upload-pack round: the open's
+/// request id when it carries one, else the digest of the request the
+/// stream retained, mirroring the collected path.
+#[cfg(unix)]
+fn upload_invocation(request_id: &str, retained: &[u8], limits: &GitLimits) -> String {
+    if !request_id.is_empty() {
+        return request_id.to_string();
+    }
+    let commands = parse_git_commands(retained);
+    let digest = ruk_git::transport::serve::git_service_digest(
+        GIT_SERVICE_UPLOAD_PACK,
+        &commands,
+        &limits.encode(),
+    );
+    format!("digest-{digest}")
+}
+
+/// Drops the ref-advertisement prefix of one streamed upload-pack serve:
+/// the serve always writes the advertisement first, so bytes through the
+/// first flush packet are its discovery half and everything after is the
+/// round the client waits for. Mirrors [`strip_advertisement`] for the
+/// collected path.
+#[cfg(unix)]
+struct AdvertStrip {
+    pending: Vec<u8>,
+    stripped: bool,
+}
+
+#[cfg(unix)]
+impl AdvertStrip {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            stripped: false,
+        }
+    }
+
+    fn stripped(&self) -> bool {
+        self.stripped
+    }
+
+    /// Feeds freshly read serve output, returning the response bytes that
+    /// are safe to forward. Buffers until the first flush packet, then
+    /// passes everything through.
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<u8>, CoreError> {
+        use ruk_git::transport::pktline::{Packet, decode_frame};
+        if self.stripped {
+            return Ok(bytes.to_vec());
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut offset = 0;
+        while offset < self.pending.len() {
+            let Some((packet, consumed)) = decode_frame(&self.pending[offset..]).map_err(|_| {
+                CoreError::new(
+                    ErrorCode::EInvalid,
+                    "serve round carries no advertisement prefix",
+                )
+            })?
+            else {
+                break;
+            };
+            offset += consumed;
+            match packet {
+                Packet::Flush => {
+                    self.stripped = true;
+                    let rest = self.pending[offset..].to_vec();
+                    self.pending.clear();
+                    return Ok(rest);
+                }
+                Packet::Data(_) => {}
+                Packet::Delimiter | Packet::ResponseEnd => {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "serve round carries no advertisement prefix",
+                    ));
+                }
+            }
+        }
+        self.pending.drain(..offset);
+        Ok(Vec::new())
+    }
 }
 
 /// Splits one full serve round into its advertisement prefix and its
