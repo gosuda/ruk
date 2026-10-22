@@ -694,6 +694,21 @@ fn git_request(service: Service, host: &str, port: Option<u16>, path: &str) -> V
     out
 }
 
+fn resolve_addrs(label: &str, host: &str, port: u16) -> Result<Vec<SocketAddr>, GitError> {
+    let resolved: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot resolve {label}: {err}"),
+        })?
+        .collect();
+    if resolved.is_empty() {
+        return Err(GitError::Io {
+            detail: format!("cannot resolve {label}: no addresses"),
+        });
+    }
+    Ok(resolved)
+}
+
 /// Dials a git daemon and sends the service request.
 ///
 /// # Errors
@@ -707,17 +722,7 @@ pub fn git_connect(
 ) -> Result<TcpStream, GitError> {
     let effective = port.unwrap_or(GIT_DAEMON_PORT);
     let label = format!("git://{host}:{effective}");
-    let resolved: Vec<SocketAddr> = (host, effective)
-        .to_socket_addrs()
-        .map_err(|err| GitError::Io {
-            detail: format!("cannot resolve {label}: {err}"),
-        })?
-        .collect();
-    if resolved.is_empty() {
-        return Err(GitError::Io {
-            detail: format!("cannot resolve {label}: no addresses"),
-        });
-    }
+    let resolved = resolve_addrs(&label, host, effective)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut last_err = String::from("no addresses tried");
     let mut dialed = None;
@@ -787,18 +792,20 @@ impl Write for Stream {
     }
 }
 
-/// Opens one duplex stream to a network endpoint: SSH spawns, git dials
-/// under the egress policy.
+/// Opens one duplex stream to a network endpoint: SSH spawns after its
+/// host passes the egress policy, and git dials under the same policy.
 ///
 /// Smart-http never opens a duplex stream: its stateless request/response
 /// pairs run through [`super::smart_http`], so an HTTP endpoint here is
 /// an internal routing error, not a gap. The policy gates git-daemon
-/// dials; SSH spawns keep their existing trust (host keys, user config),
-/// since the child performs its own dials.
+/// dials and checks the resolved SSH host before spawning. SSH retains
+/// its existing trust (host keys and user config), and the child performs
+/// the actual dial.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
-/// those elsewhere), [`GitError::Cancelled`] when the interrupt is
+/// those elsewhere), or when egress policy refuses SSH or git addresses;
+/// [`GitError::Cancelled`] when the interrupt is
 /// already tripped, [`GitError::Io`] when the peer cannot be reached.
 /// The dial itself does not observe the flag mid-connect; `git_connect`
 /// bounds it with timeouts.
@@ -815,13 +822,19 @@ pub fn open_stream(
             port,
             user,
             path,
-        } => Ok(Stream::Ssh(ssh_connect(
-            host,
-            *port,
-            user.as_deref(),
-            service,
-            path,
-        )?)),
+        } => {
+            let effective = port.unwrap_or(22);
+            let label = format!("ssh://{host}:{effective}");
+            let resolved = resolve_addrs(&label, host, effective)?;
+            let _allowed = policy.filter_addrs(&label, &resolved)?;
+            Ok(Stream::Ssh(ssh_connect(
+                host,
+                *port,
+                user.as_deref(),
+                service,
+                path,
+            )?))
+        }
         Endpoint::Git { host, port, path } => Ok(Stream::Tcp(git_connect(
             host, *port, service, path, policy,
         )?)),
@@ -1809,5 +1822,43 @@ mod tests {
             policy.filter_addrs("host", &[rebound]).is_err(),
             "a rebound loopback answer must not dial"
         );
+    }
+
+    #[test]
+    fn open_stream_refuses_ssh_outside_egress_allowlist() {
+        let endpoint = Endpoint::Ssh {
+            host: "192.0.2.1".to_owned(),
+            port: Some(22),
+            user: None,
+            path: "/srv/a.git".to_owned(),
+        };
+        let policy = EgressPolicy::deny_private()
+            .allow_cidr("10.0.0.0/8")
+            .expect("CIDR parses");
+        let err = open_stream(&endpoint, Service::UploadPack, &policy, &Interrupt::none())
+            .expect_err("denied SSH host is refused before spawn");
+        assert!(
+            matches!(&err, GitError::Invalid { detail } if detail.starts_with("egress policy refuses ssh://192.0.2.1:22")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn open_stream_allows_ssh_inside_egress_allowlist() {
+        let endpoint = Endpoint::Ssh {
+            host: "127.0.0.1".to_owned(),
+            port: Some(1),
+            user: None,
+            path: "/srv/a.git".to_owned(),
+        };
+        let policy = EgressPolicy::deny_private()
+            .allow_cidr("127.0.0.0/8")
+            .expect("CIDR parses");
+        if let Err(err) = open_stream(&endpoint, Service::UploadPack, &policy, &Interrupt::none()) {
+            assert!(
+                !matches!(&err, GitError::Invalid { detail } if detail.starts_with("egress policy refuses")),
+                "allowlisted SSH host was refused by egress policy: {err:?}"
+            );
+        }
     }
 }

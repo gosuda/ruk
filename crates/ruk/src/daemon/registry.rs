@@ -1744,7 +1744,7 @@ impl Registry {
             return Ok(Arc::clone(coordinator));
         }
         let canonical = pinned.path().to_path_buf();
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let store = match pinned.open_path() {
             Some(proc_root) => Store::open_pinned(
                 &proc_root,
@@ -1758,7 +1758,7 @@ impl Registry {
             )
             .map_err(|err| CoreError::new(err.code(), err.to_string()))?,
         };
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let store = Store::open(
             &canonical,
             Arc::new(PreparationBudget::reference_defaults()),
@@ -2700,7 +2700,7 @@ mod tests {
     /// no store file access travels it. The loop asserts at least one
     /// successful open so the test cannot pass vacuously.
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn symlink_swap_never_resolves_outside() {
         use ruk_core::ids::{HashKind, Oid};
         use ruk_core::store::types::ObjectKind;
