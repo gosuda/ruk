@@ -4753,6 +4753,12 @@ fn decode_request_args(
         Method::Unpin => mutation_request(id, decode_args(text)?, Request::Unpin),
         Method::ClaimRenew => mutation_request(id, decode_args(text)?, Request::ClaimRenew),
         Method::PolicySet => mutation_request(id, decode_args(text)?, Request::PolicySet),
+        Method::ReleaseFreezeSet => {
+            mutation_request(id, decode_args(text)?, Request::ReleaseFreezeSet)
+        }
+        Method::ReleaseFreezeClear => {
+            mutation_request(id, decode_args(text)?, Request::ReleaseFreezeClear)
+        }
         Method::RepoStat => Ok(Request::RepoStat(Box::new(decode_args(text)?))),
         Method::Tree => Ok(Request::Tree(Box::new(decode_args(text)?))),
         Method::RefsList => Ok(Request::RefsList(Box::new(decode_args(text)?))),

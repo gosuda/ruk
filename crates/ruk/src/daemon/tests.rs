@@ -2531,6 +2531,84 @@ async fn host_unauthorized_ref_refused_before_callback() {
     task.abort();
 }
 
+/// Writes a live released-tag marker for `name` under `repo_dir`.
+fn seed_released_tag(repo_dir: &Path, name: &str, owner: &str, target: Oid) {
+    use ruk_core::protocol::Timestamp;
+    use ruk_core::refs::{ReleasedTagMarker, prepare_release_freeze};
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let marker = ReleasedTagMarker {
+        owner_release_id: owner.to_owned(),
+        target_oid: target,
+        frozen_at: Timestamp::parse("1970-01-01T00:00:00Z").expect("freeze time"),
+    };
+    let tag = RefName::new(name.to_string()).expect("tag name");
+    let freeze = prepare_release_freeze(&store, &tag, &marker).expect("prepare freeze");
+    store
+        .publish(
+            Vec::new(),
+            &[freeze],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish freeze");
+}
+
+#[tokio::test]
+async fn git_push_cannot_bypass_a_released_tag_freeze() {
+    let root = temp_root("tag-freeze-bypass");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_released_tag(&repo_dir, "refs/tags/v1", "rel-1", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let zero = "0".repeat(40);
+    let hex = commit.to_hex();
+    let mut body = pkt(format!("{hex} {zero} refs/tags/v1\n").as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-tag-freeze-1"),
+    );
+    let (out, exit) = driver
+        .run_git_hosted(5, &payload, &[body], accept_all)
+        .await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("ng refs/tags/v1"), "got {text:?}");
+    assert!(
+        text.contains("rel-1"),
+        "the refusal names the owner: {text:?}"
+    );
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let tag = coordinator
+        .store()
+        .fact(FactTable::Refs, b"refs/tags/v1")
+        .expect("read tag");
+    assert!(tag.is_none(), "the frozen tag was not created");
+
+    drop(driver);
+    task.abort();
+}
+
 #[tokio::test]
 async fn hosted_atomic_push_refuses_before_pre_receive() {
     let root = temp_root("host-atomic");

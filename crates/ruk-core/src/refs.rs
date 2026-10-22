@@ -234,6 +234,7 @@ pub fn prepare_checked_transaction(
     let mut mutations = Vec::with_capacity(updates.len());
 
     for update in updates {
+        let freeze_guards = tag_freeze_guards(store, &[&update.name])?;
         let name_bytes = update.name.as_bytes();
         let current_bytes = store.fact(FactTable::Refs, name_bytes)?;
 
@@ -291,6 +292,7 @@ pub fn prepare_checked_transaction(
             mutation: mutation.clone(),
         });
         mutations.push(mutation);
+        mutations.extend(freeze_guards);
     }
 
     Ok(PreparedRefTransaction {
@@ -710,6 +712,193 @@ pub struct ReleasedTagMarker {
     pub target_oid: Oid,
     /// Wall time the freeze was written.
     pub frozen_at: Timestamp,
+}
+
+fn is_tag_name(name: &RefName) -> bool {
+    name.as_bytes().starts_with(b"refs/tags/")
+}
+
+fn frozen_refusal(name: &RefName, owner: &str) -> CoreError {
+    CoreError::new(
+        ErrorCode::EForbidden,
+        format!("tag `{name}` is frozen by release `{owner}`"),
+    )
+}
+
+fn decode_stored_marker(store: &Store, bytes: &[u8]) -> Result<ReleasedTagMarker, CoreError> {
+    let res: Result<ReleasedTagMarker, StoreError> = (|| {
+        let marker: ReleasedTagMarker = crate::store::decode("released tag marker", bytes)?;
+        reject_null_oid(marker.target_oid, "released tag marker")?;
+        marker
+            .target_oid
+            .expect_kind(store.hash_kind(), "released tag marker")?;
+        Ok(marker)
+    })();
+    store.observe(res).map_err(CoreError::from)
+}
+
+/// The released-tag marker that freezes `name`, if one is stored.
+///
+/// # Errors
+/// `E_CORRUPT` for a damaged row.
+pub fn released_tag_marker(
+    store: &Store,
+    name: &RefName,
+) -> Result<Option<ReleasedTagMarker>, CoreError> {
+    match store.fact(FactTable::ReleasedTags, name.as_bytes())? {
+        Some(bytes) => decode_stored_marker(store, &bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Refuses `name` while a live released-tag marker freezes it.
+///
+/// # Errors
+/// `E_FORBIDDEN` naming the owning release; `E_CORRUPT` for a damaged row.
+pub fn check_tag_unfrozen(store: &Store, name: &RefName) -> Result<(), CoreError> {
+    match released_tag_marker(store, name)? {
+        Some(marker) => Err(frozen_refusal(name, &marker.owner_release_id)),
+        None => Ok(()),
+    }
+}
+
+/// Freeze guards for the tag names among `names`. Each tag name is checked
+/// with [`check_tag_unfrozen`], then gets an `Absent` guard on its marker
+/// row, so a marker written between this check and the publish fails that
+/// publish with `E_STALE`. The guard removes nothing: an absent row removes
+/// as a no-op, and a present row is the stale case. Names outside
+/// `refs/tags/` produce no guard.
+///
+/// # Errors
+/// As [`check_tag_unfrozen`].
+pub fn tag_freeze_guards(
+    store: &Store,
+    names: &[&RefName],
+) -> Result<Vec<FactMutation>, CoreError> {
+    let mut guards = Vec::new();
+    for &name in names {
+        if !is_tag_name(name) {
+            continue;
+        }
+        check_tag_unfrozen(store, name)?;
+        guards.push(FactMutation {
+            table: FactTable::ReleasedTags,
+            key: name.as_bytes().to_vec(),
+            expected: FactExpectation::Absent,
+            value: None,
+        });
+    }
+    Ok(guards)
+}
+
+/// Lowers a freeze of `name` to a create-if-absent CAS on its marker row.
+///
+/// An identical row (same owner and target) makes a retry a rewrite of the
+/// same bytes guarded by those bytes, so a row cleared between the check and
+/// the publish still fails it. Any other row refuses: a retry must not move
+/// the pinned target, and another release must not take the tag over.
+///
+/// # Errors
+/// `E_INVALID` for a name outside `refs/tags/`; `E_FORBIDDEN` naming the
+/// existing owner when the row belongs to another release or pins another
+/// target; `E_LIMIT` when the row exceeds the bound; `E_CORRUPT` for a
+/// damaged row.
+pub fn prepare_release_freeze(
+    store: &Store,
+    name: &RefName,
+    marker: &ReleasedTagMarker,
+) -> Result<FactMutation, CoreError> {
+    if !is_tag_name(name) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!("a released tag must live under refs/tags/, got `{name}`"),
+        ));
+    }
+    reject_null_oid(marker.target_oid, "released tag marker")?;
+    marker
+        .target_oid
+        .expect_kind(store.hash_kind(), "released tag marker")?;
+    let key = name.as_bytes().to_vec();
+    let Some(bytes) = store.fact(FactTable::ReleasedTags, name.as_bytes())? else {
+        let encoded = crate::store::encode("released tag marker", marker)?;
+        if key.len().saturating_add(encoded.len()) > MAX_CONTROL_FRAME_BYTES {
+            return Err(CoreError::new(
+                ErrorCode::ELimit,
+                format!("released tag marker for {name} exceeds 16 MiB bound"),
+            ));
+        }
+        return Ok(FactMutation {
+            table: FactTable::ReleasedTags,
+            key,
+            expected: FactExpectation::Absent,
+            value: Some(encoded),
+        });
+    };
+    let stored = decode_stored_marker(store, &bytes)?;
+    if stored.owner_release_id != marker.owner_release_id {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            format!(
+                "tag `{name}` is already frozen by release `{}`",
+                stored.owner_release_id
+            ),
+        ));
+    }
+    if stored.target_oid != marker.target_oid {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            format!(
+                "tag `{name}` is already frozen by release `{}` at a different target",
+                stored.owner_release_id
+            ),
+        ));
+    }
+    Ok(FactMutation {
+        table: FactTable::ReleasedTags,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Value(bytes.clone()),
+        value: Some(bytes),
+    })
+}
+
+/// Lowers a clear of `name` to an owner-checked removal of its marker row.
+///
+/// No row is a no-op success guarded by absence: a row written between the
+/// check and the publish fails that publish with `E_STALE`. A present row is
+/// removed under its exact bytes, so a rewrite fails the publish the same way.
+///
+/// # Errors
+/// `E_FORBIDDEN` naming the frozen owner when `owner` does not hold the row;
+/// `E_CORRUPT` for a damaged row.
+pub fn prepare_release_unfreeze(
+    store: &Store,
+    name: &RefName,
+    owner: &str,
+) -> Result<FactMutation, CoreError> {
+    let Some(bytes) = store.fact(FactTable::ReleasedTags, name.as_bytes())? else {
+        return Ok(FactMutation {
+            table: FactTable::ReleasedTags,
+            key: name.as_bytes().to_vec(),
+            expected: FactExpectation::Absent,
+            value: None,
+        });
+    };
+    let stored = decode_stored_marker(store, &bytes)?;
+    if stored.owner_release_id != owner {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            format!(
+                "tag `{name}` is frozen by release `{}`, not `{owner}`",
+                stored.owner_release_id
+            ),
+        ));
+    }
+    Ok(FactMutation {
+        table: FactTable::ReleasedTags,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Value(bytes),
+        value: None,
+    })
 }
 
 /// Every object id named by any reflog record in the store, old and new.

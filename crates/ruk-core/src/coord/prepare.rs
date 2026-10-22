@@ -130,7 +130,8 @@ use crate::protocol::{
     WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
-    Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
+    Content, PathSelection, ReleaseFreezeClearArgs, ReleaseFreezeClearReply, ReleaseFreezeSetArgs,
+    ReleaseFreezeSetReply, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
     RevertReply, SplitArgs, SplitPlacement, UndoArgs, UndoReply,
 };
 use crate::records::Records;
@@ -140,7 +141,10 @@ use crate::records::types::{ChangeEntry, ChangeState};
 use crate::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
-use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked};
+use crate::refs::{
+    ReleasedTagMarker, StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked,
+    prepare_release_freeze, prepare_release_unfreeze,
+};
 use crate::store::ObjectKind;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
@@ -261,6 +265,8 @@ pub(crate) fn prepare_mutation_with(
         Request::BookmarkResolve(m) => bookmark_resolve_parts(ctx, m.request_id, &m.args)?,
         Request::TagSet(m) => tag_set_parts(ctx, m.request_id, &m.args)?,
         Request::TagDelete(m) => tag_delete_parts(ctx, m.request_id, &m.args)?,
+        Request::ReleaseFreezeSet(m) => release_freeze_set_parts(ctx, m.request_id, &m.args)?,
+        Request::ReleaseFreezeClear(m) => release_freeze_clear_parts(ctx, m.request_id, &m.args)?,
         Request::Pin(m) => pin_parts(ctx, m.request_id, &m.args)?,
         Request::Unpin(m) => unpin_parts(ctx, m.request_id, &m.args)?,
         Request::AttestAdd(m) => attest_add_parts(ctx, m.request_id, &m.args)?,
@@ -376,6 +382,7 @@ fn check_ref_update(
     store: &Store,
     update: RefUpdate,
 ) -> Result<(Vec<FactMutation>, RefTransaction), CoreError> {
+    crate::refs::check_tag_unfrozen(store, &update.name)?;
     let transaction =
         RefTransaction::new(store.hash_kind(), vec![update]).map_err(CoreError::from)?;
     transaction.check(&StoreRefs::new(store))?;
@@ -843,6 +850,61 @@ fn tag_delete_parts(
         fence: None,
     })
 }
+
+fn release_freeze_set_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ReleaseFreezeSetArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let marker = ReleasedTagMarker {
+        owner_release_id: args.owner_release_id.clone(),
+        target_oid: args.target_oid,
+        frozen_at: args.frozen_at,
+    };
+    let facts = vec![prepare_release_freeze(store, &args.name, &marker)?];
+    Ok(Parts {
+        reply: Reply::ReleaseFreezeSet(Box::new(ReleaseFreezeSetReply {
+            outcome: pending_outcome(session, request_id),
+            name: args.name.clone(),
+            owner_release_id: args.owner_release_id.clone(),
+            target_oid: args.target_oid,
+            frozen_at: args.frozen_at,
+        })),
+        objects: Vec::new(),
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+fn release_freeze_clear_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ReleaseFreezeClearArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let facts = vec![prepare_release_unfreeze(
+        store,
+        &args.name,
+        &args.owner_release_id,
+    )?];
+    Ok(Parts {
+        reply: Reply::ReleaseFreezeClear(Box::new(ReleaseFreezeClearReply {
+            outcome: pending_outcome(session, request_id),
+            name: args.name.clone(),
+        })),
+        objects: Vec::new(),
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
 /// Mints the empty tree when absent and stages one empty-tree commit through
 /// `ops::prepare_new`, synthesizing author and committer from `over` (the
 /// operation override) or the session identity.
@@ -4169,7 +4231,7 @@ mod tests {
             })),
         )
         .expect("tag.delete prepares on a present ref");
-        assert_eq!(prepared.facts.len(), 1);
+        assert_eq!(prepared.facts.len(), 2);
         let fact = &prepared.facts[0];
         assert_eq!(fact.table, crate::store::types::FactTable::Refs);
         assert!(fact.value.is_none());
@@ -4395,6 +4457,154 @@ mod tests {
         assert_eq!(err.code, ErrorCode::EInvalid);
     }
 
+    fn release_freeze_request(tag: &str, owner: &str, target: Oid) -> Request {
+        Request::ReleaseFreezeSet(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ReleaseFreezeSetArgs {
+                name: name(tag),
+                owner_release_id: owner.to_owned(),
+                target_oid: target,
+                frozen_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+        }))
+    }
+
+    fn release_clear_request(tag: &str, owner: &str) -> Request {
+        Request::ReleaseFreezeClear(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ReleaseFreezeClearArgs {
+                name: name(tag),
+                owner_release_id: owner.to_owned(),
+            },
+        }))
+    }
+
+    fn plain_tag_set_request(tag: &str, target: Oid) -> Request {
+        Request::TagSet(Box::new(WireMutation {
+            request_id: request_id(),
+            args: TagSetArgs {
+                name: name(tag),
+                target,
+                annotation: None,
+                expected: RefExpect::Absent,
+            },
+        }))
+    }
+
+    fn tag_delete_request(tag: &str, target: Oid) -> Request {
+        Request::TagDelete(Box::new(WireMutation {
+            request_id: request_id(),
+            args: TagDeleteArgs {
+                name: name(tag),
+                expected: RefExpect::Present(RefTarget::Direct(target)),
+            },
+        }))
+    }
+
+    fn publish_prepared(store: &Store, facts: &[FactMutation]) {
+        store
+            .publish(
+                Vec::new(),
+                facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish prepared facts");
+    }
+
+    #[test]
+    fn released_tag_freeze_gates_tag_mutations_until_its_owner_clears() {
+        let (_temp, store, session) = fixture();
+        let (_, _, target) = seed_commit(&store, None);
+
+        let frozen = prepare_mutation(
+            &store,
+            session,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect("release.freeze.set prepares");
+        assert!(matches!(frozen.reply, Reply::ReleaseFreezeSet(_)));
+        publish_prepared(&store, &frozen.facts);
+
+        let retry = prepare_mutation(
+            &store,
+            session,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect("the same owner and target retries");
+        assert_eq!(
+            retry.facts.len(),
+            1,
+            "an idempotent retry guards the marker row"
+        );
+        assert!(matches!(
+            retry.facts[0].expected,
+            crate::store::types::FactExpectation::Value(_)
+        ));
+
+        let other_owner = prepare_mutation(
+            &store,
+            session,
+            release_freeze_request("refs/tags/v1", "rel-2", target),
+        )
+        .expect_err("another owner is refused");
+        assert_eq!(other_owner.code, ErrorCode::EForbidden);
+        assert!(
+            other_owner.message.contains("rel-1"),
+            "{}",
+            other_owner.message
+        );
+
+        let set = prepare_mutation(
+            &store,
+            session,
+            plain_tag_set_request("refs/tags/v1", target),
+        )
+        .expect_err("a plain tag.set is refused while frozen");
+        assert_eq!(set.code, ErrorCode::EForbidden);
+        assert!(set.message.contains("rel-1"), "{}", set.message);
+
+        let delete = prepare_mutation(&store, session, tag_delete_request("refs/tags/v1", target))
+            .expect_err("tag.delete is refused while frozen");
+        assert_eq!(delete.code, ErrorCode::EForbidden);
+        assert!(delete.message.contains("rel-1"), "{}", delete.message);
+
+        let refused_clear = prepare_mutation(
+            &store,
+            session,
+            release_clear_request("refs/tags/v1", "rel-2"),
+        )
+        .expect_err("another owner cannot clear");
+        assert_eq!(refused_clear.code, ErrorCode::EForbidden);
+        assert!(
+            refused_clear.message.contains("rel-1"),
+            "{}",
+            refused_clear.message
+        );
+
+        let cleared = prepare_mutation(
+            &store,
+            session,
+            release_clear_request("refs/tags/v1", "rel-1"),
+        )
+        .expect("the owner clears");
+        publish_prepared(&store, &cleared.facts);
+
+        let unfrozen = prepare_mutation(
+            &store,
+            session,
+            plain_tag_set_request("refs/tags/v1", target),
+        )
+        .expect("tag.set prepares once the marker is gone");
+        assert!(
+            unfrozen
+                .facts
+                .iter()
+                .any(|fact| fact.table == crate::store::types::FactTable::ReleasedTags),
+            "the tag.set keeps its freeze guard in the same publish"
+        );
+    }
+
     #[test]
     fn tag_set_annotation_renders_tag_object() {
         let (_temp, store, session) = fixture();
@@ -4456,7 +4666,7 @@ mod tests {
             panic!("tag.set must answer its own reply");
         };
         assert_eq!(reply.target, RefTarget::Direct(expected_oid));
-        assert_eq!(prepared.facts.len(), 1);
+        assert_eq!(prepared.facts.len(), 2);
         assert!(prepared.ref_transaction.is_some());
 
         // Without an annotation tagger the session identity fills in.

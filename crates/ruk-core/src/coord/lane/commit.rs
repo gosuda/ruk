@@ -613,6 +613,9 @@ fn validate_candidate(
 
     // Validate ref transaction if present.
     if let Some(tx) = &candidate.ref_transaction {
+        for update in tx.updates() {
+            crate::refs::check_tag_unfrozen(store, &update.name)?;
+        }
         tx.check(&StoreRefs::new(store))?;
     }
 

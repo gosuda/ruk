@@ -121,6 +121,10 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
     refuse_restoring_workspaces(operation, &plan.facts)?;
     refuse_diverged(store, operation, &plan.facts)?;
     let (transaction, dependencies) = undo_ref_transaction(store, &plan.facts)?;
+    for name in &dependencies {
+        plan.facts
+            .extend(crate::refs::tag_freeze_guards(store, &[name])?);
+    }
     plan.ref_transaction = transaction;
     plan.ref_dependencies = dependencies;
     Ok(plan)
@@ -199,6 +203,9 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
             "landing consumes land plans and moves a remote outside the tracked tables"
         }
         Method::PolicySet => "policy.set rewrites the landing policy outside the tracked tables",
+        Method::ReleaseFreezeSet | Method::ReleaseFreezeClear => {
+            "release freeze markers are owner-checked outside the tracked tables"
+        }
         Method::RepoInit | Method::RepoDelete | Method::RepoRename | Method::RepoFork => {
             "repository lifecycle moves stores on disk outside the tracked tables"
         }

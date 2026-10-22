@@ -6,6 +6,8 @@ Entries describe implemented, unreleased functionality.
 
 ### Added
 
+- Protocol schema minor 4 adds `release.freeze.set` and `release.freeze.clear`, bringing the method count to 63. A release owner can freeze a tag at one target and clear its marker. Tag mutations, imports, CLI ref writes, undo, and pushes refuse frozen tags with the owner named. Marker guards publish atomically with ref changes; an atomic push refuses every sibling when any tag is frozen.
+
 - Protocol schema minor 3: `repo.fork` serves a staged fork. Sealed segments hardlink into the fork (a cross-device link copies and is reported), tail objects re-publish base-first, and facts copy under full CAS revalidation. The destination carries the forked generation, the default branch, and the refs the `refs` selection keeps; freeze markers, attestations, and live coordination state stay behind.
 - Protocol schema minor 2 with the `Admin` method kind and 14 hosted forge methods (`repo.stat`, `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`, `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`, `claim.renew`, `policy.set`), bringing the `ruk model` contract count to 61. Admin methods dispatch before any coordinator call, gated by `admin_uids`, with no session and no receipt; unserved arms refuse `E_HOSTED`.
 - `ruk model` command rendering the draft 2020-12 JSON schema for the Ruk core protocol, including framing boundaries, the 30-code closed error registry, object formats, and 61 protocol method contracts.

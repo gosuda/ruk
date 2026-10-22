@@ -79,7 +79,9 @@ pub const SCHEMA_MAJOR: u32 = 1;
 /// metadata. It also gives `repo.fork` its served reply: the forked
 /// generation, sealed and tail object counts, the hardlinked and copied
 /// segment ids, and the linked LFS payload count.
-pub const SCHEMA_MINOR: u32 = 3;
+/// Minor 4 appends `release.freeze.set` and `release.freeze.clear`;
+/// minor-3 readers refuse their frames as unknown methods.
+pub const SCHEMA_MINOR: u32 = 4;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -3173,6 +3175,20 @@ impl Validate for TagDeleteArgs {
     }
 }
 
+impl Validate for ReleaseFreezeSetArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_namespace("a released tag", &self.name, b"refs/tags/")?;
+        require_nonempty_text("release.freeze.set owner", &self.owner_release_id)
+    }
+}
+
+impl Validate for ReleaseFreezeClearArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_namespace("a released tag", &self.name, b"refs/tags/")?;
+        require_nonempty_text("release.freeze.clear owner", &self.owner_release_id)
+    }
+}
+
 impl Validate for ClaimAcquireArgs {
     fn validate(&self) -> Result<(), CoreError> {
         require_nonempty("claim paths", &self.paths)?;
@@ -3625,6 +3641,42 @@ pub struct PolicySetArgs {
 pub struct PolicySetReply {
     pub outcome: MutationOutcome,
     pub generation: u64,
+}
+
+/// `release.freeze.set`: writes the released-tag marker that freezes one tag
+/// to a target for one release. A different owner, or the same owner at a
+/// different target, is refused; the same owner at the same target is a
+/// no-op success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeSetArgs {
+    pub name: RefName,
+    pub owner_release_id: String,
+    pub target_oid: Oid,
+    pub frozen_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeSetReply {
+    pub outcome: MutationOutcome,
+    pub name: RefName,
+    pub owner_release_id: String,
+    pub target_oid: Oid,
+    pub frozen_at: Timestamp,
+}
+
+/// `release.freeze.clear`: removes the released-tag marker of one tag when
+/// the named release owns it. No marker is a no-op success; another owner is
+/// refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeClearArgs {
+    pub name: RefName,
+    pub owner_release_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeClearReply {
+    pub outcome: MutationOutcome,
+    pub name: RefName,
 }
 
 /// `repo.init`: creates one repository store under a configured root.
@@ -4132,6 +4184,8 @@ method_table! {
     RemoteRefs, "remote.refs", Read, RemoteRefsArgs, RemoteRefsReply;
     ClaimRenew, "claim.renew", Mutation, Mutation<ClaimRenewArgs>, ClaimRenewReply;
     PolicySet, "policy.set", Mutation, Mutation<PolicySetArgs>, PolicySetReply;
+    ReleaseFreezeSet, "release.freeze.set", Mutation, Mutation<ReleaseFreezeSetArgs>, ReleaseFreezeSetReply;
+    ReleaseFreezeClear, "release.freeze.clear", Mutation, Mutation<ReleaseFreezeClearArgs>, ReleaseFreezeClearReply;
 }
 
 // ---------------------------------------------------------------------------
@@ -6587,6 +6641,8 @@ mod tests {
             "remote.refs",
             "claim.renew",
             "policy.set",
+            "release.freeze.set",
+            "release.freeze.clear",
         ];
         for method in required {
             assert!(names.contains(method), "missing method {method}");
@@ -6602,5 +6658,35 @@ mod tests {
                 .eq(required.iter().copied()),
             "method table order differs from the contract order"
         );
+    }
+
+    #[test]
+    fn release_freeze_args_require_tag_namespace_and_owner() {
+        let target = Oid::from_bytes(&[0x11; 20]).expect("freeze target");
+        let frozen_at = Timestamp::new(jiff::Timestamp::UNIX_EPOCH);
+        let tag = RefName::new("refs/tags/v1").expect("tag name");
+        let branch = RefName::new("refs/heads/main").expect("branch name");
+        let set = |name: RefName, owner: &str| ReleaseFreezeSetArgs {
+            name,
+            owner_release_id: owner.to_owned(),
+            target_oid: target,
+            frozen_at,
+        };
+        assert!(set(tag.clone(), "rel-1").validate().is_ok());
+        let err = set(branch.clone(), "rel-1")
+            .validate()
+            .expect_err("namespace");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = set(tag.clone(), "").validate().expect_err("owner");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let clear = |name: RefName, owner: &str| ReleaseFreezeClearArgs {
+            name,
+            owner_release_id: owner.to_owned(),
+        };
+        assert!(clear(tag.clone(), "rel-1").validate().is_ok());
+        let err = clear(branch, "rel-1").validate().expect_err("namespace");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = clear(tag, "").validate().expect_err("owner");
+        assert_eq!(err.code, ErrorCode::EInvalid);
     }
 }
