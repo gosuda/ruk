@@ -2494,6 +2494,54 @@ mod tests {
     }
 
     #[test]
+    fn push_cancel_trips_to_uncertain() {
+        use super::super::push::{PushUpdate, PushWireRequest};
+        use super::super::session::test_support::store_with_pack;
+        use ruk_core::change::PlanId;
+
+        let kind = HashKind::Sha1;
+        let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let zero = kind.zero_oid();
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/x".to_vec(),
+            old: zero,
+            new: oid(FOUR),
+        }];
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let mut plan =
+            PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+        let mut adv = Advertisement {
+            version: super::super::refadv::ProtocolVersion::V0,
+            capabilities: super::super::refadv::Capabilities::default(),
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        };
+        adv.capabilities = super::super::refadv::Capabilities::parse_list(b"report-status");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let interrupt = super::super::Interrupt::none().with_cancel(std::sync::Arc::clone(&cancel));
+        let err = push_pack(
+            "http://127.0.0.1:9/a.git",
+            &adv,
+            &store,
+            &mut plan,
+            &req,
+            RpcCall {
+                extra: &[],
+                auth: &no_auth(),
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &interrupt,
+            },
+        )
+        .expect_err("tripped cancel fails the push");
+        assert_eq!(err.code(), ruk_core::error::ErrorCode::ECancelled);
+        assert_eq!(plan.state, super::push::PushState::Uncertain);
+    }
+
+    #[test]
     fn push_post_forbidden_is_rejected_not_uncertain() {
         use super::super::push::{PushUpdate, PushWireRequest};
         use super::super::session::test_support::store_with_pack;

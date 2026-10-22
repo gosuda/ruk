@@ -156,6 +156,10 @@ pub(crate) struct PushFlags {
     pub(crate) no_verify: bool,
     /// Credential policy for the network legs, from `--auth-stdin`.
     pub(crate) auth: AuthPolicy,
+    /// Cancellation handle for the push transfer steps. The CLI runs
+    /// unattended today, so this starts untripped; tests and the hosted
+    /// mirror job arm it with their own lease or deadline.
+    pub(crate) interrupt: Interrupt,
 }
 
 /// How a fetch updates refs. Data, not selectors: one plan per invocation.
@@ -1412,6 +1416,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         want_lfs: opts.is_set("lfs"),
         no_verify: opts.is_set("no-verify"),
         auth,
+        interrupt: Interrupt::none(),
     };
     let remote_label = configured_name(ctx, target).unwrap_or_else(|| target.to_owned());
     if flags.mirror && opts.positionals.len() > 1 {
@@ -1480,7 +1485,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 push_lfs_upload(ctx, &updates, &remote_label)?;
             }
             let store = ctx.store()?;
-            let mut outcomes = push_local(store, &dest, target, kind, flags.atomic, updates)?;
+            let mut outcomes = push_local(store, &dest, target, kind, &flags, updates)?;
             outcomes.extend(early);
             push_outcomes(outcomes)
         }
@@ -1578,20 +1583,20 @@ fn push_local(
     dest: &Store,
     target: &str,
     kind: HashKind,
-    atomic: bool,
+    flags: &PushFlags,
     updates: Vec<PushUpdate>,
 ) -> Result<Vec<ruk_git::transport::push::RefOutcome>, GitError> {
     let request = PushWireRequest {
         updates: updates.clone(),
-        atomic,
+        atomic: flags.atomic,
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
         target.as_bytes().to_vec(),
-        atomic,
+        flags.atomic,
         updates,
     );
-    local_push(dest, src, kind, &mut plan, &request, &Interrupt::none())
+    local_push(dest, src, kind, &mut plan, &request, &flags.interrupt)
 }
 
 /// Pushes to a network endpoint: discovers the remote tips for CAS
@@ -1633,7 +1638,7 @@ fn push_net(
                             auth: &flags.auth,
                             egress: &ctx.egress,
                             tls_roots: tls_roots.as_deref(),
-                            interrupt: &Interrupt::none(),
+                            interrupt: &flags.interrupt,
                         },
                     )?,
                     extra_headers,
@@ -1734,7 +1739,7 @@ fn push_net(
                 auth: &flags.auth,
                 egress: &ctx.egress,
                 tls_roots: tls_roots.as_deref(),
-                interrupt: &Interrupt::none(),
+                interrupt: &flags.interrupt,
             },
         )?,
         None => {
@@ -1745,7 +1750,7 @@ fn push_net(
                 kind,
                 &mut plan,
                 &request,
-                &Interrupt::none(),
+                &flags.interrupt,
             )?
         }
     };
@@ -1824,7 +1829,7 @@ fn push_mirror(
         kind,
         &mut plan,
         &request,
-        &Interrupt::none(),
+        &flags.interrupt,
     )?)
 }
 
