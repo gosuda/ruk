@@ -811,6 +811,13 @@ pub fn tag_freeze_guards(
 /// other row refuses: a retry must not move the pinned target, and another
 /// release must not take the tag over.
 ///
+/// Authorization is not decided here: `owner_release_id` only tie-breaks
+/// competing releases (idempotent retry vs. foreign takeover). The daemon
+/// dispatch gate (beside the `PolicySet` admin check, before
+/// `prepare_for_dispatch` replay) admits admin peers only, and the
+/// `release.freeze.set` prepare arm requires the session identity row, so
+/// the sessionless path refuses with `E_HOSTED`.
+///
 /// # Errors
 /// `E_INVALID` for a name outside `refs/tags/`; `E_STALE` naming the live
 /// tag state when no tag exists or its target differs from the pinned
@@ -908,6 +915,11 @@ pub fn prepare_release_freeze(
 
 /// Lowers a clear of `name` to an owner-checked removal of its marker row,
 /// the sole path that removes a live marker.
+///
+/// The owner check below is an ownership tie-break, not authorization: the
+/// daemon dispatch gate admits admin peers only (see
+/// [`prepare_release_freeze`]), and the `release.freeze.clear` prepare arm
+/// requires the session identity row.
 ///
 /// No row is a no-op success guarded by absence: a row written between the
 /// check and the publish fails that publish with `E_STALE`. A present row is
