@@ -1836,6 +1836,90 @@ mod tests {
     }
 
     #[test]
+    fn search_args_refuse_zero_scan_budgets() {
+        let mut args = search_args(literal("needle"));
+        args.budget.deadline_ms = Some(0);
+        assert!(args.validate().is_err(), "zero deadline refuses");
+        args.budget.deadline_ms = None;
+        args.budget.max_bytes_scanned = Some(0);
+        assert!(args.validate().is_err(), "zero bytes refuses");
+        args.budget.max_bytes_scanned = None;
+        args.budget.max_blobs = Some(0);
+        assert!(args.validate().is_err(), "zero blobs refuses");
+        args.budget.max_blobs = None;
+        assert!(args.validate().is_ok(), "defaults validate");
+    }
+
+    #[test]
+    fn walk_dir_only_budget_seal_keeps_a_decided_dir_frontier() {
+        use crate::index::FileMode;
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("dir-frontier");
+        let blob = put_blob(&store, b"needle\n");
+        let empty = put_tree(&store, &[]);
+        let dir_count = SEARCH_MAX_WALK_FILES;
+        let mut entries: Vec<(String, TreeMode, Oid)> = (0..dir_count)
+            .map(|index| (format!("d{index:07}"), TreeMode::Tree, empty))
+            .collect();
+        entries.push((
+            "zz-needle.txt".to_string(),
+            TreeMode::File(FileMode::Regular),
+            blob,
+        ));
+        let named: Vec<(&str, TreeMode, Oid)> = entries
+            .iter()
+            .map(|(name, mode, oid)| (name.as_str(), *mode, *oid))
+            .collect();
+        let root = put_tree(&store, &named);
+        let args = search_args(literal("needle"));
+        let (_guard, cancel) = crate::coord::cancellation();
+        let walk = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            WalkResume {
+                below: &[],
+                equal: false,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(600),
+            },
+        )
+        .expect("walk seals");
+        assert!(!walk.complete);
+        let frontier = walk.frontier.expect("a decided dir names the frontier");
+        assert_eq!(
+            frontier.as_slice(),
+            format!("d{:07}/", dir_count - 1).as_bytes(),
+            "the last completed directory is the resume frontier"
+        );
+        let resumed = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            WalkResume {
+                below: frontier.as_slice(),
+                equal: true,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(600),
+            },
+        )
+        .expect("resumed walk serves");
+        assert!(
+            resumed
+                .entries
+                .iter()
+                .any(|(path, _)| path.as_slice() == b"zz-needle.txt"),
+            "the needle past the sealed directory is reached on resume"
+        );
+    }
+
+    #[test]
     fn walk_seal_leaves_uncollected_boundary_file_revisitable() {
         use crate::index::FileMode;
         use crate::workcopy::tree::TreeMode;
