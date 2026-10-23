@@ -3808,6 +3808,14 @@ impl Validate for SearchArgs {
                 "search scans at most {SEARCH_MAX_BYTES_SCANNED} bytes, got {max}"
             )));
         }
+        if self.budget.max_bytes_scanned == Some(0)
+            || self.budget.max_blobs == Some(0)
+            || self.budget.deadline_ms == Some(0)
+        {
+            return Err(invalid(
+                "search scan budgets are at least one byte, one blob, and one millisecond",
+            ));
+        }
         if let Some(deadline) = self.budget.deadline_ms
             && deadline > SEARCH_MAX_DEADLINE_MS
         {

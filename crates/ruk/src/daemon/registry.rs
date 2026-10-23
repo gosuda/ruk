@@ -778,6 +778,12 @@ impl Registry {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
+            if inner.deleting.contains(&repo_root) || inner.deleting.contains(&store) {
+                return Err(CoreError::new(
+                    ErrorCode::EConflicted,
+                    "repository deletion or rename is already in flight",
+                ));
+            }
             inner.deleting.insert(repo_root.clone());
             inner.deleting.insert(store.clone());
             let taken = take_entry_by_path(&mut inner, &store);
@@ -843,6 +849,14 @@ impl Registry {
     /// `E_NOT_FOUND` for a missing repository, `E_FORBIDDEN` across roots,
     /// `E_INVALID` for an existing destination, `E_CONFLICTED` while
     /// invocations are in flight, plus rename failures.
+    fn clear_deleting(&self, paths: &[&Path]) {
+        if let Ok(mut inner) = self.inner.lock() {
+            for path in paths {
+                inner.deleting.remove(*path);
+            }
+        }
+    }
+
     pub(crate) fn rename_repo(
         &self,
         args: &ruk_core::protocol::RepoRenameArgs,
@@ -915,12 +929,22 @@ impl Registry {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
+            if inner.deleting.contains(&repo_root) || inner.deleting.contains(&store) {
+                return Err(CoreError::new(
+                    ErrorCode::EConflicted,
+                    "repository deletion or rename is already in flight",
+                ));
+            }
+            inner.deleting.insert(repo_root.clone());
+            inner.deleting.insert(store.clone());
             if let Some(entry) = entry_by_path_mut(&mut inner, &store) {
                 let busy = entry
                     .coordinator
                     .as_ref()
                     .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
                 if busy {
+                    drop(inner);
+                    self.clear_deleting(&[&repo_root, &store]);
                     return Err(CoreError::new(
                         ErrorCode::EConflicted,
                         "repository has invocations in flight",
@@ -942,11 +966,13 @@ impl Registry {
             if let Some(prior) = prior {
                 self.restore_rename_binding(&updated, prior);
             }
+            self.clear_deleting(&[&repo_root, &store]);
             return Err(CoreError::new(
                 ErrorCode::EIo,
                 format!("repository rename failed: {err}"),
             ));
         }
+        self.clear_deleting(&[&repo_root, &store]);
         if let Some(parent) = repo_root.parent() {
             fsync_dir(parent)?;
         }
@@ -1994,15 +2020,26 @@ impl Registry {
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        let canonical = pinned.path().to_path_buf();
+        let reserved = inner.deleting.contains(&canonical)
+            || inner
+                .entries
+                .get(handle)
+                .is_none_or(|entry| entry.path != canonical);
         let entry = inner
             .entries
             .get_mut(handle)
             .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository handle is unknown"))?;
+        if reserved {
+            return Err(CoreError::new(
+                ErrorCode::EConflicted,
+                "repository deletion or rename is in flight",
+            ));
+        }
         if let Some(coordinator) = entry.coordinator.as_ref() {
             entry.last_used = Instant::now();
             return Ok(Arc::clone(coordinator));
         }
-        let canonical = pinned.path().to_path_buf();
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let store = match pinned.open_path() {
             Some(proc_root) => Store::open_pinned(
@@ -2127,8 +2164,16 @@ impl Registry {
                 "repository handle escapes the configured roots",
             ));
         }
+        let path = entry.path.clone();
         entry.last_used = Instant::now();
-        Ok(entry.path.clone())
+        let reserved = inner.deleting.contains(&path);
+        if reserved {
+            return Err(CoreError::new(
+                ErrorCode::EConflicted,
+                "repository deletion or rename is in flight",
+            ));
+        }
+        Ok(path)
     }
 
     /// Returns the handle bound to `canonical`, registering it when new.
@@ -2594,6 +2639,76 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".tombstone-")),
             "no tombstone remains"
         );
+    }
+
+    #[test]
+    fn destructive_windows_are_exclusive_and_handle_opens_refuse() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        registry
+            .create_repo(&init_args(&root, "acme/busy"))
+            .expect("repo inits");
+        let repo_root = root.join("acme/busy");
+        let store = repo_root.join(".ruk");
+        let handle = registry
+            .open_by_path(&repo_root)
+            .expect("open registers the repository");
+
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            inner.deleting.insert(repo_root.clone());
+            inner.deleting.insert(store.clone());
+        }
+        let err = registry
+            .open_by_handle(&handle)
+            .expect_err("handle opens refuse during the window");
+        assert_eq!(err.code, ruk_core::ErrorCode::EConflicted);
+
+        let delete = ruk_core::protocol::RepoDeleteArgs {
+            repo: repo_root.to_str().expect("utf8").to_string(),
+            confirm_path: repo_root.to_str().expect("utf8").to_string(),
+        };
+        let err = registry
+            .remove_repo(&delete)
+            .expect_err("a second destructive op refuses the reserved window");
+        assert_eq!(err.code, ruk_core::ErrorCode::EConflicted);
+
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            inner.deleting.remove(&repo_root);
+            inner.deleting.remove(&store);
+        }
+    }
+
+    #[test]
+    fn open_refuses_source_while_rename_is_in_flight() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        registry
+            .create_repo(&init_args(&root, "acme/moving"))
+            .expect("repo inits");
+        let repo_root = root.join("acme/moving");
+        let store = repo_root.join(".ruk");
+
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            inner.deleting.insert(repo_root.clone());
+            inner.deleting.insert(store.clone());
+        }
+        let err = registry
+            .open_by_path(&repo_root)
+            .expect_err("open of the rename source refuses");
+        assert_eq!(err.code, ruk_core::ErrorCode::EConflicted);
+
+        // The reservation clears when the rename resolves.
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            inner.deleting.remove(&repo_root);
+            inner.deleting.remove(&store);
+        }
+        registry
+            .open_by_path(&repo_root)
+            .expect("open after the window resumes");
     }
 
     #[test]

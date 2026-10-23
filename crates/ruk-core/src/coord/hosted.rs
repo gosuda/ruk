@@ -85,8 +85,8 @@ use crate::protocol::{
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
 use crate::search::{
-    SearchFold, SearchPool, SearchPoolConfig, ShardScan, WalkLimits, WalkResume,
-    build_search_matcher, collect_search_candidates, decode_search_position,
+    ScanBudget, SearchFold, SearchPool, SearchPoolConfig, ShardOutput, ShardScan, WalkLimits,
+    WalkResume, build_search_matcher, collect_search_candidates, decode_search_position,
     encode_search_position, scan_search_shard, seal_search_fold, search_deadline, search_hit,
     search_query_digest, shard_search_entries,
 };
@@ -895,35 +895,93 @@ impl HostedCoordinator {
             WalkLimits { cancel, deadline },
         )?;
         let stop = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::new();
-        for shard in shard_search_entries(walk.entries) {
-            cancel.check()?;
-            let permit = self.search_pool.acquire_owned().await?;
-            let store = Arc::clone(&self.store);
-            let job = ShardScan {
-                shard,
-                matcher: matcher.clone(),
-                row_cap: limit.saturating_add(1),
-                skip_before: skip_before.clone(),
-                stop: Arc::clone(&stop),
-                cancel: cancel.clone(),
-                deadline,
-            };
-            handles.push(tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                scan_search_shard(&store, &job)
-            }));
-        }
-        let mut fold = SearchFold::new(limit, &args.budget, max_bytes, deadline, skip_before);
+        let scan_budget = Arc::new(ScanBudget::new(
+            max_bytes,
+            u64::from(args.budget.effective_max_blobs()),
+        ));
+        let mut fold = SearchFold::new(
+            limit,
+            &args.budget,
+            max_bytes,
+            deadline,
+            skip_before.clone(),
+        );
         fold.add_skipped(walk.prefilter_skipped);
-        for handle in handles {
+        let mut shards = shard_search_entries(walk.entries).into_iter().enumerate();
+        let mut set: tokio::task::JoinSet<(usize, Result<ShardOutput, CoreError>)> =
+            tokio::task::JoinSet::new();
+        let mut reorder: std::collections::HashMap<usize, Result<ShardOutput, CoreError>> =
+            std::collections::HashMap::new();
+        let mut claim_flags: Vec<Arc<AtomicBool>> = Vec::new();
+        let mut next_fold = 0usize;
+        let mut launching = true;
+        while launching || !set.is_empty() {
             cancel.check()?;
-            let joined = handle
-                .await
-                .map_err(|_| CoreError::new(ErrorCode::EIo, "search shard failed"))?;
-            fold.push_shard(joined?);
-            if fold.sealed() {
-                stop.store(true, Ordering::SeqCst);
+            if launching {
+                let permit: Option<tokio::sync::OwnedSemaphorePermit> = if set.is_empty() {
+                    Some(self.search_pool.acquire_owned().await?)
+                } else {
+                    tokio::select! {
+                        permit = self.search_pool.acquire_owned() => Some(permit?),
+                        joined = set.join_next() => {
+                            if let Some(joined) = joined {
+                                let (index, out) = joined.map_err(|_| {
+                                    CoreError::new(ErrorCode::EIo, "search shard failed")
+                                })?;
+                                reorder.insert(index, out);
+                            }
+                            None
+                        }
+                    }
+                };
+                let mut shards_left = true;
+                if let Some(permit) = permit {
+                    if let Some((index, shard)) = shards.next() {
+                        claim_flags.resize(index + 1, Arc::new(AtomicBool::new(false)));
+                        let claim_after = index
+                            .checked_sub(1)
+                            .and_then(|prior| claim_flags.get(prior))
+                            .cloned();
+                        let claim_done = Arc::clone(&claim_flags[index]);
+                        let store = Arc::clone(&self.store);
+                        let job = ShardScan {
+                            shard,
+                            matcher: matcher.clone(),
+                            row_cap: limit.saturating_add(1),
+                            skip_before: skip_before.clone(),
+                            stop: Arc::clone(&stop),
+                            cancel: cancel.clone(),
+                            deadline,
+                            scan_budget: scan_budget.clone(),
+                            claim_after,
+                            claim_done,
+                        };
+                        set.spawn_blocking(move || {
+                            let _permit = permit;
+                            (index, scan_search_shard(&store, &job))
+                        });
+                    } else {
+                        shards_left = false;
+                    }
+                }
+                if !shards_left {
+                    launching = false;
+                }
+            } else if let Some(joined) = set.join_next().await {
+                let (index, out) =
+                    joined.map_err(|_| CoreError::new(ErrorCode::EIo, "search shard failed"))?;
+                reorder.insert(index, out);
+            }
+            while let Some(out) = reorder.remove(&next_fold) {
+                fold.push_shard(out?);
+                next_fold += 1;
+                if fold.sealed() {
+                    stop.store(true, Ordering::SeqCst);
+                    launching = false;
+                    set.detach_all();
+                    reorder.clear();
+                    break;
+                }
             }
         }
         let view = current_view(&self.store)?;
@@ -1232,11 +1290,25 @@ impl HostedCoordinator {
                     "compare commit is missing from the store",
                 )
             })?;
-            Ok(record
-                .parents()
-                .iter()
-                .filter_map(|head| head.as_git().copied())
-                .collect())
+            let boundary = crate::coord::reads::shallow_boundary(&self.store, &Head::Git { oid })?;
+            let mut listed = Vec::new();
+            for head in record.parents() {
+                let Some(parent_oid) = head.as_git().copied() else {
+                    continue;
+                };
+                match records.get_commit(&Head::Git { oid: parent_oid }) {
+                    Ok(Some(_)) => listed.push(parent_oid),
+                    Ok(None) if boundary => {}
+                    Ok(None) => {
+                        return Err(CoreError::new(
+                            ErrorCode::ENotFound,
+                            "compare commit parent is missing from the store",
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(listed)
         };
         let committer_time = |oid: Oid| -> Result<i64, CoreError> {
             let record = records.get_commit(&Head::Git { oid })?.ok_or_else(|| {
@@ -2100,7 +2172,7 @@ impl HostedCoordinator {
                     });
                 }
                 paths.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
-                let query = self.status_query_digest(workspace);
+                let query = self.status_result_digest(workspace, &paths);
                 let total = paths.len();
                 let start = match args.page.cursor.as_ref() {
                     None => 0,
@@ -2152,10 +2224,20 @@ impl HostedCoordinator {
     }
 
     /// Hashes one status workspace into its lease digest.
-    fn status_query_digest(&self, workspace: WorkspaceId) -> QueryDigest {
+    /// Digest binding one status page's lease to the exact sorted result
+    /// it sliced. A continuation recomputes it over its own crawl, so a
+    /// worktree that changed between pages invalidates the cursor
+    /// instead of offsetting into a different list.
+    fn status_result_digest(&self, workspace: WorkspaceId, paths: &[PathStatus]) -> QueryDigest {
         let mut hasher = Sha256::new();
-        hasher.update(b"ruk.status/v1\x00");
+        hasher.update(b"ruk.status/result/v1\x00");
         hasher.update(workspace.as_bytes());
+        for status in paths {
+            hasher.update(status.path.as_bytes());
+            hasher.update([u8::from(status.conflicted)]);
+            hasher.update([status.change as u8]);
+            hasher.update(b"\x00");
+        }
         QueryDigest::from_bytes(hasher.finalize().into())
     }
 
@@ -4277,6 +4359,70 @@ mod tests {
                 &EventContext::default(),
             )
             .expect("publish workspace row");
+    }
+
+    #[tokio::test]
+    async fn status_continuation_refuses_a_changed_worktree() {
+        use crate::protocol::{PageRequest, SnapshotPolicy, StatusArgs};
+        use crate::workspace::{NativeWorkspace, Scope, WorkspaceState};
+        let (temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (_head_a, head_b, _) = read_fixtures(coord.store());
+        let change_b = crate::change::ChangeId::from_bytes([9; 16]);
+        let wt = temp.0.join("wt-cont");
+        std::fs::create_dir_all(&wt).expect("worktree dir");
+        std::fs::write(wt.join("a.txt"), b"dirty-a\n").expect("write a");
+        std::fs::write(wt.join("b.txt"), b"dirty-b\n").expect("write b");
+        let id = WorkspaceId::generate();
+        publish_workspace_row(
+            &coord,
+            id,
+            WorkspaceState::Native(NativeWorkspace::new(change_b, head_b, Scope::Full)),
+            session,
+            wt.to_str().expect("utf8 root"),
+        );
+        let first = status_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            StatusArgs {
+                workspace: Some(id),
+                snapshot: SnapshotPolicy::Skip,
+                page: PageRequest {
+                    limit: Some(page_limit_1()),
+                    cursor: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(first.paths.items.len(), 1, "page one slices one path");
+        let cursor = first.paths.next.clone().expect("continuation lease");
+        std::fs::remove_file(wt.join("a.txt")).expect("restore a");
+        let refused = coord
+            .read(
+                &owner,
+                session,
+                Request::Status(Box::new(StatusArgs {
+                    workspace: Some(id),
+                    snapshot: SnapshotPolicy::Skip,
+                    page: PageRequest {
+                        limit: Some(page_limit_1()),
+                        cursor: Some(cursor),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("a changed worktree invalidates the cursor");
+        assert_eq!(refused.code, crate::error::ErrorCode::EForbidden);
     }
 
     #[tokio::test]
@@ -6635,6 +6781,66 @@ mod tests {
             )
             .expect("publish commit");
         head.as_git().copied().expect("native commit head")
+    }
+
+    #[tokio::test]
+    async fn compare_honors_shallow_boundary_parents() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let absent = Oid::from_hex("1111111111111111111111111111111111111111").expect("oid");
+        let boundary = publish_parented_commit(coord.store(), 100, &[absent], "boundary");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Shallow,
+                    key: boundary.as_bytes().to_vec(),
+                    expected: FactExpectation::Any,
+                    value: Some(Vec::new()),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("shallow marker inserts");
+        let child = publish_parented_commit(coord.store(), 200, &[boundary], "child");
+        let same = CompareArgs {
+            base: CommitRev::Commit(boundary),
+            head: CommitRev::Commit(boundary),
+            limit: None,
+        };
+        let reply = coord
+            .read(&owner, session, Request::Compare(Box::new(same)), &cancel)
+            .await
+            .expect("a shallow tip compares with itself");
+        let Reply::Compare(compared) = reply else {
+            panic!("compare must answer its own reply");
+        };
+        assert!(compared.exact, "identical tips compare exactly");
+        assert_eq!(compared.ahead, 0);
+        assert_eq!(compared.behind, 0);
+        let across = CompareArgs {
+            base: CommitRev::Commit(boundary),
+            head: CommitRev::Commit(child),
+            limit: None,
+        };
+        let reply = coord
+            .read(&owner, session, Request::Compare(Box::new(across)), &cancel)
+            .await
+            .expect("a shallow boundary compares with its child");
+        let Reply::Compare(compared) = reply else {
+            panic!("compare must answer its own reply");
+        };
+        assert_eq!(compared.ahead, 1);
+        assert_eq!(compared.behind, 0);
+        drop(runner);
     }
 
     #[tokio::test]

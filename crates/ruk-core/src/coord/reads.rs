@@ -69,7 +69,7 @@ pub(crate) const READ_MAX_BYTES: u64 = 16_777_216;
 /// parents are intentional rather than corrupt. Only git commits carry
 /// shallow markers; anything else keeps the strict missing-parent
 /// refusal.
-fn shallow_boundary(store: &Store, head: &Head) -> Result<bool, CoreError> {
+pub(crate) fn shallow_boundary(store: &Store, head: &Head) -> Result<bool, CoreError> {
     let Head::Git { oid } = head else {
         return Ok(false);
     };
@@ -364,7 +364,7 @@ pub(crate) fn unified_patch(
                 .position(|(op, _)| *op != LcsOp::Match);
             match following {
                 None => {
-                    hunk_end = tagged.len();
+                    hunk_end = (hunk_end + DIFF_CONTEXT).min(tagged.len());
                     break;
                 }
                 Some(gap) if gap > 2 * DIFF_CONTEXT => {
@@ -1173,6 +1173,26 @@ mod tests {
         assert_eq!(text.matches("@@").count() / 2, 2, "two hunks: {text}");
         assert!(text.contains("-l1\n"), "deletion renders: {text}");
         assert!(text.contains("+CHANGED\n"), "insertion renders: {text}");
+    }
+
+    #[test]
+    fn unified_patch_caps_trailing_context_in_the_final_hunk() {
+        let old: Vec<&[u8]> = vec![b"line\n"; 10];
+        let mut new = old.clone();
+        new[0] = b"CHANGED\n";
+        let ops = lcs_align(&old, &new).expect("align");
+        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let text = String::from_utf8(patch).expect("patch is UTF-8");
+        let body_lines = text
+            .lines()
+            .filter(|line| line.starts_with(' ') || line.starts_with('+') || line.starts_with('-'))
+            .count();
+        assert_eq!(
+            body_lines,
+            1 + 2 * DIFF_CONTEXT,
+            "the final hunk keeps only its context window: {text}"
+        );
+        assert!(!text.contains("line\nline"), "no runaway tail: {text}");
     }
 
     #[test]

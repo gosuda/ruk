@@ -65,6 +65,12 @@ use ruk_git::transport::serve::ReceiveLimits;
 /// Default concurrent connections of one daemon process.
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
+/// Most simultaneously live streams one connection holds. Each stream
+/// owns channels and a flow-control window, so unbounded distinct ids on
+/// one peer would grow daemon memory without any per-stream quota
+/// noticing.
+pub(crate) const MAX_LIVE_STREAMS: usize = 256;
+
 /// Default blocking permits of the shared executor.
 pub(crate) const DEFAULT_BLOCKING_POOL_SIZE: usize = 16;
 
@@ -1524,6 +1530,29 @@ async fn route_stream_frame(
     let stream_id = frame.stream_id;
     match frame.kind {
         ipc::FrameKind::Open => {
+            if let Some(route) = streams.get(&stream_id)
+                && route.control.is_closed()
+            {
+                streams.remove(&stream_id);
+            }
+            if streams.len() >= MAX_LIVE_STREAMS {
+                streams.retain(|_, route| !route.control.is_closed());
+            }
+            if streams.len() >= MAX_LIVE_STREAMS {
+                let sink = StreamSink {
+                    writer: writer.clone(),
+                    stream_id,
+                };
+                send_error_exit(
+                    &sink,
+                    &Error::Core(CoreError::new(
+                        ErrorCode::ELimit,
+                        "too many live streams on one connection",
+                    )),
+                )
+                .await?;
+                return Ok(false);
+            }
             if streams.contains_key(&stream_id) {
                 let sink = StreamSink {
                     writer: writer.clone(),

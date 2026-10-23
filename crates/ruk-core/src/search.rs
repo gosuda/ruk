@@ -7,7 +7,7 @@
 //! so completion order never changes emitted rows.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant as StdInstant};
 
 use regex::bytes::{Regex, RegexBuilder};
@@ -313,6 +313,7 @@ fn walk_tree_level(
                         return Ok(());
                     }
                     walk_tree_level(store, kind, item.oid, &path, depth + 1, state)?;
+                    state.frontier = Some(path);
                 } else {
                     state.frontier = Some(path);
                 }
@@ -320,36 +321,40 @@ fn walk_tree_level(
             TreeMode::File(
                 crate::index::FileMode::Regular | crate::index::FileMode::Executable,
             ) => {
-                state.frontier = Some(path.clone());
-                if path.as_slice() < state.resume.below
+                let decided = if path.as_slice() < state.resume.below
                     || (state.resume.equal && path.as_slice() == state.resume.below)
                     || !path_selected(
                         &state.args.paths,
                         &state.args.globs,
                         &state.args.exclude_globs,
                         &path,
-                    )
-                {
-                    continue;
-                }
-                match store.object_len(item.oid).map_err(CoreError::from)? {
-                    None => {
-                        return Err(CoreError::new(
-                            ErrorCode::ECorrupt,
-                            "tree entry links a missing object",
-                        ));
-                    }
-                    Some(len) if len > SEARCH_SKIP_BLOB_BYTES => {
-                        state.prefilter_skipped = state.prefilter_skipped.saturating_add(1);
-                    }
-                    Some(_) => {
-                        state.collected = state.collected.saturating_add(1);
-                        if state.collected > SEARCH_MAX_WALK_FILES {
-                            state.complete = false;
-                            return Ok(());
+                    ) {
+                    true
+                } else {
+                    match store.object_len(item.oid).map_err(CoreError::from)? {
+                        None => {
+                            return Err(CoreError::new(
+                                ErrorCode::ECorrupt,
+                                "tree entry links a missing object",
+                            ));
                         }
-                        state.ordered.push((path, item.oid));
+                        Some(len) if len > SEARCH_SKIP_BLOB_BYTES => {
+                            state.prefilter_skipped = state.prefilter_skipped.saturating_add(1);
+                            true
+                        }
+                        Some(_) => {
+                            state.collected = state.collected.saturating_add(1);
+                            if state.collected > SEARCH_MAX_WALK_FILES {
+                                state.complete = false;
+                                return Ok(());
+                            }
+                            state.ordered.push((path.clone(), item.oid));
+                            true
+                        }
                     }
+                };
+                if decided {
+                    state.frontier = Some(path.clone());
                 }
             }
             TreeMode::File(_) => {
@@ -395,6 +400,17 @@ pub(crate) fn collect_search_candidates(
     };
     walk_tree_level(store, kind, root, &[], 0, &mut state)?;
     state.ordered.sort();
+    if !state.complete
+        && state.limits.cancel.check().is_ok()
+        && state.frontier.as_deref() == Some(&[][..])
+        && state.ordered.is_empty()
+        && state.prefilter_skipped == 0
+    {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            "search deadline seals the walk before any path decides",
+        ));
+    }
     Ok(SearchWalk {
         entries: state.ordered,
         complete: state.complete,
@@ -530,6 +546,8 @@ pub(crate) struct ShardOutput {
     pub skipped_blobs: u64,
     /// Whether the deadline passed mid-shard.
     pub deadline_hit: bool,
+    /// Whether the shard stopped on the shared scan budget.
+    pub budget_hit: bool,
     /// Last fully processed candidate path, if any.
     pub end_path: Option<Vec<u8>>,
 }
@@ -553,6 +571,98 @@ pub(crate) struct ShardScan {
     pub cancel: Cancel,
     /// The page seals once this passes.
     pub deadline: StdInstant,
+    /// Shared byte and blob budget across every launched shard; a shard
+    /// that cannot claim its next blob stops partial, like a deadline.
+    /// One allocation behind an `Arc` so parallel workers share it.
+    pub scan_budget: Arc<ScanBudget>,
+    /// Set once the predecessor shard made its first claim or finished.
+    /// This shard's first claim waits on it, so launch order funds the
+    /// shared budget and the fold prefix always has a shard that can
+    /// spend: the page cannot livelock on the same resume position.
+    pub claim_after: Option<Arc<AtomicBool>>,
+    /// Set on this shard's first claim and on every exit path, releasing
+    /// the successor's first claim.
+    pub claim_done: Arc<AtomicBool>,
+}
+
+/// Releases the successor's first claim on every exit path, including
+/// cancellation and error returns.
+struct ClaimGuard<'a>(&'a AtomicBool);
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Outcome of one shared-budget claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Claim {
+    /// Budget spent; scan proceeds.
+    Ok,
+    /// Blob exceeds the remaining bytes; the remainder is spent and the
+    /// scan proceeds so the page still advances past this blob.
+    Oversized,
+    /// No budget left; the page seals at the last completed path.
+    Exhausted,
+}
+
+/// Shared scan budget across the shards of one search page: atomics so
+/// parallel workers claim without coordinating, sealing the page once
+/// either side is exhausted.
+#[derive(Debug, Default)]
+pub(crate) struct ScanBudget {
+    bytes_left: AtomicU64,
+    blobs_left: AtomicU64,
+}
+
+impl ScanBudget {
+    /// Builds one budget of at most `max_bytes` payload bytes and
+    /// `max_blobs` payload reads.
+    pub(crate) fn new(max_bytes: u64, max_blobs: u64) -> Self {
+        Self {
+            bytes_left: AtomicU64::new(max_bytes),
+            blobs_left: AtomicU64::new(max_blobs),
+        }
+    }
+
+    /// Whether every byte of the budget is spent.
+    #[must_use]
+    pub(crate) fn exhausted(&self) -> bool {
+        self.bytes_left.load(Ordering::SeqCst) == 0
+    }
+
+    /// Claims one payload read of `len` bytes.
+    ///
+    /// `Ok` spends budget and proceeds. `Oversized` spends what remains
+    /// and also proceeds, so one blob larger than the whole page budget
+    /// still advances the frontier and the resumed page cannot loop on
+    /// it. `Exhausted` refuses: the page seals at the last completed
+    /// path, leaving the current path undecided.
+    pub(crate) fn claim(&self, len: u64) -> Claim {
+        let blobs = self
+            .blobs_left
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        let bytes = self
+            .bytes_left
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(len)
+            });
+        match (bytes, blobs) {
+            (Ok(_), Ok(_)) => Claim::Ok,
+            (Err(left), Ok(_)) if left > 0 => {
+                self.bytes_left.store(0, Ordering::SeqCst);
+                Claim::Oversized
+            }
+            _ => {
+                self.bytes_left.store(0, Ordering::SeqCst);
+                self.blobs_left.store(0, Ordering::SeqCst);
+                Claim::Exhausted
+            }
+        }
+    }
 }
 
 /// Scans one shard in path order, emitting rows path-ordered so the
@@ -574,10 +684,13 @@ pub(crate) fn scan_search_shard(store: &Store, job: &ShardScan) -> Result<ShardO
         scanned_bytes: 0,
         skipped_blobs: 0,
         deadline_hit: false,
+        budget_hit: false,
         end_path: None,
     };
     let mut cached: Option<(Oid, Vec<LineHit>)> = None;
     let (skip_path, skip_line) = &job.skip_before;
+    let _claim_guard = ClaimGuard(&job.claim_done);
+    let mut first_claim = true;
     for (path, oid) in &job.shard {
         if job.stop.load(Ordering::SeqCst) {
             break;
@@ -593,7 +706,27 @@ pub(crate) fn scan_search_shard(store: &Store, job: &ShardScan) -> Result<ShardO
             .as_ref()
             .is_none_or(|(cached_oid, _)| *cached_oid != *oid);
         if fresh {
+            if first_claim
+                && let Some(prior) = job.claim_after.as_ref()
+                && !prior.load(Ordering::SeqCst)
+            {
+                while !prior.load(Ordering::SeqCst) {
+                    if job.stop.load(Ordering::SeqCst) {
+                        return Ok(out);
+                    }
+                    job.cancel.check()?;
+                    std::thread::yield_now();
+                }
+            }
             let bytes = blob_bytes(store, *oid)?;
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            first_claim = false;
+            let claim = job.scan_budget.claim(len);
+            job.claim_done.store(true, Ordering::SeqCst);
+            if claim == Claim::Exhausted {
+                out.budget_hit = true;
+                break;
+            }
             out.scanned_blobs = out.scanned_blobs.saturating_add(1);
             out.scanned_bytes = out
                 .scanned_bytes
@@ -627,10 +760,10 @@ pub(crate) fn scan_search_shard(store: &Store, job: &ShardScan) -> Result<ShardO
             }
         }
         out.end_path = Some(path.clone());
-        if StdInstant::now() >= job.deadline {
-            // The page seals at this completed path: scanning further
-            // blobs would only hold the search permit past its deadline.
-            out.deadline_hit = true;
+        let overspent = fresh && job.scan_budget.exhausted();
+        if overspent || StdInstant::now() >= job.deadline {
+            out.budget_hit |= overspent;
+            out.deadline_hit |= StdInstant::now() >= job.deadline;
             break;
         }
     }
@@ -705,6 +838,9 @@ impl SearchFold {
         if out.deadline_hit {
             self.deadline_hit = true;
         }
+        if out.budget_hit {
+            self.budget_sealed = true;
+        }
         if let Some(end) = out.end_path {
             self.frontier = Some(end);
         }
@@ -769,8 +905,10 @@ pub(crate) fn seal_search_fold(
             .last()
             .map(|last| (last.path.clone(), Some((last.path.clone(), last.line))))
     } else {
-        let frontier = fold.frontier.or(walk_frontier);
-        frontier.map(|scan_after| (scan_after, None))
+        match fold.frontier.or(walk_frontier) {
+            Some(scan_after) => Some((scan_after, None)),
+            None => Some((fold.skip_before.0.clone(), None)),
+        }
     };
     SealedSearchPage {
         rows: fold.rows,
@@ -1051,6 +1189,9 @@ pub fn search_content_local(
             stop: Arc::clone(&stop),
             cancel: cancel.clone(),
             deadline,
+            scan_budget: Arc::new(ScanBudget::new(u64::MAX, u64::MAX)),
+            claim_after: None,
+            claim_done: Arc::new(AtomicBool::new(false)),
         };
         fold.push_shard(scan_search_shard(store, &job)?);
     }
@@ -1168,6 +1309,9 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             cancel,
             deadline: StdInstant::now() - Duration::from_secs(1),
+            scan_budget: Arc::new(ScanBudget::new(u64::MAX, u64::MAX)),
+            claim_after: None,
+            claim_done: Arc::new(AtomicBool::new(false)),
         };
         let out = scan_search_shard(&store, &job).expect("shard scans");
         assert!(out.deadline_hit);
@@ -1555,6 +1699,9 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             cancel,
             deadline: StdInstant::now() + Duration::from_secs(60),
+            scan_budget: Arc::new(ScanBudget::new(u64::MAX, u64::MAX)),
+            claim_after: None,
+            claim_done: Arc::new(AtomicBool::new(false)),
         };
         let out = scan_search_shard(&store, &job).expect("shard scans");
         assert_eq!(out.scanned_blobs, 2);
@@ -1621,6 +1768,142 @@ mod tests {
         let mut paths: Vec<Vec<u8>> = walk.entries.iter().map(|(path, _)| path.clone()).collect();
         paths.sort();
         assert_eq!(paths, vec![b"src/a.rs".to_vec(), b"src/b.txt".to_vec()]);
+    }
+
+    #[test]
+    fn scan_budget_exhausted_seals_before_any_path_completes() {
+        let (_temp, store) = test_store("budget-exhausted");
+        let (_guard, cancel) = crate::coord::cancellation();
+        let first = put_blob(&store, b"needle\n");
+        let job = ShardScan {
+            shard: vec![(b"a.txt".to_vec(), first)],
+            matcher: build_search_matcher(&literal("needle"), false).expect("matcher"),
+            row_cap: 100,
+            skip_before: (Vec::new(), 0),
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel,
+            deadline: StdInstant::now() + Duration::from_secs(60),
+            scan_budget: Arc::new(ScanBudget::new(0, 0)),
+            claim_after: None,
+            claim_done: Arc::new(AtomicBool::new(false)),
+        };
+        let out = scan_search_shard(&store, &job).expect("shard scans");
+        assert!(out.budget_hit, "exhausted budget seals the shard");
+        assert_eq!(out.end_path, None, "no path completed");
+        assert!(out.rows.is_empty());
+
+        let mut fold = SearchFold::new(
+            10,
+            &SearchBudget::default(),
+            u64::MAX,
+            StdInstant::now() + Duration::from_secs(60),
+            (b"zz-start".to_vec(), 0),
+        );
+        fold.push_shard(out);
+        assert!(fold.sealed());
+        let sealed = seal_search_fold(fold, true, None);
+        let Some((scan_after, _)) = sealed.resume else {
+            panic!("sealed first-path exhaustion must keep a resume position");
+        };
+        assert_eq!(scan_after, b"zz-start".to_vec());
+    }
+
+    #[test]
+    fn scan_budget_oversized_blob_still_advances_the_frontier() {
+        let (_temp, store) = test_store("budget-oversized");
+        let (_guard, cancel) = crate::coord::cancellation();
+        let first = put_blob(&store, &b"needle\n".repeat(64));
+        let job = ShardScan {
+            shard: vec![(b"a.txt".to_vec(), first)],
+            matcher: build_search_matcher(&literal("needle"), false).expect("matcher"),
+            row_cap: 100,
+            skip_before: (Vec::new(), 0),
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel,
+            deadline: StdInstant::now() + Duration::from_secs(60),
+            scan_budget: Arc::new(ScanBudget::new(4, 1)),
+            claim_after: None,
+            claim_done: Arc::new(AtomicBool::new(false)),
+        };
+        let out = scan_search_shard(&store, &job).expect("shard scans");
+        assert!(out.budget_hit, "the overspend seals after the blob");
+        assert_eq!(
+            out.end_path,
+            Some(b"a.txt".to_vec()),
+            "the oversized blob completes and advances the frontier"
+        );
+        assert!(!out.rows.is_empty(), "its rows are emitted");
+    }
+
+    #[test]
+    fn walk_seal_leaves_uncollected_boundary_file_revisitable() {
+        use crate::index::FileMode;
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("boundary-revisit");
+        let blob = put_blob(&store, b"needle\n");
+        let count = SEARCH_MAX_WALK_FILES + 1;
+        let mut entries: Vec<(String, TreeMode, Oid)> = (0..count)
+            .map(|index| {
+                (
+                    format!("f{index:07}.txt"),
+                    TreeMode::File(FileMode::Regular),
+                    blob,
+                )
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let named: Vec<(&str, TreeMode, Oid)> = entries
+            .iter()
+            .map(|(name, mode, oid)| (name.as_str(), *mode, *oid))
+            .collect();
+        let root = put_tree(&store, &named);
+        let args = search_args(literal("needle"));
+        let (_guard, cancel) = crate::coord::cancellation();
+        let walk = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            WalkResume {
+                below: &[],
+                equal: false,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(600),
+            },
+        )
+        .expect("walk seals");
+        assert!(!walk.complete, "the traversal budget seals the walk");
+        let boundary = format!("f{:07}.txt", count - 1);
+        let frontier = walk.frontier.expect("sealed walk names its frontier");
+        assert_ne!(
+            frontier.as_slice(),
+            boundary.as_bytes(),
+            "an uncollected file is never the resume frontier"
+        );
+        let resumed = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            WalkResume {
+                below: frontier.as_slice(),
+                equal: true,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(600),
+            },
+        )
+        .expect("resumed walk seals");
+        assert!(
+            resumed
+                .entries
+                .iter()
+                .any(|(path, _)| path.as_slice() == boundary.as_bytes()),
+            "the boundary file is revisited on resume"
+        );
     }
 
     #[test]
@@ -1720,9 +2003,11 @@ mod tests {
             Some(Vec::new()),
             "early seal keeps a restart cursor"
         );
-        // An expired deadline seals the same way.
+        // An expired deadline that seals the walk before any path
+        // decides refuses: a restart cursor equal to the page start
+        // would loop the same zero-progress page forever.
         let (_live_guard, live) = crate::coord::cancellation();
-        let walk = collect_search_candidates(
+        let err = collect_search_candidates(
             &store,
             store.hash_kind(),
             root,
@@ -1733,13 +2018,8 @@ mod tests {
                 deadline: StdInstant::now() - Duration::from_secs(1),
             },
         )
-        .expect("deadline seals instead of refusing");
-        assert!(!walk.complete, "deadline seals the walk");
-        assert_eq!(
-            walk.frontier,
-            Some(Vec::new()),
-            "early seal keeps a restart cursor"
-        );
+        .expect_err("a root-level deadline seal refuses");
+        assert_eq!(err.code, crate::error::ErrorCode::ELimit);
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "seals stay wall-clock bounded"

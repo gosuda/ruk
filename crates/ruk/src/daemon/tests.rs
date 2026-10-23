@@ -23,7 +23,7 @@ use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
     DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_RETENTION_INTERVAL_MS,
     DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE, DEFAULT_TRANSPORT_PERMITS,
-    DaemonConfig,
+    DaemonConfig, MAX_LIVE_STREAMS,
 };
 use ruk_core::bytes::ByteString;
 use ruk_core::change::{LeaseId, OperationId, PlanId, RequestId, SessionId, StoreId};
@@ -1068,6 +1068,85 @@ async fn git_service_sessionless_upload_pack_refused() {
 
     drop(driver);
     task.abort();
+}
+
+#[tokio::test]
+async fn route_refuses_opens_past_the_live_stream_cap() {
+    let root = temp_root("stream-cap-direct");
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry"));
+    registry.set_runtime(tokio::runtime::Handle::current());
+    let refs = ConnectionRefs {
+        registry: Arc::clone(&registry),
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport executor"),
+        window_bytes: INITIAL_STREAM_WINDOW_BYTES,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    let peer = ipc::PeerIdentity {
+        uid: 0,
+        gid: 0,
+        pid: None,
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(16);
+    let (done_tx, _done_rx) = tokio::sync::mpsc::channel(64);
+    use super::STREAM_CHANNEL_BOUND;
+    use super::route_stream_frame;
+    use std::collections::HashMap;
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let mut parked = Vec::new();
+    let mut parked_data = Vec::new();
+    for stream_id in 1..=u64::try_from(MAX_LIVE_STREAMS).expect("cap fits u64") {
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BOUND);
+        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel();
+        parked.push(rx);
+        parked_data.push(data_rx);
+        streams.insert(
+            stream_id,
+            super::StreamRoute {
+                control: tx,
+                data: data_tx,
+                outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                generation: 1,
+                git: false,
+                shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                task: None,
+                cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+    }
+    let open = ipc::Frame {
+        kind: FrameKind::Open,
+        stream_id: u64::try_from(MAX_LIVE_STREAMS + 1).expect("cap fits u64"),
+        payload: Vec::new(),
+    };
+    route_stream_frame(&writer_tx, open, &mut streams, &done_tx, 1, &refs, peer)
+        .await
+        .expect("the capped open routes without failing the reader");
+    let error = writer_rx.try_recv().expect("cap error frame");
+    assert_eq!(error.kind, FrameKind::Error);
+    let report: super::ErrorReply = ipc::decode_control(&error.payload).expect("error decodes");
+    assert_eq!(report.code, ErrorCode::ELimit);
+    let terminal = writer_rx.try_recv().expect("cap terminal exit");
+    assert_eq!(terminal.kind, FrameKind::Exit);
+    drop(parked);
+    drop(parked_data);
+    while writer_rx.try_recv().is_ok() {}
+    let reopen = ipc::Frame {
+        kind: FrameKind::Open,
+        stream_id: u64::try_from(MAX_LIVE_STREAMS + 1).expect("cap fits u64"),
+        payload: Vec::new(),
+    };
+    route_stream_frame(&writer_tx, reopen, &mut streams, &done_tx, 1, &refs, peer)
+        .await
+        .expect("the reclaimed open routes without failing the reader");
+    assert!(
+        streams.contains_key(&(u64::try_from(MAX_LIVE_STREAMS + 1).expect("cap fits u64"))),
+        "the reclaimed slot spawns a fresh route"
+    );
 }
 
 #[tokio::test]
