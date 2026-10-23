@@ -216,6 +216,7 @@ fn seed(fx: &Fixture) -> Vec<PlanEntry> {
     fx.put("swap", b"f");
     fx.put("dir/a.txt", b"a");
     fx.put("ren-from.txt", b"same");
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut entries = vec![
         plan_entry("mod.txt", Some(regular(b"old")), Some(regular(b"new"))),
         plan_entry("del.txt", Some(regular(b"gone")), None),

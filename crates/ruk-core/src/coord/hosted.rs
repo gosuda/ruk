@@ -85,9 +85,10 @@ use crate::protocol::{
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
 use crate::search::{
-    SearchFold, SearchPool, SearchPoolConfig, ShardScan, WalkResume, build_search_matcher,
-    collect_search_candidates, decode_search_position, encode_search_position, scan_search_shard,
-    seal_search_fold, search_deadline, search_hit, search_query_digest, shard_search_entries,
+    SearchFold, SearchPool, SearchPoolConfig, ShardScan, WalkLimits, WalkResume,
+    build_search_matcher, collect_search_candidates, decode_search_position,
+    encode_search_position, scan_search_shard, seal_search_fold, search_deadline, search_hit,
+    search_query_digest, shard_search_entries,
 };
 use crate::store::CompactionStats;
 use crate::store::FactPageBudget;
@@ -891,6 +892,7 @@ impl HostedCoordinator {
             root,
             args,
             walk_resume,
+            WalkLimits { cancel, deadline },
         )?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();

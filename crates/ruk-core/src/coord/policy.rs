@@ -2083,7 +2083,7 @@ mod tests {
         assert_eq!(source.load().expect_err("unreadable").code, ErrorCode::EIo);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_non_regular_file_is_a_policy_error_and_never_blocks() {
         let dir = TempDir::new("special");

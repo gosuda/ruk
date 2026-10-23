@@ -435,36 +435,93 @@ fn remote_command(service: Service, path: &str) -> String {
     format!("{} {}", service.name(), shell_quote(path))
 }
 
-/// How to spawn the SSH connection: a program plus argv, or a shell line
-/// when `GIT_SSH_COMMAND` overrides the program (`git/connect.c`).
-fn ssh_invocation(
-    login: &str,
+/// One SSH spawn: where to dial and what to run there.
+///
+/// The pinned path dials a filtered literal IP (`login` carries
+/// `user@<ip>`) while `host_key_alias` roots host-key verification at the
+/// original hostname via `-o HostKeyAlias=`. The unpinned path leaves the
+/// alias empty and keeps the legacy argv shape exactly, so existing
+/// `GIT_SSH_COMMAND` scripts keep their positional arguments.
+struct SshDial<'a> {
+    /// Destination login: `user@host`, or `user@<pinned IP>` when pinned.
+    login: String,
+    /// Original hostname for `-o HostKeyAlias=`, set only when pinned.
+    host_key_alias: Option<&'a str>,
+    /// Explicit `-p` port, if any.
     port: Option<u16>,
+    /// Service to run on the far end.
     service: Service,
-    path: &str,
+    /// Repository path on the far end.
+    path: &'a str,
+}
+
+impl<'a> SshDial<'a> {
+    /// Unpinned dial: the hostname stays the destination, no alias flags.
+    fn direct(login: String, port: Option<u16>, service: Service, path: &'a str) -> Self {
+        Self {
+            login,
+            host_key_alias: None,
+            port,
+            service,
+            path,
+        }
+    }
+
+    /// Pinned dial: literal-IP destination with hostname trust preserved.
+    fn pinned(
+        login: String,
+        host: &'a str,
+        port: Option<u16>,
+        service: Service,
+        path: &'a str,
+    ) -> Self {
+        Self {
+            login,
+            host_key_alias: Some(host),
+            port,
+            service,
+            path,
+        }
+    }
+}
+
+/// How to spawn the SSH connection: a program plus argv, or a shell line
+/// when `GIT_SSH_COMMAND` overrides the program (`git/connect.c`). A
+/// pinned dial adds `-o HostKeyAlias=<hostname>` ahead of the literal-IP
+/// destination; an unpinned dial keeps the legacy shape exactly.
+fn ssh_invocation(
+    dial: &SshDial<'_>,
     ssh_program: &str,
     ssh_command: Option<&str>,
 ) -> SshInvocation {
-    let remote = remote_command(service, path);
+    let remote = remote_command(dial.service, dial.path);
     match ssh_command {
         Some(command) if !command.is_empty() => {
             let mut line = command.to_owned();
-            if let Some(port) = port {
+            if let Some(port) = dial.port {
                 line.push_str(&format!(" -p {port}"));
             }
+            if let Some(alias) = dial.host_key_alias {
+                line.push_str(" -o ");
+                line.push_str(&shell_quote(&format!("HostKeyAlias={alias}")));
+            }
             line.push(' ');
-            line.push_str(&shell_quote(login));
+            line.push_str(&shell_quote(&dial.login));
             line.push(' ');
             line.push_str(&shell_quote(&remote));
             SshInvocation::Shell(line)
         }
         _ => {
             let mut argv = vec![ssh_program.to_owned()];
-            if let Some(port) = port {
+            if let Some(port) = dial.port {
                 argv.push("-p".to_owned());
                 argv.push(port.to_string());
             }
-            argv.push(login.to_owned());
+            if let Some(alias) = dial.host_key_alias {
+                argv.push("-o".to_owned());
+                argv.push(format!("HostKeyAlias={alias}"));
+            }
+            argv.push(dial.login.clone());
             argv.push(remote);
             SshInvocation::Exec(argv)
         }
@@ -637,9 +694,25 @@ pub fn ssh_connect_with(
     ssh_program: &str,
     ssh_command: Option<&str>,
 ) -> Result<SshStream, GitError> {
-    let login = ssh_login(host, user)?;
-    let what = format!("ssh to {login}");
-    let mut command = match ssh_invocation(&login, port, service, path, ssh_program, ssh_command) {
+    ssh_spawn(
+        &SshDial::direct(ssh_login(host, user)?, port, service, path),
+        ssh_program,
+        ssh_command,
+    )
+}
+
+/// Spawns one SSH child from an already-built dial: the single spawn site
+/// behind [`ssh_connect_with`] and the pinned dial below.
+///
+/// # Errors
+/// [`GitError::Io`] when the command cannot spawn.
+fn ssh_spawn(
+    dial: &SshDial<'_>,
+    ssh_program: &str,
+    ssh_command: Option<&str>,
+) -> Result<SshStream, GitError> {
+    let what = format!("ssh to {}", dial.login);
+    let mut command = match ssh_invocation(dial, ssh_program, ssh_command) {
         SshInvocation::Exec(argv) => {
             let mut command = Command::new(&argv[0]);
             command.args(&argv[1..]);
@@ -669,6 +742,56 @@ pub fn ssh_connect_with(
         stdout: Some(stdout),
         child,
     })
+}
+
+/// Builds one pinned dial for a filtered address: the literal IP is the
+/// destination so the child never re-resolves the hostname onto an address
+/// the egress policy refused, while the hostname rides along for
+/// `HostKeyAlias`.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a dash-led user.
+fn pinned_dial<'a>(
+    addr: &SocketAddr,
+    host: &'a str,
+    port: Option<u16>,
+    user: Option<&str>,
+    service: Service,
+    path: &'a str,
+) -> Result<SshDial<'a>, GitError> {
+    Ok(SshDial::pinned(
+        ssh_login(&addr.ip().to_string(), user)?,
+        host,
+        port,
+        service,
+        path,
+    ))
+}
+
+/// Tries the filtered SSH addresses in order, returning the first child
+/// that spawns. `dial` performs one pinned attempt and only ever sees
+/// addresses the egress policy already kept, so a refused address never
+/// reaches the ssh spawn.
+///
+/// # Errors
+/// The last attempt's error, or [`GitError::Io`] when `allowed` is empty
+/// (the empty-filter refusal in [`EgressPolicy::filter_addrs`] normally
+/// fires first).
+fn ssh_dial_each(
+    label: &str,
+    allowed: &[SocketAddr],
+    mut dial: impl FnMut(&SocketAddr) -> Result<SshStream, GitError>,
+) -> Result<SshStream, GitError> {
+    let mut last_err: Option<GitError> = None;
+    for addr in allowed {
+        match dial(addr) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| GitError::Io {
+        detail: format!("cannot ssh to {label}: no addresses to try"),
+    }))
 }
 
 /// Builds the git-daemon request as one pkt-line: 4-hex length prefix
@@ -792,15 +915,16 @@ impl Write for Stream {
     }
 }
 
-/// Opens one duplex stream to a network endpoint: SSH spawns after its
-/// host passes the egress policy, and git dials under the same policy.
+/// Opens one duplex stream to a network endpoint: SSH spawns pinned onto
+/// its filtered addresses, and git dials under the same policy.
 ///
 /// Smart-http never opens a duplex stream: its stateless request/response
 /// pairs run through [`super::smart_http`], so an HTTP endpoint here is
 /// an internal routing error, not a gap. The policy gates git-daemon
-/// dials and checks the resolved SSH host before spawning. SSH retains
-/// its existing trust (host keys and user config), and the child performs
-/// the actual dial.
+/// dials and filters the resolved SSH addresses before spawning. SSH dials
+/// only those filtered addresses as literal IPs (the child never
+/// re-resolves the hostname) while `HostKeyAlias` keeps host-key
+/// verification rooted at the hostname.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
@@ -826,14 +950,21 @@ pub fn open_stream(
             let effective = port.unwrap_or(22);
             let label = format!("ssh://{host}:{effective}");
             let resolved = resolve_addrs(&label, host, effective)?;
-            let _allowed = policy.filter_addrs(&label, &resolved)?;
-            Ok(Stream::Ssh(ssh_connect(
-                host,
-                *port,
-                user.as_deref(),
-                service,
-                path,
-            )?))
+            let allowed = policy.filter_addrs(&label, &resolved)?;
+            // Pin the child onto the filtered addresses: handing `host`
+            // through would let ssh re-resolve it and dial an address the
+            // policy just refused. The literal IP is the destination while
+            // `HostKeyAlias` keeps host-key verification rooted at `host`;
+            // tries in order like the git-daemon dial below.
+            let ssh_program = std::env::var("GIT_SSH").unwrap_or_else(|_| "ssh".to_owned());
+            let ssh_command = std::env::var("GIT_SSH_COMMAND").ok();
+            Ok(Stream::Ssh(ssh_dial_each(&label, &allowed, |addr| {
+                ssh_spawn(
+                    &pinned_dial(addr, host, *port, user.as_deref(), service, path)?,
+                    &ssh_program,
+                    ssh_command.as_deref(),
+                )
+            })?))
         }
         Endpoint::Git { host, port, path } => Ok(Stream::Tcp(git_connect(
             host, *port, service, path, policy,
@@ -1193,10 +1324,12 @@ mod tests {
     fn ssh_invocation_honors_env_overrides() {
         assert_eq!(
             ssh_invocation(
-                "git@host.x",
-                Some(2222),
-                Service::UploadPack,
-                "/srv/a.git",
+                &SshDial::direct(
+                    "git@host.x".to_owned(),
+                    Some(2222),
+                    Service::UploadPack,
+                    "/srv/a.git",
+                ),
                 "ssh",
                 None,
             ),
@@ -1210,10 +1343,7 @@ mod tests {
         );
         assert_eq!(
             ssh_invocation(
-                "host.x",
-                None,
-                Service::ReceivePack,
-                "a.git",
+                &SshDial::direct("host.x".to_owned(), None, Service::ReceivePack, "a.git"),
                 "ssh",
                 Some("ssh -i key"),
             ),
@@ -1253,6 +1383,152 @@ mod tests {
             ),
             Err(GitError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn ssh_pinned_invocation_pins_ip_with_host_key_alias() {
+        // Pinned dial: the destination is the literal filtered IP while
+        // `HostKeyAlias` roots host-key verification at the hostname.
+        assert_eq!(
+            ssh_invocation(
+                &SshDial::pinned(
+                    "git@93.184.216.34".to_owned(),
+                    "example.com",
+                    Some(2222),
+                    Service::UploadPack,
+                    "/srv/a.git",
+                ),
+                "ssh",
+                None,
+            ),
+            SshInvocation::Exec(vec![
+                "ssh".to_owned(),
+                "-p".to_owned(),
+                "2222".to_owned(),
+                "-o".to_owned(),
+                "HostKeyAlias=example.com".to_owned(),
+                "git@93.184.216.34".to_owned(),
+                "git-upload-pack '/srv/a.git'".to_owned(),
+            ])
+        );
+        assert_eq!(
+            ssh_invocation(
+                &SshDial::pinned(
+                    "git@93.184.216.34".to_owned(),
+                    "example.com",
+                    None,
+                    Service::ReceivePack,
+                    "a.git",
+                ),
+                "ssh",
+                Some("ssh -i key"),
+            ),
+            SshInvocation::Shell(
+                "ssh -i key -o 'HostKeyAlias=example.com' 'git@93.184.216.34' 'git-receive-pack '\\''a.git'\\'''"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn ssh_dial_only_reaches_filtered_addresses_in_order() {
+        // A DNS answer mixing an allowlisted IP with a refused one: the
+        // policy keeps only the allowed address, and the dial loop offers
+        // only filtered addresses to the ssh spawn seam.
+        let allowed: SocketAddr = "93.184.216.34:22".parse().expect("allowed addr");
+        let refused: SocketAddr = "10.0.0.1:22".parse().expect("refused addr");
+        let policy = EgressPolicy::deny_private().allow(allowed.ip());
+        let label = "ssh://example.com:22";
+        let filtered = policy
+            .filter_addrs(label, &[allowed, refused])
+            .expect("policy keeps the allowed answer");
+        assert_eq!(filtered, vec![allowed]);
+
+        // The refused address never reaches the spawn seam; every filtered
+        // address is tried in order (each failure falls through).
+        let mut seen = Vec::new();
+        let err = ssh_dial_each(label, &filtered, |addr| {
+            seen.push(*addr);
+            Err(GitError::Io {
+                detail: "spy refuses to spawn".to_owned(),
+            })
+        })
+        .expect_err("spy always fails");
+        assert_eq!(seen, vec![allowed]);
+        assert!(matches!(err, GitError::Io { .. }), "got {err:?}");
+
+        // Several allowed addresses are all tried, in order.
+        let second: SocketAddr = "93.184.216.35:22".parse().expect("second addr");
+        let mut seen = Vec::new();
+        ssh_dial_each(label, &[allowed, second], |addr| {
+            seen.push(*addr);
+            Err(GitError::Io {
+                detail: "spy refuses to spawn".to_owned(),
+            })
+        })
+        .expect_err("spy always fails");
+        assert_eq!(seen, vec![allowed, second]);
+    }
+
+    #[test]
+    fn ssh_pinned_spawn_dials_ip_with_host_key_alias() {
+        // End of the seam: the spawned ssh argv carries the literal
+        // filtered IP as the destination, with `HostKeyAlias` preserving
+        // the original hostname for host-key verification.
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-net-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let seen = dir.join("argv.txt");
+        let script = dir.join("fake-ssh-pin.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                seen.display()
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+        let addr: SocketAddr = "93.184.216.34:22".parse().expect("addr");
+        let dial = pinned_dial(
+            &addr,
+            "example.com",
+            None,
+            Some("git"),
+            Service::UploadPack,
+            "/srv/a.git",
+        )
+        .expect("pinned dial");
+        assert_eq!(dial.login, "git@93.184.216.34");
+        let stream = ssh_spawn(&dial, script.to_str().expect("utf8"), None).expect("spawn");
+        drop(stream);
+        let lines: Vec<String> = std::fs::read_to_string(&seen)
+            .expect("argv log")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "-o".to_owned(),
+                "HostKeyAlias=example.com".to_owned(),
+                "git@93.184.216.34".to_owned(),
+                "git-upload-pack '/srv/a.git'".to_owned(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -858,6 +858,16 @@ fn release_freeze_set_parts(
 ) -> Result<Parts, CoreError> {
     let store = ctx.store;
     let session = ctx.session;
+    // Session binding is a precondition, not the authorization itself:
+    // release authorization is enforced by the daemon admin gate before
+    // dispatch (beside the `PolicySet` check). The sessionless legacy path
+    // supplies no identity row, so it refuses here before any store read.
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "release.freeze.set",
+            "release.freeze.set needs the session identity row, which this path does not supply",
+        )
+    })?;
     let marker = ReleasedTagMarker {
         owner_release_id: args.owner_release_id.clone(),
         target_oid: args.target_oid,
@@ -887,6 +897,15 @@ fn release_freeze_clear_parts(
 ) -> Result<Parts, CoreError> {
     let store = ctx.store;
     let session = ctx.session;
+    // Same session-binding precondition as the set arm: the owner string
+    // below tie-breaks competing releases but never authorizes, so the
+    // sessionless path refuses before the absent-row no-op could succeed.
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "release.freeze.clear",
+            "release.freeze.clear needs the session identity row, which this path does not supply",
+        )
+    })?;
     let facts = vec![prepare_release_unfreeze(
         store,
         &args.name,
@@ -4525,9 +4544,13 @@ mod tests {
         .expect("the frozen tag exists before release.freeze.set");
         publish_prepared(&store, &tag.facts);
 
-        let frozen = prepare_mutation(
-            &store,
-            session,
+        // Freeze and clear require the session identity row; the legacy
+        // sessionless path cannot supply it.
+        let row = session_row(None);
+        let ctx = full_ctx(&store, session, Some(&row), None, None);
+
+        let frozen = prepare_mutation_with(
+            &ctx,
             release_freeze_request("refs/tags/v1", "rel-1", target),
         )
         .expect("release.freeze.set prepares");
@@ -4539,9 +4562,8 @@ mod tests {
         );
         publish_prepared(&store, &frozen.facts);
 
-        let retry = prepare_mutation(
-            &store,
-            session,
+        let retry = prepare_mutation_with(
+            &ctx,
             release_freeze_request("refs/tags/v1", "rel-1", target),
         )
         .expect("the same owner and target retries");
@@ -4555,9 +4577,8 @@ mod tests {
             crate::store::types::FactExpectation::Value(_)
         ));
 
-        let other_owner = prepare_mutation(
-            &store,
-            session,
+        let other_owner = prepare_mutation_with(
+            &ctx,
             release_freeze_request("refs/tags/v1", "rel-2", target),
         )
         .expect_err("another owner is refused");
@@ -4582,12 +4603,9 @@ mod tests {
         assert_eq!(delete.code, ErrorCode::EForbidden);
         assert!(delete.message.contains("rel-1"), "{}", delete.message);
 
-        let refused_clear = prepare_mutation(
-            &store,
-            session,
-            release_clear_request("refs/tags/v1", "rel-2"),
-        )
-        .expect_err("another owner cannot clear");
+        let refused_clear =
+            prepare_mutation_with(&ctx, release_clear_request("refs/tags/v1", "rel-2"))
+                .expect_err("another owner cannot clear");
         assert_eq!(refused_clear.code, ErrorCode::EForbidden);
         assert!(
             refused_clear.message.contains("rel-1"),
@@ -4595,12 +4613,8 @@ mod tests {
             refused_clear.message
         );
 
-        let cleared = prepare_mutation(
-            &store,
-            session,
-            release_clear_request("refs/tags/v1", "rel-1"),
-        )
-        .expect("the owner clears");
+        let cleared = prepare_mutation_with(&ctx, release_clear_request("refs/tags/v1", "rel-1"))
+            .expect("the owner clears");
         publish_prepared(&store, &cleared.facts);
 
         let unfrozen = prepare_mutation(
@@ -4624,6 +4638,35 @@ mod tests {
                 .any(|fact| fact.table == crate::store::types::FactTable::ReleasedTags),
             "the tag.set keeps its freeze guard in the same publish"
         );
+    }
+
+    #[test]
+    fn release_freeze_set_without_session_row_is_refused() {
+        let (_temp, store, session) = fixture();
+        let (_, _, target) = seed_commit(&store, None);
+        // The gate runs before the tag-liveness read: even a well-formed
+        // request for a committable target refuses on the sessionless path.
+        let err = prepare_mutation(
+            &store,
+            session,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect_err("sessionless freeze setup is refused before any store read");
+        assert_eq!(err.code, ErrorCode::EHosted);
+    }
+
+    #[test]
+    fn release_freeze_clear_without_session_row_is_refused() {
+        let (_temp, store, session) = fixture();
+        // No marker row exists, so the old path returned a no-op success;
+        // the session gate now refuses before that no-op could succeed.
+        let err = prepare_mutation(
+            &store,
+            session,
+            release_clear_request("refs/tags/v1", "rel-1"),
+        )
+        .expect_err("sessionless clear is refused even with no marker row");
+        assert_eq!(err.code, ErrorCode::EHosted);
     }
 
     #[test]

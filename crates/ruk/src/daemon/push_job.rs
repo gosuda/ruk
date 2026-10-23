@@ -350,7 +350,7 @@ impl<'a> PushJob<'a> {
             .await?;
         self.refs
             .registry
-            .note_push_reconciled(self.repo_path, &observed_refs)?;
+            .note_push_reconciled(self.repo_path, plan_id, &observed_refs)?;
         encode_reply(Some(request_id), stored)
     }
 
@@ -1380,10 +1380,40 @@ mod tests {
             .note_push_terminal(&root, blocking, std::slice::from_ref(&name), true)
             .expect("uncertain records again");
         registry
-            .note_push_reconciled(&root, std::slice::from_ref(&name))
+            .note_push_reconciled(&root, blocking, std::slice::from_ref(&name))
             .expect("reconcile clears");
         registry
             .push_guard_check(&root, std::slice::from_ref(&name))
             .expect("reconciled passes");
+    }
+
+    #[test]
+    fn reconcile_keeps_other_plans_guard() {
+        let root = std::env::temp_dir().join(format!("ruk-push-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let registry = Registry::new(vec![root.clone()]).expect("registry builds");
+        let name = b"refs/heads/main".to_vec();
+        let first = PlanId::generate();
+        let second = PlanId::generate();
+        registry
+            .note_push_terminal(&root, first, std::slice::from_ref(&name), true)
+            .expect("first plan blocks");
+        registry
+            .note_push_terminal(&root, second, std::slice::from_ref(&name), true)
+            .expect("second plan takes the block");
+        registry
+            .note_push_reconciled(&root, first, std::slice::from_ref(&name))
+            .expect("other plan's reconcile runs");
+        let err = registry
+            .push_guard_check(&root, std::slice::from_ref(&name))
+            .expect_err("other plan's reconcile keeps the block");
+        assert_eq!(err.code, ErrorCode::EPushUncertain);
+        assert!(err.to_string().contains(&second.to_string()));
+        registry
+            .note_push_reconciled(&root, second, std::slice::from_ref(&name))
+            .expect("owning plan's reconcile runs");
+        registry
+            .push_guard_check(&root, std::slice::from_ref(&name))
+            .expect("owning plan's reconcile clears");
     }
 }
