@@ -486,7 +486,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     struct Fixture {
         root: std::path::PathBuf,
@@ -519,7 +519,14 @@ mod tests {
                 .prepare(kind, len, Cursor::new(bytes), None)
                 .expect("prepare");
             let oid = prepared.oid();
-            self.store.publish(vec![prepared], &[]).expect("publish");
+            self.store
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish");
             oid
         }
 
@@ -565,7 +572,12 @@ mod tests {
     fn publish_edit(fixture: &Fixture, edit: TreeEdit) -> Oid {
         fixture
             .store
-            .publish(edit.objects, &[])
+            .publish(
+                edit.objects,
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish tree edit");
         edit.root
     }

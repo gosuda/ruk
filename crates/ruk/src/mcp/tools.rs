@@ -8,16 +8,23 @@
 //! shape.
 //!
 //! The nine change operations run against the store exactly as the CLI's
-//! `New` and `Describe` commands do. The three read tools that need
+//! `New` and `Describe` commands do. The five read tools that need
 //! coordinator state degrade to the local semantics documented on
 //! [`crate::mcp`]: `revset_eval` reports `E_UNSUPPORTED_OPERATION`,
-//! `refs_list` pages without enforcing cursor binding, and
-//! `attestation_query` reads with an allow-all checkpoint.
+//! `refs_list` pages without enforcing cursor binding,
+//! `attestation_query` reads with an allow-all checkpoint,
+//! `events_tail` answers one non-waiting page with no lane view, and
+//! `content_search` scans serially with stateless continuations.
 
 use ruk_core::attestation::{Progress, StatementFilter};
+use ruk_core::bytes::ByteString;
 use ruk_core::error::{CoreError, ErrorCode};
-use ruk_core::protocol::{AttestListArgs, AttestationRecord, PageLimit, PageRequest, QueryArgs};
+use ruk_core::protocol::{
+    AttestListArgs, AttestationRecord, EventsTailArgs, PageLimit, PageRequest, QueryArgs,
+    ScanExhaustion, SearchArgs, SearchHit, TailedEvent,
+};
 use ruk_core::store::Store;
+use ruk_core::store::types::{decode_event_target, decode_store_event};
 
 use ruk_core::ops::{
     AbandonRequest, DescribeRequest, EditRequest, NewRequest, RebaseRequest, ResolveRequest,
@@ -25,45 +32,51 @@ use ruk_core::ops::{
 };
 
 /// The wire name of the `describe_change` tool.
-pub const TOOL_DESCRIBE_CHANGE: &str = "describe_change";
+pub(crate) const TOOL_DESCRIBE_CHANGE: &str = "describe_change";
 
 /// The wire name of the `new_commit` tool.
-pub const TOOL_NEW_COMMIT: &str = "new_commit";
+pub(crate) const TOOL_NEW_COMMIT: &str = "new_commit";
 
 /// The wire name of the `edit` tool.
-pub const TOOL_EDIT: &str = "edit";
+pub(crate) const TOOL_EDIT: &str = "edit";
 
 /// The wire name of the `split` tool.
-pub const TOOL_SPLIT: &str = "split";
+pub(crate) const TOOL_SPLIT: &str = "split";
 
 /// The wire name of the `squash` tool.
-pub const TOOL_SQUASH: &str = "squash";
+pub(crate) const TOOL_SQUASH: &str = "squash";
 
 /// The wire name of the `rebase` tool.
-pub const TOOL_REBASE: &str = "rebase";
+pub(crate) const TOOL_REBASE: &str = "rebase";
 
 /// The wire name of the `abandon` tool.
-pub const TOOL_ABANDON: &str = "abandon";
+pub(crate) const TOOL_ABANDON: &str = "abandon";
 
 /// The wire name of the `resolve` tool.
-pub const TOOL_RESOLVE: &str = "resolve";
+pub(crate) const TOOL_RESOLVE: &str = "resolve";
 
 /// The wire name of the `revert` tool.
-pub const TOOL_REVERT: &str = "revert";
+pub(crate) const TOOL_REVERT: &str = "revert";
 
 /// The wire name of the `revset_eval` tool.
-pub const TOOL_REVSET_EVAL: &str = "revset_eval";
+pub(crate) const TOOL_REVSET_EVAL: &str = "revset_eval";
 
 /// The wire name of the `refs_list` tool.
-pub const TOOL_REFS_LIST: &str = "refs_list";
+pub(crate) const TOOL_REFS_LIST: &str = "refs_list";
 
 /// The wire name of the `attestation_query` tool.
-pub const TOOL_ATTESTATION_QUERY: &str = "attestation_query";
+pub(crate) const TOOL_ATTESTATION_QUERY: &str = "attestation_query";
+
+/// The wire name of the `events_tail` tool.
+pub(crate) const TOOL_EVENTS_TAIL: &str = "events_tail";
+
+/// The wire name of the `content_search` tool.
+pub(crate) const TOOL_CONTENT_SEARCH: &str = "content_search";
 
 /// One exposed tool: its wire name, what it does, and the existing Rust
 /// request type its arguments decode as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ToolInfo {
+pub(crate) struct ToolInfo {
     /// The wire name accepted by `tools/call`.
     pub name: &'static str,
     /// What the tool does, including any degraded local semantics.
@@ -72,9 +85,9 @@ pub struct ToolInfo {
     pub params_type: &'static str,
 }
 
-/// The full tool table in wire order: nine change operations, then the three
+/// The full tool table in wire order: nine change operations, then the five
 /// degraded reads.
-pub const TOOL_TABLE: &[ToolInfo] = &[
+pub(crate) const TOOL_TABLE: &[ToolInfo] = &[
     ToolInfo {
         name: TOOL_DESCRIBE_CHANGE,
         description: "Describe one commit or one change in typed form; never publishes.",
@@ -135,11 +148,21 @@ pub const TOOL_TABLE: &[ToolInfo] = &[
         description: "List verified attestations with an allow-all checkpoint; continuation is lowercase hex.",
         params_type: "ruk_core::protocol::AttestListArgs",
     },
+    ToolInfo {
+        name: TOOL_EVENTS_TAIL,
+        description: "Page ref events after a sequence with no waiting; long-poll is forced to zero locally.",
+        params_type: "ruk_core::protocol::EventsTailArgs",
+    },
+    ToolInfo {
+        name: TOOL_CONTENT_SEARCH,
+        description: "Search one revision tree serially; cursor binding is not enforced locally and continuations are stateless.",
+        params_type: "ruk_core::protocol::SearchArgs",
+    },
 ];
 
 /// Typed identity of one tool in [`TOOL_TABLE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Tool {
+pub(crate) enum Tool {
     /// Reads one commit or change via `ops::describe`.
     DescribeChange,
     /// Publishes one commit via `ops::new`.
@@ -164,6 +187,10 @@ pub enum Tool {
     RefsList,
     /// Lists verified attestations via `attestation::list`.
     AttestationQuery,
+    /// Pages ref events after a sequence with no waiting.
+    EventsTail,
+    /// Searches one revision tree serially without a coordinator.
+    ContentSearch,
 }
 
 impl Tool {
@@ -171,7 +198,7 @@ impl Tool {
     ///
     /// # Errors
     /// `E_NOT_FOUND` naming the unknown tool.
-    pub fn from_name(name: &str) -> Result<Self, CoreError> {
+    pub(crate) fn from_name(name: &str) -> Result<Self, CoreError> {
         match name {
             TOOL_DESCRIBE_CHANGE => Ok(Self::DescribeChange),
             TOOL_NEW_COMMIT => Ok(Self::NewCommit),
@@ -185,6 +212,8 @@ impl Tool {
             TOOL_REVSET_EVAL => Ok(Self::RevsetEval),
             TOOL_REFS_LIST => Ok(Self::RefsList),
             TOOL_ATTESTATION_QUERY => Ok(Self::AttestationQuery),
+            TOOL_EVENTS_TAIL => Ok(Self::EventsTail),
+            TOOL_CONTENT_SEARCH => Ok(Self::ContentSearch),
             _ => Err(CoreError::new(
                 ErrorCode::ENotFound,
                 format!("unknown MCP tool `{name}`"),
@@ -193,8 +222,15 @@ impl Tool {
     }
 
     /// The wire name accepted by `tools/call`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::DescribeChange => TOOL_DESCRIBE_CHANGE,
             Self::NewCommit => TOOL_NEW_COMMIT,
@@ -208,6 +244,8 @@ impl Tool {
             Self::RevsetEval => TOOL_REVSET_EVAL,
             Self::RefsList => TOOL_REFS_LIST,
             Self::AttestationQuery => TOOL_ATTESTATION_QUERY,
+            Self::EventsTail => TOOL_EVENTS_TAIL,
+            Self::ContentSearch => TOOL_CONTENT_SEARCH,
         }
     }
 }
@@ -217,14 +255,20 @@ impl Tool {
 /// Arguments decode directly into the existing request type named by the
 /// tool's table entry: `ruk_core::ops` requests for the nine change
 /// operations, `protocol::QueryArgs` for `revset_eval`,
-/// `protocol::PageRequest` for `refs_list`, and `protocol::AttestListArgs`
-/// for `attestation_query`.
+/// `protocol::PageRequest` for `refs_list`, `protocol::AttestListArgs`
+/// for `attestation_query`, and `protocol::EventsTailArgs` for
+/// `events_tail` (whose `wait_ms` is forced to zero: no long-poll runs
+/// without a coordinator lane).
 ///
 /// # Errors
 /// The [`CoreError`] from argument decoding, the operation itself, or result
 /// rendering. `revset_eval` always fails `E_INVALID` carrying
 /// `E_UNSUPPORTED_OPERATION`.
-pub fn call_on_store(store: &Store, tool: Tool, args_json: &[u8]) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn call_on_store(
+    store: &Store,
+    tool: Tool,
+    args_json: &[u8],
+) -> Result<Vec<u8>, CoreError> {
     match tool {
         Tool::DescribeChange => {
             let request: DescribeRequest = decode_args(args_json)?;
@@ -274,7 +318,50 @@ pub fn call_on_store(store: &Store, tool: Tool, args_json: &[u8]) -> Result<Vec<
             let request: AttestListArgs = decode_args(args_json)?;
             query_attestations(store, request)
         }
+        Tool::EventsTail => {
+            let mut request: EventsTailArgs = decode_args(args_json)?;
+            request.wait_ms = Some(0);
+            tail_events(store, &request)
+        }
+        Tool::ContentSearch => {
+            let request: SearchArgs = decode_args(args_json)?;
+            search_content(store, &request)
+        }
     }
+}
+
+/// The local answer of the `content_search` tool: the coordinator reply
+/// without lease binding, plus a stateless resume position.
+#[derive(Debug, serde::Serialize)]
+struct ContentSearchResult {
+    hits: Vec<SearchHit>,
+    truncated: bool,
+    exhausted: ScanExhaustion,
+    scanned_blobs: u64,
+    scanned_bytes: u64,
+    skipped_blobs: u64,
+    /// Resume position; pass these bytes back as the next request's cursor
+    /// position inside any `PageCursor`. The cursor's store, view, query,
+    /// and lease fields are ignored locally: only the position resumes.
+    next: Option<ByteString>,
+}
+
+/// Searches one revision tree serially with stateless continuations: the
+/// cursor position resumes, cursor binding is not enforced locally, and
+/// the view is the revision the arguments resolve. To continue a
+/// truncated page, set the next request's cursor position to the returned
+/// `next` bytes; other cursor fields may carry any values.
+fn search_content(store: &Store, args: &SearchArgs) -> Result<Vec<u8>, CoreError> {
+    let page = ruk_core::search::search_content_local(store, args)?;
+    render(&ContentSearchResult {
+        hits: page.hits,
+        truncated: page.truncated,
+        exhausted: page.exhausted,
+        scanned_blobs: page.scanned_blobs,
+        scanned_bytes: page.scanned_bytes,
+        skipped_blobs: page.skipped_blobs,
+        next: page.next,
+    })
 }
 
 /// Decodes tool arguments into the tool's existing request type.
@@ -325,6 +412,7 @@ fn query_attestations(store: &Store, request: AttestListArgs) -> Result<Vec<u8>,
     let filter = StatementFilter {
         subject: request.subject,
         kind: request.kind,
+        kind_prefix: request.kind_prefix,
         signer: request.signer,
         include_superseded: request.include_superseded,
     };
@@ -334,6 +422,102 @@ fn query_attestations(store: &Store, request: AttestListArgs) -> Result<Vec<u8>,
     render(&AttestationQueryResult {
         records: page.records,
         next: page.next.as_deref().map(encode_hex),
+    })
+}
+
+/// The local answer of the `events_tail` tool: the coordinator reply
+/// without `view`, which needs lane state.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EventsTailResult {
+    events: Vec<TailedEvent>,
+    head: u64,
+    oldest: u64,
+    expired: bool,
+}
+
+/// Pages ref events strictly after `after` with no waiting: one scan to
+/// the table end, prefix-filtered, with the same expired signal the
+/// coordinator reports. Provenance stays in the stored row; it is never
+/// surfaced in the tailed events.
+fn tail_events(store: &Store, args: &EventsTailArgs) -> Result<Vec<u8>, CoreError> {
+    if !matches!(args.wait_ms, None | Some(0)) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "E_UNSUPPORTED_OPERATION: events_tail has no long-poll locally; omit wait_ms or call with wait_ms 0",
+        ));
+    }
+    use ruk_core::store::{FactPageBudget, FactTable};
+    let map_err = |err: ruk_core::store::StoreError| CoreError::new(err.code(), err.to_string());
+    let (head, oldest) = store.event_head().map_err(map_err)?;
+    if args.after.saturating_add(1) < oldest {
+        return render(&EventsTailResult {
+            events: Vec::new(),
+            head,
+            oldest,
+            expired: true,
+        });
+    }
+    let limit = args.limit.map_or(
+        ruk_core::protocol::DEFAULT_PAGE_SIZE,
+        ruk_core::protocol::PageLimit::get,
+    );
+    let mut events = Vec::new();
+    let mut cursor = args.after;
+    loop {
+        let budget = FactPageBudget::new(limit, ruk_core::MAX_CONTROL_FRAME_BYTES);
+        let page = store
+            .fact_page(FactTable::Events, Some(&cursor.to_be_bytes()), budget)
+            .map_err(map_err)?;
+        if page.rows.is_empty() {
+            break;
+        }
+        for row in &page.rows {
+            if events.len() == limit {
+                break;
+            }
+            cursor = u64::from_be_bytes(row.key.as_slice().try_into().map_err(|_| {
+                CoreError::new(
+                    ErrorCode::ECorrupt,
+                    format!("event key is {} bytes, not a sequence", row.key.len()),
+                )
+            })?);
+            let stored = decode_store_event(&row.value).map_err(map_err)?;
+            if let Some(want) = args.prefix.as_ref()
+                && !stored.name.starts_with(want.as_bytes())
+            {
+                continue;
+            }
+            events.push(TailedEvent {
+                seq: cursor,
+                name: ByteString::from(stored.name),
+                old: stored
+                    .old
+                    .as_deref()
+                    .map(decode_event_target)
+                    .transpose()
+                    .map_err(map_err)?,
+                new: stored
+                    .new
+                    .as_deref()
+                    .map(decode_event_target)
+                    .transpose()
+                    .map_err(map_err)?,
+                at: stored.at,
+                source: stored.source,
+                operation: stored.operation,
+                request_id: stored.request_id,
+                session: stored.session,
+            });
+        }
+        if events.len() == limit || !page.more {
+            break;
+        }
+    }
+    render(&EventsTailResult {
+        events,
+        head,
+        oldest,
+        expired: false,
     })
 }
 
@@ -354,7 +538,7 @@ mod tests {
 
     #[test]
     fn tool_names_round_trip_through_the_table() {
-        assert_eq!(TOOL_TABLE.len(), 12);
+        assert_eq!(TOOL_TABLE.len(), 14);
         for info in TOOL_TABLE {
             let tool = Tool::from_name(info.name).expect("table names resolve");
             assert_eq!(tool.name(), info.name);
@@ -377,5 +561,104 @@ mod tests {
     #[test]
     fn hex_renders_lowercase_pairs() {
         assert_eq!(encode_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[test]
+    fn events_tail_pages_locally_without_waiting() {
+        use ruk_core::ids::HashKind;
+        use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction};
+        use ruk_core::store::{EventContext, EventSource, PreparationBudget};
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!("ruk-mcp-tail-{}-events", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test root");
+        let store = Store::create(
+            &root,
+            HashKind::Sha1,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("create store");
+        let oid = ruk_core::ids::Oid::from_bytes(&[0x31; 20]).expect("oid");
+        let updates = vec![ruk_core::refdata::RefUpdate {
+            name: RefName::new(b"refs/heads/main".to_vec()).expect("ref name"),
+            expected: RefExpect::Absent,
+            change: RefChange::Set(RefTarget::Direct(oid)),
+        }];
+        let transaction = RefTransaction::new(HashKind::Sha1, updates).expect("ref transaction");
+        let prepared = ruk_core::refs::prepare_checked_transaction(&store, &transaction)
+            .expect("prepare refs");
+        store
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish refs");
+        let tool = Tool::from_name("events_tail").expect("tail resolves");
+        let args = sonic_rs::to_vec(&EventsTailArgs {
+            after: 0,
+            limit: None,
+            wait_ms: Some(30_000),
+            prefix: None,
+        })
+        .expect("args encode");
+        let out = call_on_store(&store, tool, &args).expect("tail pages");
+        let result: EventsTailResult = sonic_rs::from_slice(&out).expect("result decodes");
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].seq, 1);
+        assert_eq!(result.events[0].name.as_bytes(), b"refs/heads/main");
+        assert_eq!(result.events[0].old, None);
+        assert_eq!(
+            result.events[0].new,
+            Some(RefTarget::Direct(oid)),
+            "the landed tip decodes"
+        );
+        assert_eq!((result.head, result.oldest), (1, 1));
+        assert!(!result.expired);
+        // Past the head with a 30-second wait still returns at once with
+        // no events: the local tool never long-polls.
+        let args = sonic_rs::to_vec(&EventsTailArgs {
+            after: result.head,
+            limit: None,
+            wait_ms: Some(30_000),
+            prefix: None,
+        })
+        .expect("args encode");
+        let out = call_on_store(&store, tool, &args).expect("tail pages");
+        let result: EventsTailResult = sonic_rs::from_slice(&out).expect("result decodes");
+        assert!(result.events.is_empty());
+        assert!(!result.expired);
+        // The guard accepts an omitted or zero wait on direct calls and
+        // refuses a nonzero one without waiting.
+        let direct = EventsTailArgs {
+            after: 0,
+            limit: None,
+            wait_ms: None,
+            prefix: None,
+        };
+        let out = tail_events(&store, &direct).expect("omitted wait pages");
+        let result: EventsTailResult = sonic_rs::from_slice(&out).expect("result decodes");
+        assert_eq!(result.events.len(), 1);
+        let direct = EventsTailArgs {
+            after: 0,
+            limit: None,
+            wait_ms: Some(0),
+            prefix: None,
+        };
+        let out = tail_events(&store, &direct).expect("zero wait pages");
+        let result: EventsTailResult = sonic_rs::from_slice(&out).expect("result decodes");
+        assert_eq!(result.events.len(), 1);
+        let direct = EventsTailArgs {
+            after: 0,
+            limit: None,
+            wait_ms: Some(30_000),
+            prefix: None,
+        };
+        let err = tail_events(&store, &direct).expect_err("nonzero wait refuses");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        assert!(err.message.contains("E_UNSUPPORTED_OPERATION"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

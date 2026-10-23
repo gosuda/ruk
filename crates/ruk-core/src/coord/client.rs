@@ -39,6 +39,13 @@ use crate::protocol::{ReplyBody, ReplyEnvelope, RequestEnvelope, decode_reply, e
 use crate::{CoreError, ErrorCode, StoreId};
 
 /// A connected, authenticated coordinator client.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct Client {
     stream: Option<Outgoing>,
     store: StoreId,
@@ -59,6 +66,13 @@ impl Client {
     /// * [`ErrorCode::EIo`] if transport connection fails.
     /// * Handshake errors ([`ErrorCode::EForbidden`], [`ErrorCode::EVersion`], etc.)
     ///   if authentication fails.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) async fn connect(
         store: StoreId,
         body: &LockBody,
@@ -104,6 +118,13 @@ impl Client {
     /// canceled or an I/O or framing error occurs, the stream is taken and
     /// closed irreversibly; subsequent calls on this client will fail with
     /// [`ErrorCode::ECoordinatorUnresponsive`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) async fn request(
         &mut self,
         request: &RequestEnvelope,
@@ -113,18 +134,33 @@ impl Client {
     }
 
     /// Returns the store ID this client is connected to.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn store(&self) -> StoreId {
         self.store
     }
 
     /// Returns true if the client connection is open and ready.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn is_connected(&self) -> bool {
         self.stream.is_some()
     }
 
     /// Explicitly closes the connection.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn close(&mut self) {
         self.stream = None;
     }
@@ -154,6 +190,13 @@ impl fmt::Debug for Client {
 /// received. Any cancellation or error leaves `stream_slot` as `None`,
 /// closing the connection irreversibly so that a desynchronized stream is
 /// never reused.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) async fn exchange<S>(
     stream_slot: &mut Option<S>,
     request: &RequestEnvelope,
@@ -238,7 +281,7 @@ mod tests {
     use crate::change::RequestId;
     use crate::protocol::{
         ErrorReply, Method, MethodDescriptor, MethodKind, Mutation, OpPruneArgs, Reply, Request,
-        SchemaArgs, SchemaReply, SchemaVersion, SessionOpenArgs,
+        SchemaArgs, SchemaReply, SchemaVersion,
     };
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -293,7 +336,7 @@ mod tests {
         RequestEnvelope {
             schema_version: SchemaVersion::current(),
             session: None,
-            request: Request::SessionOpen(Box::new(SessionOpenArgs::default())),
+            request: Request::SessionOpen(Box::default()),
         }
     }
 

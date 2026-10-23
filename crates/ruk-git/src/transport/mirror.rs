@@ -1,6 +1,6 @@
-//! Mirror-sync mapping for Forgejo pull/push mirrors.
+//! Mirror-sync mapping for pull/push mirrors.
 //!
-//! Forgejo syncs mirrors with plain Git commands run in the repository
+//! Hosts sync mirrors with plain Git commands run in the repository
 //! directory (`services/mirror/`):
 //!
 //! - pull mirrors: `git fetch --prune --tags <remote>` (and
@@ -96,10 +96,37 @@ pub fn prune_for_spec(
     orphaned
 }
 
+/// Hidden namespaces a mirror never carries: implementation refs, stash,
+/// forge pull/merge-request refs, review refs, and CI bookkeeping. They
+/// are filtered on both sides, so a mirror neither pushes them nor
+/// deletes their remote counterparts.
+const HIDDEN_NAMESPACES: [&[u8]; 7] = [
+    b"refs/ruk/",
+    b"refs/pull/",
+    b"refs/merge-requests/",
+    b"refs/for/",
+    b"refs/keep-around/",
+    b"refs/pipelines/",
+    b"refs/environments/",
+];
+
+/// Whether `name` is hidden from mirrors: the exact `refs/stash` ref or
+/// anything under a hidden namespace.
+#[must_use]
+pub fn is_mirror_hidden(name: &[u8]) -> bool {
+    name == b"refs/stash"
+        || name.starts_with(b"refs/stash/")
+        || HIDDEN_NAMESPACES
+            .iter()
+            .any(|namespace| name.starts_with(namespace))
+}
+
 /// The `push --mirror` update list: every local direct ref written to the
 /// same name on the destination, plus deletes for destination refs with no
 /// local counterpart. Both lists arrive as `(name, tip)` pairs of direct
-/// tips; symbolic refs never enter.
+/// tips; symbolic refs never enter. Hidden refs are filtered on both
+/// sides: a mirror neither pushes them nor deletes their remote
+/// counterparts.
 ///
 /// Force is implied for every set, the way the oracle's `--mirror` forces:
 /// callers report the updates through the normal push path with force on.
@@ -110,6 +137,9 @@ pub fn push_mirror_updates(
 ) -> Vec<MirrorUpdate> {
     let mut updates = Vec::with_capacity(local.len());
     for (name, tip) in local {
+        if is_mirror_hidden(name) {
+            continue;
+        }
         let old = remote
             .iter()
             .find(|(remote_name, _)| remote_name == name)
@@ -121,6 +151,9 @@ pub fn push_mirror_updates(
         });
     }
     for (name, tip) in remote {
+        if is_mirror_hidden(name) {
+            continue;
+        }
         if local.iter().any(|(local_name, _)| local_name == name) {
             continue;
         }
@@ -234,5 +267,48 @@ mod tests {
             old: Some(ccc),
             new: None,
         }));
+    }
+
+    #[test]
+    fn mirror_skips_hidden_refs_on_both_sides() {
+        use ruk_core::ids::HashKind;
+
+        let kind = HashKind::Sha1;
+        let tip = kind.hash_git_object("blob", b"a").expect("id");
+        let local = vec![
+            (b"refs/heads/main".to_vec(), tip),
+            (b"refs/pull/1/head".to_vec(), tip),
+            (b"refs/ruk/sync".to_vec(), tip),
+            (b"refs/stash".to_vec(), tip),
+        ];
+        let remote = vec![
+            (b"refs/merge-requests/2".to_vec(), tip),
+            (b"refs/heads/gone".to_vec(), tip),
+        ];
+        let updates = push_mirror_updates(&local, &remote);
+        let names: Vec<&[u8]> = updates
+            .iter()
+            .map(|update| update.name.as_slice())
+            .collect();
+        assert!(names.contains(&b"refs/heads/main".as_slice()));
+        assert!(names.contains(&b"refs/heads/gone".as_slice()));
+        for hidden in [
+            "refs/pull/1/head",
+            "refs/ruk/sync",
+            "refs/stash",
+            "refs/merge-requests/2",
+            "refs/for/main",
+            "refs/keep-around/abc",
+            "refs/pipelines/1",
+            "refs/environments/x",
+        ] {
+            assert!(is_mirror_hidden(hidden.as_bytes()), "{hidden}");
+            assert!(
+                !names.iter().any(|name| name == &hidden.as_bytes()),
+                "{hidden} must not sync"
+            );
+        }
+        assert!(!is_mirror_hidden(b"refs/heads/main"));
+        assert!(!is_mirror_hidden(b"refs/tags/v1"));
     }
 }

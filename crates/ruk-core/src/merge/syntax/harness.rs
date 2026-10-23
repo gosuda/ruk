@@ -7,7 +7,7 @@
 //! harness never accepts a plausible subset: every fixture must dispose
 //! exactly as declared.
 
-use super::fixtures::{Expectation, all_fixtures};
+use super::fixtures::{Expectation, Fixture, all_fixtures};
 use super::grammar::{Cancel, GrammarRegistry, Language};
 use super::treesitter::TsGrammar;
 use super::{SyntaxOutcome, SyntaxRequest, merge_triplet};
@@ -33,24 +33,19 @@ fn live_providers() -> Vec<TsGrammar> {
 fn check_fixture(
     registry: &GrammarRegistry<'_>,
     cancel: &Cancel,
-    name: &'static str,
-    language: Language,
-    base: &str,
-    ours: &str,
-    theirs: &str,
-    expect: Expectation,
+    fixture: &Fixture,
     failures: &mut Vec<String>,
 ) {
     let request = SyntaxRequest {
-        path: ByteString::from(name),
-        language,
-        base: base.as_bytes(),
-        ours: ours.as_bytes(),
-        theirs: theirs.as_bytes(),
+        path: ByteString::from(fixture.name),
+        language: fixture.language,
+        base: fixture.base.as_bytes(),
+        ours: fixture.ours.as_bytes(),
+        theirs: fixture.theirs.as_bytes(),
     };
     let outcome = merge_triplet(&request, registry, cancel)
-        .unwrap_or_else(|err| panic!("{name} errored: {err}"));
-    let matched = match (expect, &outcome) {
+        .unwrap_or_else(|err| panic!("{} errored: {err}", fixture.name));
+    let matched = match (fixture.expect, &outcome) {
         (Expectation::Merge(expected), SyntaxOutcome::Merged { bytes, .. }) => {
             bytes.as_slice() == expected.as_bytes()
         }
@@ -60,7 +55,10 @@ fn check_fixture(
         _ => false,
     };
     if !matched {
-        failures.push(format!("- {name}: expected {expect:?}, got {outcome:?}"));
+        failures.push(format!(
+            "- {}: expected {:?}, got {outcome:?}",
+            fixture.name, fixture.expect
+        ));
     }
 }
 
@@ -76,17 +74,7 @@ fn all_fixtures_dispose_exactly() {
     assert!(!fixtures.is_empty(), "no fixtures declared");
     let mut failures = Vec::new();
     for fixture in &fixtures {
-        check_fixture(
-            &registry,
-            &cancel,
-            fixture.name,
-            fixture.language,
-            fixture.base,
-            fixture.ours,
-            fixture.theirs,
-            fixture.expect,
-            &mut failures,
-        );
+        check_fixture(&registry, &cancel, fixture, &mut failures);
     }
     if !failures.is_empty() {
         panic!(

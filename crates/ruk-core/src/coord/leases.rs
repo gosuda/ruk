@@ -28,13 +28,19 @@ pub(crate) mod table;
 pub(crate) mod timing;
 
 pub(crate) use barrier::{CollectionPhase, Dedupe, RootBarrier, SealedCycle, SweepOutcome};
-pub(crate) use condemned::{BLOCK_LEN, BLOCK_RECORDS, CondemnedBuilder, CondemnedSet, RECORD_LEN};
+pub(crate) use condemned::{CondemnedBuilder, CondemnedSet, RECORD_LEN};
 pub(crate) use table::{
     AcquireArgs, BulkProgress, CursorWant, LeaseBinding, LeaseKind, RootOrigin,
 };
-pub(crate) use timing::{
-    BULK_INTERVAL, BULK_NO_PROGRESS, BULK_TOTAL, GRAY_ALLOWANCE_BYTES, INTERACTIVE_TTL,
-};
+pub(crate) use timing::INTERACTIVE_TTL;
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "re-exported for lease tests; no production caller at this commit"
+    )
+)]
+pub(crate) use timing::{BULK_NO_PROGRESS, BULK_TOTAL};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -66,26 +72,40 @@ pub(crate) struct OwnerGuard {
 impl OwnerGuard {
     /// The protected lease, if still held.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn lease(&self) -> Option<LeaseId> {
         self.lease
     }
 
     /// Releases protection early; otherwise drop releases it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn release(mut self) {
-        if let Some(lease) = self.lease.take() {
-            if let Some(registry) = self.registry.upgrade() {
-                registry.release_owner(&lease);
-            }
+        if let Some(lease) = self.lease.take()
+            && let Some(registry) = self.registry.upgrade()
+        {
+            registry.release_owner(&lease);
         }
     }
 }
 
 impl Drop for OwnerGuard {
     fn drop(&mut self) {
-        if let Some(lease) = self.lease.take() {
-            if let Some(registry) = self.registry.upgrade() {
-                registry.release_owner(&lease);
-            }
+        if let Some(lease) = self.lease.take()
+            && let Some(registry) = self.registry.upgrade()
+        {
+            registry.release_owner(&lease);
         }
     }
 }
@@ -102,6 +122,13 @@ impl std::fmt::Debug for OwnerGuard {
 /// lives exactly as long as the snapshot, so enumerated roots are accounted
 /// while any collector holds them outside the registry lock.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct FrontierSnapshot {
     roots: Arc<Vec<Head>>,
     _charge: ByteReservation,
@@ -110,18 +137,33 @@ pub(crate) struct FrontierSnapshot {
 impl FrontierSnapshot {
     /// The protected roots enumerated under the lock.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn roots(&self) -> &Arc<Vec<Head>> {
         &self.roots
     }
 
     /// Number of protected roots in the snapshot.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn len(&self) -> usize {
         self.roots.len()
     }
 
     /// Whether the snapshot holds no roots.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.roots.is_empty()
     }
@@ -141,7 +183,21 @@ struct State {
 /// leaked guard can never keep the registry alive.
 pub(crate) struct LeaseRegistry {
     clock: Clock,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     books: Arc<ByteBudget>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     scratch_dir: PathBuf,
     inner: Mutex<State>,
 }
@@ -167,6 +223,13 @@ impl LeaseRegistry {
 
     /// The coordinator clock for parent sampling.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn clock(&self) -> &Clock {
         &self.clock
     }
@@ -272,6 +335,13 @@ impl LeaseRegistry {
     /// Stages a late raw root under a live owning lease, before its first
     /// locator/object lookup. Derived references reuse the owning lease and
     /// never escape its lifetime: dropping the owner unstages them.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn stage_raw_root(
         &self,
         head: Head,
@@ -331,6 +401,13 @@ impl LeaseRegistry {
 
     /// Reports a deletion of a not-yet-enumerated untracked root row during
     /// Mark: bounded gray work plus a root-epoch increment.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn note_untracked_deletion(&self, head: Head) -> Result<(), CoreError> {
         let mut state = self.lock()?;
         state.barrier.note_gray(head)
@@ -351,6 +428,13 @@ impl LeaseRegistry {
 
     /// Records owner progress. Heartbeats never move deadlines; admitted work
     /// re-arms only the interval, never the two-hour total.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn report_progress(
         &self,
         lease: &LeaseId,
@@ -368,6 +452,13 @@ impl LeaseRegistry {
     }
 
     /// Accounts one page's exact rows and copied bytes, reserving first.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn account_page(
         &self,
         lease: &LeaseId,
@@ -398,6 +489,13 @@ impl LeaseRegistry {
     /// enumeration outside the lock. Reserved from the books budget first;
     /// the returned handle carries its reservation for as long as the
     /// snapshot lives, per the budget's RAII rule.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn frontier_snapshot(&self) -> Result<FrontierSnapshot, CoreError> {
         let state = self.lock()?;
         let record = u64::try_from(RECORD_LEN)
@@ -420,6 +518,13 @@ impl LeaseRegistry {
     }
 
     /// Begins `Mark` under sole lane ownership at the pivot generation.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn begin_mark(
         &self,
         pivot: u64,
@@ -429,42 +534,92 @@ impl LeaseRegistry {
     }
 
     /// Brackets large-frontier publication to scratch.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn begin_frontier_publish(&self) -> Result<(), CoreError> {
         self.lock()?.barrier.begin_frontier_publish()
     }
 
     /// Closes the frontier publication bracket.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn end_frontier_publish(&self) -> Result<(), CoreError> {
         self.lock()?.barrier.end_frontier_publish()
     }
 
     /// Marks root enumeration finished for `cycle`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn finish_enumeration(&self, cycle: u64) -> Result<(), CoreError> {
         self.lock()?.barrier.finish_enumeration(cycle)
     }
 
     /// Acknowledges gray entries incorporated into the candidate.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn drain_gray(&self, through_epoch: u64) -> Result<(), CoreError> {
         self.lock()?.barrier.drain_gray(through_epoch)
     }
 
     /// Current cycle, for collectors correlating enumeration with seal.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn cycle(&self) -> Result<u64, CoreError> {
         Ok(self.lock()?.barrier.cycle())
     }
 
     /// Current root epoch, for collectors stamping candidates.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn root_epoch(&self) -> Result<u64, CoreError> {
         Ok(self.lock()?.barrier.root_epoch())
     }
 
     /// Current phase, for parent orchestration and tests.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn phase(&self) -> Result<CollectionPhase, CoreError> {
         Ok(self.lock()?.barrier.phase())
     }
 
     /// Seals the candidate, minting the token the parent carries through the
     /// durable sweep-record commit.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn seal_candidate(
         &self,
         cycle: u64,
@@ -477,6 +632,13 @@ impl LeaseRegistry {
     }
 
     /// Applies the parent's sweep-record commit outcome.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn sweep_record_outcome(
         &self,
         token: &SealedCycle,
@@ -487,6 +649,13 @@ impl LeaseRegistry {
 
     /// Completes `Sweep` after the lane's final durable cursor/retirement
     /// transaction. The registry deletes nothing itself.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn complete_sweep(&self, token: &SealedCycle) -> Result<(), CoreError> {
         self.lock()?.barrier.complete_sweep(token)
     }
@@ -495,6 +664,13 @@ impl LeaseRegistry {
     /// lock during sweep phases with cycle revalidation after; condemned
     /// members reject `E_LIMIT` before effects, everything else retains its
     /// original locator, delta base, and depth.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn check_dedupe(&self, head: &Head) -> Result<Dedupe, CoreError> {
         let snapshot = {
             let state = self.lock()?;
@@ -517,6 +693,13 @@ impl LeaseRegistry {
     /// Minimum retained-operation floor over live lease pins and the running
     /// collection window. The parent validates actual retained operations
     /// against this pin under sole lane ownership before pruning.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn min_retained_floor(&self) -> Result<Option<OperationId>, CoreError> {
         let state = self.lock()?;
         Ok(
@@ -530,11 +713,25 @@ impl LeaseRegistry {
     }
 
     /// Copied rows and bytes recorded for `lease`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn page_stats(&self, lease: &LeaseId) -> Result<(u64, u64), CoreError> {
         self.lock()?.table.page_stats(lease)
     }
 
     /// Live lease count, including expired-but-protected entries.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn lease_count(&self) -> Result<usize, CoreError> {
         Ok(self.lock()?.table.len())
     }
@@ -542,6 +739,13 @@ impl LeaseRegistry {
     /// Builds a condemned candidate builder charging this registry's books
     /// and spilling under its scratch directory.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn condemned_builder(self: &Arc<Self>) -> CondemnedBuilder {
         CondemnedBuilder::new(&self.books, &self.scratch_dir)
     }
@@ -567,6 +771,28 @@ fn unstage_root(live: &mut HashMap<Head, u32>, root: &Head) {
         if *count == 0 {
             live.remove(root);
         }
+    }
+}
+
+impl LeaseRegistry {
+    /// Checks a claim-list page cursor against its leased view.
+    ///
+    /// Claim paging entry over [`LeaseRegistry::check_cursor`]: binding
+    /// mismatch is `E_FORBIDDEN`, correct binding on expired authority is
+    /// `E_LEASE_LOST`. The caller lists from the cursor position only after
+    /// this check succeeds, so paged claim lists stay bound to the immutable
+    /// leased view.
+    ///
+    /// # Errors
+    /// `E_FORBIDDEN` when the cursor binding differs from the request;
+    /// `E_LEASE_LOST` when the lease is unknown, retired, or expired.
+    pub(crate) fn check_claim_page_cursor(
+        &self,
+        cursor: &PageCursor,
+        want: &CursorWant,
+        now: Instant,
+    ) -> Result<LeaseBinding, CoreError> {
+        self.check_cursor(cursor, want, now)
     }
 }
 
@@ -716,7 +942,7 @@ mod tests {
         let clock = test_clock();
         let registry = LeaseRegistry::new(clock.clone(), scratch_dir("floor"));
         let start = now(&clock);
-        let (id, _observer, guard) = registry
+        let (_id, _observer, guard) = registry
             .acquire(args(LeaseKind::Bulk, Vec::new()), start)
             .expect("acquire");
         assert_eq!(
@@ -819,7 +1045,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::ELimit);
         assert_eq!(registry.lease_count().expect("count"), 0);
         // Post-pivot root stays live in the same phase.
-        registry
+        let (_id, _observer, _guard) = registry
             .acquire(
                 args(LeaseKind::Bulk, vec![(head(6), RootOrigin::PostPivot)]),
                 start,
@@ -1067,27 +1293,5 @@ mod tests {
         assert_eq!(registry.min_retained_floor().expect("floor"), None);
         assert!(registry.frontier_snapshot().expect("snapshot").is_empty());
         let _ = std::fs::remove_dir_all(scratch_dir("concurrent"));
-    }
-}
-
-impl LeaseRegistry {
-    /// Checks a claim-list page cursor against its leased view.
-    ///
-    /// Claim paging entry over [`LeaseRegistry::check_cursor`]: binding
-    /// mismatch is `E_FORBIDDEN`, correct binding on expired authority is
-    /// `E_LEASE_LOST`. The caller lists from the cursor position only after
-    /// this check succeeds, so paged claim lists stay bound to the immutable
-    /// leased view.
-    ///
-    /// # Errors
-    /// `E_FORBIDDEN` when the cursor binding differs from the request;
-    /// `E_LEASE_LOST` when the lease is unknown, retired, or expired.
-    pub(crate) fn check_claim_page_cursor(
-        &self,
-        cursor: &PageCursor,
-        want: &CursorWant,
-        now: Instant,
-    ) -> Result<LeaseBinding, CoreError> {
-        self.check_cursor(cursor, want, now)
     }
 }

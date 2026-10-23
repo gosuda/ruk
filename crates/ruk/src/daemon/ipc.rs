@@ -17,35 +17,41 @@ use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::protocol::{SCHEMA_MAJOR, SCHEMA_MINOR};
 
 /// Maximum payload bytes of one data frame.
-pub const MAX_DATA_CHUNK_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_DATA_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Maximum payload bytes of one control frame.
-pub const MAX_IPC_CONTROL_BYTES: usize = 1024 * 1024;
+/// Maximum payload bytes of one control frame, aligned with the schema
+/// `control_frame_bytes` limit. The per-stream credit window stays bounded
+/// at [`MAX_STREAM_WINDOW_BYTES`], so a large bound widens no window.
+pub(crate) const MAX_IPC_CONTROL_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stream identifier of the connection control channel.
-pub const CONTROL_STREAM_ID: u64 = 0;
+pub(crate) const CONTROL_STREAM_ID: u64 = 0;
 
 /// Credit bytes granted to each direction of a new stream.
-pub const INITIAL_STREAM_WINDOW_BYTES: u64 = 256 * 1024;
+pub(crate) const INITIAL_STREAM_WINDOW_BYTES: u64 = 256 * 1024;
 
 /// Credit bytes one direction of one stream may hold at most.
-pub const MAX_STREAM_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_STREAM_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Wire width of the frame length prefix in bytes.
-pub const FRAME_PREFIX_BYTES: usize = 4;
+pub(crate) const FRAME_PREFIX_BYTES: usize = 4;
 
 /// Wire width of the kind plus stream identifier header in bytes.
-pub const FRAME_HEADER_BYTES: usize = 9;
+pub(crate) const FRAME_HEADER_BYTES: usize = 9;
 
-/// Feature strings this daemon build negotiates, matching the Forgejo
-/// Go backend client: directional credit flow, structured merge notices,
-/// and outcome lookup for reconnects.
-pub const SUPPORTED_FEATURES: &[&str] = &["credits", "merge-notices", "outcome-lookup"];
+/// Feature strings this daemon build negotiates: directional credit flow,
+/// hook invocation, event streaming, and archive access.
+pub(crate) const SUPPORTED_FEATURES: &[&str] = &["credits", "hooks.v1", "events.v1", "archive.v1"];
 
 /// The kind byte of one IPC frame.
+///
+/// Discriminant 9 is retired: it once named `MergeNotices`, and it is never
+/// reused, so old captures still fail closed as unknown kinds instead of
+/// decoding as something else. Discriminants are postcard-stable and are
+/// never renumbered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum FrameKind {
+pub(crate) enum FrameKind {
     /// Opens one invocation stream with a JSON [`super::InvocationOpen`].
     Open = 1,
     /// Accepts one invocation stream with a JSON accepted document.
@@ -62,12 +68,15 @@ pub enum FrameKind {
     WindowUpdate = 7,
     /// Cancels its stream, or every stream on the control channel.
     Cancel = 8,
-    /// Carries bounded structured merge notices toward the client.
-    MergeNotices = 9,
     /// Ends one invocation with a JSON [`super::ExitReport`].
     Exit = 10,
-    /// Reports one invocation failure with a JSON [`super::ErrorReport`].
+    /// Reports one invocation failure with a JSON `ErrorReply` document
+    /// (see `ruk_core::protocol`).
     Error = 11,
+    /// Carries one hook invocation toward the hook host (control frame).
+    HookCall = 12,
+    /// Carries one hook result toward the daemon (control frame).
+    HookReply = 13,
 }
 
 impl FrameKind {
@@ -75,7 +84,7 @@ impl FrameKind {
     ///
     /// # Errors
     /// `E_INVALID` for an unknown discriminant.
-    pub fn from_u8(byte: u8) -> Result<Self, CoreError> {
+    pub(crate) fn from_u8(byte: u8) -> Result<Self, CoreError> {
         match byte {
             1 => Ok(Self::Open),
             2 => Ok(Self::Accepted),
@@ -85,9 +94,10 @@ impl FrameKind {
             6 => Ok(Self::Stderr),
             7 => Ok(Self::WindowUpdate),
             8 => Ok(Self::Cancel),
-            9 => Ok(Self::MergeNotices),
             10 => Ok(Self::Exit),
             11 => Ok(Self::Error),
+            12 => Ok(Self::HookCall),
+            13 => Ok(Self::HookReply),
             _ => Err(CoreError::new(
                 ErrorCode::EInvalid,
                 format!("unknown IPC frame kind {byte}"),
@@ -97,7 +107,7 @@ impl FrameKind {
 
     /// Encodes this kind as one wire byte.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub(crate) const fn as_u8(self) -> u8 {
         match self {
             Self::Open => 1,
             Self::Accepted => 2,
@@ -107,15 +117,16 @@ impl FrameKind {
             Self::Stderr => 6,
             Self::WindowUpdate => 7,
             Self::Cancel => 8,
-            Self::MergeNotices => 9,
             Self::Exit => 10,
             Self::Error => 11,
+            Self::HookCall => 12,
+            Self::HookReply => 13,
         }
     }
 
     /// True for raw-byte data frames, false for JSON control frames.
     #[must_use]
-    pub const fn is_data(self) -> bool {
+    pub(crate) const fn is_data(self) -> bool {
         match self {
             Self::Stdin | Self::Stdout | Self::Stderr => true,
             Self::Open
@@ -123,16 +134,17 @@ impl FrameKind {
             | Self::StdinEof
             | Self::WindowUpdate
             | Self::Cancel
-            | Self::MergeNotices
             | Self::Exit
-            | Self::Error => false,
+            | Self::Error
+            | Self::HookCall
+            | Self::HookReply => false,
         }
     }
 }
 
 /// One decoded IPC frame: its kind, its stream, and its payload bytes.
 #[derive(Debug)]
-pub struct Frame {
+pub(crate) struct Frame {
     /// The frame kind.
     pub kind: FrameKind,
     /// The stream the frame belongs to; zero is connection control.
@@ -145,7 +157,11 @@ pub struct Frame {
 ///
 /// # Errors
 /// `E_LIMIT` when the payload exceeds its kind's bound.
-pub fn encode_frame(kind: FrameKind, stream_id: u64, payload: &[u8]) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn encode_frame(
+    kind: FrameKind,
+    stream_id: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, CoreError> {
     let bound = if kind.is_data() {
         MAX_DATA_CHUNK_BYTES
     } else {
@@ -154,7 +170,7 @@ pub fn encode_frame(kind: FrameKind, stream_id: u64, payload: &[u8]) -> Result<V
     if payload.len() > bound {
         return Err(CoreError::new(
             ErrorCode::ELimit,
-            format!("IPC frame payload exceeds its bound"),
+            "IPC frame payload exceeds its bound".to_string(),
         ));
     }
     let length = u32::try_from(FRAME_HEADER_BYTES + payload.len())
@@ -173,7 +189,7 @@ pub fn encode_frame(kind: FrameKind, stream_id: u64, payload: &[u8]) -> Result<V
 /// `E_LIMIT` for an over-bound announced length or payload,
 /// `E_INVALID` for a short or unknown frame, `E_IO` for transport
 /// failures, `E_COORDINATOR_UNRESPONSIVE` on deadline expiry.
-pub async fn read_frame<S: AsyncRead + Unpin>(
+pub(crate) async fn read_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     deadline: Instant,
 ) -> Result<Frame, CoreError> {
@@ -225,7 +241,7 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
 /// # Errors
 /// As for [`encode_frame`], plus `E_IO` and deadline expiry as for
 /// [`read_frame`].
-pub async fn write_frame<S: AsyncWrite + Unpin>(
+pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     kind: FrameKind,
     stream_id: u64,
@@ -248,7 +264,7 @@ pub async fn write_frame<S: AsyncWrite + Unpin>(
 
 /// One direction of one stream's credit window.
 #[derive(Clone, Copy, Debug)]
-pub struct CreditWindow {
+pub(crate) struct CreditWindow {
     /// The most credit bytes this direction may hold.
     capacity: u64,
     /// The credit bytes currently available for writes.
@@ -259,7 +275,7 @@ impl CreditWindow {
     /// Builds one window capped at `capacity_bytes`, starting at the lesser
     /// of `initial_bytes` and the capacity.
     #[must_use]
-    pub const fn new(capacity_bytes: u64, initial_bytes: u64) -> Self {
+    pub(crate) const fn new(capacity_bytes: u64, initial_bytes: u64) -> Self {
         Self {
             capacity: capacity_bytes,
             available: if initial_bytes < capacity_bytes {
@@ -271,7 +287,7 @@ impl CreditWindow {
     }
 
     /// Adds `bytes` of credit, saturating at the capacity.
-    pub fn grant(&mut self, bytes: u64) {
+    pub(crate) fn grant(&mut self, bytes: u64) {
         self.available = self.available.saturating_add(bytes).min(self.capacity);
     }
 
@@ -279,7 +295,7 @@ impl CreditWindow {
     ///
     /// # Errors
     /// `E_LIMIT` when the window holds fewer than `bytes`.
-    pub fn consume(&mut self, bytes: u64) -> Result<(), CoreError> {
+    pub(crate) fn consume(&mut self, bytes: u64) -> Result<(), CoreError> {
         if self.available < bytes {
             return Err(CoreError::new(
                 ErrorCode::ELimit,
@@ -291,21 +307,35 @@ impl CreditWindow {
     }
 
     /// Returns the credit bytes currently available.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
-    pub const fn available(self) -> u64 {
+    pub(crate) const fn available(self) -> u64 {
         self.available
     }
 
     /// Returns the most credit bytes this direction may hold.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the test target calls this at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
-    pub const fn capacity(self) -> u64 {
+    pub(crate) const fn capacity(self) -> u64 {
         self.capacity
     }
 }
 
 /// Per-stream directional credit windows of one connection.
 #[derive(Debug)]
-pub struct StreamCredits {
+pub(crate) struct StreamCredits {
     /// Bytes the client may still send per stream.
     inbound: HashMap<u64, CreditWindow>,
     /// Bytes the daemon may still send per stream.
@@ -318,7 +348,7 @@ impl StreamCredits {
     /// Builds empty credit state granting `default_window_bytes` per new
     /// direction, capped by [`MAX_STREAM_WINDOW_BYTES`].
     #[must_use]
-    pub fn new(default_window_bytes: u64) -> Self {
+    pub(crate) fn new(default_window_bytes: u64) -> Self {
         Self {
             inbound: HashMap::new(),
             outbound: HashMap::new(),
@@ -327,23 +357,17 @@ impl StreamCredits {
     }
 
     /// Registers both directions of `stream_id` with the default window.
-    pub fn open_stream(&mut self, stream_id: u64) {
+    pub(crate) fn open_stream(&mut self, stream_id: u64) {
         let window = CreditWindow::new(MAX_STREAM_WINDOW_BYTES, self.default_window);
         self.inbound.insert(stream_id, window);
         self.outbound.insert(stream_id, window);
-    }
-
-    /// Forgets both directions of `stream_id`.
-    pub fn close_stream(&mut self, stream_id: u64) {
-        self.inbound.remove(&stream_id);
-        self.outbound.remove(&stream_id);
     }
 
     /// Adds `bytes` of outbound credit to `stream_id`.
     ///
     /// # Errors
     /// `E_INVALID` for an unknown stream.
-    pub fn grant_outbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
+    pub(crate) fn grant_outbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
         match self.outbound.get_mut(&stream_id) {
             Some(window) => {
                 window.grant(bytes);
@@ -360,7 +384,7 @@ impl StreamCredits {
     ///
     /// # Errors
     /// `E_INVALID` for an unknown stream.
-    pub fn grant_inbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
+    pub(crate) fn grant_inbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
         match self.inbound.get_mut(&stream_id) {
             Some(window) => {
                 window.grant(bytes);
@@ -377,7 +401,7 @@ impl StreamCredits {
     ///
     /// # Errors
     /// `E_INVALID` for an unknown stream, `E_LIMIT` on exhaustion.
-    pub fn consume_outbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
+    pub(crate) fn consume_outbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
         match self.outbound.get_mut(&stream_id) {
             Some(window) => window.consume(bytes),
             None => Err(CoreError::new(
@@ -391,7 +415,7 @@ impl StreamCredits {
     ///
     /// # Errors
     /// `E_INVALID` for an unknown stream, `E_LIMIT` on exhaustion.
-    pub fn consume_inbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
+    pub(crate) fn consume_inbound(&mut self, stream_id: u64, bytes: u64) -> Result<(), CoreError> {
         match self.inbound.get_mut(&stream_id) {
             Some(window) => window.consume(bytes),
             None => Err(CoreError::new(
@@ -404,15 +428,17 @@ impl StreamCredits {
 
 /// The client's stream-zero handshake proposal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandshakeHello {
+pub(crate) struct HandshakeHello {
     /// The client's protocol major version.
     pub protocol_major: u32,
-    /// The client's protocol minor version. The Forgejo Go backend omits
+    /// The client's protocol minor version. Older clients omit
     /// this field, so it defaults to zero (unknown) instead of rejecting
     /// the handshake.
     #[serde(default)]
     pub protocol_minor: u32,
-    /// The requested service profile, such as `forgejo`.
+    /// The requested service profile. This build serves the `host` profile:
+    /// the daemon accepts any non-empty profile and echoes it back in the
+    /// acceptance, leaving profile gating to later changesets.
     pub profile: String,
     /// The object formats the client speaks, such as `sha1`.
     pub object_formats: Vec<String>,
@@ -422,12 +448,12 @@ pub struct HandshakeHello {
 
 /// The daemon's stream-zero handshake acceptance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandshakeAccept {
+pub(crate) struct HandshakeAccept {
     /// The negotiated protocol major version.
     pub protocol_major: u32,
     /// The negotiated protocol minor version.
     pub protocol_minor: u32,
-    /// The accepted service profile.
+    /// The accepted service profile, echoed from the handshake proposal.
     pub profile: String,
     /// The object formats both peers speak.
     pub object_formats: Vec<String>,
@@ -435,12 +461,16 @@ pub struct HandshakeAccept {
     pub features: Vec<String>,
 }
 
-/// Negotiates one handshake proposal against this build.
+/// Negotiates one handshake proposal against this build: the acceptance
+/// echoes the proposed profile, takes the lesser of the two protocol
+/// minor versions, and carries the intersection of the proposed features
+/// with [`SUPPORTED_FEATURES`]. Unknown feature names are ignored, never
+/// an error.
 ///
 /// # Errors
 /// `E_VERSION` on a protocol major mismatch, `E_INVALID` on an empty
 /// profile or empty object-format list.
-pub fn negotiate(hello: &HandshakeHello) -> Result<HandshakeAccept, CoreError> {
+pub(crate) fn negotiate(hello: &HandshakeHello) -> Result<HandshakeAccept, CoreError> {
     if hello.protocol_major != SCHEMA_MAJOR {
         return Err(CoreError::new(
             ErrorCode::EVersion,
@@ -481,7 +511,7 @@ pub fn negotiate(hello: &HandshakeHello) -> Result<HandshakeAccept, CoreError> {
 /// # Errors
 /// `E_LIMIT` above [`MAX_IPC_CONTROL_BYTES`], `E_INVALID` when the value
 /// has no JSON form.
-pub fn encode_control<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn encode_control<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
     let text = sonic_rs::to_string(value).map_err(|err| {
         CoreError::new(
             ErrorCode::EInvalid,
@@ -502,7 +532,7 @@ pub fn encode_control<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
 /// # Errors
 /// `E_LIMIT` above [`MAX_IPC_CONTROL_BYTES`], `E_INVALID` on malformed
 /// JSON or a shape mismatch.
-pub fn decode_control<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
+pub(crate) fn decode_control<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
     if bytes.len() > MAX_IPC_CONTROL_BYTES {
         return Err(CoreError::new(
             ErrorCode::ELimit,
@@ -518,7 +548,7 @@ pub fn decode_control<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError>
 }
 /// The authenticated local peer of one Unix-socket connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PeerIdentity {
+pub(crate) struct PeerIdentity {
     /// The peer's user identifier.
     pub uid: u32,
     /// The peer's group identifier.
@@ -531,9 +561,9 @@ pub struct PeerIdentity {
 ///
 /// # Errors
 /// `E_IO` when peer credentials are unavailable, `E_FORBIDDEN` when the
-/// peer's user is outside `allowed_uids` (empty allows every local peer).
+/// peer's user is outside `allowed_uids` (an empty list denies every peer).
 #[cfg(unix)]
-pub fn authenticate_peer(
+pub(crate) fn authenticate_peer(
     stream: &tokio::net::UnixStream,
     allowed_uids: &[u32],
 ) -> Result<PeerIdentity, CoreError> {
@@ -544,10 +574,10 @@ pub fn authenticate_peer(
         )
     })?;
     let uid = cred.uid();
-    if !allowed_uids.is_empty() && !allowed_uids.contains(&uid) {
+    if !allowed_uids.contains(&uid) {
         return Err(CoreError::new(
             ErrorCode::EForbidden,
-            "Unix-socket peer user is not an authorized Forgejo service identity",
+            "Unix-socket peer user is not an authorized service identity",
         ));
     }
     let gid = cred.gid();
@@ -585,12 +615,28 @@ mod tests {
 
     #[test]
     fn frame_kind_round_trip() {
-        for byte in 1u8..=11u8 {
+        for byte in (1u8..=8u8).chain(10u8..=13u8) {
             let kind = FrameKind::from_u8(byte).expect("known kind decodes");
             assert_eq!(kind.as_u8(), byte);
         }
+        // Discriminant 9 is retired and never reused.
+        assert!(FrameKind::from_u8(9).is_err());
         assert!(FrameKind::from_u8(0).is_err());
-        assert!(FrameKind::from_u8(12).is_err());
+        assert!(FrameKind::from_u8(14).is_err());
+        assert_eq!(FrameKind::from_u8(12), Ok(FrameKind::HookCall));
+        assert_eq!(FrameKind::from_u8(13), Ok(FrameKind::HookReply));
+        assert!(!FrameKind::HookCall.is_data());
+        assert!(!FrameKind::HookReply.is_data());
+    }
+
+    #[test]
+    fn control_encode_refuses_over_bound() {
+        use super::{ErrorCode, encode_control};
+
+        assert!(encode_control(&"small".to_string()).is_ok());
+        assert!(encode_control(&"x".repeat(MAX_IPC_CONTROL_BYTES - 2)).is_ok());
+        let err = encode_control(&"x".repeat(MAX_IPC_CONTROL_BYTES)).expect_err("over bound");
+        assert_eq!(err.code, ErrorCode::ELimit);
     }
 
     #[test]
@@ -613,6 +659,15 @@ mod tests {
     }
 
     #[test]
+    fn control_bound_matches_schema_limit() {
+        assert_eq!(MAX_IPC_CONTROL_BYTES, 16 * 1024 * 1024);
+        let midsize = vec![0u8; 2 * 1024 * 1024];
+        assert!(encode_frame(FrameKind::Open, 1, &midsize).is_ok());
+        let oversized = vec![0u8; MAX_IPC_CONTROL_BYTES + 1];
+        assert!(encode_frame(FrameKind::Open, 1, &oversized).is_err());
+    }
+
+    #[test]
     fn credit_window_exhaustion_fails() {
         let mut window = CreditWindow::new(100, 100);
         assert!(window.consume(64).is_ok());
@@ -631,8 +686,25 @@ mod tests {
         assert!(credits.consume_outbound(7, 2048).is_err());
         assert!(credits.grant_outbound(7, 4096).is_ok());
         assert!(credits.consume_outbound(7, 2048).is_ok());
-        credits.close_stream(7);
-        assert!(credits.grant_outbound(7, 1).is_err());
+        assert!(credits.grant_outbound(8, 1).is_err());
+    }
+
+    #[test]
+    fn handshake_negotiates_feature_intersection() {
+        let hello = HandshakeHello {
+            protocol_major: super::SCHEMA_MAJOR,
+            protocol_minor: 0,
+            profile: String::from("host"),
+            object_formats: vec![String::from("sha1")],
+            features: vec![
+                String::from("credits"),
+                String::from("hooks.v1"),
+                String::from("no-such-feature"),
+            ],
+        };
+        let accept = negotiate(&hello).expect("unknown names still negotiate");
+        assert_eq!(accept.profile, "host");
+        assert_eq!(accept.features, ["credits", "hooks.v1"].map(String::from));
     }
 
     #[test]
@@ -640,7 +712,7 @@ mod tests {
         let hello = HandshakeHello {
             protocol_major: 999,
             protocol_minor: 0,
-            profile: String::from("forgejo"),
+            profile: String::from("host"),
             object_formats: vec![String::from("sha1")],
             features: Vec::new(),
         };

@@ -39,6 +39,13 @@ const TAG_GIT: u8 = 0;
 const TAG_CONFLICTED: u8 = 1;
 
 /// Scratch file name prefix for sealed condemned sets.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 const CONDEMNED_PREFIX: &str = "condemned-";
 
 /// Encodes one root identity as a fixed v1 record.
@@ -59,12 +66,26 @@ pub(crate) fn encode_record(head: &Head) -> [u8; RECORD_LEN] {
 }
 
 /// Converts a precise byte count into the budget charge form.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn charge_len(len: usize) -> Result<u64, CoreError> {
     u64::try_from(len)
         .map_err(|_| CoreError::new(ErrorCode::ECapacity, "condemned size overflows u64"))
 }
 
 /// Reserves `bytes` from `books` before the bytes exist.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn reserve_before(books: &Arc<ByteBudget>, bytes: u64) -> Result<ByteReservation, CoreError> {
     books.reserve(bytes).map_err(|refused| {
         CoreError::new(
@@ -78,6 +99,13 @@ fn reserve_before(books: &Arc<ByteBudget>, bytes: u64) -> Result<ByteReservation
 ///
 /// Every push reserves exactly [`RECORD_LEN`] bytes before the record exists.
 /// Refusal poisons the builder against further input and reports `E_LIMIT`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct CondemnedBuilder {
     books: Arc<ByteBudget>,
     scratch_dir: PathBuf,
@@ -89,6 +117,13 @@ pub(crate) struct CondemnedBuilder {
 impl CondemnedBuilder {
     /// Starts an empty candidate; performs no I/O and reserves nothing yet.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn new(books: &Arc<ByteBudget>, scratch_dir: &Path) -> Self {
         Self {
             books: Arc::clone(books),
@@ -100,6 +135,13 @@ impl CondemnedBuilder {
     }
 
     /// Appends one root identity, reserving its exact record bytes first.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn push(&mut self, head: &Head) -> Result<(), CoreError> {
         if self.failed {
             return Err(CoreError::new(
@@ -123,12 +165,26 @@ impl CondemnedBuilder {
 
     /// Whether no record has been pushed.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
     /// Sorts, deduplicates, writes the sealed file, and builds the charged
     /// block index. File I/O runs here, outside any registry lock.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn seal(mut self, cycle: u64) -> Result<CondemnedSet, CoreError> {
         if self.failed {
             return Err(CoreError::new(
@@ -169,6 +225,13 @@ impl CondemnedBuilder {
 }
 
 /// Writes sorted records to a uniquely named scratch file.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn write_sealed_file(dir: &Path, records: &[[u8; RECORD_LEN]]) -> Result<PathBuf, CoreError> {
     fs::create_dir_all(dir).map_err(|err| {
         CoreError::new(
@@ -220,6 +283,10 @@ fn write_sealed_file(dir: &Path, records: &[[u8; RECORD_LEN]]) -> Result<PathBuf
 pub(crate) struct CondemnedSet {
     path: PathBuf,
     index: Vec<[u8; RECORD_LEN]>,
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     file_charges: Vec<ByteReservation>,
     _index_charge: Option<ByteReservation>,
     len: u64,
@@ -230,6 +297,13 @@ impl CondemnedSet {
     /// An empty set bound to `cycle`: no file, no I/O, never a member.
     /// Reserves nothing because an empty index and zero records charge zero.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn empty(cycle: u64) -> Self {
         Self {
             path: PathBuf::new(),
@@ -243,18 +317,39 @@ impl CondemnedSet {
 
     /// The collection cycle this set was sealed for.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn cycle(&self) -> u64 {
         self.cycle
     }
 
     /// Number of distinct condemned roots.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
 
     /// Whether the set holds no roots.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -333,7 +428,7 @@ impl CondemnedSet {
                 format!("condemned block read failed: {err}"),
             )
         })?;
-        Ok(buf.chunks_exact(RECORD_LEN).any(|chunk| chunk == needle))
+        Ok(buf.as_chunks::<RECORD_LEN>().0.contains(&needle))
     }
 }
 

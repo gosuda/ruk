@@ -30,6 +30,7 @@ use crate::ids::{HashKind, Oid};
 use crate::store::MAX_DELTA_DEPTH;
 use crate::store::delta::{self, IO_CHUNK, classify_read};
 use crate::store::error::StoreError;
+use crate::store::pinned::PinnedRoot;
 use crate::store::spool::{PreparationBudget, Spool, SpoolView, SpoolWriter, io_to_store, to_u64};
 use crate::store::types::{Encoding, ObjectKind, PreparedObject, ReadObject};
 
@@ -284,11 +285,12 @@ struct Job<'a> {
     decoded_len: u64,
     budget: &'a Arc<PreparationBudget>,
     store_root: &'a Path,
+    pin: &'a PinnedRoot,
 }
 
 impl Job<'_> {
     fn writer(&self) -> SpoolWriter {
-        SpoolWriter::new(self.budget, self.store_root)
+        SpoolWriter::new(self.budget, self.store_root, self.pin)
     }
 
     fn prepared(
@@ -354,6 +356,10 @@ fn vet_predecessor<'a>(
 /// differs from `decoded_len` or the predecessor is unusable, `E_IO` for
 /// read or scratch failures. A failure leaves no visible state: every spool
 /// and reservation is released.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the frozen store integration contract names each of these inputs"
+)]
 pub(crate) fn prepare_object(
     hash_kind: HashKind,
     kind: ObjectKind,
@@ -362,6 +368,7 @@ pub(crate) fn prepare_object(
     predecessor: Option<(Oid, &ReadObject)>,
     budget: &Arc<PreparationBudget>,
     store_root: &Path,
+    pin: &PinnedRoot,
 ) -> Result<PreparedObject, StoreError> {
     if let Some(max) = budget.limits().max_object_bytes
         && decoded_len > max
@@ -376,6 +383,7 @@ pub(crate) fn prepare_object(
         decoded_len,
         budget,
         store_root,
+        pin,
     };
     let base = vet_predecessor(&job, predecessor)?;
     let encode_allowance = if decoded_len <= SMALL_OBJECT && base.is_none() {
@@ -704,6 +712,7 @@ pub(crate) fn decode_record(
     base: Option<(Oid, SpoolView<'_>)>,
     budget: &Arc<PreparationBudget>,
     store_root: &Path,
+    pin: &PinnedRoot,
 ) -> Result<Spool, StoreError> {
     if oid.kind() != hash_kind {
         return Err(StoreError::ObjectFormat(format!(
@@ -722,7 +731,7 @@ pub(crate) fn decode_record(
     };
     let mut tee = HashTee::new(
         start_hasher(hash_kind, kind, decoded_len),
-        SpoolWriter::new(budget, store_root),
+        SpoolWriter::new(budget, store_root, pin),
     );
     // The streaming chunk lives only in the arms that copy through it. The
     // Delta arm decodes via `apply_delta`'s own bounded buffers and must not

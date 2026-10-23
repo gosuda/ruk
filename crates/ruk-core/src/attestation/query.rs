@@ -19,8 +19,9 @@ use crate::protocol::{
 use crate::store::{FactRow, Store};
 
 use super::layout::{
-    ORDER_PREFIX, group_prefix, order_group_prefix, order_kind_prefix, parse_order_key,
-    parse_statement_key, subject_kind_prefix, subject_prefix,
+    ORDER_PREFIX, group_prefix, order_group_prefix, order_kind_prefix, order_kind_prefix_scan,
+    parse_order_key, parse_statement_key, subject_kind_prefix, subject_kind_prefix_scan,
+    subject_prefix,
 };
 use super::rows::{corrupt, decode_row, load_group, read_statement};
 use super::status;
@@ -39,10 +40,33 @@ pub struct StatementFilter {
     pub subject: Option<Oid>,
     /// Only statements of this kind.
     pub kind: Option<AttestKind>,
+    /// Only statements whose kind starts with this prefix. Combines with
+    /// `kind`: a statement matches when its kind equals `kind` and starts
+    /// with `kind_prefix`.
+    pub kind_prefix: Option<AttestKind>,
     /// Only statements by this signer.
     pub signer: Option<SignerFingerprint>,
     /// Whether superseded statements are returned, with their status.
     pub include_superseded: bool,
+}
+
+/// Whether a scanned statement's kind passes the filter's kind selectors.
+fn kind_matches(filter: &StatementFilter, kind: &str) -> bool {
+    if filter
+        .kind
+        .as_ref()
+        .is_some_and(|exact| exact.as_str() != kind)
+    {
+        return false;
+    }
+    if filter
+        .kind_prefix
+        .as_ref()
+        .is_some_and(|prefix| !kind.starts_with(prefix.as_str()))
+    {
+        return false;
+    }
+    true
 }
 
 /// One page of statements.
@@ -80,18 +104,19 @@ pub enum Gap {
 
 /// One land requirement with the latest signing time it accepts.
 ///
-/// The signed schema carries no expiry field, so the bound travels with the
-/// requirement instead: a live match counts only when its signed `signed_at`
-/// is at or before [`BoundedRequirement::valid_until`]. A later-signed match
-/// is expired for this requirement. This mirrors the planned
-/// `AttestRequirement::valid_until` protocol bound; when the protocol gains
-/// that field this wrapper folds into it.
+/// The bound travels with the requirement, mirroring the
+/// [`AttestRequirement::valid_until`](crate::protocol::AttestRequirement::valid_until)
+/// protocol field: a live match counts only when its signed `signed_at`
+/// is at or before the bound. A later-signed match is expired for this
+/// requirement. An absent bound never expires.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundedRequirement {
     /// The kind and result a trusted signer's live statement must carry.
     pub requirement: AttestRequirement,
-    /// The latest `signed_at` this requirement accepts.
-    pub valid_until: Timestamp,
+    /// The latest `signed_at` this requirement accepts, if any. This is
+    /// the enforced bound; callers source it from the requirement's own
+    /// `valid_until` field.
+    pub valid_until: Option<Timestamp>,
 }
 
 /// Whether one requirement is met, and by what.
@@ -347,7 +372,7 @@ pub fn evaluate_bounded_requirements(
             store,
             subject,
             &bounded.requirement,
-            Some(bounded.valid_until),
+            bounded.valid_until,
             &signers,
             &mut groups,
             &mut work,
@@ -366,7 +391,7 @@ pub fn evaluate_bounded_requirements(
 }
 
 /// Rejects over-limit or trustless land evaluations before any store read.
-fn check_land_policy(
+pub(crate) fn check_land_policy(
     requirement_count: usize,
     trusted: &[SignerFingerprint],
 ) -> Result<BTreeSet<&SignerFingerprint>, CoreError> {
@@ -465,6 +490,7 @@ enum Source {
 /// The family a filter scans and the prefix that bounds the scan. Filters that
 /// the prefix cannot express are checked per row.
 fn plan(filter: &StatementFilter) -> (Source, Vec<u8>) {
+    let prefix = filter.kind_prefix.as_ref().map(|prefix| prefix.as_str());
     match (&filter.subject, &filter.kind, &filter.signer) {
         (Some(subject), Some(kind), Some(signer)) => (
             Source::Statements,
@@ -474,13 +500,26 @@ fn plan(filter: &StatementFilter) -> (Source, Vec<u8>) {
             Source::Statements,
             subject_kind_prefix(subject, kind.as_str()),
         ),
-        (Some(subject), None, _) => (Source::Statements, subject_prefix(subject)),
+        (Some(subject), None, _) => match prefix {
+            Some(prefix) => (
+                Source::Statements,
+                subject_kind_prefix_scan(subject, prefix),
+            ),
+            None => (Source::Statements, subject_prefix(subject)),
+        },
         (None, Some(kind), Some(signer)) => (
             Source::Order,
             order_group_prefix(kind.as_str(), signer.as_str()),
         ),
         (None, Some(kind), None) => (Source::Order, order_kind_prefix(kind.as_str())),
-        (None, None, _) => (Source::Order, ORDER_PREFIX.to_vec()),
+        (None, None, Some(_)) => match prefix {
+            Some(prefix) => (Source::Order, order_kind_prefix_scan(prefix)),
+            None => (Source::Order, ORDER_PREFIX.to_vec()),
+        },
+        (None, None, None) => match prefix {
+            Some(prefix) => (Source::Order, order_kind_prefix_scan(prefix)),
+            None => (Source::Order, ORDER_PREFIX.to_vec()),
+        },
     }
 }
 
@@ -508,6 +547,9 @@ fn resolve_statement_row(
     let Some((_, fields)) = parse_statement_key(&row.key, store.hash_kind().oid_len()) else {
         return corrupt(store, "statement row key is malformed");
     };
+    if !kind_matches(filter, fields.kind) {
+        return Ok(None);
+    }
     if filter
         .signer
         .as_ref()
@@ -528,6 +570,9 @@ fn resolve_order_row(
     let Some(fields) = parse_order_key(&row.key) else {
         return corrupt(store, "order index key is malformed");
     };
+    if !kind_matches(filter, fields.kind) {
+        return Ok(None);
+    }
     if filter
         .signer
         .as_ref()

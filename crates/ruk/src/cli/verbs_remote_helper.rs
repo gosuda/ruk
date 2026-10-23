@@ -90,7 +90,7 @@
 //! overwrites the same refs with the same values.
 
 use std::io::{BufRead, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ruk_core::ids::HashKind;
 use ruk_core::refdata::{RefName, RefRead as _, RefTarget};
@@ -349,7 +349,7 @@ fn helper_root(env: &CliEnv, url: &str) -> Result<PathBuf, GitError> {
 /// Mirrors the serve verbs' fallback: a repository root holding `.ruk`
 /// first, then whatever `open_local_store` recognizes (a bare store
 /// directory), so both layouts answer the helper.
-fn open_helper_store(root: &PathBuf) -> Result<Store, GitError> {
+fn open_helper_store(root: &Path) -> Result<Store, GitError> {
     match open_store_at(root) {
         Ok(store) => Ok(store),
         Err(first) => match open_local_store(root) {
@@ -372,6 +372,7 @@ fn helper_ctx(session: &HelperSession, store: Store) -> Result<Ctx, GitError> {
         bare: true,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private(),
     })
 }
 

@@ -13,15 +13,15 @@
 //! 10. Cancellation before publication and receiver drop after commit
 //! 11. Fail-closed ambiguous storage error handling
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jiff::SignedDuration;
 use tokio::sync::oneshot;
 
+use super::commit::{StoreFailureKind, classify_store_error};
 use super::*;
 use crate::bytes::ByteString;
 use crate::change::{ClaimId, RequestId, SessionId, WorkspaceId};
@@ -29,20 +29,19 @@ use crate::coord::cancel::cancellation;
 use crate::coord::clock::Clock;
 use crate::coord::oplog;
 use crate::coord::policy::{Policy, PolicySource, Principal};
-use crate::coord::receipt;
-use crate::coord::rows::{self, SessionRow, WorkspaceRow};
+use crate::coord::rows::{self, WorkspaceRow};
 use crate::coord::session::{SessionLive, SessionTable, prepare_open};
 use crate::error::ErrorCode;
 use crate::ids::HashKind;
 use crate::index::RepoPath;
 use crate::protocol::{
-    ClaimAcquireArgs, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimTtl, Method, Mutation,
+    ClaimAcquireArgs, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimTtl, Mutation,
     MutationOutcome, ReceiptRef, Reply, Request, RequestDigest, SessionOpenArgs, Timestamp,
     WorkspaceInit, WsNewArgs, WsNewReply,
 };
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
 use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject};
-use crate::store::{PreparationBudget, Store, StoreError};
+use crate::store::{EventContext, EventSource, PreparationBudget, Store, StoreError};
 use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState};
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -149,6 +148,11 @@ fn dummy_mutation_request(request_id: RequestId) -> (Request, Reply) {
     (req, reply)
 }
 
+fn ref_value(n: u8) -> Vec<u8> {
+    let oid = crate::ids::Oid::from_hex(&format!("{n:040x}")).expect("test oid");
+    crate::store::encode("ref target", &RefTarget::Direct(oid)).expect("encode test target")
+}
+
 fn make_candidate(
     session: Arc<SessionLive>,
     principal: Principal,
@@ -198,13 +202,13 @@ fn test_1_two_disjoint_requests_in_one_batch() {
         table: FactTable::Refs,
         key: b"refs/heads/branch-1".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-value-1".to_vec()),
+        value: Some(ref_value(1)),
     };
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/branch-2".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-value-2".to_vec()),
+        value: Some(ref_value(2)),
     };
 
     let cand1 = make_candidate(
@@ -282,13 +286,13 @@ fn test_2_per_session_activity_coalescing() {
         table: FactTable::Refs,
         key: b"refs/heads/feature-a".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-a".to_vec()),
+        value: Some(ref_value(11)),
     };
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/feature-b".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-b".to_vec()),
+        value: Some(ref_value(12)),
     };
 
     let cand1 = make_candidate(
@@ -347,7 +351,7 @@ fn test_3_exact_duplicate_coalescing_and_mismatched_digest() {
         table: FactTable::Refs,
         key: b"refs/heads/dedup".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-dedup".to_vec()),
+        value: Some(ref_value(13)),
     };
 
     let cand1 = make_candidate(
@@ -524,6 +528,8 @@ fn test_4_stale_same_workspace_rejection_and_epoch_first_fencing() {
                 expected: FactExpectation::Absent,
                 value: Some(encoded_ws),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .unwrap();
 
@@ -692,7 +698,7 @@ fn test_6_receipt_replay_despite_expiry_or_stale_stamp() {
         table: FactTable::Refs,
         key: b"refs/heads/replay-branch".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"committed-value".to_vec()),
+        value: Some(ref_value(21)),
     };
 
     let cand = make_candidate(
@@ -820,11 +826,13 @@ fn test_8_atomic_domain_op_receipt_head_after_reopen() {
         .expect("prepare blob");
     let prep_oid = prep.oid();
 
+    let target_bytes =
+        crate::store::encode("ref target", &RefTarget::Direct(prep_oid)).expect("encode target");
     let fact = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/persisted".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(prep_oid.as_bytes().to_vec()),
+        value: Some(target_bytes.clone()),
     };
 
     let cand = make_candidate(session, principal, req_id, vec![prep], vec![fact]);
@@ -863,7 +871,7 @@ fn test_8_atomic_domain_op_receipt_head_after_reopen() {
         .fact(FactTable::Refs, b"refs/heads/persisted")
         .unwrap()
         .expect("ref fact persisted");
-    assert_eq!(ref_bytes, prep_oid.as_bytes());
+    assert_eq!(ref_bytes, target_bytes);
 
     // Verify op header exists
     let op_header = oplog::read_header(&reopened, op_id)
@@ -902,17 +910,19 @@ fn test_9_overlapping_candidates_deferred_with_owned_spools_intact() {
 
     let same_key = b"refs/heads/contended".to_vec();
 
+    let first = ref_value(31);
+    let second = ref_value(32);
     let fact1 = FactMutation {
         table: FactTable::Refs,
         key: same_key.clone(),
         expected: FactExpectation::Absent,
-        value: Some(b"first".to_vec()),
+        value: Some(first.clone()),
     };
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: same_key,
-        expected: FactExpectation::Value(b"first".to_vec()),
-        value: Some(b"second".to_vec()),
+        expected: FactExpectation::Value(first),
+        value: Some(second),
     };
 
     let cand1 = make_candidate(
@@ -998,7 +1008,7 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
         table: FactTable::Refs,
         key: b"refs/heads/cancelled".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"val".to_vec()),
+        value: Some(ref_value(25)),
     };
     let mut cand = make_candidate(
         Arc::clone(&session),
@@ -1038,11 +1048,12 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
     let (tx2, rx2) = oneshot::channel();
     drop(rx2); // Receiver dropped before publication begins
 
+    let survived = ref_value(26);
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/dropped-rx".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"survives".to_vec()),
+        value: Some(survived.clone()),
     };
     let cand2 = make_candidate(
         session,
@@ -1071,7 +1082,7 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
             .fact(FactTable::Refs, b"refs/heads/dropped-rx")
             .unwrap()
             .unwrap(),
-        b"survives"
+        survived
     );
 }
 
@@ -1192,6 +1203,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 paths: paths.clone(),
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
         }));
         let reply = Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
@@ -1217,6 +1229,8 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 paths,
                 mode: ClaimMode::Enforce,
                 expires_at: Timestamp::new(jiff::Timestamp::now()),
+                on_behalf_of: None,
+                subject: None,
             },
         }));
         let (handle, cancel) = cancellation();
@@ -1331,7 +1345,9 @@ fn branch_write_candidate(
         table: FactTable::Refs,
         key: name.as_bytes().to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(vec![oid_byte; 20]),
+        value: Some(
+            crate::store::encode("ref target", &RefTarget::Direct(oid)).expect("encode target"),
+        ),
     };
     let request_id = RequestId::generate();
     let (req, reply) = dummy_mutation_request(request_id);
@@ -1606,7 +1622,10 @@ fn symbolic_link_candidate(
         table: FactTable::Refs,
         key: name.as_bytes().to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(target.as_bytes().to_vec()),
+        value: Some(
+            crate::store::encode("ref target", &RefTarget::Symbolic(target.clone()))
+                .expect("encode target"),
+        ),
     };
     let request_id = RequestId::generate();
     let (req, reply) = dummy_mutation_request(request_id);
@@ -1751,5 +1770,175 @@ fn test_18_symbolic_cycle_halves_serialize_across_batches() {
     assert!(
         accumulator3.can_admit(&right_item),
         "links sharing one target must share one batch"
+    );
+}
+
+/// Tag and freeze for one tag never share a batch: `tag.set` moves the
+/// `Refs` row while guarding the `ReleasedTags` row absent, and the new
+/// `release.freeze.set` pins the live tag with a `Refs` guard plus its
+/// `ReleasedTags` marker. Both touch the same `Refs` key and the same
+/// `ReleasedTags` key, so `has_key_conflict` (via `can_admit`) defers the
+/// second in either arrival order.
+#[test]
+fn test_19_tag_set_and_release_freeze_set_for_same_tag_serialize() {
+    let (_temp, store, _clock, session_table, _policy_source, principal, idle) =
+        ref_test_setup("tag-freeze-conflict");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+    let session3 = test_session(&session_table, &principal, idle);
+    let session4 = test_session(&session_table, &principal, idle);
+
+    let name = RefName::new("refs/tags/v1").expect("valid tag name");
+    let live_oid = crate::ids::Oid::from_bytes(&[0x11; 20]).expect("test oid");
+    let live_target = RefTarget::Direct(live_oid);
+    let live_bytes = crate::store::encode("ref target", &live_target).expect("encode live target");
+    // Real store fixture: the live tag freeze requires.
+    store
+        .publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::Refs,
+                key: name.as_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(live_bytes.clone()),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("seed live tag");
+
+    // Real `tag.set` facts: move the live tag, guarding the marker absent.
+    let moved_oid = crate::ids::Oid::from_bytes(&[0x22; 20]).expect("test oid");
+    let tag_transaction = RefTransaction::new(
+        HashKind::Sha1,
+        vec![RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Present(live_target.clone()),
+            change: RefChange::Set(RefTarget::Direct(moved_oid)),
+        }],
+    )
+    .expect("valid tag transaction");
+    let tag_facts = crate::refs::prepare_checked_transaction(&store, &tag_transaction)
+        .expect("prepare tag.set")
+        .into_mutations();
+    assert!(
+        tag_facts
+            .iter()
+            .any(|fact| fact.table == FactTable::Refs && fact.key == name.as_bytes()),
+        "tag.set touches the tag Refs row"
+    );
+
+    // Real `release.freeze.set` facts: the new Vec API pins the live tag
+    // with a Refs guard plus its ReleasedTags marker.
+    let marker = crate::refs::ReleasedTagMarker {
+        owner_release_id: "rel-1".to_owned(),
+        target_oid: live_oid,
+        frozen_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+    };
+    let freeze_facts = crate::refs::prepare_release_freeze(&store, &name, &marker)
+        .expect("prepare freeze at the live target");
+    assert_eq!(
+        freeze_facts.len(),
+        2,
+        "fresh freeze carries the Refs guard plus the marker"
+    );
+    assert!(
+        freeze_facts
+            .iter()
+            .any(|fact| fact.table == FactTable::Refs && fact.key == name.as_bytes()),
+        "freeze carries the Refs guard driving has_key_conflict"
+    );
+    assert!(
+        freeze_facts
+            .iter()
+            .any(|fact| fact.table == FactTable::ReleasedTags && fact.key == name.as_bytes()),
+        "freeze carries the ReleasedTags marker"
+    );
+
+    // Direct `has_key_conflict`: the freeze touches keys the tag batch holds.
+    {
+        let mut touched: std::collections::HashMap<FactTable, std::collections::HashSet<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for fact in &tag_facts {
+            touched
+                .entry(fact.table)
+                .or_default()
+                .insert(fact.key.clone());
+        }
+        let probe = make_candidate(
+            Arc::clone(&session1),
+            principal.clone(),
+            RequestId::generate(),
+            Vec::new(),
+            freeze_facts.clone(),
+        );
+        let probe_item = BatchItem::Mutation {
+            candidate: Box::new(probe),
+            reply_tx: None,
+        };
+        assert!(
+            probe_item.has_key_conflict(&touched),
+            "freeze after tag.set hits the same Refs/ReleasedTags keys"
+        );
+    }
+
+    let tag_candidate = make_candidate(
+        session1,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        tag_facts.clone(),
+    );
+    let freeze_candidate = make_candidate(
+        session2,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        freeze_facts.clone(),
+    );
+    let tag_item = BatchItem::Mutation {
+        candidate: Box::new(tag_candidate),
+        reply_tx: None,
+    };
+    let freeze_item = BatchItem::Mutation {
+        candidate: Box::new(freeze_candidate),
+        reply_tx: None,
+    };
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&tag_item));
+    accumulator.add(tag_item);
+    assert!(
+        !accumulator.can_admit(&freeze_item),
+        "freeze.set after tag.set on the same tag must defer"
+    );
+
+    let freeze_candidate2 = make_candidate(
+        session3,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        freeze_facts,
+    );
+    let tag_candidate2 = make_candidate(
+        session4,
+        principal,
+        RequestId::generate(),
+        Vec::new(),
+        tag_facts,
+    );
+    let freeze_item2 = BatchItem::Mutation {
+        candidate: Box::new(freeze_candidate2),
+        reply_tx: None,
+    };
+    let tag_item2 = BatchItem::Mutation {
+        candidate: Box::new(tag_candidate2),
+        reply_tx: None,
+    };
+    let mut accumulator2 = BatchAccumulator::new();
+    assert!(accumulator2.can_admit(&freeze_item2));
+    accumulator2.add(freeze_item2);
+    assert!(
+        !accumulator2.can_admit(&tag_item2),
+        "tag.set after freeze.set on the same tag must defer"
     );
 }

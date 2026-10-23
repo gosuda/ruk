@@ -25,19 +25,23 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::archive_zip::{header_name, parse_octal, pax_path_record, tar_to_zip};
 use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::{StoreRefs, all_reflog_oids};
-use ruk_core::store::{FactExpectation, FactMutation, FactTable, ObjectKind, Store};
+use ruk_core::store::{
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, ObjectKind, Store,
+};
 use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
+use ruk_git::transport::credentials::{AuthPolicy, TransportAuth};
 use ruk_git::transport::fetch::{self, FetchWireRequest};
 use ruk_git::transport::mirror::{prune_for_spec, push_mirror_updates};
 use ruk_git::transport::net::{self, Endpoint};
 use ruk_git::transport::pack::IngestLimits;
-use ruk_git::transport::push::{PushUpdate, PushWireRequest};
+use ruk_git::transport::push::{PushUpdate, PushWireRequest, RefOutcome, RefResult};
 use ruk_git::transport::refadv::{AdvertisedRef, Capabilities};
 use ruk_git::transport::serve::{HeadAdvertisement, serve_receive_pack, serve_upload_pack};
 use ruk_git::transport::serve_v2::{git_protocol_requests_v2, serve_upload_pack_v2};
@@ -51,7 +55,7 @@ use super::state::{
     is_ancestor, list_refs, load_or_default, open_store_at, remote_fetch_specs, remote_root,
     resolve_rev, scan_index, walk_history,
 };
-use super::{Ctx, FlagSpec, collect, line};
+use super::{Collected, Ctx, FlagSpec, collect, line};
 
 /// Downloads objects and refs from a local repository.
 ///
@@ -92,8 +96,14 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
     let remote_label = configured_name(ctx, target).unwrap_or_else(|| target.to_owned());
     let spec_texts: Vec<String> = if opts.positionals.len() > 1 {
@@ -115,6 +125,7 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         depth,
         fetch_tags: opts.is_set("tags"),
         prune: opts.is_set("prune"),
+        auth,
     };
     let (out, tips) = run_fetch(ctx, &remote_label, &spec_texts, plan)?;
     // Mirror LFS sync, after the refs moved: walks the newly-arrived tips
@@ -143,6 +154,12 @@ pub(crate) struct PushFlags {
     pub(crate) want_lfs: bool,
     /// Skip the `pre-push` hook.
     pub(crate) no_verify: bool,
+    /// Credential policy for the network legs, from `--auth-stdin`.
+    pub(crate) auth: AuthPolicy,
+    /// Cancellation handle for the push transfer steps. The CLI runs
+    /// unattended today, so this starts untripped; tests and the hosted
+    /// mirror job arm it with their own lease or deadline.
+    pub(crate) interrupt: Interrupt,
 }
 
 /// How a fetch updates refs. Data, not selectors: one plan per invocation.
@@ -155,6 +172,8 @@ pub(crate) struct FetchPlan {
     pub(crate) fetch_tags: bool,
     /// Delete remote-tracking refs whose upstream counterpart is gone.
     pub(crate) prune: bool,
+    /// Credential policy for the network legs, from `--auth-stdin`.
+    pub(crate) auth: AuthPolicy,
 }
 
 /// Where a fetch/push/ls-remote target points: a local repository root or
@@ -188,9 +207,14 @@ fn resolve_target(ctx: &Ctx, target: &str) -> Result<Target, GitError> {
 /// The source side of one fetch: a local store or a network endpoint.
 enum FetchSource {
     /// A local source store.
-    Local(Store),
+    Local(Box<Store>),
     /// A network endpoint (refs discover over a separate connection).
-    Net(Endpoint),
+    Net {
+        /// The endpoint the pack connection opens.
+        endpoint: Endpoint,
+        /// Egress policy for the pack connection, carried from discovery.
+        egress: net::EgressPolicy,
+    },
     /// A smart-http base plus its upload-pack advertisement: discovery
     /// already ran for refspec expansion, and the fetch POST reuses the
     /// same caps (stateless, so no connection is held).
@@ -202,6 +226,12 @@ enum FetchSource {
         /// Resolved `http.extraHeader` rows for the base, reused by the
         /// fetch POST (stateless, so no connection is held).
         extra_headers: Vec<(String, String)>,
+        /// Credential policy for the fetch POST, carried from discovery.
+        auth: AuthPolicy,
+        /// Egress policy for the fetch POST, carried from discovery.
+        egress: net::EgressPolicy,
+        /// PEM trust bundle for the fetch POST, carried from discovery.
+        tls_roots: Option<Vec<u8>>,
     },
     /// A smart-http v2 base plus its capability advertisement: refs came
     /// from one `ls-refs` RPC and the fetch POSTs `command=fetch`
@@ -213,6 +243,12 @@ enum FetchSource {
         caps: Capabilities,
         /// Resolved `http.extraHeader` rows for the base.
         extra_headers: Vec<(String, String)>,
+        /// Credential policy for the fetch POST, carried from discovery.
+        auth: AuthPolicy,
+        /// Egress policy for the fetch POST, carried from discovery.
+        egress: net::EgressPolicy,
+        /// PEM trust bundle for the fetch POST, carried from discovery.
+        tls_roots: Option<Vec<u8>>,
     },
     /// A dumb-http base: the smart advertisement was absent, so discovery
     /// fell back to the text `info/refs` file (the same fallback `git`
@@ -222,6 +258,12 @@ enum FetchSource {
         base: String,
         /// Resolved `http.extraHeader` rows for the base.
         extra_headers: Vec<(String, String)>,
+        /// Credential policy for the dumb fetch reads, carried from discovery.
+        auth: AuthPolicy,
+        /// Egress policy for the dumb fetch reads, carried from discovery.
+        egress: net::EgressPolicy,
+        /// PEM trust bundle for the dumb fetch reads, carried from discovery.
+        tls_roots: Option<Vec<u8>>,
     },
 }
 
@@ -254,39 +296,76 @@ fn extra_header_scope(name: &str) -> Option<Option<String>> {
 fn http_extra_headers(ctx: &Ctx, url: &str) -> Vec<(String, String)> {
     use ruk_git::transport::{credentials, http};
     let mut rows = credentials::http_extra_header_rows();
-    if let Ok(store) = ctx.store() {
-        if let Ok(pairs) = super::state::config_list(store) {
-            let mut scoped = Vec::new();
-            let mut unscoped = None;
-            for (name, value) in &pairs {
-                match extra_header_scope(name) {
-                    Some(None) => unscoped = Some(value.clone()),
-                    Some(Some(scope)) => scoped.push((scope, value.clone())),
-                    None => {}
-                }
+    if let Ok(store) = ctx.store()
+        && let Ok(pairs) = super::state::config_list(store)
+    {
+        let mut scoped = Vec::new();
+        let mut unscoped = None;
+        for (name, value) in &pairs {
+            match extra_header_scope(name) {
+                Some(None) => unscoped = Some(value.clone()),
+                Some(Some(scope)) => scoped.push((scope, value.clone())),
+                None => {}
             }
-            if let Some(value) = unscoped {
-                rows.push(http::ExtraHeaderRow { scope: None, value });
-            }
-            scoped.sort();
-            for (scope, value) in scoped {
-                rows.push(http::ExtraHeaderRow {
-                    scope: Some(scope),
-                    value,
-                });
-            }
+        }
+        if let Some(value) = unscoped {
+            rows.push(http::ExtraHeaderRow { scope: None, value });
+        }
+        scoped.sort();
+        for (scope, value) in scoped {
+            rows.push(http::ExtraHeaderRow {
+                scope: Some(scope),
+                value,
+            });
         }
     }
     for (key, value) in &ctx.cli_config {
-        match extra_header_scope(key) {
-            Some(scope) => rows.push(http::ExtraHeaderRow {
+        if let Some(scope) = extra_header_scope(key) {
+            rows.push(http::ExtraHeaderRow {
                 scope,
                 value: value.clone(),
-            }),
-            None => {}
+            })
         }
     }
     http::extra_headers_for_url(url, &rows)
+}
+
+/// Resolves the `http.sslCAInfo` trust bundle for one network verb: an
+/// explicit path from `-c` overrides or the repo store, read as PEM.
+/// `None` keeps the Mozilla roots. The git-config-file layer is not read
+/// here (no generic single-key file reader exists yet); store rows and
+/// explicit `-c http.sslCAInfo=...` cover daemon-managed and explicit
+/// CLI use.
+///
+/// # Errors
+/// [`GitError::Io`] when the configured path does not read.
+fn tls_roots_for(ctx: &Ctx) -> Result<Option<Vec<u8>>, GitError> {
+    let Some(path) = ctx.config_get("http.sslCAInfo") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+    std::fs::read(&path).map(Some).map_err(|err| GitError::Io {
+        detail: format!("cannot read tls bundle {path:?}: {err}"),
+    })
+}
+
+/// Resolves the transport credential policy for one network verb:
+/// `--auth-stdin` carries a JSON [`TransportAuth`] record on stdin and
+/// yields the Explicit policy (fail closed on a malformed record), while
+/// its absence yields the Ambient policy over the captured environment
+/// map, so helpers and config resolve hermetically under test.
+fn invocation_auth(ctx: &Ctx, opts: &Collected) -> Result<AuthPolicy, GitError> {
+    if opts.is_set("auth-stdin") {
+        let bytes = super::read_stdin_bytes(&ctx.env)?;
+        let auth: TransportAuth = sonic_rs::from_slice(&bytes).map_err(|_| GitError::Invalid {
+            detail: "--auth-stdin needs a JSON TransportAuth record".to_owned(),
+        })?;
+        auth.validate()?;
+        return Ok(AuthPolicy::explicit(auth));
+    }
+    Ok(AuthPolicy::ambient_in(ctx.env.vars.clone()))
 }
 
 /// Expands refspecs, negotiates the pack, and updates refs.
@@ -311,6 +390,7 @@ pub(crate) fn run_fetch(
 ) -> Result<(Vec<u8>, Vec<Oid>), GitError> {
     let dest = ctx.store()?;
     let dest_kind = ctx.kind()?;
+    let tls_roots = tls_roots_for(ctx)?;
     let (source, advertised) = match resolve_target(ctx, remote_label)? {
         Target::Local(src_root) => {
             let src = open_store_at(&src_root)?;
@@ -320,10 +400,11 @@ pub(crate) fn run_fetch(
                 });
             }
             let advertised = advertise(&src)?;
-            (FetchSource::Local(src), advertised)
+            (FetchSource::Local(Box::new(src)), advertised)
         }
         Target::Net(endpoint) => match endpoint {
             Endpoint::Http { url, .. } => {
+                ruk_git::transport::credentials::refuse_url_userinfo(&url, &plan.auth)?;
                 let base = ruk_git::transport::smart_http::normalize_base(&url)?;
                 let extra_headers = http_extra_headers(ctx, &base);
                 // Highest protocol first: one `Git-Protocol` GET parses
@@ -332,7 +413,13 @@ pub(crate) fn run_fetch(
                     &base,
                     ruk_git::transport::smart_http::SmartService::UploadPack,
                     dest_kind,
-                    &extra_headers,
+                    ruk_git::transport::smart_http::RpcCall {
+                        extra: &extra_headers,
+                        auth: &plan.auth,
+                        egress: &ctx.egress,
+                        tls_roots: tls_roots.as_deref(),
+                        interrupt: &Interrupt::none(),
+                    },
                 ) {
                     Ok(ruk_git::transport::smart_http::VersionedDiscovery::V2(caps)) => {
                         let refs = ruk_git::transport::smart_http::ls_refs_v2(
@@ -340,8 +427,13 @@ pub(crate) fn run_fetch(
                             &caps,
                             dest_kind,
                             &[],
-                            &Interrupt::none(),
-                            &extra_headers,
+                            ruk_git::transport::smart_http::RpcCall {
+                                extra: &extra_headers,
+                                auth: &plan.auth,
+                                egress: &ctx.egress,
+                                tls_roots: tls_roots.as_deref(),
+                                interrupt: &Interrupt::none(),
+                            },
                         )?;
                         let advertised = net::to_local_refs(refs)?;
                         (
@@ -349,6 +441,9 @@ pub(crate) fn run_fetch(
                                 base,
                                 caps,
                                 extra_headers,
+                                auth: plan.auth.clone(),
+                                egress: ctx.egress.clone(),
+                                tls_roots: tls_roots.clone(),
                             },
                             advertised,
                         )
@@ -360,6 +455,9 @@ pub(crate) fn run_fetch(
                                 base,
                                 adv,
                                 extra_headers,
+                                auth: plan.auth.clone(),
+                                egress: ctx.egress.clone(),
+                                tls_roots: tls_roots.clone(),
                             },
                             advertised,
                         )
@@ -368,13 +466,22 @@ pub(crate) fn run_fetch(
                         let adv = ruk_git::transport::dumb_http::discover(
                             &base,
                             dest_kind,
-                            &extra_headers,
+                            ruk_git::transport::smart_http::RpcCall {
+                                extra: &extra_headers,
+                                auth: &plan.auth,
+                                egress: &ctx.egress,
+                                tls_roots: tls_roots.as_deref(),
+                                interrupt: &Interrupt::none(),
+                            },
                         )?;
                         let advertised = net::to_local_refs(adv.refs.clone())?;
                         (
                             FetchSource::DumbHttp {
                                 base,
                                 extra_headers,
+                                auth: plan.auth.clone(),
+                                egress: ctx.egress.clone(),
+                                tls_roots: tls_roots.clone(),
                             },
                             advertised,
                         )
@@ -387,8 +494,21 @@ pub(crate) fn run_fetch(
                     &endpoint,
                     Service::UploadPack,
                     dest_kind,
+                    ruk_git::transport::smart_http::RpcCall {
+                        extra: &[],
+                        auth: &plan.auth,
+                        egress: &ctx.egress,
+                        tls_roots: tls_roots.as_deref(),
+                        interrupt: &ruk_git::transport::Interrupt::none(),
+                    },
                 )?)?;
-                (FetchSource::Net(endpoint), advertised)
+                (
+                    FetchSource::Net {
+                        endpoint,
+                        egress: ctx.egress.clone(),
+                    },
+                    advertised,
+                )
             }
         },
     };
@@ -396,7 +516,7 @@ pub(crate) fn run_fetch(
     for spec_text in spec_texts {
         match &source {
             FetchSource::Local(src) => pairs.extend(expand_spec(src, &advertised, spec_text)?),
-            FetchSource::Net(_)
+            FetchSource::Net { .. }
             | FetchSource::Http { .. }
             | FetchSource::HttpV2 { .. }
             | FetchSource::DumbHttp { .. } => {
@@ -459,22 +579,21 @@ pub(crate) fn run_fetch(
         let oid = fetched.oid;
         let name = &fetched.name;
         let target = &fetched.target;
-        let current = dest_refs
-            .get(name)
-            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
-        if !plan.force_all && !fetched.force {
-            if let Some(old) = current_as_direct(&current) {
-                // Runs after phase one publishes, so the new tip's ancestry
-                // resolves from committed state. A lookup failure still
-                // aborts the fetch: only a proven non-ancestor refuses the
-                // ref, and the published objects stay either way.
-                if !is_ancestor(dest, old, oid)? {
-                    lines.push(format!(
-                        "! rejected {} (non-fast-forward)\n",
-                        name.to_utf8().unwrap_or_default()
-                    ));
-                    continue;
-                }
+        let current = dest_refs.get(name).map_err(GitError::from)?;
+        if !plan.force_all
+            && !fetched.force
+            && let Some(old) = current_as_direct(&current)
+        {
+            // Runs after phase one publishes, so the new tip's ancestry
+            // resolves from committed state. A lookup failure still
+            // aborts the fetch: only a proven non-ancestor refuses the
+            // ref, and the published objects stay either way.
+            if !is_ancestor(dest, old, oid)? {
+                lines.push(format!(
+                    "! rejected {} (non-fast-forward)\n",
+                    name.to_utf8().unwrap_or_default()
+                ));
+                continue;
             }
         }
         let expected = current.map(RefExpect::Present).unwrap_or(RefExpect::Absent);
@@ -491,9 +610,7 @@ pub(crate) fn run_fetch(
         ));
     }
     for name in &pruned {
-        let current = dest_refs
-            .get(name)
-            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+        let current = dest_refs.get(name).map_err(GitError::from)?;
         let Some(RefTarget::Direct(oid)) = current else {
             continue;
         };
@@ -533,7 +650,12 @@ pub(crate) fn run_fetch(
         // Ref updates only: the objects published in phase one stay even
         // when every update below is a prune delete or a refusal left no
         // updates at all.
-        dest.publish(Vec::new(), &ref_mutations)?;
+        dest.publish(
+            Vec::new(),
+            &ref_mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
     }
     let mut out = lines.concat().into_bytes();
     out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
@@ -582,8 +704,8 @@ fn fetch_objects_only(
                 &Interrupt::none(),
             )?;
         }
-        FetchSource::Net(endpoint) => {
-            fetch_pack_net(dest, endpoint, remote_label, &request, &[], &[])?;
+        FetchSource::Net { .. } => {
+            fetch_pack_net(dest, source, remote_label, &request, &[], &[])?;
         }
         FetchSource::Http { .. } => {
             fetch_pack_http(dest, source, remote_label, &request, &[], &[])?;
@@ -606,13 +728,23 @@ fn fetch_objects_only(
 /// Oracle: `git/builtin/fetch.c`.
 fn fetch_pack_net(
     dest: &Store,
-    endpoint: &Endpoint,
+    source: &FetchSource,
     remote_label: &str,
     request: &FetchWireRequest,
     tracking: &[(RefName, RefTarget)],
     ref_mutations: &[FactMutation],
 ) -> Result<(), GitError> {
-    let stream = net::open_stream(endpoint, Service::UploadPack)?;
+    let FetchSource::Net { endpoint, egress } = source else {
+        return Err(GitError::Invalid {
+            detail: "network fetch needs a network source".to_owned(),
+        });
+    };
+    let stream = net::open_stream(
+        endpoint,
+        Service::UploadPack,
+        egress,
+        &ruk_git::transport::Interrupt::none(),
+    )?;
     let received = fetch::receive(
         stream,
         dest.hash_kind(),
@@ -649,6 +781,9 @@ fn fetch_pack_http(
         base,
         adv,
         extra_headers,
+        auth,
+        egress,
+        tls_roots,
     } = source
     else {
         return Err(GitError::Invalid {
@@ -661,8 +796,13 @@ fn fetch_pack_http(
         dest,
         request,
         IngestLimits::default(),
-        &Interrupt::none(),
-        extra_headers,
+        ruk_git::transport::smart_http::RpcCall {
+            extra: extra_headers,
+            auth,
+            egress,
+            tls_roots: tls_roots.as_deref(),
+            interrupt: &Interrupt::none(),
+        },
     )?;
     publish_received(
         dest,
@@ -692,6 +832,9 @@ fn fetch_pack_http_v2(
         base,
         caps,
         extra_headers,
+        auth,
+        egress,
+        tls_roots,
     } = source
     else {
         return Err(GitError::Invalid {
@@ -704,8 +847,13 @@ fn fetch_pack_http_v2(
         dest,
         request,
         IngestLimits::default(),
-        &Interrupt::none(),
-        extra_headers,
+        ruk_git::transport::smart_http::RpcCall {
+            extra: extra_headers,
+            auth,
+            egress,
+            tls_roots: tls_roots.as_deref(),
+            interrupt: &Interrupt::none(),
+        },
     )?;
     publish_received(
         dest,
@@ -735,6 +883,9 @@ fn fetch_pack_dumb(
     let FetchSource::DumbHttp {
         base,
         extra_headers,
+        auth,
+        egress,
+        tls_roots,
     } = source
     else {
         return Err(GitError::Invalid {
@@ -746,8 +897,13 @@ fn fetch_pack_dumb(
         dest,
         request,
         IngestLimits::default(),
-        &Interrupt::none(),
-        extra_headers,
+        ruk_git::transport::smart_http::RpcCall {
+            extra: extra_headers,
+            auth,
+            egress,
+            tls_roots: tls_roots.as_deref(),
+            interrupt: &Interrupt::none(),
+        },
     )?;
     publish_received(
         dest,
@@ -963,15 +1119,15 @@ fn expand_glob(
         let name = RefName::new(mapped).map_err(|err| GitError::Invalid {
             detail: format!("mapped ref refused: {err}"),
         })?;
-        if let RefTarget::Direct(oid) = &entry.target {
-            if entry.name.starts_with(b"refs/heads/") || entry.name.starts_with(b"refs/tags/") {
-                out.push(FetchedRef {
-                    oid: *oid,
-                    name,
-                    target: entry.target.clone(),
-                    force: spec.force,
-                });
-            }
+        if let RefTarget::Direct(oid) = &entry.target
+            && (entry.name.starts_with(b"refs/heads/") || entry.name.starts_with(b"refs/tags/"))
+        {
+            out.push(FetchedRef {
+                oid: *oid,
+                name,
+                target: entry.target.clone(),
+                force: spec.force,
+            });
         }
     }
     Ok(out)
@@ -990,19 +1146,18 @@ fn resolve_advertised(
         format!("refs/tags/{src}"),
     ];
     for guess in &guesses {
-        match advertised
+        if let Some(entry) = advertised
             .iter()
             .find(|entry| String::from_utf8_lossy(&entry.name) == *guess)
         {
-            Some(entry) => match &entry.target {
+            match &entry.target {
                 RefTarget::Direct(oid) => return Ok((*oid, entry.target.clone())),
                 RefTarget::Symbolic(_) => {
                     return Err(GitError::Invalid {
                         detail: format!("cannot fetch unborn ref {src:?}"),
                     });
                 }
-            },
-            None => {}
+            }
         }
     }
     Oid::from_hex(src)
@@ -1030,11 +1185,7 @@ fn dwell_dest(store: &Store, text: &str) -> Result<RefName, GitError> {
         let name = RefName::new(candidate).map_err(|err| GitError::Invalid {
             detail: format!("bad destination ref: {err}"),
         })?;
-        if reader
-            .get(&name)
-            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?
-            .is_some()
-        {
+        if reader.get(&name).map_err(GitError::from)?.is_some() {
             return Ok(name);
         }
     }
@@ -1127,6 +1278,8 @@ fn write_fetch_head(ctx: &Ctx, pairs: &[FetchedRef]) -> Result<Vec<u8>, GitError
                 expected,
                 value: Some(text.into_bytes()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(Vec::new())
@@ -1147,12 +1300,20 @@ fn configured_name(ctx: &Ctx, target: &str) -> Option<String> {
 ///
 /// Oracle: `git/builtin/pull.c`.
 pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
-    let specs = [FlagSpec {
-        long: "ff-only",
-        short: None,
-        takes_value: false,
-    }];
+    let specs = [
+        FlagSpec {
+            long: "ff-only",
+            short: None,
+            takes_value: false,
+        },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
+    ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     ctx.require_worktree()?;
     let (target, branch_arg) = match opts.positionals.as_slice() {
         [] => ("origin", None),
@@ -1186,6 +1347,7 @@ pub(crate) fn pull(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         depth: None,
         fetch_tags: false,
         prune: false,
+        auth,
     };
     let (_, _) = run_fetch(ctx, &remote_label, &[spec], plan)?;
     let tip = resolve_rev(
@@ -1242,8 +1404,14 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
     let kind = ctx.kind()?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
     // Mirror force: the oracle's `--mirror` forces every ref update, the
@@ -1256,6 +1424,8 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         mirror: opts.is_set("mirror"),
         want_lfs: opts.is_set("lfs"),
         no_verify: opts.is_set("no-verify"),
+        auth,
+        interrupt: Interrupt::none(),
     };
     let remote_label = configured_name(ctx, target).unwrap_or_else(|| target.to_owned());
     if flags.mirror && opts.positionals.len() > 1 {
@@ -1284,7 +1454,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             }
             // Scoped borrows: the store borrow ends before the LFS upload
             // reborrows `ctx` mutably for stderr.
-            let updates = {
+            let (updates, early) = {
                 let store = ctx.store()?;
                 build_push_updates(
                     store,
@@ -1295,6 +1465,18 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                     &|name| peel_dest_oid(&dest, name),
                 )?
             };
+            if flags.atomic && !early.is_empty() {
+                let mut all = early;
+                for update in &updates {
+                    all.push(RefOutcome {
+                        name: update.name.clone(),
+                        result: RefResult::Rejected {
+                            reason: "atomic push withheld: a sibling ref diverged".to_owned(),
+                        },
+                    });
+                }
+                return push_outcomes(all);
+            }
             if !flags.no_verify {
                 let url = ctx
                     .config_get(&format!("remote.{target}.url"))
@@ -1312,7 +1494,9 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 push_lfs_upload(ctx, &updates, &remote_label)?;
             }
             let store = ctx.store()?;
-            push_local(store, &dest, target, kind, flags.atomic, updates)
+            let mut outcomes = push_local(store, &dest, target, kind, &flags, updates)?;
+            outcomes.extend(early);
+            push_outcomes(outcomes)
         }
         Target::Net(endpoint) => {
             push_net(ctx, &endpoint, target, &spec_texts, &flags, &remote_label)
@@ -1336,9 +1520,10 @@ fn default_push_specs(store: &Store) -> Result<Vec<String>, GitError> {
     }
 }
 
-/// Builds push updates from refspecs: deletes resolve the destination name
-/// and zero the tip, sets resolve the source rev locally and check
-/// fast-forward against the destination tip `peel` reports.
+/// Builds the requested updates plus the locally refused ones, isolated
+/// per ref: a diverged spec reports `rejected: non-fast-forward` for its
+/// own ref while the batch proceeds, instead of aborting the sync.
+/// Explicit deletes of hidden refs are refused before any plan exists.
 fn build_push_updates(
     src: &Store,
     dwell: &Store,
@@ -1346,10 +1531,11 @@ fn build_push_updates(
     delete: bool,
     force_all: bool,
     peel: &dyn Fn(&RefName) -> Result<Option<Oid>, GitError>,
-) -> Result<Vec<PushUpdate>, GitError> {
+) -> Result<(Vec<PushUpdate>, Vec<RefOutcome>), GitError> {
     let kind = src.hash_kind();
     let zero = kind.zero_oid();
     let mut updates = Vec::new();
+    let mut refused = Vec::new();
     for spec_text in spec_texts {
         let (force, rest) = spec_text
             .strip_prefix('+')
@@ -1359,9 +1545,18 @@ fn build_push_updates(
             .map_or((rest, rest), |(left, right)| (left, right));
         if delete {
             let name = dwell_dest(dwell, dst_text)?;
+            let bytes = name.as_bytes().to_vec();
+            if ruk_git::transport::mirror::is_mirror_hidden(&bytes) {
+                return Err(GitError::Invalid {
+                    detail: format!(
+                        "refusing to delete hidden {}",
+                        name.to_utf8().unwrap_or_default()
+                    ),
+                });
+            }
             let old = peel(&name)?.unwrap_or(zero);
             updates.push(PushUpdate {
-                name: name.as_bytes().to_vec(),
+                name: bytes,
                 old,
                 new: zero,
             });
@@ -1371,12 +1566,16 @@ fn build_push_updates(
         let name = dwell_dest(dwell, dst_text)?;
         let old = peel(&name)?.unwrap_or(zero);
         if old != zero && !force && !force_all && !is_ancestor(src, old, new)? {
-            return Err(GitError::PushRejected {
-                detail: format!(
-                    "non-fast-forward push to {}",
-                    name.to_utf8().unwrap_or_default()
-                ),
+            refused.push(RefOutcome {
+                name: name.as_bytes().to_vec(),
+                result: RefResult::Rejected {
+                    reason: format!(
+                        "non-fast-forward push to {}",
+                        name.to_utf8().unwrap_or_default()
+                    ),
+                },
             });
+            continue;
         }
         updates.push(PushUpdate {
             name: name.as_bytes().to_vec(),
@@ -1384,7 +1583,7 @@ fn build_push_updates(
             new,
         });
     }
-    Ok(updates)
+    Ok((updates, refused))
 }
 
 /// Pushes prebuilt updates to a local destination through a persisted plan.
@@ -1393,27 +1592,20 @@ fn push_local(
     dest: &Store,
     target: &str,
     kind: HashKind,
-    atomic: bool,
+    flags: &PushFlags,
     updates: Vec<PushUpdate>,
-) -> Result<Vec<u8>, GitError> {
+) -> Result<Vec<ruk_git::transport::push::RefOutcome>, GitError> {
     let request = PushWireRequest {
         updates: updates.clone(),
-        atomic,
+        atomic: flags.atomic,
     };
     let mut plan = ruk_git::transport::push::PushPlanRecord::prepare(
         PlanId::generate(),
         target.as_bytes().to_vec(),
-        atomic,
+        flags.atomic,
         updates,
     );
-    push_outcomes(local_push(
-        dest,
-        src,
-        kind,
-        &mut plan,
-        &request,
-        &Interrupt::none(),
-    )?)
+    local_push(dest, src, kind, &mut plan, &request, &flags.interrupt)
 }
 
 /// Pushes to a network endpoint: discovers the remote tips for CAS
@@ -1431,15 +1623,17 @@ fn push_net(
     remote_label: &str,
 ) -> Result<Vec<u8>, GitError> {
     let kind = ctx.kind()?;
+    let tls_roots = tls_roots_for(ctx)?;
     // Discovery plus the update list under one scoped store borrow, so the
     // LFS upload below can reborrow `ctx` mutably for stderr.
-    let (updates, http_adv) = {
+    let (updates, early, http_adv) = {
         let store = ctx.store()?;
         // HTTP discovery keeps the full advertisement: the POST half reuses
         // its capabilities, while the other transports only need the refs.
         // Stateless, so no connection is held between the two round trips.
         let http_adv = match endpoint {
             Endpoint::Http { url, .. } => {
+                ruk_git::transport::credentials::refuse_url_userinfo(url, &flags.auth)?;
                 let base = ruk_git::transport::smart_http::normalize_base(url)?;
                 let extra_headers = http_extra_headers(ctx, &base);
                 Some((
@@ -1448,7 +1642,13 @@ fn push_net(
                         &base,
                         ruk_git::transport::smart_http::SmartService::ReceivePack,
                         kind,
-                        &extra_headers,
+                        ruk_git::transport::smart_http::RpcCall {
+                            extra: &extra_headers,
+                            auth: &flags.auth,
+                            egress: &ctx.egress,
+                            tls_roots: tls_roots.as_deref(),
+                            interrupt: &flags.interrupt,
+                        },
                     )?,
                     extra_headers,
                 ))
@@ -1461,6 +1661,13 @@ fn push_net(
                 endpoint,
                 Service::ReceivePack,
                 kind,
+                ruk_git::transport::smart_http::RpcCall {
+                    extra: &[],
+                    auth: &flags.auth,
+                    egress: &ctx.egress,
+                    tls_roots: tls_roots.as_deref(),
+                    interrupt: &ruk_git::transport::Interrupt::none(),
+                },
             )?)?,
         };
         let remote: Vec<(Vec<u8>, Oid)> = advertised
@@ -1470,8 +1677,11 @@ fn push_net(
                 RefTarget::Symbolic(_) => None,
             })
             .collect();
-        let updates = if flags.mirror {
-            mirror_push_updates(kind, &direct_tips(store)?, &remote)
+        let (updates, early) = if flags.mirror {
+            (
+                mirror_push_updates(kind, &direct_tips(store)?, &remote),
+                Vec::new(),
+            )
         } else {
             build_push_updates(
                 store,
@@ -1482,7 +1692,19 @@ fn push_net(
                 &|name| peel_advertised(&advertised, name),
             )?
         };
-        (updates, http_adv)
+        if flags.atomic && !early.is_empty() {
+            let mut all = early;
+            for update in &updates {
+                all.push(RefOutcome {
+                    name: update.name.clone(),
+                    result: RefResult::Rejected {
+                        reason: "atomic push withheld: a sibling ref diverged".to_owned(),
+                    },
+                });
+            }
+            return push_outcomes(all);
+        }
+        (updates, early, http_adv)
     };
     if !flags.no_verify {
         let url = ctx
@@ -1518,30 +1740,40 @@ fn push_net(
         flags.atomic,
         updates,
     );
-    match &http_adv {
-        Some((base, adv, extra_headers)) => {
-            push_outcomes(ruk_git::transport::smart_http::push_pack(
-                base,
-                adv,
-                &store,
-                &mut plan,
-                &request,
-                &Interrupt::none(),
-                extra_headers,
-            )?)
-        }
+    let mut outcomes = match &http_adv {
+        Some((base, adv, extra_headers)) => ruk_git::transport::smart_http::push_pack(
+            base,
+            adv,
+            store,
+            &mut plan,
+            &request,
+            ruk_git::transport::smart_http::RpcCall {
+                extra: extra_headers,
+                auth: &flags.auth,
+                egress: &ctx.egress,
+                tls_roots: tls_roots.as_deref(),
+                interrupt: &flags.interrupt,
+            },
+        )?,
         None => {
-            let stream = net::open_stream(endpoint, Service::ReceivePack)?;
-            push_outcomes(ruk_git::transport::push::push_over(
+            let stream = net::open_stream(
+                endpoint,
+                Service::ReceivePack,
+                &ctx.egress,
+                &ruk_git::transport::Interrupt::none(),
+            )?;
+            ruk_git::transport::push::push_over(
                 stream,
                 store,
                 kind,
                 &mut plan,
                 &request,
-                &Interrupt::none(),
-            )?)
+                &flags.interrupt,
+            )?
         }
-    }
+    };
+    outcomes.extend(early);
+    push_outcomes(outcomes)
 }
 
 /// Reads the advertised tip behind one destination ref, if it exists: the
@@ -1615,7 +1847,7 @@ fn push_mirror(
         kind,
         &mut plan,
         &request,
-        &Interrupt::none(),
+        &flags.interrupt,
     )?)
 }
 
@@ -1628,7 +1860,7 @@ fn mirror_push_updates(
 ) -> Vec<PushUpdate> {
     let zero = kind.zero_oid();
     let mut updates = Vec::new();
-    for mirror_update in push_mirror_updates(&local, &remote) {
+    for mirror_update in push_mirror_updates(local, remote) {
         updates.push(PushUpdate {
             name: mirror_update.name,
             old: mirror_update.old.unwrap_or(zero),
@@ -1639,12 +1871,17 @@ fn mirror_push_updates(
 }
 
 /// Direct ref tips of one store as `(name, oid)` pairs; symbolic refs
-/// never enter a mirror update.
+/// never enter a mirror update, and hidden namespaces never leave the
+/// store.
 fn direct_tips(store: &Store) -> Result<Vec<(Vec<u8>, ruk_core::ids::Oid)>, GitError> {
     let mut tips = Vec::new();
     for (name, target) in list_refs(store)? {
         if let RefTarget::Direct(oid) = target {
-            tips.push((name.as_bytes().to_vec(), oid));
+            let bytes = name.as_bytes().to_vec();
+            if ruk_git::transport::mirror::is_mirror_hidden(&bytes) {
+                continue;
+            }
+            tips.push((bytes, oid));
         }
     }
     Ok(tips)
@@ -1677,9 +1914,7 @@ fn push_outcomes(outcomes: Vec<ruk_git::transport::push::RefOutcome>) -> Result<
 
 /// Reads the direct oid behind one destination ref, if it exists.
 fn peel_dest_oid(dest: &Store, name: &RefName) -> Result<Option<Oid>, GitError> {
-    let target = StoreRefs::new(dest)
-        .get(name)
-        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+    let target = StoreRefs::new(dest).get(name).map_err(GitError::from)?;
     match target {
         None => Ok(None),
         Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
@@ -1838,7 +2073,7 @@ enum ServeStore<'a> {
     /// The context store, borrowed.
     Open(&'a Store),
     /// A store opened from `<dir>` for this invocation.
-    Owned(Store),
+    Owned(Box<Store>),
 }
 
 impl std::ops::Deref for ServeStore<'_> {
@@ -1880,9 +2115,9 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
     if let Some(dir) = positionals.first() {
         let path = std::path::Path::new(dir);
         return match open_store_at(path) {
-            Ok(store) => Ok(ServeStore::Owned(store)),
+            Ok(store) => Ok(ServeStore::Owned(Box::new(store))),
             Err(first) => match open_local_store(path) {
-                Ok(store) => Ok(ServeStore::Owned(store)),
+                Ok(store) => Ok(ServeStore::Owned(Box::new(store))),
                 Err(_) => Err(first),
             },
         };
@@ -1895,7 +2130,7 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
     let mut dir = ctx.root.as_path();
     loop {
         if let Ok(store) = open_store_at(dir) {
-            return Ok(ServeStore::Owned(store));
+            return Ok(ServeStore::Owned(Box::new(store)));
         }
         match dir.parent() {
             Some(parent) => dir = parent,
@@ -1915,7 +2150,7 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
 /// link, as every other reader does. A dangling, cyclic, or over-deep chain
 /// advertises the zero OID. A store read failure is not unborn: it propagates,
 /// so a corrupt store never serves a false HEAD.
-fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
+pub(crate) fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
     let (workspace, _) = load_or_default(store)?;
     match workspace.head.resolve(&StoreRefs::new(store)) {
         Ok(ruk_core::workspace::ResolvedHead::Detached(oid)) => {
@@ -1976,8 +2211,15 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
             short: Some('o'),
             takes_value: true,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
+    let tls_roots = tls_roots_for(ctx)?;
     let format = opts.single("format")?.unwrap_or_else(|| "tar".to_owned());
     let zipped = match format.as_str() {
         "tar" => false,
@@ -2053,18 +2295,28 @@ pub(crate) fn archive(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
                     archive_local(&store, kind, &rev)?
                 }
                 Endpoint::Http { url, .. } => {
+                    ruk_git::transport::credentials::refuse_url_userinfo(&url, &auth)?;
                     let base = ruk_git::transport::smart_http::normalize_base(&url)?;
                     let extra_headers = http_extra_headers(ctx, &base);
                     let out = ruk_git::transport::smart_http::fetch_archive(
                         &base,
                         &ruk_git::transport::smart_http::ArchiveWireRequest { rev },
-                        &Interrupt::none(),
-                        &extra_headers,
+                        ruk_git::transport::smart_http::RpcCall {
+                            extra: &extra_headers,
+                            auth: &auth,
+                            egress: &ctx.egress,
+                            tls_roots: tls_roots.as_deref(),
+                            interrupt: &Interrupt::none(),
+                        },
                     )?;
                     out.tar
                 }
                 endpoint @ (Endpoint::Ssh { .. } | Endpoint::Git { .. }) => {
-                    let stream = net::open_archive_stream(&endpoint)?;
+                    let stream = net::open_archive_stream(
+                        &endpoint,
+                        &ctx.egress,
+                        &ruk_git::transport::Interrupt::none(),
+                    )?;
                     net::fetch_archive_stream(stream, &rev)?
                 }
             }
@@ -2137,29 +2389,6 @@ fn split_tar_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
     }
 }
 
-/// Parses a NUL/space-terminated octal header field.
-fn parse_octal(field: &[u8], what: &str) -> Result<u64, GitError> {
-    let end = field
-        .iter()
-        .position(|byte| *byte == 0 || *byte == b' ')
-        .unwrap_or(field.len());
-    let text = std::str::from_utf8(&field[..end]).map_err(|_| GitError::Corrupt {
-        detail: format!("archive header {what} is not ASCII"),
-    })?;
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(0);
-    }
-    if !text.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
-        return Err(GitError::Corrupt {
-            detail: format!("archive header {what} is not octal: {text:?}"),
-        });
-    }
-    u64::from_str_radix(text, 8).map_err(|_| GitError::Corrupt {
-        detail: format!("archive header {what} overflows: {text:?}"),
-    })
-}
-
 /// Recomputes a member header's checksum over spaces, mirroring the
 /// server half's `%07o` shape.
 fn checksum_header(header: &mut [u8; 512]) {
@@ -2177,50 +2406,6 @@ fn checksum_header(header: &mut [u8; 512]) {
     let n = bytes.len().min(7);
     header[148..148 + n].copy_from_slice(&bytes[..n]);
     header[155] = b' ';
-}
-
-/// The ustar prefix/name fields joined with `/`, without consulting any
-/// `x` record beside the member.
-fn header_name(header: &[u8; 512]) -> Vec<u8> {
-    let prefix_end = header[345..500]
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(155);
-    let name_end = header[..100]
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(100);
-    let (prefix, name) = (&header[345..345 + prefix_end], &header[..name_end]);
-    if prefix.is_empty() {
-        name.to_vec()
-    } else {
-        let mut out = prefix.to_vec();
-        out.push(b'/');
-        out.extend_from_slice(name);
-        out
-    }
-}
-
-/// Reads the `path` record out of pax extended-header data, if present.
-fn pax_path_record(data: &[u8]) -> Option<Vec<u8>> {
-    let mut rest = data;
-    while !rest.is_empty() {
-        let space = rest.iter().position(|byte| *byte == b' ')?;
-        let len: usize = std::str::from_utf8(&rest[..space]).ok()?.parse().ok()?;
-        if len == 0 || len > rest.len() {
-            return None;
-        }
-        let record = &rest[..len];
-        rest = &rest[len..];
-        if !record.ends_with(b"\n") {
-            continue;
-        }
-        let body = &record[space + 1..record.len() - 1];
-        if let Some(value) = body.strip_prefix(b"path=") {
-            return Some(value.to_vec());
-        }
-    }
-    None
 }
 
 /// Ensures pax extended-header data carries a `path` record for `path`:
@@ -2571,191 +2756,6 @@ fn octal_into(field: &mut [u8], value: u64) {
     let bytes = text.as_bytes();
     let n = bytes.len().min(digits);
     field[..n].copy_from_slice(&bytes[..n]);
-}
-
-/// One tar member staged for zip output: the logical path (the pax `path`
-/// record when one describes the member, else the ustar fields), its kind,
-/// the archived mode and mtime, and the payload (file bytes, or the link
-/// target for symlinks).
-struct ZipEntry {
-    name: Vec<u8>,
-    dir: bool,
-    symlink: bool,
-    mode: u32,
-    mtime: u64,
-    data: Vec<u8>,
-}
-
-/// Reads the link target out of a symlink member's ustar linkname field.
-fn header_linkname(header: &[u8; 512]) -> Vec<u8> {
-    let end = header[157..257]
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(100);
-    header[157..157 + end].to_vec()
-}
-
-/// Splits a rewrapped tar into zip entries: the `g` global header carries
-/// no member, `x` pax headers only rename the entry they describe, `5`
-/// members become directories, `2` members symlinks (target from the
-/// linkname field), and `0` members files. Anything else is corrupt: the
-/// only producer is the `upload-archive` serve half, which emits exactly
-/// these kinds.
-fn parse_zip_entries(tar: &[u8]) -> Result<Vec<ZipEntry>, GitError> {
-    let corrupt = |detail: String| GitError::Corrupt { detail };
-    let mut entries = Vec::new();
-    let mut held_path: Option<Vec<u8>> = None;
-    let mut pos = 0;
-    while pos + 512 <= tar.len() {
-        let mut header = [0u8; 512];
-        header.copy_from_slice(&tar[pos..pos + 512]);
-        pos += 512;
-        if header.iter().all(|byte| *byte == 0) {
-            break;
-        }
-        if header[257..263] != *b"ustar\0" {
-            return Err(corrupt("archive member is not a ustar header".to_owned()));
-        }
-        let size = usize::try_from(parse_octal(&header[124..136], "size")?)
-            .map_err(|_| corrupt("archive member size overflows".to_owned()))?;
-        let padded = size.div_ceil(512) * 512;
-        if pos + padded > tar.len() {
-            return Err(corrupt("archive member runs past the stream".to_owned()));
-        }
-        let data = tar[pos..pos + size].to_vec();
-        pos += padded;
-        match header[156] {
-            b'x' => {
-                if let Some(path) = pax_path_record(&data) {
-                    held_path = Some(path);
-                }
-            }
-            b'g' => {}
-            flag @ (b'0' | b'5' | b'2') => {
-                let name = held_path.take().unwrap_or_else(|| header_name(&header));
-                let mode = u32::try_from(parse_octal(&header[100..108], "mode")?)
-                    .map_err(|_| corrupt("archive member mode overflows".to_owned()))?;
-                let mtime = parse_octal(&header[136..148], "mtime")?;
-                let (dir, symlink, data) = match flag {
-                    b'5' => (true, false, Vec::new()),
-                    b'2' => (false, true, header_linkname(&header)),
-                    _ => (false, false, data),
-                };
-                entries.push(ZipEntry {
-                    name,
-                    dir,
-                    symlink,
-                    mode,
-                    mtime,
-                    data,
-                });
-            }
-            other => {
-                return Err(corrupt(format!("archive member has unknown type {other}")));
-            }
-        }
-    }
-    Ok(entries)
-}
-
-/// Maps a zip writer failure onto the interpreter: I/O stays I/O, every
-/// other refusal (bad names, duplicate entries, a finished stream) is a
-/// corrupt archive, never a silent truncation.
-fn zip_failed(err: zip::result::ZipError) -> GitError {
-    match err {
-        zip::result::ZipError::Io(io) => GitError::Io {
-            detail: format!("cannot write the zip archive: {io}"),
-        },
-        other => GitError::Corrupt {
-            detail: format!("cannot write the zip archive: {other}"),
-        },
-    }
-}
-
-/// Converts a tar mtime into zip's DOS timestamp: out-of-range stamps
-/// (before 1980 or past 2107) fall back to the zip epoch instead of
-/// failing the archive.
-fn zip_mtime(stamp: u64) -> zip::DateTime {
-    const DAY: u64 = 86400;
-    let (days, clock) = (stamp / DAY, stamp % DAY);
-    // Days to civil date on the proleptic Gregorian calendar; the shifted
-    // era keeps every division exact for all representable stamps.
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    // Saturating conversions: any component outside the DOS range fails
-    // `from_date_and_time` below and lands on the zip epoch, exactly like
-    // a pre-1980 stamp.
-    let year = u16::try_from(year).unwrap_or(u16::MAX);
-    let month = u8::try_from(month).unwrap_or(u8::MAX);
-    let day = u8::try_from(day).unwrap_or(u8::MAX);
-    let hour = u8::try_from(clock / 3600).unwrap_or(u8::MAX);
-    let minute = u8::try_from((clock % 3600) / 60).unwrap_or(u8::MAX);
-    let second = u8::try_from(clock % 60).unwrap_or(u8::MAX);
-    zip::DateTime::from_date_and_time(year, month, day, hour, minute, second).unwrap_or_default()
-}
-
-/// Transcodes a rewrapped tar into a zip archive: non-empty files deflate,
-/// empty files store, directories and symlinks go through the writer's own
-/// constructors, and modes and mtimes carry over. Names must be UTF-8 (the
-/// writer stores them as text), so a non-UTF-8 tree name refuses here
-/// rather than landing mojibake in the archive.
-fn tar_to_zip(tar: &[u8]) -> Result<Vec<u8>, GitError> {
-    use std::io::Write as _;
-
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    for entry in parse_zip_entries(tar)? {
-        let name = String::from_utf8(entry.name).map_err(|_| GitError::Corrupt {
-            detail: "archive member name is not UTF-8; zip stores names as text".to_owned(),
-        })?;
-        let mtime = zip_mtime(entry.mtime);
-        if entry.dir {
-            zip.add_directory(
-                name,
-                zip::write::SimpleFileOptions::default()
-                    .unix_permissions(entry.mode)
-                    .last_modified_time(mtime),
-            )
-            .map_err(zip_failed)?;
-        } else if entry.symlink {
-            let target = String::from_utf8(entry.data).map_err(|_| GitError::Corrupt {
-                detail: "symlink target is not UTF-8; zip stores it as text".to_owned(),
-            })?;
-            zip.add_symlink(
-                name,
-                target,
-                zip::write::SimpleFileOptions::default()
-                    .unix_permissions(entry.mode)
-                    .last_modified_time(mtime),
-            )
-            .map_err(zip_failed)?;
-        } else {
-            let method = if entry.data.is_empty() {
-                zip::CompressionMethod::Stored
-            } else {
-                zip::CompressionMethod::Deflated
-            };
-            zip.start_file(
-                name,
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(method)
-                    .unix_permissions(entry.mode)
-                    .last_modified_time(mtime),
-            )
-            .map_err(zip_failed)?;
-            zip.write_all(&entry.data).map_err(|err| GitError::Io {
-                detail: format!("cannot write the zip archive: {err}"),
-            })?;
-        }
-    }
-    Ok(zip.finish().map_err(zip_failed)?.into_inner())
 }
 
 /// Archives one revision of a local store through the `upload-archive`
@@ -3167,10 +3167,10 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             // oid (a tree through a tag, a blob, a tree itself): the
             // terminal is reachable, and a terminal tree walks its subtree.
             None => {
-                if let Some(&terminal) = visited.last() {
-                    if super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree {
-                        mark_tree(store, kind, terminal, &mut reachable)?;
-                    }
+                if let Some(&terminal) = visited.last()
+                    && super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree
+                {
+                    mark_tree(store, kind, terminal, &mut reachable)?;
                 }
             }
         }
@@ -3420,7 +3420,12 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     let mut out = String::from("{\"synced\": [");
@@ -3532,6 +3537,7 @@ fn sync_via_batch_at(
     use ruk_git::transport::http::{self, BatchEntry};
 
     let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
+    let tls_roots = tls_roots_for(ctx)?;
     let request = http::batch_request_body(pending)?;
     let mut headers: Vec<(String, String)> = vec![
         ("Content-Type".to_owned(), http::LFS_JSON.to_owned()),
@@ -3544,7 +3550,13 @@ fn sync_via_batch_at(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let reply = http::post_json(&batch_url, &borrowed, &request)?;
+    let reply = http::post_json(
+        &batch_url,
+        &borrowed,
+        &request,
+        &ctx.egress,
+        tls_roots.as_deref(),
+    )?;
     if !http::is_success(reply.status) {
         let preview: String = String::from_utf8_lossy(&reply.body)
             .chars()
@@ -3588,7 +3600,13 @@ fn sync_via_batch_at(
                     get_headers.push(auth);
                 }
                 let tmp = tmp_dir.join(format!("dl-{hex}.{}", std::process::id()));
-                let outcome = download_and_stage(store, href, &get_headers, hex, *size, &tmp);
+                let target = TransferTarget {
+                    href,
+                    headers: &get_headers,
+                    egress: &ctx.egress,
+                    tls_roots: tls_roots.as_deref(),
+                };
+                let outcome = download_and_stage(store, &target, hex, *size, &tmp);
                 let _ = std::fs::remove_file(&tmp);
                 match outcome {
                     Ok(()) => {
@@ -3691,7 +3709,12 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
     )?;
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     for (hex, error) in &missing {
@@ -3699,6 +3722,9 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
     }
     Ok(())
 }
+
+/// Outgoing LFS payloads by hex: already on the server, still to upload.
+type LfsObjectLists = (Vec<(String, u64)>, Vec<(String, u64)>);
 
 /// Uploads LFS payloads for one push's outgoing range: the `push --lfs`
 /// half of push-mirror sync. Scans the same wants-minus-haves closure the
@@ -3727,7 +3753,7 @@ fn push_lfs_upload(
     // entries carry canonical bytes, so pointer parsing needs no second
     // object read. Deletes carry nothing; an all-delete push uploads
     // nothing.
-    let (present, pending): (Vec<(String, u64)>, Vec<(String, u64)>) = {
+    let (present, pending): LfsObjectLists = {
         let store = ctx.store()?;
         if mode_for_store(store.root()) != LfsMode::Full {
             return Ok(());
@@ -3971,6 +3997,7 @@ fn sync_via_batch_upload_at(
         return Ok(());
     }
     let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
+    let tls_roots = tls_roots_for(ctx)?;
     let request = http::batch_upload_request_body(present)?;
     let mut headers: Vec<(String, String)> = vec![
         ("Content-Type".to_owned(), http::LFS_JSON.to_owned()),
@@ -3983,7 +4010,13 @@ fn sync_via_batch_upload_at(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let reply = http::post_json(&batch_url, &borrowed, &request)?;
+    let reply = http::post_json(
+        &batch_url,
+        &borrowed,
+        &request,
+        &ctx.egress,
+        tls_roots.as_deref(),
+    )?;
     if !http::is_success(reply.status) {
         let preview: String = String::from_utf8_lossy(&reply.body)
             .chars()
@@ -4021,7 +4054,7 @@ fn sync_via_batch_upload_at(
                 let mut put_headers: Vec<(String, String)> = action_headers.clone();
                 if put_headers
                     .iter()
-                    .all(|(name, _)| name.to_ascii_lowercase() != "content-type")
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
                 {
                     put_headers.push((
                         "Content-Type".to_owned(),
@@ -4033,7 +4066,13 @@ fn sync_via_batch_upload_at(
                 {
                     put_headers.push(auth);
                 }
-                let outcome = upload_one(store, href, &put_headers, hex, *size);
+                let target = TransferTarget {
+                    href,
+                    headers: &put_headers,
+                    egress: &ctx.egress,
+                    tls_roots: tls_roots.as_deref(),
+                };
+                let outcome = upload_one(store, &target, hex, *size);
                 match outcome {
                     Ok(()) => uploaded.push(hex.clone()),
                     Err(detail) => missing.push((hex.clone(), detail)),
@@ -4044,14 +4083,22 @@ fn sync_via_batch_upload_at(
     Ok(())
 }
 
+/// One LFS payload move: the presigned URL, its headers, the egress
+/// policy the dial must satisfy, and the optional PEM trust bundle.
+struct TransferTarget<'a> {
+    href: &'a str,
+    headers: &'a [(String, String)],
+    egress: &'a net::EgressPolicy,
+    tls_roots: Option<&'a [u8]>,
+}
+
 /// Streams one sidecar payload to `href`, returning the human detail for
 /// `missing` on any failure so one bad object never fails its siblings.
 /// The file is never buffered: bytes move straight from the sidecar into
 /// the PUT, the way downloads stream into staging.
 fn upload_one(
     store: &Store,
-    href: &str,
-    headers: &[(String, String)],
+    target: &TransferTarget<'_>,
     hex: &str,
     size: u64,
 ) -> Result<(), String> {
@@ -4075,14 +4122,25 @@ fn upload_one(
             "local payload size {actual} differs from pointer size {size}"
         ));
     }
-    let borrowed: Vec<(&str, &str)> = headers
+    let borrowed: Vec<(&str, &str)> = target
+        .headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let reply = http::put_stream(href, &borrowed, size, &mut file)
-        .map_err(|err| format!("PUT {href} failed: {err}"))?;
+    let reply = http::put_stream(
+        target.href,
+        &borrowed,
+        size,
+        &mut file,
+        target.egress,
+        target.tls_roots,
+    )
+    .map_err(|err| format!("PUT {} failed: {err}", target.href))?;
     if !http::is_success(reply.status) {
-        return Err(format!("PUT {href} failed with status {}", reply.status));
+        return Err(format!(
+            "PUT {} failed with status {}",
+            target.href, reply.status
+        ));
     }
     Ok(())
 }
@@ -4137,8 +4195,7 @@ impl<W: std::io::Write> std::io::Write for SizeCapWriter<W> {
 /// so one bad object never fails its siblings.
 fn download_and_stage(
     store: &Store,
-    href: &str,
-    headers: &[(String, String)],
+    target: &TransferTarget<'_>,
     hex: &str,
     size: u64,
     tmp: &std::path::Path,
@@ -4146,7 +4203,8 @@ fn download_and_stage(
     use ruk_core::store::lfs as sidecar;
     use ruk_git::transport::http;
 
-    let borrowed: Vec<(&str, &str)> = headers
+    let borrowed: Vec<(&str, &str)> = target
+        .headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
@@ -4155,14 +4213,20 @@ fn download_and_stage(
     // so abort the stream there: a lying or endless body cannot fill the
     // disk while we wait for the hash check to reject it.
     let mut capped = SizeCapWriter::new(file, size);
-    let (status, _) = http::get_to_writer(href, &borrowed, &mut capped)
-        .map_err(|err| format!("GET {href} failed: {err}"))?;
+    let (status, _, _) = http::get_to_writer(
+        target.href,
+        &borrowed,
+        &mut capped,
+        target.egress,
+        target.tls_roots,
+    )
+    .map_err(|err| format!("GET {} failed: {err}", target.href))?;
     let mut file = capped.into_inner();
     // The staging read opens its own descriptor; flush here so it sees
     // every byte even though the handle drops at return.
     std::io::Write::flush(&mut file).map_err(|err| format!("cannot flush download: {err}"))?;
     if !http::is_success(status) {
-        return Err(format!("GET {href} failed with status {status}"));
+        return Err(format!("GET {} failed with status {status}", target.href));
     }
     sidecar::stage_verified(store.root(), hex, size, tmp)
         .map_err(|err| err.to_string())
@@ -4213,8 +4277,15 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             short: None,
             takes_value: false,
         },
+        FlagSpec {
+            long: "auth-stdin",
+            short: None,
+            takes_value: false,
+        },
     ];
     let opts = collect(args, &specs)?;
+    let auth = invocation_auth(ctx, &opts)?;
+    let tls_roots = tls_roots_for(ctx)?;
     let target = opts.positionals.first().map_or("origin", String::as_str);
     if opts.positionals.len() > 2 {
         return Err(GitError::Invalid {
@@ -4243,13 +4314,20 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             // `run_fetch` makes.
             let refs = match &endpoint {
                 Endpoint::Http { url, .. } => {
+                    ruk_git::transport::credentials::refuse_url_userinfo(url, &auth)?;
                     let base = ruk_git::transport::smart_http::normalize_base(url)?;
                     let extra_headers = http_extra_headers(ctx, &base);
                     match ruk_git::transport::smart_http::discover_versioned(
                         &base,
                         ruk_git::transport::smart_http::SmartService::UploadPack,
                         ctx.kind()?,
-                        &extra_headers,
+                        ruk_git::transport::smart_http::RpcCall {
+                            extra: &extra_headers,
+                            auth: &auth,
+                            egress: &ctx.egress,
+                            tls_roots: tls_roots.as_deref(),
+                            interrupt: &Interrupt::none(),
+                        },
                     ) {
                         Ok(ruk_git::transport::smart_http::VersionedDiscovery::V2(caps)) => {
                             ruk_git::transport::smart_http::ls_refs_v2(
@@ -4257,8 +4335,13 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                                 &caps,
                                 ctx.kind()?,
                                 &[],
-                                &Interrupt::none(),
-                                &extra_headers,
+                                ruk_git::transport::smart_http::RpcCall {
+                                    extra: &extra_headers,
+                                    auth: &auth,
+                                    egress: &ctx.egress,
+                                    tls_roots: tls_roots.as_deref(),
+                                    interrupt: &Interrupt::none(),
+                                },
                             )?
                         }
                         Ok(ruk_git::transport::smart_http::VersionedDiscovery::V0(adv)) => adv.refs,
@@ -4266,7 +4349,13 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             let adv = ruk_git::transport::dumb_http::discover(
                                 &base,
                                 ctx.kind()?,
-                                &extra_headers,
+                                ruk_git::transport::smart_http::RpcCall {
+                                    extra: &extra_headers,
+                                    auth: &auth,
+                                    egress: &ctx.egress,
+                                    tls_roots: tls_roots.as_deref(),
+                                    interrupt: &Interrupt::none(),
+                                },
                             )?;
                             // Dumb `info/refs` carries no symref: the
                             // oracle reads the `HEAD` text file for the
@@ -4277,20 +4366,25 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             // never print the row twice.
                             let file_names_head =
                                 adv.refs.iter().any(|entry| entry.name == b"HEAD");
-                            if !file_names_head {
-                                if let Some(pointed) =
+                            if !file_names_head
+                                && let Some(pointed) =
                                     ruk_git::transport::dumb_http::fetch_head_symref(
                                         &base,
-                                        &extra_headers,
+                                        ruk_git::transport::smart_http::RpcCall {
+                                            extra: &extra_headers,
+                                            auth: &auth,
+                                            egress: &ctx.egress,
+                                            tls_roots: tls_roots.as_deref(),
+                                            interrupt: &Interrupt::none(),
+                                        },
                                     )?
-                                {
-                                    refs.push(AdvertisedRef {
-                                        name: b"HEAD".to_vec(),
-                                        oid: None,
-                                        peeled: None,
-                                        symref_target: Some(pointed.into_bytes()),
-                                    });
-                                }
+                            {
+                                refs.push(AdvertisedRef {
+                                    name: b"HEAD".to_vec(),
+                                    oid: None,
+                                    peeled: None,
+                                    symref_target: Some(pointed.into_bytes()),
+                                });
                             }
                             refs.extend(adv.refs);
                             refs
@@ -4298,7 +4392,18 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                         Err(err) => return Err(err),
                     }
                 }
-                _ => net::discover_endpoint(&endpoint, Service::UploadPack, ctx.kind()?)?,
+                _ => net::discover_endpoint(
+                    &endpoint,
+                    Service::UploadPack,
+                    ctx.kind()?,
+                    ruk_git::transport::smart_http::RpcCall {
+                        extra: &[],
+                        auth: &auth,
+                        egress: &ctx.egress,
+                        tls_roots: tls_roots.as_deref(),
+                        interrupt: &ruk_git::transport::Interrupt::none(),
+                    },
+                )?,
             };
             net::to_local_refs(refs)?
         }
@@ -4548,7 +4653,7 @@ mod archive_rewrap_tests {
     #[test]
     fn rewrap_prefix_tracks_pax_records() {
         // No slash: unsplittable, so the `x` path record carries the name.
-        let sub_path: Vec<u8> = core::iter::repeat(b'n').take(120).collect();
+        let sub_path: Vec<u8> = std::iter::repeat_n(b'n', 120).collect();
         let record = ext_record_bytes("path", &sub_path);
         let mut tar = member_bytes(b"h.paxheader", b'x', &record);
         tar.extend_from_slice(&raw_member(&sub_path[..100], b'0', b"data\n"));
@@ -4565,9 +4670,9 @@ mod archive_rewrap_tests {
     #[test]
     fn rewrap_unsplittable_rename_gains_a_pax_header() {
         // Splits (slash at 150) but not after the prefix moves it to 155.
-        let mut name = core::iter::repeat(b'a').take(150).collect::<Vec<u8>>();
+        let mut name = std::iter::repeat_n(b'a', 150).collect::<Vec<u8>>();
         name.push(b'/');
-        name.extend_from_slice(&core::iter::repeat(b'b').take(40).collect::<Vec<u8>>());
+        name.extend_from_slice(&std::iter::repeat_n(b'b', 40).collect::<Vec<u8>>());
         let tar = tar_of(&[(name.as_slice(), b'0', b"deep\n")]);
         let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
         let members = logical(&out);

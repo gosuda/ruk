@@ -28,6 +28,8 @@ use std::collections::{HashSet, VecDeque};
 
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::types::ObjectKind;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 use ruk_core::{LfsMode, is_pointer};
 
 use super::Interrupt;
@@ -292,7 +294,12 @@ mod tests {
             .expect("plain blob");
         let plain_oid = prepared.oid();
         store
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish plain blob");
         let pointers: HashSet<Oid> = HashSet::from([blob_oid]);
         let refused =

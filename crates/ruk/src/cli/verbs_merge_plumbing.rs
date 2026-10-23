@@ -41,7 +41,8 @@ use std::collections::{BTreeMap, HashMap};
 use ruk_core::ids::Oid;
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::store::{
-    FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store,
+    EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable,
+    ObjectKind, Store,
 };
 use ruk_git::GitError;
 use serde::{Deserialize, Serialize};
@@ -287,11 +288,11 @@ fn text_merge(request: &TextMerge<'_>) -> Option<(Vec<u8>, bool)> {
     bounds.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(bounds.len());
     for bound in bounds {
-        if let Some(last) = merged.last_mut() {
-            if bound.0 <= last.1 {
-                last.1 = last.1.max(bound.1);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && bound.0 <= last.1
+        {
+            last.1 = last.1.max(bound.1);
+            continue;
         }
         merged.push(bound);
     }
@@ -741,15 +742,18 @@ fn lane_blob(
     Ok(body)
 }
 
+/// One union path's three tree sides: base, ours, theirs.
+type MergeSides = (
+    Option<(TreeMode, Oid)>,
+    Option<(TreeMode, Oid)>,
+    Option<(TreeMode, Oid)>,
+);
+
 /// Merges one union path at tree level (no syntax lane: plumbing).
 fn merge_tree_path(
     store: &Store,
     blobs: &mut HashMap<Oid, Vec<u8>>,
-    sides: (
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-    ),
+    sides: MergeSides,
 ) -> Result<TreePathOutcome, GitError> {
     let (base, ours, theirs) = sides;
     // Directory/file clashes cannot happen here: tree paths never prefix
@@ -1023,7 +1027,12 @@ fn read_tree_empty(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     if opts.is_set("u") {
         ctx.require_worktree()?;
@@ -1130,7 +1139,12 @@ fn read_tree_merge(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
     let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     if opts.is_set("u") {
         ctx.require_worktree()?;
@@ -1155,12 +1169,7 @@ fn read_merge_resolution(
         )
         .map_err(core_err)
     };
-    let stages = |sides: (
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-        Option<(TreeMode, Oid)>,
-    )|
-     -> Result<Vec<(Stage, IndexEntry)>, GitError> {
+    let stages = |sides: MergeSides| -> Result<Vec<(Stage, IndexEntry)>, GitError> {
         let mut out = Vec::new();
         for (side, stage) in [
             (sides.0, Stage::Base),
@@ -1480,12 +1489,12 @@ pub(crate) fn checkout_index(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, 
             detail: "checkout-index -z needs --stdin".to_owned(),
         });
     }
-    if let Some(stage) = opts.single("stage")? {
-        if !["1", "2", "3"].contains(&stage.as_str()) {
-            return Err(GitError::Unsupported {
-                command: "checkout-index --stage=all".to_owned(),
-            });
-        }
+    if let Some(stage) = opts.single("stage")?
+        && !["1", "2", "3"].contains(&stage.as_str())
+    {
+        return Err(GitError::Unsupported {
+            command: "checkout-index --stage=all".to_owned(),
+        });
     }
     ctx.require_worktree()?;
     let store = ctx.store()?;
@@ -1755,7 +1764,14 @@ fn rerere_replay(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         let next = workspace.mutate_index(workspace.stamp).map_err(core_err)?;
         let mut all = mutations;
         all.push(workspace_mutation(raw.as_deref(), &next)?);
-        store.publish(Vec::new(), &all).map_err(GitError::from)?;
+        store
+            .publish(
+                Vec::new(),
+                &all,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .map_err(GitError::from)?;
         out.extend_from_slice(
             format!(
                 "Resolved '{}' using previous resolution.\n",
@@ -1937,7 +1953,12 @@ fn rerere_forget(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(Vec::new())
@@ -1974,7 +1995,12 @@ fn rerere_clear(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError>
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(Vec::new())
@@ -2011,7 +2037,12 @@ fn rerere_gc(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError> {
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(line(
@@ -2085,6 +2116,8 @@ fn rerere_write(ctx: &Ctx, id: &str, record: &RerereRecord) -> Result<(), GitErr
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -2137,6 +2170,8 @@ fn rerere_mark_active(ctx: &Ctx, path: &[u8], id: &str) -> Result<(), GitError> 
                 expected: FactExpectation::Any,
                 value: Some(id.as_bytes().to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -2156,6 +2191,8 @@ fn rerere_unmark_active(ctx: &Ctx, path: &[u8]) -> Result<(), GitError> {
                 expected: FactExpectation::Any,
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())

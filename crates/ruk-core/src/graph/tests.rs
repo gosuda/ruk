@@ -8,17 +8,14 @@ use smallvec::SmallVec;
 use crate::budget::ByteBudget;
 use crate::change::ChangeId;
 use crate::error::ErrorCode;
-use crate::graph::bloom::{
-    DEFAULT_MAX_CHANGED_PATHS, build_bloom_filter, check_bloom_filter, murmur3_seeded,
-};
+use crate::graph::bloom::{build_bloom_filter, check_bloom_filter};
 use crate::graph::cache::ReachabilityCache;
 use crate::graph::composite::{ChangeIdCursor, GraphIndex, GraphIndexBuilder};
-use crate::graph::folding::{fold_segments, should_fold};
+use crate::graph::folding::should_fold;
 use crate::graph::segment::{CommitGraphEntry, GraphSegment, GraphSegmentWriter, StagedCommit};
-use crate::graph::traversal::{AncestorStepper, find_heads, find_roots, is_ancestor};
+use crate::graph::traversal::{AncestorStepper, is_ancestor};
 use crate::graph::types::{
-    BloomMatch, ExactPathVerifier, GRAPH_SEGMENT_MAGIC, GRAPH_SEGMENT_V1_FORMAT, Generation,
-    GlobalPosition, LocalPosition, MAX_GRAPH_POSITIONS, PrefixResolution, ShallowAncestry,
+    BloomMatch, Generation, GlobalPosition, LocalPosition, PrefixResolution, ShallowAncestry,
 };
 use crate::heads::Head;
 use crate::ids::{CommitKey, HashKind, Oid};
@@ -33,7 +30,7 @@ fn make_git_head(byte_val: u8, kind: HashKind) -> Head {
     Head::Git { oid }
 }
 
-fn make_conflicted_head(byte_val: u8, kind: HashKind) -> Head {
+fn make_conflicted_head(byte_val: u8) -> Head {
     // Native CommitKey has 32-byte identity
     let mut bytes = vec![0u8; 32];
     bytes[0] = byte_val;
@@ -255,7 +252,7 @@ fn test_prefix_lookup_work_and_early_ambiguity() {
     };
 
     // Third head with completely different first byte 0xBB
-    let mut b3 = vec![0xBB; 20];
+    let b3 = vec![0xBB; 20];
     let h3 = Head::Git {
         oid: Oid::from_bytes(&b3).unwrap(),
     };
@@ -375,7 +372,7 @@ fn test_octopus_parent_ordering_preservation() {
         parent_positions[3],
     ];
 
-    let merge_head = make_conflicted_head(99, kind);
+    let merge_head = make_conflicted_head(99);
     let merge_pos = builder
         .add_commit(
             merge_head,
@@ -606,7 +603,10 @@ fn test_graph_installed_file_reopen() {
 fn measure_object_and_row_work() {
     use std::time::Instant;
 
-    use crate::store::{FactMutation, FactPageBudget, FactTable, PreparationBudget, Store};
+    use crate::store::{
+        EventContext, EventSource, FactMutation, FactPageBudget, FactTable, PreparationBudget,
+        Store,
+    };
 
     let kind = HashKind::Sha1;
     let budget = Arc::new(ByteBudget::new(256 * 1024 * 1024));
@@ -687,7 +687,6 @@ fn measure_object_and_row_work() {
     assert_eq!(proven, 1000);
 
     // --- prefix resolution over 100k heads ---
-    let tip = seq_head(N - 1, kind);
     let t = Instant::now();
     let mut misses = 0usize;
     for i in 0..1000u32 {
@@ -707,12 +706,6 @@ fn measure_object_and_row_work() {
     assert_eq!(misses, 0);
 
     // --- changed-path Bloom: 10k checks against one dense filter ---
-    let paths: Vec<&[u8]> = (0..4096u32)
-        .map(|i| format!("src/mod_{}.rs", i).into_bytes())
-        .collect::<Vec<_>>()
-        .iter()
-        .map(|v| v.as_slice())
-        .collect();
     let owned: Vec<Vec<u8>> = (0..4096u32)
         .map(|i| format!("src/mod_{}.rs", i).into_bytes())
         .collect();
@@ -753,7 +746,14 @@ fn measure_object_and_row_work() {
             value: Some(b"target".to_vec()),
         });
     }
-    store.publish(Vec::new(), &facts).expect("publish refs");
+    store
+        .publish(
+            Vec::new(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish refs");
     println!(
         "MEASURE ref_publish rows=10000 ms={}",
         t.elapsed().as_millis()
@@ -801,7 +801,14 @@ fn measure_object_and_row_work() {
                 .expect("prepare"),
         );
     }
-    store.publish(prepared, &[]).expect("publish blobs");
+    store
+        .publish(
+            prepared,
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish blobs");
     println!(
         "MEASURE blob_publish objects=1000 ms={}",
         t.elapsed().as_millis()

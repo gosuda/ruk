@@ -1,27 +1,23 @@
-//! AGit review routing: diverting `refs/for/` and `refs/pull/` pushes to
-//! the `proc-receive` hook.
+//! AGit review routing: diverting configured review prefixes (default
+//! `refs/for/`) to the `proc-receive` hook.
 //!
-//! Forgejo implements AGit ("push to `refs/for/<branch>` opens a pull
-//! request") through git's `proc-receive` hook, not through ref updates:
-//! every repository gets `receive.procReceiveRefs` values `refs/for` and
-//! `refs/pull/` (`forgejo/modules/git/git.go`) plus a generated
-//! `hooks/proc-receive` dispatcher chaining `forgejo hook proc-receive`
-//! (`forgejo/modules/git/hook_generate.go`), which creates or updates the
-//! pull request and its `refs/pull/<N>/head` ref itself
-//! (`forgejo/services/agit/agit.go`, `forgejo/services/pull/pull.go`
-//! `UpdateRef`). The review backend therefore owns the alternate-ref
-//! write; this module only diverts the commands, speaks the hook
-//! protocol, and translates the verdicts into per-ref outcomes.
+//! The AGit flow ("push to `refs/for/<branch>` opens a pull request")
+//! runs through git's `proc-receive` hook, not through ref updates.
+//! The diversion prefixes are configurable per repository hook set
+//! (default `["refs/for"]`); `refs/pull/` pushes land as plain refs
+//! unless a caller opts back in. The review backend owns the
+//! alternate-ref write; this module only diverts the commands, speaks
+//! the hook protocol, and translates the verdicts into per-ref outcomes.
 //!
 //! The diversion mirrors the oracle (`git/builtin/receive-pack.c`):
 //!
 //! - A ref matches when it equals a configured prefix or extends it past
 //!   a `/` (`proc_receive_ref_append` strips trailing slashes, so the
-//!   Forgejo values behave as `refs/for/` and `refs/pull/`), for adds,
+//!   configured values behave as `refs/for/` and `refs/pull/`), for adds,
 //!   modifies and deletes alike. Matched commands skip the `update` hook
 //!   and the normal ref update entirely and report the hook's verdict.
 //! - With no `proc-receive` script installed the commands fall through to
-//!   the normal path: Forgejo always installs the dispatcher, so a
+//!   the normal path: the review backend always installs the dispatcher, so a
 //!   missing script means no review backend is configured and the push is
 //!   an ordinary ref push. (The oracle would refuse instead, but only
 //!   when its config names prefixes; Ruk carries no per-repo config, so
@@ -30,7 +26,7 @@
 //!   verbatim: `version=1[\0<features>]` plus flush both ways, the diverted
 //!   `<old> <new> <ref>` commands plus flush, the push options plus flush
 //!   when the hook asks for them, then `ok`/`ng`/`option` lines to a
-//!   flush. `option fall-through` (which Forgejo sends for refs its
+//!   flush. `option fall-through` (which the review backend sends for refs its
 //!   `ProcReceive` does not match) returns the command to the normal
 //!   path; `option refname/old-oid/new-oid/forced-update` records the
 //!   review ref the hook created for observability.
@@ -53,17 +49,12 @@ use super::hooks::{Quarantine, ReceiveHooks, apply_hook_env};
 use super::pktline::{Packet, PktReader, encode_data, encode_flush};
 use crate::{GitError, parse_oid_for};
 
-/// Refs diverted to the `proc-receive` hook: Forgejo's
-/// `receive.procReceiveRefs` values with oracle-style trailing slashes
-/// stripped (`forgejo/modules/git/git.go`, `proc_receive_ref_append`).
-const PROC_RECEIVE_PREFIXES: [&str; 2] = ["refs/for", "refs/pull"];
-
 /// Whether a ref name diverts to the `proc-receive` hook: equal to a
 /// configured prefix or extending it past a `/`, mirroring
-/// `proc_receive_ref_matches`.
+/// `proc_receive_ref_matches` (oracle-style trailing slashes stripped).
 #[must_use]
-pub fn is_proc_receive_ref(name: &[u8]) -> bool {
-    PROC_RECEIVE_PREFIXES.iter().any(|prefix| {
+pub(crate) fn is_proc_receive_ref(prefixes: &[String], name: &[u8]) -> bool {
+    prefixes.iter().any(|prefix| {
         let raw = prefix.as_bytes();
         name == raw || (name.starts_with(raw) && name.get(raw.len()) == Some(&b'/'))
     })
@@ -96,12 +87,12 @@ pub struct ProcReceiveCommand {
 
 /// The review ref the hook reported creating, from its `option` lines.
 ///
-/// The hook performed the write itself (Forgejo's `UpdateRef`), so the
+/// The hook performed the write itself (the review backend's `UpdateRef`), so the
 /// client still reports the original ref while `post-receive` observes
-/// this review ref (see `run_proc_receive_phase` in `serve.rs`).
+/// this review ref (see [`super::policy::ScriptPolicy`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlternateRef {
-    /// The review ref, e.g. `refs/pull/1/head`.
+    /// The review ref, e.g. `refs/changes/1/head`.
     pub refname: Vec<u8>,
     /// Previous review-ref tip, when the hook sent `option old-oid`.
     pub old_oid: Option<Oid>,
@@ -259,20 +250,10 @@ pub(crate) fn run_proc_receive(
         std::thread::sleep(CONVERSE_POLL);
     }
     reap(&mut child);
-    let stderr = stderr_rx.recv_timeout(CONVERSE_GRACE).unwrap_or_default();
-    let stderr_text = String::from_utf8_lossy(&stderr);
-    if !stderr_text.trim().is_empty() {
-        tracing::warn!(
-            "proc-receive hook stderr: {}",
-            stderr_text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(512)
-                .collect::<String>()
-        );
-    }
+    // Drain the stderr pipe so a chatty hook cannot block the reap; the
+    // text itself has no channel (no tracing subscriber exists), so it is
+    // dropped after the drain.
+    let _ = stderr_rx.recv_timeout(CONVERSE_GRACE);
     if cancelled {
         return reject_all(commands, "proc-receive hook was cancelled".to_owned());
     }
@@ -352,7 +333,7 @@ fn converse(
 ) -> Result<Vec<ProcVerdict>, GitError> {
     // The version line carries its LF inside the frame; commands and
     // options travel without one, exactly like the oracle's
-    // `packet_write_fmt_gently` calls. Forgejo parses the raw payloads
+    // `packet_write_fmt_gently` calls. The hook parses the raw payloads
     // (`strings.SplitN(..., " ", 3)`, `pushoptions.Parse`), so a stray LF
     // would corrupt the ref name and option values.
     let mut out = Vec::new();
@@ -532,8 +513,7 @@ fn report_line(
 fn report_option(line: &str, pending: &mut [Pending], kind: HashKind) -> Result<(), GitError> {
     let state = pending
         .iter_mut()
-        .filter(|state| state.returned && state.accepted)
-        .next_back()
+        .rfind(|state| state.returned && state.accepted)
         .ok_or_else(|| broken("proc-receive sent 'option' without a matching 'ok'"))?;
     let (key, value) = match line.split_once(' ') {
         Some((key, value)) => (key, Some(value)),
@@ -684,7 +664,7 @@ mod tests {
 
     /// Reads every frame the server wrote during a drive.
     fn written_frames(written: &[u8]) -> Vec<Vec<u8>> {
-        let mut pkt = PktReader::new(&written[..], Interrupt::none());
+        let mut pkt = PktReader::new(written, Interrupt::none());
         let mut frames = Vec::new();
         loop {
             match pkt.read_packet().expect("frame") {
@@ -727,7 +707,7 @@ mod tests {
         );
     }
 
-    /// A Forgejo-shaped answer (`ok` plus the review-ref options) accepts
+    /// A hook-shaped answer (`ok` plus the review-ref options) accepts
     /// the push and records the review ref.
     #[test]
     fn hook_ok_with_review_ref_accepts() {
@@ -875,13 +855,17 @@ mod tests {
 
     #[test]
     fn prefix_matching_mirrors_the_oracle() {
-        assert!(is_proc_receive_ref(b"refs/for/main"));
-        assert!(is_proc_receive_ref(b"refs/for/main/topic"));
-        assert!(is_proc_receive_ref(b"refs/pull/1/head"));
-        assert!(!is_proc_receive_ref(b"refs/heads/main"));
-        assert!(!is_proc_receive_ref(b"refs/forum/main"));
+        let defaults = vec!["refs/for".to_owned()];
+        assert!(is_proc_receive_ref(&defaults, b"refs/for/main"));
+        assert!(is_proc_receive_ref(&defaults, b"refs/for/main/topic"));
+        assert!(!is_proc_receive_ref(&defaults, b"refs/pull/1/head"));
+        assert!(!is_proc_receive_ref(&defaults, b"refs/heads/main"));
+        assert!(!is_proc_receive_ref(&defaults, b"refs/forum/main"));
         // A bare prefix matches like the oracle (`!*remains`); the hook
-        // then refuses it (Forgejo: empty branch name is no review).
-        assert!(is_proc_receive_ref(b"refs/for"));
+        // then refuses it (the hook: empty branch name is no review).
+        assert!(is_proc_receive_ref(&defaults, b"refs/for"));
+        // Opting back in restores the old pair.
+        let pair = vec!["refs/for".to_owned(), "refs/pull".to_owned()];
+        assert!(is_proc_receive_ref(&pair, b"refs/pull/1/head"));
     }
 }

@@ -5,7 +5,8 @@
 use ruk_core::change::ChangeId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
-use ruk_core::store::{FactTable, ObjectKind, Store};
+use ruk_core::store::types::decode_store_event;
+use ruk_core::store::{EventSource, FactPageBudget, FactTable, ObjectKind, Store};
 
 use super::fixtures::{Fixture, IndexFormat, PackBody, PackObject, observation, read_object};
 use super::{DirectPublish, ImportProgress, ImportReport, PublishSink, import_repository};
@@ -99,6 +100,74 @@ struct TestOids {
     tag: Oid,
     tag_payload: Vec<u8>,
     foreign: Oid,
+}
+
+#[test]
+fn import_refuses_a_frozen_tag_without_publishing_refs() {
+    use ruk_core::protocol::Timestamp;
+    use ruk_core::refdata::{RefChange, RefExpect, RefTransaction, RefUpdate};
+    use ruk_core::refs::{ReleasedTagMarker, prepare_checked_transaction, prepare_release_freeze};
+    use ruk_core::store::EventContext;
+
+    let (fixture, store, oids) = loose_repo();
+    let name = ref_name("refs/tags/v1");
+    let seed = RefTransaction::new(
+        HashKind::Sha1,
+        vec![RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Absent,
+            change: RefChange::Set(RefTarget::Direct(oids.foreign)),
+        }],
+    )
+    .expect("seed tag transaction");
+    let prepared = prepare_checked_transaction(&store, &seed).expect("prepare seed tag");
+    store
+        .publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed tag");
+    let seeded = store
+        .fact(FactTable::Refs, name.as_bytes())
+        .expect("read seeded tag")
+        .expect("seeded tag present");
+    let marker = ReleasedTagMarker {
+        owner_release_id: "rel-1".to_owned(),
+        target_oid: oids.foreign,
+        frozen_at: Timestamp::parse("1970-01-01T00:00:00Z").expect("timestamp"),
+    };
+    let freeze = prepare_release_freeze(&store, &name, &marker).expect("freeze");
+    store
+        .publish(
+            Vec::new(),
+            &freeze,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish freeze");
+    let error = import_repository(
+        &store,
+        &fixture.request(1, b"origin"),
+        &ImportProgress::new(),
+        &mut DirectPublish(&store),
+    )
+    .expect_err("frozen import");
+    assert!(error.to_string().contains("rel-1"), "{error}");
+    assert_eq!(
+        store
+            .fact(FactTable::Refs, name.as_bytes())
+            .expect("read tag"),
+        Some(seeded),
+        "the preexisting frozen tag survives a refused import"
+    );
+    assert!(
+        store
+            .fact(FactTable::Refs, b"refs/heads/main")
+            .expect("read main")
+            .is_none()
+    );
 }
 
 #[test]
@@ -499,6 +568,33 @@ fn missing_object_names_oid_and_referrer() {
 }
 
 #[test]
+fn import_publishes_with_import_source() {
+    let (fixture, store, _) = loose_repo();
+    let progress = ImportProgress::new();
+    let mut sink = DirectPublish(&store);
+    let request = fixture.request(1, b"origin");
+    import_repository(&store, &request, &progress, &mut sink).expect("import");
+    let page = store
+        .fact_page(
+            FactTable::Events,
+            None,
+            FactPageBudget::new(100, usize::MAX),
+        )
+        .expect("read events");
+    let event = page
+        .rows
+        .iter()
+        .map(|row| decode_store_event(&row.value).expect("event decodes"))
+        .rfind(|event| event.name == b"refs/heads/main")
+        .expect("import emits the main event");
+    assert_eq!(
+        event.source,
+        EventSource::Import,
+        "import batches publish as Import, not LocalPush"
+    );
+}
+
+#[test]
 fn empty_source_is_noop() {
     let fixture = Fixture::sha1();
     let store = fixture.store();
@@ -576,7 +672,7 @@ fn object_links_cover_all_kinds() {
 
     let blob = HashKind::Sha1.hash_git_object("blob", b"f").expect("blob");
     let tree_hex = blob.to_hex();
-    let mut tree = format!("100644 f\0").into_bytes();
+    let mut tree = "100644 f\0".to_string().into_bytes();
     tree.extend_from_slice(blob.as_bytes());
     let mut with_link = tree.clone();
     let foreign = Oid::from_bytes(&[9u8; 20]).expect("oid");
@@ -613,7 +709,7 @@ fn object_links_cover_all_kinds() {
 
     // Unsorted entries are tolerated the way Git reads them: both objects
     // still join the closure.
-    let mut unsorted = format!("100644 b\0").into_bytes();
+    let mut unsorted = "100644 b\0".to_string().into_bytes();
     unsorted.extend_from_slice(blob.as_bytes());
     unsorted.extend_from_slice(b"100644 a\0");
     unsorted.extend_from_slice(blob.as_bytes());

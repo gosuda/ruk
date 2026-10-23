@@ -53,7 +53,7 @@ pub(crate) struct PlanEntry {
     /// What the path must become; `None` deletes it.
     pub(crate) target: Option<ManifestEntry>,
     /// Link bytes for a symlink target whose blob is supplied in
-    /// [`super::MaterializePlan::target_objects`] rather than committed.
+    /// [`super::apply::MaterializePlan::target_objects`] rather than committed.
     /// Verified against the target oid.
     pub(crate) target_link: Option<ByteString>,
 }

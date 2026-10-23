@@ -1279,10 +1279,9 @@ fn clean_checked(
 
 /// Validates collected edits (sorted, non-overlapping, in-bounds) and
 /// splices them into `base` from the end in one pass.
-fn splice_edits(
-    base: &[u8],
-    mut edits: Vec<RawEdit>,
-) -> Result<(Vec<u8>, Vec<ByteEdit>, Vec<EditProvenance>), Decline> {
+type SplicedEdits = (Vec<u8>, Vec<ByteEdit>, Vec<EditProvenance>);
+
+fn splice_edits(base: &[u8], mut edits: Vec<RawEdit>) -> Result<SplicedEdits, Decline> {
     edits.sort_by_key(|edit| (edit.base_start, edit.base_end));
     let base_len = to_u32(base.len()).ok_or_else(|| {
         Decline::new(

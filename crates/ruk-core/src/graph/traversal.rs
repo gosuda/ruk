@@ -47,6 +47,7 @@ impl PartialOrd for HeapNode {
 }
 
 /// Bounded page result from an ancestor traversal step.
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 #[derive(Clone, Debug)]
 pub(crate) struct TraversalPage {
     pub(crate) positions: SmallVec<[GlobalPosition; 64]>,
@@ -70,6 +71,7 @@ pub(crate) struct AncestorStepper {
     steps_taken: usize,
 }
 
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl AncestorStepper {
     pub(crate) fn new(
         graph: &dyn GraphAccess,

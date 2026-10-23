@@ -25,6 +25,7 @@ use crate::store::types::FactTable;
 use crate::store::{FactPageBudget, Store};
 
 /// Typed Store-backed reader for commits, changes, and history.
+#[derive(Debug)]
 pub struct Records<'a> {
     store: &'a Store,
 }

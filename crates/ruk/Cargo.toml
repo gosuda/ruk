@@ -16,11 +16,13 @@ ruk-core = { path = "../ruk-core", version = "0.1.0" }
 # error boundary from the slice that introduces Git commands.
 ruk-git = { path = "../ruk-git", version = "0.1.0" }
 clap.workspace = true
+jiff.workspace = true
 serde.workspace = true
 sonic-rs.workspace = true
 regex.workspace = true
 
 tokio.workspace = true
+tracing.workspace = true
 toml.workspace = true
 zip.workspace = true
 

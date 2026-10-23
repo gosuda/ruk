@@ -71,7 +71,7 @@ use ruk_git::GitError;
 /// touching the real process, the same reason `git.c` threads explicit
 /// option state instead of reading globals at each call site.
 #[derive(Clone, Debug)]
-pub struct CliEnv {
+pub(crate) struct CliEnv {
     /// Process variables (`GIT_DIR`, `GIT_AUTHOR_*`, ...).
     pub(crate) vars: HashMap<String, String>,
     /// Working directory the command starts in.
@@ -85,7 +85,7 @@ pub struct CliEnv {
 impl CliEnv {
     /// Captures the live process environment.
     #[must_use]
-    pub fn capture() -> Self {
+    pub(crate) fn capture() -> Self {
         Self {
             vars: std::env::vars().collect(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -95,7 +95,7 @@ impl CliEnv {
 
     /// Reads one variable, exactly like `getenv`.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.vars.get(name).map(String::as_str)
     }
 }
@@ -125,6 +125,9 @@ pub(crate) struct Ctx {
     /// Advisory bytes for standard error (e.g. `Switched to branch ...`),
     /// kept off the stdout return the way git splits its descriptors.
     pub(crate) stderr: Vec<u8>,
+    /// The egress policy every network dial this command opens must
+    /// satisfy: default-deny, with loopback allowed in the test harness.
+    pub(crate) egress: ruk_git::transport::net::EgressPolicy,
 }
 
 impl Ctx {
@@ -206,18 +209,43 @@ pub(crate) struct CliOutcome {
 /// Success carries the verb's stdout bytes with code zero; failure renders
 /// the same `ruk: {err}` line [`run`] would print, with the error's native
 /// exit status.
-pub(crate) fn run_captured(argv: Vec<String>, env: CliEnv) -> CliOutcome {
-    match run_inner(&argv, env) {
+pub(crate) fn run_captured(
+    argv: Vec<String>,
+    env: CliEnv,
+    egress: ruk_git::transport::net::EgressPolicy,
+) -> CliOutcome {
+    let secrets = captured_secrets(&argv, &env);
+    let scrub = |bytes: &[u8]| {
+        ruk_git::transport::credentials::scrub_userinfo_bytes(
+            &ruk_git::transport::credentials::scrub_secrets(bytes, &secrets),
+        )
+    };
+    match run_inner(&argv, env, egress) {
         Ok((stdout, stderr)) => CliOutcome {
             stdout,
-            stderr,
+            stderr: scrub(&stderr),
             code: 0,
         },
         Err(err) => CliOutcome {
             stdout: Vec::new(),
-            stderr: format!("ruk: {err}\n").into_bytes(),
+            stderr: scrub(format!("ruk: {err}\n").as_bytes()),
             code: err.exit_code(),
         },
+    }
+}
+
+/// The injected credential a captured invocation carries on `--auth-stdin`,
+/// read from its captured stdin, so its output can be scrubbed.
+fn captured_secrets(argv: &[String], env: &CliEnv) -> Vec<String> {
+    if !argv.iter().any(|arg| arg == "--auth-stdin") {
+        return Vec::new();
+    }
+    let Some(bytes) = env.stdin.as_deref() else {
+        return Vec::new();
+    };
+    match sonic_rs::from_slice::<ruk_git::transport::credentials::TransportAuth>(bytes) {
+        Ok(auth) => vec![auth.credential],
+        Err(_) => Vec::new(),
     }
 }
 
@@ -243,8 +271,12 @@ pub(crate) fn read_stdin_text(env: &CliEnv) -> Result<String, GitError> {
 }
 
 #[must_use]
-pub fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
-    let outcome = run_captured(argv, env);
+pub(crate) fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
+    let outcome = run_captured(
+        argv,
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private(),
+    );
     if !outcome.stdout.is_empty() {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
@@ -255,7 +287,8 @@ pub fn run(argv: Vec<String>, env: CliEnv) -> ExitCode {
     if !outcome.stderr.is_empty() {
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
-        let _ = lock.write_all(&outcome.stderr);
+        let scrubbed = ruk_git::transport::credentials::scrub_userinfo_bytes(&outcome.stderr);
+        let _ = lock.write_all(&scrubbed);
     }
     ExitCode::from(outcome.code)
 }
@@ -305,7 +338,11 @@ fn serve_verb_for_dashed(name: &str) -> Option<&'static str> {
 }
 
 /// Parses globals, discovers the repository, and dispatches the verb.
-pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8>), GitError> {
+pub(crate) fn run_inner(
+    argv: &[String],
+    env: CliEnv,
+    egress: ruk_git::transport::net::EgressPolicy,
+) -> Result<(Vec<u8>, Vec<u8>), GitError> {
     let rest = argv.first().map_or(&[][..], |_| &argv[1.min(argv.len())..]);
     let (globals, verb, verb_args) = split_globals(rest)?;
     let mut env = env;
@@ -329,10 +366,10 @@ pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8
             Global::Bare => bare = true,
         }
     }
-    if let Some(value) = env.get("GIT_DIR").map(str::to_owned) {
-        if git_dir.is_none() {
-            git_dir = Some(PathBuf::from(value));
-        }
+    if let Some(value) = env.get("GIT_DIR").map(str::to_owned)
+        && git_dir.is_none()
+    {
+        git_dir = Some(PathBuf::from(value));
     }
     let Some(verb) = verb else {
         return Err(GitError::Invalid {
@@ -349,7 +386,7 @@ pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8
     // commit lane. It stays out of the advertised table (and its count) the
     // way git keeps its dashed server commands off `git help`.
     if verb == "coordinator" {
-        let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, false)?;
+        let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, false, egress)?;
         let stdout = coordinator::serve(&mut ctx, &verb_args)?;
         return Ok((stdout, std::mem::take(&mut ctx.stderr)));
     }
@@ -359,13 +396,24 @@ pub(crate) fn run_inner(argv: &[String], env: CliEnv) -> Result<(Vec<u8>, Vec<u8
     if verb_args.iter().any(|arg| arg == "--help") {
         return Ok((dispatch::help_text(Some(entry)), Vec::new()));
     }
-    let mut ctx = open_ctx(env, git_dir, work_tree, bare, cli_config, entry.needs_repo)?;
+    let mut ctx = open_ctx(
+        env,
+        git_dir,
+        work_tree,
+        bare,
+        cli_config,
+        entry.needs_repo,
+        egress,
+    )?;
     let stdout = (entry.run)(&mut ctx, &verb_args)?;
     Ok((stdout, std::mem::take(&mut ctx.stderr)))
 }
 
+/// Parsed leading globals: collected options, the verb, and its arguments.
+type SplitGlobals = (Vec<Global>, Option<String>, Vec<String>);
+
 /// Splits leading global options from the verb and its arguments.
-fn split_globals(rest: &[String]) -> Result<(Vec<Global>, Option<String>, Vec<String>), GitError> {
+fn split_globals(rest: &[String]) -> Result<SplitGlobals, GitError> {
     let mut globals = Vec::new();
     let mut index = 0;
     while index < rest.len() {
@@ -391,9 +439,11 @@ fn split_globals(rest: &[String]) -> Result<(Vec<Global>, Option<String>, Vec<St
             globals.push(Global::Define(key, value));
         } else if arg == "--bare" {
             globals.push(Global::Bare);
-        } else if arg == "-p" || arg == "--paginate" || arg == "-P" || arg == "--no-pager" {
-            let _ = arg;
-        } else if arg == "--no-replace-objects"
+        } else if arg == "-p"
+            || arg == "--paginate"
+            || arg == "-P"
+            || arg == "--no-pager"
+            || arg == "--no-replace-objects"
             || arg == "--no-lazy-fetch"
             || arg == "--no-optional-locks"
             || arg == "--no-advice"
@@ -420,14 +470,6 @@ fn split_globals(rest: &[String]) -> Result<(Vec<Global>, Option<String>, Vec<St
             })?;
             let (key, value) = parse_config_env(pair)?;
             globals.push(Global::Define(key, value));
-        } else if arg == "--exec-path"
-            || arg == "--html-path"
-            || arg == "--man-path"
-            || arg == "--info-path"
-        {
-            return Err(GitError::Unsupported {
-                command: arg.clone(),
-            });
         } else if arg.starts_with('-') && arg.len() > 1 {
             return Err(GitError::Unsupported {
                 command: arg.clone(),
@@ -479,6 +521,7 @@ fn open_ctx(
     bare: bool,
     cli_config: Vec<(String, String)>,
     needs_repo: bool,
+    egress: ruk_git::transport::net::EgressPolicy,
 ) -> Result<Ctx, GitError> {
     let budget = || Arc::new(PreparationBudget::reference_defaults());
     if !needs_repo {
@@ -497,15 +540,16 @@ fn open_ctx(
             bare,
             cli_config,
             stderr: Vec::new(),
+            egress,
         });
     }
     let root = find_root(&env.cwd, git_dir.as_deref(), bare)?;
-    if let Some(work_tree) = &work_tree {
-        if !work_tree.is_dir() {
-            return Err(GitError::Io {
-                detail: format!("work tree {} is not a directory", work_tree.display()),
-            });
-        }
+    if let Some(work_tree) = &work_tree
+        && !work_tree.is_dir()
+    {
+        return Err(GitError::Io {
+            detail: format!("work tree {} is not a directory", work_tree.display()),
+        });
     }
     let store = Store::open(&root.join(".ruk"), budget()).map_err(GitError::from)?;
     let kind = store.hash_kind();
@@ -519,6 +563,7 @@ fn open_ctx(
         bare,
         cli_config,
         stderr: Vec::new(),
+        egress,
     })
 }
 
@@ -531,7 +576,15 @@ pub(crate) fn lfs_payload_sync_native(
 ) -> Result<Vec<u8>, GitError> {
     let mut env = CliEnv::capture();
     env.cwd = repo;
-    let mut ctx = open_ctx(env, None, None, false, Vec::new(), true)?;
+    let mut ctx = open_ctx(
+        env,
+        None,
+        None,
+        false,
+        Vec::new(),
+        true,
+        ruk_git::transport::net::EgressPolicy::deny_private(),
+    )?;
     let mut args = from.map_or_else(Vec::new, |dir| vec!["--from".to_owned(), dir]);
     if upload {
         args.push("--upload".to_owned());
@@ -540,6 +593,10 @@ pub(crate) fn lfs_payload_sync_native(
 }
 
 /// Opens a store for repo-optional verbs when one is already there.
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 fn open_existing(root: &Path, git_dir: &Option<PathBuf>) -> Result<Store, GitError> {
     let budget = Arc::new(PreparationBudget::reference_defaults());
     if let Some(dir) = git_dir {
@@ -676,9 +733,9 @@ pub(crate) fn collect(args: &[String], specs: &[FlagSpec]) -> Result<Collected, 
             return Ok(out);
         }
         if arg.starts_with("--") {
-            index = collect_long(&args, index, specs, &mut out)?;
+            index = collect_long(args, index, specs, &mut out)?;
         } else if arg.starts_with('-') && arg.len() > 1 {
-            index = collect_short(&args, index, specs, &mut out)?;
+            index = collect_short(args, index, specs, &mut out)?;
         } else {
             out.positionals.push(arg.clone());
         }

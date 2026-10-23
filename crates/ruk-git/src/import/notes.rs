@@ -308,9 +308,9 @@ mod tests {
         let (target_payload, target) = fixture.commit(target_tree, &[], b"", b"annotated\n");
         let _ = target_payload;
         let hex = target.to_hex();
-        let (inner_payload, inner) = fixture.tree(&[(false, hex[2..].as_bytes(), blob)]);
+        let (inner_payload, inner) = fixture.tree(&[(false, &hex.as_bytes()[2..], blob)]);
         let _ = inner_payload;
-        let (root_payload, root) = fixture.tree(&[(true, hex[..2].as_bytes(), inner)]);
+        let (root_payload, root) = fixture.tree(&[(true, &hex.as_bytes()[..2], inner)]);
         let _ = root_payload;
         let (notes_payload, notes) = fixture.commit(root, &[], b"", b"notes\n");
         let _ = notes_payload;

@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
 use ruk_git::transport::session::{LocalFetchRequest, advertise, local_fetch};
@@ -199,10 +199,8 @@ fn parse_gitmodules(bytes: &[u8]) -> Vec<SubmoduleEntry> {
             match key.trim() {
                 "path" => entry.path = value,
                 "url" => entry.url = value,
-                "branch" => {
-                    if !value.is_empty() {
-                        entry.branch = Some(value);
-                    }
+                "branch" if !value.is_empty() => {
+                    entry.branch = Some(value);
                 }
                 _ => {}
             }
@@ -268,11 +266,11 @@ fn load_modules(ctx: &Ctx, store: &Store, kind: HashKind) -> Result<Vec<Submodul
             return Ok(parse_gitmodules(&body));
         }
     }
-    if let Ok(tree) = head_tree_map(store, kind) {
-        if let Some((_, oid)) = tree.get(b".rukmodules".as_slice()) {
-            let (_, body) = read_object_bytes(store, *oid)?;
-            return Ok(parse_gitmodules(&body));
-        }
+    if let Ok(tree) = head_tree_map(store, kind)
+        && let Some((_, oid)) = tree.get(b".rukmodules".as_slice())
+    {
+        let (_, body) = read_object_bytes(store, *oid)?;
+        return Ok(parse_gitmodules(&body));
     }
     Ok(Vec::new())
 }
@@ -519,7 +517,14 @@ fn cmd_add(ctx: &mut Ctx, opts: &Collected, rest: &[String]) -> Result<Vec<u8>, 
     )?);
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     ctx.emit_stderr(format!("Cloning into {path_text:?}...\n").as_bytes());
     Ok(Vec::new())
 }
@@ -621,8 +626,13 @@ fn clone_local_into(
     })?;
     let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(head_name), Scope::Full);
     let mutation = workspace_mutation(None, &workspace)?;
-    dst.publish(Vec::new(), &[mutation])
-        .map_err(GitError::from)?;
+    dst.publish(
+        Vec::new(),
+        &[mutation],
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )
+    .map_err(GitError::from)?;
     config_write(&dst, "remote.origin.url", url)?;
     config_write(
         &dst,
@@ -654,7 +664,12 @@ fn checkout_child_inner(
         workspace.head = HeadRef::Detached(oid);
         let next = workspace.mutate_index(workspace.stamp)?;
         child
-            .publish(Vec::new(), &[workspace_mutation(raw.as_deref(), &next)?])
+            .publish(
+                Vec::new(),
+                &[workspace_mutation(raw.as_deref(), &next)?],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(())
@@ -803,7 +818,12 @@ fn write_flat_index(
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     child
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }

@@ -4,7 +4,7 @@
 //! Key: the 16 raw [`WorkspaceId`] bytes (the same layout as the
 //! `workspaces` row). Value: the postcard encoding of [`ApplyJournal`].
 //! The row is inserted with [`FactExpectation::Absent`] by
-//! [`super::begin_apply`] and removed with the exact observed bytes by a
+//! [`super::apply::begin_apply`] and removed with the exact observed bytes by a
 //! completing finish, abort, or recovery batch; there is no idle row.
 
 use std::collections::BTreeSet;

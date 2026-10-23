@@ -88,7 +88,7 @@ impl Fixture {
     /// sorted in Git order.
     pub(crate) fn tree_payload(entries: &[(bool, &[u8], Oid)]) -> Vec<u8> {
         let mut sorted: Vec<_> = entries.to_vec();
-        sorted.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        sorted.sort_by_key(sort_key);
         let mut payload = Vec::new();
         for (is_tree, name, oid) in &sorted {
             let mode = if *is_tree { "40000" } else { "100644" };

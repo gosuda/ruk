@@ -34,10 +34,15 @@ use gix_pack::data::entry::Header as PackHeader;
 use gix_pack::data::input::{BytesToEntriesIter, EntryDataMode, Mode};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::types::ObjectKind;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 use ruk_core::store::{PreparedObject, Store};
 
 use super::{Interrupt, stage_object};
 use crate::GitError;
+
+/// One staged pack entry: index order, kind, and decompressed bytes.
+type StagedPackEntry = Result<(usize, ObjectKind, Vec<u8>), GitError>;
 
 /// Bounds for one ingested pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,11 +50,11 @@ pub struct IngestLimits {
     /// Largest total compressed entry bytes accepted.
     pub max_pack_bytes: u64,
     /// Largest entry count accepted.
-    pub max_objects: u32,
+    pub max_objects: u64,
     /// Largest single decompressed object accepted.
     pub max_object_bytes: u64,
     /// Deepest delta chain followed before refusing.
-    pub max_delta_depth: u32,
+    pub max_delta_depth: u64,
 }
 
 impl Default for IngestLimits {
@@ -312,7 +317,7 @@ pub fn ingest_pack<R: Read>(
         let count = u64::try_from(raw.len()).map_err(|_| GitError::Limit {
             detail: "pack entry count does not fit".to_owned(),
         })?;
-        if count >= u64::from(limits.max_objects) {
+        if count >= limits.max_objects {
             return Err(GitError::Limit {
                 detail: format!("pack holds more than {} objects", limits.max_objects),
             });
@@ -410,7 +415,7 @@ pub fn stage_local_objects(
     let count = u64::try_from(objects.len()).map_err(|_| GitError::Limit {
         detail: "closure entry count does not fit".to_owned(),
     })?;
-    if count > u64::from(limits.max_objects) {
+    if count > limits.max_objects {
         return Err(GitError::Limit {
             detail: format!("closure holds more than {} objects", limits.max_objects),
         });
@@ -522,55 +527,54 @@ fn pre_resolve_independent(
         return Ok(());
     }
     let width = pack_threads();
-    let staged: Vec<Result<(usize, ObjectKind, Vec<u8>), GitError>> =
-        if width <= 1 || independent.len() < 32 {
-            independent
-                .iter()
-                .map(|(index, kind)| {
-                    interrupt.check("resolving pack deltas")?;
-                    inflate(
-                        &resolver.raw[*index].compressed,
-                        resolver.raw[*index].declared,
-                        resolver.limits.max_object_bytes,
-                    )
-                    .map(|bytes| (*index, *kind, bytes))
-                })
-                .collect()
-        } else {
-            let piece = independent.len().div_ceil(width);
-            let raw = &resolver.raw;
-            let max_object_bytes = resolver.limits.max_object_bytes;
-            std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                for part in independent.chunks(piece) {
-                    handles.push(scope.spawn(move || {
-                        part.iter()
-                            .map(|(index, kind)| {
-                                if interrupt.check("resolving pack deltas").is_err() {
-                                    return Err(GitError::Cancelled {
-                                        detail: "resolving pack deltas was cancelled".to_owned(),
-                                    });
-                                }
-                                inflate(
-                                    &raw[*index].compressed,
-                                    raw[*index].declared,
-                                    max_object_bytes,
-                                )
-                                .map(|bytes| (*index, *kind, bytes))
-                            })
-                            .collect::<Vec<_>>()
-                    }));
-                }
-                let mut staged = Vec::with_capacity(independent.len());
-                for handle in handles {
-                    match handle.join() {
-                        Ok(part) => staged.extend(part),
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    }
-                }
-                staged
+    let staged: Vec<StagedPackEntry> = if width <= 1 || independent.len() < 32 {
+        independent
+            .iter()
+            .map(|(index, kind)| {
+                interrupt.check("resolving pack deltas")?;
+                inflate(
+                    &resolver.raw[*index].compressed,
+                    resolver.raw[*index].declared,
+                    resolver.limits.max_object_bytes,
+                )
+                .map(|bytes| (*index, *kind, bytes))
             })
-        };
+            .collect()
+    } else {
+        let piece = independent.len().div_ceil(width);
+        let raw = &resolver.raw;
+        let max_object_bytes = resolver.limits.max_object_bytes;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for part in independent.chunks(piece) {
+                handles.push(scope.spawn(move || {
+                    part.iter()
+                        .map(|(index, kind)| {
+                            if interrupt.check("resolving pack deltas").is_err() {
+                                return Err(GitError::Cancelled {
+                                    detail: "resolving pack deltas was cancelled".to_owned(),
+                                });
+                            }
+                            inflate(
+                                &raw[*index].compressed,
+                                raw[*index].declared,
+                                max_object_bytes,
+                            )
+                            .map(|bytes| (*index, *kind, bytes))
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut staged = Vec::with_capacity(independent.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(part) => staged.extend(part),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            staged
+        })
+    };
     for entry in staged {
         let (index, kind, bytes) = entry?;
         resolver.finish(index, kind, bytes)?;
@@ -628,8 +632,10 @@ fn resolve_all(
     while !deferred.is_empty() {
         interrupt.check("resolving pack deltas")?;
         let mut progress = false;
-        let pending: Vec<usize> = deferred.iter().copied().collect();
-        for index in pending {
+        for index in (0..raw.len()).rev() {
+            if !deferred.contains(&index) {
+                continue;
+            }
             match resolver.resolve(index, 0)? {
                 Resolution::Done => {
                     deferred.remove(&index);
@@ -658,7 +664,7 @@ impl Resolver<'_> {
         if self.payloads[index].is_some() {
             return Ok(Resolution::Done);
         }
-        if depth > self.limits.max_delta_depth {
+        if u64::from(depth) > self.limits.max_delta_depth {
             return Err(corrupt("pack delta chain exceeds its depth bound"));
         }
         if self.resolving[index] {
@@ -671,9 +677,9 @@ impl Resolver<'_> {
     }
 
     fn resolve_inner(&mut self, index: usize, depth: u32) -> Result<Resolution, GitError> {
-        // The header is cloned so delta recursion can borrow `self`
+        // The header is copied so delta recursion can borrow `self`
         // mutably; offsets below are plain copies for the same reason.
-        let header = self.raw[index].header.clone();
+        let header = self.raw[index].header;
         let pack_offset = self.raw[index].pack_offset;
         let declared = self.raw[index].declared;
         if let Some(kind) = pack_kind(&header) {
@@ -705,9 +711,14 @@ impl Resolver<'_> {
                 if base_oid.kind() != self.kind {
                     return Err(corrupt("ref-delta base has the wrong width"));
                 }
-                if self.oid_index.get(&base_oid).is_none() {
+                if !self.oid_index.contains_key(&base_oid) {
                     match self.store.read(base_oid) {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let entry_depth = 1u64;
+                            if entry_depth > self.limits.max_delta_depth {
+                                return Err(corrupt("pack delta chain exceeds its depth bound"));
+                            }
+                        }
                         Err(err) if err.code() == ruk_core::error::ErrorCode::ENotFound => {
                             return Ok(Resolution::Deferred);
                         }
@@ -1104,6 +1115,55 @@ struct StagedEntry {
 /// [`write_pack_inner`] applies the first error in entry order, exactly as
 /// the serial loop would. A cancelled wave finishes its in-flight entries
 /// before the rejoin reports it; nothing is written until assembly.
+fn stage_entry(
+    entry: &PackEntry<'_>,
+    thin: bool,
+    interrupt: &Interrupt,
+) -> Result<StagedEntry, GitError> {
+    interrupt.check("writing the pack")?;
+    let type_id = pack_type_id(entry.kind)?;
+    // Pack entry headers declare the *decompressed* size. For a thin
+    // REF_DELTA the base object id travels between the header and the
+    // compressed delta, never inside the compressed payload.
+    let mut base_prefix = Vec::new();
+    let (emit_type, payload) = match (thin, entry.base) {
+        (true, Some((base_oid, base_bytes))) => {
+            let delta = encode_delta(base_bytes, entry.bytes);
+            if delta.len() < entry.bytes.len() {
+                base_prefix.extend_from_slice(base_oid.as_bytes());
+                (7u8, delta)
+            } else {
+                (type_id, entry.bytes.to_vec())
+            }
+        }
+        _ => (type_id, entry.bytes.to_vec()),
+    };
+    let compressed = deflate(&payload)?;
+    let declared = payload.len();
+    // The mask bounds the value to four bits, so the narrowing cast is exact.
+    let mut first = (emit_type << 4) | ((declared & 0x0f) as u8);
+    let mut size = declared;
+    size >>= 4;
+    if size != 0 {
+        first |= 0x80;
+    }
+    let mut header_bytes = vec![first];
+    while size != 0 {
+        // The mask bounds the value to seven bits, so the narrowing cast is exact.
+        let mut byte = (size & 0x7f) as u8;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        header_bytes.push(byte);
+    }
+    Ok(StagedEntry {
+        header_bytes,
+        base_prefix,
+        compressed,
+    })
+}
+
 fn compress_entries(
     entries: &[PackEntry<'_>],
     thin: bool,
@@ -1114,48 +1174,7 @@ fn compress_entries(
         thin: bool,
         interrupt: &Interrupt,
     ) -> Result<StagedEntry, GitError> {
-        interrupt.check("writing the pack")?;
-        let type_id = pack_type_id(entry.kind)?;
-        // Pack entry headers declare the *decompressed* size. For a thin
-        // REF_DELTA the base object id travels between the header and the
-        // compressed delta, never inside the compressed payload.
-        let mut base_prefix = Vec::new();
-        let (emit_type, payload) = match (thin, entry.base) {
-            (true, Some((base_oid, base_bytes))) => {
-                let delta = encode_delta(base_bytes, entry.bytes);
-                if delta.len() < entry.bytes.len() {
-                    base_prefix.extend_from_slice(base_oid.as_bytes());
-                    (7u8, delta)
-                } else {
-                    (type_id, entry.bytes.to_vec())
-                }
-            }
-            _ => (type_id, entry.bytes.to_vec()),
-        };
-        let compressed = deflate(&payload)?;
-        let declared = payload.len();
-        // The mask bounds the value to four bits, so the narrowing cast is exact.
-        let mut first = (emit_type << 4) | ((declared & 0x0f) as u8);
-        let mut size = declared;
-        size >>= 4;
-        if size != 0 {
-            first |= 0x80;
-        }
-        let mut header_bytes = vec![first];
-        while size != 0 {
-            // The mask bounds the value to seven bits, so the narrowing cast is exact.
-            let mut byte = (size & 0x7f) as u8;
-            size >>= 7;
-            if size != 0 {
-                byte |= 0x80;
-            }
-            header_bytes.push(byte);
-        }
-        Ok(StagedEntry {
-            header_bytes,
-            base_prefix,
-            compressed,
-        })
+        stage_entry(entry, thin, interrupt)
     }
 
     let width = pack_threads();
@@ -1240,6 +1259,113 @@ fn write_pack_inner<W: Write>(
     Ok(index)
 }
 
+/// A pack stream written one entry at a time: the header carries the
+/// total count up front, then each staged entry is hashed and emitted
+/// before the next loads, so peak memory stays near one entry instead of
+/// the whole pack. Assembly order and bytes are identical to
+/// [`write_pack_inner`]; only the worker fan-out is gone.
+pub struct PackStreamWriter<'w, W: Write> {
+    out: &'w mut W,
+    hasher: gix_hash::Hasher,
+    thin: bool,
+    offset: u64,
+    index: Vec<PackedEntry>,
+}
+
+impl<W: Write> std::fmt::Debug for PackStreamWriter<'_, W> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackStreamWriter")
+            .field("thin", &self.thin)
+            .field("offset", &self.offset)
+            .field("entries", &self.index.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'w, W: Write> PackStreamWriter<'w, W> {
+    /// Emits the pack header for `count` entries.
+    ///
+    /// # Errors
+    /// [`GitError::Invalid`] past the u32 entry count, [`GitError::Io`]
+    /// when `out` fails.
+    pub fn begin(
+        out: &'w mut W,
+        kind: HashKind,
+        count: usize,
+        thin: bool,
+    ) -> Result<Self, GitError> {
+        let io = |err: std::io::Error| GitError::Io {
+            detail: format!("writing the pack: {err}"),
+        };
+        let count = u32::try_from(count).map_err(|_| GitError::Invalid {
+            detail: "pack entry count exceeds u32".to_owned(),
+        })?;
+        let mut hasher = gix_hash::hasher(kind.gix());
+        let mut header = [0u8; 12];
+        header[..4].copy_from_slice(b"PACK");
+        header[4..8].copy_from_slice(&2u32.to_be_bytes());
+        header[8..12].copy_from_slice(&count.to_be_bytes());
+        hasher.update(&header);
+        out.write_all(&header).map_err(io)?;
+        Ok(Self {
+            out,
+            hasher,
+            thin,
+            offset: 12,
+            index: Vec::new(),
+        })
+    }
+
+    /// Stages, hashes, and emits one entry, then drops its bytes: the
+    /// only entry resident at a time.
+    ///
+    /// # Errors
+    /// [`GitError::Invalid`] for a native conflict entry, [`GitError::Io`]
+    /// when `out` fails.
+    pub fn entry(&mut self, entry: &PackEntry<'_>, interrupt: &Interrupt) -> Result<(), GitError> {
+        let io = |err: std::io::Error| GitError::Io {
+            detail: format!("writing the pack: {err}"),
+        };
+        let staged = stage_entry(entry, self.thin, interrupt)?;
+        let entry_offset = self.offset;
+        self.hasher.update(&staged.header_bytes);
+        self.out.write_all(&staged.header_bytes).map_err(io)?;
+        if !staged.base_prefix.is_empty() {
+            self.hasher.update(&staged.base_prefix);
+            self.out.write_all(&staged.base_prefix).map_err(io)?;
+        }
+        self.hasher.update(&staged.compressed);
+        self.out.write_all(&staged.compressed).map_err(io)?;
+        let entry_len =
+            (staged.header_bytes.len() + staged.base_prefix.len() + staged.compressed.len()) as u64;
+        self.offset += entry_len;
+        self.index.push(PackedEntry {
+            oid: entry.oid,
+            offset: entry_offset,
+            len: entry_len,
+        });
+        Ok(())
+    }
+
+    /// Emits the trailer checksum over every streamed byte.
+    ///
+    /// # Errors
+    /// [`GitError::Io`] when `out` fails.
+    pub fn finish(self) -> Result<Vec<PackedEntry>, GitError> {
+        let io = |err: std::io::Error| GitError::Io {
+            detail: format!("writing the pack: {err}"),
+        };
+        let checksum = self
+            .hasher
+            .try_finalize()
+            .map_err(|err| corrupt(format!("finishing the pack hash: {err}")))?;
+        self.out.write_all(checksum.as_bytes()).map_err(io)?;
+        self.out.flush().map_err(io)?;
+        Ok(self.index)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,6 +1388,55 @@ mod tests {
             let back = apply_delta(base, &delta).expect("round trip");
             assert_eq!(&back, target, "base {base:?}");
         }
+    }
+
+    #[test]
+    fn streaming_writer_matches_batched_bytes() {
+        let blob = b"hello world, hello brave new world".to_vec();
+        let blob_oid = HashKind::Sha1.hash_git_object("blob", &blob).expect("hash");
+        let changed = b"hello world, hello CHANGED new world".to_vec();
+        let changed_oid = HashKind::Sha1
+            .hash_git_object("blob", &changed)
+            .expect("hash");
+        let entries = [
+            PackEntry {
+                oid: blob_oid,
+                kind: ObjectKind::Blob,
+                bytes: &blob,
+                base: None,
+            },
+            PackEntry {
+                oid: changed_oid,
+                kind: ObjectKind::Blob,
+                bytes: &changed,
+                base: Some((blob_oid, blob.as_slice())),
+            },
+        ];
+        for thin in [false, true] {
+            let mut batched = Vec::new();
+            if thin {
+                write_thin_pack(&mut batched, HashKind::Sha1, &entries, &Interrupt::none())
+                    .expect("write");
+            } else {
+                write_pack(&mut batched, HashKind::Sha1, &entries, &Interrupt::none())
+                    .expect("write");
+            }
+            let mut streamed = Vec::new();
+            let mut writer =
+                PackStreamWriter::begin(&mut streamed, HashKind::Sha1, entries.len(), thin)
+                    .expect("begin");
+            for entry in &entries {
+                writer.entry(entry, &Interrupt::none()).expect("entry");
+            }
+            writer.finish().expect("finish");
+            assert_eq!(streamed, batched, "thin={thin}");
+        }
+        assert!(
+            entries[1]
+                .bytes
+                .windows(b"hello".len())
+                .any(|w| w == b"hello")
+        );
     }
 
     #[test]
@@ -1395,7 +1570,14 @@ mod tests {
         .expect("history ingests");
         let mut objects = staged.into_objects();
         objects.extend(staged_basic.into_objects());
-        let publication = store.publish(objects, &[]).expect("bases publish");
+        let publication = store
+            .publish(
+                objects,
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("bases publish");
         assert!(!publication.objects.is_empty());
         let thin = include_bytes!("fixtures/thin.pack");
         let staged = ingest_pack(
@@ -1459,7 +1641,14 @@ mod tests {
         let prepared = store
             .prepare(ObjectKind::Blob, base.len() as u64, &base[..], None)
             .expect("stage base");
-        store.publish(vec![prepared], &[]).expect("publish base");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let staged = ingest_pack(
             &pack[..],
             HashKind::Sha1,

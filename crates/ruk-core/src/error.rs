@@ -1,7 +1,7 @@
 //! Typed error surface and the native exit-code class map.
 //!
 //! The closed error-code set is fixed by the core contract; a new code
-//! arrives only through a schema revision. The Forgejo contract's extra
+//! arrives only through a schema revision. The hosted contract's extra
 //! outcomes (unsupported command family, syntax worker unhealthy, stale
 //! preview tuple, stale conversion inventory, invalid mode, notebook
 //! structure declined) are carried by these codes and the typed merge
@@ -12,6 +12,8 @@ use core::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::protocol::ErrorDetail;
 
 /// The one closed error-code registry. The serde and schema form is the
 /// contract spelling (`E_STALE`), identical to [`ErrorCode::as_str`].
@@ -261,6 +263,7 @@ pub struct CoreError {
     pub code: ErrorCode,
     pub message: String,
     pub hints: Vec<String>,
+    pub detail: Option<Box<ErrorDetail>>,
 }
 
 impl CoreError {
@@ -270,12 +273,19 @@ impl CoreError {
             code,
             message: message.into(),
             hints: Vec::new(),
+            detail: None,
         }
     }
 
     #[must_use]
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hints.push(hint.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_detail(mut self, detail: ErrorDetail) -> Self {
+        self.detail = Some(Box::new(detail));
         self
     }
 }

@@ -23,7 +23,9 @@ use std::path::{Component, Path, PathBuf};
 
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Store};
+use ruk_core::store::{
+    EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable, Store,
+};
 use ruk_core::workspace::{HeadRef, ResolvedHead};
 use ruk_git::GitError;
 use serde::{Deserialize, Serialize};
@@ -211,12 +213,12 @@ fn add(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
         let (oid, branch) = resolve_attached_head(store, kind, rev_arg)?;
         (oid, branch, false, None)
     };
-    if let Some(name) = &branch {
-        if let Some(holder) = holder_of(store, &ctx.root, name)? {
-            return Err(GitError::Invalid {
-                detail: format!("{name:?} is already used by worktree at {holder:?}"),
-            });
-        }
+    if let Some(name) = &branch
+        && let Some(holder) = holder_of(store, &ctx.root, name)?
+    {
+        return Err(GitError::Invalid {
+            detail: format!("{name:?} is already used by worktree at {holder:?}"),
+        });
     }
     if let Some((refname, start, expected)) = pending {
         write_add_branch(store, kind, refname, start, expected)?;
@@ -249,6 +251,8 @@ fn add(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
                 expected: FactExpectation::Absent,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
 
@@ -310,15 +314,16 @@ fn resolve_attached_head(
 
 /// Names the branch `rev` designates, when it designates a local branch.
 fn attach_candidate(store: &Store, rev: &str) -> Result<Option<RefName>, GitError> {
-    if let Ok(short) = branch_name(rev) {
-        if read_ref(store, &short)?.is_some() {
-            return Ok(Some(short));
-        }
+    if let Ok(short) = branch_name(rev)
+        && read_ref(store, &short)?.is_some()
+    {
+        return Ok(Some(short));
     }
-    if let Ok(full) = RefName::new(rev) {
-        if rev.starts_with("refs/heads/") && read_ref(store, &full)?.is_some() {
-            return Ok(Some(full));
-        }
+    if let Ok(full) = RefName::new(rev)
+        && rev.starts_with("refs/heads/")
+        && read_ref(store, &full)?.is_some()
+    {
+        return Ok(Some(full));
     }
     Ok(None)
 }
@@ -484,6 +489,8 @@ fn remove(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
                 expected: FactExpectation::Value(raw),
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(Vec::new())
@@ -519,6 +526,8 @@ fn prune(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
                     expected: FactExpectation::Value(raw),
                     value: None,
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .map_err(GitError::from)?;
     }
@@ -528,10 +537,10 @@ fn prune(ctx: &mut Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
 /// Names the holder already checking out `branch`, if any.
 fn holder_of(store: &Store, main_root: &Path, branch: &str) -> Result<Option<String>, GitError> {
     let (workspace, _) = load_or_default(store)?;
-    if let HeadRef::Symbolic(name) = &workspace.head {
-        if name.to_string() == branch {
-            return Ok(Some(display_path(main_root)?));
-        }
+    if let HeadRef::Symbolic(name) = &workspace.head
+        && name.to_string() == branch
+    {
+        return Ok(Some(display_path(main_root)?));
     }
     for (record, _) in scan_records(store)? {
         if record.branch.as_deref() == Some(branch) {

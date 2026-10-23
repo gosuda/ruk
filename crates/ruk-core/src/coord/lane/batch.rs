@@ -186,7 +186,7 @@ impl BatchItem {
             Self::Mutation { candidate, .. } => {
                 if matches!(
                     candidate.request,
-                    Request::ClaimAcquire(_) | Request::ClaimRelease(_)
+                    Request::ClaimAcquire(_) | Request::ClaimRelease(_) | Request::ClaimRenew(_)
                 ) {
                     return true;
                 }
@@ -248,12 +248,20 @@ impl BatchAccumulator {
     }
 
     /// Returns the number of items currently in the batch.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Returns `true` if the batch has no items.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()

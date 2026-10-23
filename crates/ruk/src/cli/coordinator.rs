@@ -34,7 +34,7 @@ use ruk_core::ops::{
 };
 use ruk_core::protocol::{GitCommitArgs, GitCommitRefUpdate, Mutation, NewReply, Reply, Request};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
@@ -66,6 +66,7 @@ impl Mode {
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Bounds spawn plus first contact with a fresh server.
+#[cfg(all(unix, not(test)))]
 const SPAWN_WAIT: Duration = Duration::from_millis(500);
 
 /// Bounds one submission exchange.
@@ -308,7 +309,12 @@ fn direct_stash(ctx: &mut Ctx, request: NewRequest) -> Result<Oid, GitError> {
     };
     if missing {
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(oid)
@@ -333,7 +339,7 @@ fn commit_via_coordinator(
     let runtime = client_runtime()?;
     for _ in 0..MAX_STALE_RETRIES {
         match try_remote(ctx, &runtime, &args, request_id)? {
-            Remote::Done(reply) => return Ok(finish(reply)),
+            Remote::Done(reply) => return Ok(finish(*reply)),
             // No coordinator answered: publish the caller's commit
             // directly with identical arguments. A Stale refusal proves a
             // racing writer landed first; only then rebuild against its
@@ -636,7 +642,12 @@ fn advance_head_to(
             let next = workspace.move_head(workspace.stamp, HeadRef::Detached(new_oid))?;
             let mutation = state::workspace_mutation(raw.as_deref(), &next)?;
             store
-                .publish(Vec::new(), &[mutation])
+                .publish(
+                    Vec::new(),
+                    &[mutation],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .map_err(GitError::from)?;
             Ok(())
         }
@@ -646,7 +657,7 @@ fn advance_head_to(
 /// What one remote round settled as.
 enum Remote {
     /// The lane answered; the commit is durable.
-    Done(NewReply),
+    Done(Box<NewReply>),
     /// No coordinator answered before any byte could commit; publish direct.
     Direct,
     /// The lane refused a lost branch race; retry with a fresh tip.
@@ -726,7 +737,7 @@ fn remote_round(
 fn settle(answer: CommitAnswer) -> Result<Remote, GitError> {
     if answer.ok {
         return match answer.body {
-            Some(Reply::GitCommit(boxed)) => Ok(Remote::Done(*boxed)),
+            Some(Reply::GitCommit(boxed)) => Ok(Remote::Done(boxed)),
             Some(_) => Ok(Remote::Uncertain),
             None => Ok(Remote::Uncertain),
         };

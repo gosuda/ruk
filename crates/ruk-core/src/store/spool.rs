@@ -21,14 +21,20 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::store::error::StoreError;
+use crate::store::pinned::PinnedRoot;
 
 const SCRATCH_DIR: &str = "scratch";
+/// The pin-relative scratch subdirectory: every spool file create goes
+/// through the pinned store root, never by recorded path.
+fn scratch_dir() -> &'static Path {
+    Path::new(SCRATCH_DIR)
+}
 /// Smallest in-memory spool allocation step.
 const MIN_MEMORY_CHUNK: usize = 4096;
 /// Entries one occupancy scan may visit before it fails closed.
@@ -178,8 +184,12 @@ impl PreparationBudget {
     ///
     /// # Errors
     /// I/O failures and a directory too large to scan fail closed.
-    pub(crate) fn register_scratch(&self, store_root: &Path) -> Result<(), StoreError> {
-        self.open_scratch(store_root).map(drop)
+    pub(crate) fn register_scratch(
+        &self,
+        pin: &PinnedRoot,
+        store_root: &Path,
+    ) -> Result<(), StoreError> {
+        self.open_scratch(pin, store_root).map(drop)
     }
 
     #[cfg(test)]
@@ -275,10 +285,16 @@ impl PreparationBudget {
 
     /// Creates the scratch directory if needed and returns its canonical
     /// path after registering its bucket (baseline scan on first use).
-    fn open_scratch(&self, store_root: &Path) -> Result<PathBuf, StoreError> {
-        let dir = store_root.join(SCRATCH_DIR);
-        fs::create_dir_all(&dir)?;
-        let key = fs::canonicalize(&dir)?;
+    /// The directory create and the key probe both travel the pin, so
+    /// a symlink swapped in after open can neither divert the spill
+    /// nor split the bucket; the recorded path serves only the
+    /// no-descriptor fallback.
+    fn open_scratch(&self, pin: &PinnedRoot, store_root: &Path) -> Result<PathBuf, StoreError> {
+        pin.create_dir_all(scratch_dir()).map_err(StoreError::Io)?;
+        let probe = pin
+            .proc_subpath(SCRATCH_DIR)
+            .unwrap_or_else(|| store_root.join(SCRATCH_DIR));
+        let key = fs::canonicalize(&probe)?;
         if self.usage().roots.contains_key(&key) {
             return Ok(key);
         }
@@ -562,14 +578,34 @@ impl Read for SpoolView<'_> {
                 buf[..want].copy_from_slice(memory_slice(bytes, self.pos, want)?);
                 want
             }
+            // Clone the open description: the view reads its own
+            // positions without ever resolving the spool path by
+            // name, so a swapped parent cannot redirect the read.
+            // `read_at` leaves the shared offset alone, so sibling
+            // views never race.
+            #[cfg(unix)]
+            Storage::File { file, .. } => {
+                use std::os::unix::fs::FileExt as _;
+                if self.file.is_none() {
+                    let cloned = file
+                        .try_clone()
+                        .map_err(|_| io::Error::other("spool view lost its file"))?;
+                    self.file = Some(cloned);
+                }
+                let Some(opened) = self.file.as_ref() else {
+                    return Err(io::Error::other("spool view lost its file"));
+                };
+                opened.read_at(&mut buf[..want], self.pos)?
+            }
+            #[cfg(not(unix))]
             Storage::File { path, .. } => {
                 if self.file.is_none() {
-                    let mut file = File::open(path)?;
-                    file.seek(SeekFrom::Start(self.pos))?;
-                    self.file = Some(file);
+                    let mut opened = File::open(path)?;
+                    opened.seek(SeekFrom::Start(self.pos))?;
+                    self.file = Some(opened);
                 }
                 match self.file.as_mut() {
-                    Some(file) => file.read(&mut buf[..want])?,
+                    Some(opened) => opened.read(&mut buf[..want])?,
                     None => return Err(io::Error::other("spool view lost its file")),
                 }
             }
@@ -582,6 +618,7 @@ impl Read for SpoolView<'_> {
 impl Seek for SpoolView<'_> {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         let target = resolve_seek(self.spool.len, self.pos, from)?;
+        #[cfg(not(unix))]
         if let Some(file) = self.file.as_mut() {
             file.seek(SeekFrom::Start(target))?;
         }
@@ -596,6 +633,7 @@ impl Seek for SpoolView<'_> {
 pub(crate) struct SpoolWriter {
     spool: Spool,
     store_root: PathBuf,
+    pin: PinnedRoot,
     threshold: usize,
     failed: bool,
 }
@@ -611,8 +649,14 @@ impl fmt::Debug for SpoolWriter {
 
 impl SpoolWriter {
     /// Starts an empty spool charged to `budget` with scratch files under
-    /// `store_root/scratch`. Performs no I/O.
-    pub(crate) fn new(budget: &Arc<PreparationBudget>, store_root: &Path) -> Self {
+    /// `store_root/scratch`. Every scratch create travels `pin`, never
+    /// the recorded path; only the accounting key still uses
+    /// `store_root`. Performs no I/O.
+    pub(crate) fn new(
+        budget: &Arc<PreparationBudget>,
+        store_root: &Path,
+        pin: &PinnedRoot,
+    ) -> Self {
         Self {
             spool: Spool {
                 storage: Storage::Memory(Vec::new()),
@@ -621,6 +665,7 @@ impl SpoolWriter {
                 charge: PreparationGuard::new(budget),
             },
             store_root: store_root.to_path_buf(),
+            pin: pin.fork(),
             threshold: budget.limits.memory_spool_threshold,
             failed: false,
         }
@@ -684,10 +729,14 @@ impl SpoolWriter {
     /// the buffered bytes before the file exists; the memory charge is
     /// released only after the copy.
     fn spill(&mut self) -> Result<(), StoreError> {
-        let dir = self.spool.charge.budget.open_scratch(&self.store_root)?;
+        let dir = self
+            .spool
+            .charge
+            .budget
+            .open_scratch(&self.pin, &self.store_root)?;
         self.spool.charge.root = Some(dir.clone());
         self.spool.charge.grow(0, self.spool.len)?;
-        let (file, path) = create_spool_file(&dir)?;
+        let (file, path) = create_spool_file(&self.pin, &dir)?;
         let previous = std::mem::replace(&mut self.spool.storage, Storage::File { file, path });
         let Storage::Memory(buffered) = previous else {
             return Err(StoreError::Invalid("spool already on disk".to_owned()));
@@ -735,18 +784,16 @@ impl Write for SpoolWriter {
     }
 }
 
-/// Creates a new uniquely named scratch file. Never opens or truncates an
-/// existing path.
-fn create_spool_file(dir: &Path) -> Result<(File, PathBuf), StoreError> {
+/// Creates a new uniquely named scratch file through the pin. Never
+/// opens or truncates an existing path. Returns the file and its
+/// recorded absolute path: the recorded path serves cleanup and
+/// non-Unix reads only — live Unix I/O travels the open file and its
+/// clones, never the path, so a swapped parent cannot redirect it.
+fn create_spool_file(pin: &PinnedRoot, record_dir: &Path) -> Result<(File, PathBuf), StoreError> {
     for _ in 0..8 {
-        let path = dir.join(format!("spool-{}.tmp", uuid::Uuid::new_v4().simple()));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((file, path)),
+        let name = format!("spool-{}.tmp", uuid::Uuid::new_v4().simple());
+        match pin.create_new(&scratch_dir().join(&name)) {
+            Ok(file) => return Ok((file, record_dir.join(&name))),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err.into()),
         }

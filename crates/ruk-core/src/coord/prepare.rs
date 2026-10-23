@@ -84,7 +84,7 @@
 //! committed, and the exact fact expectations add point compare-and-swap
 //! as a second layer.
 
-use super::claims::{ClaimClock, canonical_paths, read_record};
+use super::claims::{ClaimClock, canonical_paths, read_record, validate_claim_ttl};
 use super::land::{LandPrepareRequest, prepare_land_plan};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -119,16 +119,19 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
-    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
-    EditReply, EffectiveIdentity, GitCommitArgs, HeadRewrite, IdentityClaim, IdentitySource,
+    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, ClaimRenewArgs,
+    ClaimRenewReply, DescribeArgs, EditArgs, EditReply, EffectiveIdentity, GitCommitArgs,
+    HeadRewrite, IdentityClaim, IdentitySource, LandExecuteArgs, LandExecuteReply, LandLocalState,
     LandPrepareArgs, LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply,
-    RebaseArgs, RebaseScope, ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs,
-    SquashArgs, TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs,
-    UnpinReply, Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply,
-    WsNewArgs, WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
+    PolicySetArgs, PolicySetReply, PushRefOutcome, PushRefStatus, RebaseArgs, RebaseScope,
+    ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs, SquashArgs,
+    TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply,
+    Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs,
+    WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
-    Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
+    Content, PathSelection, ReleaseFreezeClearArgs, ReleaseFreezeClearReply, ReleaseFreezeSetArgs,
+    ReleaseFreezeSetReply, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
     RevertReply, SplitArgs, SplitPlacement, UndoArgs, UndoReply,
 };
 use crate::records::Records;
@@ -138,7 +141,10 @@ use crate::records::types::{ChangeEntry, ChangeState};
 use crate::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
-use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked};
+use crate::refs::{
+    ReleasedTagMarker, StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked,
+    prepare_release_freeze, prepare_release_unfreeze,
+};
 use crate::store::ObjectKind;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
@@ -167,11 +173,18 @@ pub(crate) struct PrepareContext<'a> {
     /// Wall clock for signature timestamps; absent on the legacy path.
     pub(crate) clock: Option<&'a Clock>,
     /// Monotonic claim clock for claim sealing; absent on the legacy path.
+    #[expect(
+        dead_code,
+        reason = "reserved for a later row; preparation predicts without sealing"
+    )]
     pub(crate) claim_clock: Option<&'a ClaimClock>,
     /// Admission policy for land preparation; absent on the legacy path.
+    #[expect(dead_code, reason = "wired in CS-R38/40/44 (land preparation)")]
     pub(crate) policy: Option<&'a Policy>,
     /// Progress gate for attestation verification; absent on the legacy path.
     pub(crate) checkpoint: Option<&'a Checkpoint<'a>>,
+    /// Provenance the invoking call declared; recorded, never authorized on.
+    pub(crate) on_behalf_of: Option<String>,
 }
 
 /// One method's lane parts: the precomputed reply, staged objects, exact
@@ -216,6 +229,7 @@ pub fn prepare_mutation(
         claim_clock: None,
         policy: None,
         checkpoint: None,
+        on_behalf_of: None,
     };
     prepare_mutation_with(&ctx, request)
 }
@@ -251,6 +265,8 @@ pub(crate) fn prepare_mutation_with(
         Request::BookmarkResolve(m) => bookmark_resolve_parts(ctx, m.request_id, &m.args)?,
         Request::TagSet(m) => tag_set_parts(ctx, m.request_id, &m.args)?,
         Request::TagDelete(m) => tag_delete_parts(ctx, m.request_id, &m.args)?,
+        Request::ReleaseFreezeSet(m) => release_freeze_set_parts(ctx, m.request_id, &m.args)?,
+        Request::ReleaseFreezeClear(m) => release_freeze_clear_parts(ctx, m.request_id, &m.args)?,
         Request::Pin(m) => pin_parts(ctx, m.request_id, &m.args)?,
         Request::Unpin(m) => unpin_parts(ctx, m.request_id, &m.args)?,
         Request::AttestAdd(m) => attest_add_parts(ctx, m.request_id, &m.args)?,
@@ -258,6 +274,7 @@ pub(crate) fn prepare_mutation_with(
         Request::GitCommit(m) => git_commit_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimAcquire(m) => claim_acquire_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimRelease(m) => claim_release_parts(ctx, m.request_id, &m.args)?,
+        Request::ClaimRenew(m) => claim_renew_parts(ctx, m.request_id, &m.args)?,
         Request::WsNew(m) => ws_new_parts(ctx, m.request_id, &m.args)?,
         Request::WsScope(m) => ws_scope_parts(ctx, m.request_id, &m.args)?,
         Request::WsTake(m) => ws_take_parts(ctx, m.request_id, &m.args)?,
@@ -293,12 +310,8 @@ pub(crate) fn prepare_mutation_with(
             ));
         }
         Request::LandPrepare(m) => land_prepare_parts(ctx, m.request_id, &m.args)?,
-        Request::LandExecute(_) => {
-            return Err(uncovered(
-                "land.execute",
-                "land.execute pushes a stored candidate: the local leg (coord/land.rs land_execute) publishes eagerly outside the lane and the remote push leg lives in transport, so executing through preparation needs a prepare/job split with no producer on this path — load the plan with load_plan and re-prepare when it drifts",
-            ));
-        }
+        Request::PolicySet(m) => policy_set_parts(ctx, m.request_id, &m.args)?,
+        Request::LandExecute(m) => land_execute_parts(ctx, m.request_id, &m.args)?,
         Request::OpPrune(_) => {
             return Err(uncovered(
                 "op.prune",
@@ -331,6 +344,7 @@ pub(crate) fn prepare_mutation_with(
         workspace_fence: parts.fence,
         ref_transaction: parts.transaction,
         ref_dependencies: parts.dependencies,
+        on_behalf_of: ctx.on_behalf_of.clone(),
     })
 }
 
@@ -368,6 +382,7 @@ fn check_ref_update(
     store: &Store,
     update: RefUpdate,
 ) -> Result<(Vec<FactMutation>, RefTransaction), CoreError> {
+    crate::refs::check_tag_unfrozen(store, &update.name)?;
     let transaction =
         RefTransaction::new(store.hash_kind(), vec![update]).map_err(CoreError::from)?;
     transaction.check(&StoreRefs::new(store))?;
@@ -835,6 +850,80 @@ fn tag_delete_parts(
         fence: None,
     })
 }
+
+fn release_freeze_set_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ReleaseFreezeSetArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    // Session binding is a precondition, not the authorization itself:
+    // release authorization is enforced by the daemon admin gate before
+    // dispatch (beside the `PolicySet` check). The sessionless legacy path
+    // supplies no identity row, so it refuses here before any store read.
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "release.freeze.set",
+            "release.freeze.set needs the session identity row, which this path does not supply",
+        )
+    })?;
+    let marker = ReleasedTagMarker {
+        owner_release_id: args.owner_release_id.clone(),
+        target_oid: args.target_oid,
+        frozen_at: args.frozen_at,
+    };
+    let facts = prepare_release_freeze(store, &args.name, &marker)?;
+    Ok(Parts {
+        reply: Reply::ReleaseFreezeSet(Box::new(ReleaseFreezeSetReply {
+            outcome: pending_outcome(session, request_id),
+            name: args.name.clone(),
+            owner_release_id: args.owner_release_id.clone(),
+            target_oid: args.target_oid,
+            frozen_at: args.frozen_at,
+        })),
+        objects: Vec::new(),
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+fn release_freeze_clear_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ReleaseFreezeClearArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    // Same session-binding precondition as the set arm: the owner string
+    // below tie-breaks competing releases but never authorizes, so the
+    // sessionless path refuses before the absent-row no-op could succeed.
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "release.freeze.clear",
+            "release.freeze.clear needs the session identity row, which this path does not supply",
+        )
+    })?;
+    let facts = vec![prepare_release_unfreeze(
+        store,
+        &args.name,
+        &args.owner_release_id,
+    )?];
+    Ok(Parts {
+        reply: Reply::ReleaseFreezeClear(Box::new(ReleaseFreezeClearReply {
+            outcome: pending_outcome(session, request_id),
+            name: args.name.clone(),
+        })),
+        objects: Vec::new(),
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
 /// Mints the empty tree when absent and stages one empty-tree commit through
 /// `ops::prepare_new`, synthesizing author and committer from `over` (the
 /// operation override) or the session identity.
@@ -950,17 +1039,17 @@ fn mint_empty_commit(
         change_id: staged.record.change_id(),
         oid: head.as_git().copied(),
     };
-    if let Some(existing) = records.get_commit(&head)? {
-        if existing == staged.record {
-            return Ok((
-                PreparedOp {
-                    objects: staged_prefix,
-                    facts: Vec::new(),
-                    output,
-                },
-                identity,
-            ));
-        }
+    if let Some(existing) = records.get_commit(&head)?
+        && existing == staged.record
+    {
+        return Ok((
+            PreparedOp {
+                objects: staged_prefix,
+                facts: Vec::new(),
+                output,
+            },
+            identity,
+        ));
     }
     let mut objects = staged_prefix;
     objects.push(staged.prepared_object);
@@ -1208,6 +1297,7 @@ fn claim_acquire_parts(
     for path in &paths {
         row.capabilities.require_claim(path)?;
     }
+    validate_claim_ttl(args.subject.as_ref(), args.ttl.seconds())?;
     let now = jiff::Timestamp::now();
     let expires_at = Timestamp::new(
         now.checked_add(jiff::SignedDuration::from_secs(i64::from(
@@ -1224,6 +1314,8 @@ fn claim_acquire_parts(
                 paths,
                 mode: args.mode,
                 expires_at,
+                on_behalf_of: ctx.on_behalf_of.clone(),
+                subject: args.subject.clone(),
             },
         })),
         objects: Vec::new(),
@@ -1260,6 +1352,66 @@ fn claim_release_parts(
         reply: Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: pending_outcome(session, request_id),
             released: record,
+        })),
+        objects: Vec::new(),
+        facts: Vec::new(),
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// Prepares `claim.renew` without sealing: reads the stored record for an
+/// early holder and liveness check and predicts the renewed reply. The lane
+/// re-reads and seals authoritatively at commit time and overwrites the
+/// record.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown claim.
+/// - [`ErrorCode::EForbidden`] for another session's claim.
+/// - [`ErrorCode::EStale`] for an expired claim.
+/// - [`ErrorCode::EInvalid`] for a path-only renewal above the hourly ceiling.
+fn claim_renew_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ClaimRenewArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let Some(record) = read_record(ctx.store, args.claim)? else {
+        return Err(CoreError::new(ErrorCode::ENotFound, "claim does not exist"));
+    };
+    if record.holder != session {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            "claim belongs to another session",
+        ));
+    }
+    let now = jiff::Timestamp::now();
+    if record.expires_at <= Timestamp::new(now) {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            "claim has expired; acquire a fresh claim",
+        ));
+    }
+    validate_claim_ttl(record.subject.as_ref(), args.ttl.seconds())?;
+    let expires_at = Timestamp::new(
+        now.checked_add(jiff::SignedDuration::from_secs(i64::from(
+            args.ttl.seconds(),
+        )))
+        .unwrap_or(now),
+    );
+    Ok(Parts {
+        reply: Reply::ClaimRenew(Box::new(ClaimRenewReply {
+            outcome: pending_outcome(session, request_id),
+            claim: ClaimRecord {
+                claim: record.claim,
+                holder: record.holder,
+                paths: record.paths,
+                mode: record.mode,
+                expires_at,
+                on_behalf_of: record.on_behalf_of,
+                subject: record.subject,
+            },
         })),
         objects: Vec::new(),
         facts: Vec::new(),
@@ -3424,15 +3576,76 @@ fn undo_parts(
     })
 }
 
+/// Prepares `policy.set`: replaces the repo-wide landing policy and bumps
+/// the policy generation by one. The write is conditional on the row read,
+/// so a concurrent `policy.set` fails loudly as stale instead of silently
+/// winning. Landing plans prepared under an older generation refuse at
+/// execution with `E_STALE`, so a policy bump invalidates prepared plans.
+///
+/// # Errors
+/// - [`ErrorCode::EHosted`] without the session row (no identity source).
+/// - [`ErrorCode::ELimit`] for a policy larger than the land bounds.
+/// - [`ErrorCode::ENotFound`] when no metadata row exists yet.
+/// - [`ErrorCode::EStale`] when the policy row moved under the call.
+/// - Store failures.
+fn policy_set_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &PolicySetArgs,
+) -> Result<Parts, CoreError> {
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "policy.set",
+            "policy.set checks the session identity row this path does not supply",
+        )
+    })?;
+    crate::attestation::check_land_policy(args.requirements.len(), &args.trusted_signers)?;
+    let key = crate::store::types::REPO_META_KEY.to_vec();
+    let Some((row, raw)) = ctx.store.repo_meta_raw().map_err(CoreError::from)? else {
+        return Err(CoreError::new(
+            ErrorCode::ENotFound,
+            "repo metadata is missing; run repo.init first",
+        ));
+    };
+    let generation = row
+        .policy_generation
+        .checked_add(1)
+        .ok_or_else(|| CoreError::new(ErrorCode::ECapacity, "land policy generation overflow"))?;
+    let next = crate::store::types::RepoMetaRow {
+        default_branch: row.default_branch,
+        land_requirements: args.requirements.clone(),
+        trusted_signers: args.trusted_signers.clone(),
+        policy_generation: generation,
+    };
+    let bytes = crate::store::encode("repo meta", &next).map_err(CoreError::from)?;
+    let reply = Reply::PolicySet(Box::new(PolicySetReply {
+        outcome: pending_outcome(ctx.session, request_id),
+        generation,
+    }));
+    Ok(Parts {
+        reply,
+        objects: Vec::new(),
+        facts: vec![crate::store::types::FactMutation {
+            table: crate::store::types::FactTable::RepoMeta,
+            key,
+            expected: crate::store::types::FactExpectation::Value(raw),
+            value: Some(bytes),
+        }],
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
 /// Prepares `land.prepare`: freezes the resolved change head as the exact
 /// single-candidate plan over the target's live tip, moving no ref.
 ///
 /// The candidate set derives from the resolved head: one exact commit.
-/// Requirements and trusted signers ship empty with `policy_generation = 0`
-/// because `PrincipalPolicy` carries no land-requirement fields, only `land`
-/// ref patterns and `attest` kinds; a `[land] requirements` policy section is
-/// follow-up work. The target still needs the session's `land` capability,
-/// checked here while the lane re-checks authority at commit time.
+/// Requirements, trusted signers, and the policy generation come from the
+/// repo-wide landing policy (`policy.set`); stores predating the policy
+/// prepare unconstrained at generation zero. The target still needs the
+/// session's `land` capability, checked here while the lane re-checks
+/// authority at commit time.
 ///
 /// # Errors
 /// - [`ErrorCode::EHosted`] without the session row (no capability source),
@@ -3474,16 +3687,31 @@ fn land_prepare_parts(
         ));
     };
     row.capabilities.require_land(&args.target)?;
+    if args.remote.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::EHosted,
+            "land.prepare with a remote refuses: the transport push leg is not served yet",
+        ));
+    }
+    let (requirements, trusted, policy_generation) =
+        match store.repo_meta().map_err(CoreError::from)? {
+            Some(meta) => (
+                meta.land_requirements,
+                meta.trusted_signers,
+                meta.policy_generation,
+            ),
+            None => (Vec::new(), Vec::new(), 0),
+        };
     let (plan, mutation) = prepare_land_plan(
         store,
         LandPrepareRequest {
             change: args.change,
             target: args.target.clone(),
             candidates: vec![*candidate],
-            requirements: Vec::new(),
-            trusted: Vec::new(),
+            requirements,
+            trusted,
             merge: args.merge,
-            policy_generation: 0,
+            policy_generation,
             now: clock.sample()?.timestamp(),
         },
         checkpoint,
@@ -3509,6 +3737,87 @@ fn land_prepare_parts(
         facts: vec![mutation],
         transaction: None,
         dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// Prepares `land.execute`: validates the stored plan against live state and
+/// stages the target move plus plan-row deletion for the lane to publish.
+///
+/// The presented candidate must be the plan's primary candidate, and the
+/// policy generation must still match: a `policy.set` after prepare fails
+/// the execution as stale. The executing session must hold the `land`
+/// capability on the stored target, re-checked here because the executor
+/// may differ from the session that prepared the plan. Only the local leg
+/// is served: `remote` must be absent (this store); a present remote names
+/// a transport push the coordinator does not run.
+///
+/// The staged target move travels in `Parts.transaction` so the lane
+/// re-runs its collision check against live state at publication.
+///
+/// # Errors
+/// `E_HOSTED` for a present remote; `E_NOT_FOUND` for an unknown plan;
+/// `E_STALE` for a non-primary candidate, an expired plan, a moved target
+/// tip, a changed land policy, or a lost commit race; `E_POLICY` for a
+/// candidate that misses a requirement; `E_FORBIDDEN` when the executing
+/// session lacks the `land` grant on the target; `E_CORRUPT` or `E_IO`
+/// from the store.
+fn land_execute_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &LandExecuteArgs,
+) -> Result<Parts, CoreError> {
+    let row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "land.execute",
+            "land.execute checks the executing session's `land` capability, which needs the session identity row this path does not supply",
+        )
+    })?;
+    let clock = ctx.clock.ok_or_else(|| {
+        uncovered(
+            "land.execute",
+            "land.execute checks the plan deadline, which needs the coordinator clock this path does not supply",
+        )
+    })?;
+    let Some(checkpoint) = ctx.checkpoint else {
+        return Err(uncovered(
+            "land.execute",
+            "land.execute re-evaluates attestations, which needs the attestation progress gate this path does not supply",
+        ));
+    };
+    let now = clock.sample()?.timestamp();
+    let (outcome, facts) =
+        super::land::prepare_land_execute(ctx.store, args.plan, args.candidate, now, checkpoint)?;
+    row.capabilities.require_land(&outcome.target)?;
+    let transaction = RefTransaction::new(
+        ctx.store.hash_kind(),
+        vec![RefUpdate {
+            name: outcome.target.clone(),
+            expected: match outcome.base {
+                Some(base) => RefExpect::Present(RefTarget::Direct(base)),
+                None => RefExpect::Absent,
+            },
+            change: RefChange::Set(RefTarget::Direct(outcome.candidate)),
+        }],
+    )
+    .map_err(CoreError::from)?;
+    let reply = Reply::LandExecute(Box::new(LandExecuteReply {
+        outcome: pending_outcome(ctx.session, request_id),
+        plan: outcome.plan,
+        remote: PushRefOutcome {
+            remote_ref: outcome.target.clone(),
+            status: PushRefStatus::Confirmed {
+                new: Some(outcome.candidate),
+            },
+        },
+        local: LandLocalState::Published,
+    }));
+    Ok(Parts {
+        reply,
+        objects: Vec::new(),
+        facts,
+        transaction: Some(transaction),
+        dependencies: vec![outcome.target.clone()],
         fence: None,
     })
 }
@@ -3715,21 +4024,21 @@ mod tests {
     use crate::index::RepoPath;
     use crate::ops::{NewRequest, prepare_new};
     use crate::protocol::{
-        AbandonArgs, AttestAddArgs, AttestListArgs, AttestSignature, AttestStatement,
-        BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimListArgs, ClaimMode,
-        ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs,
-        GitCommitArgs, GitCommitRefUpdate, IdentityClaim, LandExecuteArgs, LandPrepareArgs,
-        MergeSelection, Mutation as WireMutation, NewArgs, OpLogArgs, PathSelection, PinArgs,
-        PushArgs, PushAtomicity, PushReconcileArgs, PushSource, PushUpdate, RebaseArgs,
-        RebaseScope, RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
-        SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs, WorkspaceBinding,
-        WorkspaceInit, WsNewArgs,
+        AbandonArgs, AttestAddArgs, AttestRequirement, AttestSignature, AttestStatement,
+        BookmarkDeleteArgs, ChangeRef, ClaimAcquireArgs, ClaimMode, ClaimReleaseArgs, ClaimTtl,
+        DescribeArgs, EditArgs, FetchArgs, FetchFilter, FetchRefs, GitCommitArgs,
+        GitCommitRefUpdate, IdentityClaim, LandExecuteArgs, LandPrepareArgs, MergeSelection,
+        Mutation as WireMutation, NewArgs, PathSelection, PinArgs, PolicySetArgs, PushArgs,
+        PushAtomicity, PushReconcileArgs, PushSource, PushUpdate, RebaseArgs, RebaseScope,
+        RemoteName, RemoteSpec, Resolution, ResolveArgs, RevertArgs, SessionAuthority,
+        SignerFingerprint, SplitArgs, SplitPlacement, SquashArgs, TagAnnotation, UnpinArgs,
+        WorkspaceBinding, WorkspaceInit, WsNewArgs,
     };
     use crate::records::codec::encode_change_entry;
     use crate::records::keys::change_key;
     use crate::records::types::{ChangeEntry, ChangeState};
     use crate::refdata::RefName;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
     use crate::workcopy::journal_state::ws_apply_key;
     use crate::workspace::WorkspaceStamp;
 
@@ -3802,7 +4111,14 @@ mod tests {
             .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("prepare empty tree");
         let tree_oid = tree.oid();
-        store.publish(vec![tree], &[]).expect("publish empty tree");
+        store
+            .publish(
+                vec![tree],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish empty tree");
         let prepared = prepare_new(
             store,
             NewRequest {
@@ -3821,7 +4137,12 @@ mod tests {
         let change = prepared.output.change_id;
         let oid = prepared.output.oid.expect("seed commit is a Git commit");
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish seed commit");
         (head, change, oid)
     }
@@ -3865,6 +4186,7 @@ mod tests {
             claim_clock: None,
             policy: None,
             checkpoint,
+            on_behalf_of: None,
         }
     }
 
@@ -3912,6 +4234,8 @@ mod tests {
                     expected: crate::store::types::FactExpectation::Absent,
                     value: Some(crate::store::encode("ref target", &target).expect("encode ref")),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish fixture ref");
         let prepared = prepare_mutation(
@@ -3926,7 +4250,7 @@ mod tests {
             })),
         )
         .expect("tag.delete prepares on a present ref");
-        assert_eq!(prepared.facts.len(), 1);
+        assert_eq!(prepared.facts.len(), 2);
         let fact = &prepared.facts[0];
         assert_eq!(fact.table, crate::store::types::FactTable::Refs);
         assert!(fact.value.is_none());
@@ -3979,6 +4303,7 @@ mod tests {
                 paths: vec![RepoPath::new("src").expect("test path")],
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
         }));
         let err =
@@ -4130,6 +4455,8 @@ mod tests {
                     expected: crate::store::types::FactExpectation::Absent,
                     value: Some(encode_change_entry(&entry).expect("encode change entry")),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish conflicted change");
         let err = prepare_mutation(
@@ -4147,6 +4474,199 @@ mod tests {
         )
         .expect_err("conflicted head cannot become a ref");
         assert_eq!(err.code, ErrorCode::EInvalid);
+    }
+
+    fn release_freeze_request(tag: &str, owner: &str, target: Oid) -> Request {
+        Request::ReleaseFreezeSet(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ReleaseFreezeSetArgs {
+                name: name(tag),
+                owner_release_id: owner.to_owned(),
+                target_oid: target,
+                frozen_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+        }))
+    }
+
+    fn release_clear_request(tag: &str, owner: &str) -> Request {
+        Request::ReleaseFreezeClear(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ReleaseFreezeClearArgs {
+                name: name(tag),
+                owner_release_id: owner.to_owned(),
+            },
+        }))
+    }
+
+    fn plain_tag_set_request(tag: &str, target: Oid) -> Request {
+        Request::TagSet(Box::new(WireMutation {
+            request_id: request_id(),
+            args: TagSetArgs {
+                name: name(tag),
+                target,
+                annotation: None,
+                expected: RefExpect::Absent,
+            },
+        }))
+    }
+
+    fn tag_delete_request(tag: &str, target: Oid) -> Request {
+        Request::TagDelete(Box::new(WireMutation {
+            request_id: request_id(),
+            args: TagDeleteArgs {
+                name: name(tag),
+                expected: RefExpect::Present(RefTarget::Direct(target)),
+            },
+        }))
+    }
+
+    fn publish_prepared(store: &Store, facts: &[FactMutation]) {
+        store
+            .publish(
+                Vec::new(),
+                facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish prepared facts");
+    }
+
+    #[test]
+    fn released_tag_freeze_gates_tag_mutations_until_its_owner_clears() {
+        let (_temp, store, session) = fixture();
+        let (_, _, target) = seed_commit(&store, None);
+
+        let tag = prepare_mutation(
+            &store,
+            session,
+            plain_tag_set_request("refs/tags/v1", target),
+        )
+        .expect("the frozen tag exists before release.freeze.set");
+        publish_prepared(&store, &tag.facts);
+
+        // Freeze and clear require the session identity row; the legacy
+        // sessionless path cannot supply it.
+        let row = session_row(None);
+        let ctx = full_ctx(&store, session, Some(&row), None, None);
+
+        let frozen = prepare_mutation_with(
+            &ctx,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect("release.freeze.set prepares");
+        assert!(matches!(frozen.reply, Reply::ReleaseFreezeSet(_)));
+        assert_eq!(
+            frozen.facts.len(),
+            2,
+            "a fresh freeze pins the live tag row plus the marker row"
+        );
+        publish_prepared(&store, &frozen.facts);
+
+        let retry = prepare_mutation_with(
+            &ctx,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect("the same owner and target retries");
+        assert_eq!(
+            retry.facts.len(),
+            1,
+            "an idempotent retry guards the marker row"
+        );
+        assert!(matches!(
+            retry.facts[0].expected,
+            crate::store::types::FactExpectation::Value(_)
+        ));
+
+        let other_owner = prepare_mutation_with(
+            &ctx,
+            release_freeze_request("refs/tags/v1", "rel-2", target),
+        )
+        .expect_err("another owner is refused");
+        assert_eq!(other_owner.code, ErrorCode::EForbidden);
+        assert!(
+            other_owner.message.contains("rel-1"),
+            "{}",
+            other_owner.message
+        );
+
+        let set = prepare_mutation(
+            &store,
+            session,
+            plain_tag_set_request("refs/tags/v1", target),
+        )
+        .expect_err("a plain tag.set is refused while frozen");
+        assert_eq!(set.code, ErrorCode::EForbidden);
+        assert!(set.message.contains("rel-1"), "{}", set.message);
+
+        let delete = prepare_mutation(&store, session, tag_delete_request("refs/tags/v1", target))
+            .expect_err("tag.delete is refused while frozen");
+        assert_eq!(delete.code, ErrorCode::EForbidden);
+        assert!(delete.message.contains("rel-1"), "{}", delete.message);
+
+        let refused_clear =
+            prepare_mutation_with(&ctx, release_clear_request("refs/tags/v1", "rel-2"))
+                .expect_err("another owner cannot clear");
+        assert_eq!(refused_clear.code, ErrorCode::EForbidden);
+        assert!(
+            refused_clear.message.contains("rel-1"),
+            "{}",
+            refused_clear.message
+        );
+
+        let cleared = prepare_mutation_with(&ctx, release_clear_request("refs/tags/v1", "rel-1"))
+            .expect("the owner clears");
+        publish_prepared(&store, &cleared.facts);
+
+        let unfrozen = prepare_mutation(
+            &store,
+            session,
+            Request::TagSet(Box::new(WireMutation {
+                request_id: request_id(),
+                args: TagSetArgs {
+                    name: name("refs/tags/v1"),
+                    target,
+                    annotation: None,
+                    expected: RefExpect::Present(RefTarget::Direct(target)),
+                },
+            })),
+        )
+        .expect("tag.set prepares once the marker is gone");
+        assert!(
+            unfrozen
+                .facts
+                .iter()
+                .any(|fact| fact.table == crate::store::types::FactTable::ReleasedTags),
+            "the tag.set keeps its freeze guard in the same publish"
+        );
+    }
+
+    #[test]
+    fn release_freeze_set_without_session_row_is_refused() {
+        let (_temp, store, session) = fixture();
+        let (_, _, target) = seed_commit(&store, None);
+        // The gate runs before the tag-liveness read: even a well-formed
+        // request for a committable target refuses on the sessionless path.
+        let err = prepare_mutation(
+            &store,
+            session,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect_err("sessionless freeze setup is refused before any store read");
+        assert_eq!(err.code, ErrorCode::EHosted);
+    }
+
+    #[test]
+    fn release_freeze_clear_without_session_row_is_refused() {
+        let (_temp, store, session) = fixture();
+        // No marker row exists, so the old path returned a no-op success;
+        // the session gate now refuses before that no-op could succeed.
+        let err = prepare_mutation(
+            &store,
+            session,
+            release_clear_request("refs/tags/v1", "rel-1"),
+        )
+        .expect_err("sessionless clear is refused even with no marker row");
+        assert_eq!(err.code, ErrorCode::EHosted);
     }
 
     #[test]
@@ -4210,7 +4730,7 @@ mod tests {
             panic!("tag.set must answer its own reply");
         };
         assert_eq!(reply.target, RefTarget::Direct(expected_oid));
-        assert_eq!(prepared.facts.len(), 1);
+        assert_eq!(prepared.facts.len(), 2);
         assert!(prepared.ref_transaction.is_some());
 
         // Without an annotation tagger the session identity fills in.
@@ -4336,7 +4856,12 @@ mod tests {
 
         // Once published, unpinning removes the fact against its bytes.
         store
-            .publish(Vec::new(), &prepared.facts)
+            .publish(
+                Vec::new(),
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish pin");
         let prepared = prepare_mutation(
             &store,
@@ -4387,7 +4912,12 @@ mod tests {
             .expect("prepare subject");
         let subject = subject_object.oid();
         store
-            .publish(vec![subject_object], &[])
+            .publish(
+                vec![subject_object],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish subject");
 
         let key =
@@ -4398,6 +4928,7 @@ mod tests {
             result: AttestResult::new("pass").expect("result"),
             signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
             supersedes: None,
+            evidence: None,
         };
         let payload = statement
             .canonical_payload_v1(HashKind::Sha1)
@@ -4444,7 +4975,12 @@ mod tests {
 
         // Publishing once makes the repeat a duplicate that stages nothing.
         store
-            .publish(Vec::new(), &prepared.facts)
+            .publish(
+                Vec::new(),
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish attestation");
         let repeat = prepare_mutation_with(&ctx, request()).expect("duplicate prepares");
         assert!(repeat.facts.is_empty());
@@ -4494,7 +5030,19 @@ mod tests {
             request_id: request_id(),
             args: LandPrepareArgs {
                 change: ChangeRef { change, head },
-                remote: origin_remote(),
+                remote: None,
+                target: name("refs/heads/main"),
+                merge: MergeSelection::default(),
+            },
+        }))
+    }
+
+    fn land_request_remote(change: ChangeId, head: Option<Head>) -> Request {
+        Request::LandPrepare(Box::new(WireMutation {
+            request_id: request_id(),
+            args: LandPrepareArgs {
+                change: ChangeRef { change, head },
+                remote: Some(origin_remote()),
                 target: name("refs/heads/main"),
                 merge: MergeSelection::default(),
             },
@@ -4528,13 +5076,336 @@ mod tests {
         assert!(prepared.workspace_fence.is_none());
         assert_eq!(prepared.facts.len(), 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish land plan");
         let stored = load_plan(&store, reply.plan)
             .expect("read plan")
             .expect("plan stored");
         assert_eq!(stored.candidate(), Some(oid));
         assert_eq!(stored.base, None);
+    }
+
+    #[test]
+    fn policy_set_bumps_generation_and_land_prepare_inherits_it() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        store
+            .write_repo_meta(RefName::new("refs/heads/main").expect("branch"))
+            .expect("seed repo meta");
+        let requirement = || AttestRequirement {
+            kind: AttestKind::new("ci/build").expect("kind"),
+            result: AttestResult::new("pass").expect("result"),
+            valid_until: None,
+        };
+        let signer =
+            || SignerFingerprint::new(format!("SHA256:{}", "A".repeat(43))).expect("signer");
+        let set = || {
+            Request::PolicySet(Box::new(WireMutation {
+                request_id: request_id(),
+                args: PolicySetArgs {
+                    requirements: vec![requirement()],
+                    trusted_signers: vec![signer()],
+                },
+            }))
+        };
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let first = prepare_mutation_with(&ctx, set()).expect("policy.set serves");
+        let Reply::PolicySet(first_reply) = first.reply else {
+            panic!("policy.set must answer its own reply");
+        };
+        assert_eq!(first_reply.generation, 1);
+        store
+            .publish(
+                first.objects,
+                &first.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish first policy");
+        let second = prepare_mutation_with(&ctx, set()).expect("policy.set serves again");
+        let Reply::PolicySet(second_reply) = second.reply else {
+            panic!("policy.set must answer its own reply");
+        };
+        assert_eq!(second_reply.generation, 2);
+        store
+            .publish(
+                second.objects,
+                &second.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish second policy");
+        let (head, change, _) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        assert_eq!(reply.policy_generation, 2);
+        assert_eq!(reply.requirements, vec![requirement()]);
+    }
+
+    #[test]
+    fn land_execute_moves_the_tip_and_consumes_the_plan() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        let execute = || {
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: oid,
+                },
+            }))
+        };
+        let staged = prepare_mutation_with(&ctx, execute()).expect("land.execute serves");
+        let Reply::LandExecute(run) = staged.reply else {
+            panic!("land.execute must answer its own reply");
+        };
+        assert_eq!(run.plan, reply.plan);
+        assert_eq!(
+            run.remote,
+            PushRefOutcome {
+                remote_ref: RefName::new("refs/heads/main").expect("target"),
+                status: crate::protocol::PushRefStatus::Confirmed { new: Some(oid) },
+            }
+        );
+        assert_eq!(run.local, LandLocalState::Published);
+        store
+            .publish(
+                staged.objects,
+                &staged.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land execution");
+        let target = store
+            .fact(crate::store::types::FactTable::Refs, b"refs/heads/main")
+            .expect("read target")
+            .expect("target landed");
+        let moved: crate::refdata::RefTarget =
+            crate::store::decode("ref target", &target).expect("decode target");
+        assert_eq!(moved, crate::refdata::RefTarget::Direct(oid));
+        assert!(
+            load_plan(&store, reply.plan).expect("read plans").is_none(),
+            "the executed plan is consumed"
+        );
+        let err =
+            prepare_mutation_with(&ctx, execute()).expect_err("a second execution finds no plan");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+    }
+
+    #[test]
+    fn land_execute_refuses_a_non_primary_candidate() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        let wrong = Oid::from_bytes(&[0xabu8; 20]).expect("test oid");
+        assert_ne!(wrong, oid);
+        let err = prepare_mutation_with(
+            &ctx,
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: wrong,
+                },
+            })),
+        )
+        .expect_err("a non-primary candidate refuses");
+        assert_eq!(err.code, ErrorCode::EStale);
+    }
+
+    #[test]
+    fn land_execute_refuses_without_land_capability() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        // The executing session holds no land grant on the target, even
+        // though the preparing session did.
+        let bare = session_row_caps(None, Capabilities::default());
+        let exec_ctx = full_ctx(
+            &store,
+            session,
+            Some(&bare),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let err = prepare_mutation_with(
+            &exec_ctx,
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: oid,
+                },
+            })),
+        )
+        .expect_err("land.execute without the land grant is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn land_execute_carries_a_transaction_that_refuses_new_collisions() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, oid) = seed_commit(&store, None);
+        let prepared = prepare_mutation_with(&ctx, land_request(change, Some(head)))
+            .expect("land.prepare serves");
+        let Reply::LandPrepare(reply) = prepared.reply else {
+            panic!("land.prepare must answer its own reply");
+        };
+        store
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish land plan");
+        // A file ref appears below the target after prepare, so the staged
+        // target move now collides with live state.
+        let child_target = crate::refdata::RefTarget::Direct(oid);
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: crate::store::types::FactTable::Refs,
+                    key: b"refs/heads/main/child".to_vec(),
+                    expected: crate::store::types::FactExpectation::Absent,
+                    value: Some(
+                        crate::store::encode("ref target", &child_target)
+                            .expect("encode child target"),
+                    ),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish colliding child ref");
+        let staged = prepare_mutation_with(
+            &ctx,
+            Request::LandExecute(Box::new(WireMutation {
+                request_id: request_id(),
+                args: LandExecuteArgs {
+                    plan: reply.plan,
+                    candidate: oid,
+                },
+            })),
+        )
+        .expect("land.execute stages against a moved ref namespace");
+        let transaction = staged
+            .ref_transaction
+            .as_ref()
+            .expect("land.execute stages its target move");
+        let err = transaction
+            .check(&StoreRefs::new(&store))
+            .expect_err("a new directory/file collision refuses at publication");
+        assert!(
+            matches!(err, crate::refdata::RefError::Collision { .. }),
+            "a collision refuses, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn land_prepare_refuses_a_remote_push_leg() {
+        let (_temp, store, session) = fixture();
+        let clock = fixed_clock();
+        let row = session_row_caps(None, land_caps());
+        let ctx = full_ctx(
+            &store,
+            session,
+            Some(&row),
+            Some(&clock),
+            Some(&open_checkpoint),
+        );
+        let (head, change, _) = seed_commit(&store, None);
+        let err = prepare_mutation_with(&ctx, land_request_remote(change, Some(head)))
+            .expect_err("remote land.prepare refuses");
+        assert_eq!(err.code, ErrorCode::EHosted);
     }
 
     #[test]
@@ -4662,12 +5533,12 @@ mod tests {
                 candidate: oid(0x31),
             },
         }));
-        let err = prepare_mutation_with(&ctx, execute)
-            .expect_err("land.execute stays refused with context");
-        assert_eq!(err.code, ErrorCode::EHosted);
+        let err =
+            prepare_mutation_with(&ctx, execute).expect_err("unknown land.execute plan refuses");
+        assert_eq!(err.code, ErrorCode::ENotFound);
         assert!(
-            err.message.contains("load_plan"),
-            "land.execute names its plan machinery: {}",
+            err.message.contains("unknown land plan"),
+            "land.execute names the missing plan: {}",
             err.message
         );
     }
@@ -4752,7 +5623,12 @@ mod tests {
 
         // The staged parts commit: the head resolves to a stored commit.
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish new");
         let read = store.read(empty_tree_oid(&store)).expect("read empty tree");
         assert_eq!(read.kind, ObjectKind::Tree);
@@ -4794,7 +5670,14 @@ mod tests {
             .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("stage lane tree");
         let tree_oid = tree.oid();
-        store.publish(vec![tree], &[]).expect("publish lane tree");
+        store
+            .publish(
+                vec![tree],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish lane tree");
         GitCommitArgs {
             tree: tree_oid,
             parents: vec![parent],
@@ -4835,7 +5718,12 @@ mod tests {
             .expect("lane commit has a git identity");
         assert!(prepared.ref_transaction.is_some());
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish lane commit");
         assert!(
             Records::new(&store)
@@ -4857,13 +5745,18 @@ mod tests {
             session,
             Request::GitCommit(Box::new(WireMutation {
                 request_id: request_id(),
-                args: git_commit_args(&store, parent.clone(), branch.clone(), RefExpect::Absent),
+                args: git_commit_args(&store, parent, branch.clone(), RefExpect::Absent),
             })),
         )
         .expect("first git.commit prepares");
         assert!(first.ref_transaction.is_some());
         store
-            .publish(first.objects, &first.facts)
+            .publish(
+                first.objects,
+                &first.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish first lane commit");
         // The retry carries the original (now stale) expectation, but the
         // commit already landed and the ref already holds it, so preparation
@@ -4923,7 +5816,12 @@ mod tests {
         assert_eq!(identity.name, "Bea");
         assert_eq!(identity.source, IdentitySource::OperationOverride);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish child");
         let record = Records::new(&store)
             .get_commit(&reply.created.head)
@@ -5033,7 +5931,12 @@ mod tests {
         )
         .expect("ws.new prepares");
         store
-            .publish(ws.objects, &ws.facts)
+            .publish(
+                ws.objects,
+                &ws.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish workspace");
         let Reply::WsNew(ws_reply) = ws.reply else {
             panic!("ws.new must answer its own reply");
@@ -5071,7 +5974,12 @@ mod tests {
             .collect();
         assert_eq!(facts.len(), 1);
         store
-            .publish(switched.objects, &switched.facts)
+            .publish(
+                switched.objects,
+                &switched.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish switch");
 
         // A holder that is not the session loses the fence, not the call.
@@ -5129,6 +6037,7 @@ mod tests {
                     ],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5160,6 +6069,7 @@ mod tests {
                     paths: vec![RepoPath::new("src").expect("test path")],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5175,6 +6085,7 @@ mod tests {
                     paths: Vec::new(),
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5197,11 +6108,18 @@ mod tests {
                 paths: vec![RepoPath::new("src").expect("test path")],
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
+            None,
         )
         .expect("seal fixture claim");
         store
-            .publish(Vec::new(), &sealed.facts)
+            .publish(
+                Vec::new(),
+                &sealed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish fixture claim");
 
         // The legacy path serves releases: prediction is a read, and the
@@ -5254,6 +6172,134 @@ mod tests {
     }
 
     #[test]
+    fn claim_renew_predicts_the_renewed_record() {
+        let (_temp, store, session) = fixture();
+        // The lapsed claim seals first, while no claim-clock fence exists
+        // yet, so the fixed clock anchors it in the past; a later fence
+        // would max the window back to the present.
+        let past = crate::coord::claims::ClaimClock::open(&store, fixed_clock())
+            .expect("past claim clock opens");
+        let lapsed = crate::coord::claims::seal_acquire(
+            &store,
+            &past,
+            session,
+            ClaimId::generate(),
+            ClaimAcquireArgs {
+                paths: vec![RepoPath::new("old").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: None,
+            },
+            None,
+        )
+        .expect("seal lapsed claim");
+        store
+            .publish(
+                Vec::new(),
+                &lapsed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish lapsed claim");
+        let clock = crate::coord::clock::Clock::system();
+        let claims =
+            crate::coord::claims::ClaimClock::open(&store, clock).expect("claim clock opens");
+        let subject = Some(crate::protocol::ClaimSubject::Task(
+            crate::protocol::TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+        ));
+        let sealed = crate::coord::claims::seal_acquire(
+            &store,
+            &claims,
+            session,
+            ClaimId::generate(),
+            ClaimAcquireArgs {
+                paths: vec![RepoPath::new("src").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: subject.clone(),
+            },
+            None,
+        )
+        .expect("seal fixture claim");
+        store
+            .publish(
+                Vec::new(),
+                &sealed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish fixture claim");
+
+        // The legacy path serves renewals: prediction reads the record and
+        // extends its window, and the lane re-seals authoritatively.
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: sealed.record.claim,
+                    ttl: ClaimTtl::new(120).expect("ttl"),
+                },
+            })),
+        )
+        .expect("claim.renew prepares");
+        let Reply::ClaimRenew(reply) = prepared.reply else {
+            panic!("claim.renew must answer its own reply");
+        };
+        assert_eq!(reply.claim.subject, subject);
+        assert_eq!(reply.claim.holder, session);
+        assert_eq!(reply.claim.paths, sealed.record.paths);
+        assert!(prepared.facts.is_empty());
+
+        // An unknown claim is not found.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: ClaimId::generate(),
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("unknown claim is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        // Another session's claim is forbidden.
+        let holder = SessionId::generate();
+        let err = prepare_mutation(
+            &store,
+            holder,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: sealed.record.claim,
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("foreign claim is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        // An expired claim predicts stale, matching the lane seal.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: lapsed.record.claim,
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("expired claim is stale");
+        assert_eq!(err.code, ErrorCode::EStale);
+    }
+
+    #[test]
     fn ws_new_creates_native_and_gitcompat_rows() {
         let (_temp, store, session) = fixture();
         let clock = fixed_clock();
@@ -5289,7 +6335,12 @@ mod tests {
         );
         assert!(prepared.workspace_fence.is_none());
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish native workspace");
 
         // GitCompat creation is context-free: no identity, no clock.
@@ -5315,7 +6366,12 @@ mod tests {
         };
         assert!(reply.outcome.identity.is_none());
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish gitcompat workspace");
 
         // Native creation without an identity is invalid, even with a clock.
@@ -5402,7 +6458,12 @@ mod tests {
         )
         .expect("ws.new prepares");
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish workspace");
         let Reply::WsNew(reply) = prepared.reply else {
             panic!("ws.new must answer its own reply");
@@ -5453,7 +6514,12 @@ mod tests {
             crate::store::types::FactTable::Workspaces
         );
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish edit");
 
         // The row transition is context-free, so the legacy path serves it
@@ -5504,7 +6570,12 @@ mod tests {
         )
         .expect("gitcompat ws.new prepares");
         store
-            .publish(git.objects, &git.facts)
+            .publish(
+                git.objects,
+                &git.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish gitcompat workspace");
         let Reply::WsNew(git_reply) = git.reply else {
             panic!("ws.new must answer its own reply");
@@ -5618,7 +6689,12 @@ mod tests {
         assert_eq!(reply.state.scope(), &scope);
         assert_eq!(reply.state.stamp().sequence, before.sequence + 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish scope");
 
         let legacy = prepare_mutation(
@@ -5670,7 +6746,12 @@ mod tests {
         assert_eq!(reply.state.stamp().sequence, before.sequence);
         assert_eq!(reply.state.stamp().lease_epoch, before.lease_epoch + 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish take");
 
         // An unpinned take seizes from whoever holds the workspace and
@@ -5699,7 +6780,12 @@ mod tests {
             before.lease_epoch + 2
         );
         store
-            .publish(seized.objects, &seized.facts)
+            .publish(
+                seized.objects,
+                &seized.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish seize");
 
         // The displaced holder's stamp can never match again.
@@ -5746,7 +6832,12 @@ mod tests {
             panic!("ws.drop must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish drop");
         assert!(
             workspace::observe(&store, id).is_err(),
@@ -5814,6 +6905,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(vec![0x01]),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("stage open journal");
         let err =
@@ -5838,6 +6931,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(value),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish bare row");
         let err = prepare_mutation_with(
@@ -5930,6 +7025,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(vec![0x01]),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("stage open journal");
         let err = prepare_mutation(&store, session, request())
@@ -6028,7 +7125,12 @@ mod tests {
         let head = prepared.output.head;
         let change = prepared.output.change_id;
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish child commit");
         (head, change)
     }
@@ -6050,7 +7152,12 @@ mod tests {
             .expect("prepare marker tree");
         let oid = staged.oid();
         store
-            .publish(vec![staged], &[])
+            .publish(
+                vec![staged],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish marker tree");
         oid
     }
@@ -6128,7 +7235,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[1].old, bhead);
         assert_eq!(reply.rewrites.items[2].old, chead);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish describe");
         assert_eq!(commit_message(&store, &new_a), b"a rewritten");
         assert_eq!(commit_message(&store, &new_b), b"b");
@@ -6243,7 +7355,12 @@ mod tests {
             .collect();
         assert_eq!(change_facts.len(), 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish merged describe");
         assert_eq!(change_heads(&store, &achange).len(), 2);
         let _ = bhead;
@@ -6286,7 +7403,12 @@ mod tests {
         };
         assert_eq!(reply.rewrites.items.len(), 4);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish diamond describe");
         let merge_rewrite = reply
             .rewrites
@@ -6362,7 +7484,12 @@ mod tests {
         assert_eq!(reply.rewrites.items.len(), 2);
         assert_eq!(reply.rewrites.items[0].old, shead);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish rebase");
         let new_s = reply.rewrites.items[0].new;
         let new_d = reply.rewrites.items[1].new;
@@ -6400,7 +7527,12 @@ mod tests {
         };
         assert_eq!(reply.rewrites.items.len(), 2);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish revisions-only rebase");
         let new_d = reply.rewrites.items[1].new;
         assert_eq!(commit_parents(&store, &new_d), vec![phead]);
@@ -6572,18 +7704,39 @@ mod tests {
             .prepare(ObjectKind::Tree, 0, std::io::Cursor::new(Vec::new()), None)
             .expect("prepare empty tree");
         let mut root = empty.oid();
-        store.publish(vec![empty], &[]).expect("publish empty tree");
+        store
+            .publish(
+                vec![empty],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish empty tree");
         for (name, marker) in files {
             let blob_bytes = [*marker];
             let blob = store
                 .prepare(ObjectKind::Blob, 1, std::io::Cursor::new(blob_bytes), None)
                 .expect("prepare blob");
             let blob_oid = blob.oid();
-            store.publish(vec![blob], &[]).expect("publish blob");
+            store
+                .publish(
+                    vec![blob],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish blob");
             let path = RepoPath::new(name.as_bytes().to_vec()).expect("test path");
             let entry = Some((TreeMode::File(FileMode::Regular), blob_oid));
             let edit = set_entry(store, root, &path, entry).expect("set entry");
-            store.publish(edit.objects, &[]).expect("publish tree edit");
+            store
+                .publish(
+                    edit.objects,
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish tree edit");
             root = edit.root;
         }
         root
@@ -6612,7 +7765,12 @@ mod tests {
             .expect("prepare conflicted commit");
         let head = conflicted.head;
         store
-            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .publish(
+                vec![conflicted.prepared_object],
+                &conflicted.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted commit");
         let request = Request::Resolve(Box::new(WireMutation {
             request_id: request_id(),
@@ -6635,7 +7793,12 @@ mod tests {
             "the only path is resolved"
         );
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish resolve");
         let resolved = Records::new(&store)
             .get_commit(&reply.change.head)
@@ -6672,7 +7835,12 @@ mod tests {
             .expect("prepare conflicted commit");
         let head = conflicted.head;
         store
-            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .publish(
+                vec![conflicted.prepared_object],
+                &conflicted.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted commit");
         let prepared = prepare_mutation(
             &store,
@@ -6695,7 +7863,12 @@ mod tests {
             panic!("resolve must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish resolve");
         let resolved = Records::new(&store)
             .get_commit(&reply.change.head)
@@ -6731,7 +7904,12 @@ mod tests {
             .expect("prepare conflicted commit");
         let head = conflicted.head;
         store
-            .publish(vec![conflicted.prepared_object], &conflicted.mutations)
+            .publish(
+                vec![conflicted.prepared_object],
+                &conflicted.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted commit");
         let request = Request::Resolve(Box::new(WireMutation {
             request_id: request_id(),
@@ -6781,7 +7959,12 @@ mod tests {
             panic!("revert must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish revert");
         assert_ne!(reply.created.change, target_change, "a fresh change");
         let created = Records::new(&store)
@@ -6824,7 +8007,12 @@ mod tests {
             panic!("split must answer its own reply");
         };
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish split");
         assert_eq!(
             reply.rewrites.items.len(),
@@ -6892,7 +8080,12 @@ mod tests {
             "the remainder keeps the source"
         );
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish squash");
         let new_destination = reply.rewrites.items[0].new;
         let new_source = reply.rewrites.items[1].new;
@@ -6969,7 +8162,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[0].old, dhead);
         assert_eq!(reply.abandoned.items, vec![schange]);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish squash");
         let new_dest = reply.rewrites.items[0].new;
         let new_child = reply.rewrites.items[1].new;
@@ -7062,7 +8260,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[0].old, dhead);
         assert_eq!(reply.abandoned.items, vec![tchange]);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish abandon");
         let new_child = reply.rewrites.items[0].new;
         assert!(commit_parents(&store, &new_child).is_empty());
@@ -7098,7 +8301,12 @@ mod tests {
         assert_eq!(reply.rewrites.items[0].old, dhead);
         assert_eq!(reply.abandoned.items.len(), 2);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish nested abandon");
         let new_leaf = reply.rewrites.items[0].new;
         assert!(commit_parents(&store, &new_leaf).is_empty());
@@ -7179,7 +8387,12 @@ mod tests {
         )
         .expect("ws.new prepares");
         store
-            .publish(ws.objects, &ws.facts)
+            .publish(
+                ws.objects,
+                &ws.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish workspace");
         let Reply::WsNew(ws_reply) = ws.reply else {
             panic!("ws.new must answer its own reply");
@@ -7220,7 +8433,12 @@ mod tests {
             .collect();
         assert_eq!(workspace_facts.len(), 1);
         store
-            .publish(prepared.objects, &prepared.facts)
+            .publish(
+                prepared.objects,
+                &prepared.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish fenced describe");
 
         // Two bindings exceed the single lane fence.
@@ -7252,9 +8470,9 @@ mod tests {
     fn reads_have_no_preparation() {
         let (_temp, store, session) = fixture();
         for request in [
-            Request::ClaimList(Box::new(ClaimListArgs::default())),
-            Request::AttestList(Box::new(AttestListArgs::default())),
-            Request::OpLog(Box::new(OpLogArgs::default())),
+            Request::ClaimList(Box::default()),
+            Request::AttestList(Box::default()),
+            Request::OpLog(Box::default()),
         ] {
             let err = prepare_mutation(&store, session, request).expect_err("reads never prepare");
             assert_eq!(err.code, ErrorCode::EInvalid);

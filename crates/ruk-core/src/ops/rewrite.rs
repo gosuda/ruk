@@ -167,8 +167,8 @@ mod tests {
     use crate::conflict::{Signature, TzOffset};
     use crate::ids::HashKind;
     use crate::ops::{NewRequest, prepare_new};
-    use crate::store::PreparationBudget;
     use crate::store::types::ObjectKind;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     struct Fixture {
         root: std::path::PathBuf,
@@ -219,7 +219,14 @@ mod tests {
                 .prepare(ObjectKind::Tree, 0, Cursor::new(Vec::new()), None)
                 .expect("prepare empty tree");
             let tree_oid = tree.oid();
-            self.store.publish(vec![tree], &[]).ok();
+            self.store
+                .publish(
+                    vec![tree],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .ok();
             let signature = Signature {
                 name: ByteString::from("Test"),
                 email: ByteString::from("test@example.invalid"),
@@ -242,7 +249,12 @@ mod tests {
             .expect("prepare fixture commit");
             let head = prepared.output.head;
             self.store
-                .publish(prepared.objects, &prepared.facts)
+                .publish(
+                    prepared.objects,
+                    &prepared.facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish fixture commit");
             head
         }

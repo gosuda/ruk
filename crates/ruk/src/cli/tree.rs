@@ -7,12 +7,11 @@
 //! tag headers the store's Git import path already accepts.
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
 
 use ruk_core::conflict::Signature;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry};
-use ruk_core::store::{ObjectKind, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, Store};
 use ruk_git::GitError;
 use std::io::Read;
 
@@ -182,6 +181,10 @@ pub(crate) fn encode_tree(entries: &[TreeEntry]) -> Vec<u8> {
     out
 }
 
+/// Per-directory file rows behind one staged tree build: directory bytes to
+/// `(file name, mode, id)` rows.
+type DirEntries = BTreeMap<Vec<u8>, Vec<(Vec<u8>, FileMode, Oid)>>;
+
 /// Builds and publishes the tree for stage-zero `rows`, bottom-up.
 ///
 /// `rows` holds `(full path bytes, entry)` pairs; intermediate subtrees are
@@ -192,7 +195,7 @@ pub(crate) fn build_index_tree(
     kind: HashKind,
     rows: &[(Vec<u8>, IndexEntry)],
 ) -> Result<Oid, GitError> {
-    let mut by_dir: BTreeMap<Vec<u8>, Vec<(Vec<u8>, FileMode, Oid)>> = BTreeMap::new();
+    let mut by_dir: DirEntries = BTreeMap::new();
     for (path, entry) in rows {
         entry
             .validate(kind)
@@ -205,15 +208,22 @@ pub(crate) fn build_index_tree(
     }
     let mut published = Vec::new();
     let root = build_dir(store, kind, &by_dir, &[], &mut published)?;
-    store.publish(published, &[]).map_err(GitError::from)?;
+    store
+        .publish(
+            published,
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(root)
 }
 
 /// Builds one directory level, recursing into subdirectories first.
 fn build_dir(
     store: &Store,
-    kind: HashKind,
-    by_dir: &BTreeMap<Vec<u8>, Vec<(Vec<u8>, FileMode, Oid)>>,
+    _kind: HashKind,
+    by_dir: &DirEntries,
     dir: &[u8],
     published: &mut Vec<ruk_core::store::PreparedObject>,
 ) -> Result<Oid, GitError> {
@@ -246,7 +256,7 @@ fn build_dir(
             full.push(b'/');
         }
         full.extend_from_slice(child);
-        let oid = build_dir(store, kind, by_dir, &full, published)?;
+        let oid = build_dir(store, _kind, by_dir, &full, published)?;
         entries.push(TreeEntry {
             mode: TreeMode::Tree,
             name: child.clone(),
@@ -369,7 +379,14 @@ pub(crate) fn store_object(
         .prepare(kind, body_len, std::io::Cursor::new(body), None)
         .map_err(GitError::from)?;
     let oid = prepared.oid();
-    store.publish(vec![prepared], &[]).map_err(GitError::from)?;
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(oid)
 }
 

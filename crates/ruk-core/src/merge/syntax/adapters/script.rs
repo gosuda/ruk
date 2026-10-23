@@ -55,17 +55,27 @@ fn mark_ancestors(tree: &ParsedTree, kind: &str) -> HashSet<u32> {
     marked
 }
 
+/// Shared read-only context for one script-adapter collection pass.
+#[derive(Clone, Copy)]
+struct ScriptCollectCtx<'a> {
+    tree: &'a ParsedTree,
+    source: &'a [u8],
+    rules: &'a ScriptRules,
+}
+
 fn collect(
-    tree: &ParsedTree,
-    source: &[u8],
+    ctx: ScriptCollectCtx<'_>,
     node: u32,
-    rules: &ScriptRules,
-    language: Language,
     parents: &mut Vec<Vec<u8>>,
     out: &mut Vec<SourceUnit>,
     depth: usize,
     floor: u32,
 ) {
+    let ScriptCollectCtx {
+        tree,
+        source,
+        rules,
+    } = ctx;
     if depth > super::MAX_WALK_DEPTH {
         return;
     }
@@ -98,12 +108,11 @@ fn collect(
             parents.push(qualified);
             pushed = true;
         }
-    } else if !rules.passthrough_kinds.contains(&kind.as_str()) {
-        if tree.get(node).is_some_and(|n| n.parent != NODE_NONE)
-            && !rules.body_kinds.contains(&kind.as_str())
-        {
-            return;
-        }
+    } else if !rules.passthrough_kinds.contains(&kind.as_str())
+        && tree.get(node).is_some_and(|n| n.parent != NODE_NONE)
+        && !rules.body_kinds.contains(&kind.as_str())
+    {
+        return;
     }
     // Transparent wrappers (decorated definitions) extend the floor so the
     // wrapped definition owns its decorators: decorators belong to their
@@ -114,45 +123,25 @@ fn collect(
         floor
     };
     for child in tree.named_children(node) {
-        collect(
-            tree,
-            source,
-            child,
-            rules,
-            language,
-            parents,
-            out,
-            depth + 1,
-            floor,
-        );
+        collect(ctx, child, parents, out, depth + 1, floor);
     }
     if pushed {
         parents.pop();
     }
 }
 
-fn extract(
-    tree: &ParsedTree,
-    source: &[u8],
-    rules: &ScriptRules,
-    language: Language,
-) -> Vec<SourceUnit> {
+fn extract(tree: &ParsedTree, source: &[u8], rules: &ScriptRules) -> Vec<SourceUnit> {
     let mut out = Vec::new();
     if tree.is_empty() {
         return out;
     }
     let mut parents = Vec::new();
-    collect(
+    let ctx = ScriptCollectCtx {
         tree,
         source,
-        0,
         rules,
-        language,
-        &mut parents,
-        &mut out,
-        0,
-        u32::MAX,
-    );
+    };
+    collect(ctx, 0, &mut parents, &mut out, 0, u32::MAX);
     if let Some(boundary) = rules.boundary_kind {
         let marked = mark_ancestors(tree, boundary);
         out.retain(|unit| !marked.contains(&unit.node));
@@ -173,7 +162,7 @@ macro_rules! script_adapter {
             }
 
             fn units(&self, tree: &ParsedTree, source: &[u8]) -> Vec<SourceUnit> {
-                extract(tree, source, &$rules, $lang)
+                extract(tree, source, &$rules)
             }
         }
     };

@@ -517,6 +517,10 @@ impl Policy {
     /// (`max_pending` / `max_total`), unbounded when absent. The
     /// coordinator applies them to the store with
     /// [`crate::store::Store::set_capacity_limits`].
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) const fn capacity_limits(&self) -> CapacityLimits {
         self.capacity
@@ -2079,7 +2083,7 @@ mod tests {
         assert_eq!(source.load().expect_err("unreadable").code, ErrorCode::EIo);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_non_regular_file_is_a_policy_error_and_never_blocks() {
         let dir = TempDir::new("special");

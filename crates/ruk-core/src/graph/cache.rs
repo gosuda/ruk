@@ -22,16 +22,26 @@ use crate::error::{CoreError, ErrorCode};
 use crate::graph::types::GlobalPosition;
 use crate::heads::Head;
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 const EMPTY_INDEX: usize = usize::MAX;
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 pub(crate) const DEFAULT_MAX_CACHE_ENTRIES: usize = 256;
 
 /// A cached reachability checkpoint holding an immutable, pre-reserved byte slice.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 pub(crate) struct CachedReachabilityEntry {
     _reservation: ByteReservation,
     serialized_bytes: Box<[u8]>,
     cardinality: u64,
 }
 
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl CachedReachabilityEntry {
     /// Deserializes the bitmap into a bounded temporary scope charged to `budget`.
     pub(crate) fn decode_scoped(
@@ -68,11 +78,16 @@ impl CachedReachabilityEntry {
 }
 
 /// Bounded temporary decoded bitmap holding an active reservation against `budget`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 pub(crate) struct ScopedReachability {
     _reservation: ByteReservation,
     bitmap: RoaringBitmap,
 }
 
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl ScopedReachability {
     /// Checks if `pos` is contained in this reachability checkpoint.
     #[must_use]
@@ -87,6 +102,10 @@ impl ScopedReachability {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 struct Slot {
     head: Option<Head>,
     entry: Option<Arc<CachedReachabilityEntry>>,
@@ -94,6 +113,10 @@ struct Slot {
     next_lru: usize,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 struct CacheInner {
     slots: Box<[Slot]>,
     hash_table: Box<[usize]>,
@@ -104,12 +127,17 @@ struct CacheInner {
 }
 
 /// Fixed-capacity, byte-bounded reachability cache.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 pub(crate) struct ReachabilityCache {
     _container_reservation: ByteReservation,
     inner: Mutex<CacheInner>,
     budget: Arc<ByteBudget>,
 }
 
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 impl ReachabilityCache {
     /// Creates a new cache with pre-reserved slot and index capacity.
     pub(crate) fn new(budget: Arc<ByteBudget>, max_entries: usize) -> Result<Self, CoreError> {

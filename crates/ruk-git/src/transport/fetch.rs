@@ -33,7 +33,7 @@ use std::io::{Read, Write};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::types::ObjectKind;
-use ruk_core::store::{FactMutation, Store};
+use ruk_core::store::{EventContext, EventSource, FactMutation, Store};
 
 use super::pack::{IngestLimits, Links, StagedPack, ingest_pack, object_links};
 use super::pktline::{self, PktReader, RemoteMessages, SidebandReader, send};
@@ -421,6 +421,15 @@ pub struct ClosureReport {
     pub missing_promisor: Vec<Oid>,
 }
 
+/// Existing-history boundaries for one closure walk.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ClosureScope<'a> {
+    /// Object ids of existing ref tips whose closures were already verified.
+    pub roots: &'a [Oid],
+    /// Shallow boundaries the server declared.
+    pub server_shallow: &'a [Oid],
+}
+
 /// Verifies the closure of `wanted` over staged plus committed objects.
 ///
 /// Committed objects are not descended: their closures were verified at
@@ -439,11 +448,39 @@ pub fn verify_closure(
     server_shallow: &[Oid],
     interrupt: &Interrupt,
 ) -> Result<ClosureReport, GitError> {
+    let scope = ClosureScope {
+        roots: &[],
+        server_shallow,
+    };
+    verify_closure_in_scope(store, staged, wanted, scope, filter, interrupt)
+}
+
+/// Verifies the closure of `wanted` with existing verified roots excluded.
+///
+/// `scope.roots` are object ids of existing ref tips whose closures were
+/// proven when those refs were published. The walk still checks that each
+/// root is present, but it does not descend through one: a root's ancestry
+/// is history the destination store already holds and verified. Everything
+/// else (a newly introduced commit, a commit merely present in the store,
+/// trees, blobs, tags) is walked and verified exactly as [`verify_closure`]
+/// does, so a dangling object below the exclusion boundary is still refused.
+///
+/// # Errors
+/// [`GitError::Corrupt`] for an incomplete pack and store failures.
+pub(crate) fn verify_closure_in_scope(
+    store: &Store,
+    staged: &StagedPack,
+    wanted: &[Oid],
+    scope: ClosureScope<'_>,
+    filter: Option<Filter>,
+    interrupt: &Interrupt,
+) -> Result<ClosureReport, GitError> {
     let mut verifier = Verifier {
         store,
         staged,
         filter,
-        shallow: server_shallow.iter().copied().collect(),
+        shallow: scope.server_shallow.iter().copied().collect(),
+        roots: scope.roots.iter().copied().collect(),
         present: HashMap::new(),
         missing_promisor: Vec::new(),
         missing_set: HashSet::new(),
@@ -474,6 +511,39 @@ pub fn verify_closure(
     })
 }
 
+/// Every direct object id a ref in `store` currently names.
+///
+/// These are the destination's existing ref tips: each became visible in one
+/// atomic publication with the objects justifying it, so a receive may treat
+/// them as closure roots instead of re-walking history that has already
+/// passed closure verification. Symbolic refs carry no object of their own
+/// and are skipped; the ref they point at is a row of its own.
+///
+/// # Errors
+/// Store failures and corrupt ref rows.
+pub(crate) fn existing_ref_tips(store: &Store) -> Result<Vec<Oid>, GitError> {
+    let mut tips = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = ruk_core::refs::page_refs(store, after.as_deref(), 1000)?;
+        for entry in &page.entries {
+            if let RefTarget::Direct(oid) = &entry.target {
+                tips.push(*oid);
+            }
+        }
+        if !page.more {
+            return Ok(tips);
+        }
+        after = page
+            .entries
+            .last()
+            .map(|entry| entry.name.as_bytes().to_vec());
+        if after.is_none() {
+            return Ok(tips);
+        }
+    }
+}
+
 /// Closure verification state: staged plus committed availability with one
 /// cached probe per OID, promisor collection, and the walk queue.
 struct Verifier<'a> {
@@ -481,6 +551,7 @@ struct Verifier<'a> {
     staged: &'a StagedPack,
     filter: Option<Filter>,
     shallow: HashSet<Oid>,
+    roots: HashSet<Oid>,
     present: HashMap<Oid, bool>,
     missing_promisor: Vec<Oid>,
     missing_set: HashSet<Oid>,
@@ -539,7 +610,12 @@ impl Verifier<'_> {
         for (link, link_kind, is_parent) in need {
             self.interrupt.check("verifying the fetch closure")?;
             if self.available(link)? {
-                self.queue.push_back((link, link_kind));
+                // An existing ref tip is a closure root: its ancestry was
+                // verified when the ref landed, so stop here instead of
+                // re-reading verified history on every receive.
+                if !(is_parent && link_kind == ObjectKind::Commit && self.roots.contains(&link)) {
+                    self.queue.push_back((link, link_kind));
+                }
                 continue;
             }
             if is_parent && (self.shallow.contains(&oid) || super::is_shallow(self.store, oid)?) {
@@ -586,7 +662,7 @@ pub fn collect_haves_filtered(
         let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
             Ok((ObjectKind::Commit, bytes)) => bytes,
             Ok(_) => continue,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+            Err(GitError::NotFound { .. }) => continue,
             Err(err) => return Err(err),
         };
         haves.push(oid);
@@ -746,7 +822,12 @@ pub fn publish_fetch(
 ) -> Result<ruk_core::store::types::Publication, GitError> {
     let mut facts = facts.to_vec();
     facts.extend(commit_record_facts(store, &staged)?);
-    Ok(store.publish(staged.into_objects(), &facts)?)
+    Ok(store.publish(
+        staged.into_objects(),
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )?)
 }
 
 /// Compiles commit-record mutations for every commit staged in a pack.
@@ -769,12 +850,10 @@ pub fn commit_record_facts(
         if let Some((ObjectKind::Commit, payload)) = staged.payload(*oid) {
             batch
                 .observe_git_payload(payload.to_vec(), None)
-                .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+                .map_err(GitError::from)?;
         }
     }
-    batch
-        .into_mutations()
-        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))
+    batch.into_mutations().map_err(GitError::from)
 }
 
 #[cfg(test)]
@@ -1054,6 +1133,8 @@ mod tests {
         dest.publish(
             Vec::new(),
             &promisor_facts(b"origin", Filter::BlobNone, &[missing]).expect("row"),
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("promise the blob");
         assert!(
@@ -1118,6 +1199,269 @@ mod tests {
         .expect_err("empty delivery");
         assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
     }
+
+    fn empty_tree(kind: HashKind) -> Oid {
+        kind.hash_git_object("tree", b"").expect("empty tree")
+    }
+
+    fn commit_object(
+        kind: HashKind,
+        tree: Oid,
+        parent: Option<Oid>,
+        label: &str,
+    ) -> (Oid, Vec<u8>) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(format!("tree {}\n", tree.to_hex()).as_bytes());
+        if let Some(parent) = parent {
+            bytes.extend_from_slice(format!("parent {}\n", parent.to_hex()).as_bytes());
+        }
+        bytes.extend_from_slice(
+            b"author Closure Test <closure@example.com> 1 +0000\n\
+              committer Closure Test <closure@example.com> 1 +0000\n\n",
+        );
+        bytes.extend_from_slice(label.as_bytes());
+        bytes.push(b'\n');
+        let oid = kind
+            .hash_git_object("commit", &bytes)
+            .expect("commit object id");
+        (oid, bytes)
+    }
+
+    fn stage_objects(store: &Store, objects: Vec<(Oid, ObjectKind, Vec<u8>)>) -> StagedPack {
+        crate::transport::pack::stage_local_objects(
+            objects,
+            store,
+            IngestLimits::default(),
+            &Interrupt::none(),
+        )
+        .expect("objects stage")
+    }
+
+    fn publish_objects(store: &Store, objects: Vec<(Oid, ObjectKind, Vec<u8>)>) {
+        let staged = stage_objects(store, objects);
+        let facts = commit_record_facts(store, &staged).expect("commit records");
+        store
+            .publish(
+                staged.into_objects(),
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("objects publish");
+    }
+
+    fn set_ref(store: &Store, kind: HashKind, name: &[u8], target: Oid) {
+        use ruk_core::refdata::RefTransaction;
+        use ruk_core::refs::prepare_checked_transaction;
+        let update = RefUpdate {
+            expected: RefExpect::Absent,
+            change: RefChange::Set(RefTarget::Direct(target)),
+            name: RefName::new(name.to_vec()).expect("ref name"),
+        };
+        let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
+        let prepared = prepare_checked_transaction(store, &transaction).expect("prepare ref");
+        store
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish ref");
+    }
+
+    #[test]
+    fn new_commit_chaining_to_existing_refs_still_verifies_own_closure() {
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+        let tree = empty_tree(kind);
+        let (base, base_bytes) = commit_object(kind, tree, None, "base");
+        publish_objects(
+            &store,
+            vec![
+                (tree, ObjectKind::Tree, Vec::new()),
+                (base, ObjectKind::Commit, base_bytes),
+            ],
+        );
+        set_ref(&store, kind, b"refs/heads/main", base);
+        let roots = [base];
+
+        let missing_tree = kind
+            .hash_git_object("tree", b"missing tree")
+            .expect("missing tree id");
+        let (bad_tree, bad_tree_bytes) = commit_object(kind, missing_tree, Some(base), "bad tree");
+        let staged = stage_objects(&store, vec![(bad_tree, ObjectKind::Commit, bad_tree_bytes)]);
+        let scope = ClosureScope {
+            roots: &roots,
+            server_shallow: &[],
+        };
+        let err = verify_closure_in_scope(
+            &store,
+            &staged,
+            &[bad_tree],
+            scope,
+            None,
+            &Interrupt::none(),
+        )
+        .expect_err("a new commit with a missing tree must refuse");
+        assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
+
+        let missing_parent = kind
+            .hash_git_object("commit", b"missing parent")
+            .expect("missing parent id");
+        let (bad_link, bad_link_bytes) =
+            commit_object(kind, tree, Some(missing_parent), "bad linkage");
+        let staged = stage_objects(&store, vec![(bad_link, ObjectKind::Commit, bad_link_bytes)]);
+        let err = verify_closure_in_scope(
+            &store,
+            &staged,
+            &[bad_link],
+            scope,
+            None,
+            &Interrupt::none(),
+        )
+        .expect_err("a new commit with a missing parent must refuse");
+        assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn dangling_ancestor_below_exclusion_boundary_is_refused() {
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+        let tree = empty_tree(kind);
+        let (base, base_bytes) = commit_object(kind, tree, None, "base");
+        publish_objects(
+            &store,
+            vec![
+                (tree, ObjectKind::Tree, Vec::new()),
+                (base, ObjectKind::Commit, base_bytes),
+            ],
+        );
+        set_ref(&store, kind, b"refs/heads/main", base);
+        let roots = [base];
+
+        let missing_ancestor = kind
+            .hash_git_object("commit", b"missing ancestor")
+            .expect("missing ancestor id");
+        let (dangling, dangling_bytes) =
+            commit_object(kind, tree, Some(missing_ancestor), "dangling");
+        publish_objects(&store, vec![(dangling, ObjectKind::Commit, dangling_bytes)]);
+
+        let (tip, tip_bytes) = commit_object(kind, tree, Some(dangling), "new tip");
+        let staged = stage_objects(&store, vec![(tip, ObjectKind::Commit, tip_bytes)]);
+        let scope = ClosureScope {
+            roots: &roots,
+            server_shallow: &[],
+        };
+        let err = verify_closure_in_scope(&store, &staged, &[tip], scope, None, &Interrupt::none())
+            .expect_err("a present but unreferenced ancestor must not become a root");
+        assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn fresh_store_still_walks_full_closure() {
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+        let tree = empty_tree(kind);
+        let (one, one_bytes) = commit_object(kind, tree, None, "one");
+        let (two, two_bytes) = commit_object(kind, tree, Some(one), "two");
+        let staged = stage_objects(
+            &store,
+            vec![
+                (tree, ObjectKind::Tree, Vec::new()),
+                (one, ObjectKind::Commit, one_bytes),
+                (two, ObjectKind::Commit, two_bytes),
+            ],
+        );
+        verify_closure(&store, &staged, &[two], None, &[], &Interrupt::none())
+            .expect("a fresh repo verifies the complete closure");
+        let facts = commit_record_facts(&store, &staged).expect("commit records");
+        store
+            .publish(
+                staged.into_objects(),
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish full history");
+
+        let missing_tree = kind
+            .hash_git_object("tree", b"still missing")
+            .expect("missing tree id");
+        let (three, three_bytes) = commit_object(kind, missing_tree, Some(two), "three");
+        let staged = stage_objects(&store, vec![(three, ObjectKind::Commit, three_bytes)]);
+        let err = verify_closure(&store, &staged, &[three], None, &[], &Interrupt::none())
+            .expect_err("without refs there are no closure roots");
+        assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn incremental_verify_reads_only_new_commits_on_second_push() {
+        const HISTORY: usize = 300;
+        const NEW: usize = 5;
+        const FIRST: usize = HISTORY - NEW;
+
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+        let tree = empty_tree(kind);
+        let mut objects = vec![(tree, ObjectKind::Tree, Vec::new())];
+        let mut parent = None;
+        let mut first_tip = None;
+        for n in 0..FIRST {
+            let (commit, bytes) = commit_object(kind, tree, parent, &format!("history {n}"));
+            objects.push((commit, ObjectKind::Commit, bytes));
+            parent = Some(commit);
+            first_tip = Some(commit);
+        }
+        let first_tip = first_tip.expect("synthetic history has a tip");
+        let staged = stage_objects(&store, objects);
+        verify_closure(&store, &staged, &[first_tip], None, &[], &Interrupt::none())
+            .expect("first push verifies");
+        let facts = commit_record_facts(&store, &staged).expect("commit records");
+        store
+            .publish(
+                staged.into_objects(),
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("first push publishes");
+        set_ref(&store, kind, b"refs/heads/main", first_tip);
+
+        let mut objects = Vec::new();
+        let mut parent = Some(first_tip);
+        let mut second_tip = None;
+        for n in FIRST..HISTORY {
+            let (commit, bytes) = commit_object(kind, tree, parent, &format!("new {n}"));
+            objects.push((commit, ObjectKind::Commit, bytes));
+            parent = Some(commit);
+            second_tip = Some(commit);
+        }
+        let second_tip = second_tip.expect("synthetic second push has a tip");
+        let staged = stage_objects(&store, objects);
+        let roots = existing_ref_tips(&store).expect("ref tips");
+        assert_eq!(roots, vec![first_tip]);
+
+        let before = store.io_stats().object_reads;
+        let scope = ClosureScope {
+            roots: &roots,
+            server_shallow: &[],
+        };
+        verify_closure_in_scope(
+            &store,
+            &staged,
+            &[second_tip],
+            scope,
+            None,
+            &Interrupt::none(),
+        )
+        .expect("incremental push verifies");
+        let walked = store.io_stats().object_reads - before;
+        assert_eq!(
+            walked, 3,
+            "verification should only probe the existing root and shared tree"
+        );
+    }
 }
 
 /// A stream factory for prefetch batches: one fresh connection per batch.
@@ -1180,7 +1524,12 @@ pub fn prefetch(
         }
         verify_closure(store, &received.staged, batch, None, &[], interrupt)?;
         let facts = prefetch_clears(batch);
-        store.publish(received.staged.into_objects(), &facts)?;
+        store.publish(
+            received.staged.into_objects(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
         delivered.extend(batch.iter().copied());
         batches += 1;
     }

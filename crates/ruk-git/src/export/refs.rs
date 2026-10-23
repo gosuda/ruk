@@ -120,7 +120,7 @@ impl RefPlan {
     /// in the report instead of writing a link Git would misread.
     fn prune_symbolic(&mut self, table: &RefMap) -> Result<(), GitError> {
         let mut dropped = Vec::new();
-        for (name, _) in &self.symbolic {
+        for name in self.symbolic.keys() {
             let terminal = resolve(table, name).map_err(|err| GitError::Invalid {
                 detail: format!("ref {name} does not resolve: {err}"),
             })?;

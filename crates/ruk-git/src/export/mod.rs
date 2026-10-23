@@ -280,7 +280,7 @@ fn write_reflogs(
             let more = page.more;
             for ReflogEntry { key, record } in page.entries {
                 after = Some(key);
-                if record.message.as_bytes().iter().any(|&byte| byte == b'\n') {
+                if record.message.as_bytes().contains(&b'\n') {
                     dropped += 1;
                     continue;
                 }
@@ -378,7 +378,7 @@ fn verify_entries(
     for (&oid, &want) in expected {
         let gix_id = gix_hash::ObjectId::from(oid);
         let at = index
-            .lookup(&gix_id)
+            .lookup(gix_id)
             .ok_or_else(|| corrupt(format!("object {oid} is missing from the index")))?;
         by_offset.push((index.pack_offset_at_index(at), oid, want, at));
     }
@@ -406,6 +406,10 @@ fn verify_entries(
 }
 
 /// Checks one entry's type, CRC, hash identity, and store bytes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the pack entry call shape"
+)]
 fn verify_entry(
     store: &Store,
     pack: &gix_pack::data::File,

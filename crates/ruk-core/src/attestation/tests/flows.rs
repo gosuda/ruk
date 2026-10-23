@@ -15,7 +15,7 @@ use crate::protocol::{
     AttestRequirement, AttestationRecord, AttestationStatus, PageLimit, SignerFingerprint,
     StatementDigest,
 };
-use crate::store::{FactExpectation, FactMutation, FactTable, Store};
+use crate::store::{EventContext, EventSource, FactExpectation, FactMutation, FactTable, Store};
 
 use super::fixtures::{
     TempStore, apply, digest_of, independent_fingerprint, key, kind, oid, open, public_bytes,
@@ -83,6 +83,7 @@ fn requirement(kind_text: &str, result_text: &str) -> AttestRequirement {
     AttestRequirement {
         kind: kind(kind_text),
         result: result(result_text),
+        valid_until: None,
     }
 }
 
@@ -373,7 +374,12 @@ fn a_prepared_publication_is_refused_when_its_rows_changed_underneath_it() {
 
     let stale = lab
         .store()
-        .publish(Vec::new(), &prepared.mutations)
+        .publish(
+            Vec::new(),
+            &prepared.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect_err("the prepared rows are stale");
     assert_eq!(stale.code(), ErrorCode::EStale);
     assert_eq!(
@@ -528,6 +534,65 @@ fn filters_select_by_subject_kind_and_signer_in_export_order() {
 }
 
 #[test]
+fn kind_prefix_selects_a_kind_family_across_scopes() {
+    let lab = Lab::new("kind-prefix");
+    let owner = key(0x11);
+    lab.add(&sign(&owner, statement(lab.a, "ci/lint", "pass", T0, None)));
+    lab.add(&sign(&owner, statement(lab.a, "ci/test", "pass", T0, None)));
+    lab.add(&sign(&owner, statement(lab.a, "ci", "pass", T0, None)));
+    lab.add(&sign(&owner, statement(lab.a, "review", "pass", T0, None)));
+    lab.add(&sign(&owner, statement(lab.b, "ci/lint", "fail", T0, None)));
+
+    let family = StatementFilter {
+        kind_prefix: Some(kind("ci/")),
+        include_superseded: true,
+        ..StatementFilter::default()
+    };
+    let lint_and_test = list(lab.store(), &family, PageLimit::MAX, None, &open)
+        .expect("prefix filter")
+        .records;
+    assert_eq!(lint_and_test.len(), 3);
+    assert!(
+        lint_and_test
+            .iter()
+            .all(|record| record.kind.as_str().starts_with("ci/"))
+    );
+
+    let bare = StatementFilter {
+        kind_prefix: Some(kind("ci")),
+        include_superseded: true,
+        ..StatementFilter::default()
+    };
+    let ci_all = list(lab.store(), &bare, PageLimit::MAX, None, &open)
+        .expect("shorter prefix")
+        .records;
+    assert_eq!(ci_all.len(), 4);
+
+    let disjoint = StatementFilter {
+        kind: Some(kind("review")),
+        kind_prefix: Some(kind("ci/")),
+        include_superseded: true,
+        ..StatementFilter::default()
+    };
+    let none = list(lab.store(), &disjoint, PageLimit::MAX, None, &open)
+        .expect("disjoint filters")
+        .records;
+    assert!(none.is_empty());
+
+    let scoped = StatementFilter {
+        subject: Some(lab.a),
+        kind_prefix: Some(kind("ci/")),
+        include_superseded: true,
+        ..StatementFilter::default()
+    };
+    let on_a = list(lab.store(), &scoped, PageLimit::MAX, None, &open)
+        .expect("scoped prefix")
+        .records;
+    assert_eq!(on_a.len(), 2);
+    assert!(on_a.iter().all(|record| record.subject == lab.a));
+}
+
+#[test]
 fn paged_listing_visits_every_retained_variant_once_and_in_order() {
     let lab = Lab::new("paging");
     populate(&lab);
@@ -678,6 +743,8 @@ fn a_stored_row_that_fails_reverification_is_corruption_and_latches_quarantine()
                 expected: FactExpectation::Absent,
                 value: Some(bytes),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("plant the unverifiable row");
 
@@ -811,6 +878,8 @@ fn a_stored_statement_without_its_order_row_is_corruption() {
                 expected: FactExpectation::Absent,
                 value: Some(row),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("plant the statement row without its order row");
 

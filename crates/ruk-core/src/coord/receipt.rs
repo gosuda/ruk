@@ -9,7 +9,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::change::{RequestId, SessionId};
-use crate::coord::rows::{ReceiptRow, decode_receipt, receipt_key};
+use crate::coord::rows::{decode_receipt, receipt_key};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Reply, Request, RequestDigest};
 use crate::store::Store;
@@ -86,10 +86,14 @@ pub(crate) fn lookup(
 /// committed attempt — so a retry would fail `E_STALE`/`E_INVALID` before
 /// ever reaching the lane. The dispatch path calls this before preparing.
 ///
+/// The hosted push transport jobs (`push`, `push.reconcile`) also call this
+/// before touching the network: a retried push must return the stored reply
+/// instead of re-sending bytes to the remote.
+///
 /// # Errors
 /// - [`ErrorCode::ERequestReused`] if the request id was used with a different digest.
 /// - [`ErrorCode::ECorrupt`] if committed receipt bytes fail decode or invariant validation.
-pub(crate) fn replay_if_committed(
+pub fn replay_if_committed(
     store: &Store,
     session: SessionId,
     request: &Request,
@@ -119,6 +123,13 @@ pub(crate) fn replay_if_committed(
 /// # Errors
 /// - [`ErrorCode::ERequestReused`] if the request id was used with a different digest.
 /// - `err` if no receipt exists.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) fn settle_rejection(
     store: &Store,
     session: SessionId,
@@ -146,14 +157,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::change::{ChangeId, OperationId, WorkspaceId};
-    use crate::coord::rows::encode;
+    use crate::coord::rows::{ReceiptRow, encode};
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{
         BoundedList, Method, MutationOutcome, ReceiptRef, Timestamp, WsTakeArgs, WsTakeReply,
     };
-    use crate::store::PreparationBudget;
     use crate::store::types::{FactExpectation, FactMutation};
+    use crate::store::{EventContext, EventSource, PreparationBudget};
     use crate::workspace::{NativeWorkspace, Scope, WorkspaceState};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -299,6 +310,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -351,6 +364,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -389,6 +404,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
         let wall = jiff::Timestamp::now();
@@ -440,6 +457,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 
@@ -510,6 +529,8 @@ mod tests {
                     expected: FactExpectation::Absent,
                     value: Some(encoded),
                 }],
+                EventSource::LocalPush,
+                &EventContext::default(),
             )
             .expect("publish");
 

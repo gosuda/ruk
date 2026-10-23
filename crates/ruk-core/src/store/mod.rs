@@ -44,6 +44,7 @@ pub mod durability;
 mod group;
 mod guards;
 mod metadata;
+pub(crate) mod pinned;
 mod prepare;
 mod recovery;
 mod segment;
@@ -71,23 +72,27 @@ pub use capacity::CapacityLimits;
 pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
 pub use compact::{CompactionBacklog, CompactionStats, PruneStats};
 pub use error::StoreError;
-pub(crate) use guards::{CapturedLink, GenerationGuard, GenerationRegistry, ObjectSnapshot};
+pub(crate) use guards::{GenerationGuard, GenerationRegistry};
 pub use metadata::{FactPage, FactPageBudget, FactRow};
-pub(crate) use metadata::{MAX_FACT_ROW_BYTES, decode, encode};
+pub(crate) use metadata::{decode, encode};
 pub use spool::{BudgetLimits, PreparationBudget, Spool};
 pub use stream::{ChunkDecision, StreamMeta};
 pub use types::{
-    Encoding, FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
-    Publication, ReadObject, SegmentManifest, StoreFormat,
+    EVENT_HEAD_KEY, Encoding, EventContext, EventHeadRow, EventSource, FactExpectation,
+    FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject, Publication,
+    REPO_META_KEY, ReadObject, RefEvent, RepoMetaRow, SegmentManifest, StoreEvent, StoreFormat,
 };
 
 use crate::change::StoreId;
 use crate::error::ErrorCode;
 use crate::ids::{HashKind, Oid};
 use crate::physical::{AllocationError as PhysicalAllocationError, PhysicalReservation};
+use crate::refdata::RefName;
 use metadata::{Metadata, PublicationTxn};
+use pinned::{PinnedRoot, segment_rel};
 use recovery::{Committed, OpenSegment, Recovered, SegmentFileCache};
 use segment::SegmentWriter;
+use types::{RepoMetaRowV0, decode_store_event};
 
 /// Longest delta chain accepted on write and read.
 pub(crate) const MAX_DELTA_DEPTH: u8 = 50;
@@ -171,6 +176,11 @@ pub struct Store {
     /// Read-only descriptors for committed segments, opened once per id and
     /// shared by every read through positional I/O. Dropped with the store.
     segment_fds: SegmentFileCache,
+    /// The held store-root directory. Every later segment-file open,
+    /// create, probe, unlink, and directory sync travels this descriptor
+    /// instead of the recorded path, so a symlink swapped into the path
+    /// after open cannot redirect them.
+    pin: PinnedRoot,
     /// Serializes whole compaction passes against each other. Publications
     /// never take it; the swap takes the writer lock beneath it.
     compaction_lock: Mutex<()>,
@@ -180,6 +190,16 @@ pub struct Store {
     queue: group::Queue,
     /// The commit linger window in nanoseconds (`RUK_COMMIT_LINGER_MS`).
     commit_linger_nanos: AtomicU64,
+}
+
+/// One held reader pin against segment retirement for the duration of a
+/// fork photograph and copy.
+///
+/// Dropping the pin releases the registration; release is unconditional on
+/// every path.
+#[derive(Debug)]
+pub struct ForkPin {
+    _guard: GenerationGuard,
 }
 
 /// State owned by the serialized publication writer.
@@ -285,7 +305,7 @@ impl Store {
     /// Windows requires an existing, already durable parent and an absent
     /// `root`. Nothing proves that an ancestor some other actor created is
     /// durable, so none is created here and none is trusted: the caller
-    /// (standalone setup, the Forgejo patch) provisions the parent and makes
+    /// (standalone setup, a hosting process) provisions the parent and makes
     /// it durable before this call. A missing parent fails before any change,
     /// an existing `root` of any kind is never adopted, and only the call
     /// whose exclusive publication of `root` succeeds builds inside it.
@@ -332,7 +352,7 @@ impl Store {
         sync_entries(root)?;
 
         let guards = Arc::new(GenerationRegistry::new(0));
-        Ok(Self::assemble(
+        let mut store = Self::assemble(
             root,
             format,
             meta,
@@ -342,7 +362,9 @@ impl Store {
                 next_segment_id: 0,
                 open: None,
             },
-        ))
+        );
+        store.pin = PinnedRoot::open(root)?;
+        Ok(store)
     }
 
     /// Opens an existing store after verifying all committed bytes.
@@ -400,15 +422,60 @@ impl Store {
         budget: Arc<PreparationBudget>,
         timeout: Duration,
     ) -> Result<Self, StoreError> {
+        Self::open_with_timeout_inner(root, root, budget, timeout)
+    }
+
+    /// Opens the store at `open_root` while recording `record_root`: every
+    /// file access during the open travels `open_root`, so callers holding
+    /// a containment descriptor open through `/proc/self/fd` and keep the
+    /// recorded root free of process-local file descriptor numbers. The
+    /// recorded root must name the same directory.
+    ///
+    /// # Errors
+    /// As for [`Store::open`].
+    pub fn open_pinned(
+        open_root: &Path,
+        record_root: &Path,
+        budget: Arc<PreparationBudget>,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_timeout_inner(
+            open_root,
+            record_root,
+            budget,
+            metadata::open_wait_timeout(),
+        )
+    }
+
+    fn open_with_timeout_inner(
+        open_root: &Path,
+        record_root: &Path,
+        budget: Arc<PreparationBudget>,
+        timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let profiling = profile_enabled();
         let total = ProfileClock::now(profiling);
         let mut clock = ProfileClock::now(profiling);
-        let root = std::path::absolute(root)?;
+        let root = std::path::absolute(open_root)?;
         let root = root.as_path();
-        let (format, format_file) = read_format(root)?;
+        let record_root = std::path::absolute(record_root)?;
+        let record_root = record_root.as_path();
+        // Hold the opened directory before any file access: every later
+        // segment open travels this descriptor, so flips of the recorded
+        // path after this point cannot redirect them.
+        let pin = PinnedRoot::open(root)?;
+        // The format and metadata opens travel the held descriptor when
+        // pinned, so no later segment, metadata, or format access follows
+        // the recorded path by name.
+        let format_path = pin
+            .proc_subpath(FORMAT_FILE)
+            .unwrap_or_else(|| root.join(FORMAT_FILE));
+        let (format, format_file) = read_format_file(&format_path)?;
         let format_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
-        let meta = Metadata::open_with_timeout(&root.join(META_FILE), timeout)?;
+        let meta_path = pin
+            .proc_subpath(META_FILE)
+            .unwrap_or_else(|| root.join(META_FILE));
+        let meta = Metadata::open_with_timeout(&meta_path, timeout)?;
         let meta_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
         durability::sync_file(&format_file)?;
@@ -416,7 +483,7 @@ impl Store {
         drop(format_file);
         let sync_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
-        budget.register_scratch(root)?;
+        budget.register_scratch(&pin, root)?;
         let scratch_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
         let generation = meta.generation()?;
@@ -429,6 +496,7 @@ impl Store {
             budget: &budget,
             guards: &guards,
             files: &segment_fds,
+            pin: &pin,
         };
         let setup_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
@@ -454,8 +522,9 @@ impl Store {
         // reopening those segments on first serve.
         let recovery_ms = clock.elapsed_ms();
         clock = ProfileClock::now(profiling);
-        let mut store = Self::assemble(root, format, meta, budget, guards, recovered);
+        let mut store = Self::assemble(record_root, format, meta, budget, guards, recovered);
         store.segment_fds = segment_fds;
+        store.pin = pin;
         let assemble_ms = clock.elapsed_ms();
         if profiling {
             eprintln!(
@@ -490,6 +559,7 @@ impl Store {
             capacity: Mutex::new(CapacityLimits::unbounded()),
             guards,
             segment_fds: SegmentFileCache::default(),
+            pin: PinnedRoot::default(),
             writer: Mutex::new(WriterState {
                 active: None,
                 resume: recovered.open,
@@ -512,6 +582,14 @@ impl Store {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The path of segment `id` under this store's root.
+    #[must_use]
+    pub fn segment_path(&self, id: u64) -> PathBuf {
+        self.root
+            .join(SEGMENTS_DIR)
+            .join(segment::segment_file_name(id))
     }
 
     /// The fixed hash kind of this store.
@@ -547,6 +625,7 @@ impl Store {
             budget: &self.budget,
             guards: &self.guards,
             files: &self.segment_fds,
+            pin: &self.pin,
         }
     }
 
@@ -558,6 +637,13 @@ impl Store {
     ///
     /// No filesystem I/O is performed under this registry mutex.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn is_segment_retired_ready_for_unlink(&self, retired_generation: u64) -> bool {
         self.guards
             .is_segment_retired_ready_for_unlink(retired_generation)
@@ -565,6 +651,13 @@ impl Store {
 
     /// Accessor for the store's generation registry.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn generation_registry(&self) -> &Arc<GenerationRegistry> {
         &self.guards
     }
@@ -723,6 +816,7 @@ impl Store {
             base.as_ref().map(|(oid, read)| (*oid, read)),
             &self.budget,
             &self.root,
+            &self.pin,
         )
     }
 
@@ -814,6 +908,7 @@ impl Store {
             base.as_ref().map(|(oid, spool)| (*oid, spool.view())),
             &self.budget,
             &self.root,
+            &self.pin,
         )
     }
 
@@ -853,6 +948,33 @@ impl Store {
         self.refuse_if_quarantined()?;
         self.io.fact_page_calls.fetch_add(1, Ordering::Relaxed);
         let result = self.observe(self.meta.fact_page(table, after, budget));
+        if let Ok(page) = &result {
+            self.io
+                .fact_rows
+                .fetch_add(page.rows.len() as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// A bounded page of raw fact rows under `prefix`, seeking inclusively
+    /// at the prefix when `after` is absent and exclusively after `after`
+    /// otherwise. Stops at the first key outside `prefix`.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for zero rows or bytes in `budget`;
+    /// [`StoreError::Limit`] if the first row alone exceeds the byte budget;
+    /// [`StoreError::Corrupt`] for storage damage, which also latches quarantine;
+    /// quarantine refuses.
+    pub fn fact_page_prefixed(
+        &self,
+        table: FactTable,
+        after: Option<&[u8]>,
+        prefix: &[u8],
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.io.fact_page_calls.fetch_add(1, Ordering::Relaxed);
+        let result = self.observe(self.meta.fact_page_prefixed(table, after, prefix, budget));
         if let Ok(page) = &result {
             self.io
                 .fact_rows
@@ -912,28 +1034,479 @@ impl Store {
         &self,
         objects: Vec<PreparedObject>,
         facts: &[FactMutation],
+        source: EventSource,
+        context: &EventContext,
     ) -> Result<Publication, StoreError> {
         self.refuse_if_quarantined()?;
         if objects.is_empty() && facts.is_empty() {
             return Ok(Publication {
                 objects: Vec::new(),
                 generation: self.observe(self.meta.generation())?,
+                ref_events: Vec::new(),
             });
         }
-        let outcome = self.publish_grouped(objects, facts);
+        let attribution = vec![(source, context.clone()); facts.len()];
+        let outcome = self.publish_grouped(objects, facts, attribution);
         if outcome.is_ok() {
             self.io.publications.fetch_add(1, Ordering::Relaxed);
         }
         outcome
     }
 
+    /// Commits one publication with one source and per-fact contexts: the
+    /// lane's multi-candidate batches attribute each fact to its own
+    /// candidate. `contexts` aligns 1:1 with `facts`.
+    pub(crate) fn publish_detailed(
+        &self,
+        objects: Vec<PreparedObject>,
+        facts: &[FactMutation],
+        source: EventSource,
+        contexts: &[EventContext],
+    ) -> Result<Publication, StoreError> {
+        self.refuse_if_quarantined()?;
+        if objects.is_empty() && facts.is_empty() {
+            return Ok(Publication {
+                objects: Vec::new(),
+                generation: self.observe(self.meta.generation())?,
+                ref_events: Vec::new(),
+            });
+        }
+        if contexts.len() != facts.len() {
+            return Err(StoreError::Invalid(
+                "event attribution must align 1:1 with facts".to_owned(),
+            ));
+        }
+        let attribution: Vec<(EventSource, EventContext)> = contexts
+            .iter()
+            .map(|context| (source, context.clone()))
+            .collect();
+        let outcome = self.publish_grouped(objects, facts, attribution);
+        if outcome.is_ok() {
+            self.io.publications.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Largest events rows one retention sweep prunes per call. Sweeps run
+    /// periodically, so a backlog drains over rounds instead of one giant
+    /// transaction.
+    pub(crate) const SWEEP_EVENTS_PAGE_ROWS: usize = 10_000;
+
+    /// Builds the event rows plus head bump for one publication: one event
+    /// per `FactTable::Refs` mutation, sequenced past the stored head, with
+    /// `oldest` carried forward. Empty when the batch moves no refs. The
+    /// writer lock is held, so sequences stay strictly increasing across
+    /// lane and receive-pack publications.
+    fn emit_ref_events(
+        &self,
+        facts: &[FactMutation],
+        attribution: &[(EventSource, EventContext)],
+    ) -> Result<(Vec<FactMutation>, Vec<RefEvent>), StoreError> {
+        let mut ref_facts = Vec::new();
+        for (fact, attr) in facts.iter().zip(attribution.iter()) {
+            if fact.table == FactTable::Refs {
+                ref_facts.push((fact, attr));
+            }
+        }
+        if ref_facts.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let (mut head, oldest, head_raw) = self.read_event_head()?;
+        let at = Self::unix_millis()?;
+        let mut out = Vec::with_capacity(ref_facts.len() + 1);
+        let mut ref_events = Vec::with_capacity(ref_facts.len());
+        for (fact, (source, context)) in ref_facts {
+            head = head
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Capacity("event sequence exhausted".to_owned()))?;
+            let event = StoreEvent {
+                name: fact.key.clone(),
+                old: match &fact.expected {
+                    FactExpectation::Value(before) => Some(before.clone()),
+                    _ => None,
+                },
+                new: fact.value.clone(),
+                at,
+                source: *source,
+                operation: context.operation,
+                request_id: context.request_id.clone(),
+                session: context.session,
+                on_behalf_of: context.on_behalf_of.clone(),
+            };
+            out.push(FactMutation {
+                table: FactTable::Events,
+                key: head.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &event)?),
+            });
+            ref_events.push(RefEvent {
+                name: fact.key.clone(),
+                seq: head,
+            });
+        }
+        let row = EventHeadRow { head, oldest };
+        out.push(FactMutation {
+            table: FactTable::EventHead,
+            key: EVENT_HEAD_KEY.to_vec(),
+            expected: head_raw.map_or(FactExpectation::Absent, FactExpectation::Value),
+            value: Some(encode("event head", &row)?),
+        });
+        Ok((out, ref_events))
+    }
+
+    /// The event horizon: the last assigned sequence and the oldest
+    /// retained sequence. Absent rows mean no event ever committed.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn event_head(&self) -> Result<(u64, u64), StoreError> {
+        let (head, oldest, _) = self.read_event_head()?;
+        Ok((head, oldest))
+    }
+
+    /// Reads the repository metadata row written at init. Absent rows mean
+    /// the store predates `repo.init` metadata and carries no default
+    /// branch.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn repo_meta(&self) -> Result<Option<RepoMetaRow>, StoreError> {
+        Ok(self.repo_meta_raw()?.map(|(row, _)| row))
+    }
+
+    /// Reads the repository metadata row with its exact stored bytes.
+    /// Absent rows mean the store predates `repo.init` metadata.
+    pub(crate) fn repo_meta_raw(&self) -> Result<Option<(RepoMetaRow, Vec<u8>)>, StoreError> {
+        match self.fact(FactTable::RepoMeta, REPO_META_KEY)? {
+            None => Ok(None),
+            Some(raw) => decode_repo_meta(&raw).map(|row| Some((row, raw))),
+        }
+    }
+
+    /// Persists the repository metadata row written once at init.
+    ///
+    /// Refuses when the row is already present: init runs once per store.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn write_repo_meta(&self, default_branch: RefName) -> Result<(), StoreError> {
+        let row = RepoMetaRow {
+            default_branch,
+            land_requirements: Vec::new(),
+            trusted_signers: Vec::new(),
+            policy_generation: 0,
+        };
+        let bytes = metadata::encode("repo meta", &row)?;
+        self.publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::RepoMeta,
+                key: REPO_META_KEY.to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(bytes),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
+        Ok(())
+    }
+
+    /// The current locator generation of this store.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn generation(&self) -> Result<u64, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.observe(self.meta.generation())
+    }
+
+    /// The default branch recorded at init, or `None` when the store
+    /// predates `repo.init` metadata.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn default_branch(&self) -> Result<Option<RefName>, StoreError> {
+        Ok(self.repo_meta()?.map(|row| row.default_branch))
+    }
+
+    /// Every committed segment manifest in id order.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for storage damage, which also latches
+    /// quarantine; quarantine refuses.
+    pub fn all_manifests(&self) -> Result<Vec<SegmentManifest>, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.observe(self.meta.all_manifests())
+    }
+
+    /// Every committed object locator in raw-digest order.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for storage damage, which also latches
+    /// quarantine; quarantine refuses.
+    pub fn all_object_locations(&self) -> Result<Vec<(Oid, ObjectLocation)>, StoreError> {
+        self.refuse_if_quarantined()?;
+        let mut out = Vec::new();
+        let mut after: Option<Oid> = None;
+        loop {
+            let page = self.observe(self.meta.object_page(after.as_ref(), 1024))?;
+            if page.is_empty() {
+                return Ok(out);
+            }
+            after = page.last().map(|(oid, _)| *oid);
+            out.extend(page);
+        }
+    }
+
+    /// Installs one photographed sealed snapshot into this fresh staging
+    /// store: the hardlinked sealed-segment manifests plus their verbatim
+    /// sealed locators, with the destination generation set to the forked
+    /// source generation in both the metadata and the in-memory generation
+    /// registry. The destination generation reaches the forked generation
+    /// even when the sealed set is empty, so a tail-only fork still
+    /// carries the source generation. Tail-resident objects are never
+    /// installed here; the caller re-creates them by content copy
+    /// afterwards, so the two sets must be disjoint and the call fails
+    /// closed on any overlap. Each linked segment file is re-verified
+    /// against its photographed committed extent before install. Runs
+    /// before the destination's first open, so recovery validates the
+    /// installed state like any committed store.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for an overlap between the sealed and tail
+    /// sets, a locator generation above `generation`, an unsealed or
+    /// retired manifest, a linked file shorter than its committed extent,
+    /// or a generation that regresses the fresh store; database failures
+    /// propagate; quarantine refuses.
+    pub fn import_sealed_snapshot(
+        &self,
+        manifests: &[SegmentManifest],
+        sealed: &[(Oid, ObjectLocation)],
+        tail_oids: &[Oid],
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        self.refuse_if_quarantined()?;
+        let mut staged: std::collections::HashSet<Oid> =
+            std::collections::HashSet::with_capacity(sealed.len());
+        for (oid, _) in sealed {
+            if !staged.insert(*oid) {
+                return Err(StoreError::Invalid(format!(
+                    "sealed snapshot repeats object {oid}"
+                )));
+            }
+        }
+        for oid in tail_oids {
+            if staged.contains(oid) {
+                return Err(StoreError::Invalid(format!(
+                    "fork snapshot overlaps sealed and tail on {oid}"
+                )));
+            }
+        }
+        let mut by_id: std::collections::HashMap<u64, &SegmentManifest> =
+            std::collections::HashMap::with_capacity(manifests.len());
+        for manifest in manifests {
+            if !manifest.sealed {
+                return Err(StoreError::Invalid(format!(
+                    "fork snapshot links unsealed segment {}",
+                    manifest.id
+                )));
+            }
+            if manifest.retired {
+                return Err(StoreError::Invalid(format!(
+                    "fork snapshot links retired segment {}",
+                    manifest.id
+                )));
+            }
+            let path = self
+                .root
+                .join(SEGMENTS_DIR)
+                .join(segment::segment_file_name(manifest.id));
+            let len = std::fs::metadata(&path)
+                .map(|meta| meta.len())
+                .map_err(|err| {
+                    StoreError::Invalid(format!(
+                        "linked segment {} is not readable: {err}",
+                        manifest.id
+                    ))
+                })?;
+            if len < manifest.committed_end {
+                return Err(StoreError::Invalid(format!(
+                    "linked segment {} holds {len} bytes below its committed end {}",
+                    manifest.id, manifest.committed_end
+                )));
+            }
+            if by_id.insert(manifest.id, manifest).is_some() {
+                return Err(StoreError::Invalid(format!(
+                    "sealed snapshot repeats segment {}",
+                    manifest.id
+                )));
+            }
+        }
+        for (oid, location) in sealed {
+            if !by_id.contains_key(&location.segment) {
+                return Err(StoreError::Invalid(format!(
+                    "sealed object {oid} names unlinked segment {}",
+                    location.segment
+                )));
+            }
+            if location.generation > generation {
+                return Err(StoreError::Invalid(format!(
+                    "sealed object {oid} is newer than the forked generation {generation}"
+                )));
+            }
+        }
+        let current = self.observe(self.meta.generation())?;
+        if generation < current {
+            return Err(StoreError::Invalid(format!(
+                "forked generation {generation} regresses past {current}"
+            )));
+        }
+        let _writer = self.lock_writer()?;
+        let txn = self.observe(self.meta.begin_publication(&[]))?;
+        for (oid, location) in sealed {
+            self.observe(txn.insert_object(oid, location))?;
+        }
+        for manifest in manifests {
+            self.observe(txn.upsert_manifest(manifest))?;
+        }
+        if generation > current {
+            self.observe(txn.set_generation(generation))?;
+        }
+        self.observe(txn.commit())?;
+        drop(_writer);
+        self.guards.advance_published_generation(generation);
+        Ok(())
+    }
+
+    /// Registers one reader pin on this store for a fork photograph and
+    /// copy: the pin registers before any snapshot read and releases on
+    /// drop, so compaction cannot retire and unlink a linked sealed
+    /// segment under the fork.
+    #[must_use]
+    pub fn pin_for_fork(&self) -> ForkPin {
+        ForkPin {
+            _guard: self.guards.register(),
+        }
+    }
+
+    /// Reads the event horizon: the last assigned sequence, the oldest
+    /// retained sequence, and the raw head row for CAS updates. Absent rows
+    /// mean no event ever committed.
+    fn read_event_head(&self) -> Result<(u64, u64, Option<Vec<u8>>), StoreError> {
+        match self.fact(FactTable::EventHead, EVENT_HEAD_KEY)? {
+            None => Ok((0, 1, None)),
+            Some(raw) => {
+                let row: EventHeadRow = decode("event head", &raw)?;
+                Ok((row.head, row.oldest, Some(raw)))
+            }
+        }
+    }
+
+    /// Builds deletion facts pruning `Events` rows older than
+    /// `cutoff_millis`, keeping the head row's `oldest` current. Reads at
+    /// most one oldest-first page per call; later sweeps drain the rest.
+    /// Empty when nothing is old enough.
+    pub(crate) fn sweep_events_page(
+        &self,
+        cutoff_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<FactMutation>, StoreError> {
+        let page = self.fact_page(
+            FactTable::Events,
+            None,
+            FactPageBudget::new(limit, usize::MAX),
+        )?;
+        if page.rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (head, oldest, head_raw) = self.read_event_head()?;
+        let mut out = Vec::new();
+        let mut kept: Option<u64> = None;
+        for row in &page.rows {
+            let event: StoreEvent = decode_store_event(&row.value)?;
+            if event.at >= cutoff_millis {
+                // The first kept row ends the prunable prefix. `at` is wall
+                // clock: after a backward step a later row can carry an old
+                // stamp, and pruning it would leave a hole above `oldest`
+                // that a follower skips with no expired signal.
+                kept = Some(Self::seq_from_event_key(&row.key)?);
+                break;
+            }
+            out.push(FactMutation {
+                table: FactTable::Events,
+                key: row.key.clone(),
+                expected: FactExpectation::Value(row.value.clone()),
+                value: None,
+            });
+        }
+        if out.is_empty() {
+            return Ok(Vec::new());
+        }
+        let new_oldest = match (kept, page.more) {
+            (Some(seq), _) => oldest.max(seq),
+            (None, false) => head.saturating_add(1),
+            (None, true) => {
+                // Every row in this page is pruned but more rows remain:
+                // oldest must advance past the page's final deleted
+                // sequence, or a cursor inside the hole would skip the
+                // pruned rows without the expired signal.
+                let last = page
+                    .rows
+                    .last()
+                    .map(|row| Self::seq_from_event_key(&row.key))
+                    .transpose()?
+                    .unwrap_or(oldest);
+                oldest.max(last.saturating_add(1))
+            }
+        };
+        if new_oldest != oldest || head_raw.is_none() {
+            let row = EventHeadRow {
+                head,
+                oldest: new_oldest,
+            };
+            out.push(FactMutation {
+                table: FactTable::EventHead,
+                key: EVENT_HEAD_KEY.to_vec(),
+                expected: head_raw.map_or(FactExpectation::Absent, FactExpectation::Value),
+                value: Some(encode("event head", &row)?),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Decodes one big-endian event sequence key.
+    ///
+    /// # Errors
+    /// `Invalid` for a short key.
+    fn seq_from_event_key(key: &[u8]) -> Result<u64, StoreError> {
+        let bytes: [u8; 8] = key
+            .try_into()
+            .map_err(|_| StoreError::Invalid("event key is not an 8-byte sequence".to_owned()))?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    /// Unix millis of the system clock, for event timestamps.
+    ///
+    /// # Errors
+    /// `E_IO` when the clock predates the epoch.
+    fn unix_millis() -> Result<u64, StoreError> {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| StoreError::Io(std::io::Error::other("clock predates the epoch")))?;
+        u64::try_from(elapsed.as_millis())
+            .map_err(|_| StoreError::Io(std::io::Error::other("clock millis overflow u64")))
+    }
+
     /// Commits one publication with the writer held: the probe, the pending
-    /// reservation, the real transaction, then append and commit.
+    /// reservation, the real transaction, the ref events, then append and
+    /// commit. Ref events and the head bump join the real transaction, so a
+    /// batch and its events commit atomically under the writer lock.
     fn publish_locked(
         &self,
         writer: &mut WriterState,
         objects: &[&PreparedObject],
         facts: &[FactMutation],
+        attribution: &[(EventSource, EventContext)],
     ) -> Result<Publication, StoreError> {
         // A read may have latched quarantine while this call waited for the
         // writer; nothing commits on a store already known to be corrupt.
@@ -954,10 +1527,13 @@ impl Store {
             drop(probe_txn);
             let pending = self.persist_pending(&probe_plan)?;
             let txn = self.observe(self.meta.begin_publication(facts))?;
+            let (event_facts, ref_events) =
+                self.observe(self.emit_ref_events(facts, attribution))?;
+            self.observe(txn.apply_more(&event_facts))?;
             let plan = self.observe(self.plan(&txn, objects))?;
-            Ok::<_, StoreError>((pending, txn, plan))
+            Ok::<_, StoreError>((pending, txn, plan, ref_events))
         })();
-        let (pending, txn, plan) = match staged {
+        let (pending, txn, plan, ref_events) = match staged {
             Ok(prepared) => prepared,
             Err(err) => {
                 // Committed corruption met before the first append still
@@ -997,7 +1573,10 @@ impl Store {
             );
         }
         match self.write_and_commit(writer, txn, plan, profile, pending) {
-            Ok(publication) => Ok(publication),
+            Ok(mut publication) => {
+                publication.ref_events = ref_events;
+                Ok(publication)
+            }
             Err(err) => {
                 writer.closed = Some(format!(
                     "publication failed after durable work began; reopen the store to run recovery ({err})"
@@ -1118,6 +1697,23 @@ impl Store {
     }
 }
 
+/// Decodes one repository metadata row, accepting the pre-policy shape.
+/// Rows written before `policy.set` existed read back with an empty
+/// landing policy at generation zero.
+fn decode_repo_meta(bytes: &[u8]) -> Result<RepoMetaRow, StoreError> {
+    if let Ok(row) = decode::<RepoMetaRow>("repo meta", bytes) {
+        return Ok(row);
+    }
+    let old: RepoMetaRowV0 = decode("repo meta", bytes)
+        .map_err(|_| StoreError::Corrupt("repo meta: malformed row".to_owned()))?;
+    Ok(RepoMetaRow {
+        default_branch: old.default_branch,
+        land_requirements: Vec::new(),
+        trusted_signers: Vec::new(),
+        policy_generation: 0,
+    })
+}
+
 /// A committed duplicate is compatible when kind and decoded length agree.
 fn ensure_same_identity(
     oid: Oid,
@@ -1206,7 +1802,6 @@ impl Store {
             fresh,
             generation,
         } = plan;
-        let segments_dir = self.root.join(SEGMENTS_DIR);
         let mut batch = Batch::default();
         let total_start = ProfileClock::now(profile);
         let append_start = ProfileClock::now(profile);
@@ -1218,12 +1813,7 @@ impl Store {
         };
         for object in &fresh {
             append(
-                writer,
-                &mut batch,
-                &segments_dir,
-                object,
-                generation,
-                &mut probe,
+                writer, &mut batch, &self.pin, object, generation, &mut probe,
             )?;
             if profile {
                 append_bytes += segment::record_len_for(object.payload.len()).unwrap_or(0);
@@ -1250,7 +1840,7 @@ impl Store {
 
         let dir_start = ProfileClock::now(profile);
         if batch.new_entries {
-            sync_entries(&segments_dir)?;
+            self.pin.sync_segments_dir().map_err(StoreError::from)?;
             self.io.directory_syncs.fetch_add(1, Ordering::Relaxed);
         }
         let sync_dir_ms = dir_start.elapsed_ms();
@@ -1290,6 +1880,7 @@ impl Store {
         Ok(Publication {
             objects: order,
             generation,
+            ref_events: Vec::new(),
         })
     }
 }
@@ -1421,7 +2012,7 @@ impl AppendProbe {
 fn append(
     writer: &mut WriterState,
     batch: &mut Batch,
-    segments_dir: &Path,
+    pin: &PinnedRoot,
     object: &PreparedObject,
     generation: u64,
     probe: &mut AppendProbe,
@@ -1429,7 +2020,7 @@ fn append(
     let payload_len = object.payload.len();
     let record_len = segment::record_len_for(payload_len)?;
     let pick_start = probe.clock();
-    let active = active_segment(writer, batch, segments_dir, record_len)?;
+    let active = active_segment(writer, batch, pin, record_len)?;
     probe.pick_ms += pick_start.elapsed_ms();
     // Pre-publication reservation of exactly the range about to be
     // appended, on the still-open segment file. The receipt carries the
@@ -1498,11 +2089,11 @@ fn append(
 fn active_segment<'w>(
     writer: &'w mut WriterState,
     batch: &mut Batch,
-    segments_dir: &Path,
+    pin: &PinnedRoot,
     record_len: u64,
 ) -> Result<&'w mut ActiveSegment, StoreError> {
     if writer.active.is_none() {
-        let opened = open_segment(writer, batch, segments_dir)?;
+        let opened = open_segment(writer, batch, pin)?;
         writer.active = Some(opened);
     }
     let target = writer.target_bytes();
@@ -1511,7 +2102,7 @@ fn active_segment<'w>(
     });
     if overflows {
         seal_active(writer, batch)?;
-        let opened = open_segment(writer, batch, segments_dir)?;
+        let opened = open_segment(writer, batch, pin)?;
         writer.active = Some(opened);
     }
     writer
@@ -1572,11 +2163,12 @@ fn map_allocation_error(err: PhysicalAllocationError) -> StoreError {
 fn open_segment(
     writer: &mut WriterState,
     batch: &mut Batch,
-    segments_dir: &Path,
+    pin: &PinnedRoot,
 ) -> Result<ActiveSegment, StoreError> {
     if let Some(resume) = writer.resume.take() {
-        let path = segments_dir.join(segment::segment_file_name(resume.id));
-        let file = durability::open_existing(&path)?;
+        let file = pin
+            .open_read_write(&segment_rel(resume.id))
+            .map_err(StoreError::from)?;
         return Ok(ActiveSegment {
             id: resume.id,
             writer: SegmentWriter::resumed(file, resume.records_end, resume.records_crc)?,
@@ -1587,8 +2179,7 @@ fn open_segment(
         let next = id
             .checked_add(1)
             .ok_or_else(|| StoreError::Capacity("segment id space exhausted".to_owned()))?;
-        let path = segments_dir.join(segment::segment_file_name(id));
-        match durability::create_file_published(&path) {
+        match pin.create_new(&segment_rel(id)) {
             Ok(file) => {
                 writer.next_segment_id = next;
                 batch.new_entries = true;
@@ -1597,10 +2188,10 @@ fn open_segment(
                     writer: SegmentWriter::fresh(file)?,
                 });
             }
-            Err(StoreError::Io(err)) if err.kind() == io::ErrorKind::AlreadyExists => {
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 writer.next_segment_id = next;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(StoreError::from(err)),
         }
     }
 }
@@ -1691,12 +2282,16 @@ fn require_absent(path: &Path) -> Result<(), StoreError> {
 /// read through. The handle can write because flushing a file needs a
 /// write-capable handle on Windows; it is never written.
 pub(crate) fn read_format(root: &Path) -> Result<(StoreFormat, File), StoreError> {
-    let mut file = match durability::open_existing(&root.join(FORMAT_FILE)) {
+    read_format_file(&root.join(FORMAT_FILE))
+}
+
+fn read_format_file(path: &Path) -> Result<(StoreFormat, File), StoreError> {
+    let mut file = match durability::open_existing(path) {
         Ok(file) => file,
         Err(StoreError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
             return Err(StoreError::NotFound(format!(
                 "no store format file under {}",
-                root.display()
+                path.display()
             )));
         }
         Err(err) => return Err(err),
@@ -1763,6 +2358,38 @@ mod tests {
 
     fn reopen(temp: &TempRoot) -> Store {
         Store::open(&temp.store_dir(), budget()).expect("open store")
+    }
+
+    #[test]
+    fn repo_meta_reads_pre_policy_rows_with_empty_policy() {
+        #[derive(serde::Serialize)]
+        struct OldRepoMetaRow {
+            default_branch: crate::refdata::RefName,
+        }
+        let temp = TempRoot::new("repo-meta-v0");
+        let store = create(&temp, HashKind::Sha1);
+        let old = OldRepoMetaRow {
+            default_branch: crate::refdata::RefName::new("refs/heads/main").expect("branch"),
+        };
+        let bytes = postcard::to_allocvec(&old).expect("encode old row");
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::RepoMeta,
+                    key: REPO_META_KEY.to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish old row");
+        let row = store.repo_meta().expect("read meta").expect("row present");
+        assert_eq!(row.default_branch.as_bytes(), b"refs/heads/main");
+        assert!(row.land_requirements.is_empty());
+        assert!(row.trusted_signers.is_empty());
+        assert_eq!(row.policy_generation, 0);
     }
 
     #[test]
@@ -1902,7 +2529,12 @@ mod tests {
             Some(healthy_oid.as_bytes()),
         )];
         store
-            .publish(vec![healthy, victim], &main)
+            .publish(
+                vec![healthy, victim],
+                &main,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish committed objects");
         let mut changed = victim_bytes.clone();
         changed[16_000..16_008].copy_from_slice(b"EDITED!!");
@@ -1945,7 +2577,10 @@ mod tests {
             let meta = Metadata::open(&meta_file(temp)).expect("healthy metadata");
             let generation = meta.generation().expect("healthy generation");
             let guards = Arc::new(GenerationRegistry::new(generation));
-            shared.register_scratch(&root).expect("scratch accounting");
+            let pin = PinnedRoot::open(&root).expect("pin test store");
+            shared
+                .register_scratch(&pin, &root)
+                .expect("scratch accounting");
             let files = SegmentFileCache::default();
             let committed = Committed {
                 root: &root,
@@ -1954,6 +2589,7 @@ mod tests {
                 budget: &shared,
                 guards: &guards,
                 files: &files,
+                pin: &pin,
             };
             recovery::run(&committed).expect("healthy store recovers")
         };
@@ -1997,11 +2633,32 @@ mod tests {
             FactExpectation::Absent,
             Some(b"v"),
         )];
-        assert_refused("fact-only publish", store.publish(vec![], &facts));
-        assert_refused("empty publish", store.publish(vec![], &[]));
+        assert_refused(
+            "fact-only publish",
+            store.publish(
+                vec![],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ),
+        );
+        assert_refused(
+            "empty publish",
+            store.publish(
+                vec![],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ),
+        );
         assert_refused(
             "unrelated object publish",
-            store.publish(vec![spare], &facts),
+            store.publish(
+                vec![spare],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ),
         );
     }
 
@@ -2022,7 +2679,14 @@ mod tests {
                 FactExpectation::Absent,
                 Some(oid.as_bytes()),
             )];
-            let published = store.publish(vec![prepared], &facts).expect("publish");
+            let published = store
+                .publish(
+                    vec![prepared],
+                    &facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish");
             assert_eq!(published.objects, vec![oid]);
             assert_eq!(published.generation, 1);
             drop(store);
@@ -2133,7 +2797,12 @@ mod tests {
             let winner = store.store_id();
             let payload = pseudo(2000, 61);
             let oid = store
-                .publish(vec![blob(&store, &payload)], &[])
+                .publish(
+                    vec![blob(&store, &payload)],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("the winner's store publishes")
                 .objects[0];
             drop(store);
@@ -2194,7 +2863,12 @@ mod tests {
             let healthy = create(&temp, HashKind::Sha1);
             let payload = pseudo(2000, 62);
             let oid = healthy
-                .publish(vec![blob(&healthy, &payload)], &[])
+                .publish(
+                    vec![blob(&healthy, &payload)],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish")
                 .objects[0];
             drop(healthy);
@@ -2299,13 +2973,23 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let payload = pseudo(3000, 2);
         let first = store
-            .publish(vec![blob(&store, &payload)], &[])
+            .publish(
+                vec![blob(&store, &payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("first publish");
         let before = std::fs::metadata(segment_file(&temp, 0))
             .expect("segment")
             .len();
         let again = store
-            .publish(vec![blob(&store, &payload)], &[])
+            .publish(
+                vec![blob(&store, &payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("duplicate publish");
         assert_eq!(again.objects, first.objects);
         assert_eq!(again.generation, first.generation);
@@ -2323,7 +3007,12 @@ mod tests {
         let target = create(&sha256, HashKind::Sha256);
         let foreign = blob(&source, b"foreign width");
         let err = target
-            .publish(vec![foreign], &[])
+            .publish(
+                vec![foreign],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("width mismatch");
         assert!(matches!(err, StoreError::ObjectFormat(_)), "{err:?}");
     }
@@ -2337,7 +3026,14 @@ mod tests {
         let base_bytes = pseudo(32 * 1024, 3);
         let base = blob(&source, &base_bytes);
         let base_oid = base.oid();
-        source.publish(vec![base], &[]).expect("publish base");
+        source
+            .publish(
+                vec![base],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let mut changed = base_bytes.clone();
         changed[16_000..16_008].copy_from_slice(b"EDITED!!");
         let delta = source
@@ -2356,7 +3052,12 @@ mod tests {
             Some(b"v"),
         )];
         let err = target
-            .publish(vec![delta], &facts)
+            .publish(
+                vec![delta],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("dangling base");
         assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
         assert_eq!(
@@ -2368,7 +3069,12 @@ mod tests {
             .count();
         assert_eq!(entries, 0, "validation must precede any segment creation");
         target
-            .publish(vec![], &facts)
+            .publish(
+                vec![],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("writer stays open after a validation failure");
     }
 
@@ -2379,7 +3085,14 @@ mod tests {
         let base_bytes = pseudo(32 * 1024, 4);
         let base = blob(&store, &base_bytes);
         let base_oid = base.oid();
-        store.publish(vec![base], &[]).expect("publish base");
+        store
+            .publish(
+                vec![base],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let mut changed = base_bytes.clone();
         changed[100..108].copy_from_slice(b"CHANGED!");
         let delta = store
@@ -2393,13 +3106,70 @@ mod tests {
         assert_eq!(delta.encoding(), Encoding::Delta);
         assert_eq!(delta.depth(), 1);
         let delta_oid = delta.oid();
-        store.publish(vec![delta], &[]).expect("publish delta");
+        store
+            .publish(
+                vec![delta],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish delta");
         drop(store);
 
         let store = reopen(&temp);
         assert_eq!(read_all(&store, delta_oid), changed);
         assert_eq!(store.read(delta_oid).expect("read").depth, 1);
         assert_eq!(read_all(&store, base_oid), base_bytes);
+    }
+
+    #[test]
+    fn identical_record_replay_converges_while_conflicts_stay_stale() {
+        let temp = TempRoot::new("record-replay");
+        let store = create(&temp, HashKind::Sha1);
+        for table in [
+            FactTable::Commits,
+            FactTable::Changes,
+            FactTable::ImportedChanges,
+            FactTable::ChangeHistory,
+        ] {
+            let first = [mutation(
+                table,
+                b"row",
+                FactExpectation::Absent,
+                Some(b"v1"),
+            )];
+            store
+                .publish(
+                    vec![],
+                    &first,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("first record write");
+            store
+                .publish(
+                    vec![],
+                    &first,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("identical record replay converges");
+            let changed = [mutation(
+                table,
+                b"row",
+                FactExpectation::Absent,
+                Some(b"v2"),
+            )];
+            let err = store
+                .publish(
+                    vec![],
+                    &changed,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect_err("a differing record still refuses");
+            assert!(matches!(err, StoreError::StaleFact { .. }), "{err:?}");
+        }
     }
 
     #[test]
@@ -2423,9 +3193,21 @@ mod tests {
             FactExpectation::Absent,
             Some(b"one"),
         )];
-        store.publish(vec![], &set).expect("first set");
+        store
+            .publish(
+                vec![],
+                &set,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("first set");
         let err = store
-            .publish(vec![], &set)
+            .publish(
+                vec![],
+                &set,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("claim already present");
         assert!(matches!(err, StoreError::StaleFact { .. }), "{err:?}");
 
@@ -2433,7 +3215,14 @@ mod tests {
             mutation(FactTable::Claims, b"dup", FactExpectation::Any, Some(b"a")),
             mutation(FactTable::Claims, b"dup", FactExpectation::Any, Some(b"b")),
         ];
-        let err = store.publish(vec![], &twice).expect_err("duplicate key");
+        let err = store
+            .publish(
+                vec![],
+                &twice,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect_err("duplicate key");
         assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
         assert_eq!(store.fact(FactTable::Claims, b"dup").expect("fact"), None);
         assert_eq!(
@@ -2446,7 +3235,14 @@ mod tests {
             FactExpectation::Value(b"one".to_vec()),
             None,
         )];
-        store.publish(vec![], &remove).expect("conditional remove");
+        store
+            .publish(
+                vec![],
+                &remove,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("conditional remove");
         assert_eq!(store.fact(FactTable::Claims, b"claim").expect("fact"), None);
     }
 
@@ -2460,7 +3256,12 @@ mod tests {
         let prepared = blob(&store, &payload);
         let oid = prepared.oid();
         store
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish past orphan");
         assert_eq!(
             std::fs::read(&orphan).expect("orphan"),
@@ -2484,7 +3285,12 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let first = pseudo(2000, 6);
         let first_oid = store
-            .publish(vec![blob(&store, &first)], &[])
+            .publish(
+                vec![blob(&store, &first)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("first")
             .objects[0];
         drop(store);
@@ -2492,7 +3298,12 @@ mod tests {
         let store = reopen(&temp);
         let second = pseudo(2000, 7);
         let second_oid = store
-            .publish(vec![blob(&store, &second)], &[])
+            .publish(
+                vec![blob(&store, &second)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("second")
             .objects[0];
         assert!(!segment_file(&temp, 1).exists());
@@ -2509,7 +3320,12 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let first = pseudo(2000, 60);
         let first_oid = store
-            .publish(vec![blob(&store, &first)], &[])
+            .publish(
+                vec![blob(&store, &first)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("first")
             .objects[0];
         store.close().expect("close");
@@ -2520,7 +3336,12 @@ mod tests {
         // opens and fail the next recovery.
         let refused = pseudo(2000, 61);
         let err = store
-            .publish(vec![blob(&store, &refused)], &[])
+            .publish(
+                vec![blob(&store, &refused)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("publish after close is refused");
         assert!(
             matches!(err, StoreError::WriterClosed(_)),
@@ -2535,7 +3356,12 @@ mod tests {
         assert_eq!(read_all(&store, first_oid), first);
         let second = pseudo(2000, 62);
         let second_oid = store
-            .publish(vec![blob(&store, &second)], &[])
+            .publish(
+                vec![blob(&store, &second)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("post-reopen publish resumes the open segment")
             .objects[0];
         assert!(!segment_file(&temp, 1).exists());
@@ -2552,7 +3378,12 @@ mod tests {
         let store = create(&temp, HashKind::Sha1);
         let payload = pseudo(2000, 8);
         let oid = store
-            .publish(vec![blob(&store, &payload)], &[])
+            .publish(
+                vec![blob(&store, &payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish")
             .objects[0];
         drop(store);
@@ -2570,7 +3401,12 @@ mod tests {
         assert_eq!(read_all(&store, oid), payload);
         let more = pseudo(500, 9);
         let more_oid = store
-            .publish(vec![blob(&store, &more)], &[])
+            .publish(
+                vec![blob(&store, &more)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish after truncation")
             .objects[0];
         assert_eq!(read_all(&store, more_oid), more);
@@ -2598,7 +3434,12 @@ mod tests {
                     )
                 })
                 .collect();
-            oids.extend(store.publish(batch, &[]).expect("publish").objects);
+            oids.extend(
+                store
+                    .publish(batch, &[], EventSource::LocalPush, &EventContext::default())
+                    .expect("publish")
+                    .objects,
+            );
         }
         assert_eq!(oids.len(), OBJECTS);
         drop(store);
@@ -2624,7 +3465,12 @@ mod tests {
         let temp = TempRoot::new("short");
         let store = create(&temp, HashKind::Sha1);
         store
-            .publish(vec![blob(&store, &pseudo(2000, 10))], &[])
+            .publish(
+                vec![blob(&store, &pseudo(2000, 10))],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish");
         drop(store);
         let path = segment_file(&temp, 0);
@@ -2647,7 +3493,14 @@ mod tests {
         let payload = pseudo(2000, 11);
         let prepared = blob(&store, &payload);
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let path = segment_file(&temp, 0);
         let mut bytes = std::fs::read(&path).expect("segment bytes");
@@ -2665,7 +3518,12 @@ mod tests {
             Some(b"v"),
         )];
         assert!(matches!(
-            store.publish(vec![], &facts),
+            store.publish(
+                vec![],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(
@@ -2696,7 +3554,12 @@ mod tests {
         });
 
         let err = store
-            .publish(vec![seeded.victim_again], &[])
+            .publish(
+                vec![seeded.victim_again],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("malformed locator");
         assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
         assert!(
@@ -2729,7 +3592,12 @@ mod tests {
         });
 
         let err = store
-            .publish(vec![seeded.delta_over_victim], &[])
+            .publish(
+                vec![seeded.delta_over_victim],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("malformed base locator");
         assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
         assert!(
@@ -2750,7 +3618,12 @@ mod tests {
         let store = reopen_over_damage(&temp, |meta| raw_put_segment(meta, 0, &[0xFF; 3]));
 
         let err = store
-            .publish(vec![seeded.unrelated], &[])
+            .publish(
+                vec![seeded.unrelated],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect_err("manifest row of the segment being appended is malformed");
         assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
         assert!(
@@ -2785,9 +3658,21 @@ mod tests {
             FactExpectation::Absent,
             Some(b"one"),
         )];
-        store.publish(vec![], &claim).expect("first claim");
+        store
+            .publish(
+                vec![],
+                &claim,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("first claim");
         assert!(matches!(
-            store.publish(vec![], &claim),
+            store.publish(
+                vec![],
+                &claim,
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::StaleFact { .. })
         ));
         let twice = [
@@ -2795,18 +3680,35 @@ mod tests {
             mutation(FactTable::Claims, b"dup", FactExpectation::Any, Some(b"b")),
         ];
         assert!(matches!(
-            store.publish(vec![], &twice),
+            store.publish(
+                vec![],
+                &twice,
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::Invalid(_))
         ));
         assert!(matches!(
-            store.publish(vec![blob(&foreign, b"wide")], &[]),
+            store.publish(
+                vec![blob(&foreign, b"wide")],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::ObjectFormat(_))
         ));
 
         let base_bytes = pseudo(32 * 1024, 31);
         let base = blob(&source, &base_bytes);
         let base_oid = base.oid();
-        source.publish(vec![base], &[]).expect("publish base");
+        source
+            .publish(
+                vec![base],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let mut changed = base_bytes;
         changed[100..108].copy_from_slice(b"CHANGED!");
         let dangling = source
@@ -2819,7 +3721,12 @@ mod tests {
             .expect("prepare delta");
         assert_eq!(dangling.encoding(), Encoding::Delta);
         assert!(matches!(
-            store.publish(vec![dangling], &[]),
+            store.publish(
+                vec![dangling],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default()
+            ),
             Err(StoreError::Invalid(_))
         ));
 
@@ -2845,7 +3752,12 @@ mod tests {
         let prepared = blob(&store, &payload);
         let oid = prepared.oid();
         store
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("the store still serves");
         assert_eq!(read_all(&store, oid), payload);
     }
@@ -2915,7 +3827,12 @@ mod tests {
         let store =
             Store::create(&root, HashKind::Sha1, budget()).expect("create by relative root");
         let first = store
-            .publish(vec![blob(&store, &first_payload)], &[])
+            .publish(
+                vec![blob(&store, &first_payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish before the move")
             .objects[0];
         drop(store);
@@ -2926,7 +3843,12 @@ mod tests {
         assert_eq!(read_all(&store, first), first_payload);
         let later_payload = pseudo(2000, 42);
         let later = store
-            .publish(vec![blob(&store, &later_payload)], &[])
+            .publish(
+                vec![blob(&store, &later_payload)],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish after the move")
             .objects[0];
         assert_eq!(read_all(&store, later), later_payload);
@@ -2942,7 +3864,12 @@ mod tests {
         let before = store.io_stats();
         for seed in 0..5 {
             store
-                .publish(vec![blob(&store, &pseudo(256, seed))], &[])
+                .publish(
+                    vec![blob(&store, &pseudo(256, seed))],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("sequential publish");
         }
         let after = store.io_stats();
@@ -2971,12 +3898,22 @@ mod tests {
         // Solo baseline on this store: no linger, one publication at a time.
         store.set_commit_linger(Duration::ZERO);
         store
-            .publish(vec![blob(&store, &pseudo(64, 9_999))], &[])
+            .publish(
+                vec![blob(&store, &pseudo(64, 9_999))],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("warm-up publish");
         let solo_before = store.io_stats();
         for seed in 0..SOLO {
             store
-                .publish(vec![blob(&store, &pseudo(512, 20_000 + seed))], &[])
+                .publish(
+                    vec![blob(&store, &pseudo(512, 20_000 + seed))],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("solo publish");
         }
         let solo = barriers(store.io_stats()) - barriers(solo_before);
@@ -2998,7 +3935,12 @@ mod tests {
                             Some(tip.as_bytes()),
                         );
                         let publication = store
-                            .publish(vec![blob(&store, &payload)], &[fact])
+                            .publish(
+                                vec![blob(&store, &payload)],
+                                &[fact],
+                                EventSource::LocalPush,
+                                &EventContext::default(),
+                            )
                             .expect("grouped publication commits");
                         assert_eq!(publication.objects, vec![expected]);
                     }
@@ -3066,7 +4008,12 @@ mod tests {
                             FactExpectation::Absent,
                             Some(&tip[..]),
                         );
-                        store.publish(vec![blob(&store, &payload)], &[fact])
+                        store.publish(
+                            vec![blob(&store, &payload)],
+                            &[fact],
+                            EventSource::LocalPush,
+                            &EventContext::default(),
+                        )
                     })
                 })
                 .collect();
@@ -3086,5 +4033,315 @@ mod tests {
                 "a losing claim must fail as stale, got: {loser}"
             );
         }
+    }
+
+    fn read_events(store: &Store) -> Vec<(u64, StoreEvent)> {
+        let page = store
+            .fact_page(
+                FactTable::Events,
+                None,
+                FactPageBudget::new(10_000, usize::MAX),
+            )
+            .expect("read events");
+        assert!(!page.more, "the test writes fewer rows than one page");
+        page.rows
+            .iter()
+            .map(|row| {
+                let seq =
+                    u64::from_be_bytes(row.key.as_slice().try_into().expect("8-byte event key"));
+                let event: StoreEvent = decode_store_event(&row.value).expect("decode event");
+                (seq, event)
+            })
+            .collect()
+    }
+
+    fn read_head(store: &Store) -> EventHeadRow {
+        let raw = store
+            .fact(FactTable::EventHead, EVENT_HEAD_KEY)
+            .expect("read head")
+            .expect("the head row exists once an event commits");
+        decode("event head", &raw).expect("decode head")
+    }
+
+    #[test]
+    fn events_survive_restart() {
+        let temp = TempRoot::new("events-restart");
+        let store = create(&temp, HashKind::Sha1);
+        let set = [mutation(
+            FactTable::Refs,
+            b"refs/heads/main",
+            FactExpectation::Absent,
+            Some(b"v1"),
+        )];
+        store
+            .publish(
+                Vec::new(),
+                &set,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("publish ref");
+        let before = read_events(&store);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].0, 1);
+        assert_eq!(before[0].1.name, b"refs/heads/main");
+        assert_eq!(before[0].1.old, None);
+        assert_eq!(before[0].1.new, Some(b"v1".to_vec()));
+        assert_eq!(read_head(&store), EventHeadRow { head: 1, oldest: 1 });
+        drop(store);
+        let store = reopen(&temp);
+        let after = read_events(&store);
+        assert_eq!(after, before, "events persist across reopen");
+        assert_eq!(read_head(&store), EventHeadRow { head: 1, oldest: 1 });
+    }
+
+    #[test]
+    fn events_increase_strictly_across_sources_with_attribution() {
+        use crate::change::{OperationId, SessionId};
+        let temp = TempRoot::new("events-order");
+        let store = create(&temp, HashKind::Sha1);
+        let lane_context = EventContext {
+            operation: Some(OperationId(7)),
+            request_id: Some("req-lane".to_string()),
+            session: Some(SessionId::from_bytes([3; 16])),
+            on_behalf_of: Some("agent-lane".to_string()),
+        };
+        let lane = [mutation(
+            FactTable::Refs,
+            b"refs/heads/main",
+            FactExpectation::Absent,
+            Some(b"v1"),
+        )];
+        store
+            .publish(Vec::new(), &lane, EventSource::Lane, &lane_context)
+            .expect("publish lane batch");
+        let receive = [mutation(
+            FactTable::Refs,
+            b"refs/heads/scratch",
+            FactExpectation::Absent,
+            Some(b"v2"),
+        )];
+        store
+            .publish(
+                Vec::new(),
+                &receive,
+                EventSource::ReceivePack,
+                &EventContext::default(),
+            )
+            .expect("publish receive batch");
+        let events = read_events(&store);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, 1);
+        assert_eq!(events[1].0, 2);
+        assert_eq!(events[0].1.source, EventSource::Lane);
+        assert_eq!(events[1].1.source, EventSource::ReceivePack);
+        assert_eq!(events[0].1.operation, Some(OperationId(7)));
+        assert_eq!(events[0].1.request_id.as_deref(), Some("req-lane"));
+        assert_eq!(events[0].1.session, Some(SessionId::from_bytes([3; 16])));
+        assert_eq!(events[0].1.on_behalf_of.as_deref(), Some("agent-lane"));
+        assert_eq!(events[1].1.operation, None);
+        assert_eq!(events[1].1.on_behalf_of, None);
+        assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 1 });
+    }
+
+    #[test]
+    fn events_sweep_prunes_to_retention_keeping_oldest_current() {
+        let temp = TempRoot::new("events-sweep");
+        let store = create(&temp, HashKind::Sha1);
+        let old_event = StoreEvent {
+            name: b"refs/heads/old".to_vec(),
+            old: None,
+            new: Some(b"v1".to_vec()),
+            at: 1_000,
+            source: EventSource::Lane,
+            operation: None,
+            request_id: None,
+            session: None,
+            on_behalf_of: None,
+        };
+        let new_event = StoreEvent {
+            name: b"refs/heads/new".to_vec(),
+            old: None,
+            new: Some(b"v2".to_vec()),
+            at: 9_000,
+            source: EventSource::ReceivePack,
+            operation: None,
+            request_id: None,
+            session: None,
+            on_behalf_of: None,
+        };
+        let facts = [
+            FactMutation {
+                table: FactTable::Events,
+                key: 1_u64.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &old_event).expect("encode")),
+            },
+            FactMutation {
+                table: FactTable::Events,
+                key: 2_u64.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &new_event).expect("encode")),
+            },
+            FactMutation {
+                table: FactTable::EventHead,
+                key: EVENT_HEAD_KEY.to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(
+                    encode("event head", &EventHeadRow { head: 2, oldest: 1 }).expect("encode"),
+                ),
+            },
+        ];
+        store
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("seed events");
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        assert_eq!(deletions.len(), 2, "one event row plus the head bump");
+        store
+            .publish(
+                Vec::new(),
+                &deletions,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("publish sweep");
+        let remaining = read_events(&store);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 2);
+        assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 2 });
+    }
+
+    /// Seeds events `(seq, at)` with head and oldest, for sweep tests.
+    fn seed_stamped_events(store: &Store, stamps: &[(u64, u64)], head: u64) {
+        let mut facts: Vec<FactMutation> = stamps
+            .iter()
+            .map(|&(seq, at)| {
+                let event = StoreEvent {
+                    name: format!("refs/heads/e{seq}").into_bytes(),
+                    old: None,
+                    new: Some(b"v1".to_vec()),
+                    at,
+                    source: EventSource::Lane,
+                    operation: None,
+                    request_id: None,
+                    session: None,
+                    on_behalf_of: None,
+                };
+                FactMutation {
+                    table: FactTable::Events,
+                    key: seq.to_be_bytes().to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(encode("event", &event).expect("encode")),
+                }
+            })
+            .collect();
+        facts.push(FactMutation {
+            table: FactTable::EventHead,
+            key: EVENT_HEAD_KEY.to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(encode("event head", &EventHeadRow { head, oldest: 1 }).expect("encode")),
+        });
+        store
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("seed events");
+    }
+
+    /// The sweep prunes only the leading run of expired events and stops at
+    /// the first kept one. A later row whose stamp is old (a backward clock
+    /// step) must survive, or a follower resuming below it skips it silently.
+    #[test]
+    fn events_sweep_stops_at_the_first_kept_event() {
+        let leading_kept = TempRoot::new("events-sweep-leading-kept");
+        let store = create(&leading_kept, HashKind::Sha1);
+        seed_stamped_events(&store, &[(1, 9_000), (2, 1_000), (3, 1_000)], 3);
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        assert!(
+            deletions.is_empty(),
+            "a kept leading row prunes nothing, got {} mutations",
+            deletions.len()
+        );
+
+        let old_kept_old = TempRoot::new("events-sweep-old-kept-old");
+        let store = create(&old_kept_old, HashKind::Sha1);
+        seed_stamped_events(&store, &[(1, 1_000), (2, 9_000), (3, 1_000)], 3);
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        let pruned: Vec<Vec<u8>> = deletions
+            .iter()
+            .filter(|mutation| mutation.table == FactTable::Events)
+            .map(|mutation| mutation.key.clone())
+            .collect();
+        assert_eq!(
+            pruned,
+            vec![1_u64.to_be_bytes().to_vec()],
+            "only the leading expired row goes; row 3 above the kept row stays"
+        );
+    }
+
+    #[test]
+    fn events_sweep_full_page_advances_oldest_past_pruned() {
+        let temp = TempRoot::new("events-sweep-full-page");
+        let store = create(&temp, HashKind::Sha1);
+        let mut facts = Vec::new();
+        for seq in 1_u64..=3 {
+            let event = StoreEvent {
+                name: format!("refs/heads/e{seq}").into_bytes(),
+                old: None,
+                new: Some(b"v1".to_vec()),
+                at: 1_000,
+                source: EventSource::Lane,
+                operation: None,
+                request_id: None,
+                session: None,
+                on_behalf_of: None,
+            };
+            facts.push(FactMutation {
+                table: FactTable::Events,
+                key: seq.to_be_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(encode("event", &event).expect("encode")),
+            });
+        }
+        facts.push(FactMutation {
+            table: FactTable::EventHead,
+            key: EVENT_HEAD_KEY.to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(
+                encode("event head", &EventHeadRow { head: 3, oldest: 1 }).expect("encode"),
+            ),
+        });
+        store
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("seed events");
+        // The first page prunes every row it holds while more rows
+        // remain: oldest must jump past the page, not stay behind it.
+        let deletions = store.sweep_events_page(5_000, 2).expect("sweep");
+        assert_eq!(deletions.len(), 3, "two event rows plus the head bump");
+        store
+            .publish(
+                Vec::new(),
+                &deletions,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("publish sweep");
+        assert_eq!(read_head(&store), EventHeadRow { head: 3, oldest: 3 });
+        let remaining = read_events(&store);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 3);
     }
 }

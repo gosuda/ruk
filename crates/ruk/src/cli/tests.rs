@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -37,6 +37,16 @@ use super::verbs_transport;
 use super::verbs_worktree;
 use super::{CliEnv, Ctx, collect};
 
+/// `(request head, body)` smart-http request log.
+type HttpRequests = Vec<(String, Vec<u8>)>;
+/// `(request paths, PUT body)` LFS upload observation.
+type UploadSeen = (Vec<String>, Vec<u8>);
+/// `(name, verb)` leftover dispatch stub.
+type LeftoverStub = (
+    &'static str,
+    fn(&mut Ctx, &[String]) -> Result<Vec<u8>, ruk_git::GitError>,
+);
+
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -50,7 +60,7 @@ fn temp_base(case: &str) -> PathBuf {
 }
 
 /// Builds an environment with a fixed test identity and one cwd.
-fn test_env(cwd: &PathBuf) -> CliEnv {
+fn test_env(cwd: &Path) -> CliEnv {
     let vars = [
         ("GIT_AUTHOR_NAME", "Ada"),
         ("GIT_AUTHOR_EMAIL", "ada@example.invalid"),
@@ -62,13 +72,13 @@ fn test_env(cwd: &PathBuf) -> CliEnv {
     .collect::<HashMap<String, String>>();
     CliEnv {
         vars,
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         stdin: None,
     }
 }
 
 /// Opens the store at one root with the reference budget.
-fn open_store(root: &PathBuf) -> Store {
+fn open_store(root: &Path) -> Store {
     Store::open(
         &root.join(".ruk"),
         Arc::new(PreparationBudget::reference_defaults()),
@@ -77,19 +87,20 @@ fn open_store(root: &PathBuf) -> Store {
 }
 
 /// Builds a repo-backed context for verb calls.
-fn repo_ctx(root: &PathBuf, mut env: CliEnv) -> Ctx {
-    env.cwd = root.clone();
+fn repo_ctx(root: &Path, mut env: CliEnv) -> Ctx {
+    env.cwd = root.to_path_buf();
     let store = open_store(root);
     let kind = store.hash_kind();
     Ctx {
         store: Some(store),
-        root: root.clone(),
-        file_base: root.clone(),
+        root: root.to_path_buf(),
+        file_base: root.to_path_buf(),
         kind: Some(kind),
         env,
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     }
 }
 
@@ -106,6 +117,7 @@ fn seeded_repo(case: &str, file: &str, body: &[u8]) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -776,6 +788,7 @@ fn clone_fetch_push_local_cycle() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(
         verbs_repo::clone,
@@ -1147,6 +1160,7 @@ fn indexed_repo(case: &str, pack: Vec<u8>) -> (PathBuf, CliEnv, Ctx) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(verbs_repo::init, &mut init_ctx, &["dst"]).expect("init");
     let root = base.join("dst");
@@ -1355,7 +1369,7 @@ fn gc_dry_run_reports_without_mutating() {
 
 #[test]
 fn serve_verbs_round_trip_scripted_stdin() {
-    use ruk_git::transport::pktline::{Packet, decode_frame, encode_data, encode_flush};
+    use ruk_git::transport::pktline::{Packet, decode_frame, encode_data};
 
     fn framed(line: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1413,7 +1427,7 @@ fn serve_verbs_round_trip_scripted_stdin() {
         .as_bytes(),
     );
     push.extend_from_slice(b"0000");
-    push.extend_from_slice(&pack);
+    push.extend_from_slice(pack);
     ctx_b.env.stdin = Some(push);
     let report = run(verbs_transport::receive_pack, &mut ctx_b, &[]).expect("receive");
     let (_, after_adv) = split_at_flush(&report);
@@ -1453,7 +1467,12 @@ fn upload_archive_argv_reaches_serve_half() {
         "upload-archive".to_owned(),
         root.to_str().expect("utf8 root").to_owned(),
     ];
-    let (stdout, _) = super::run_inner(&argv, env).expect("upload-archive routes");
+    let (stdout, _) = super::run_inner(
+        &argv,
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    )
+    .expect("upload-archive routes");
     assert!(
         stdout.starts_with(b"0008ACK\n0000"),
         "argv reaches serve_upload_archive: {stdout:?}"
@@ -1522,7 +1541,12 @@ fn dashed_upload_archive_argv_reaches_serve_half() {
         "git-upload-archive".to_owned(),
         root.to_str().expect("utf8 root").to_owned(),
     ];
-    let (stdout, _) = super::run_inner(&argv, env).expect("dashed routes");
+    let (stdout, _) = super::run_inner(
+        &argv,
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    )
+    .expect("dashed routes");
     assert!(
         stdout.starts_with(b"0008ACK\n0000"),
         "dashed argv reaches serve_upload_archive: {stdout:?}"
@@ -1612,6 +1636,7 @@ fn walk_orders_merge_topology_by_committer_date() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -1698,6 +1723,7 @@ fn log_excluding_skips_branch_in_date_order() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -1956,16 +1982,7 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
                 }
             }
             let text = String::from_utf8_lossy(&head).into_owned();
-            let length = text
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if length > 0 {
-                let mut discard = vec![0_u8; length];
-                reader.read_exact(&mut discard).expect("request body");
-            }
+            let _discard = read_http_body(&mut reader, &text);
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -1998,7 +2015,7 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
     let oid = ruk_core::ids::Oid::from_hex(FOUR).expect("hex");
     store.read(oid).expect("fetched object present");
     let name = RefName::new(b"refs/remotes/origin/main".to_vec()).expect("name");
-    let target = StoreRefs::new(&store)
+    let target = StoreRefs::new(store)
         .get(&name)
         .expect("read ref")
         .expect("ref present");
@@ -2010,9 +2027,76 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
 /// request head plus body and delivering the log once all replies
 /// are served. The receiver bounds the wait: a client that stops
 /// early fails the test instead of hanging the suite.
+/// Reads one request body by Content-Length, or decodes it as
+/// `Transfer-Encoding: chunked` when the client streams.
+fn read_http_body(reader: &mut BufReader<std::net::TcpStream>, head: &str) -> Vec<u8> {
+    let chunked = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("transfer-encoding"))
+        .is_some_and(|(_, value)| value.trim().eq_ignore_ascii_case("chunked"));
+    if chunked {
+        read_chunked_body(reader)
+    } else {
+        read_length_body(reader, head)
+    }
+}
+
+/// Reads `length` bytes under a Content-Length head.
+fn read_length_body(reader: &mut BufReader<std::net::TcpStream>, head: &str) -> Vec<u8> {
+    let length = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; length];
+    if length > 0 {
+        reader.read_exact(&mut body).expect("request body");
+    }
+    body
+}
+
+/// Decodes size-prefixed blocks ending in a zero chunk plus trailers.
+fn read_chunked_body(reader: &mut BufReader<std::net::TcpStream>) -> Vec<u8> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = Vec::new();
+        reader
+            .read_until(b'\n', &mut size_line)
+            .expect("chunk size");
+        let size_text = String::from_utf8_lossy(&size_line);
+        let size = usize::from_str_radix(size_text.trim().split(';').next().unwrap_or(""), 16)
+            .expect("chunk size parses as hex");
+        if size == 0 {
+            skip_trailers(reader);
+            return body;
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader.read_exact(&mut body[start..]).expect("chunk bytes");
+        let mut end = [0_u8; 2];
+        reader.read_exact(&mut end).expect("chunk terminator");
+        assert_eq!(&end, b"\r\n", "chunk ends with CRLF");
+    }
+}
+
+/// Consumes trailer lines through the blank line that ends the message.
+fn skip_trailers(reader: &mut BufReader<std::net::TcpStream>) {
+    loop {
+        let mut trailer = Vec::new();
+        reader
+            .read_until(b'\n', &mut trailer)
+            .expect("trailer line");
+        if trailer == b"\r\n" || trailer == b"\n" || trailer.is_empty() {
+            return;
+        }
+    }
+}
+
 fn smart_http_server(
     replies: Vec<(Vec<u8>, &'static str)>,
-) -> (String, std::sync::mpsc::Receiver<Vec<(String, Vec<u8>)>>) {
+) -> (String, std::sync::mpsc::Receiver<HttpRequests>) {
     use std::net::TcpListener;
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
@@ -2039,16 +2123,7 @@ fn smart_http_server(
                 }
             }
             let text = String::from_utf8_lossy(&head).into_owned();
-            let length = text
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
-                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            let mut request_body = vec![0_u8; length];
-            if length > 0 {
-                reader.read_exact(&mut request_body).expect("request body");
-            }
+            let request_body = read_http_body(&mut reader, &text);
             requests.push((text, request_body));
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n",
@@ -2111,6 +2186,81 @@ fn push_over_smart_http_reports_status() {
         "no command line"
     );
     assert!(body.windows(4).any(|w| w == b"PACK"), "no pack bytes");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn push_isolates_diverged_refs_per_ref() {
+    const FOREIGN: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+    let mut adv = pkt_frame(b"# service=git-receive-pack\n");
+    adv.extend_from_slice(b"0000");
+    adv.extend_from_slice(&pkt_frame(
+        format!("{FOREIGN} refs/heads/main\0report-status report-status-v2 side-band-64k delete-refs ofs-delta object-format=sha1\n")
+            .as_bytes(),
+    ));
+    adv.extend_from_slice(b"0000");
+    let mut report = pkt_frame(b"\x01unpack ok\n");
+    report.extend_from_slice(&pkt_frame(b"\x01ok refs/heads/other\n"));
+    report.extend_from_slice(b"0000");
+    let (base, log) = smart_http_server(vec![
+        (adv, "application/x-git-receive-pack-advertisement"),
+        (report, "application/x-git-receive-pack-result"),
+    ]);
+    let (root, env) = seeded_repo("ffisolate", "p.txt", b"p\n");
+    let mut ctx = repo_ctx(&root, env);
+    let err = run(
+        verbs_transport::push,
+        &mut ctx,
+        &[
+            &base,
+            "refs/heads/main:refs/heads/main",
+            "refs/heads/main:refs/heads/other",
+        ],
+    )
+    .expect_err("diverged ref fails the push");
+    let text = format!("ruk: {err}");
+    assert!(text.contains("rejected refs/heads/main"), "{text}");
+    assert!(text.contains("non-fast-forward"), "{text}");
+    assert!(text.contains("ok refs/heads/other"), "{text}");
+    let requests = log
+        .recv_timeout(Duration::from_secs(30))
+        .expect("server finished both RPCs");
+    assert_eq!(requests.len(), 2);
+    let (head, body) = &requests[1];
+    assert!(
+        head.starts_with("POST /a.git/git-receive-pack HTTP/1.1\r\n"),
+        "{head:?}"
+    );
+    assert!(
+        body.windows(b"refs/heads/other".len())
+            .any(|w| w == b"refs/heads/other"),
+        "live ref missing from commands"
+    );
+    assert!(
+        !body
+            .windows(b"refs/heads/main".len())
+            .any(|w| w == b"refs/heads/main"),
+        "diverged ref must not be sent"
+    );
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
+#[test]
+fn push_refuses_hidden_deletes_before_any_post() {
+    let (root, env) = seeded_repo("hiddendel", "p.txt", b"p\n");
+    let (droot, _) = seeded_repo("hiddendeldst", "d.txt", b"d\n");
+    let mut ctx = repo_ctx(&root, env);
+    let target = droot.to_str().expect("utf8 root").to_owned();
+    let err = run(
+        verbs_transport::push,
+        &mut ctx,
+        &["--delete", &target, "refs/pull/1/head"],
+    )
+    .expect_err("hidden delete must fail");
+    assert!(
+        err.to_string().contains("refusing to delete hidden"),
+        "unexpected {err:?}"
+    );
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
@@ -2252,6 +2402,47 @@ fn credential_fill_approve_reject_round_trip() {
 }
 
 #[test]
+fn captured_errors_scrub_userinfo_from_stderr() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if socket.read(&mut byte).expect("read head") == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("reply");
+    });
+    let (root, mut env) = seeded_repo("captured-canary", "a.txt", b"a\n");
+    env.cwd = root;
+    let url = format!("http://ada:CANARY-s3cret@127.0.0.1:{port}/a.git");
+    let outcome = super::run_captured(
+        vec!["ruk".to_owned(), "fetch".to_owned(), url],
+        env,
+        ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
+    );
+    server.join().expect("server");
+    assert_ne!(outcome.code, 0, "a 401 fails the verb");
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    assert!(
+        stderr.contains("authentication failed with status 401"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("127.0.0.1"), "{stderr}");
+    assert!(!stderr.contains("CANARY-s3cret"), "{stderr}");
+}
+
+#[test]
 fn archive_over_smart_http_streams_tar() {
     let tar = b"fake-tar-bytes".to_vec();
     let mut body = pkt_frame(b"ACK\n");
@@ -2370,7 +2561,7 @@ fn archive_zip_prefix_and_path_limits() {
         &["--format=zip", "--prefix=pre/", "HEAD", "b.txt"],
     )
     .expect("zip with prefix and limit");
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
     let names: Vec<String> = archive
         .file_names()
         .map(|name| name.expect("entry name").into_owned())
@@ -2390,7 +2581,7 @@ fn archive_zip_prefix_and_path_limits() {
         &["--format=zip", "--prefix=pre/", "HEAD"],
     )
     .expect("full zip");
-    let mut full_archive =
+    let full_archive =
         zip::ZipArchive::new(std::io::Cursor::new(&full)).expect("readable full zip");
     let full_names: Vec<String> = full_archive
         .file_names()
@@ -2710,6 +2901,7 @@ fn lfs_pointer_repo(case: &str) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -2749,7 +2941,7 @@ fn read_http_request(socket: &std::net::TcpStream) -> (String, Vec<u8>) {
     let length = text
         .lines()
         .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
     let mut body = vec![0_u8; length];
@@ -2850,7 +3042,7 @@ fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
 /// meaning already present (`mode == "upload-present"`); `/up/<oid>`
 /// accepts the PUT and keeps its body. Returns the port plus the join
 /// handle for the request paths seen in order and the PUT body bytes.
-fn lfs_batch_upload_server(mode: &str) -> (u16, std::thread::JoinHandle<(Vec<String>, Vec<u8>)>) {
+fn lfs_batch_upload_server(mode: &str) -> (u16, std::thread::JoinHandle<UploadSeen>) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("addr").port();
@@ -3379,6 +3571,7 @@ fn bundle_create_verify_unbundle_round_trip() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(verbs_repo::init, &mut naked, &["repo2"]).expect("init");
     let root2 = base.join("repo2");
@@ -3436,6 +3629,7 @@ fn bundle_clone_from_file_plants_refs() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     let out =
         String::from_utf8(run(verbs_repo::clone, &mut naked, &[&bundle, "cloned"]).expect("clone"))
@@ -3487,7 +3681,7 @@ fn bundle_exclusion_records_prerequisite() {
 // ---------------------------------------------------------------------------
 
 /// Writes, stages, and commits one file in a lane test.
-fn lane_commit(ctx: &mut Ctx, root: &PathBuf, file: &str, body: &[u8], message: &str) {
+fn lane_commit(ctx: &mut Ctx, root: &Path, file: &str, body: &[u8], message: &str) {
     std::fs::write(root.join(file), body).expect("write file");
     run(verbs_stage::add, ctx, &[file]).expect("add");
     run(verbs_history::commit, ctx, &["-m", message]).expect("commit");
@@ -3975,7 +4169,7 @@ fn rebase_replays_side_onto_main() {
 }
 
 /// Commits `body` as `file` under one author name for blame tests.
-fn blame_commit(ctx: &mut Ctx, root: &PathBuf, file: &str, body: &[u8], name: &str, message: &str) {
+fn blame_commit(ctx: &mut Ctx, root: &Path, file: &str, body: &[u8], name: &str, message: &str) {
     for role in ["AUTHOR", "COMMITTER"] {
         ctx.env
             .vars
@@ -4004,6 +4198,7 @@ fn blame_repo(case: &str) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     (base.join("repo"), env)
@@ -4246,7 +4441,7 @@ fn bisect_head(ctx: &mut Ctx) -> String {
 
 /// Commits `extra - 1` more revisions on `f.txt`, returning every `HEAD`
 /// oid oldest-first (the seed commit starts the chain).
-fn bisect_chain(ctx: &mut Ctx, root: &PathBuf, extra: usize) -> Vec<String> {
+fn bisect_chain(ctx: &mut Ctx, root: &Path, extra: usize) -> Vec<String> {
     let mut oids = vec![bisect_head(ctx)];
     for index in 2..=extra {
         lane_commit(
@@ -4733,6 +4928,7 @@ fn submodule_case(case: &str) -> (PathBuf, CliEnv, PathBuf, String) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["parent".to_owned()]).expect("init");
     let root = base.join("parent");
@@ -4888,6 +5084,7 @@ fn plumbing_repo(case: &str, files: &[(&str, &[u8])]) -> (PathBuf, CliEnv) {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -4914,16 +5111,17 @@ fn plumbing_head(ctx: &mut Ctx) -> String {
 }
 
 /// Builds a file-only context for repository-optional verbs.
-fn file_ctx(base: &PathBuf, env: CliEnv) -> Ctx {
+fn file_ctx(base: &Path, env: CliEnv) -> Ctx {
     Ctx {
         store: None,
-        root: base.clone(),
-        file_base: base.clone(),
+        root: base.to_path_buf(),
+        file_base: base.to_path_buf(),
         kind: None,
         env,
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     }
 }
 
@@ -5733,6 +5931,7 @@ fn fastio_import_creates_branch_history() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -5793,6 +5992,7 @@ fn fastio_export_import_roundtrip() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut dest_ctx, &["repo".to_owned()]).expect("init");
     let dest_root = dest_base.join("repo");
@@ -6391,6 +6591,7 @@ fn log_boundary_ignores_disjoint_root() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -7206,7 +7407,7 @@ fn wave_j_commit_file_signoff_cleanup_template() {
     let msg = root.join("msg.txt");
     std::fs::write(&msg, b"# comment\nreal subject\n\nbody text\n").expect("msg");
     let msg_arg = msg.to_str().expect("utf8").to_owned();
-    run(verbs_history::commit, &mut ctx, &[&"-F", &msg_arg, &"-s"]).expect("commit -F -s");
+    run(verbs_history::commit, &mut ctx, &["-F", &msg_arg, "-s"]).expect("commit -F -s");
     assert_eq!(
         wave_j_head_message(&mut ctx),
         "# comment\nreal subject\n\nbody text\n\nSigned-off-by: Ada <ada@example.invalid>\n"
@@ -7241,7 +7442,7 @@ fn wave_j_commit_file_signoff_cleanup_template() {
     let tpl = root.join("tpl.txt");
     std::fs::write(&tpl, b"templated\n").expect("template");
     let tpl_arg = tpl.to_str().expect("utf8").to_owned();
-    run(verbs_history::commit, &mut ctx, &[&"--template", &tpl_arg]).expect("template");
+    run(verbs_history::commit, &mut ctx, &["--template", &tpl_arg]).expect("template");
     assert_eq!(wave_j_head_message(&mut ctx), "templated\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -7257,7 +7458,7 @@ fn wave_j_commit_squash_fixup_amend() {
     std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     wave_j_stamp(&mut ctx, 1700000001);
-    run(verbs_history::commit, &mut ctx, &[&"--fixup", &base]).expect("fixup");
+    run(verbs_history::commit, &mut ctx, &["--fixup", &base]).expect("fixup");
     assert_eq!(wave_j_head_message(&mut ctx), "fixup! seed\n");
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
@@ -7265,7 +7466,7 @@ fn wave_j_commit_squash_fixup_amend() {
     run(
         verbs_history::commit,
         &mut ctx,
-        &[&"--squash", &base, &"-m", &"extra body"],
+        &["--squash", &base, "-m", "extra body"],
     )
     .expect("squash -m");
     assert_eq!(
@@ -7354,7 +7555,7 @@ fn wave_j_commit_rejections() {
     let err = run(
         verbs_history::commit,
         &mut ctx,
-        &[&"-m", &"x", &"-F", &msg_arg],
+        &["-m", "x", "-F", &msg_arg],
     )
     .expect_err("-m -F");
     assert!(err.to_string().contains("cannot be combined"), "{err}");
@@ -7400,8 +7601,8 @@ fn wave_j_commit_rejections() {
     let blank = root.join("blank.txt");
     std::fs::write(&blank, b"\n").expect("blank");
     let blank_arg = blank.to_str().expect("utf8").to_owned();
-    let err = run(verbs_history::commit, &mut ctx, &[&"-F", &blank_arg, &"-s"])
-        .expect_err("signoff-only");
+    let err =
+        run(verbs_history::commit, &mut ctx, &["-F", &blank_arg, "-s"]).expect_err("signoff-only");
     assert!(err.to_string().contains("empty commit message"), "{err}");
     run(
         verbs_history::commit,
@@ -8038,6 +8239,7 @@ fn wave_k_remote_helper_export_round_trip() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx_init, &["repo".to_owned()]).expect("init");
     let root_b = base_b.join("repo");
@@ -8090,6 +8292,7 @@ fn wave_k_remote_helper_verb_entry() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     let url = root.display().to_string();
     let out = run(
@@ -8582,10 +8785,7 @@ fn leftover_cat_file_batch_command() {
 fn leftover_dispatch_rows_and_named_gaps() {
     let (root, env) = seeded_repo("leftover-gaps", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
-    let stubs: &[(
-        &str,
-        fn(&mut Ctx, &[String]) -> Result<Vec<u8>, ruk_git::GitError>,
-    )] = &[
+    let stubs: &[LeftoverStub] = &[
         ("filter-branch", super::verbs_misc::filter_branch),
         ("pack-redundant", super::verbs_misc::pack_redundant),
         ("web--browse", super::verbs_misc::web_browse),
@@ -8797,7 +8997,7 @@ fn hooks_mailmap_var_ident() {
 }
 
 /// Writes an executable hook script under `.ruk/hooks`.
-fn write_hook(root: &std::path::PathBuf, name: &str, body: &str) {
+fn write_hook(root: &Path, name: &str, body: &str) {
     let dir = root.join(".ruk").join("hooks");
     std::fs::create_dir_all(&dir).expect("hooks dir");
     let path = dir.join(name);
@@ -8954,6 +9154,7 @@ fn hooks_pre_push_blocks_local_push() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     run(
         verbs_repo::init,
@@ -9067,6 +9268,7 @@ fn wave_l_stat_cache_clean_repo_reports_empty_status() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");
@@ -9113,6 +9315,7 @@ fn wave_l_stat_cache_old_files_trust_without_rehash() {
         bare: false,
         cli_config: Vec::new(),
         stderr: Vec::new(),
+        egress: ruk_git::transport::net::EgressPolicy::deny_private().allow_loopback(),
     };
     verbs_repo::init(&mut ctx, &["repo".to_owned()]).expect("init");
     let root = base.join("repo");

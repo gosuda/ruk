@@ -34,11 +34,15 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, timeout};
 
-use super::cancel::{Cancel, cancellation};
+use super::cancel::Cancel;
+#[cfg(unix)]
+use super::cancel::cancellation;
 use super::endpoint::{self, Incoming, Outgoing};
 use super::handshake;
 use super::hosted::{DispatchReady, HostedCoordinator};
-use super::lock::{Acquisition, EndpointAddress, EndpointNonce, LockBody, LockSnapshot, StoreLock};
+#[cfg(unix)]
+use super::lock::EndpointAddress;
+use super::lock::{Acquisition, EndpointNonce, LockBody, LockSnapshot, StoreLock};
 use super::transport;
 use crate::attestation::Progress;
 use crate::change::SessionId;
@@ -49,7 +53,7 @@ use crate::protocol::{
 use crate::store::{PreparationBudget, Store};
 
 /// Socket leaf name inside the store directory.
-pub const SOCK_NAME: &str = "coordinator.sock";
+pub(crate) const SOCK_NAME: &str = "coordinator.sock";
 
 /// CLI session persistence leaf name inside the store directory.
 const SESSION_NAME: &str = "cli-session";
@@ -368,23 +372,23 @@ impl Server {
     /// Opens (or resumes) the persistent CLI session for one burst.
     async fn ensure_session(&self, coord: &HostedCoordinator) -> Result<SessionId, CoreError> {
         let path = session_path(&self.store_dir);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(saved) = decode_frame::<CliSession>(&bytes) {
-                let resumed = coord
-                    .resume_session(
-                        &self.owner,
-                        &SessionResumeArgs {
-                            session: saved.session,
-                            reconnect_secret: saved.secret.clone(),
-                        },
-                        &self.cancel,
-                    )
-                    .await;
-                if let Ok(reply) = resumed {
-                    if matches!(reply.authority, SessionAuthority::Active { .. }) {
-                        return Ok(saved.session);
-                    }
-                }
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(saved) = decode_frame::<CliSession>(&bytes)
+        {
+            let resumed = coord
+                .resume_session(
+                    &self.owner,
+                    &SessionResumeArgs {
+                        session: saved.session,
+                        reconnect_secret: saved.secret,
+                    },
+                    &self.cancel,
+                )
+                .await;
+            if let Ok(reply) = resumed
+                && matches!(reply.authority, SessionAuthority::Active { .. })
+            {
+                return Ok(saved.session);
             }
         }
         let (session, secret) = coord
@@ -521,7 +525,7 @@ impl Server {
         handshake::accept_client(stream, deadline).await?;
         let length = transport::read_length(stream, deadline).await?;
         let body = transport::read_body(stream, length, deadline).await?;
-        let call = decode_frame::<CommitCall>(&body.to_vec())?;
+        let call = decode_frame::<CommitCall>(&body)?;
         // Lane failures travel as error frames (never a hung-up stream), so
         // the caller can tell a lost branch race (retry with a fresh tip)
         // from a transport failure (replay the same id).
@@ -569,11 +573,11 @@ impl Server {
         // and submit stay concurrent so the loser's retry gap stays small
         // enough for the group-commit sharing window.
         let (coord, session) = self.burst().await?;
-        let reply = match coord.prepare_for_dispatch(session, call.body.clone(), &allow)? {
+        let reply = match coord.prepare_for_dispatch(session, call.body.clone(), &allow, None)? {
             DispatchReady::Replay(reply) => reply,
             DispatchReady::Prepared(prepared) => {
                 coord
-                    .submit_prepared(&self.owner, prepared, &self.cancel)
+                    .submit_prepared(&self.owner, *prepared, &self.cancel)
                     .await?
             }
         };
@@ -610,10 +614,10 @@ fn write_session_file(path: &Path, bytes: &[u8]) {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
 }
 

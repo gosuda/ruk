@@ -129,7 +129,7 @@ pub(crate) fn build_bloom_filter(changed_paths: &[&[u8]]) -> Vec<u8> {
     let num_bits = expanded
         .len()
         .saturating_mul(DEFAULT_BITS_PER_ENTRY as usize);
-    let num_bytes = (num_bits + 7) / 8;
+    let num_bytes = num_bits.div_ceil(8);
     let num_bytes = if num_bytes == 0 { 1 } else { num_bytes };
 
     let mut filter = vec![0u8; num_bytes];

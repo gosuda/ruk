@@ -31,7 +31,7 @@ use ruk_core::index::{FileMode, IndexEntry, IndexFlags, RepoPath, Stage};
 use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::refs::{ReflogKey, ReflogRecord, StoreRefs, prepare_append_reflog};
-use ruk_core::store::{FactMutation, Store};
+use ruk_core::store::{EventContext, EventSource, FactMutation, Store};
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
@@ -754,18 +754,18 @@ fn copy_branch(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErr
             config_write(store, &format!("branch.{new_short}.{key}"), &value)?;
         }
     }
-    if opts.is_set("create-reflog") {
-        if let Some(oid) = copied_oid {
-            let skipped = maybe_create_reflog(
-                ctx,
-                &new_name,
-                before,
-                oid,
-                format!("branch: Copied from {old}"),
-            )?;
-            if skipped {
-                ctx.emit_stderr(b"warning: no identity configured; skipping reflog creation\n");
-            }
+    if opts.is_set("create-reflog")
+        && let Some(oid) = copied_oid
+    {
+        let skipped = maybe_create_reflog(
+            ctx,
+            &new_name,
+            before,
+            oid,
+            format!("branch: Copied from {old}"),
+        )?;
+        if skipped {
+            ctx.emit_stderr(b"warning: no identity configured; skipping reflog creation\n");
         }
     }
     Ok(Vec::new())
@@ -954,7 +954,7 @@ fn list_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
         for (text, short, mark, target) in &kept {
             let row = BranchRow {
                 full: text,
-                short: short,
+                short,
                 mark: *mark,
                 target,
             };
@@ -1009,6 +1009,10 @@ fn list_branches(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
 }
 
 /// Renders the oid and subject behind one listed ref target.
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 fn ref_detail(ctx: &Ctx, target: &RefTarget) -> Result<String, GitError> {
     let store = ctx.store()?;
     let oid = match target {
@@ -1403,14 +1407,19 @@ fn rename_branch(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitError
     });
     apply_refs(store, kind, updates)?;
     let (workspace, raw) = load_or_default(store)?;
-    if let HeadRef::Symbolic(current) = &workspace.head {
-        if current == &old_name {
-            let next = workspace.move_head(workspace.stamp, HeadRef::Symbolic(new_name))?;
-            let mutation = workspace_mutation(raw.as_deref(), &next)?;
-            store
-                .publish(Vec::new(), &[mutation])
-                .map_err(GitError::from)?;
-        }
+    if let HeadRef::Symbolic(current) = &workspace.head
+        && current == &old_name
+    {
+        let next = workspace.move_head(workspace.stamp, HeadRef::Symbolic(new_name))?;
+        let mutation = workspace_mutation(raw.as_deref(), &next)?;
+        store
+            .publish(
+                Vec::new(),
+                &[mutation],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .map_err(GitError::from)?;
     }
     Ok(Vec::new())
 }
@@ -1636,7 +1645,7 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         } else {
             checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?
         };
-        if start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track") {
+        if start.is_some_and(is_remote_start) && !opts.is_set("no-track") {
             let Some(start) = start else {
                 return Ok(out);
             };
@@ -1651,7 +1660,7 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
         } else {
             checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"))?
         };
-        if start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track") {
+        if start.is_some_and(is_remote_start) && !opts.is_set("no-track") {
             let Some(start) = start else {
                 return Ok(out);
             };
@@ -1745,10 +1754,10 @@ pub(crate) fn checkout(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             if opts.is_set("merge") {
                 if let Ok(name) = branch_name(rev) {
                     let store = ctx.store()?;
-                    if let Some(target) = super::state::read_ref(store, &name)? {
-                        if let Some(tip) = peel_direct(&target) {
-                            switch_merge_guard(ctx, tree_for_tip(ctx, tip)?)?;
-                        }
+                    if let Some(target) = super::state::read_ref(store, &name)?
+                        && let Some(tip) = peel_direct(&target)
+                    {
+                        switch_merge_guard(ctx, tree_for_tip(ctx, tip)?)?;
                     }
                 }
                 return switch_to_rev_merging(ctx, rev, opts.is_set("quiet"));
@@ -1786,7 +1795,12 @@ fn checkout_orphan(
     }
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     if start.is_some() {
         sync_worktree_to_index(ctx)?;
@@ -1945,14 +1959,14 @@ fn checkout_new_branch_merging(
 fn switch_to_rev(ctx: &mut Ctx, rev: &str, quiet: bool) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    if let Ok(name) = branch_name(rev) {
-        if super::state::read_ref(store, &name)?.is_some() {
-            switch_head_to(ctx, HeadRef::Symbolic(name))?;
-            if !quiet {
-                ctx.emit_stderr(format!("Switched to branch '{rev}'\n").as_bytes());
-            }
-            return Ok(Vec::new());
+    if let Ok(name) = branch_name(rev)
+        && super::state::read_ref(store, &name)?.is_some()
+    {
+        switch_head_to(ctx, HeadRef::Symbolic(name))?;
+        if !quiet {
+            ctx.emit_stderr(format!("Switched to branch '{rev}'\n").as_bytes());
         }
+        return Ok(Vec::new());
     }
     let oid = resolve_rev(store, kind, rev)?;
     detach_at(ctx, oid)
@@ -1963,14 +1977,14 @@ fn switch_to_rev(ctx: &mut Ctx, rev: &str, quiet: bool) -> Result<Vec<u8>, GitEr
 fn switch_to_rev_merging(ctx: &mut Ctx, rev: &str, quiet: bool) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    if let Ok(name) = branch_name(rev) {
-        if super::state::read_ref(store, &name)?.is_some() {
-            switch_head_to_merging(ctx, HeadRef::Symbolic(name))?;
-            if !quiet {
-                ctx.emit_stderr(format!("Switched to branch '{rev}'\n").as_bytes());
-            }
-            return Ok(Vec::new());
+    if let Ok(name) = branch_name(rev)
+        && super::state::read_ref(store, &name)?.is_some()
+    {
+        switch_head_to_merging(ctx, HeadRef::Symbolic(name))?;
+        if !quiet {
+            ctx.emit_stderr(format!("Switched to branch '{rev}'\n").as_bytes());
         }
+        return Ok(Vec::new());
     }
     let oid = resolve_rev(store, kind, rev)?;
     detach_at_merging(ctx, oid)
@@ -2001,7 +2015,12 @@ fn switch_head_to(ctx: &mut Ctx, head: HeadRef) -> Result<Vec<u8>, GitError> {
     let mut mutations = reset_index_to(store, kind, tree)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     sync_worktree_to_index(ctx)?;
     emit_post_checkout(ctx, kind, old)?;
@@ -2071,7 +2090,12 @@ fn switch_head_to_merging(ctx: &mut Ctx, head: HeadRef) -> Result<Vec<u8>, GitEr
     }
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     for path in &differing {
         match new_map.get(path) {
@@ -2159,10 +2183,10 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
             detail: "checkout needs paths".to_owned(),
         });
     }
-    if let Some(want) = positionals.first() {
-        if want == "--" {
-            positionals = &positionals[1..];
-        }
+    if let Some(want) = positionals.first()
+        && want == "--"
+    {
+        positionals = &positionals[1..];
     }
     if positionals.is_empty() {
         return Err(GitError::Invalid {
@@ -2291,7 +2315,12 @@ fn checkout_paths(ctx: &Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         mutations.push(super::state::index_stamp_mutation()?);
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     for (full, body) in worktree_writes {
@@ -2360,7 +2389,12 @@ fn checkout_conflict_paths(
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         mutations.push(super::state::index_stamp_mutation()?);
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     for (full, body) in worktree_writes {
@@ -2550,8 +2584,7 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         } else {
             checkout_new_branch(ctx, &name, start, false, opts.is_set("quiet"))?
         };
-        if opts.is_set("track")
-            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
+        if opts.is_set("track") || (start.is_some_and(is_remote_start) && !opts.is_set("no-track"))
         {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
@@ -2569,8 +2602,7 @@ pub(crate) fn switch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
         } else {
             checkout_new_branch(ctx, &name, start, true, opts.is_set("quiet"))?
         };
-        if opts.is_set("track")
-            || (start.is_some_and(|s| is_remote_start(s)) && !opts.is_set("no-track"))
+        if opts.is_set("track") || (start.is_some_and(is_remote_start) && !opts.is_set("no-track"))
         {
             let Some(start) = start else {
                 return Err(GitError::Invalid {
@@ -2652,7 +2684,12 @@ fn switch_orphan(ctx: &mut Ctx, name: &str, quiet: bool) -> Result<Vec<u8>, GitE
     let mut mutations = reset_index_to(store, kind, empty)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     sync_worktree_to_index(ctx)?;
     let switch_zero = kind.zero_oid().to_hex();
@@ -2744,45 +2781,43 @@ fn switch_guessing_with(
 ) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
     let kind = ctx.kind()?;
-    if let Ok(name) = branch_name(branch) {
-        if super::state::read_ref(store, &name)?.is_some() {
-            let tip = super::state::read_ref(store, &name)?.and_then(|target| match target {
-                RefTarget::Direct(oid) => Some(oid),
-                RefTarget::Symbolic(_) => None,
-            });
-            run_switch_transition(ctx, HeadRef::Symbolic(name), tip, transition)?;
+    if let Ok(name) = branch_name(branch)
+        && super::state::read_ref(store, &name)?.is_some()
+    {
+        let tip = super::state::read_ref(store, &name)?.and_then(|target| match target {
+            RefTarget::Direct(oid) => Some(oid),
+            RefTarget::Symbolic(_) => None,
+        });
+        run_switch_transition(ctx, HeadRef::Symbolic(name), tip, transition)?;
+        if !quiet {
+            ctx.emit_stderr(format!("Switched to branch '{branch}'\n").as_bytes());
+        }
+        return Ok(Vec::new());
+    }
+    if guess && let Some(tracked) = guess_remote_branch(store, branch)? {
+        let target = super::state::read_ref(store, &tracked)?.and_then(|target| match target {
+            RefTarget::Direct(oid) => Some(oid),
+            RefTarget::Symbolic(_) => None,
+        });
+        if let Some(target) = target {
+            if transition == SwitchTransition::Merging {
+                switch_merge_guard(ctx, tree_for_tip(ctx, target)?)?;
+            }
+            create_branch(store, kind, branch, target)?;
+            if track {
+                let remote = tracked.to_utf8().unwrap_or_default().to_owned();
+                record_tracking(store, branch, &remote)?;
+            }
+            run_switch_transition(
+                ctx,
+                HeadRef::Symbolic(branch_name(branch)?),
+                Some(target),
+                transition,
+            )?;
             if !quiet {
                 ctx.emit_stderr(format!("Switched to branch '{branch}'\n").as_bytes());
             }
             return Ok(Vec::new());
-        }
-    }
-    if guess {
-        if let Some(tracked) = guess_remote_branch(store, branch)? {
-            let target = super::state::read_ref(store, &tracked)?.and_then(|target| match target {
-                RefTarget::Direct(oid) => Some(oid),
-                RefTarget::Symbolic(_) => None,
-            });
-            if let Some(target) = target {
-                if transition == SwitchTransition::Merging {
-                    switch_merge_guard(ctx, tree_for_tip(ctx, target)?)?;
-                }
-                create_branch(store, kind, branch, target)?;
-                if track {
-                    let remote = tracked.to_utf8().unwrap_or_default().to_owned();
-                    record_tracking(store, branch, &remote)?;
-                }
-                run_switch_transition(
-                    ctx,
-                    HeadRef::Symbolic(branch_name(branch)?),
-                    Some(target),
-                    transition,
-                )?;
-                if !quiet {
-                    ctx.emit_stderr(format!("Switched to branch '{branch}'\n").as_bytes());
-                }
-                return Ok(Vec::new());
-            }
         }
     }
     Err(GitError::NotFound {
@@ -2895,7 +2930,12 @@ fn restore_staged(ctx: &Ctx, opts: &super::Collected, tree: Oid) -> Result<(), G
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3158,7 +3198,12 @@ fn reset_paths_intent(ctx: &Ctx, paths: &[String], tree: Oid) -> Result<(), GitE
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3342,7 +3387,12 @@ fn reset_tree_intent(ctx: &Ctx, tree: Oid) -> Result<(), GitError> {
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3425,7 +3475,12 @@ fn reset_keep(ctx: &Ctx, target: Oid, quiet: bool) -> Result<Vec<u8>, GitError> 
     index_mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     index_mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &index_mutations)
+        .publish(
+            Vec::new(),
+            &index_mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     // Scoped worktree sync: only differing paths are rewritten.
     for path in &differing {
@@ -3518,7 +3573,12 @@ pub(crate) fn move_branch_to(ctx: &Ctx, target: Oid) -> Result<(), GitError> {
             let next = workspace.move_head(workspace.stamp, HeadRef::Detached(target))?;
             let mutation = workspace_mutation(raw.as_deref(), &next)?;
             store
-                .publish(Vec::new(), &[mutation])
+                .publish(
+                    Vec::new(),
+                    &[mutation],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .map_err(GitError::from)?;
             Ok(())
         }
@@ -3534,7 +3594,12 @@ pub(crate) fn reset_index_tree(ctx: &Ctx, tree: Oid) -> Result<(), GitError> {
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -3967,7 +4032,12 @@ fn append_reflog(
         mutations.push(prepare_append_reflog(store, &key, &record).map_err(GitError::from)?);
     }
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -4159,7 +4229,12 @@ fn write_symbolic(ctx: &Ctx, name: &str, target: &str) -> Result<Vec<u8>, GitErr
         let next = workspace.move_head(workspace.stamp, HeadRef::Symbolic(target_name))?;
         let mutation = workspace_mutation(raw.as_deref(), &next)?;
         store
-            .publish(Vec::new(), &[mutation])
+            .publish(
+                Vec::new(),
+                &[mutation],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
         return Ok(Vec::new());
     }
@@ -4343,14 +4418,14 @@ pub(crate) fn show_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErr
             None => hex,
         }
     };
-    if opts.is_set("head") {
-        if let Ok(tip) = head_oid(store) {
-            let shown = render_oid(&tip);
-            if hash_only {
-                out.extend_from_slice(format!("{shown}\n").as_bytes());
-            } else {
-                out.extend_from_slice(format!("{shown} HEAD\n").as_bytes());
-            }
+    if opts.is_set("head")
+        && let Ok(tip) = head_oid(store)
+    {
+        let shown = render_oid(&tip);
+        if hash_only {
+            out.extend_from_slice(format!("{shown}\n").as_bytes());
+        } else {
+            out.extend_from_slice(format!("{shown} HEAD\n").as_bytes());
         }
     }
     let heads_only = opts.is_set("heads") || opts.is_set("branches");
@@ -4437,7 +4512,7 @@ fn peel_tag_target(ctx: &Ctx, target: &RefTarget) -> Result<Option<Oid>, GitErro
     let store = ctx.store()?;
     let kind = ctx.kind()?;
     let RefTarget::Direct(oid) = target else {
-        return Ok(peel_target_oid(ctx, target)?);
+        return peel_target_oid(ctx, target);
     };
     let (object_kind, body) = read_object_bytes(store, *oid)?;
     if object_kind != ruk_core::store::ObjectKind::Tag {
@@ -4564,7 +4639,7 @@ pub(crate) fn for_each_ref(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, Gi
                         detail: format!("ref {text} is unborn"),
                     })?;
                     let hex = oid.to_hex();
-                    rendered_line.extend_from_slice(hex[..7.min(hex.len())].as_bytes());
+                    rendered_line.extend_from_slice(&hex.as_bytes()[..7.min(hex.len())]);
                 }
                 FormatField::ObjectType => {
                     let kind_name = ref_object_type(ctx, target)?;
@@ -4956,14 +5031,15 @@ pub(crate) fn tag(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             tag_index += 1;
             continue;
         }
-        if let Some(digits) = arg.strip_prefix("-n") {
-            if !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) {
-                annotation_lines = Some(digits.parse().map_err(|_| GitError::Invalid {
-                    detail: format!("bad -n value {arg:?}"),
-                })?);
-                tag_index += 1;
-                continue;
-            }
+        if let Some(digits) = arg.strip_prefix("-n")
+            && !digits.is_empty()
+            && digits.chars().all(|ch| ch.is_ascii_digit())
+        {
+            annotation_lines = Some(digits.parse().map_err(|_| GitError::Invalid {
+                detail: format!("bad -n value {arg:?}"),
+            })?);
+            tag_index += 1;
+            continue;
         }
         let mut matched: Option<&str> = None;
         let mut inline: Option<String> = None;
@@ -5521,23 +5597,21 @@ fn apply_tag_cleanup(raw: &[u8], mode: &str) -> Vec<u8> {
     }
     let text = String::from_utf8_lossy(raw);
     let mut lines: Vec<&str> = text.lines().collect();
-    if mode == "scissors" {
-        if let Some(at) = lines
+    if mode == "scissors"
+        && let Some(at) = lines
             .iter()
             .position(|line| line.contains("------------------------ >8 ------------------------"))
-        {
-            lines.truncate(at);
-        }
+    {
+        lines.truncate(at);
     }
     let mut kept: Vec<String> = Vec::new();
     for line in lines {
         let no_trailing = line.trim_end();
         if (mode == "strip" || mode == "default" || mode == "scissors")
             && (no_trailing.starts_with('#') || no_trailing.is_empty() && kept.is_empty())
+            && no_trailing.starts_with('#')
         {
-            if no_trailing.starts_with('#') {
-                continue;
-            }
+            continue;
         }
         if mode == "whitespace" {
             kept.push(no_trailing.to_owned());
@@ -5804,10 +5878,10 @@ fn unique_short_oid(store: &Store, oid: Oid) -> Result<String, GitError> {
             .page_commits(after.as_ref(), budget)
             .map_err(GitError::from)?;
         for (head, _) in &page.items {
-            if let Head::Git { oid: peer } = head {
-                if *peer != oid {
-                    peers.push(peer.to_hex());
-                }
+            if let Head::Git { oid: peer } = head
+                && *peer != oid
+            {
+                peers.push(peer.to_hex());
             }
         }
         after = page.next_cursor;
@@ -5854,7 +5928,9 @@ fn stash_push(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     let index_tree = build_index_tree(store, kind, &merged_rows(&rows))?;
     let (worktree_rows, blobs) = worktree_overlay_rows(ctx, store, kind, &rows)?;
     if !blobs.is_empty() {
-        store.publish(blobs, &[]).map_err(GitError::from)?;
+        store
+            .publish(blobs, &[], EventSource::LocalPush, &EventContext::default())
+            .map_err(GitError::from)?;
     }
     let worktree_tree = build_index_tree(store, kind, &worktree_rows)?;
     if index_tree == head_tree && worktree_tree == head_tree {
@@ -5888,7 +5964,7 @@ fn stash_push(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
         },
         RequestId::generate(),
     )?;
-    let store = ctx.store()?;
+    let _store = ctx.store()?;
     let mut wip_parents = base_heads;
     wip_parents.push(Head::Git { oid: index_oid });
     let commit_oid = super::coordinator::commit_stash(
@@ -5946,6 +6022,13 @@ fn stash_push(ctx: &mut Ctx, opts: &super::Collected) -> Result<Vec<u8>, GitErro
     Ok(format!("Saved working directory and index state {message}\n").into_bytes())
 }
 
+/// Stash worktree overlay: re-hashed `(path, entry)` rows plus the newly
+/// staged blob objects for the caller to publish.
+type WorktreeOverlay = (
+    Vec<(Vec<u8>, IndexEntry)>,
+    Vec<ruk_core::store::PreparedObject>,
+);
+
 /// Builds `(path, entry)` rows for the stash worktree tree: the tracked
 /// index rows with every on-disk file's bytes re-hashed, so unstaged edits
 /// land in the `WIP` commit the way the oracle records them. Files missing
@@ -5957,13 +6040,7 @@ fn worktree_overlay_rows(
     store: &Store,
     kind: HashKind,
     rows: &[(RepoPath, Stage, IndexEntry)],
-) -> Result<
-    (
-        Vec<(Vec<u8>, IndexEntry)>,
-        Vec<ruk_core::store::PreparedObject>,
-    ),
-    GitError,
-> {
+) -> Result<WorktreeOverlay, GitError> {
     let mut out = Vec::new();
     let mut objects = Vec::new();
     for (path, stage, entry) in rows {
@@ -6243,7 +6320,7 @@ fn stash_show(ctx: &Ctx, slot: Option<u64>) -> Result<Vec<u8>, GitError> {
 /// Drops one stash slot and repoints `refs/stash` at the newest survivor.
 fn stash_drop_slot(ctx: &Ctx, slot: u64) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
-    let kind = ctx.kind()?;
+    let _kind = ctx.kind()?;
     let entry = stash_read(store, slot)?.ok_or_else(|| GitError::NotFound {
         detail: format!("no such stash slot: stash@{{{slot}}}"),
     })?;
@@ -6482,7 +6559,7 @@ fn refuse_index_restore_conflict(
 fn checkout_stash_files(
     ctx: &Ctx,
     store: &Store,
-    kind: HashKind,
+    _kind: HashKind,
     wip: &[(Vec<u8>, TreeMode, Oid)],
     touched: &[Vec<u8>],
 ) -> Result<(), GitError> {
@@ -6633,7 +6710,12 @@ fn restore_stash_index(
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }

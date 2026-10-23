@@ -9,7 +9,8 @@ use crate::bytes::ByteString;
 use crate::ids::{HashKind, Oid};
 use crate::index::{FileMode, RepoPath};
 use crate::store::{
-    FactExpectation, FactMutation, FactTable, ObjectKind, PreparationBudget, Store,
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, ObjectKind,
+    PreparationBudget, Store,
 };
 use crate::workcopy::journal_state::{ApplyPhase, JournalState, ensure_idle};
 use crate::workcopy::lfs::LfsMode;
@@ -46,7 +47,12 @@ impl Fixture {
             value: Some(row.clone()),
         };
         store
-            .publish(Vec::new(), &[insert])
+            .publish(
+                Vec::new(),
+                &[insert],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("register workspace");
         Self {
             dir,
@@ -88,7 +94,12 @@ impl Fixture {
             value: Some(next.clone()),
         };
         self.store()
-            .publish(Vec::new(), &[swap])
+            .publish(
+                Vec::new(),
+                &[swap],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("take workspace");
         *self.row.borrow_mut() = next;
         self.epoch.set(self.epoch.get() + 1);
@@ -102,7 +113,12 @@ impl Fixture {
             .expect("prepare blob");
         let oid = prepared.oid();
         self.store()
-            .publish(vec![prepared], &[])
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish blob");
         oid
     }
@@ -200,6 +216,7 @@ fn seed(fx: &Fixture) -> Vec<PlanEntry> {
     fx.put("swap", b"f");
     fx.put("dir/a.txt", b"a");
     fx.put("ren-from.txt", b"same");
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut entries = vec![
         plan_entry("mod.txt", Some(regular(b"old")), Some(regular(b"new"))),
         plan_entry("del.txt", Some(regular(b"gone")), None),

@@ -24,7 +24,7 @@ use crate::ids::{HashKind, Oid};
 use crate::protocol::{
     AttestAddArgs, AttestSignature, AttestStatement, StatementDigest, Timestamp,
 };
-use crate::store::{ObjectKind, PreparationBudget, Store};
+use crate::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
 
 /// A store under a unique temporary root, removed when dropped.
 pub(super) struct TempStore {
@@ -71,7 +71,14 @@ fn publish_object(store: &Store, kind: ObjectKind, body: &[u8]) -> Oid {
         .prepare(kind, length, body, None)
         .expect("prepare object");
     let oid = prepared.oid();
-    store.publish(vec![prepared], &[]).expect("publish object");
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish object");
     oid
 }
 
@@ -79,7 +86,12 @@ fn publish_object(store: &Store, kind: ObjectKind, body: &[u8]) -> Oid {
 pub(super) fn apply(store: &Store, prepared: &PreparedAttestations) {
     if !prepared.mutations.is_empty() {
         store
-            .publish(Vec::new(), &prepared.mutations)
+            .publish(
+                Vec::new(),
+                &prepared.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish attestation rows");
     }
 }
@@ -129,6 +141,24 @@ pub(super) fn statement(
         result: result(result_text),
         signed_at: Timestamp::parse(signed_at).expect("timestamp"),
         supersedes,
+        evidence: None,
+    }
+}
+
+pub(super) fn evidenced(
+    subject: Oid,
+    kind_text: &str,
+    result_text: &str,
+    signed_at: &str,
+    evidence: Option<StatementDigest>,
+) -> AttestStatement {
+    AttestStatement {
+        subject,
+        kind: kind(kind_text),
+        result: result(result_text),
+        signed_at: Timestamp::parse(signed_at).expect("timestamp"),
+        supersedes: None,
+        evidence,
     }
 }
 
@@ -144,7 +174,7 @@ pub(super) fn sign(key: &PrivateKey, statement: AttestStatement) -> AttestAddArg
     )
 }
 
-/// Signs the canonical payload of `statement` for `format`, in `namespace`,
+/// Signs the canonical v2 payload of `statement` for `format`, in `namespace`,
 /// with `hash`.
 pub(super) fn sign_for(
     format: HashKind,
@@ -154,9 +184,25 @@ pub(super) fn sign_for(
     hash: HashAlg,
 ) -> AttestAddArgs {
     let payload = statement
-        .canonical_payload_v1(format)
+        .canonical_payload_v2(format)
         .expect("canonical payload");
     let signature = key.sign(namespace, hash, &payload).expect("sign");
+    let armor = signature.to_pem(LineEnding::LF).expect("armor");
+    AttestAddArgs {
+        statement,
+        signature: AttestSignature::new(armor).expect("armored signature"),
+    }
+}
+
+/// Signs the canonical v1 payload of `statement`: pre-evidence signatures stay
+/// verifiable, so compatibility tests sign here and nowhere else.
+pub(super) fn sign_v1(key: &PrivateKey, statement: AttestStatement) -> AttestAddArgs {
+    let payload = statement
+        .canonical_payload_v1(HashKind::Sha1)
+        .expect("canonical payload");
+    let signature = key
+        .sign(ATTEST_NAMESPACE, HashAlg::Sha256, &payload)
+        .expect("sign");
     let armor = signature.to_pem(LineEnding::LF).expect("armor");
     AttestAddArgs {
         statement,

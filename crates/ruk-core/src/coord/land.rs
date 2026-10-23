@@ -4,9 +4,10 @@
 //! candidate commit set, the required base tip, the attestation predicates,
 //! and the execution deadline. [`land_prepare`] computes the plan and stores
 //! it in [`FactTable::LandPlans`](crate::store::types::FactTable::LandPlans).
-//! [`land_execute`] validates the stored plan against live state and
-//! publishes the target move in one store commit. Any drift refuses with a
-//! typed decline. Execution never re-plans silently.
+//! [`prepare_land_execute`] validates the stored plan against live state
+//! and stages the target move plus plan-row deletion for the lane to publish
+//! atomically. Any drift refuses with a typed decline. Execution never
+//! re-plans silently.
 //!
 //! # Exactness contract
 //! - The candidate set is frozen sorted and deduplicated. Execution publishes
@@ -28,10 +29,10 @@
 //!   `plan`, `candidate` (the primary candidate), `base` (the zero OID of the
 //!   store hash kind when the target is unborn), `expires_at`,
 //!   `policy_generation`, and `requirements`.
-//! - [`land_execute`] takes the stored plan. A daemon serving
-//!   [`LandExecuteArgs`](crate::protocol::LandExecuteArgs) loads the plan
-//!   with [`load_plan`], refuses `E_STALE` when `args.candidate` differs from
-//!   the primary candidate, then calls [`land_execute`].
+//! - [`prepare_land_execute`] takes a stored plan id plus the presented
+//!   candidate. A daemon serving [`LandExecuteArgs`](crate::protocol::LandExecuteArgs)
+//!   stages it, refuses `E_STALE` when `args.candidate` differs from the
+//!   primary candidate, then publishes through the lane.
 //! - [`LandOutcome`] is the local publish leg. The remote push leg and the
 //!   [`LandExecuteReply`](crate::protocol::LandExecuteReply) assembly stay
 //!   with the transport owner.
@@ -50,7 +51,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::attestation::{
-    Checkpoint, MAX_LAND_REQUIREMENTS, MAX_TRUSTED_SIGNERS, evaluate_requirements,
+    BoundedRequirement, Checkpoint, MAX_LAND_REQUIREMENTS, MAX_TRUSTED_SIGNERS,
+    evaluate_bounded_requirements,
 };
 use crate::change::PlanId;
 use crate::error::{CoreError, ErrorCode};
@@ -60,18 +62,18 @@ use crate::refdata::{
     RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate, resolve,
 };
 use crate::refs::{StoreRefs, prepare_checked_transaction};
-use crate::store::types::{FactExpectation, FactMutation, FactTable};
-use crate::store::{Store, decode, encode};
+use crate::store::types::{FactExpectation, FactMutation, FactTable, REPO_META_KEY};
+use crate::store::{EventContext, EventSource, Store, decode, encode};
 
 /// How long a land plan stays executable after creation.
-pub const LAND_PLAN_TTL: SignedDuration = SignedDuration::from_hours(1);
+pub(super) const LAND_PLAN_TTL: SignedDuration = SignedDuration::from_hours(1);
 
 /// Most candidate commits one land plan freezes.
-pub const MAX_LAND_CANDIDATES: usize = 1024;
+pub(super) const MAX_LAND_CANDIDATES: usize = 1024;
 
 /// The frozen inputs [`land_prepare`] turns into a [`LandPlan`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LandPrepareRequest {
+pub(super) struct LandPrepareRequest {
     /// The change under land, with its selected head.
     pub change: ChangeRef,
     /// The target ref to land onto, e.g. `refs/heads/main`.
@@ -94,7 +96,7 @@ pub struct LandPrepareRequest {
 ///
 /// All durable row formats declared here are v1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LandPlan {
+pub(super) struct LandPlan {
     /// The durable identity of this plan.
     pub plan: PlanId,
     /// The change under land, with its selected head.
@@ -128,7 +130,7 @@ impl LandPlan {
     /// carries at least one member. An empty set decodes only from a
     /// hand-built row and reports as absent here.
     #[must_use]
-    pub fn candidate(&self) -> Option<Oid> {
+    pub(super) fn candidate(&self) -> Option<Oid> {
         self.candidates.first().copied()
     }
 
@@ -136,14 +138,14 @@ impl LandPlan {
     ///
     /// The plan stays valid at exactly `expires_at` and refuses after it.
     #[must_use]
-    pub fn is_expired(&self, now: Timestamp) -> bool {
+    pub(super) fn is_expired(&self, now: Timestamp) -> bool {
         now.instant() > self.expires_at.instant()
     }
 }
 
 /// The local publish leg of one executed land plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct LandOutcome {
+pub(super) struct LandOutcome {
     /// The executed plan.
     pub plan: PlanId,
     /// The target ref that moved.
@@ -160,7 +162,7 @@ pub struct LandOutcome {
 
 /// Returns the [`FactTable::LandPlans`](crate::store::types::FactTable::LandPlans) key for `plan`.
 #[must_use]
-pub fn plan_key(plan: PlanId) -> [u8; 16] {
+pub(super) fn plan_key(plan: PlanId) -> [u8; 16] {
     *plan.as_bytes()
 }
 
@@ -170,7 +172,8 @@ pub fn plan_key(plan: PlanId) -> [u8; 16] {
 ///
 /// # Errors
 /// `E_CORRUPT` for a stored row that fails decoding; I/O failures propagate.
-pub fn load_plan(store: &Store, plan: PlanId) -> Result<Option<LandPlan>, CoreError> {
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
+pub(super) fn load_plan(store: &Store, plan: PlanId) -> Result<Option<LandPlan>, CoreError> {
     let raw = store.fact(FactTable::LandPlans, &plan_key(plan))?;
     let Some(bytes) = raw else {
         return Ok(None);
@@ -190,7 +193,7 @@ pub fn load_plan(store: &Store, plan: PlanId) -> Result<Option<LandPlan>, CoreEr
 ///
 /// # Errors
 /// Same as [`land_prepare`], without publishing.
-pub fn prepare_land_plan(
+pub(super) fn prepare_land_plan(
     store: &Store,
     request: LandPrepareRequest,
     checkpoint: &Checkpoint<'_>,
@@ -250,10 +253,18 @@ pub fn prepare_land_plan(
     }
     let mut satisfied_at_prepare = true;
     for candidate in &candidates {
-        let evaluation = evaluate_requirements(
+        let bounded: Vec<BoundedRequirement> = request
+            .requirements
+            .iter()
+            .map(|requirement| BoundedRequirement {
+                requirement: requirement.clone(),
+                valid_until: requirement.valid_until,
+            })
+            .collect();
+        let evaluation = evaluate_bounded_requirements(
             store,
             candidate,
-            &request.requirements,
+            &bounded,
             &request.trusted,
             checkpoint,
         )?;
@@ -320,77 +331,109 @@ pub fn prepare_land_plan(
 /// of the wrong hash width; `E_NOT_FOUND` for a candidate with no stored
 /// object; `E_POLICY` for requirements with no trusted signer; `E_STALE`
 /// for a plan identity collision; `E_CORRUPT` or `E_IO` from the store.
-pub fn land_prepare(
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R43/CS-R44"))]
+pub(super) fn land_prepare(
     store: &Store,
     request: LandPrepareRequest,
     checkpoint: &Checkpoint<'_>,
 ) -> Result<LandPlan, CoreError> {
     let (plan, mutation) = prepare_land_plan(store, request, checkpoint)?;
-    store.publish(Vec::new(), &[mutation])?;
+    store.publish(
+        Vec::new(),
+        &[mutation],
+        EventSource::Land,
+        &EventContext::default(),
+    )?;
     Ok(plan)
 }
 
-/// Executes a land plan after validating it against live state.
+/// Stages one land plan execution without publishing it: validates the
+/// stored plan against live state and builds the exact ref move plus the
+/// plan-row deletion plus a `RepoMeta` guard rewriting the policy row read
+/// at validation, so a concurrent `policy.set` fails the publish as stale.
+/// The lane publishes the facts atomically with the
+/// receipt, so a second execution loses the plan-row race instead of
+/// double-landing.
 ///
-/// The stored plan row must equal `plan` exactly, the plan must be
-/// unexpired, the live target tip must still equal the frozen base, and
-/// every candidate must meet every requirement under the frozen trust set.
-/// The commit moves the target to the primary candidate and consumes the
-/// plan row in one atomic publication.
+/// The presented candidate must be the plan's primary candidate: landing
+/// runs what the caller reviewed, never a reselected member. Candidates
+/// are deterministic for a given head and base: prepare freezes one exact
+/// commit, so re-preparing the same change yields the same primary.
 ///
 /// # Errors
 /// `E_NOT_FOUND` for an unknown plan; `E_STALE` for an expired plan, a
-/// stored plan that differs from `plan`, a moved target tip, or a lost
-/// commit race; `E_POLICY` for a candidate that misses a requirement;
-/// `E_CORRUPT` or `E_IO` from the store.
-pub fn land_execute(
+/// presented candidate that differs from the primary, a moved target tip,
+/// a changed land policy, or a lost commit race; `E_POLICY` for a
+/// candidate that misses a requirement; `E_CORRUPT` or `E_IO` from the
+/// store.
+pub(super) fn prepare_land_execute(
     store: &Store,
-    plan: &LandPlan,
+    plan: PlanId,
+    candidate: Oid,
     now: Timestamp,
     checkpoint: &Checkpoint<'_>,
-) -> Result<LandOutcome, CoreError> {
-    let raw = store.fact(FactTable::LandPlans, &plan_key(plan.plan))?;
+) -> Result<(LandOutcome, Vec<FactMutation>), CoreError> {
+    let raw = store.fact(FactTable::LandPlans, &plan_key(plan))?;
     let Some(stored_bytes) = raw else {
         return Err(CoreError::new(
             ErrorCode::ENotFound,
-            format!("unknown land plan {}", plan.plan),
+            format!("unknown land plan {plan}"),
         ));
     };
     let stored: LandPlan = store.observe(decode("land plan", &stored_bytes))?;
-    if stored != *plan {
+    let Some(primary) = stored.candidate() else {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            "stored land plan has an empty candidate set",
+        ));
+    };
+    if candidate != primary {
         return Err(CoreError::new(
             ErrorCode::EStale,
-            "stored land plan differs from the presented plan; re-prepare",
+            "presented candidate differs from the stored primary candidate; re-prepare",
         ));
     }
-    if plan.is_expired(now) {
+    if stored.is_expired(now) {
         return Err(CoreError::new(
             ErrorCode::EStale,
             "land plan expired; re-prepare",
         ));
     }
+    let current_meta = store.repo_meta_raw().map_err(CoreError::from)?;
+    let current_generation = current_meta
+        .as_ref()
+        .map_or(0, |(meta, _)| meta.policy_generation);
+    if current_generation != stored.policy_generation {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            "land policy changed since prepare; re-prepare",
+        ));
+    }
     let refs = StoreRefs::new(store);
-    let resolved = resolve(&refs, &plan.target).map_err(CoreError::from)?;
-    if resolved.terminal != plan.target {
+    let resolved = resolve(&refs, &stored.target).map_err(CoreError::from)?;
+    if resolved.terminal != stored.target {
         return Err(CoreError::new(
             ErrorCode::EStale,
             "land target no longer resolves directly; re-prepare",
         ));
     }
-    if resolved.oid != plan.base {
+    if resolved.oid != stored.base {
         return Err(CoreError::new(
             ErrorCode::EStale,
             "land target tip moved since prepare; re-prepare",
         ));
     }
-    for candidate in &plan.candidates {
-        let evaluation = evaluate_requirements(
-            store,
-            candidate,
-            &plan.requirements,
-            &plan.trusted,
-            checkpoint,
-        )?;
+    for candidate in &stored.candidates {
+        let bounded: Vec<BoundedRequirement> = stored
+            .requirements
+            .iter()
+            .map(|requirement| BoundedRequirement {
+                requirement: requirement.clone(),
+                valid_until: requirement.valid_until,
+            })
+            .collect();
+        let evaluation =
+            evaluate_bounded_requirements(store, candidate, &bounded, &stored.trusted, checkpoint)?;
         if !evaluation.satisfied {
             return Err(CoreError::new(
                 ErrorCode::EPolicy,
@@ -398,40 +441,358 @@ pub fn land_execute(
             ));
         }
     }
-    let Some(primary) = plan.candidate() else {
-        return Err(CoreError::new(
-            ErrorCode::ECorrupt,
-            "stored land plan has an empty candidate set",
-        ));
-    };
-    let ref_expected = match plan.base {
+    let ref_expected = match stored.base {
         Some(base) => RefExpect::Present(RefTarget::Direct(base)),
         None => RefExpect::Absent,
     };
     let transaction = RefTransaction::new(
         store.hash_kind(),
         vec![RefUpdate {
-            name: plan.target.clone(),
+            name: stored.target.clone(),
             expected: ref_expected,
             change: RefChange::Set(RefTarget::Direct(primary)),
         }],
     )
     .map_err(CoreError::from)?;
-    let prepared = prepare_checked_transaction(store, &transaction).map_err(CoreError::from)?;
+    let prepared = prepare_checked_transaction(store, &transaction)?;
     let mut mutations = prepared.into_mutations();
     mutations.push(FactMutation {
         table: FactTable::LandPlans,
-        key: plan_key(plan.plan).to_vec(),
+        key: plan_key(plan).to_vec(),
         expected: FactExpectation::Value(stored_bytes),
         value: None,
     });
-    store.publish(Vec::new(), &mutations)?;
-    Ok(LandOutcome {
-        plan: plan.plan,
-        target: plan.target.clone(),
-        base: plan.base,
+    let (repo_meta_expected, repo_meta_value) = match current_meta {
+        Some((_, raw)) => (FactExpectation::Value(raw.clone()), Some(raw)),
+        None => (FactExpectation::Absent, None),
+    };
+    mutations.push(FactMutation {
+        table: FactTable::RepoMeta,
+        key: REPO_META_KEY.to_vec(),
+        expected: repo_meta_expected,
+        value: repo_meta_value,
+    });
+    let outcome = LandOutcome {
+        plan: stored.plan,
+        target: stored.target.clone(),
+        base: stored.base,
         candidate: primary,
-        candidates: plan.candidates.clone(),
-        expires_at: plan.expires_at,
-    })
+        candidates: stored.candidates.clone(),
+        expires_at: stored.expires_at,
+    };
+    Ok((outcome, mutations))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attestation::Progress;
+    use crate::capability::{AttestKind, AttestResult};
+    use crate::change::ChangeId;
+    use crate::ids::HashKind;
+    use crate::store::PreparationBudget;
+    use std::sync::Arc;
+
+    const SIGNED_AT: &str = "2026-10-17T12:00:00Z";
+
+    fn test_store(tag: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-land-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let store = Store::create(&dir, HashKind::Sha1, budget).expect("test store");
+        (dir, store)
+    }
+
+    fn publish_object(store: &Store, kind: crate::store::ObjectKind, body: &[u8]) -> Oid {
+        let length = u64::try_from(body.len()).expect("object length fits u64");
+        let prepared = store
+            .prepare(kind, length, body, None)
+            .expect("prepare object");
+        let oid = prepared.oid();
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish object");
+        oid
+    }
+
+    fn commit_body(tree: &str, parents: &[Oid], timestamp: &str, message: &str) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let mut body = format!("tree {tree}\n");
+        for parent in parents {
+            writeln!(body, "parent {}", parent.to_hex()).expect("parent line");
+        }
+        write!(
+            body,
+            "author Land <land@test.invalid> {timestamp} +0000\n\
+             committer Land <land@test.invalid> {timestamp} +0000\n\n{message}\n"
+        )
+        .expect("ident lines");
+        body.into_bytes()
+    }
+
+    struct Lab {
+        _dir: std::path::PathBuf,
+        store: Store,
+        candidate: Oid,
+        signer: SignerFingerprint,
+    }
+
+    impl Lab {
+        fn new() -> Self {
+            let (_dir, store) = test_store("bounded");
+            let empty = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+            let candidate = publish_object(
+                &store,
+                crate::store::ObjectKind::Commit,
+                &commit_body(empty, &[], SIGNED_AT, "candidate"),
+            );
+            let key =
+                ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[0x33; 32]));
+            let statement = crate::protocol::AttestStatement {
+                subject: candidate,
+                kind: AttestKind::new("review").expect("kind"),
+                result: AttestResult::new("pass").expect("result"),
+                signed_at: Timestamp::parse(SIGNED_AT).expect("timestamp"),
+                supersedes: None,
+                evidence: None,
+            };
+            let payload = statement
+                .canonical_payload_v1(HashKind::Sha1)
+                .expect("payload");
+            let signature = key
+                .sign(
+                    crate::attestation::ATTEST_NAMESPACE,
+                    ssh_key::HashAlg::Sha256,
+                    &payload,
+                )
+                .expect("sign");
+            let armor = signature.to_pem(ssh_key::LineEnding::LF).expect("armor");
+            let args = crate::protocol::AttestAddArgs {
+                statement,
+                signature: crate::protocol::AttestSignature::new(armor).expect("armored signature"),
+            };
+            let open = |_: Progress| Ok::<(), CoreError>(());
+            let prepared =
+                crate::attestation::prepare_add(&store, &args, &open).expect("prepare attestation");
+            assert!(!prepared.mutations.is_empty());
+            store
+                .publish(
+                    Vec::new(),
+                    &prepared.mutations,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish attestation");
+            let verified = crate::attestation::verify_statement(crate::ids::HashKind::Sha1, &args)
+                .expect("verify attestation");
+            let signer = verified.signer().clone();
+            Self {
+                _dir,
+                store,
+                candidate,
+                signer,
+            }
+        }
+
+        fn request(&self, valid_until: Option<Timestamp>) -> LandPrepareRequest {
+            LandPrepareRequest {
+                change: ChangeRef {
+                    change: ChangeId::generate(),
+                    head: Some(crate::heads::Head::Git {
+                        oid: self.candidate,
+                    }),
+                },
+                target: RefName::new("refs/heads/main").expect("target"),
+                candidates: vec![self.candidate],
+                requirements: vec![AttestRequirement {
+                    kind: AttestKind::new("review").expect("kind"),
+                    result: AttestResult::new("pass").expect("result"),
+                    valid_until,
+                }],
+                trusted: vec![self.signer.clone()],
+                merge: MergeSelection::default(),
+                policy_generation: 0,
+                now: Timestamp::parse(SIGNED_AT).expect("timestamp"),
+            }
+        }
+
+        fn open_target(&self) {
+            let target = crate::store::encode(
+                "ref target",
+                &crate::refdata::RefTarget::Direct(self.candidate),
+            )
+            .expect("encode target");
+            self.store
+                .publish(
+                    Vec::new(),
+                    &[FactMutation {
+                        table: FactTable::Refs,
+                        key: b"refs/heads/main".to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(target),
+                    }],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("publish target ref");
+        }
+    }
+
+    #[test]
+    fn expired_evidence_fails_the_land_gate() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let before_signing =
+            Timestamp::parse("2026-10-17T11:00:00Z").expect("bound before signing");
+        let plan = land_prepare(&lab.store, lab.request(Some(before_signing)), &checkpoint)
+            .expect("prepare records the attempt");
+        assert!(
+            !plan.satisfied_at_prepare,
+            "a bound before signing leaves the gate unsatisfied"
+        );
+        let candidate = plan.candidate().expect("prepared candidate");
+        let err = prepare_land_execute(
+            &lab.store,
+            plan.plan,
+            candidate,
+            Timestamp::parse(SIGNED_AT).expect("now"),
+            &checkpoint,
+        )
+        .expect_err("expired evidence refuses execution");
+        assert_eq!(err.code, ErrorCode::EPolicy);
+        assert!(
+            err.message.contains("misses a required attestation"),
+            "names the gap: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn fresh_evidence_satisfies_the_land_gate() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let after_signing = Timestamp::parse("2026-10-17T13:00:00Z").expect("bound after signing");
+        let plan = land_prepare(&lab.store, lab.request(Some(after_signing)), &checkpoint)
+            .expect("prepare records the attempt");
+        assert!(
+            plan.satisfied_at_prepare,
+            "a bound after signing keeps the gate satisfied"
+        );
+    }
+
+    #[test]
+    fn policy_bump_invalidates_prepared_plans() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let plan = land_prepare(&lab.store, lab.request(None), &checkpoint)
+            .expect("prepare records the attempt");
+        assert_eq!(plan.policy_generation, 0);
+        let bumped = crate::store::types::RepoMetaRow {
+            default_branch: crate::refdata::RefName::new("refs/heads/main").expect("branch"),
+            land_requirements: Vec::new(),
+            trusted_signers: Vec::new(),
+            policy_generation: 1,
+        };
+        let bytes = crate::store::encode("repo meta", &bumped).expect("encode policy");
+        lab.store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::RepoMeta,
+                    key: crate::store::types::REPO_META_KEY.to_vec(),
+                    expected: FactExpectation::Any,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("bump the land policy");
+        let candidate = plan.candidate().expect("prepared candidate");
+        let err = prepare_land_execute(
+            &lab.store,
+            plan.plan,
+            candidate,
+            Timestamp::parse(SIGNED_AT).expect("now"),
+            &checkpoint,
+        )
+        .expect_err("a policy bump invalidates the prepared plan");
+        assert_eq!(err.code, ErrorCode::EStale);
+        assert!(
+            err.message.contains("policy changed"),
+            "names the invalidation: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn prepared_land_goes_stale_on_concurrent_policy_bump() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let plan = land_prepare(&lab.store, lab.request(None), &checkpoint)
+            .expect("prepare records the attempt");
+        let candidate = plan.candidate().expect("prepared candidate");
+        let (_, mutations) = prepare_land_execute(
+            &lab.store,
+            plan.plan,
+            candidate,
+            Timestamp::parse(SIGNED_AT).expect("now"),
+            &checkpoint,
+        )
+        .expect("execute stages before the concurrent bump");
+        assert!(
+            mutations.iter().any(|mutation| {
+                matches!(mutation.table, FactTable::RepoMeta)
+                    && mutation.key.as_slice() == crate::store::types::REPO_META_KEY
+            }),
+            "staged execution carries the RepoMeta guard",
+        );
+        let bumped = crate::store::types::RepoMetaRow {
+            default_branch: crate::refdata::RefName::new("refs/heads/main").expect("branch"),
+            land_requirements: Vec::new(),
+            trusted_signers: Vec::new(),
+            policy_generation: 1,
+        };
+        let bytes = crate::store::encode("repo meta", &bumped).expect("encode policy");
+        lab.store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::RepoMeta,
+                    key: crate::store::types::REPO_META_KEY.to_vec(),
+                    expected: FactExpectation::Any,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("bump the land policy");
+        let err = lab
+            .store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect_err("a concurrent policy bump fails the staged publish");
+        assert!(
+            matches!(err, crate::store::StoreError::StaleFact { .. }),
+            "concurrent bump fails the publish as stale, got: {err:?}",
+        );
+    }
 }

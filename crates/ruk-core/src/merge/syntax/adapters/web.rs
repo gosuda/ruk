@@ -130,16 +130,7 @@ fn export_inner_name(tree: &ParsedTree, source: &[u8], node: u32) -> Option<(Vec
     None
 }
 
-fn push_unit(
-    tree: &ParsedTree,
-    source: &[u8],
-    node: u32,
-    kind: String,
-    name: Vec<u8>,
-    discriminator: Vec<u8>,
-    parent: &[u8],
-    out: &mut Vec<SourceUnit>,
-) {
+fn push_unit(tree: &ParsedTree, source: &[u8], node: u32, key: UnitKey, out: &mut Vec<SourceUnit>) {
     let Some(record) = tree.get(node) else {
         return;
     };
@@ -148,7 +139,7 @@ fn push_unit(
         return;
     }
     out.push(SourceUnit {
-        key: UnitKey::new(kind, name, discriminator, parent.to_vec()),
+        key,
         start,
         end: record.end,
         node,
@@ -178,10 +169,7 @@ fn collect(
             tree,
             source,
             node,
-            kind,
-            text,
-            Vec::new(),
-            &parents.concat(),
+            UnitKey::new(kind, text, Vec::new(), parents.concat()),
             out,
         );
         return;
@@ -193,10 +181,7 @@ fn collect(
                     tree,
                     source,
                     node,
-                    kind,
-                    name,
-                    discriminator,
-                    &parents.concat(),
+                    UnitKey::new(kind, name, discriminator, parents.concat()),
                     out,
                 );
             }
@@ -206,10 +191,7 @@ fn collect(
                     tree,
                     source,
                     node,
-                    kind,
-                    text,
-                    Vec::new(),
-                    &parents.concat(),
+                    UnitKey::new(kind, text, Vec::new(), parents.concat()),
                     out,
                 );
             }
@@ -255,10 +237,7 @@ fn collect(
             tree,
             source,
             node,
-            kind,
-            name,
-            discriminator,
-            &parents.concat(),
+            UnitKey::new(kind, name, discriminator, parents.concat()),
             out,
         );
         return;
@@ -269,10 +248,7 @@ fn collect(
                 tree,
                 source,
                 node,
-                kind,
-                name,
-                discriminator,
-                &parents.concat(),
+                UnitKey::new(kind, name, discriminator, parents.concat()),
                 out,
             );
         }
@@ -290,10 +266,7 @@ fn collect(
             tree,
             source,
             node,
-            kind,
-            name,
-            discriminator,
-            &parents.concat(),
+            UnitKey::new(kind, name, discriminator, parents.concat()),
             out,
         );
         return;

@@ -109,21 +109,23 @@ pub(super) struct SegmentFileCache {
 impl SegmentFileCache {
     /// The canonical read-only handle for `id`, opening `path` once. A
     /// missing file is missing committed bytes, hence corruption.
-    pub(super) fn get_or_open(&self, id: u64, path: &Path) -> Result<Arc<File>, StoreError> {
+    pub(super) fn get_or_open(
+        &self,
+        id: u64,
+        open: impl FnOnce() -> Result<File, StoreError>,
+    ) -> Result<Arc<File>, StoreError> {
         let mut files = match self.files.lock() {
             Ok(guard) => guard,
             Err(_) => {
                 // A poisoned cache must not refuse reads: serve this one
                 // uncached. Correctness never depends on the cache.
-                return File::open(path)
-                    .map(Arc::new)
-                    .map_err(|err| missing_is_corrupt(err, id));
+                return open().map(Arc::new);
             }
         };
         if let Some(cached) = files.get(&id) {
             return Ok(Arc::clone(cached));
         }
-        let file = Arc::new(File::open(path).map_err(|err| missing_is_corrupt(err, id))?);
+        let file = Arc::new(open()?);
         files.insert(id, Arc::clone(&file));
         Ok(file)
     }
@@ -146,6 +148,7 @@ pub(super) struct Committed<'a> {
     pub(super) budget: &'a Arc<PreparationBudget>,
     pub(super) guards: &'a Arc<GenerationRegistry>,
     pub(super) files: &'a SegmentFileCache,
+    pub(super) pin: &'a super::pinned::PinnedRoot,
 }
 
 /// The open (unsealed) segment recovery verified, ready to resume appends.
@@ -176,11 +179,17 @@ impl Committed<'_> {
             .join(segment::segment_file_name(id))
     }
 
-    /// The cached read-only handle for a committed segment. A missing file
-    /// is missing committed bytes, hence corruption. Callers read through
-    /// [`PreadReader`]: the shared cursor is never moved.
+    /// The cached read-only handle for a committed segment, opened through
+    /// the store pin so a swapped symlink cannot redirect it. A missing
+    /// file is missing committed bytes, hence corruption. Callers read
+    /// through [`PreadReader`]: the shared cursor is never moved.
     pub(super) fn open_committed(&self, id: u64) -> Result<Arc<File>, StoreError> {
-        self.files.get_or_open(id, &self.segment_path(id))
+        let rel = super::pinned::segment_rel(id);
+        self.files.get_or_open(id, || {
+            self.pin
+                .open_read(&rel)
+                .map_err(|err| missing_is_corrupt(err, id))
+        })
     }
 
     pub(super) fn check_width(&self, oid: Oid) -> Result<(), StoreError> {
@@ -278,6 +287,7 @@ impl Committed<'_> {
             base,
             self.budget,
             self.root,
+            self.pin,
         )?;
         payload.finish()?;
         Ok(decoded)

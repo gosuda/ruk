@@ -18,7 +18,7 @@ use crate::merge::Merge;
 use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// Header name carrying the native change ID.
 const CHANGE_ID_HEADER: &[u8] = b"change-id";
@@ -63,7 +63,12 @@ pub struct ResolveResult {
 pub fn resolve(store: &Store, request: ResolveRequest) -> Result<ResolveResult, CoreError> {
     let prepared = prepare_resolve(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -229,7 +234,12 @@ mod tests {
                 .expect("prepare tree");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish tree");
             oid
         }
@@ -276,7 +286,12 @@ mod tests {
             .expect("prepare conflicted");
         fixture
             .store
-            .publish(vec![prepared.prepared_object], &prepared.mutations)
+            .publish(
+                vec![prepared.prepared_object],
+                &prepared.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted");
         let conflicted_head = prepared.head;
 
@@ -335,7 +350,12 @@ mod tests {
             .expect("prepare conflicted");
         fixture
             .store
-            .publish(vec![prepared.prepared_object], &prepared.mutations)
+            .publish(
+                vec![prepared.prepared_object],
+                &prepared.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish conflicted");
 
         let result = resolve(

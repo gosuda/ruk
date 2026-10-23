@@ -61,8 +61,9 @@ impl ExpiryLab {
             requirement: AttestRequirement {
                 kind: kind("review"),
                 result: result("pass"),
+                valid_until: Some(Timestamp::parse(bound).expect("bound")),
             },
-            valid_until: Timestamp::parse(bound).expect("bound"),
+            valid_until: Some(Timestamp::parse(bound).expect("bound")),
         }
     }
 }
@@ -75,7 +76,7 @@ fn a_statement_signed_after_the_bound_is_expired_not_missing() {
         &lab.temp.store,
         &lab.subject,
         &[lab.bounded(BOUND_BEFORE_SIGNING)],
-        &[lab.signer.clone()],
+        std::slice::from_ref(&lab.signer),
         &open,
     )
     .expect("expiry evaluates");
@@ -107,7 +108,7 @@ fn a_statement_signed_before_the_bound_satisfies() {
         &lab.temp.store,
         &lab.subject,
         &[lab.bounded(BOUND_AFTER_SIGNING)],
-        &[lab.signer.clone()],
+        std::slice::from_ref(&lab.signer),
         &open,
     )
     .expect("in-bound evaluates");
@@ -127,13 +128,14 @@ fn legacy_evaluation_ignores_validity_bounds() {
     let required = [AttestRequirement {
         kind: kind("review"),
         result: result("pass"),
+        valid_until: None,
     }];
 
     let evaluation = evaluate_requirements(
         &lab.temp.store,
         &lab.subject,
         &required,
-        &[lab.signer.clone()],
+        std::slice::from_ref(&lab.signer),
         &open,
     )
     .expect("unbounded evaluates");

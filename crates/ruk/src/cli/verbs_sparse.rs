@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 
 use ruk_core::ids::Oid;
 use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage};
-use ruk_core::store::Store;
+use ruk_core::store::{EventContext, EventSource, Store};
 use ruk_git::GitError;
 
 use super::state::{
@@ -171,10 +171,7 @@ fn set(ctx: &Ctx, opts: &Collected) -> Result<Vec<u8>, GitError> {
 /// Prints the stored patterns, one per line.
 fn list(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
     let path = patterns_path(ctx);
-    let body = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => Vec::new(),
-    };
+    let body = std::fs::read(&path).unwrap_or_default();
     Ok(line(body))
 }
 
@@ -190,7 +187,7 @@ fn disable(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         if stage != Stage::Zero || entry.mode() == FileMode::Gitlink {
             continue;
         }
-        if worktree_present(ctx, &path.as_bytes().to_vec()) {
+        if worktree_present(ctx, path.as_bytes()) {
             continue;
         }
         writes.push((
@@ -245,9 +242,9 @@ fn apply_patterns(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
         if flags.skip_worktree == !wanted {
             // Flag already correct; the worktree may still need the file.
             if wanted {
-                plan_materialize(ctx, store, raw_path, &entry, &mut writes, &mut blocked);
+                plan_materialize(ctx, store, raw_path, entry, &mut writes, &mut blocked);
             } else {
-                plan_removal(ctx, store, raw_path, &entry, &mut writes, &mut blocked);
+                plan_removal(ctx, store, raw_path, entry, &mut writes, &mut blocked);
             }
             continue;
         }
@@ -290,7 +287,12 @@ fn apply_patterns(ctx: &Ctx) -> Result<Vec<u8>, GitError> {
             .map_err(core_invalid)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     sync_sparse_worktree(ctx, &writes)?;
@@ -329,7 +331,12 @@ fn clear_skip_flags(ctx: &Ctx) -> Result<(), GitError> {
         .map_err(core_invalid)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -380,10 +387,7 @@ fn plan_materialize(
         ));
         return;
     }
-    let body = match std::fs::read(&full) {
-        Ok(body) => Some(body),
-        Err(_) => None,
-    };
+    let body = std::fs::read(&full).ok();
     let wanted = read_object_bytes(store, entry.oid())
         .ok()
         .map(|(_, body)| body);

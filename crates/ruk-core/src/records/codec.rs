@@ -1,10 +1,10 @@
 //! Postcard codecs and semantic invariant validation for records fact tables.
 //!
 //! Encodes and decodes values for:
-//! - [`FactTable::Commits`]: [`CommitRecord`]
-//! - [`FactTable::Changes`]: [`ChangeEntry`]
-//! - [`FactTable::ImportedChanges`]: [`ImportedChangeEntry`]
-//! - [`FactTable::ChangeHistory`]: [`ChangeHistoryEntry`]
+//! - [`FactTable::Commits`] via [`CommitRecord`]
+//! - [`FactTable::Changes`] via [`ChangeEntry`]
+//! - [`FactTable::ImportedChanges`] via [`ImportedChangeEntry`]
+//! - [`FactTable::ChangeHistory`] via [`ChangeHistoryEntry`]
 //!
 //! All reads validate decoded semantic invariants and call [`Store::observe`]
 //! on committed corruption to latch quarantine.

@@ -303,7 +303,7 @@ pub fn declared_name(tree: &ParsedTree, source: &[u8], node: u32, alt_fields: &[
         return tree.text_of(name, source).to_vec();
     }
     for field in alt_fields {
-        if let Some(name) = tree.child_with_field(node, *field) {
+        if let Some(name) = tree.child_with_field(node, field) {
             return tree.text_of(name, source).to_vec();
         }
     }
@@ -398,10 +398,10 @@ pub fn index_units<'u>(
     }
     // Include the first occurrence in each duplicate group.
     for (index, unit) in units.iter().enumerate() {
-        if let Some(group) = dups.get_mut(&unit.key) {
-            if !group.contains(&index) {
-                group.push(index);
-            }
+        if let Some(group) = dups.get_mut(&unit.key)
+            && !group.contains(&index)
+        {
+            group.push(index);
         }
     }
     for (key, group) in &dups {

@@ -30,7 +30,21 @@ use crate::heads::Head;
 pub(crate) enum CollectionPhase {
     Idle,
     Mark,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     SweepPending,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     Sweep,
     Closed,
 }
@@ -38,6 +52,13 @@ pub(crate) enum CollectionPhase {
 /// Outcome of the parent's durable sweep-record commit, reported back under
 /// the sole writer lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) enum SweepOutcome {
     /// The sweep record committed: enter `Sweep`.
     Committed,
@@ -63,6 +84,13 @@ pub(crate) enum Dedupe {
 /// in-flight frontier publication. Every later transition rechecks the token
 /// against live state.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct SealedCycle {
     cycle: u64,
     root_epoch: u64,
@@ -72,18 +100,36 @@ pub(crate) struct SealedCycle {
 impl SealedCycle {
     /// The sealed collection cycle.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn cycle(&self) -> u64 {
         self.cycle
     }
 
     /// The root epoch the candidate was built against.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn root_epoch(&self) -> u64 {
         self.root_epoch
     }
 
     /// The pivot generation separating condemned from live roots.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn pivot(&self) -> u64 {
         self.pivot
     }
@@ -94,6 +140,13 @@ pub(crate) struct RootBarrier {
     phase: CollectionPhase,
     cycle: u64,
     root_epoch: u64,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pivot: u64,
     gray: Vec<Head>,
     gray_books: Option<Arc<ByteBudget>>,
@@ -136,6 +189,13 @@ impl RootBarrier {
 
     /// Current root epoch.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn root_epoch(&self) -> u64 {
         self.root_epoch
     }
@@ -148,6 +208,13 @@ impl RootBarrier {
 
     /// Operation window pinned by the running collection cycle.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn cycle_floor(&self) -> Option<OperationId> {
         self.op_window.map(|(low, _)| OperationId(low))
     }
@@ -181,6 +248,13 @@ impl RootBarrier {
 
     /// Begins `Mark` under sole lane ownership at the pivot generation,
     /// opening a fresh per-cycle gray budget of [`GRAY_ALLOWANCE_BYTES`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn begin_mark(
         &mut self,
         pivot: u64,
@@ -193,13 +267,13 @@ impl RootBarrier {
                 "collection cycle already in progress",
             ));
         }
-        if let Some((low, high)) = op_window {
-            if low > high {
-                return Err(CoreError::new(
-                    ErrorCode::EInvalid,
-                    "collection op window inverted",
-                ));
-            }
+        if let Some((low, high)) = op_window
+            && low > high
+        {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "collection op window inverted",
+            ));
         }
         self.phase = CollectionPhase::Mark;
         self.pivot = pivot;
@@ -266,6 +340,10 @@ impl RootBarrier {
 
     /// Brackets large-frontier publication to scratch. Seal fails while a
     /// publication is in flight.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn begin_frontier_publish(&mut self) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if self.phase != CollectionPhase::Mark {
@@ -285,6 +363,10 @@ impl RootBarrier {
     }
 
     /// Closes the frontier publication bracket.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn end_frontier_publish(&mut self) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if !self.frontier_in_flight {
@@ -298,6 +380,13 @@ impl RootBarrier {
     }
 
     /// Marks root enumeration finished for `cycle`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn finish_enumeration(&mut self, cycle: u64) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if self.phase != CollectionPhase::Mark || cycle != self.cycle {
@@ -313,6 +402,13 @@ impl RootBarrier {
     /// Acknowledges gray entries incorporated into the candidate through
     /// `through_epoch`, draining them. Seal still requires the gray set to be
     /// fully empty.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn drain_gray(&mut self, through_epoch: u64) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if self.phase != CollectionPhase::Mark {
@@ -345,6 +441,13 @@ impl RootBarrier {
     /// the durable sweep-record commit. Verifies the candidate epoch equals
     /// the current epoch, the gray set is empty, enumeration finished, and no
     /// frontier publication is in flight.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn seal_candidate(
         &mut self,
         cycle: u64,
@@ -398,6 +501,13 @@ impl RootBarrier {
     }
 
     /// Checks a sealed token against live state.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     fn check_token(&self, token: &SealedCycle) -> Result<(), CoreError> {
         self.refuse_if_closed()?;
         if token.cycle != self.cycle || token.root_epoch != self.root_epoch {
@@ -412,6 +522,13 @@ impl RootBarrier {
     /// Applies the parent's sweep-record commit outcome. Ambiguous failure
     /// closes the coordinator terminally; definite failure restores `Mark`
     /// with a fresh cycle.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn sweep_record_outcome(
         &mut self,
         token: &SealedCycle,
@@ -448,6 +565,13 @@ impl RootBarrier {
     /// Completes `Sweep` after the lane's final durable cursor/retirement
     /// transaction, returning to `Idle` with a fresh cycle and dropping the
     /// condemned handle. The registry deletes nothing itself.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn complete_sweep(&mut self, token: &SealedCycle) -> Result<(), CoreError> {
         if self.phase != CollectionPhase::Sweep {
             return Err(CoreError::new(
@@ -472,6 +596,13 @@ impl RootBarrier {
     /// the result back through [`RootBarrier::confirm_dedupe`]; this method
     /// only reports whether a lookup is required. Outside sweep phases the
     /// original locator is always retained.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn dedupe_needs_lookup(&self) -> Result<bool, CoreError> {
         self.refuse_if_closed()?;
         Ok(matches!(

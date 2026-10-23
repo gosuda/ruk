@@ -5,7 +5,7 @@
 //! it from its current heads. When a change has no heads left, its state
 //! transitions to abandoned.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,7 @@ use crate::records::codec::{decode_change_entry, encode_change_entry};
 use crate::records::keys::change_key;
 use crate::records::types::{ChangeEntry, ChangeState};
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// One request to abandon commit heads.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -52,7 +52,12 @@ pub struct AbandonResult {
 pub fn abandon(store: &Store, request: AbandonRequest) -> Result<AbandonResult, CoreError> {
     let prepared = prepare_abandon(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -85,9 +90,9 @@ pub fn prepare_abandon(
         })?;
         let change_id = record.change_id();
 
-        if !pending.contains_key(&change_id) {
+        if let Entry::Vacant(slot) = pending.entry(change_id) {
             let update = load_change_update(store, &change_id)?;
-            pending.insert(change_id, update);
+            slot.insert(update);
             order.push(change_id);
         }
 
@@ -217,7 +222,12 @@ mod tests {
                 .expect("prepare tree");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish tree");
             oid
         }

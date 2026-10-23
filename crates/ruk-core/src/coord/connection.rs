@@ -3,6 +3,10 @@ use super::policy::Principal;
 use super::session::BoundSession;
 use crate::{CoreError, ErrorCode, SessionId};
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) struct Connection {
     pub(crate) principal: Principal,
     pub(crate) session: Option<BoundSession>,
@@ -11,6 +15,10 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn new(principal: Principal) -> Self {
         let (lifetime, cancel) = cancellation();
         Self {
@@ -21,6 +29,10 @@ impl Connection {
         }
     }
 
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn bound_session(&self, requested: SessionId) -> Result<&BoundSession, CoreError> {
         self.cancel.check()?;
         self.session

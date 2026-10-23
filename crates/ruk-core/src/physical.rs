@@ -75,6 +75,10 @@ pub(crate) enum AllocationError {
     /// Ordinary I/O failure, including out-of-space.
     Io(std::io::Error),
     /// No strict reservation primitive exists on this platform.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     Unsupported,
     /// The handle does not name a regular file.
     NotRegularFile,
@@ -111,6 +115,13 @@ impl std::error::Error for AllocationError {}
 /// caller-visible floor (`f_bavail`-class, so per-user quotas and the
 /// privileged reserve are reflected); `total` is the volume size.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct VolumeFloor {
     /// Bytes reported free to the calling user.
     pub(crate) available: u64,
@@ -168,6 +179,13 @@ impl PhysicalReservation {
 }
 
 /// Advisory volume sample for admission diagnostics. See [`VolumeFloor`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
     platform::volume_free_floor(path)
 }
@@ -250,6 +268,13 @@ mod platform {
         })
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(super) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
         let dir = File::open(path).map_err(AllocationError::Io)?;
         let v = fstatvfs(&dir).map_err(|e| AllocationError::Io(e.into()))?;
@@ -281,15 +306,18 @@ mod platform {
     use std::path::Path;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_TAG_INFO, FILE_INFO_BY_HANDLE_CLASS,
-        FILE_REMOTE_DEVICE, FILE_STANDARD_INFO, FILE_SUPPORTS_BLOCK_REFCOUNTING,
+        FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_TAG_INFO, FILE_STANDARD_INFO,
         FileAllocationInfo, FileStandardInfo, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
         GetVolumeInformationByHandleW, SetFileInformationByHandle,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        FILE_SUPPORTS_BLOCK_REFCOUNTING, FILE_SUPPORTS_REMOTE_STORAGE,
     };
 
     const REJECTED_ATTRIBUTES: u32 =
         FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_REPARSE_POINT;
-    const REJECTED_VOLUME_FLAGS: u32 = FILE_SUPPORTS_BLOCK_REFCOUNTING | FILE_REMOTE_DEVICE;
+    const REJECTED_VOLUME_FLAGS: u32 =
+        FILE_SUPPORTS_BLOCK_REFCOUNTING | FILE_SUPPORTS_REMOTE_STORAGE;
 
     pub(super) fn reserve(
         file: &File,

@@ -9,6 +9,7 @@ use crate::error::{CoreError, CoreModelError, ErrorCode};
 use crate::ids::{HashKind, Oid};
 use crate::index::reject_null_oid;
 use crate::merge::Merge;
+use crate::protocol::Timestamp;
 use crate::refdata::{
     RefChange, RefError, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
@@ -17,6 +18,7 @@ use crate::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Sto
 #[cfg(test)]
 mod tests;
 
+#[derive(Debug)]
 pub struct StoreRefs<'a> {
     store: &'a Store,
 }
@@ -92,6 +94,50 @@ pub struct RefEntry {
 pub struct RefPage {
     pub entries: Vec<RefEntry>,
     pub more: bool,
+}
+
+/// One page of refs under `prefix`, seeking inclusively at the prefix
+/// when `after` is absent and exclusively after `after` otherwise, so
+/// single-ref resolve and prefix listings never scan the namespace.
+pub fn page_refs_prefixed(
+    store: &Store,
+    prefix: &[u8],
+    after: Option<&RefName>,
+    limit: usize,
+) -> Result<RefPage, CoreError> {
+    if limit == 0 {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "ref page limit must be non-zero",
+        ));
+    }
+    if let Some(cursor) = after
+        && !cursor.as_bytes().starts_with(prefix)
+    {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "ref page cursor must stay under its prefix",
+        ));
+    }
+    let max_rows = limit.min(1000);
+    let budget = FactPageBudget::new(max_rows, MAX_CONTROL_FRAME_BYTES);
+    let page = store.fact_page_prefixed(
+        FactTable::Refs,
+        after.map(RefName::as_bytes),
+        prefix,
+        budget,
+    )?;
+    let mut entries = Vec::with_capacity(page.rows.len());
+    for row in page.rows {
+        let name = RefName::new(row.key)
+            .map_err(|err| corrupt_store(store, format!("stored ref key is invalid: {err}")))?;
+        let target = decode_stored_target(store, &name, &row.value)?;
+        entries.push(RefEntry { name, target });
+    }
+    Ok(RefPage {
+        entries,
+        more: page.more,
+    })
 }
 
 pub fn page_refs(store: &Store, after: Option<&[u8]>, limit: usize) -> Result<RefPage, CoreError> {
@@ -188,6 +234,7 @@ pub fn prepare_checked_transaction(
     let mut mutations = Vec::with_capacity(updates.len());
 
     for update in updates {
+        let freeze_guards = tag_freeze_guards(store, &[&update.name])?;
         let name_bytes = update.name.as_bytes();
         let current_bytes = store.fact(FactTable::Refs, name_bytes)?;
 
@@ -245,6 +292,7 @@ pub fn prepare_checked_transaction(
             mutation: mutation.clone(),
         });
         mutations.push(mutation);
+        mutations.extend(freeze_guards);
     }
 
     Ok(PreparedRefTransaction {
@@ -272,11 +320,9 @@ fn decode_stored_conflict(
 ) -> Result<Merge<Option<Oid>>, CoreError> {
     let res: Result<Merge<Option<Oid>>, StoreError> = (|| {
         let conflict: Merge<Option<Oid>> = crate::store::decode("ref conflict", bytes)?;
-        for term in conflict.adds().chain(conflict.removes()) {
-            if let Some(oid) = term {
-                reject_null_oid(*oid, "ref conflict")?;
-                oid.expect_kind(store.hash_kind(), "ref conflict")?;
-            }
+        for oid in conflict.adds().chain(conflict.removes()).flatten() {
+            reject_null_oid(*oid, "ref conflict")?;
+            oid.expect_kind(store.hash_kind(), "ref conflict")?;
         }
         if conflict.is_resolved() {
             return Err(StoreError::Corrupt(format!(
@@ -304,11 +350,9 @@ pub fn prepare_set_ref_conflict(
     name: &RefName,
     conflict: &Merge<Option<Oid>>,
 ) -> Result<FactMutation, CoreError> {
-    for term in conflict.adds().chain(conflict.removes()) {
-        if let Some(oid) = term {
-            reject_null_oid(*oid, "ref conflict")?;
-            oid.expect_kind(store.hash_kind(), "ref conflict")?;
-        }
+    for oid in conflict.adds().chain(conflict.removes()).flatten() {
+        reject_null_oid(*oid, "ref conflict")?;
+        oid.expect_kind(store.hash_kind(), "ref conflict")?;
     }
     if conflict.is_resolved() {
         return Err(CoreModelError::Invalid {
@@ -654,6 +698,265 @@ pub fn page_reflogs(
     }
 
     Ok(ReflogPage { entries, more })
+}
+
+/// One frozen release tag: the `ReleasedTags` row at key
+/// `refs/tags/<name>`, written by `release.freeze.set` once the tag exists
+/// at the pinned target. The row is removed only by owner-checked
+/// `release.freeze.clear`: every tag mutation path (including delete) is
+/// refused while a live marker exists, and repository deletion drops the
+/// whole store instead of clearing rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleasedTagMarker {
+    /// The release that owns the freeze.
+    pub owner_release_id: String,
+    /// The tag target the freeze pins.
+    pub target_oid: Oid,
+    /// Wall time the freeze was written.
+    pub frozen_at: Timestamp,
+}
+
+fn is_tag_name(name: &RefName) -> bool {
+    name.as_bytes().starts_with(b"refs/tags/")
+}
+
+fn frozen_refusal(name: &RefName, owner: &str) -> CoreError {
+    CoreError::new(
+        ErrorCode::EForbidden,
+        format!("tag `{name}` is frozen by release `{owner}`"),
+    )
+}
+
+fn decode_stored_marker(store: &Store, bytes: &[u8]) -> Result<ReleasedTagMarker, CoreError> {
+    let res: Result<ReleasedTagMarker, StoreError> = (|| {
+        let marker: ReleasedTagMarker = crate::store::decode("released tag marker", bytes)?;
+        reject_null_oid(marker.target_oid, "released tag marker")?;
+        marker
+            .target_oid
+            .expect_kind(store.hash_kind(), "released tag marker")?;
+        Ok(marker)
+    })();
+    store.observe(res).map_err(CoreError::from)
+}
+
+/// The released-tag marker that freezes `name`, if one is stored.
+///
+/// # Errors
+/// `E_CORRUPT` for a damaged row.
+pub fn released_tag_marker(
+    store: &Store,
+    name: &RefName,
+) -> Result<Option<ReleasedTagMarker>, CoreError> {
+    match store.fact(FactTable::ReleasedTags, name.as_bytes())? {
+        Some(bytes) => decode_stored_marker(store, &bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Refuses `name` while a live released-tag marker freezes it.
+///
+/// # Errors
+/// `E_FORBIDDEN` naming the owning release; `E_CORRUPT` for a damaged row.
+pub fn check_tag_unfrozen(store: &Store, name: &RefName) -> Result<(), CoreError> {
+    match released_tag_marker(store, name)? {
+        Some(marker) => Err(frozen_refusal(name, &marker.owner_release_id)),
+        None => Ok(()),
+    }
+}
+
+/// Freeze guards for the tag names among `names`. Each tag name is checked
+/// with [`check_tag_unfrozen`], then gets an `Absent` guard on its marker
+/// row, so a marker written between this check and the publish fails that
+/// publish with `E_STALE`. The guard removes nothing: an absent row removes
+/// as a no-op, and a present row is the stale case. Names outside
+/// `refs/tags/` produce no guard.
+///
+/// # Errors
+/// As [`check_tag_unfrozen`].
+pub fn tag_freeze_guards(
+    store: &Store,
+    names: &[&RefName],
+) -> Result<Vec<FactMutation>, CoreError> {
+    let mut guards = Vec::new();
+    for &name in names {
+        if !is_tag_name(name) {
+            continue;
+        }
+        check_tag_unfrozen(store, name)?;
+        guards.push(FactMutation {
+            table: FactTable::ReleasedTags,
+            key: name.as_bytes().to_vec(),
+            expected: FactExpectation::Absent,
+            value: None,
+        });
+    }
+    Ok(guards)
+}
+
+/// Lowers a freeze of `name` to a `Refs` guard plus a create-if-absent CAS
+/// on its marker row.
+///
+/// The tag must already exist at the pinned target: the live `Refs` row is
+/// read, an absent tag or a tag at another target is refused eagerly, and
+/// the returned vector pins that exact row (`expected: Value` of the stored
+/// serialized [`RefTarget`] bytes, `value: Some` of those same bytes) ahead
+/// of the marker create, so a tag that moves between this check and the
+/// publish fails that publish with `E_STALE`. The guard carries the stored
+/// row bytes, never the raw oid: `Refs` values are serialized [`RefTarget`]
+/// rows, including the `Direct` framing.
+///
+/// An identical marker row (same owner and target) makes a retry a
+/// marker-only rewrite of the same stored bytes guarded by those bytes, so
+/// a row cleared between the check and the publish still fails it. Any
+/// other row refuses: a retry must not move the pinned target, and another
+/// release must not take the tag over.
+///
+/// Authorization is not decided here: `owner_release_id` only tie-breaks
+/// competing releases (idempotent retry vs. foreign takeover). The daemon
+/// dispatch gate (beside the `PolicySet` admin check, before
+/// `prepare_for_dispatch` replay) admits admin peers only, and the
+/// `release.freeze.set` prepare arm requires the session identity row, so
+/// the sessionless path refuses with `E_HOSTED`.
+///
+/// # Errors
+/// `E_INVALID` for a name outside `refs/tags/`; `E_STALE` naming the live
+/// tag state when no tag exists or its target differs from the pinned
+/// target; `E_FORBIDDEN` naming the existing owner when the marker row
+/// belongs to another release or pins another target; `E_LIMIT` when the
+/// row exceeds the bound; `E_CORRUPT` for a damaged row.
+pub fn prepare_release_freeze(
+    store: &Store,
+    name: &RefName,
+    marker: &ReleasedTagMarker,
+) -> Result<Vec<FactMutation>, CoreError> {
+    if !is_tag_name(name) {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!("a released tag must live under refs/tags/, got `{name}`"),
+        ));
+    }
+    reject_null_oid(marker.target_oid, "released tag marker")?;
+    marker
+        .target_oid
+        .expect_kind(store.hash_kind(), "released tag marker")?;
+    let key = name.as_bytes().to_vec();
+    let Some(ref_bytes) = store.fact(FactTable::Refs, name.as_bytes())? else {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            format!(
+                "tag `{name}` does not exist; freeze needs the live tag at `{}`",
+                marker.target_oid
+            ),
+        ));
+    };
+    let live = decode_stored_target(store, name, &ref_bytes)?;
+    if live != RefTarget::Direct(marker.target_oid) {
+        let live_desc = match &live {
+            RefTarget::Direct(oid) => oid.to_string(),
+            RefTarget::Symbolic(target) => format!("symbolic ref `{target}`"),
+        };
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            format!(
+                "tag `{name}` is live as {live_desc}, not `{}`; freeze follows the live tag",
+                marker.target_oid
+            ),
+        ));
+    }
+    let Some(bytes) = store.fact(FactTable::ReleasedTags, name.as_bytes())? else {
+        let encoded = crate::store::encode("released tag marker", marker)?;
+        if key.len().saturating_add(encoded.len()) > MAX_CONTROL_FRAME_BYTES {
+            return Err(CoreError::new(
+                ErrorCode::ELimit,
+                format!("released tag marker for {name} exceeds 16 MiB bound"),
+            ));
+        }
+        return Ok(vec![
+            FactMutation {
+                table: FactTable::Refs,
+                key: name.as_bytes().to_vec(),
+                expected: FactExpectation::Value(ref_bytes.clone()),
+                value: Some(ref_bytes),
+            },
+            FactMutation {
+                table: FactTable::ReleasedTags,
+                key,
+                expected: FactExpectation::Absent,
+                value: Some(encoded),
+            },
+        ]);
+    };
+    let stored = decode_stored_marker(store, &bytes)?;
+    if stored.owner_release_id != marker.owner_release_id {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            format!(
+                "tag `{name}` is already frozen by release `{}`",
+                stored.owner_release_id
+            ),
+        ));
+    }
+    if stored.target_oid != marker.target_oid {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            format!(
+                "tag `{name}` is already frozen by release `{}` at a different target",
+                stored.owner_release_id
+            ),
+        ));
+    }
+    Ok(vec![FactMutation {
+        table: FactTable::ReleasedTags,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Value(bytes.clone()),
+        value: Some(bytes),
+    }])
+}
+
+/// Lowers a clear of `name` to an owner-checked removal of its marker row,
+/// the sole path that removes a live marker.
+///
+/// The owner check below is an ownership tie-break, not authorization: the
+/// daemon dispatch gate admits admin peers only (see
+/// [`prepare_release_freeze`]), and the `release.freeze.clear` prepare arm
+/// requires the session identity row.
+///
+/// No row is a no-op success guarded by absence: a row written between the
+/// check and the publish fails that publish with `E_STALE`. A present row is
+/// removed under its exact bytes, so a rewrite fails the publish the same way.
+///
+/// # Errors
+/// `E_FORBIDDEN` naming the frozen owner when `owner` does not hold the row;
+/// `E_CORRUPT` for a damaged row.
+pub fn prepare_release_unfreeze(
+    store: &Store,
+    name: &RefName,
+    owner: &str,
+) -> Result<FactMutation, CoreError> {
+    let Some(bytes) = store.fact(FactTable::ReleasedTags, name.as_bytes())? else {
+        return Ok(FactMutation {
+            table: FactTable::ReleasedTags,
+            key: name.as_bytes().to_vec(),
+            expected: FactExpectation::Absent,
+            value: None,
+        });
+    };
+    let stored = decode_stored_marker(store, &bytes)?;
+    if stored.owner_release_id != owner {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            format!(
+                "tag `{name}` is frozen by release `{}`, not `{owner}`",
+                stored.owner_release_id
+            ),
+        ));
+    }
+    Ok(FactMutation {
+        table: FactTable::ReleasedTags,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Value(bytes),
+        value: None,
+    })
 }
 
 /// Every object id named by any reflog record in the store, old and new.

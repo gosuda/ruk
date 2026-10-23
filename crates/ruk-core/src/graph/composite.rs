@@ -22,7 +22,7 @@ use crate::budget::ByteBudget;
 use crate::change::ChangeId;
 use crate::error::{CoreError, ErrorCode};
 use crate::graph::folding::{fold_segments, select_folding_chain};
-use crate::graph::segment::{ChangeIdPage, GraphSegment, GraphSegmentWriter, StagedCommit};
+use crate::graph::segment::{GraphSegment, GraphSegmentWriter, StagedCommit};
 use crate::graph::traversal::GraphAccess;
 use crate::graph::types::{
     Generation, GlobalPosition, LocalPosition, MAX_GRAPH_POSITIONS, PrefixResolution,
@@ -38,8 +38,9 @@ pub(crate) struct ChangeIdCursor {
 }
 
 /// One bounded page of a composite divergence query. Unlike the per-segment
-/// [`ChangeIdPage`], the continuation is a [`ChangeIdCursor`] spanning
+/// [`crate::graph::segment::ChangeIdPage`], the continuation is a [`ChangeIdCursor`] spanning
 /// segments rather than an overflow offset inside one.
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 #[derive(Clone, Debug)]
 pub(crate) struct DivergentPage<T> {
     pub(crate) items: SmallVec<[T; 8]>,
@@ -183,6 +184,10 @@ impl GraphIndex {
     }
 
     /// Resolves `ChangeId` at `pos`.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; reserved for revset callers"
+    )]
     pub(crate) fn pos_to_change_id(&self, pos: GlobalPosition) -> Result<ChangeId, CoreError> {
         let (seg, lpos) = self.find_segment_for_pos(pos)?;
         seg.change_id_at(lpos)
@@ -265,7 +270,11 @@ impl GraphIndex {
         })
     }
 
-    /// Bounded lookup of heads for a change ID, up to `limit`.
+    /// Bounded lookup for heads for a change ID, up to `limit`.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; reserved for revset callers"
+    )]
     pub(crate) fn change_id_to_heads_bounded(
         &self,
         change_id: &ChangeId,

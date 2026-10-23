@@ -14,7 +14,6 @@ use crate::merge::syntax::grammar::{
     Cancel, GrammarRegistry, Language, MAX_TRIPLET_BYTES, SyntaxError,
 };
 use markdown::mdast::Node;
-use markdown::unist::Position;
 
 use super::host::{ComposedOutcome, ComposedRequest};
 
@@ -152,11 +151,14 @@ fn extract_top_units(root: &Node, source: &str) -> Result<Vec<MdxUnit>, DeclineR
     Ok(units)
 }
 
+/// Open and close boundary spans of one MDX JSX element.
+type JsxBoundaries = (Option<(usize, usize)>, Option<(usize, usize)>);
+
 fn compute_jsx_boundaries(
     elem: &markdown::mdast::MdxJsxFlowElement,
     start: usize,
     end: usize,
-) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+) -> JsxBoundaries {
     if elem.children.is_empty() {
         return (Some((start, end)), None);
     }

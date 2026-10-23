@@ -57,6 +57,8 @@ use crate::index::RepoPath;
 use crate::merge::Merge;
 use crate::merge::composed::{MergeMode, MergeReport};
 use crate::refdata::{RefExpect, RefName, RefTarget};
+use crate::refs::RefEntry;
+use crate::store::types::EventSource;
 use crate::workspace::{HeadRef, Scope, WorkspaceStamp, WorkspaceState};
 
 /// Major protocol/schema version implemented by this build.
@@ -64,8 +66,22 @@ pub const SCHEMA_MAJOR: u32 = 1;
 
 /// Minor schema version within the current major; increments are additive.
 /// Minor 1 appends the `git.commit` lane method for per-repository commit
-/// batching; older readers refuse its frames as unknown methods.
-pub const SCHEMA_MINOR: u32 = 1;
+/// batching. Minor 2 appends the hosted forge methods (`repo.stat`,
+/// `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`,
+/// `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`,
+/// `claim.renew`, `policy.set`) and the `Admin` method kind; older readers
+/// refuse its frames as unknown methods. Minor 3 appends the task-keyed
+/// claim subject (`ClaimRecord.subject`) and the task-lease lifetime
+/// ceiling; minor-2 readers cannot decode subject-carrying claim rows.
+/// It adds the `result` field to the `archive` invocation's `Accepted`
+/// frame (commit, format, content type). The field is serde-defaulted, so
+/// minor-2 readers decode the frame unchanged and simply ignore the
+/// metadata. It also gives `repo.fork` its served reply: the forked
+/// generation, sealed and tail object counts, the hardlinked and copied
+/// segment ids, and the linked LFS payload count.
+/// Minor 4 appends `release.freeze.set` and `release.freeze.clear`;
+/// minor-3 readers refuse their frames as unknown methods.
+pub const SCHEMA_MINOR: u32 = 4;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -79,8 +95,15 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// Largest accepted page limit; more is rejected, never clamped.
 pub const MAX_PAGE_SIZE: usize = 1000;
 
-/// Longest claim lifetime in seconds (one hour).
+/// Longest path-only claim lifetime in seconds (one hour). Task-keyed
+/// claims name a subject that outlives one operator session, so they may
+/// use [`MAX_TASK_CLAIM_TTL_SECONDS`] instead.
 pub const MAX_CLAIM_TTL_SECONDS: u32 = 3600;
+
+/// Longest task-keyed claim lifetime in seconds (one day). Only records
+/// carrying a [`ClaimSubject`] may use lifetimes above
+/// [`MAX_CLAIM_TTL_SECONDS`]; the seal enforces the scope.
+pub const MAX_TASK_CLAIM_TTL_SECONDS: u32 = 24 * 3600;
 
 /// Longest accepted revset text.
 pub const MAX_REVSET_BYTES: usize = 64 * 1024;
@@ -93,6 +116,7 @@ pub const REQUEST_DIGEST_VERSION: u8 = 1;
 
 const DIGEST_DOMAIN_V1: &[u8] = b"ruk-request-digest-v1";
 const ATTEST_PAYLOAD_DOMAIN_V1: &[u8] = b"ruk-attest-payload-v1";
+const ATTEST_PAYLOAD_DOMAIN_V2: &[u8] = b"ruk-attest-payload-v2";
 
 fn invalid(detail: impl Into<String>) -> CoreError {
     CoreError::new(ErrorCode::EInvalid, detail)
@@ -555,6 +579,45 @@ impl<T> Page<T> {
     }
 }
 
+/// A revision naming one commit: either a ref resolved at read time or a
+/// literal object id. Reads that accept revisions (tree, compare, archive,
+/// blame) take this shape instead of free-form strings.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitRev {
+    Ref(RefName),
+    Commit(Oid),
+}
+
+/// One stateless keyset page: rows plus the opaque position to resume
+/// after. Unlike [`Page`], the cursor binds no 30-second lease: the caller
+/// passes `next_after` back as the next request's `after`, so forge reads
+/// never hold lease state for pagination.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KeysetPage<T> {
+    pub items: Vec<T>,
+    /// The last returned key as raw bytes: a ref name for `refs.list`, an
+    /// entry name for `tree`. Absent when the listing is exhausted.
+    #[serde(default)]
+    pub next_after: Option<ByteString>,
+}
+
+impl<T> KeysetPage<T> {
+    /// Builds a page.
+    ///
+    /// # Errors
+    /// `E_LIMIT` when `items` exceeds [`MAX_PAGE_SIZE`].
+    pub fn new(items: Vec<T>, next_after: Option<ByteString>) -> Result<Self, CoreError> {
+        if items.len() > MAX_PAGE_SIZE {
+            return Err(limit_exceeded(format!(
+                "a keyset page holds at most {MAX_PAGE_SIZE} rows, got {}",
+                items.len()
+            )));
+        }
+        Ok(Self { items, next_after })
+    }
+}
+
 /// A bounded excerpt of a collection too large to return whole: at most
 /// [`MAX_PAGE_SIZE`] items, the true total, and whether anything was left out.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -686,6 +749,12 @@ pub struct StagedObject {
 pub struct StreamId(pub u64);
 
 /// Where a read reply's bytes are: in the frame, or on a stream.
+/// Producers must use `Streamed` for any body that would push the
+/// reply past [`MAX_CONTROL_FRAME_BYTES`]; the transport layer writes
+/// exactly `size` bytes on `stream` after the reply frame, and the
+/// caller correlates them by stream id. No served read produces one
+/// yet: every served page fits the control bound with room to spare,
+/// and the first bulk-body producer owns the delivery half.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ByteSource {
@@ -804,6 +873,16 @@ bounded_text! {
 }
 
 bounded_text! {
+    /// A rukie task (intent) identity naming one task-keyed claim.
+    pub struct TaskKey {
+        schema: "TaskKey",
+        max: 128,
+        doc: "Task key: 1..=128 bytes without control characters; the subject key renders as `task:<id>`.",
+        check: no_controls,
+    }
+}
+
+bounded_text! {
     /// An armored SSH signature over an attestation payload.
     pub struct AttestSignature {
         schema: "AttestSignature",
@@ -813,7 +892,9 @@ bounded_text! {
     }
 }
 
-/// How long a claim lasts: `1..=`[`MAX_CLAIM_TTL_SECONDS`] seconds.
+/// How long a claim lasts: `1..=`[`MAX_TASK_CLAIM_TTL_SECONDS`] seconds.
+/// Lifetimes above [`MAX_CLAIM_TTL_SECONDS`] are task-lease scope only; the
+/// claim seal refuses them on records without a [`ClaimSubject`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
 pub struct ClaimTtl(u32);
@@ -822,12 +903,12 @@ impl ClaimTtl {
     /// Validates a lifetime in seconds.
     ///
     /// # Errors
-    /// Zero, or longer than one hour.
+    /// Zero, or longer than one day.
     pub fn new(seconds: u32) -> Result<Self, CoreModelError> {
-        if seconds == 0 || seconds > MAX_CLAIM_TTL_SECONDS {
+        if seconds == 0 || seconds > MAX_TASK_CLAIM_TTL_SECONDS {
             return Err(model_invalid(
                 "claim ttl",
-                format!("{seconds} is outside 1..={MAX_CLAIM_TTL_SECONDS} seconds"),
+                format!("{seconds} is outside 1..={MAX_TASK_CLAIM_TTL_SECONDS} seconds"),
             ));
         }
         Ok(Self(seconds))
@@ -863,8 +944,8 @@ impl JsonSchema for ClaimTtl {
         json_schema!({
             "type": "integer",
             "minimum": 1,
-            "maximum": MAX_CLAIM_TTL_SECONDS,
-            "description": "Claim lifetime in seconds, at most one hour."
+            "maximum": MAX_TASK_CLAIM_TTL_SECONDS,
+            "description": "Claim lifetime in seconds, at most one day for task-keyed claims."
         })
     }
 }
@@ -1138,6 +1219,9 @@ pub enum MethodKind {
     Read,
     /// Requires a session; carries a request id and a receipt.
     Mutation,
+    /// Dispatched before any coordinator call and gated by the daemon's
+    /// `admin_uids`; takes no session and no receipt.
+    Admin,
 }
 
 /// `schema`: the versioned schemas of the protocol.
@@ -1704,6 +1788,33 @@ pub enum ClaimMode {
     Advise,
 }
 
+/// What a claim is held for: the task/change subject key alongside paths.
+///
+/// A task-keyed claim carries `task:<id>` so one record covers the intent's
+/// declared paths across rukie restarts; a change-keyed claim names the Ruk
+/// change under review. Path-only claims carry no subject and stay capped
+/// at [`MAX_CLAIM_TTL_SECONDS`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimSubject {
+    /// A rukie task (intent); the subject key renders as `task:<id>`.
+    Task(TaskKey),
+    /// The Ruk change under review; the subject key is the change id.
+    Change(ChangeId),
+}
+
+impl ClaimSubject {
+    /// The canonical subject-key string rukie correlates against:
+    /// `task:<id>` for tasks, the change id for changes.
+    #[must_use]
+    pub fn subject_key(&self) -> String {
+        match self {
+            Self::Task(task) => format!("task:{task}"),
+            Self::Change(change) => change.to_string(),
+        }
+    }
+}
+
 /// `claim.acquire`: each path claims itself and everything below it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimAcquireArgs {
@@ -1711,6 +1822,11 @@ pub struct ClaimAcquireArgs {
     pub ttl: ClaimTtl,
     #[serde(default)]
     pub mode: ClaimMode,
+    /// Task/change subject for task-keyed claims; absent for path-only
+    /// claims. Only subject-carrying acquisitions may use task-lease
+    /// lifetimes above [`MAX_CLAIM_TTL_SECONDS`].
+    #[serde(default)]
+    pub subject: Option<ClaimSubject>,
 }
 
 /// A held claim.
@@ -1721,6 +1837,15 @@ pub struct ClaimRecord {
     pub paths: Vec<RepoPath>,
     pub mode: ClaimMode,
     pub expires_at: Timestamp,
+    /// Provenance the acquiring invocation declared; never an
+    /// authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    /// Task/change subject for task-keyed claims; absent for path-only
+    /// claims. Renewals preserve it; releases and sweeps drop the record
+    /// with it.
+    #[serde(default)]
+    pub subject: Option<ClaimSubject>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1772,6 +1897,10 @@ pub struct ClaimListReply {
 // ---------------------------------------------------------------------------
 
 /// What a signer attests about one exact object.
+///
+/// `evidence` is appended last so the postcard encoding of every earlier
+/// field is unchanged; stored v1 rows decode through the versioned fallback
+/// in `attestation::rows`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestStatement {
     pub subject: Oid,
@@ -1782,10 +1911,17 @@ pub struct AttestStatement {
     /// The earlier statement this one explicitly supersedes.
     #[serde(default)]
     pub supersedes: Option<StatementDigest>,
+    /// The SHA-256 of an external blob this statement binds, such as a CI
+    /// log. `None` and `Some(zero)` differ on the wire: absence encodes as an
+    /// empty field, presence as exactly 32 bytes.
+    #[serde(default)]
+    pub evidence: Option<StatementDigest>,
 }
 
-/// `attest.add`: the signature is over [`AttestStatement::canonical_payload_v1`]
+/// `attest.add`: the signature is over [`AttestStatement::canonical_payload_v2`]
 /// in namespace `ruk-attest`; private keys never reach the coordinator.
+/// Statements without evidence signed over
+/// [`AttestStatement::canonical_payload_v1`] stay verifiable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestAddArgs {
     pub statement: AttestStatement,
@@ -1822,6 +1958,11 @@ pub struct AttestAddReply {
 }
 
 /// `attest.list`.
+///
+/// `kind` selects one exact kind; `kind_prefix` selects every kind starting
+/// with the prefix, for CI dashboards scanning `ci/` verdicts. Both set
+/// filters combine: a statement matches when its kind equals `kind` and
+/// starts with `kind_prefix`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestListArgs {
     #[serde(default)]
@@ -1834,6 +1975,11 @@ pub struct AttestListArgs {
     pub include_superseded: bool,
     #[serde(default)]
     pub page: PageRequest,
+    /// Only kinds starting with this prefix. Appended last so the postcard
+    /// encoding of every earlier field is unchanged; the field is optional,
+    /// so older JSON without it decodes to no prefix filter.
+    #[serde(default)]
+    pub kind_prefix: Option<AttestKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2025,7 +2171,10 @@ pub struct PushReconcileReply {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LandPrepareArgs {
     pub change: ChangeRef,
-    pub remote: RemoteSpec,
+    /// Where to push the landed candidate; absent means this store.
+    /// A present remote refuses: the transport push leg is not served yet.
+    #[serde(default)]
+    pub remote: Option<RemoteSpec>,
     /// The target ref to land onto, e.g. `refs/heads/main`.
     pub target: RefName,
     #[serde(default)]
@@ -2037,6 +2186,10 @@ pub struct LandPrepareArgs {
 pub struct AttestRequirement {
     pub kind: AttestKind,
     pub result: AttestResult,
+    /// The latest `signed_at` this requirement accepts; absent never
+    /// expires. A later-signed match reports `Gap::Expired`.
+    #[serde(default)]
+    pub valid_until: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2116,6 +2269,29 @@ pub struct OpLogArgs {
     /// Paging state; absent starts at the newest operation.
     #[serde(default)]
     pub page: PageRequest,
+    /// Ascending cursor: only operations strictly after this id, oldest
+    /// first. Absent keeps the newest-first walk.
+    #[serde(default)]
+    pub after: Option<OperationId>,
+}
+
+/// One ref moved by an operation: the ref name plus its before and after
+/// targets. Recorded for lane (op-sourced) mutations from the operation's
+/// own ref deltas, so orchestration readers need no stream walk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpRefDelta {
+    pub name: RefName,
+    pub before: Option<RefTarget>,
+    pub after: Option<RefTarget>,
+}
+
+/// One attestation an operation recorded: the attested kind and subject.
+/// Recorded for lane (op-sourced) mutations from the operation's own
+/// attestation rows, so proof lists read subjects without a stream walk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpAttestationSubject {
+    pub kind: AttestKind,
+    pub subject: Oid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2127,6 +2303,15 @@ pub struct OperationEntry {
     pub committed_at: Timestamp,
     /// The operation this one inverts, if it is an undo.
     pub undoes: Option<OperationId>,
+    /// Provenance the invoking call declared; never an authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    /// Per-op ref deltas, in delta order within the operation.
+    #[serde(default)]
+    pub ref_deltas: Vec<OpRefDelta>,
+    /// Attested (kind, subject) pairs this operation recorded, deduplicated.
+    #[serde(default)]
+    pub attestation_subjects: Vec<OpAttestationSubject>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2390,6 +2575,9 @@ pub struct TreeEntry {
     pub name: ByteString,
     pub oid: Oid,
     pub kind: EntryKind,
+    /// Stored object length for blobs; absent for trees and gitlinks.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// One side of a conflicted file.
@@ -2520,20 +2708,64 @@ pub enum ErrorDetail {
         state: PushState,
         refs: BoundedList<PushRefOutcome>,
     },
+    /// An HTTP failure with the facts a caller needs to classify it: the
+    /// status, the `Retry-After` delay when the server sent one, the
+    /// redirect target for 3xx, and a scrubbed body preview capped at 512
+    /// bytes. Appended after `Push`, so existing encodings are unchanged.
+    Http {
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        location: Option<String>,
+        body_preview: String,
+    },
+    /// A detail this build does not model: tolerated so newer writers do
+    /// not break older readers. Never constructed locally.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ErrorDetail {
+    /// Builds the [`ErrorDetail::Http`] variant, truncating `preview` to
+    /// 512 bytes on a character boundary. The caller scrubs `preview` and
+    /// `location` first; this only bounds the size.
+    #[must_use]
+    pub fn http_detail(
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        location: Option<String>,
+        preview: &str,
+    ) -> Self {
+        let mut end = preview.len().min(512);
+        while !preview.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self::Http {
+            status,
+            retry_after_seconds,
+            location,
+            body_preview: preview[..end].to_owned(),
+        }
+    }
 }
 
 /// The error body of a failed request. Callers branch on `code`.
+///
+/// The daemon's IPC `Error` frame carries this body. The trailing fields
+/// default so a payload written before they existed still decodes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorReply {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(default)]
     pub hints: Vec<String>,
+    #[serde(default)]
     pub fixes: Vec<Fix>,
+    #[serde(default)]
     pub detail: Option<ErrorDetail>,
 }
 
 impl ErrorReply {
-    /// The wire form of a core error, with no fixes or detail attached.
+    /// The wire form of a core error, preserving its detail when present.
     #[must_use]
     pub fn from_core(error: &CoreError) -> Self {
         Self {
@@ -2541,7 +2773,7 @@ impl ErrorReply {
             message: error.message.clone(),
             hints: error.hints.clone(),
             fixes: Vec::new(),
-            detail: None,
+            detail: error.detail.as_deref().cloned(),
         }
     }
 
@@ -2582,8 +2814,19 @@ macro_rules! no_invariants {
     };
 }
 
+impl<T> Validate for KeysetPage<T> {}
+
 no_invariants!(
     SchemaArgs,
+    CommitRev,
+    RepoStatArgs,
+    TreeArgs,
+    RefsListArgs,
+    CompareArgs,
+    ArchiveArgs,
+    RemoteRefsArgs,
+    ClaimRenewArgs,
+    PolicySetArgs,
     SessionResumeArgs,
     WsScopeArgs,
     WsTakeArgs,
@@ -2932,6 +3175,20 @@ impl Validate for TagDeleteArgs {
     }
 }
 
+impl Validate for ReleaseFreezeSetArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_namespace("a released tag", &self.name, b"refs/tags/")?;
+        require_nonempty_text("release.freeze.set owner", &self.owner_release_id)
+    }
+}
+
+impl Validate for ReleaseFreezeClearArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_namespace("a released tag", &self.name, b"refs/tags/")?;
+        require_nonempty_text("release.freeze.clear owner", &self.owner_release_id)
+    }
+}
+
 impl Validate for ClaimAcquireArgs {
     fn validate(&self) -> Result<(), CoreError> {
         require_nonempty("claim paths", &self.paths)?;
@@ -3035,6 +3292,576 @@ impl Validate for BlameArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Hosted forge methods (minor 2)
+// ---------------------------------------------------------------------------
+
+/// `repo.stat`: store identity, object format, default branch, quarantine
+/// latch, and the event horizon. Served from the store head; counts no
+/// refs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoStatArgs {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoStatReply {
+    pub view: ViewInfo,
+    pub store_id: StoreId,
+    pub object_format: HashKind,
+    #[serde(default)]
+    pub default_branch: Option<RefName>,
+    /// Whether committed corruption latched quarantine in this session.
+    pub quarantined: bool,
+    /// The oldest retained event sequence.
+    pub oldest: u64,
+    /// The last assigned event sequence.
+    pub head: u64,
+}
+
+/// `tree`: one directory listing with stateless keyset paging.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TreeArgs {
+    pub rev: CommitRev,
+    /// The directory to list; absent is the root.
+    #[serde(default)]
+    pub path: Option<RepoPath>,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+    /// Resume after this entry name; absent starts at the beginning.
+    #[serde(default)]
+    pub after: Option<ByteString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TreeReply {
+    pub view: ViewInfo,
+    pub entries: KeysetPage<TreeEntry>,
+}
+
+/// `refs.list`: ref names and targets with prefix and inclusive-start
+/// seek. Covers single-ref resolve, so no separate `ref.get` exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RefsListArgs {
+    /// Only names starting with these bytes; absent lists every ref.
+    #[serde(default)]
+    pub prefix: Option<ByteString>,
+    /// Resume after this name; absent starts at `prefix` (inclusive).
+    #[serde(default)]
+    pub after: Option<RefName>,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RefsListReply {
+    pub view: ViewInfo,
+    pub refs: KeysetPage<RefEntry>,
+    /// The event head the page was read under. Read before the page so it
+    /// never runs ahead of the events the page reflects.
+    pub as_of: u64,
+}
+
+/// `compare`: merge bases plus bounded ahead/behind counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompareArgs {
+    pub base: CommitRev,
+    pub head: CommitRev,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompareReply {
+    pub view: ViewInfo,
+    pub bases: Vec<Oid>,
+    pub ahead: u64,
+    pub behind: u64,
+    /// False when the walk exhausted its budget: counts are lower bounds.
+    pub exact: bool,
+}
+
+/// Longest `search` needle or regex, in bytes.
+pub const SEARCH_PATTERN_MAX_BYTES: usize = 4096;
+
+/// Most include plus exclude globs one `search` request carries.
+pub const SEARCH_MAX_GLOBS: usize = 32;
+
+/// Longest single `search` glob, in bytes.
+pub const SEARCH_GLOB_MAX_BYTES: usize = 1024;
+
+/// Decoded blob bytes one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_MAX_BYTES_SCANNED: u64 = 268_435_456;
+
+/// Most decoded blob bytes one `search` page scans; over-cap budgets refuse.
+pub const SEARCH_MAX_BYTES_SCANNED: u64 = 1_073_741_824;
+
+/// Unique blobs one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_MAX_BLOBS: u32 = 100_000;
+
+/// Milliseconds one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_DEADLINE_MS: u64 = 5_000;
+
+/// Most milliseconds one `search` page scans; over-cap budgets refuse.
+pub const SEARCH_MAX_DEADLINE_MS: u64 = 30_000;
+
+/// Blobs larger than this skip the scan without payload reads.
+pub const SEARCH_SKIP_BLOB_BYTES: u64 = 524_288;
+
+/// Longest match preview a `search` hit carries, in bytes.
+pub const SEARCH_PREVIEW_MAX_BYTES: usize = 1024;
+
+/// `search`: byte-exact or regex code search over one revision's tree,
+/// served from the core-owned search pool with lease-bound cursors.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchPattern {
+    /// Byte-exact needle; empty needles refuse.
+    Literal(ByteString),
+    /// Rust regex syntax over raw line bytes; empty patterns refuse.
+    Regex(String),
+}
+
+/// Scan budget of one `search` page: every field optional wire-wise, absent
+/// means the default. Over-cap values refuse; they never clamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchBudget {
+    /// Decoded blob bytes scanned before the page seals.
+    #[serde(default)]
+    pub max_bytes_scanned: Option<u64>,
+    /// Unique blobs scanned before the page seals.
+    #[serde(default)]
+    pub max_blobs: Option<u32>,
+    /// Milliseconds before the page seals.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+}
+
+impl SearchBudget {
+    /// The decoded-byte bound the scan enforces.
+    #[must_use]
+    pub fn effective_max_bytes(&self) -> u64 {
+        self.max_bytes_scanned
+            .unwrap_or(SEARCH_DEFAULT_MAX_BYTES_SCANNED)
+    }
+
+    /// The unique-blob bound the scan enforces.
+    #[must_use]
+    pub fn effective_max_blobs(&self) -> u32 {
+        self.max_blobs.unwrap_or(SEARCH_DEFAULT_MAX_BLOBS)
+    }
+
+    /// The millisecond bound the scan enforces.
+    #[must_use]
+    pub fn effective_deadline_ms(&self) -> u64 {
+        self.deadline_ms.unwrap_or(SEARCH_DEFAULT_DEADLINE_MS)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// Head or change revision; a workspace revision refuses.
+    pub at: RevisionRef,
+    /// Byte-exact needle or regex over raw line bytes.
+    pub pattern: SearchPattern,
+    /// Fold ASCII case before matching.
+    #[serde(default)]
+    pub case_insensitive: bool,
+    /// Which tree paths the scan visits.
+    pub paths: PathSelection,
+    /// Include globs; empty searches every selected path.
+    #[serde(default)]
+    pub globs: Vec<String>,
+    /// Exclude globs; any match drops the path.
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
+    /// Scan budget; absent fields take the defaults.
+    #[serde(default)]
+    pub budget: SearchBudget,
+    /// Rows wanted and the lease-bound continuation.
+    #[serde(default)]
+    pub page: PageRequest,
+}
+
+/// One matching line: 1-based line and byte-column numbers with the first
+/// kibibyte of the line. Lines past the preview bound carry a trailing
+/// `...` marker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchHit {
+    pub path: RepoPath,
+    pub line: u32,
+    pub column: u32,
+    pub preview: ByteString,
+    pub blob: Oid,
+}
+
+/// Why a `search` page sealed before covering its tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanExhaustion {
+    /// The page covers its tree; no budget ran out.
+    None,
+    /// The byte or blob budget ran out at the sealed frontier.
+    Budget,
+    /// The deadline passed at the sealed frontier.
+    Deadline,
+}
+
+/// `search`: one path-ordered page of matching lines with lease-bound
+/// continuation. `truncated` mirrors `hits.next.is_some()`; exhaustion
+/// seals the page with a cursor instead of refusing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchReply {
+    pub view: ViewInfo,
+    pub hits: Page<SearchHit>,
+    pub truncated: bool,
+    pub exhausted: ScanExhaustion,
+    pub scanned_blobs: u64,
+    pub scanned_bytes: u64,
+    pub skipped_blobs: u64,
+}
+
+/// The archive payloads the daemon streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveFormat {
+    Tar,
+    Zip,
+}
+
+impl ArchiveFormat {
+    /// The media type of the streamed payload.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Tar => "application/x-tar",
+            Self::Zip => "application/zip",
+        }
+    }
+}
+
+/// `archive`: metadata for the streamed payload; bytes ride `Stdout`
+/// frames under the reply window, never the control frame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveArgs {
+    pub rev: CommitRev,
+    #[serde(default)]
+    pub format: Option<ArchiveFormat>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveReply {
+    pub view: ViewInfo,
+    pub commit: Oid,
+    pub format: ArchiveFormat,
+    pub content_type: String,
+}
+
+/// Longest `events.tail` wait: the only ref feed long-polls instead of
+/// holding a subscription.
+pub const MAX_TAIL_WAIT_MS: u32 = 30_000;
+
+/// `events.tail`: ref events strictly after `after`, long-polled. The
+/// only ref feed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventsTailArgs {
+    pub after: u64,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+    /// Long-poll milliseconds; absent returns immediately.
+    #[serde(default)]
+    pub wait_ms: Option<u32>,
+    /// Only events whose ref name starts with these bytes.
+    #[serde(default)]
+    pub prefix: Option<ByteString>,
+}
+
+/// One ref event carried by `events.tail`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TailedEvent {
+    pub seq: u64,
+    pub name: ByteString,
+    #[serde(default)]
+    pub old: Option<RefTarget>,
+    #[serde(default)]
+    pub new: Option<RefTarget>,
+    pub at: u64,
+    pub source: EventSource,
+    #[serde(default)]
+    pub operation: Option<OperationId>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub session: Option<SessionId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventsTailReply {
+    pub view: ViewInfo,
+    pub events: Vec<TailedEvent>,
+    /// The last assigned sequence at reply time.
+    pub head: u64,
+    /// The oldest retained sequence at reply time.
+    pub oldest: u64,
+    /// True when `after + 1` predates `oldest`: the caller missed events
+    /// and must resnapshot from `refs.list` with `as_of`.
+    pub expired: bool,
+}
+
+/// `remote.refs`: advertised refs of an explicit remote URL, never stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteRefsArgs {
+    pub url: RemoteUrl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteRefsReply {
+    pub view: ViewInfo,
+    pub refs: Vec<RefEntry>,
+}
+
+/// `claim.renew`: extends one held claim by a fresh lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimRenewArgs {
+    pub claim: ClaimId,
+    pub ttl: ClaimTtl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimRenewReply {
+    pub outcome: MutationOutcome,
+    pub claim: ClaimRecord,
+}
+
+/// `policy.set`: replaces the landing policy of the repository.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicySetArgs {
+    pub requirements: Vec<AttestRequirement>,
+    pub trusted_signers: Vec<SignerFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicySetReply {
+    pub outcome: MutationOutcome,
+    pub generation: u64,
+}
+
+/// `release.freeze.set`: writes the released-tag marker that freezes one tag
+/// at its live target for one release. The tag must already exist at the
+/// pinned target: an absent tag or a tag at another target is refused with
+/// `E_STALE` naming the live tag, and the freeze publishes a `Refs` guard
+/// with the marker so a tag that moves after prepare fails the publish with
+/// `E_STALE`. A different owner, or the same owner at a different target,
+/// is refused; the same owner at the same target is a no-op success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeSetArgs {
+    pub name: RefName,
+    pub owner_release_id: String,
+    pub target_oid: Oid,
+    pub frozen_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeSetReply {
+    pub outcome: MutationOutcome,
+    pub name: RefName,
+    pub owner_release_id: String,
+    pub target_oid: Oid,
+    pub frozen_at: Timestamp,
+}
+
+/// `release.freeze.clear`: removes the released-tag marker of one tag when
+/// the named release owns it, the sole path that removes a live marker. No
+/// marker is a no-op success; another owner is refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeClearArgs {
+    pub name: RefName,
+    pub owner_release_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeClearReply {
+    pub outcome: MutationOutcome,
+    pub name: RefName,
+}
+
+/// `repo.init`: creates one repository store under a configured root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoInitArgs {
+    pub root: String,
+    pub path: String,
+    #[serde(default)]
+    pub object_format: Option<HashKind>,
+    #[serde(default)]
+    pub default_branch: Option<RefName>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoInitReply {
+    pub path: String,
+    pub store_id: StoreId,
+    pub object_format: HashKind,
+    pub default_branch: RefName,
+}
+
+/// `repo.delete`: tombstones one repository; a purge job removes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoDeleteArgs {
+    pub repo: String,
+    pub confirm_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoDeleteReply {
+    pub deleted_path: String,
+}
+
+/// `repo.rename`: moves one repository within its root; the store id is
+/// unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoRenameArgs {
+    pub repo: String,
+    pub new_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoRenameReply {
+    pub path: String,
+    pub previous_path: String,
+}
+
+/// Which refs a fork copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForkRefs {
+    All,
+    DefaultAndTags,
+    None,
+}
+
+/// `repo.fork`: copies one repository to a fresh store id. Sealed segments
+/// hardlink into the fork (a cross-device link copies and is reported);
+/// tail objects re-publish base-first; facts copy under full revalidation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoForkArgs {
+    pub source: String,
+    pub path: String,
+    #[serde(default)]
+    pub refs: Option<ForkRefs>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoForkReply {
+    pub path: String,
+    pub store_id: StoreId,
+    pub source_generation: u64,
+    pub objects: u64,
+    pub sealed_objects: u64,
+    pub tail_objects: u64,
+    pub refs_copied: u64,
+    pub segments_linked: Vec<u64>,
+    pub segments_copied: Vec<u64>,
+    pub lfs_linked: u64,
+    pub generation: u64,
+}
+
+fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
+    if text.is_empty() {
+        return Err(invalid(format!("{what} must not be empty")));
+    }
+    Ok(())
+}
+
+impl Validate for SearchArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        let raw: &[u8] = match &self.pattern {
+            SearchPattern::Literal(needle) => needle.as_bytes(),
+            SearchPattern::Regex(pattern) => pattern.as_bytes(),
+        };
+        if raw.is_empty() || raw.len() > SEARCH_PATTERN_MAX_BYTES {
+            return Err(invalid(format!(
+                "search pattern is 1..={SEARCH_PATTERN_MAX_BYTES} bytes, got {}",
+                raw.len()
+            )));
+        }
+        if let SearchPattern::Regex(pattern) = &self.pattern {
+            regex::bytes::RegexBuilder::new(pattern)
+                .case_insensitive(self.case_insensitive)
+                .build()
+                .map_err(|err| invalid(format!("search regex is invalid: {err}")))?;
+        }
+        let globs = self.globs.len().saturating_add(self.exclude_globs.len());
+        if globs > SEARCH_MAX_GLOBS {
+            return Err(invalid(format!(
+                "search carries at most {SEARCH_MAX_GLOBS} globs, got {globs}"
+            )));
+        }
+        for glob in self.globs.iter().chain(self.exclude_globs.iter()) {
+            if glob.is_empty() || glob.len() > SEARCH_GLOB_MAX_BYTES {
+                return Err(invalid(format!(
+                    "search globs are 1..={SEARCH_GLOB_MAX_BYTES} bytes, got {}",
+                    glob.len()
+                )));
+            }
+        }
+        if let Some(max) = self.budget.max_bytes_scanned
+            && max > SEARCH_MAX_BYTES_SCANNED
+        {
+            return Err(invalid(format!(
+                "search scans at most {SEARCH_MAX_BYTES_SCANNED} bytes, got {max}"
+            )));
+        }
+        if let Some(deadline) = self.budget.deadline_ms
+            && deadline > SEARCH_MAX_DEADLINE_MS
+        {
+            return Err(invalid(format!(
+                "search waits at most {SEARCH_MAX_DEADLINE_MS} ms, got {deadline}"
+            )));
+        }
+        self.paths.validate()?;
+        self.page.validate()
+    }
+}
+
+impl Validate for EventsTailArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        if let Some(wait_ms) = self.wait_ms
+            && wait_ms > MAX_TAIL_WAIT_MS
+        {
+            return Err(limit_exceeded(format!(
+                "tail wait is at most {MAX_TAIL_WAIT_MS} ms, got {wait_ms}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for RepoInitArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("init root", &self.root)?;
+        require_nonempty_text("init path", &self.path)
+    }
+}
+
+impl Validate for RepoDeleteArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("delete repo", &self.repo)?;
+        require_nonempty_text("delete confirm path", &self.confirm_path)
+    }
+}
+
+impl Validate for RepoRenameArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("rename repo", &self.repo)?;
+        require_nonempty_text("rename new path", &self.new_path)
+    }
+}
+
+impl Validate for RepoForkArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("fork source", &self.source)?;
+        require_nonempty_text("fork path", &self.path)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The method table
 // ---------------------------------------------------------------------------
 
@@ -3049,7 +3876,7 @@ enum SessionRule {
 impl MethodKind {
     const fn session_rule(self) -> SessionRule {
         match self {
-            Self::Anonymous => SessionRule::Optional,
+            Self::Anonymous | Self::Admin => SessionRule::Optional,
             Self::Bootstrap => SessionRule::Forbidden,
             Self::Read | Self::Mutation => SessionRule::Required,
         }
@@ -3061,6 +3888,10 @@ macro_rules! digest_args {
     (Mutation, $params:expr) => {
         Some(postcard::to_allocvec(&$params.args))
     };
+    (Admin, $params:expr) => {{
+        let _ = &$params;
+        None
+    }};
     ($kind:ident, $params:expr) => {{
         let _ = &$params;
         None
@@ -3072,6 +3903,10 @@ macro_rules! request_id_of {
     (Mutation, $params:expr) => {
         Some($params.request_id)
     };
+    (Admin, $params:expr) => {{
+        let _ = &$params;
+        None
+    }};
     ($kind:ident, $params:expr) => {{
         let _ = &$params;
         None
@@ -3095,6 +3930,10 @@ macro_rules! outcome_of {
         let _ = &$result;
         None
     }};
+    (Admin, $result:expr) => {{
+        let _ = &$result;
+        None
+    }};
 }
 
 /// Mutable access to the outcome of a mutation reply.
@@ -3111,6 +3950,10 @@ macro_rules! outcome_of_mut {
         None
     }};
     (Read, $result:expr) => {{
+        let _ = $result;
+        None
+    }};
+    (Admin, $result:expr) => {{
         let _ = $result;
         None
     }};
@@ -3330,6 +4173,22 @@ method_table! {
     Blame, "blame", Read, BlameArgs, BlameReply;
     Query, "query", Read, QueryArgs, QueryReply;
     GitCommit, "git.commit", Mutation, Mutation<GitCommitArgs>, NewReply;
+    RepoStat, "repo.stat", Read, RepoStatArgs, RepoStatReply;
+    Tree, "tree", Read, TreeArgs, TreeReply;
+    RefsList, "refs.list", Read, RefsListArgs, RefsListReply;
+    Compare, "compare", Read, CompareArgs, CompareReply;
+    Search, "search", Read, SearchArgs, SearchReply;
+    Archive, "archive", Read, ArchiveArgs, ArchiveReply;
+    EventsTail, "events.tail", Read, EventsTailArgs, EventsTailReply;
+    RepoInit, "repo.init", Admin, RepoInitArgs, RepoInitReply;
+    RepoDelete, "repo.delete", Admin, RepoDeleteArgs, RepoDeleteReply;
+    RepoRename, "repo.rename", Admin, RepoRenameArgs, RepoRenameReply;
+    RepoFork, "repo.fork", Admin, RepoForkArgs, RepoForkReply;
+    RemoteRefs, "remote.refs", Read, RemoteRefsArgs, RemoteRefsReply;
+    ClaimRenew, "claim.renew", Mutation, Mutation<ClaimRenewArgs>, ClaimRenewReply;
+    PolicySet, "policy.set", Mutation, Mutation<PolicySetArgs>, PolicySetReply;
+    ReleaseFreezeSet, "release.freeze.set", Mutation, Mutation<ReleaseFreezeSetArgs>, ReleaseFreezeSetReply;
+    ReleaseFreezeClear, "release.freeze.clear", Mutation, Mutation<ReleaseFreezeClearArgs>, ReleaseFreezeClearReply;
 }
 
 // ---------------------------------------------------------------------------
@@ -3625,17 +4484,27 @@ pub fn control_frame_len(prefix: [u8; FRAME_PREFIX_BYTES]) -> Result<usize, Core
 // ---------------------------------------------------------------------------
 
 impl AttestStatement {
-    /// The canonical payload that is signed (namespace `ruk-attest`): seven
-    /// length-prefixed fields (4-byte big-endian length each) in this order:
-    /// domain separator, object format name, exact OID bytes, kind, result,
-    /// UTC timestamp text, and the superseded statement digest (empty when
-    /// the statement supersedes nothing; otherwise exactly 32 bytes, so
+    /// The canonical v1 payload that is signed (namespace `ruk-attest`):
+    /// seven length-prefixed fields (4-byte big-endian length each) in this
+    /// order: domain separator, object format name, exact OID bytes, kind,
+    /// result, UTC timestamp text, and the superseded statement digest (empty
+    /// when the statement supersedes nothing; otherwise exactly 32 bytes, so
     /// absence and presence cannot be confused). Length prefixes make the
     /// field boundaries unambiguous: `("a", "bc")` and `("ab", "c")` differ.
     ///
+    /// Only evidenceless statements have a v1 payload: v1 cannot bind
+    /// evidence, so signing one would silently drop it. New signatures cover
+    /// [`Self::canonical_payload_v2`]; v1 stays verifiable for old ones.
+    ///
     /// # Errors
     /// `E_OBJECT_FORMAT` when the subject's width is not `format`'s.
+    /// `E_INVALID` when the statement carries evidence, which v1 cannot bind.
     pub fn canonical_payload_v1(&self, format: HashKind) -> Result<Vec<u8>, CoreError> {
+        if self.evidence.is_some() {
+            return Err(invalid(
+                "an attestation carrying evidence has no v1 payload: sign the v2 payload",
+            ));
+        }
         if self.subject.kind() != format {
             return Err(CoreError::new(
                 ErrorCode::EObjectFormat,
@@ -3660,6 +4529,52 @@ impl AttestStatement {
             superseded,
         ];
         let mut payload = Vec::with_capacity(128);
+        for field in fields {
+            push_field(&mut payload, field)?;
+        }
+        Ok(payload)
+    }
+
+    /// The canonical v2 payload that is signed (namespace `ruk-attest`):
+    /// eight length-prefixed fields (4-byte big-endian length each) in this
+    /// order: the v2 domain separator, object format name, exact OID bytes,
+    /// kind, result, UTC timestamp text, the superseded statement digest,
+    /// and the bound evidence digest. Either digest field is empty when
+    /// absent and exactly 32 bytes when present, so absence and presence
+    /// cannot be confused and `None` differs from a zero digest.
+    ///
+    /// # Errors
+    /// `E_OBJECT_FORMAT` when the subject's width is not `format`'s.
+    pub fn canonical_payload_v2(&self, format: HashKind) -> Result<Vec<u8>, CoreError> {
+        if self.subject.kind() != format {
+            return Err(CoreError::new(
+                ErrorCode::EObjectFormat,
+                format!(
+                    "attestation subject is a {} object but the repository is {format}",
+                    self.subject.kind()
+                ),
+            ));
+        }
+        let timestamp = self.signed_at.to_string();
+        let superseded: &[u8] = match &self.supersedes {
+            Some(digest) => digest.as_bytes(),
+            None => &[],
+        };
+        let evidence: &[u8] = match &self.evidence {
+            Some(digest) => digest.as_bytes(),
+            None => &[],
+        };
+        let fields: [&[u8]; 8] = [
+            ATTEST_PAYLOAD_DOMAIN_V2,
+            format.format_name().as_bytes(),
+            self.subject.as_bytes(),
+            self.kind.as_str().as_bytes(),
+            self.result.as_str().as_bytes(),
+            timestamp.as_bytes(),
+            superseded,
+            evidence,
+        ];
+        let mut payload = Vec::with_capacity(160);
         for field in fields {
             push_field(&mut payload, field)?;
         }
@@ -3705,6 +4620,7 @@ pub fn model_schema_json() -> Schema {
             "page_default": DEFAULT_PAGE_SIZE,
             "page_max": MAX_PAGE_SIZE,
             "claim_ttl_seconds": MAX_CLAIM_TTL_SECONDS,
+            "task_claim_ttl_seconds": MAX_TASK_CLAIM_TTL_SECONDS,
         },
         "framing": {
             "length_prefix_bytes": FRAME_PREFIX_BYTES,
@@ -4017,6 +4933,59 @@ mod tests {
         assert_eq!(log_request(PageRequest::default()).request_id(), None);
     }
 
+    #[test]
+    fn admin_methods_take_no_session_and_no_receipt() {
+        for method in [
+            Method::RepoInit,
+            Method::RepoDelete,
+            Method::RepoRename,
+            Method::RepoFork,
+        ] {
+            assert_eq!(method.kind(), MethodKind::Admin);
+            assert!(!method.is_mutation());
+        }
+        let request = Request::RepoInit(Box::new(RepoInitArgs {
+            root: "default".to_string(),
+            path: "acme/hello".to_string(),
+            object_format: None,
+            default_branch: None,
+        }));
+        assert_eq!(request.request_id(), None);
+        assert_eq!(
+            request.digest_input_v1().expect("digestable"),
+            None,
+            "admin calls leave no digest for receipts"
+        );
+        let mut reply = Reply::RepoInit(Box::new(RepoInitReply {
+            path: "acme/hello".to_string(),
+            store_id: StoreId::generate(),
+            object_format: HashKind::Sha1,
+            default_branch: name("refs/heads/main"),
+        }));
+        assert_eq!(reply.outcome(), None);
+        assert!(reply.outcome_mut().is_none());
+
+        let bare = RequestEnvelope {
+            schema_version: SchemaVersion::current(),
+            session: None,
+            request,
+        };
+        assert!(bare.validate().is_ok());
+        let mut carried = bare.clone();
+        carried.session = Some(session());
+        assert!(carried.validate().is_ok());
+
+        let forbidden = Request::PolicySet(mutation(
+            1,
+            PolicySetArgs {
+                requirements: Vec::new(),
+                trusted_signers: Vec::new(),
+            },
+        ));
+        assert_eq!(forbidden.request_id(), Some(request_id(1)));
+        assert!(forbidden.digest_input_v1().expect("digestable").is_some());
+    }
+
     // ----- paging and inline bounds ---------------------------------------
 
     #[test]
@@ -4043,6 +5012,103 @@ mod tests {
                 "limit {limit}"
             );
         }
+    }
+
+    #[test]
+    fn commit_rev_uses_single_key_ref_or_commit_objects() {
+        let by_ref = CommitRev::Ref(name("refs/heads/main"));
+        let wire = sonic_rs::to_value(&by_ref).expect("json");
+        assert_eq!(wire, json!({"ref": "refs/heads/main"}));
+        let back: CommitRev = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, by_ref);
+
+        let by_id = CommitRev::Commit(oid(9));
+        let wire = sonic_rs::to_value(&by_id).expect("json");
+        assert_eq!(wire, json!({"commit": "09".repeat(20)}));
+        let back: CommitRev = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, by_id);
+
+        assert!(sonic_rs::from_str::<CommitRev>("{\"REF\": \"refs/heads/main\"}").is_err());
+        assert!(by_ref.validate().is_ok());
+        assert!(by_id.validate().is_ok());
+    }
+
+    #[test]
+    fn keyset_pages_are_stateless_and_bounded() {
+        let page = KeysetPage::new(vec![1_u32, 2], Some(ByteString::from("ff00"))).expect("page");
+        assert_eq!(page.next_after, Some(ByteString::from("ff00")));
+        let wire = sonic_rs::to_value(&page).expect("json");
+        assert_eq!(wire, json!({"items": [1, 2], "next_after": "ff00"}));
+        let back: KeysetPage<u32> = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, page);
+
+        let terminal = KeysetPage::new(vec![1_u32], None).expect("terminal");
+        let wire = sonic_rs::to_value(&terminal).expect("json");
+        assert_eq!(wire["next_after"], json!(null));
+        assert!(terminal.validate().is_ok());
+
+        let over = (0..=MAX_PAGE_SIZE).collect::<Vec<_>>();
+        assert_eq!(
+            KeysetPage::new(over, None).expect_err("cap").code,
+            ErrorCode::ELimit
+        );
+    }
+
+    #[test]
+    fn shared_scalars_keep_their_wire_contracts() {
+        let utf8 = ByteString::from("refs/heads/main");
+        assert_eq!(
+            sonic_rs::to_value(&utf8).expect("json"),
+            json!("refs/heads/main")
+        );
+        let raw = ByteString::new(vec![0xff, 0xfe]);
+        assert_eq!(
+            sonic_rs::to_value(&raw).expect("json"),
+            json!({"hex": "fffe"})
+        );
+        let back: ByteString = sonic_rs::from_value(&json!({"hex": "fffe"})).expect("parse");
+        assert_eq!(back, raw);
+
+        let direct = RefTarget::Direct(oid(3));
+        assert_eq!(
+            sonic_rs::to_value(&direct).expect("json"),
+            json!({"direct": "03".repeat(20)})
+        );
+        let symbolic = RefTarget::Symbolic(name("refs/heads/main"));
+        assert_eq!(
+            sonic_rs::to_value(&symbolic).expect("json"),
+            json!({"symbolic": "refs/heads/main"})
+        );
+        assert!(sonic_rs::from_str::<RefTarget>("{\"Direct\": \"00\"}").is_err());
+    }
+
+    #[test]
+    fn events_tail_bounds_reject_over_limit_and_wait() {
+        let args = EventsTailArgs {
+            after: 0,
+            limit: Some(PageLimit::new(1000).expect("max page")),
+            wait_ms: Some(MAX_TAIL_WAIT_MS),
+            prefix: None,
+        };
+        assert!(args.validate().is_ok());
+
+        let over_wait = EventsTailArgs {
+            wait_ms: Some(MAX_TAIL_WAIT_MS + 1),
+            ..args.clone()
+        };
+        assert_eq!(
+            invalid_code(over_wait.validate()),
+            ErrorCode::ELimit,
+            "wait past 30000 ms is refused, not clamped"
+        );
+
+        assert!(PageLimit::new(1001).is_err());
+        let over_limit: Result<EventsTailArgs, _> =
+            sonic_rs::from_str("{\"after\":0,\"limit\":1001}");
+        assert!(over_limit.is_err(), "limit 1001 never decodes");
+        let at_limit: EventsTailArgs =
+            sonic_rs::from_str("{\"after\":0,\"limit\":1000}").expect("limit 1000 decodes");
+        assert!(at_limit.validate().is_ok());
     }
 
     #[test]
@@ -4367,13 +5433,15 @@ mod tests {
     }
 
     #[test]
-    fn claim_lifetimes_are_between_one_second_and_one_hour() {
+    fn claim_lifetimes_are_between_one_second_and_one_day() {
         assert!(ClaimTtl::new(1).is_ok());
         assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS).is_ok());
+        assert!(ClaimTtl::new(MAX_TASK_CLAIM_TTL_SECONDS).is_ok());
         assert!(ClaimTtl::new(0).is_err());
-        assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS + 1).is_err());
+        assert!(ClaimTtl::new(MAX_TASK_CLAIM_TTL_SECONDS + 1).is_err());
         assert!(sonic_rs::from_str::<ClaimTtl>("3600").is_ok());
-        assert!(sonic_rs::from_str::<ClaimTtl>("3601").is_err());
+        assert!(sonic_rs::from_str::<ClaimTtl>("86400").is_ok());
+        assert!(sonic_rs::from_str::<ClaimTtl>("86401").is_err());
         let acquire = |paths: Vec<RepoPath>| {
             Request::ClaimAcquire(mutation(
                 1,
@@ -4381,6 +5449,7 @@ mod tests {
                     paths,
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::default(),
+                    subject: None,
                 },
             ))
             .validate()
@@ -4389,6 +5458,31 @@ mod tests {
         assert!(acquire(vec![]).is_err());
         assert!(acquire(vec![path("src"), path("src")]).is_err());
         assert_eq!(ClaimMode::default(), ClaimMode::Enforce);
+    }
+
+    #[test]
+    fn claim_subject_keys_render_canonically() {
+        let task = ClaimSubject::Task(TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task"));
+        assert_eq!(task.subject_key(), "task:01JATASKKEYEXAMPLE000000001");
+        let change = ClaimSubject::Change(ChangeId::from_bytes([7; 16]));
+        assert_eq!(
+            change.subject_key(),
+            ChangeId::from_bytes([7; 16]).to_string()
+        );
+        assert!(TaskKey::new("has\0nul").is_err());
+        assert!(TaskKey::new("has\nnewline").is_err());
+        let wired = sonic_rs::to_value(&ClaimAcquireArgs {
+            paths: vec![path("src")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+            subject: Some(task),
+        })
+        .expect("subject args encode");
+        let back: ClaimAcquireArgs = sonic_rs::from_value(&wired).expect("subject args decode");
+        assert_eq!(
+            back.subject.expect("subject").subject_key(),
+            "task:01JATASKKEYEXAMPLE000000001"
+        );
     }
 
     #[test]
@@ -4579,6 +5673,7 @@ mod tests {
             result: AttestResult::new(result).expect("result"),
             signed_at: timestamp("2026-10-17T12:00:00Z"),
             supersedes: None,
+            evidence: None,
         }
     }
 
@@ -4642,6 +5737,60 @@ mod tests {
             .canonical_payload_v1(HashKind::Sha256)
             .expect_err("a sha1 subject in a sha256 repository");
         assert_eq!(err.code, ErrorCode::EObjectFormat);
+    }
+
+    #[test]
+    fn attestation_payload_v2_has_eight_fields_and_binds_evidence() {
+        let plain = statement("a", "bc");
+        let payload = plain.canonical_payload_v2(HashKind::Sha1).expect("payload");
+        let fields = split_fields(&payload);
+        assert_eq!(fields.len(), 8);
+        assert_eq!(fields[0], ATTEST_PAYLOAD_DOMAIN_V2);
+        assert_eq!(fields[1], b"sha1");
+        assert_eq!(fields[2], oid(7).as_bytes());
+        assert_eq!(fields[3], b"a");
+        assert_eq!(fields[4], b"bc");
+        assert_eq!(fields[5], b"2026-10-17T12:00:00Z");
+        assert!(fields[6].is_empty());
+        assert!(fields[7].is_empty());
+
+        // The domain bump alone separates the versions: the same statement
+        // signs different bytes under v1 and v2.
+        let v1 = plain
+            .canonical_payload_v1(HashKind::Sha1)
+            .expect("v1 payload");
+        assert_ne!(v1, payload);
+
+        // Evidence is covered: one byte changes the payload.
+        let digest = |byte: u8| StatementDigest::from_bytes([byte; 32]);
+        let bound = |evidence: Option<StatementDigest>| {
+            let mut with = statement("a", "bc");
+            with.evidence = evidence;
+            with.canonical_payload_v2(HashKind::Sha1).expect("payload")
+        };
+        assert_ne!(payload, bound(Some(digest(1))));
+        assert_ne!(bound(Some(digest(1))), bound(Some(digest(2))));
+        // Absence and a zero digest are distinct on the wire.
+        assert_eq!(split_fields(&bound(Some(digest(0))))[7], vec![0_u8; 32]);
+        assert_ne!(payload, bound(Some(digest(0))));
+    }
+
+    #[test]
+    fn attestation_payload_v2_rejects_a_subject_of_the_wrong_object_format() {
+        let err = statement("a", "b")
+            .canonical_payload_v2(HashKind::Sha256)
+            .expect_err("a sha1 subject in a sha256 repository");
+        assert_eq!(err.code, ErrorCode::EObjectFormat);
+    }
+
+    #[test]
+    fn attestation_payload_v1_refuses_a_statement_carrying_evidence() {
+        let mut with = statement("a", "b");
+        with.evidence = Some(StatementDigest::from_bytes([9; 32]));
+        let err = with
+            .canonical_payload_v1(HashKind::Sha1)
+            .expect_err("v1 cannot bind evidence");
+        assert_eq!(err.code, ErrorCode::EInvalid);
     }
 
     #[test]
@@ -4880,6 +6029,10 @@ mod tests {
             paths: vec![path("src")],
             mode: ClaimMode::Advise,
             expires_at: timestamp("2026-10-17T13:00:00Z"),
+            on_behalf_of: None,
+            subject: Some(ClaimSubject::Task(
+                TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+            )),
         };
         let release = Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: sample_outcome(),
@@ -5331,6 +6484,7 @@ mod tests {
         assert_eq!(doc["limits"]["page_default"], 100);
         assert_eq!(doc["limits"]["page_max"], 1000);
         assert_eq!(doc["limits"]["claim_ttl_seconds"], 3600);
+        assert_eq!(doc["limits"]["task_claim_ttl_seconds"], 24 * 3600);
         assert_eq!(doc["framing"]["length_prefix_bytes"], 4);
         let registry = doc["error_codes"].as_array().expect("error codes");
         assert_eq!(registry.len(), ErrorCode::ALL.len());
@@ -5380,7 +6534,7 @@ mod tests {
                 MethodKind::Read => {
                     assert!(result_fields.contains_key(&"view"), "{}", method.as_str());
                 }
-                MethodKind::Anonymous | MethodKind::Bootstrap => {}
+                MethodKind::Anonymous | MethodKind::Bootstrap | MethodKind::Admin => {}
             }
         }
     }
@@ -5429,9 +6583,9 @@ mod tests {
             assert_eq!(method.is_mutation(), method.kind() == MethodKind::Mutation);
         }
         let required = [
+            "schema",
             "session.open",
             "session.resume",
-            "schema",
             "ws.new",
             "ws.scope",
             "ws.take",
@@ -5476,10 +6630,66 @@ mod tests {
             "blame",
             "query",
             "git.commit",
+            "repo.stat",
+            "tree",
+            "refs.list",
+            "compare",
+            "search",
+            "archive",
+            "events.tail",
+            "repo.init",
+            "repo.delete",
+            "repo.rename",
+            "repo.fork",
+            "remote.refs",
+            "claim.renew",
+            "policy.set",
+            "release.freeze.set",
+            "release.freeze.clear",
         ];
         for method in required {
             assert!(names.contains(method), "missing method {method}");
         }
         assert_eq!(names.len(), required.len(), "methods beyond the contract");
+        // Order is part of the contract: a method's position in the table is
+        // its discriminant, so a reordered row changes the wire.
+        assert!(
+            Method::ALL
+                .iter()
+                .copied()
+                .map(Method::as_str)
+                .eq(required.iter().copied()),
+            "method table order differs from the contract order"
+        );
+    }
+
+    #[test]
+    fn release_freeze_args_require_tag_namespace_and_owner() {
+        let target = Oid::from_bytes(&[0x11; 20]).expect("freeze target");
+        let frozen_at = Timestamp::new(jiff::Timestamp::UNIX_EPOCH);
+        let tag = RefName::new("refs/tags/v1").expect("tag name");
+        let branch = RefName::new("refs/heads/main").expect("branch name");
+        let set = |name: RefName, owner: &str| ReleaseFreezeSetArgs {
+            name,
+            owner_release_id: owner.to_owned(),
+            target_oid: target,
+            frozen_at,
+        };
+        assert!(set(tag.clone(), "rel-1").validate().is_ok());
+        let err = set(branch.clone(), "rel-1")
+            .validate()
+            .expect_err("namespace");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = set(tag.clone(), "").validate().expect_err("owner");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let clear = |name: RefName, owner: &str| ReleaseFreezeClearArgs {
+            name,
+            owner_release_id: owner.to_owned(),
+        };
+        assert!(clear(tag.clone(), "rel-1").validate().is_ok());
+        let err = clear(branch, "rel-1").validate().expect_err("namespace");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = clear(tag, "").validate().expect_err("owner");
+        assert_eq!(err.code, ErrorCode::EInvalid);
     }
 }
