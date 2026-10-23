@@ -18,11 +18,11 @@ use redb::{
 use std::sync::Arc;
 
 use super::error::StoreError;
-use super::metadata::{FactPage, FactPageBudget, FactRow, Metadata, PublicationTxn};
+use super::metadata::{FactPageBudget, Metadata, PublicationTxn};
 use super::types::{
     FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, SegmentManifest,
 };
-use super::{PreparationBudget, Store};
+use super::{EventContext, EventSource, PreparationBudget, Store};
 use crate::ids::{HashKind, Oid};
 
 const RAW_OBJECTS: TableDefinition<'static, &'static [u8], &'static [u8]> =
@@ -33,7 +33,7 @@ const RAW_VERIFIED: TableDefinition<'static, (), u64> = TableDefinition::new("ve
 
 /// The census of the core contract, spelled independently of the code under
 /// test: every table a store must contain, and no other.
-const CENSUS: [&str; 32] = [
+const CENSUS: [&str; 37] = [
     "objects",
     "commits",
     "changes",
@@ -66,6 +66,11 @@ const CENSUS: [&str; 32] = [
     "reflogs",
     "lfs_objects",
     "pending_reservations",
+    "events",
+    "event_head",
+    "service_receipts",
+    "repo_meta",
+    "released_tags",
 ];
 
 fn every_fact_table() -> Vec<FactTable> {
@@ -97,6 +102,11 @@ fn every_fact_table() -> Vec<FactTable> {
         FactTable::Shallow,
         FactTable::Pins,
         FactTable::LfsObjects,
+        FactTable::Events,
+        FactTable::EventHead,
+        FactTable::ServiceReceipts,
+        FactTable::RepoMeta,
+        FactTable::ReleasedTags,
     ];
     // A new variant fails to compile here until it is listed above.
     for table in &all {
@@ -127,7 +137,12 @@ fn every_fact_table() -> Vec<FactTable> {
             | FactTable::Promisor
             | FactTable::Shallow
             | FactTable::Pins
-            | FactTable::LfsObjects => {}
+            | FactTable::LfsObjects
+            | FactTable::Events
+            | FactTable::EventHead
+            | FactTable::ServiceReceipts
+            | FactTable::RepoMeta
+            | FactTable::ReleasedTags => {}
         }
     }
     all
@@ -449,7 +464,7 @@ fn create_initializes_the_complete_census_and_generation_zero() {
 
     let reopened = reopen(&dir);
     let tables = every_fact_table();
-    assert_eq!(tables.len(), 27);
+    assert_eq!(tables.len(), 32);
     assert_eq!(tables, FactTable::ALL.to_vec(), "FactTable::ALL drifted");
     for table in tables {
         assert!(CENSUS.contains(&table.table_name()), "{table:?}");
@@ -614,6 +629,77 @@ fn open_accepts_a_store_predating_the_verified_generation_table_as_unverified() 
     assert_eq!(
         meta.verified_generation().expect("verified generation"),
         Some(7)
+    );
+}
+
+#[test]
+fn open_predating_the_events_census_creates_new_tables_empty() {
+    const NEW_TABLES: [&str; 5] = [
+        "events",
+        "event_head",
+        "service_receipts",
+        "repo_meta",
+        "released_tags",
+    ];
+    let dir = TestDir::new("open-old-census");
+    drop(create(&dir));
+    {
+        let db = Database::open(dir.meta_path()).expect("raw open");
+        let txn = db.begin_write().expect("raw write");
+        for name in NEW_TABLES {
+            let table: TableDefinition<'static, &'static [u8], &'static [u8]> =
+                TableDefinition::new(name);
+            assert!(
+                txn.delete_table(table).expect("delete table"),
+                "the census created {name}"
+            );
+        }
+        txn.commit().expect("raw commit");
+    }
+    let meta = reopen(&dir);
+    for table in [
+        FactTable::Events,
+        FactTable::EventHead,
+        FactTable::ServiceReceipts,
+        FactTable::RepoMeta,
+        FactTable::ReleasedTags,
+    ] {
+        assert_eq!(
+            read_fact(&meta, table, b"refs/tags/v1"),
+            None,
+            "no backfill: {table:?} opens empty"
+        );
+    }
+    publish(
+        &meta,
+        &[put(FactTable::ReleasedTags, b"refs/tags/v1", b"marker")],
+    );
+    assert_eq!(
+        read_fact(&meta, FactTable::ReleasedTags, b"refs/tags/v1"),
+        Some(b"marker".to_vec())
+    );
+    publish(
+        &meta,
+        &[put(
+            FactTable::Events,
+            b"\x00\x00\x00\x00\x00\x00\x00\x01",
+            b"e",
+        )],
+    );
+    assert_eq!(
+        read_fact(
+            &meta,
+            FactTable::Events,
+            b"\x00\x00\x00\x00\x00\x00\x00\x01"
+        ),
+        Some(b"e".to_vec())
+    );
+    drop(meta);
+    let reopened = reopen(&dir);
+    assert_eq!(
+        read_fact(&reopened, FactTable::ReleasedTags, b"refs/tags/v1"),
+        Some(b"marker".to_vec()),
+        "created-empty tables persist across reopen"
     );
 }
 
@@ -1558,6 +1644,64 @@ fn fact_page_exact_budget_eof_versus_another_row() {
 }
 
 #[test]
+fn fact_page_prefixed_omitted_matching_row_reports_more() {
+    let dir = TestDir::new("fact-page-prefixed-omitted-more");
+    let meta = create(&dir);
+    publish(
+        &meta,
+        &[
+            put(FactTable::Refs, b"p/a", b"v1"),
+            put(FactTable::Refs, b"p/b", b"v2"),
+            put(FactTable::Refs, b"q/z", b"v3"),
+        ],
+    );
+
+    // Each row costs 5 bytes (3 key + 2 value). A 9-byte budget returns the
+    // first match and omits the second; the omitted row still matches the
+    // prefix, so more must be true even though the row after it does not.
+    let page = meta
+        .fact_page_prefixed(FactTable::Refs, None, b"p/", FactPageBudget::new(10, 9))
+        .expect("prefixed page");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].key, b"p/a");
+    assert!(page.more, "omitted matching row means more remain");
+
+    // The continuation returns the omitted row; nothing follows under the
+    // prefix, so more is false.
+    let next = meta
+        .fact_page_prefixed(
+            FactTable::Refs,
+            Some(b"p/a"),
+            b"p/",
+            FactPageBudget::new(10, 1024),
+        )
+        .expect("continuation page");
+    assert_eq!(next.rows.len(), 1);
+    assert_eq!(next.rows[0].key, b"p/b");
+    assert!(!next.more);
+
+    // Same omission at end of table: no row follows the omitted match.
+    let dir_eof = TestDir::new("fact-page-prefixed-omitted-eof");
+    let meta_eof = create(&dir_eof);
+    publish(
+        &meta_eof,
+        &[
+            put(FactTable::Refs, b"p/a", b"v1"),
+            put(FactTable::Refs, b"p/b", b"v2"),
+        ],
+    );
+    let page_eof = meta_eof
+        .fact_page_prefixed(FactTable::Refs, None, b"p/", FactPageBudget::new(10, 9))
+        .expect("prefixed page at eof");
+    assert_eq!(page_eof.rows.len(), 1);
+    assert_eq!(page_eof.rows[0].key, b"p/a");
+    assert!(
+        page_eof.more,
+        "omitted final matching row means more remain"
+    );
+}
+
+#[test]
 fn fact_page_counts_both_key_and_value_bytes() {
     let dir = TestDir::new("fact-page-key-bytes");
     let meta = create(&dir);
@@ -1774,7 +1918,14 @@ fn fact_page_refuses_when_store_is_quarantined() {
         FactExpectation::Absent,
         some(b"hash1"),
     )];
-    store.publish(vec![], &facts).expect("publish fact");
+    store
+        .publish(
+            vec![],
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish fact");
 
     // Verify healthy fact_page works through Store.
     let page = store

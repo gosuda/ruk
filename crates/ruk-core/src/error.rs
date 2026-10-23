@@ -1,7 +1,7 @@
 //! Typed error surface and the native exit-code class map.
 //!
 //! The closed error-code set is fixed by the core contract; a new code
-//! arrives only through a schema revision. The Forgejo contract's extra
+//! arrives only through a schema revision. The hosted contract's extra
 //! outcomes (unsupported command family, syntax worker unhealthy, stale
 //! preview tuple, stale conversion inventory, invalid mode, notebook
 //! structure declined) are carried by these codes and the typed merge

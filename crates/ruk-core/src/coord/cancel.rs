@@ -36,7 +36,6 @@ pub struct Cancel {
 }
 
 /// Creates a new cancellation pair starting in the uncancelled state.
-#[must_use]
 pub fn cancellation() -> (CancelHandle, Cancel) {
     let (sender, receiver) = watch::channel(false);
     (CancelHandle { sender }, Cancel { receiver })
@@ -80,7 +79,7 @@ impl Cancel {
     ///
     /// If the channel is already cancelled prior to this call, returns immediately.
     /// Channel closure is treated as cancellation and unblocks without spinning or panicking.
-    pub(crate) async fn cancelled(&mut self) {
+    pub async fn cancelled(&mut self) {
         if self.is_cancelled() {
             return;
         }

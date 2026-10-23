@@ -17,7 +17,6 @@
 use std::collections::HashMap;
 
 use super::host::{ComposedOutcome, ComposedRequest};
-use crate::bytes::ByteString;
 use crate::merge::composed::{MergeMode, MergeNotice, MergeNotices, NoticeCode, NoticeCollector};
 use crate::merge::syntax::{
     Cancel, DeclineReason, GrammarRegistry, Language, MAX_TRIPLET_BYTES, SyntaxError,
@@ -32,7 +31,7 @@ pub const MAX_FENCED_REGIONS: usize = 256;
 /// Returns `None` for absent, unknown, or bare `sh` labels without sniffing.
 #[must_use]
 pub fn language_for_fence_info(info: &str) -> Option<Language> {
-    let label = info.trim().split_whitespace().next()?;
+    let label = info.split_whitespace().next()?;
     let lower = label.to_ascii_lowercase();
     match lower.as_str() {
         "js" | "javascript" | "jsx" => Some(Language::Javascript),
@@ -508,7 +507,7 @@ fn parse_markdown_units(source: &[u8]) -> Result<Vec<MdUnit>, SyntaxError> {
 
             while active_headings
                 .last()
-                .map_or(false, |(lvl, _, _)| *lvl >= level)
+                .is_some_and(|(lvl, _, _)| *lvl >= level)
             {
                 active_headings.pop();
             }
@@ -781,10 +780,10 @@ fn fence_span_end(
     side_len: usize,
 ) -> usize {
     for next_base in &base_units[(base_idx + 1)..] {
-        if let Some(pos) = side_map.get(next_base.key()).copied() {
-            if pos > match_pos {
-                return pos;
-            }
+        if let Some(pos) = side_map.get(next_base.key()).copied()
+            && pos > match_pos
+        {
+            return pos;
         }
     }
     side_len
@@ -1218,6 +1217,7 @@ pub fn merge_markdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytes::ByteString;
     use crate::merge::syntax::treesitter::registry_providers;
 
     fn setup_test_registry<'a>(

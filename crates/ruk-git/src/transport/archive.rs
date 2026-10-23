@@ -59,6 +59,8 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::RefTarget;
 use ruk_core::store::types::ObjectKind;
 use ruk_core::store::{ChunkDecision, Store};
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 
 use super::pack::object_links;
 use super::pktline::{Packet, PktReader, encode_data, encode_flush, send};
@@ -165,9 +167,7 @@ pub fn serve_upload_archive<R: Read, W: Write>(
     let mut ack = Vec::new();
     encode_data(&mut ack, b"ACK\n")?;
     encode_flush(&mut ack);
-    if let Err(err) = send(&mut writer, &ack) {
-        return Err(err);
-    }
+    send(&mut writer, &ack)?;
     let (root, mtime, commit) = match resolved {
         Resolved::Commit {
             tree,
@@ -189,10 +189,10 @@ pub fn serve_upload_archive<R: Read, W: Write>(
         pending: Vec::new(),
         interrupt,
     };
-    if let Some(commit) = commit {
-        if let Err(err) = walk.tar.emit_global(commit) {
-            return stream_failed(walk, err);
-        }
+    if let Some(commit) = commit
+        && let Err(err) = walk.tar.emit_global(commit)
+    {
+        return stream_failed(walk, err);
     }
     if let Err(err) = walk.walk_tree(root, b"") {
         return stream_failed(walk, err);
@@ -261,13 +261,13 @@ fn parse_arguments(args: &[Vec<u8>]) -> Result<ArchiveRequest, GitError> {
             rev = Some(text.to_owned());
         }
     }
-    if let Some(name) = &format {
-        if name.as_slice() != &b"tar"[..] {
-            return Err(unsupported(format!(
-                "archive format {}",
-                name.escape_ascii()
-            )));
-        }
+    if let Some(name) = &format
+        && name.as_slice() != &b"tar"[..]
+    {
+        return Err(unsupported(format!(
+            "archive format {}",
+            name.escape_ascii()
+        )));
     }
     rev.map(|rev| ArchiveRequest { rev })
         .ok_or_else(|| corrupt("archive needs one revision"))
@@ -384,10 +384,10 @@ fn commit_mtime(bytes: &[u8], oid: Oid) -> Result<u64, GitError> {
             let fields: Vec<&[u8]> = rest.split(|b| *b == b' ').collect();
             if fields.len() >= 2 {
                 let stamp = fields[fields.len() - 2];
-                if let Ok(text) = std::str::from_utf8(stamp) {
-                    if let Ok(value) = text.parse::<u64>() {
-                        mtime = Some(value);
-                    }
+                if let Ok(text) = std::str::from_utf8(stamp)
+                    && let Ok(value) = text.parse::<u64>()
+                {
+                    mtime = Some(value);
                 }
             }
         }
@@ -891,7 +891,14 @@ mod tests {
         let len = u64::try_from(bytes.len()).expect("fixture fits");
         let prepared = store.prepare(kind, len, bytes, None).expect("prepare");
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
         oid
     }
 
@@ -904,7 +911,12 @@ mod tests {
         let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
         let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
         store
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish ref");
     }
 
@@ -1409,6 +1421,7 @@ mod tests {
             fx.kind,
             &fx.head,
             &Interrupt::none(),
+            &super::super::policy::NoPolicy,
         )
         .expect("dispatch");
         assert!(out.starts_with(b"0008ACK\n0000"), "dispatched framing");
@@ -1421,6 +1434,7 @@ mod tests {
             fx.kind,
             &fx.head,
             &Interrupt::none(),
+            &super::super::policy::NoPolicy,
         )
         .expect_err("unknown command");
         assert!(matches!(err, GitError::Unsupported { .. }), "{err:?}");

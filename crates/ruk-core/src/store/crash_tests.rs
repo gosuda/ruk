@@ -128,7 +128,9 @@ use crate::store::types::{
     FactExpectation, FactMutation, FactTable, ObjectKind, ObjectLocation, PreparedObject,
     SegmentManifest,
 };
-use crate::store::{META_FILE, PreparationBudget, SEGMENTS_DIR, Store, StoreError};
+use crate::store::{
+    EventContext, EventSource, META_FILE, PreparationBudget, SEGMENTS_DIR, Store, StoreError,
+};
 
 // ---------------------------------------------------------------------------
 // Child process contract
@@ -548,7 +550,12 @@ fn child_publish_blob_fact(args: &[String]) -> i32 {
         FactExpectation::Absent,
         Some(oid.as_bytes()),
     )];
-    match store.publish(vec![prepared], &facts) {
+    match store.publish(
+        vec![prepared],
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Ok(_) => acknowledge(&root, "a"),
         Err(_) => EXIT_STORE,
     }
@@ -578,7 +585,12 @@ fn child_publish_capacity_probe(args: &[String]) -> i32 {
         FactExpectation::Absent,
         Some(oid.as_bytes()),
     )];
-    match store.publish(vec![prepared], &facts) {
+    match store.publish(
+        vec![prepared],
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Ok(_) => acknowledge(&root, "a"),
         Err(_) => EXIT_STORE,
     }
@@ -606,7 +618,12 @@ fn child_publish_two_serial(args: &[String]) -> i32 {
         FactExpectation::Absent,
         Some(oid_a.as_bytes()),
     )];
-    match store.publish(vec![prepared_a], &facts_a) {
+    match store.publish(
+        vec![prepared_a],
+        &facts_a,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Ok(_) => {}
         Err(_) => return EXIT_STORE,
     }
@@ -624,7 +641,12 @@ fn child_publish_two_serial(args: &[String]) -> i32 {
         FactExpectation::Absent,
         Some(oid_b.as_bytes()),
     )];
-    match store.publish(vec![prepared_b], &facts_b) {
+    match store.publish(
+        vec![prepared_b],
+        &facts_b,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Ok(_) => acknowledge(&root, "b"),
         Err(_) => EXIT_STORE,
     }
@@ -661,7 +683,12 @@ fn child_publish_two_racing(args: &[String]) -> i32 {
                 FactExpectation::Absent,
                 Some(oid_a.as_bytes()),
             )];
-            match store.publish(vec![prepared_a], &facts) {
+            match store.publish(
+                vec![prepared_a],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ) {
                 Ok(_) => {
                     if write_ack_marker(ack_dir, "a").is_err() {
                         EXIT_STORE
@@ -680,7 +707,12 @@ fn child_publish_two_racing(args: &[String]) -> i32 {
                 FactExpectation::Absent,
                 Some(oid_b.as_bytes()),
             )];
-            match store.publish(vec![prepared_b], &facts) {
+            match store.publish(
+                vec![prepared_b],
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            ) {
                 Ok(_) => {
                     if write_ack_marker(ack_dir, "b").is_err() {
                         EXIT_STORE
@@ -735,7 +767,12 @@ fn child_publish_mixed_conflict(args: &[String]) -> i32 {
         FactExpectation::Absent,
         Some(conflict_oid.as_bytes()),
     )];
-    match store.publish(vec![prepared_blob, prepared_conflict], &facts) {
+    match store.publish(
+        vec![prepared_blob, prepared_conflict],
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Ok(_) => acknowledge(&root, "mixed"),
         Err(_) => EXIT_STORE,
     }
@@ -763,7 +800,15 @@ fn child_publish_seal_boundary(args: &[String]) -> i32 {
         FactExpectation::Absent,
         Some(oid_a.as_bytes()),
     )];
-    if store.publish(vec![prepared_a], &facts_a).is_err() {
+    if store
+        .publish(
+            vec![prepared_a],
+            &facts_a,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .is_err()
+    {
         return EXIT_STORE;
     }
     let code = acknowledge(&root, "a");
@@ -781,7 +826,12 @@ fn child_publish_seal_boundary(args: &[String]) -> i32 {
         FactExpectation::Absent,
         Some(oid.as_bytes()),
     )];
-    match store.publish(vec![prepared], &facts) {
+    match store.publish(
+        vec![prepared],
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Ok(_) => acknowledge(&root, "sealed"),
         Err(_) => EXIT_STORE,
     }
@@ -1141,7 +1191,12 @@ fn publish_small_blob(store: &Store, kind: HashKind, payload: &[u8], key: &[u8])
         Some(oid.as_bytes()),
     )];
     store
-        .publish(vec![prepared], &facts)
+        .publish(
+            vec![prepared],
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish a small blob");
     oid
 }
@@ -1296,7 +1351,12 @@ fn assert_precommit_kill_leaves_absence(kind: HashKind, point: &str) {
         FactExpectation::Absent,
         Some(oid.as_bytes()),
     )];
-    match store.publish(vec![prepared], &facts) {
+    match store.publish(
+        vec![prepared],
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Err(StoreError::StaleFact { .. }) => {}
         other => panic!(
             "{context}: duplicate same-path fact row must be refused with a stale \
@@ -1561,7 +1621,12 @@ fn corrupt_committed_bytes_refuse_service() {
         ),
     }
     match store.prepare(ObjectKind::Blob, len_u64(BLOB_B), BLOB_B, None) {
-        Ok(prepared) => match store.publish(vec![prepared], &[]) {
+        Ok(prepared) => match store.publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        ) {
             Err(StoreError::Corrupt(_)) => {}
             other => panic!(
                 "publication must refuse under quarantine, got ok={}",
@@ -1714,7 +1779,12 @@ fn unknown_scratch_and_segment_files_survive_recovery() {
         Some(oid.as_bytes()),
     )];
     store
-        .publish(vec![prepared], &facts)
+        .publish(
+            vec![prepared],
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish alongside unknown files");
     assert_bytes(&store, oid, ObjectKind::Blob, BLOB_B).expect("new publication readable");
     assert_eq!(
@@ -1770,7 +1840,12 @@ fn concurrent_preparation_and_serial_publications_roundtrip() {
         })
         .collect();
     let publication = store
-        .publish(prepared, &facts)
+        .publish(
+            prepared,
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("one atomic four-object publication");
     assert!(publication.generation >= 1, "publication bumps generation");
     for (index, payload) in C1_PAYLOADS.iter().enumerate() {
@@ -1793,7 +1868,14 @@ fn concurrent_preparation_and_serial_publications_roundtrip() {
                 FactExpectation::Absent,
                 Some(oid.as_bytes()),
             )];
-            store.publish(vec![prepared], &facts).map(|_| ())
+            store
+                .publish(
+                    vec![prepared],
+                    &facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .map(|_| ())
         });
         let second = scope.spawn(move || -> Result<(), StoreError> {
             let prepared = store.prepare(ObjectKind::Blob, len_u64(BLOB_B), BLOB_B, None)?;
@@ -1804,7 +1886,14 @@ fn concurrent_preparation_and_serial_publications_roundtrip() {
                 FactExpectation::Absent,
                 Some(oid.as_bytes()),
             )];
-            store.publish(vec![prepared], &facts).map(|_| ())
+            store
+                .publish(
+                    vec![prepared],
+                    &facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .map(|_| ())
         });
         vec![
             first.join().expect("concurrent publish thread A"),
@@ -1874,7 +1963,12 @@ fn concurrent_publications_are_atomic_under_crash() {
         Some(oid.as_bytes()),
     )];
     store
-        .publish(vec![prepared], &facts)
+        .publish(
+            vec![prepared],
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("publish on the recovered racing store");
     assert_bytes(&store, oid, ObjectKind::Blob, BLOB_A).expect("recovered store publishes");
     drop(store);
@@ -2048,7 +2142,12 @@ fn assert_mixed_absent(root: &Path, kind: HashKind, context: &str) {
         Some(conflict.as_bytes()),
     )];
     store
-        .publish(vec![prepared_blob, prepared_conflict], &facts)
+        .publish(
+            vec![prepared_blob, prepared_conflict],
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("republish the mixed set on the recovered store");
     assert_eq!(
         mixed_presence(&store, blob, conflict),
@@ -2377,12 +2476,22 @@ fn stale_expectations_reject_atomically_without_duplicate_rows() {
         Some(oid.as_bytes()),
     )];
     store
-        .publish(vec![prepared], &refs_facts)
+        .publish(
+            vec![prepared],
+            &refs_facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("initial publication");
     let duplicate = store
         .prepare(ObjectKind::Blob, len_u64(BLOB_A), BLOB_A, None)
         .expect("prepare for duplicate probe");
-    match store.publish(vec![duplicate], &refs_facts) {
+    match store.publish(
+        vec![duplicate],
+        &refs_facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Err(StoreError::StaleFact { .. }) => {}
         other => panic!(
             "duplicate same-path fact row must be refused with a stale \
@@ -2402,7 +2511,12 @@ fn stale_expectations_reject_atomically_without_duplicate_rows() {
         FactExpectation::Value(b"wrong".to_vec()),
         Some(b"right"),
     )];
-    match store.publish(Vec::new(), &wrong_value) {
+    match store.publish(
+        Vec::new(),
+        &wrong_value,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Err(StoreError::StaleFact { .. }) => {}
         other => panic!(
             "wrong value expectation must be refused, got ok={}",
@@ -2428,7 +2542,12 @@ fn stale_expectations_reject_atomically_without_duplicate_rows() {
             Some(b"second"),
         ),
     ];
-    match store.publish(Vec::new(), &duplicate_batch) {
+    match store.publish(
+        Vec::new(),
+        &duplicate_batch,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         Err(StoreError::Invalid(_)) => {}
         other => panic!(
             "duplicate (table, key) inside one publish batch must be rejected \
@@ -2450,7 +2569,12 @@ fn stale_expectations_reject_atomically_without_duplicate_rows() {
         Some(b"right"),
     )];
     store
-        .publish(Vec::new(), &insert)
+        .publish(
+            Vec::new(),
+            &insert,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("satisfied insert");
     assert_eq!(
         store.fact(FactTable::Claims, CLAIM_KEY).expect("fact read"),
@@ -2464,7 +2588,12 @@ fn stale_expectations_reject_atomically_without_duplicate_rows() {
         None,
     )];
     store
-        .publish(Vec::new(), &remove)
+        .publish(
+            Vec::new(),
+            &remove,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect("satisfied remove");
     assert_eq!(
         store.fact(FactTable::Claims, CLAIM_KEY).expect("fact read"),

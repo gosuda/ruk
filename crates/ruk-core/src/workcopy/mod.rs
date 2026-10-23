@@ -38,7 +38,21 @@ pub(crate) mod lfs;
 pub(crate) mod snapshot;
 pub(crate) mod statcache;
 pub(crate) mod tree;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired subsystem; consumers land in later changeset rows"
+    )
+)]
 pub(crate) mod watcher;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired subsystem; consumers land in later changeset rows"
+    )
+)]
 pub(crate) mod write;
 
 #[cfg(test)]
@@ -142,10 +156,13 @@ pub(crate) fn scan_prefix(
     }
 }
 
+/// Keyed mutations for one publication: table and key select the row.
+type FactSetRows = BTreeMap<(FactTable, Vec<u8>), (FactExpectation, Option<Vec<u8>>)>;
+
 /// Mutations keyed by table and key, so a publication never names one key
 /// twice. A later insertion for the same key replaces the earlier one.
 #[derive(Default)]
-pub(crate) struct FactSet(BTreeMap<(FactTable, Vec<u8>), (FactExpectation, Option<Vec<u8>>)>);
+pub(crate) struct FactSet(FactSetRows);
 
 impl fmt::Debug for FactSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -155,6 +172,13 @@ impl fmt::Debug for FactSet {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired snapshot/write path; consumers land in later changeset rows"
+    )
+)]
 impl FactSet {
     pub(crate) fn push(&mut self, fact: FactMutation) {
         self.0

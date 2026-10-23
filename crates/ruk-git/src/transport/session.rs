@@ -29,8 +29,8 @@ use ruk_core::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
 use ruk_core::refs::{StoreRefs, page_refs, prepare_checked_transaction};
-use ruk_core::store::types::{ObjectKind, Publication};
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::types::{ObjectKind, Publication, RefEvent};
+use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 
 use super::fetch::observation_mutations;
 use super::fetch::{Filter, promisor_facts, shallow_facts};
@@ -249,6 +249,10 @@ pub struct FetchReport {
 /// # Errors
 /// Closure, ingest, verification and store failures; nothing is published
 /// on failure.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the local-fetch call shape: stores, request, tracking, mutations, limits, and interrupt"
+)]
 pub fn local_fetch(
     dest: &Store,
     src: &Store,
@@ -308,7 +312,12 @@ pub fn local_fetch(
     let records_ms = records_start
         .map(|start| start.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
-    let publication = dest.publish(staged.into_objects(), &facts)?;
+    let publication = dest.publish(
+        staged.into_objects(),
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )?;
     if let Some(start) = fetch_start {
         eprintln!(
             "[ruk-profile] local_fetch objects={object_count} raw_bytes={raw_bytes} closure={closure_ms:.1}ms stage={stage_ms:.1}ms verify={verify_ms:.1}ms records={records_ms:.1}ms local_fast=1 total={:.1}ms",
@@ -518,7 +527,7 @@ fn local_closure_scoped(
             let links = match read {
                 Ok((ObjectKind::Commit, _, links)) => links,
                 Ok(_) => continue,
-                Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+                Err(GitError::NotFound { .. }) => continue,
                 Err(err) => return Err(err),
             };
             frontier.extend(links.parents.iter().copied());
@@ -596,7 +605,7 @@ fn local_closure_scoped(
             .unwrap_or(0.0);
     }
     let sort_start = profile.then(std::time::Instant::now);
-    objects.sort_by(|a, b| a.0.cmp(&b.0));
+    objects.sort_by_key(|a| a.0);
     let sort_ms = sort_start
         .map(|start| start.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
@@ -654,7 +663,12 @@ fn persist_plan(
     kind: HashKind,
     previous: Option<Vec<u8>>,
 ) -> Result<(), GitError> {
-    store.publish(Vec::new(), &[plan.persist_mutation(kind, previous)?])?;
+    store.publish(
+        Vec::new(),
+        &[plan.persist_mutation(kind, previous)?],
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )?;
     Ok(())
 }
 
@@ -667,7 +681,12 @@ fn persist_plan_best_effort(store: &Store, plan: &PushPlanRecord, kind: HashKind
         .ok()
         .flatten();
     if let Ok(mutation) = plan.persist_mutation(kind, current) {
-        let _ = store.publish(Vec::new(), &[mutation]);
+        let _ = store.publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        );
     }
 }
 
@@ -759,9 +778,14 @@ fn local_push_inner(
         let staged: StagedPack =
             ingest_pack(&pack[..], kind, dest, IngestLimits::default(), interrupt)?;
         let facts = super::fetch::commit_record_facts(dest, &staged)?;
-        dest.publish(staged.into_objects(), &facts)?;
+        dest.publish(
+            staged.into_objects(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
     }
-    let mut report = apply_refs(dest, kind, &live, req.atomic)?;
+    let (mut report, _) = apply_refs(dest, kind, &live, req.atomic, None)?;
     report.extend(outcomes);
     plan.finalize(report.clone())?;
     persist_plan(dest, plan, kind, plan_encoding(dest, plan)?)?;
@@ -780,7 +804,12 @@ pub(crate) fn apply_refs(
     kind: HashKind,
     live: &[&PushUpdate],
     atomic: bool,
-) -> Result<Vec<RefOutcome>, GitError> {
+    on_behalf_of: Option<&str>,
+) -> Result<(Vec<RefOutcome>, Vec<RefEvent>), GitError> {
+    let context = EventContext {
+        on_behalf_of: on_behalf_of.map(str::to_owned),
+        ..EventContext::default()
+    };
     let zero = kind.zero_oid();
     let to_update = |update: &PushUpdate| -> Result<RefUpdate, GitError> {
         let name = RefName::new(update.name.clone()).map_err(|err| GitError::Invalid {
@@ -807,34 +836,52 @@ pub(crate) fn apply_refs(
             .collect::<Result<_, _>>()?;
         let transaction = RefTransaction::new(kind, updates).map_err(map_ref_error)?;
         let prepared = prepare_checked_transaction(dest, &transaction).map_err(GitError::from)?;
-        match dest.publish(Vec::new(), &prepared.into_mutations()) {
-            Ok(_) => Ok(live
-                .iter()
-                .map(|u| RefOutcome {
-                    name: u.name.clone(),
-                    result: RefResult::Ok,
-                })
-                .collect()),
-            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => Ok(live
-                .iter()
-                .map(|u| RefOutcome {
-                    name: u.name.clone(),
-                    result: RefResult::Rejected {
-                        reason: "destination ref moved during apply".to_owned(),
-                    },
-                })
-                .collect()),
+        match dest.publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::ReceivePack,
+            &context,
+        ) {
+            Ok(publication) => Ok((
+                live.iter()
+                    .map(|u| RefOutcome {
+                        name: u.name.clone(),
+                        result: RefResult::Ok,
+                    })
+                    .collect(),
+                publication.ref_events,
+            )),
+            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => Ok((
+                live.iter()
+                    .map(|u| RefOutcome {
+                        name: u.name.clone(),
+                        result: RefResult::Rejected {
+                            reason: "destination ref moved during apply".to_owned(),
+                        },
+                    })
+                    .collect(),
+                Vec::new(),
+            )),
             Err(err) => Err(err.into()),
         }
     } else {
         let mut outcomes = Vec::with_capacity(live.len());
+        let mut ref_events = Vec::new();
         for update in live {
             let transaction =
                 RefTransaction::new(kind, vec![to_update(update)?]).map_err(map_ref_error)?;
             let outcome =
                 match prepare_checked_transaction(dest, &transaction).map_err(GitError::from) {
-                    Ok(prepared) => match dest.publish(Vec::new(), &prepared.into_mutations()) {
-                        Ok(_) => RefResult::Ok,
+                    Ok(prepared) => match dest.publish(
+                        Vec::new(),
+                        &prepared.into_mutations(),
+                        EventSource::ReceivePack,
+                        &context,
+                    ) {
+                        Ok(publication) => {
+                            ref_events.extend(publication.ref_events);
+                            RefResult::Ok
+                        }
                         Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
                             RefResult::Rejected {
                                 reason: "destination ref moved during apply".to_owned(),
@@ -852,7 +899,7 @@ pub(crate) fn apply_refs(
                 result: outcome,
             });
         }
-        Ok(outcomes)
+        Ok((outcomes, ref_events))
     }
 }
 
@@ -943,7 +990,12 @@ pub mod test_support {
         )
         .expect("fixture stages");
         store
-            .publish(staged.into_objects(), &[])
+            .publish(
+                staged.into_objects(),
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("fixture publishes");
         store
     }

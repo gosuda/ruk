@@ -30,7 +30,7 @@ use std::io::{Read, Write};
 use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::types::ObjectKind;
-use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
+use ruk_core::store::{EventContext, EventSource, FactExpectation, FactMutation, FactTable, Store};
 
 use super::pack::{PackEntry, object_links, write_pack, write_thin_pack};
 use super::pktline::{self, Packet, PktReader, SidebandReader, send};
@@ -517,7 +517,12 @@ pub(crate) fn persist(
     previous: Option<Vec<u8>>,
 ) -> Result<(), GitError> {
     let mutation = plan.persist_mutation(kind, previous)?;
-    store.publish(Vec::new(), &[mutation])?;
+    store.publish(
+        Vec::new(),
+        &[mutation],
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )?;
     Ok(())
 }
 
@@ -529,7 +534,12 @@ pub(crate) fn persist_best_effort(store: &Store, plan: &PushPlanRecord, kind: Ha
         .ok()
         .flatten();
     if let Ok(mutation) = plan.persist_mutation(kind, current) {
-        let _ = store.publish(Vec::new(), &[mutation]);
+        let _ = store.publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        );
     }
 }
 
@@ -577,7 +587,7 @@ pub(crate) fn check_report_covers_live(
     }
     let mut seen: HashMap<&[u8], usize> = HashMap::with_capacity(server.len());
     for outcome in server {
-        if wanted.get(outcome.name.as_slice()).is_none() {
+        if !wanted.contains_key(outcome.name.as_slice()) {
             return Err(GitError::Corrupt {
                 detail: "push report names a ref the client did not send".to_owned(),
             });
@@ -833,7 +843,7 @@ pub(crate) fn push_closure_filtered(
         let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
             Ok((ObjectKind::Commit, bytes)) => bytes,
             Ok(_) => continue,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+            Err(GitError::NotFound { .. }) => continue,
             Err(err) => return Err(err),
         };
         for parent in &object_links(ObjectKind::Commit, &bytes, kind)?.parents {
@@ -860,7 +870,7 @@ pub(crate) fn push_closure_filtered(
         }
         let (kind, bytes) = match read_object(store, oid, WALK_OBJECT_BYTES) {
             Ok(found) => found,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => {
+            Err(GitError::NotFound { .. }) => {
                 return Err(GitError::NotFound {
                     detail: format!("push needs local object {oid} which is absent"),
                 });
@@ -883,7 +893,7 @@ pub(crate) fn push_closure_filtered(
             base: None,
         });
     }
-    entries.sort_by(|a, b| a.oid.cmp(&b.oid));
+    entries.sort_by_key(|a| a.oid);
     Ok(entries)
 }
 
@@ -957,7 +967,7 @@ fn commit_tree(store: &Store, oid: Oid) -> Result<Option<Oid>, GitError> {
     let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
         Ok((ObjectKind::Commit, bytes)) => bytes,
         Ok(_) => return Ok(None),
-        Err(err) if matches!(err, GitError::NotFound { .. }) => return Ok(None),
+        Err(GitError::NotFound { .. }) => return Ok(None),
         Err(err) => return Err(err),
     };
     Ok(object_links(ObjectKind::Commit, &bytes, store.hash_kind())?.tree)

@@ -334,11 +334,8 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
     }
     // The userinfo half never authenticates here (tokens travel in
     // headers); strip it so it cannot leak into Host or SNI.
-    let hostport = match authority.rsplit('@').next() {
-        Some(kept) => kept,
-        // `rsplit` always yields one item; the empty host fails below.
-        None => "",
-    };
+    // `rsplit` always yields one item; the empty host fails below.
+    let hostport: &str = authority.rsplit('@').next().unwrap_or_default();
     let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
         let end = bracketed.find(']').ok_or_else(|| invalid("bad ipv6"))?;
         let port = match bracketed[end + 1..].strip_prefix(':') {
@@ -378,7 +375,7 @@ fn parse_url(url: &str) -> Result<Url, GitError> {
 /// One request stream: plaintext or a TLS session over the same socket.
 enum Stream {
     Plain(TcpStream),
-    Tls(rustls::StreamOwned<rustls::ClientConnection, TcpStream>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
 
 impl Read for Stream {
@@ -502,7 +499,7 @@ fn connect(parsed: &Url) -> Result<Stream, GitError> {
     tls.flush().map_err(|err| GitError::Io {
         detail: format!("tls handshake with {} failed: {err}", parsed.host),
     })?;
-    Ok(Stream::Tls(tls))
+    Ok(Stream::Tls(Box::new(tls)))
 }
 
 /// Writes one HTTP/1.1 request head: method line, Host, caller headers,
@@ -793,6 +790,10 @@ fn read_body(
     }
 }
 
+/// One open response head: the reader positioned at the body, the status,
+/// and the headers.
+type ResponseHead = (BufReader<Stream>, u16, Vec<(String, String)>);
+
 /// Sends one request and returns the open response: status, headers, and
 /// the reader positioned at the body. The caller picks the sink by
 /// passing it to [`read_body`], so redirect hops and error pages can
@@ -805,7 +806,7 @@ fn request_head(
     method: &str,
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
-) -> Result<(BufReader<Stream>, u16, Vec<(String, String)>), GitError> {
+) -> Result<ResponseHead, GitError> {
     let parsed = parse_url(url)?;
     let mut stream = connect(&parsed)?;
     send_request(&mut stream, method, &parsed, headers, body)?;
@@ -875,11 +876,20 @@ enum ChunkState {
 /// never sees chunk-size text. Dropping it closes the connection, so
 /// error statuses need no draining; the caller reports the status.
 ///
-/// No `Debug`: the inner stream (notably the TLS session) has none.
+/// No derived `Debug`: the inner stream (notably the TLS session) has none.
 pub struct HttpBodyReader {
     reader: BufReader<Stream>,
     framing: BodyFraming,
 }
+
+impl std::fmt::Debug for HttpBodyReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpBodyReader").finish_non_exhaustive()
+    }
+}
+
+/// One open response: the framing body reader, the status, and the headers.
+type OpenResponse = (HttpBodyReader, u16, Vec<(String, String)>);
 
 fn io_failed(what: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned())
@@ -974,7 +984,7 @@ pub fn post_open(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
-) -> Result<(HttpBodyReader, u16, Vec<(String, String)>), GitError> {
+) -> Result<OpenResponse, GitError> {
     let (reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
     let framing = open_framing(&headers)?;
     Ok((HttpBodyReader { reader, framing }, status, headers))
@@ -1101,7 +1111,7 @@ pub fn get_to_writer(
                 })?
                 .to_owned();
             if !same_origin(&current, &next)? {
-                owned.retain(|(name, _)| name.to_ascii_lowercase() != "authorization");
+                owned.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
             }
             current = next;
             continue;
@@ -1400,7 +1410,6 @@ pub fn parse_batch_upload_response(body: &[u8]) -> Result<Vec<UploadEntry>, GitE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
 
     #[test]
     fn base64_vectors() {
@@ -1471,7 +1480,7 @@ mod tests {
         let length = text
             .lines()
             .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
             .and_then(|(_, value)| value.trim().parse::<usize>().ok())
             .unwrap_or(0);
         let mut body = vec![0_u8; length];
@@ -1486,9 +1495,9 @@ mod tests {
     /// written on the same accepted socket, and each request head is
     /// recorded for assertions. Returns the port plus the join handle for
     /// the recorded request heads.
-    fn fake_server(
-        replies: Vec<(u16, Vec<(String, String)>, Vec<u8>)>,
-    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    type CannedReply = (u16, Vec<(String, String)>, Vec<u8>);
+
+    fn fake_server(replies: Vec<CannedReply>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
         let port = listener.local_addr().expect("addr").port();
         let server = std::thread::spawn(move || {

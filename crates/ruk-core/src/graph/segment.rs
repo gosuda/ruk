@@ -72,6 +72,10 @@ use crate::store::durability::install_file;
 
 pub(crate) const HEADER_PREFIX_LEN: usize = 40;
 pub(crate) const COMMIT_ENTRY_LEN: usize = 52;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 pub(crate) const MAX_SEGMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[inline]
@@ -155,7 +159,7 @@ impl CommitGraphEntry {
         bytes
     }
 
-    pub(crate) fn to_head(&self, kind: HashKind) -> Result<Head, CoreError> {
+    pub(crate) fn to_head(self, kind: HashKind) -> Result<Head, CoreError> {
         match self.head_tag {
             0 => {
                 let oid_len = kind.oid_len();
@@ -185,6 +189,7 @@ pub(crate) struct ChangeIdPage<T> {
 }
 
 /// In-memory representation of an immutable v1 graph segment.
+#[expect(dead_code, reason = "never used; goes live when revset is wired")]
 pub(crate) struct GraphSegment {
     _reservation: ByteReservation,
     data: Vec<u8>,
@@ -222,6 +227,10 @@ impl Drop for GraphSegment {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 impl GraphSegment {
     /// Opens and validates an immutable graph segment from byte slice.
     pub(crate) fn open_from_bytes(
@@ -960,6 +969,10 @@ pub(crate) struct GraphSegmentWriter {
     commits: Vec<StagedCommit>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used only in test builds; dead in lib build")
+)]
 impl GraphSegmentWriter {
     #[must_use]
     pub(crate) fn new(

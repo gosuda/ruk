@@ -26,7 +26,7 @@ use crate::merge::Merge;
 use crate::ops::PreparedOp;
 use crate::records::{RecordBatchPreparer, Records};
 use crate::store::types::ObjectKind;
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// Request to revert a stored commit.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -82,7 +82,12 @@ pub struct InvertResult {
 pub fn revert(store: &Store, request: RevertRequest) -> Result<RevertResult, CoreError> {
     let prepared = prepare_revert(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -286,7 +291,12 @@ mod tests {
                 .expect("prepare object");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish object");
             oid
         }

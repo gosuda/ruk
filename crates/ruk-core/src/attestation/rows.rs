@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::capability::AttestKind;
 use crate::error::{CoreError, ErrorCode};
 use crate::ids::Oid;
 use crate::protocol::{
@@ -50,6 +51,30 @@ pub(super) fn group_limit() -> CoreError {
         ErrorCode::ELimit,
         format!("a (subject, kind, signer) group holds at most {MAX_GROUP_STATEMENTS} statements"),
     )
+}
+
+/// Extracts the attested (kind, subject) identity from committed row bytes.
+///
+/// The row shape is checked but the signature is not re-verified: the caller
+/// summarizes coordinator-built facts before publication, and verification
+/// happens on the attest preparation path and again on every stored-row read.
+///
+/// # Errors
+/// `E_CORRUPT` for bytes that are not an encoded attestation row of the
+/// current row version.
+pub(crate) fn stored_statement_identity(bytes: &[u8]) -> Result<(AttestKind, Oid), CoreError> {
+    let row: StatementRow =
+        crate::store::decode("attestation row", bytes).map_err(CoreError::from)?;
+    if row.version != ROW_VERSION {
+        return Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            format!(
+                "op summary: attestation row version {} is not {ROW_VERSION}",
+                row.version
+            ),
+        ));
+    }
+    Ok((row.statement.kind.clone(), row.statement.subject))
 }
 
 /// Encodes one verified statement as its stored row.
@@ -154,4 +179,57 @@ pub(super) fn load_group(
         members.push(decode_row(store, &row.key, &row.value)?);
     }
     Ok(members)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::AttestResult;
+
+    fn signed_row(kind: &str, subject: Oid) -> Vec<u8> {
+        let key =
+            ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[0x22; 32]));
+        let statement = AttestStatement {
+            subject,
+            kind: crate::capability::AttestKind::new(kind).expect("kind"),
+            result: AttestResult::new("pass").expect("result"),
+            signed_at: crate::protocol::Timestamp::parse("2026-10-17T12:00:00Z")
+                .expect("timestamp"),
+            supersedes: None,
+        };
+        let payload = statement
+            .canonical_payload_v1(crate::ids::HashKind::Sha1)
+            .expect("payload");
+        let signature = key
+            .sign(
+                crate::attestation::ATTEST_NAMESPACE,
+                ssh_key::HashAlg::Sha256,
+                &payload,
+            )
+            .expect("sign");
+        let armor = signature.to_pem(ssh_key::LineEnding::LF).expect("armor");
+        let args = AttestAddArgs {
+            statement,
+            signature: AttestSignature::new(armor).expect("armored signature"),
+        };
+        let verified =
+            crate::attestation::verify::verify_statement(crate::ids::HashKind::Sha1, &args)
+                .expect("verify");
+        encode_row(&verified).expect("encode row")
+    }
+
+    #[test]
+    fn stored_statement_identity_extracts_kind_and_subject() {
+        let subject = Oid::from_hex(&format!("{:040x}", 9)).expect("subject oid");
+        let bytes = signed_row("ci/build", subject);
+        let (kind, found) = stored_statement_identity(&bytes).expect("identity");
+        assert_eq!(kind.as_str(), "ci/build");
+        assert_eq!(found, subject);
+    }
+
+    #[test]
+    fn stored_statement_identity_rejects_garbage() {
+        let err = stored_statement_identity(b"not a row").expect_err("garbage fails");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
+    }
 }

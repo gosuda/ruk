@@ -5,7 +5,8 @@
 use ruk_core::change::ChangeId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefName, RefTarget};
-use ruk_core::store::{FactTable, ObjectKind, Store};
+use ruk_core::store::types::decode_store_event;
+use ruk_core::store::{EventSource, FactPageBudget, FactTable, ObjectKind, Store};
 
 use super::fixtures::{Fixture, IndexFormat, PackBody, PackObject, observation, read_object};
 use super::{DirectPublish, ImportProgress, ImportReport, PublishSink, import_repository};
@@ -499,6 +500,33 @@ fn missing_object_names_oid_and_referrer() {
 }
 
 #[test]
+fn import_publishes_with_import_source() {
+    let (fixture, store, _) = loose_repo();
+    let progress = ImportProgress::new();
+    let mut sink = DirectPublish(&store);
+    let request = fixture.request(1, b"origin");
+    import_repository(&store, &request, &progress, &mut sink).expect("import");
+    let page = store
+        .fact_page(
+            FactTable::Events,
+            None,
+            FactPageBudget::new(100, usize::MAX),
+        )
+        .expect("read events");
+    let event = page
+        .rows
+        .iter()
+        .map(|row| decode_store_event(&row.value).expect("event decodes"))
+        .rfind(|event| event.name == b"refs/heads/main")
+        .expect("import emits the main event");
+    assert_eq!(
+        event.source,
+        EventSource::Import,
+        "import batches publish as Import, not LocalPush"
+    );
+}
+
+#[test]
 fn empty_source_is_noop() {
     let fixture = Fixture::sha1();
     let store = fixture.store();
@@ -576,7 +604,7 @@ fn object_links_cover_all_kinds() {
 
     let blob = HashKind::Sha1.hash_git_object("blob", b"f").expect("blob");
     let tree_hex = blob.to_hex();
-    let mut tree = format!("100644 f\0").into_bytes();
+    let mut tree = "100644 f\0".to_string().into_bytes();
     tree.extend_from_slice(blob.as_bytes());
     let mut with_link = tree.clone();
     let foreign = Oid::from_bytes(&[9u8; 20]).expect("oid");
@@ -613,7 +641,7 @@ fn object_links_cover_all_kinds() {
 
     // Unsorted entries are tolerated the way Git reads them: both objects
     // still join the closure.
-    let mut unsorted = format!("100644 b\0").into_bytes();
+    let mut unsorted = "100644 b\0".to_string().into_bytes();
     unsorted.extend_from_slice(blob.as_bytes());
     unsorted.extend_from_slice(b"100644 a\0");
     unsorted.extend_from_slice(blob.as_bytes());

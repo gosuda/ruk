@@ -41,6 +41,8 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::RefTarget;
 use ruk_core::store::Store;
 use ruk_core::store::types::ObjectKind;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 
 use super::pack::{PackEntry, write_pack};
 use super::pktline::{self, Packet, PktReader, encode_data, encode_flush, send};
@@ -431,7 +433,7 @@ fn peel_tag(store: &Store, oid: Oid, kind: HashKind) -> Result<Option<Oid>, GitE
     const TAG_READ_MAX: u64 = 1 << 20;
     const MAX_TAG_DEPTH: usize = 32;
     let (first_kind, mut current_bytes) = match read_object(store, oid, TAG_READ_MAX) {
-        Err(err) if matches!(err, GitError::NotFound { .. }) => return Ok(None),
+        Err(GitError::NotFound { .. }) => return Ok(None),
         Err(err) => return Err(err),
         Ok(read) => read,
     };
@@ -443,7 +445,7 @@ fn peel_tag(store: &Store, oid: Oid, kind: HashKind) -> Result<Option<Oid>, GitE
             return Err(corrupt(format!("tag {oid} names no object")));
         };
         let (next_kind, next_bytes) = match read_object(store, next, TAG_READ_MAX) {
-            Err(err) if matches!(err, GitError::NotFound { .. }) => return Ok(None),
+            Err(GitError::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(err),
             Ok(read) => read,
         };
@@ -489,11 +491,11 @@ fn serve_ls_refs<W: Write>(
     if head.oid != zero {
         if matches_prefixes(b"HEAD", &args.prefixes) {
             let mut row = format!("{} HEAD", head.oid.to_hex()).into_bytes();
-            if args.symrefs {
-                if let Some(target) = head.symref.as_deref() {
-                    row.extend_from_slice(b" symref-target:");
-                    row.extend_from_slice(target);
-                }
+            if args.symrefs
+                && let Some(target) = head.symref.as_deref()
+            {
+                row.extend_from_slice(b" symref-target:");
+                row.extend_from_slice(target);
             }
             row.push(b'\n');
             encode_data(&mut out, &row)?;
@@ -501,13 +503,13 @@ fn serve_ls_refs<W: Write>(
     } else if args.unborn && args.symrefs {
         // An unborn `HEAD` is reported only when the client asked for both
         // `unborn` and `symrefs`, mirroring `send_possibly_unborn_head`.
-        if let Some(target) = head.symref.as_deref() {
-            if matches_prefixes(b"HEAD", &args.prefixes) {
-                let mut row = b"unborn HEAD symref-target:".to_vec();
-                row.extend_from_slice(target);
-                row.push(b'\n');
-                encode_data(&mut out, &row)?;
-            }
+        if let Some(target) = head.symref.as_deref()
+            && matches_prefixes(b"HEAD", &args.prefixes)
+        {
+            let mut row = b"unborn HEAD symref-target:".to_vec();
+            row.extend_from_slice(target);
+            row.push(b'\n');
+            encode_data(&mut out, &row)?;
         }
     }
     for entry in advertise(store)? {
@@ -520,11 +522,11 @@ fn serve_ls_refs<W: Write>(
         let mut row = oid.to_hex().into_bytes();
         row.push(b' ');
         row.extend_from_slice(&entry.name);
-        if args.peel {
-            if let Some(peeled) = peel_tag(store, *oid, kind)? {
-                row.extend_from_slice(b" peeled:");
-                row.extend_from_slice(peeled.to_hex().as_bytes());
-            }
+        if args.peel
+            && let Some(peeled) = peel_tag(store, *oid, kind)?
+        {
+            row.extend_from_slice(b" peeled:");
+            row.extend_from_slice(peeled.to_hex().as_bytes());
         }
         row.push(b'\n');
         encode_data(&mut out, &row)?;
@@ -658,7 +660,7 @@ impl<W: Write> Write for SidebandWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::super::fetch::verify_closure;
-    use super::super::pack::{IngestLimits, ingest_pack};
+    use super::super::pack::IngestLimits;
     use super::super::pktline::{PktReader, encode_data};
     use super::super::refadv::{Initial, read_initial};
     use super::super::session::test_support::{store_with_pack, test_store};
@@ -689,7 +691,12 @@ mod tests {
         let transaction = RefTransaction::new(kind, vec![update]).expect("transaction");
         let prepared = prepare_checked_transaction(store, &transaction).expect("prepare");
         store
-            .publish(Vec::new(), &prepared.into_mutations())
+            .publish(
+                Vec::new(),
+                &prepared.into_mutations(),
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish ref");
     }
 
@@ -734,7 +741,7 @@ mod tests {
 
     /// Skips the v2 capability advertisement, returning a reader over the
     /// first command response.
-    fn past_advertisement<'a>(out: &'a [u8], kind: HashKind) -> PktReader<&'a [u8]> {
+    fn past_advertisement(out: &[u8], kind: HashKind) -> PktReader<&[u8]> {
         let mut pkt = PktReader::new(out, Interrupt::none());
         match read_initial(&mut pkt, kind).expect("advertisement parses") {
             Initial::V2(caps) => {
@@ -882,10 +889,17 @@ mod tests {
             format!("object {FOUR}\ntype commit\ntag v1\ntagger test <t@t> 0 +0000\n\nv1\n");
         let tag_len = u64::try_from(tag_bytes.len()).expect("tag fits in memory");
         let prepared = store
-            .prepare(ObjectKind::Tag, tag_len, &tag_bytes.as_bytes()[..], None)
+            .prepare(ObjectKind::Tag, tag_len, tag_bytes.as_bytes(), None)
             .expect("prepare tag");
         let tag_oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish tag");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tag");
         set_ref(&store, kind, b"refs/tags/v1", tag_oid);
         let out = serve_session(&ls_refs_command(&[]), &store, kind);
         let mut pkt = past_advertisement(&out, kind);
@@ -918,7 +932,7 @@ mod tests {
         let kind = HashKind::Sha1;
         let store = server_store();
         let caps = server_capabilities(kind);
-        let mut script = fetch_command(&caps, &[oid(FOUR)], &[oid(THREE)]);
+        let script = fetch_command(&caps, &[oid(FOUR)], &[oid(THREE)]);
         // The test client framing ends at its flush; EOF then ends the
         // session the way a real client tears down.
         let out = serve_session(&script, &store, kind);

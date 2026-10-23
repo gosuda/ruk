@@ -34,10 +34,15 @@ use gix_pack::data::entry::Header as PackHeader;
 use gix_pack::data::input::{BytesToEntriesIter, EntryDataMode, Mode};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::store::types::ObjectKind;
+#[cfg(test)]
+use ruk_core::store::{EventContext, EventSource};
 use ruk_core::store::{PreparedObject, Store};
 
 use super::{Interrupt, stage_object};
 use crate::GitError;
+
+/// One staged pack entry: index order, kind, and decompressed bytes.
+type StagedPackEntry = Result<(usize, ObjectKind, Vec<u8>), GitError>;
 
 /// Bounds for one ingested pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,11 +50,11 @@ pub struct IngestLimits {
     /// Largest total compressed entry bytes accepted.
     pub max_pack_bytes: u64,
     /// Largest entry count accepted.
-    pub max_objects: u32,
+    pub max_objects: u64,
     /// Largest single decompressed object accepted.
     pub max_object_bytes: u64,
     /// Deepest delta chain followed before refusing.
-    pub max_delta_depth: u32,
+    pub max_delta_depth: u64,
 }
 
 impl Default for IngestLimits {
@@ -312,7 +317,7 @@ pub fn ingest_pack<R: Read>(
         let count = u64::try_from(raw.len()).map_err(|_| GitError::Limit {
             detail: "pack entry count does not fit".to_owned(),
         })?;
-        if count >= u64::from(limits.max_objects) {
+        if count >= limits.max_objects {
             return Err(GitError::Limit {
                 detail: format!("pack holds more than {} objects", limits.max_objects),
             });
@@ -410,7 +415,7 @@ pub fn stage_local_objects(
     let count = u64::try_from(objects.len()).map_err(|_| GitError::Limit {
         detail: "closure entry count does not fit".to_owned(),
     })?;
-    if count > u64::from(limits.max_objects) {
+    if count > limits.max_objects {
         return Err(GitError::Limit {
             detail: format!("closure holds more than {} objects", limits.max_objects),
         });
@@ -522,55 +527,54 @@ fn pre_resolve_independent(
         return Ok(());
     }
     let width = pack_threads();
-    let staged: Vec<Result<(usize, ObjectKind, Vec<u8>), GitError>> =
-        if width <= 1 || independent.len() < 32 {
-            independent
-                .iter()
-                .map(|(index, kind)| {
-                    interrupt.check("resolving pack deltas")?;
-                    inflate(
-                        &resolver.raw[*index].compressed,
-                        resolver.raw[*index].declared,
-                        resolver.limits.max_object_bytes,
-                    )
-                    .map(|bytes| (*index, *kind, bytes))
-                })
-                .collect()
-        } else {
-            let piece = independent.len().div_ceil(width);
-            let raw = &resolver.raw;
-            let max_object_bytes = resolver.limits.max_object_bytes;
-            std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                for part in independent.chunks(piece) {
-                    handles.push(scope.spawn(move || {
-                        part.iter()
-                            .map(|(index, kind)| {
-                                if interrupt.check("resolving pack deltas").is_err() {
-                                    return Err(GitError::Cancelled {
-                                        detail: "resolving pack deltas was cancelled".to_owned(),
-                                    });
-                                }
-                                inflate(
-                                    &raw[*index].compressed,
-                                    raw[*index].declared,
-                                    max_object_bytes,
-                                )
-                                .map(|bytes| (*index, *kind, bytes))
-                            })
-                            .collect::<Vec<_>>()
-                    }));
-                }
-                let mut staged = Vec::with_capacity(independent.len());
-                for handle in handles {
-                    match handle.join() {
-                        Ok(part) => staged.extend(part),
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    }
-                }
-                staged
+    let staged: Vec<StagedPackEntry> = if width <= 1 || independent.len() < 32 {
+        independent
+            .iter()
+            .map(|(index, kind)| {
+                interrupt.check("resolving pack deltas")?;
+                inflate(
+                    &resolver.raw[*index].compressed,
+                    resolver.raw[*index].declared,
+                    resolver.limits.max_object_bytes,
+                )
+                .map(|bytes| (*index, *kind, bytes))
             })
-        };
+            .collect()
+    } else {
+        let piece = independent.len().div_ceil(width);
+        let raw = &resolver.raw;
+        let max_object_bytes = resolver.limits.max_object_bytes;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for part in independent.chunks(piece) {
+                handles.push(scope.spawn(move || {
+                    part.iter()
+                        .map(|(index, kind)| {
+                            if interrupt.check("resolving pack deltas").is_err() {
+                                return Err(GitError::Cancelled {
+                                    detail: "resolving pack deltas was cancelled".to_owned(),
+                                });
+                            }
+                            inflate(
+                                &raw[*index].compressed,
+                                raw[*index].declared,
+                                max_object_bytes,
+                            )
+                            .map(|bytes| (*index, *kind, bytes))
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut staged = Vec::with_capacity(independent.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(part) => staged.extend(part),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            staged
+        })
+    };
     for entry in staged {
         let (index, kind, bytes) = entry?;
         resolver.finish(index, kind, bytes)?;
@@ -628,8 +632,10 @@ fn resolve_all(
     while !deferred.is_empty() {
         interrupt.check("resolving pack deltas")?;
         let mut progress = false;
-        let pending: Vec<usize> = deferred.iter().copied().collect();
-        for index in pending {
+        for index in (0..raw.len()).rev() {
+            if !deferred.contains(&index) {
+                continue;
+            }
             match resolver.resolve(index, 0)? {
                 Resolution::Done => {
                     deferred.remove(&index);
@@ -658,7 +664,7 @@ impl Resolver<'_> {
         if self.payloads[index].is_some() {
             return Ok(Resolution::Done);
         }
-        if depth > self.limits.max_delta_depth {
+        if u64::from(depth) > self.limits.max_delta_depth {
             return Err(corrupt("pack delta chain exceeds its depth bound"));
         }
         if self.resolving[index] {
@@ -671,9 +677,9 @@ impl Resolver<'_> {
     }
 
     fn resolve_inner(&mut self, index: usize, depth: u32) -> Result<Resolution, GitError> {
-        // The header is cloned so delta recursion can borrow `self`
+        // The header is copied so delta recursion can borrow `self`
         // mutably; offsets below are plain copies for the same reason.
-        let header = self.raw[index].header.clone();
+        let header = self.raw[index].header;
         let pack_offset = self.raw[index].pack_offset;
         let declared = self.raw[index].declared;
         if let Some(kind) = pack_kind(&header) {
@@ -705,9 +711,14 @@ impl Resolver<'_> {
                 if base_oid.kind() != self.kind {
                     return Err(corrupt("ref-delta base has the wrong width"));
                 }
-                if self.oid_index.get(&base_oid).is_none() {
+                if !self.oid_index.contains_key(&base_oid) {
                     match self.store.read(base_oid) {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let entry_depth = 1u64;
+                            if entry_depth > self.limits.max_delta_depth {
+                                return Err(corrupt("pack delta chain exceeds its depth bound"));
+                            }
+                        }
                         Err(err) if err.code() == ruk_core::error::ErrorCode::ENotFound => {
                             return Ok(Resolution::Deferred);
                         }
@@ -1395,7 +1406,14 @@ mod tests {
         .expect("history ingests");
         let mut objects = staged.into_objects();
         objects.extend(staged_basic.into_objects());
-        let publication = store.publish(objects, &[]).expect("bases publish");
+        let publication = store
+            .publish(
+                objects,
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("bases publish");
         assert!(!publication.objects.is_empty());
         let thin = include_bytes!("fixtures/thin.pack");
         let staged = ingest_pack(
@@ -1459,7 +1477,14 @@ mod tests {
         let prepared = store
             .prepare(ObjectKind::Blob, base.len() as u64, &base[..], None)
             .expect("stage base");
-        store.publish(vec![prepared], &[]).expect("publish base");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish base");
         let staged = ingest_pack(
             &pack[..],
             HashKind::Sha1,

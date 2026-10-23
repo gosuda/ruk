@@ -269,6 +269,7 @@ pub fn discover(
 /// capability advertisement, or the parsed v0 document from a server
 /// that ignored the header — from that single response, with no second
 /// round trip for the fallback.
+#[derive(Debug)]
 pub enum VersionedDiscovery {
     /// The server speaks v2: refs come from one [`ls_refs_v2`] RPC.
     V2(Capabilities),
@@ -970,7 +971,7 @@ pub fn fetch_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
 
@@ -1090,6 +1091,9 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// Canned reply: status, headers, body, and whether to frame it chunked.
+    type CannedReply = (u16, Vec<(String, String)>, Vec<u8>, bool);
+
     /// Serves canned replies on loopback, recording every request head
     /// plus body. Each reply names its framing: `chunked` emits
     /// `Transfer-Encoding: chunked` with the body in two chunks (so the
@@ -1097,7 +1101,7 @@ mod tests {
     /// otherwise `Content-Length`. Returns the base URL plus the join
     /// handle.
     fn fake_smart_server(
-        replies: Vec<(u16, Vec<(String, String)>, Vec<u8>, bool)>,
+        replies: Vec<CannedReply>,
     ) -> (String, std::thread::JoinHandle<Vec<Recorded>>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
         let port = listener.local_addr().expect("addr").port();
@@ -1169,7 +1173,7 @@ mod tests {
         let length = text
             .lines()
             .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
             .and_then(|(_, value)| value.trim().parse::<usize>().ok())
             .unwrap_or(0);
         let mut body = vec![0_u8; length];
@@ -1595,7 +1599,7 @@ mod tests {
     #[test]
     fn push_reports_ref_status() {
         use super::super::push::{PushUpdate, PushWireRequest};
-        use super::super::session::test_support::{store_with_pack, test_store};
+        use super::super::session::test_support::store_with_pack;
         use ruk_core::change::PlanId;
 
         let kind = HashKind::Sha1;

@@ -28,16 +28,6 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
-enum ForgejoCommand {
-    /// Serve the daemon until interrupted.
-    Serve {
-        /// Daemon configuration document path (TOML).
-        #[arg(long)]
-        config: std::path::PathBuf,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum Command {
     /// Render the implemented model schema and encoding contracts.
     ///
@@ -61,14 +51,15 @@ enum Command {
         #[arg(long, default_value = "-")]
         input: String,
     },
-    /// Serve Forgejo as a hosted multi-repository daemon.
+    /// Serve as a hosted multi-repository daemon.
     ///
     /// Loads a TOML config naming the socket path, repository roots, and
     /// the runtime bounds, then serves the pooled IPC surface until
     /// interrupted.
-    Forgejo {
-        #[command(subcommand)]
-        command: ForgejoCommand,
+    Serve {
+        /// Daemon configuration document path (TOML).
+        #[arg(long)]
+        config: std::path::PathBuf,
     },
     /// Decode a native conflict-v1 record to its canonical JSON form.
     ///
@@ -198,9 +189,7 @@ fn run(cli: Cli) -> Result<Vec<u8>, CoreError> {
             cli::lfs_payload_sync_native(repo, from, upload)
                 .map_err(|err| CoreError::new(err.code(), err.to_string()))
         }
-        Command::Forgejo {
-            command: ForgejoCommand::Serve { config },
-        } => {
+        Command::Serve { config } => {
             let doc = std::fs::read(&config).map_err(|err| {
                 CoreError::new(
                     ErrorCode::EIo,
@@ -370,6 +359,18 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruk_core::store::{EventContext, EventSource};
+
+    #[test]
+    fn forgejo_subcommand_is_rejected() {
+        let err = Cli::try_parse_from(["ruk", "forgejo", "serve"])
+            .expect_err("forgejo subcommand must not parse");
+        assert_eq!(err.exit_code(), 2);
+        let help = Cli::try_parse_from(["ruk", "serve", "--help"])
+            .expect_err("help exits")
+            .to_string();
+        assert!(help.contains("--config"));
+    }
 
     /// Endless zero bytes that count every byte pulled from the source.
     struct CountingInfinite {
@@ -419,7 +420,14 @@ mod tests {
             )
             .expect("prepare tree");
         let tree = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish tree");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tree");
         drop(store);
 
         let signature = Signature {

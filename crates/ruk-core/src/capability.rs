@@ -653,7 +653,9 @@ pub struct Capabilities {
     /// Undo authority; `None` forbids undo.
     #[serde(default)]
     pub undo: Option<UndoScope>,
-    /// Attestation kinds this session may record.
+    /// Attestation kinds this session may record. A grant ending in `/`
+    /// is a namespace prefix (for example `ci/` covers `ci/build`); any
+    /// other grant matches exactly, so `ci` never covers `ci/build`.
     #[serde(default)]
     pub attest: Vec<AttestKind>,
     /// Private provenance/claim read access.
@@ -675,6 +677,14 @@ fn forbidden(field: &str, detail: String) -> CoreError {
 fn covered_by<P: Pattern>(wanted: &Shape, ceiling: &[P]) -> bool {
     ceiling.iter().any(|allowed| allowed.shape().covers(wanted))
         || wanted.covered_by_union(ceiling.iter().map(Pattern::shape))
+}
+
+/// True when an `attest` grant covers `kind`: an exact grant, or a
+/// namespace grant (trailing `/`) that prefixes the kind. A grant without
+/// a trailing slash never crosses into longer kinds, so a `ci` grant
+/// cannot smuggle `ci/build` or `cix` past the ceiling.
+fn attest_grant_covers(grant: &AttestKind, kind: &AttestKind) -> bool {
+    grant == kind || (grant.as_str().ends_with('/') && kind.as_str().starts_with(grant.as_str()))
 }
 
 fn first_uncovered<'a, P: Pattern>(requested: &'a [P], ceiling: &[P]) -> Option<&'a P> {
@@ -727,11 +737,12 @@ impl Capabilities {
                 format!("`{wanted:?}` exceeds the policy ({:?})", ceiling.undo),
             ));
         }
-        if let Some(kind) = self
-            .attest
-            .iter()
-            .find(|kind| !ceiling.attest.contains(kind))
-        {
+        if let Some(kind) = self.attest.iter().find(|kind| {
+            !ceiling
+                .attest
+                .iter()
+                .any(|allowed| attest_grant_covers(allowed, kind))
+        }) {
             return Err(forbidden(
                 "attest",
                 format!("kind `{kind}` is not in the principal's policy"),
@@ -848,12 +859,17 @@ impl Capabilities {
         }
     }
 
-    /// Succeeds when `kind` is in `attest`.
+    /// Succeeds when `kind` is in `attest`, exactly or under a namespace
+    /// grant (a granted `ci/` covers `ci/build`).
     ///
     /// # Errors
     /// `E_FORBIDDEN` otherwise.
     pub fn require_attest(&self, kind: &AttestKind) -> Result<(), CoreError> {
-        if self.attest.contains(kind) {
+        if self
+            .attest
+            .iter()
+            .any(|granted| attest_grant_covers(granted, kind))
+        {
             return Ok(());
         }
         Err(forbidden("attest", format!("kind `{kind}` is not granted")))
@@ -1404,6 +1420,45 @@ mod tests {
         let ci = AttestKind::new("ci").expect("kind");
         assert!(caps.require_attest(&review).is_ok());
         assert_eq!(code(caps.require_attest(&ci)), ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn attest_namespace_grants_cover_kinds_without_crossing_namespaces() {
+        let kind = |text: &str| AttestKind::new(text).expect("kind");
+        let granted = |texts: &[&str]| Capabilities {
+            attest: texts.iter().map(|text| kind(text)).collect(),
+            ..Capabilities::default()
+        };
+        let namespaced = granted(&["ci/", "review"]);
+        assert!(namespaced.require_attest(&kind("ci/build")).is_ok());
+        assert!(namespaced.require_attest(&kind("ci/")).is_ok());
+        assert!(namespaced.require_attest(&kind("review")).is_ok());
+        for denied in ["ci", "cix", "ci2/build", "model/review"] {
+            assert_eq!(
+                code(namespaced.require_attest(&kind(denied))),
+                ErrorCode::EForbidden,
+                "{denied} must not ride the ci/ namespace"
+            );
+        }
+        let exact = granted(&["ci"]);
+        assert!(exact.require_attest(&kind("ci")).is_ok());
+        assert_eq!(
+            code(exact.require_attest(&kind("ci/build"))),
+            ErrorCode::EForbidden,
+            "a grant without a trailing slash never prefixes"
+        );
+        let ceiling = granted(&["ci/"]);
+        assert!(granted(&["ci/build"]).check_within(&ceiling).is_ok());
+        assert!(granted(&["ci/"]).check_within(&ceiling).is_ok());
+        assert_eq!(
+            code(granted(&["ci/"]).check_within(&granted(&["ci/build"]))),
+            ErrorCode::EForbidden,
+            "a narrower ceiling cannot cover a wider request"
+        );
+        assert_eq!(
+            code(granted(&["review"]).check_within(&ceiling)),
+            ErrorCode::EForbidden
+        );
     }
 
     #[test]

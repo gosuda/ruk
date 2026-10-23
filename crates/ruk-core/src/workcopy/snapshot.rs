@@ -79,6 +79,13 @@ pub(crate) struct ConflictEdit {
 /// The operation a changed snapshot asks the caller to record: rewrite
 /// `change` from `base_tree` to `tree`, fenced on `stamp`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired snapshot/write path; consumers land in later changeset rows"
+    )
+)]
 pub(crate) struct SnapshotDescriptor {
     pub(crate) workspace: WorkspaceId,
     pub(crate) change: ChangeId,
@@ -96,6 +103,13 @@ pub(crate) struct SnapshotDescriptor {
 
 /// A changed snapshot ready for one publication.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired snapshot/write path; consumers land in later changeset rows"
+    )
+)]
 pub(crate) struct PreparedSnapshot {
     /// New blobs and trees.
     pub(crate) objects: Vec<PreparedObject>,
@@ -108,6 +122,13 @@ pub(crate) struct PreparedSnapshot {
 
 /// The result of an autosnapshot.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired snapshot/write path; consumers land in later changeset rows"
+    )
+)]
 pub(crate) enum SnapshotOutcome {
     /// The worktree matches the base tree. `cache` may refresh stat rows and
     /// the watcher token; publishing it records no operation and does not
@@ -115,7 +136,7 @@ pub(crate) enum SnapshotOutcome {
     NoChange {
         cache: Vec<FactMutation>,
     },
-    Changed(PreparedSnapshot),
+    Changed(Box<PreparedSnapshot>),
 }
 
 /// A read-only status report.
@@ -138,6 +159,13 @@ pub(crate) enum StatusReport {
 /// `E_INVALID` for a GitCompat workspace; `E_WORKSPACE_APPLYING` or
 /// `E_WORKSPACE_RECOVERY` while a journal is open; `E_OBJECT_FORMAT` for a
 /// base tree of the wrong width; crawl, hashing, and store failures.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired snapshot/write path; consumers land in later changeset rows"
+    )
+)]
 pub(crate) fn snapshot(
     store: &Store,
     input: &SnapshotInput<'_>,
@@ -167,7 +195,7 @@ pub(crate) fn snapshot(
         });
     }
     facts.push(guard);
-    Ok(SnapshotOutcome::Changed(PreparedSnapshot {
+    Ok(SnapshotOutcome::Changed(Box::new(PreparedSnapshot {
         objects,
         facts: facts.into_vec(),
         descriptor: SnapshotDescriptor {
@@ -182,7 +210,7 @@ pub(crate) fn snapshot(
             conflict_edits,
             source,
         },
-    }))
+    })))
 }
 
 /// Reports how the worktree differs from the base tree without writing.
@@ -218,6 +246,13 @@ pub(crate) struct Computed {
     pub(crate) changed: Vec<RepoPath>,
     pub(crate) removed: Vec<RepoPath>,
     pub(crate) conflict_edits: Vec<ConflictEdit>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "unwired snapshot/write path; only the write path reads this field"
+        )
+    )]
     pub(crate) source: DirtySource,
 }
 

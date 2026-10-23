@@ -33,7 +33,8 @@ use ruk_core::refdata::{
 };
 use ruk_core::refs::{StoreRefs, page_refs, prepare_checked_transaction};
 use ruk_core::store::{
-    FactExpectation, FactMutation, FactPageBudget, FactTable, ObjectKind, Store,
+    EventContext, EventSource, FactExpectation, FactMutation, FactPageBudget, FactTable,
+    ObjectKind, Store,
 };
 pub(crate) use ruk_core::workspace::ResolvedHead;
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
@@ -460,7 +461,12 @@ pub(crate) fn refresh_stats_after_write(
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(())
 }
@@ -549,6 +555,8 @@ pub(crate) fn config_write(store: &Store, name: &str, value: &str) -> Result<(),
                 expected,
                 value: Some(value.as_bytes().to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -572,6 +580,8 @@ pub(crate) fn config_unset(store: &Store, name: &str) -> Result<(), GitError> {
                 expected: FactExpectation::Value(raw),
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -641,6 +651,8 @@ pub(crate) fn sequencer_write(
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -659,6 +671,8 @@ pub(crate) fn sequencer_delete(store: &Store, verb: &str) -> Result<(), GitError
                 expected: FactExpectation::Any,
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -691,6 +705,8 @@ pub(crate) fn pseudo_write(store: &Store, name: &str, value: Vec<u8>) -> Result<
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -707,6 +723,8 @@ pub(crate) fn pseudo_delete(store: &Store, name: &str) -> Result<(), GitError> {
                 expected: FactExpectation::Any,
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -757,6 +775,8 @@ pub(crate) fn stash_write(store: &Store, slot: u64, entry: &StashSlot) -> Result
                 expected: FactExpectation::Any,
                 value: Some(value),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -779,6 +799,8 @@ pub(crate) fn stash_drop(store: &Store, slot: u64) -> Result<(), GitError> {
                 expected: FactExpectation::Value(raw),
                 value: None,
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(())
@@ -838,6 +860,8 @@ fn counter_alloc(store: &Store, key: &[u8]) -> Result<u64, GitError> {
                 expected,
                 value: Some(next.to_le_bytes().to_vec()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(current)
@@ -876,7 +900,12 @@ pub(crate) fn apply_refs(
         .map(|prepared| prepared.update.clone())
         .collect();
     store
-        .publish(Vec::new(), &prepared.into_mutations())
+        .publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(updates_back
         .into_iter()
@@ -947,7 +976,7 @@ pub(crate) fn list_refs(store: &Store) -> Result<Vec<(RefName, RefTarget)>, GitE
     let mut out = Vec::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
-        let page = page_refs(store, after.as_deref(), 1000).map_err(|err| GitError::from(err))?;
+        let page = page_refs(store, after.as_deref(), 1000).map_err(GitError::from)?;
         for entry in &page.entries {
             out.push((entry.name.clone(), entry.target.clone()));
         }
@@ -1154,7 +1183,7 @@ fn resolve_base(store: &Store, kind: HashKind, base: &str) -> Result<Oid, GitErr
         return head_oid(store);
     }
     if let Ok(oid) = ruk_git::parse_oid(base) {
-        return ruk_git::require_kind(oid, kind).map_err(GitError::from);
+        return ruk_git::require_kind(oid, kind);
     }
     for candidate in [
         base.to_owned(),
@@ -1486,49 +1515,27 @@ pub(crate) fn is_ancestor(store: &Store, ancestor: Oid, descendant: Oid) -> Resu
     Ok(false)
 }
 
-/// Finds the first common ancestor of `left` and `right` by breadth-first
-/// paint-down from both tips.
+/// Finds the first common ancestor of `left` and `right` by paint-down
+/// from both tips.
+///
+/// The walk lives in `ruk-core`; this adapter only supplies the
+/// replacement-aware parent lookup. Output is identical by construction:
+/// the local CLI walks unbounded.
 pub(crate) fn merge_base(store: &Store, left: Oid, right: Oid) -> Result<Oid, GitError> {
-    if left == right {
-        return Ok(left);
-    }
-    let left = replace_redirect(store, left);
-    let right = replace_redirect(store, right);
-    let records = Records::new(store);
-    let mut left_seen: HashMap<Oid, bool> = HashMap::new();
-    let mut queue = vec![left];
-    while let Some(oid) = queue.pop() {
-        let oid = replace_redirect(store, oid);
-        if left_seen.contains_key(&oid) {
-            continue;
-        }
-        left_seen.insert(oid, true);
+    let parents = |oid: Oid| -> Result<Vec<Oid>, GitError> {
+        let records = Records::new(store);
         let record = walk_record(store, &records, oid)?;
-        for parent in record.parents() {
-            if let Some(parent_oid) = head_oid_of(parent) {
-                queue.push(parent_oid);
-            }
-        }
-    }
-    let mut queue = vec![right];
-    let mut right_seen: HashMap<Oid, bool> = HashMap::new();
-    while let Some(oid) = queue.pop() {
-        let oid = replace_redirect(store, oid);
-        if left_seen.contains_key(&oid) {
-            return Ok(oid);
-        }
-        if right_seen.contains_key(&oid) {
-            continue;
-        }
-        right_seen.insert(oid, true);
-        let record = walk_record(store, &records, oid)?;
-        for parent in record.parents() {
-            if let Some(parent_oid) = head_oid_of(parent) {
-                queue.push(parent_oid);
-            }
-        }
-    }
-    Err(GitError::NotFound {
+        Ok(record.parents().iter().filter_map(head_oid_of).collect())
+    };
+    let mut budget = u64::MAX;
+    ruk_core::ops::compare::merge_base(
+        &|oid| replace_redirect(store, oid),
+        &parents,
+        &mut budget,
+        left,
+        right,
+    )?
+    .ok_or_else(|| GitError::NotFound {
         detail: "no merge base".to_owned(),
     })
 }

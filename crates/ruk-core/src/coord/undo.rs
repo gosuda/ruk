@@ -23,14 +23,18 @@
 use std::collections::BTreeMap;
 
 use crate::change::OperationId;
-use crate::coord::oplog::{OpDeltaReader, read_header, tracked};
+use crate::coord::oplog::{OpDeltaReader, journaled, read_header, undoable};
 use crate::coord::rows::{OpHeader, fact_table_from_name};
 use crate::error::{CoreError, ErrorCode};
 use crate::protocol::{Method, Request, UndoSummary};
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
+
 use crate::refs::StoreRefs;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
+
+/// Net undo change per key: the value before the first delta and after the last.
+type NetChanges = BTreeMap<(String, Vec<u8>), (Option<Vec<u8>>, Option<Vec<u8>>)>;
 
 /// The inverse of one operation, ready to lane as a mutation.
 #[derive(Debug)]
@@ -56,13 +60,18 @@ pub(crate) fn undone_operation(request: &Request) -> Option<OperationId> {
 
 /// Builds the inverse of `operation` from its stored deltas.
 ///
+/// Deltas, expectations, and the ref transaction all derive from the
+/// committed operation stream; current keys are re-checked before
+/// anything inverts, so a moved key refuses instead of restoring stale
+/// bytes.
+///
 /// # Errors
 /// - [`ErrorCode::ENotFound`] when the operation is not retained (never
 ///   committed, or pruned).
 /// - [`ErrorCode::EUndoConflict`] for methods whose effects lie outside the
-///   tracked tables, and for a key that no longer holds the value the operation
-///   left.
-/// - [`ErrorCode::ECorrupt`] for a delta naming an unknown or untracked table.
+///   undoable tables, for a journaled-but-not-undoable delta, and for a key
+///   that no longer holds the value the operation left.
+/// - [`ErrorCode::ECorrupt`] for a delta naming an unknown or unjournaled table.
 /// - Store and stream decoding failures.
 pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<UndoPlan, CoreError> {
     let header = read_header(store, operation)?.ok_or_else(|| {
@@ -75,7 +84,7 @@ pub(crate) fn prepare_undo(store: &Store, operation: OperationId) -> Result<Undo
     let mut reader = OpDeltaReader::new(store, operation, header);
     // Keyed by table name and key, each entry keeps the value before the first
     // delta and the value after the last: the net change to that key.
-    let mut net: BTreeMap<(String, Vec<u8>), (Option<Vec<u8>>, Option<Vec<u8>>)> = BTreeMap::new();
+    let mut net: NetChanges = BTreeMap::new();
     while let Some(delta) = reader.next_delta()? {
         let slot = net
             .entry((delta.table, delta.key))
@@ -189,6 +198,10 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
         Method::LandPrepare | Method::LandExecute => {
             "landing consumes land plans and moves a remote outside the tracked tables"
         }
+        Method::PolicySet => "policy.set rewrites the landing policy outside the tracked tables",
+        Method::RepoInit | Method::RepoDelete | Method::RepoRename | Method::RepoFork => {
+            "repository lifecycle moves stores on disk outside the tracked tables"
+        }
         Method::Edit
         | Method::New
         | Method::WsNew
@@ -232,7 +245,16 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
         | Method::File
         | Method::Blame
         | Method::Query
-        | Method::GitCommit => return Ok(()),
+        | Method::GitCommit
+        | Method::ClaimRenew
+        | Method::RepoStat
+        | Method::Tree
+        | Method::RefsList
+        | Method::Compare
+        | Method::Search
+        | Method::Archive
+        | Method::EventsTail
+        | Method::RemoteRefs => return Ok(()),
     };
     Err(CoreError::new(
         ErrorCode::EUndoConflict,
@@ -240,7 +262,12 @@ fn refuse_non_invertible(header: &OpHeader) -> Result<(), CoreError> {
     ))
 }
 
-/// Resolves a stored table name to a tracked table, refusing anything else.
+/// Resolves a stored table name to an undoable table, refusing anything else.
+///
+/// Journaled-but-not-undoable tables (`Claims`, `Attestations`, `PushPlans`,
+/// `LandPlans`) refuse with `E_UNDO_CONFLICT`: their rows name real operation
+/// state, so failing to invert them is a policy refusal, never corruption.
+/// Anything outside the journaled set is committed damage.
 fn inverse_table(name: &str) -> Result<FactTable, CoreError> {
     let table = fact_table_from_name(name).ok_or_else(|| {
         CoreError::new(
@@ -248,13 +275,19 @@ fn inverse_table(name: &str) -> Result<FactTable, CoreError> {
             format!("operation names unknown table `{name}`"),
         )
     })?;
-    if !tracked(table) {
+    if undoable(table) {
+        return Ok(table);
+    }
+    if journaled(table) {
         return Err(CoreError::new(
-            ErrorCode::ECorrupt,
-            format!("operation names untracked table `{name}`"),
+            ErrorCode::EUndoConflict,
+            format!("operation names journaled table `{name}` that undo cannot invert"),
         ));
     }
-    Ok(table)
+    Err(CoreError::new(
+        ErrorCode::ECorrupt,
+        format!("operation names unjournaled table `{name}`"),
+    ))
 }
 
 /// Refuses the undo when it would restore a workspace row.
@@ -327,7 +360,7 @@ mod tests {
     use crate::ids::{HashKind, Oid};
     use crate::protocol::Timestamp;
     use crate::refdata::RefTarget;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     struct Fixture {
         root: std::path::PathBuf,
@@ -361,6 +394,7 @@ mod tests {
                 method,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
             };
             let (id, mutations) = oplog::record(&mut ops, None, meta, changes)
                 .expect("record operation")
@@ -368,7 +402,12 @@ mod tests {
             let mut facts = changes.to_vec();
             facts.extend(mutations);
             self.store
-                .publish(Vec::new(), &facts)
+                .publish(
+                    Vec::new(),
+                    &facts,
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish operation and its state");
             id
         }
@@ -431,7 +470,12 @@ mod tests {
         let deleted = ref_target(1);
         fixture
             .store
-            .publish(Vec::new(), &[ref_set(b"refs/heads/a", &deleted)])
+            .publish(
+                Vec::new(),
+                &[ref_set(b"refs/heads/a", &deleted)],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("seed the ref the operation deletes");
         let id = fixture.record(
             Method::BookmarkDelete,
@@ -444,7 +488,12 @@ mod tests {
         );
         fixture
             .store
-            .publish(Vec::new(), &[ref_set(b"refs/heads/a/b", &ref_target(2))])
+            .publish(
+                Vec::new(),
+                &[ref_set(b"refs/heads/a/b", &ref_target(2))],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("a sibling ref lands");
         let err = prepare_undo(&fixture.store, id).expect_err("directory/file clash refuses");
         assert_eq!(err.code, ErrorCode::EInvalid);
@@ -458,7 +507,10 @@ mod tests {
     #[test]
     fn undo_refuses_operations_with_effects_outside_tracked_tables() {
         let fixture = Fixture::new("fetch");
-        let id = fixture.record(Method::Fetch, &[ref_set(b"refs/remotes/origin/main", b"x")]);
+        let id = fixture.record(
+            Method::Fetch,
+            &[ref_set(b"refs/remotes/origin/main", &ref_target(4))],
+        );
         let err = prepare_undo(&fixture.store, id).expect_err("fetch cannot be inverted");
         assert_eq!(err.code, ErrorCode::EUndoConflict);
         assert!(
@@ -471,16 +523,25 @@ mod tests {
     #[test]
     fn undo_refuses_a_key_that_moved_since_the_operation() {
         let fixture = Fixture::new("diverged");
-        let id = fixture.record(Method::BookmarkSet, &[ref_set(b"refs/heads/main", b"new")]);
+        let created = ref_target(5);
+        let id = fixture.record(
+            Method::BookmarkSet,
+            &[ref_set(b"refs/heads/main", &created)],
+        );
         let moved = FactMutation {
             table: FactTable::Refs,
             key: b"refs/heads/main".to_vec(),
-            expected: FactExpectation::Value(b"new".to_vec()),
-            value: Some(b"later".to_vec()),
+            expected: FactExpectation::Value(created),
+            value: Some(ref_target(6)),
         };
         fixture
             .store
-            .publish(Vec::new(), &[moved])
+            .publish(
+                Vec::new(),
+                &[moved],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("a later write lands");
         let err = prepare_undo(&fixture.store, id).expect_err("the key has moved");
         assert_eq!(err.code, ErrorCode::EUndoConflict);

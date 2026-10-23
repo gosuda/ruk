@@ -80,18 +80,19 @@ pub enum Gap {
 
 /// One land requirement with the latest signing time it accepts.
 ///
-/// The signed schema carries no expiry field, so the bound travels with the
-/// requirement instead: a live match counts only when its signed `signed_at`
-/// is at or before [`BoundedRequirement::valid_until`]. A later-signed match
-/// is expired for this requirement. This mirrors the planned
-/// `AttestRequirement::valid_until` protocol bound; when the protocol gains
-/// that field this wrapper folds into it.
+/// The bound travels with the requirement, mirroring the
+/// [`AttestRequirement::valid_until`](crate::protocol::AttestRequirement::valid_until)
+/// protocol field: a live match counts only when its signed `signed_at`
+/// is at or before the bound. A later-signed match is expired for this
+/// requirement. An absent bound never expires.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundedRequirement {
     /// The kind and result a trusted signer's live statement must carry.
     pub requirement: AttestRequirement,
-    /// The latest `signed_at` this requirement accepts.
-    pub valid_until: Timestamp,
+    /// The latest `signed_at` this requirement accepts, if any. This is
+    /// the enforced bound; callers source it from the requirement's own
+    /// `valid_until` field.
+    pub valid_until: Option<Timestamp>,
 }
 
 /// Whether one requirement is met, and by what.
@@ -347,7 +348,7 @@ pub fn evaluate_bounded_requirements(
             store,
             subject,
             &bounded.requirement,
-            Some(bounded.valid_until),
+            bounded.valid_until,
             &signers,
             &mut groups,
             &mut work,
@@ -366,7 +367,7 @@ pub fn evaluate_bounded_requirements(
 }
 
 /// Rejects over-limit or trustless land evaluations before any store read.
-fn check_land_policy(
+pub(crate) fn check_land_policy(
     requirement_count: usize,
     trusted: &[SignerFingerprint],
 ) -> Result<BTreeSet<&SignerFingerprint>, CoreError> {

@@ -28,18 +28,53 @@ use crate::error::{CoreError, ErrorCode};
 use crate::ids::hex_byte;
 
 /// Largest socket pathname, in native bytes, that this endpoint will bind.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Socket leaf name inside the generation directory.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 const SOCKET_LEAF_NAME: &str = "s";
 
 /// Fresh random bytes per generation directory name. Independent of the lock nonce.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 const RANDOM_BYTES: usize = 8;
 
 /// Bounded number of fresh-random retries after `EEXIST` on the generation name.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 const MAX_CREATION_ATTEMPTS: usize = 8;
 
 /// One exclusive generation: its directory, its listener, and its published address.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct UnixEndpoint {
     address: EndpointAddress,
     listener: UnixListener,
@@ -65,12 +100,26 @@ impl UnixEndpoint {
     /// `E_LIMIT` when the socket path would exceed the portable limit (nothing is
     /// created), `E_INVALID` for a relative temporary directory, `E_IO` for
     /// filesystem or socket failures.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn bind(store: StoreId) -> Result<Self, CoreError> {
         Self::bind_in(&std::env::temp_dir(), store)
     }
 
     /// Binds a new generation under `temp_base`, the only bind path besides
     /// [`Self::bind`]. Tests reach it directly to avoid mutating `TMPDIR`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     fn bind_in(temp_base: &Path, store: StoreId) -> Result<Self, CoreError> {
         if !temp_base.is_absolute() {
             return Err(CoreError::new(
@@ -97,11 +146,25 @@ impl UnixEndpoint {
     }
 
     /// The published address, for the store lock body.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn address(&self) -> &EndpointAddress {
         &self.address
     }
 
     /// Waits for the next peer connection.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) async fn accept(&self) -> io::Result<UnixStream> {
         let (stream, _peer) = self.listener.accept().await?;
         Ok(stream)
@@ -109,10 +172,24 @@ impl UnixEndpoint {
 
     /// Removes this generation and reports any failure. Drop repeats the removal
     /// best-effort; a second removal is a no-op.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn close(mut self) -> Result<(), CoreError> {
         self.cleanup()
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     fn cleanup(&mut self) -> Result<(), CoreError> {
         if self.cleaned {
             return Ok(());
@@ -133,6 +210,13 @@ impl Drop for UnixEndpoint {
 
 /// One generation attempt. `Ok(None)` means the random name already existed and
 /// the caller should retry with fresh randomness.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn try_create_and_bind(
     temp_base: &Path,
     store_hex: &str,
@@ -195,6 +279,13 @@ fn try_create_and_bind(
 /// Opens the generation directory without following links and checks what was
 /// opened: a directory owned by the effective uid with no group or other bits.
 /// Never repairs modes; a violation is `E_FORBIDDEN`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn verify_generation_dir(dir: &Path) -> Result<(), CoreError> {
     // No O_DIRECTORY: on Linux a trailing symlink under O_DIRECTORY | O_NOFOLLOW
     // fails with ENOTDIR instead of ELOOP. O_NONBLOCK stops a FIFO planted at this
@@ -273,6 +364,13 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, CoreError> {
 /// Parent calls this before `StoreLock` acquisition. It never creates `root`
 /// and never opens redb. Filesystems the platform cannot name precisely are
 /// accepted; local durable storage is the deployment prerequisite for them.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) fn ensure_local_storage(root: &Path) -> Result<(), CoreError> {
     let metadata = root.metadata().map_err(|err| match err.kind() {
         ErrorKind::NotFound => CoreError::new(
@@ -294,6 +392,13 @@ pub(crate) fn ensure_local_storage(root: &Path) -> Result<(), CoreError> {
 /// magics. FUSE is deliberately not matched because `statfs` cannot report the
 /// backing subtype, so a local FUSE mount is never labelled remote.
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn check_filesystem_type(root: &Path) -> Result<(), CoreError> {
     let statfs = rustix::fs::statfs(root).map_err(|err| statfs_error(root, err))?;
     // Kernel superblock magics are 32-bit values. On ILP32 glibc `f_type` is a
@@ -311,6 +416,13 @@ fn check_filesystem_type(root: &Path) -> Result<(), CoreError> {
 /// Maps a `statfs` superblock magic to a remote network filesystem name. Values
 /// come from Linux `linux/magic.h`; the set is the network filesystems only.
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn classify_linux_remote_magic(magic: i128) -> Option<&'static str> {
     const NFS_SUPER_MAGIC: i128 = 0x6969;
     const SMB_SUPER_MAGIC: i128 = 0x517B;
@@ -381,6 +493,13 @@ fn check_filesystem_type(_root: &Path) -> Result<(), CoreError> {
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn statfs_error(root: &Path, err: rustix::io::Errno) -> CoreError {
     match err.kind() {
         ErrorKind::NotFound => CoreError::new(
@@ -392,6 +511,13 @@ fn statfs_error(root: &Path, err: rustix::io::Errno) -> CoreError {
 }
 
 /// Removal tolerant of an absent entry; any other failure is `E_IO`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn tolerate_absent(path: &Path, result: io::Result<()>) -> Result<(), CoreError> {
     match result {
         Ok(()) => Ok(()),
@@ -400,10 +526,24 @@ fn tolerate_absent(path: &Path, result: io::Result<()>) -> Result<(), CoreError>
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn io_failure(path: &Path, op: &'static str, err: impl core::fmt::Display) -> CoreError {
     CoreError::new(ErrorCode::EIo, format!("{op} {}: {err}", path.display()))
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn forbidden(path: &Path, reason: &str) -> CoreError {
     CoreError::new(
         ErrorCode::EForbidden,
@@ -411,10 +551,24 @@ fn forbidden(path: &Path, reason: &str) -> CoreError {
     )
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn byte_len(path: &Path) -> usize {
     path.as_os_str().as_bytes().len()
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 fn hex_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -427,11 +581,8 @@ fn hex_string(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::{
-        DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _,
-    };
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::oneshot;
 

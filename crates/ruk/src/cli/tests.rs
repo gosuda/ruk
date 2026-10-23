@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -37,6 +37,16 @@ use super::verbs_transport;
 use super::verbs_worktree;
 use super::{CliEnv, Ctx, collect};
 
+/// `(request head, body)` smart-http request log.
+type HttpRequests = Vec<(String, Vec<u8>)>;
+/// `(request paths, PUT body)` LFS upload observation.
+type UploadSeen = (Vec<String>, Vec<u8>);
+/// `(name, verb)` leftover dispatch stub.
+type LeftoverStub = (
+    &'static str,
+    fn(&mut Ctx, &[String]) -> Result<Vec<u8>, ruk_git::GitError>,
+);
+
 /// Hands out unique temp directory names across parallel tests.
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -50,7 +60,7 @@ fn temp_base(case: &str) -> PathBuf {
 }
 
 /// Builds an environment with a fixed test identity and one cwd.
-fn test_env(cwd: &PathBuf) -> CliEnv {
+fn test_env(cwd: &Path) -> CliEnv {
     let vars = [
         ("GIT_AUTHOR_NAME", "Ada"),
         ("GIT_AUTHOR_EMAIL", "ada@example.invalid"),
@@ -62,13 +72,13 @@ fn test_env(cwd: &PathBuf) -> CliEnv {
     .collect::<HashMap<String, String>>();
     CliEnv {
         vars,
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         stdin: None,
     }
 }
 
 /// Opens the store at one root with the reference budget.
-fn open_store(root: &PathBuf) -> Store {
+fn open_store(root: &Path) -> Store {
     Store::open(
         &root.join(".ruk"),
         Arc::new(PreparationBudget::reference_defaults()),
@@ -77,14 +87,14 @@ fn open_store(root: &PathBuf) -> Store {
 }
 
 /// Builds a repo-backed context for verb calls.
-fn repo_ctx(root: &PathBuf, mut env: CliEnv) -> Ctx {
-    env.cwd = root.clone();
+fn repo_ctx(root: &Path, mut env: CliEnv) -> Ctx {
+    env.cwd = root.to_path_buf();
     let store = open_store(root);
     let kind = store.hash_kind();
     Ctx {
         store: Some(store),
-        root: root.clone(),
-        file_base: root.clone(),
+        root: root.to_path_buf(),
+        file_base: root.to_path_buf(),
         kind: Some(kind),
         env,
         bare: false,
@@ -1355,7 +1365,7 @@ fn gc_dry_run_reports_without_mutating() {
 
 #[test]
 fn serve_verbs_round_trip_scripted_stdin() {
-    use ruk_git::transport::pktline::{Packet, decode_frame, encode_data, encode_flush};
+    use ruk_git::transport::pktline::{Packet, decode_frame, encode_data};
 
     fn framed(line: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1413,7 +1423,7 @@ fn serve_verbs_round_trip_scripted_stdin() {
         .as_bytes(),
     );
     push.extend_from_slice(b"0000");
-    push.extend_from_slice(&pack);
+    push.extend_from_slice(pack);
     ctx_b.env.stdin = Some(push);
     let report = run(verbs_transport::receive_pack, &mut ctx_b, &[]).expect("receive");
     let (_, after_adv) = split_at_flush(&report);
@@ -1959,7 +1969,7 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
             let length = text
                 .lines()
                 .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
                 .and_then(|(_, value)| value.trim().parse::<usize>().ok())
                 .unwrap_or(0);
             if length > 0 {
@@ -1998,7 +2008,7 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
     let oid = ruk_core::ids::Oid::from_hex(FOUR).expect("hex");
     store.read(oid).expect("fetched object present");
     let name = RefName::new(b"refs/remotes/origin/main".to_vec()).expect("name");
-    let target = StoreRefs::new(&store)
+    let target = StoreRefs::new(store)
         .get(&name)
         .expect("read ref")
         .expect("ref present");
@@ -2012,7 +2022,7 @@ fn fetch_over_smart_http_publishes_pack_and_ref() {
 /// early fails the test instead of hanging the suite.
 fn smart_http_server(
     replies: Vec<(Vec<u8>, &'static str)>,
-) -> (String, std::sync::mpsc::Receiver<Vec<(String, Vec<u8>)>>) {
+) -> (String, std::sync::mpsc::Receiver<HttpRequests>) {
     use std::net::TcpListener;
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
@@ -2042,7 +2052,7 @@ fn smart_http_server(
             let length = text
                 .lines()
                 .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
                 .and_then(|(_, value)| value.trim().parse::<usize>().ok())
                 .unwrap_or(0);
             let mut request_body = vec![0_u8; length];
@@ -2370,7 +2380,7 @@ fn archive_zip_prefix_and_path_limits() {
         &["--format=zip", "--prefix=pre/", "HEAD", "b.txt"],
     )
     .expect("zip with prefix and limit");
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(&zip)).expect("readable zip");
     let names: Vec<String> = archive
         .file_names()
         .map(|name| name.expect("entry name").into_owned())
@@ -2390,7 +2400,7 @@ fn archive_zip_prefix_and_path_limits() {
         &["--format=zip", "--prefix=pre/", "HEAD"],
     )
     .expect("full zip");
-    let mut full_archive =
+    let full_archive =
         zip::ZipArchive::new(std::io::Cursor::new(&full)).expect("readable full zip");
     let full_names: Vec<String> = full_archive
         .file_names()
@@ -2749,7 +2759,7 @@ fn read_http_request(socket: &std::net::TcpStream) -> (String, Vec<u8>) {
     let length = text
         .lines()
         .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().to_ascii_lowercase() == "content-length")
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
     let mut body = vec![0_u8; length];
@@ -2850,7 +2860,7 @@ fn lfs_batch_server(mode: &str) -> (u16, std::thread::JoinHandle<Vec<String>>) {
 /// meaning already present (`mode == "upload-present"`); `/up/<oid>`
 /// accepts the PUT and keeps its body. Returns the port plus the join
 /// handle for the request paths seen in order and the PUT body bytes.
-fn lfs_batch_upload_server(mode: &str) -> (u16, std::thread::JoinHandle<(Vec<String>, Vec<u8>)>) {
+fn lfs_batch_upload_server(mode: &str) -> (u16, std::thread::JoinHandle<UploadSeen>) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("addr").port();
@@ -3487,7 +3497,7 @@ fn bundle_exclusion_records_prerequisite() {
 // ---------------------------------------------------------------------------
 
 /// Writes, stages, and commits one file in a lane test.
-fn lane_commit(ctx: &mut Ctx, root: &PathBuf, file: &str, body: &[u8], message: &str) {
+fn lane_commit(ctx: &mut Ctx, root: &Path, file: &str, body: &[u8], message: &str) {
     std::fs::write(root.join(file), body).expect("write file");
     run(verbs_stage::add, ctx, &[file]).expect("add");
     run(verbs_history::commit, ctx, &["-m", message]).expect("commit");
@@ -3975,7 +3985,7 @@ fn rebase_replays_side_onto_main() {
 }
 
 /// Commits `body` as `file` under one author name for blame tests.
-fn blame_commit(ctx: &mut Ctx, root: &PathBuf, file: &str, body: &[u8], name: &str, message: &str) {
+fn blame_commit(ctx: &mut Ctx, root: &Path, file: &str, body: &[u8], name: &str, message: &str) {
     for role in ["AUTHOR", "COMMITTER"] {
         ctx.env
             .vars
@@ -4246,7 +4256,7 @@ fn bisect_head(ctx: &mut Ctx) -> String {
 
 /// Commits `extra - 1` more revisions on `f.txt`, returning every `HEAD`
 /// oid oldest-first (the seed commit starts the chain).
-fn bisect_chain(ctx: &mut Ctx, root: &PathBuf, extra: usize) -> Vec<String> {
+fn bisect_chain(ctx: &mut Ctx, root: &Path, extra: usize) -> Vec<String> {
     let mut oids = vec![bisect_head(ctx)];
     for index in 2..=extra {
         lane_commit(
@@ -4914,11 +4924,11 @@ fn plumbing_head(ctx: &mut Ctx) -> String {
 }
 
 /// Builds a file-only context for repository-optional verbs.
-fn file_ctx(base: &PathBuf, env: CliEnv) -> Ctx {
+fn file_ctx(base: &Path, env: CliEnv) -> Ctx {
     Ctx {
         store: None,
-        root: base.clone(),
-        file_base: base.clone(),
+        root: base.to_path_buf(),
+        file_base: base.to_path_buf(),
         kind: None,
         env,
         bare: false,
@@ -7206,7 +7216,7 @@ fn wave_j_commit_file_signoff_cleanup_template() {
     let msg = root.join("msg.txt");
     std::fs::write(&msg, b"# comment\nreal subject\n\nbody text\n").expect("msg");
     let msg_arg = msg.to_str().expect("utf8").to_owned();
-    run(verbs_history::commit, &mut ctx, &[&"-F", &msg_arg, &"-s"]).expect("commit -F -s");
+    run(verbs_history::commit, &mut ctx, &["-F", &msg_arg, "-s"]).expect("commit -F -s");
     assert_eq!(
         wave_j_head_message(&mut ctx),
         "# comment\nreal subject\n\nbody text\n\nSigned-off-by: Ada <ada@example.invalid>\n"
@@ -7241,7 +7251,7 @@ fn wave_j_commit_file_signoff_cleanup_template() {
     let tpl = root.join("tpl.txt");
     std::fs::write(&tpl, b"templated\n").expect("template");
     let tpl_arg = tpl.to_str().expect("utf8").to_owned();
-    run(verbs_history::commit, &mut ctx, &[&"--template", &tpl_arg]).expect("template");
+    run(verbs_history::commit, &mut ctx, &["--template", &tpl_arg]).expect("template");
     assert_eq!(wave_j_head_message(&mut ctx), "templated\n");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
@@ -7257,7 +7267,7 @@ fn wave_j_commit_squash_fixup_amend() {
     std::fs::write(root.join("f.txt"), b"one\ntwo\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
     wave_j_stamp(&mut ctx, 1700000001);
-    run(verbs_history::commit, &mut ctx, &[&"--fixup", &base]).expect("fixup");
+    run(verbs_history::commit, &mut ctx, &["--fixup", &base]).expect("fixup");
     assert_eq!(wave_j_head_message(&mut ctx), "fixup! seed\n");
     std::fs::write(root.join("f.txt"), b"one\ntwo\nthree\n").expect("modify");
     run(verbs_stage::add, &mut ctx, &["f.txt"]).expect("add");
@@ -7265,7 +7275,7 @@ fn wave_j_commit_squash_fixup_amend() {
     run(
         verbs_history::commit,
         &mut ctx,
-        &[&"--squash", &base, &"-m", &"extra body"],
+        &["--squash", &base, "-m", "extra body"],
     )
     .expect("squash -m");
     assert_eq!(
@@ -7354,7 +7364,7 @@ fn wave_j_commit_rejections() {
     let err = run(
         verbs_history::commit,
         &mut ctx,
-        &[&"-m", &"x", &"-F", &msg_arg],
+        &["-m", "x", "-F", &msg_arg],
     )
     .expect_err("-m -F");
     assert!(err.to_string().contains("cannot be combined"), "{err}");
@@ -7400,8 +7410,8 @@ fn wave_j_commit_rejections() {
     let blank = root.join("blank.txt");
     std::fs::write(&blank, b"\n").expect("blank");
     let blank_arg = blank.to_str().expect("utf8").to_owned();
-    let err = run(verbs_history::commit, &mut ctx, &[&"-F", &blank_arg, &"-s"])
-        .expect_err("signoff-only");
+    let err =
+        run(verbs_history::commit, &mut ctx, &["-F", &blank_arg, "-s"]).expect_err("signoff-only");
     assert!(err.to_string().contains("empty commit message"), "{err}");
     run(
         verbs_history::commit,
@@ -8582,10 +8592,7 @@ fn leftover_cat_file_batch_command() {
 fn leftover_dispatch_rows_and_named_gaps() {
     let (root, env) = seeded_repo("leftover-gaps", "f.txt", b"one\n");
     let mut ctx = repo_ctx(&root, env);
-    let stubs: &[(
-        &str,
-        fn(&mut Ctx, &[String]) -> Result<Vec<u8>, ruk_git::GitError>,
-    )] = &[
+    let stubs: &[LeftoverStub] = &[
         ("filter-branch", super::verbs_misc::filter_branch),
         ("pack-redundant", super::verbs_misc::pack_redundant),
         ("web--browse", super::verbs_misc::web_browse),
@@ -8797,7 +8804,7 @@ fn hooks_mailmap_var_ident() {
 }
 
 /// Writes an executable hook script under `.ruk/hooks`.
-fn write_hook(root: &std::path::PathBuf, name: &str, body: &str) {
+fn write_hook(root: &Path, name: &str, body: &str) {
     let dir = root.join(".ruk").join("hooks");
     std::fs::create_dir_all(&dir).expect("hooks dir");
     let path = dir.join(name);

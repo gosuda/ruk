@@ -28,11 +28,25 @@ pub(crate) enum LeaseKind {
     Interactive,
     /// Scratch/export/stream lease: 15 min interval on admitted progress,
     /// 30 s no-progress cancel, 2 h total cap.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     Bulk,
 }
 
 /// Whether the owner reported admitted progress since the last renewal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) enum BulkProgress {
     /// The owner completed admitted work: re-arm the interval deadline.
     AdmittedWork,
@@ -47,6 +61,13 @@ pub(crate) enum RootOrigin {
     PrePivot,
     /// Root was created beyond the pivot: live, but its dependencies still
     /// require a protected closure (enforced by the parent, not here).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     PostPivot,
 }
 
@@ -88,8 +109,22 @@ pub(crate) struct CursorWant {
 #[derive(Debug)]
 pub(crate) struct LeaseBinding {
     /// The lease the cursor was issued for.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) lease: LeaseId,
     /// Lifetime class of that lease.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) kind: LeaseKind,
 }
 
@@ -124,8 +159,29 @@ struct LeaseEntry {
     authority: CancelHandle,
     expired: bool,
     owner_live: bool,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     op_floor: Option<OperationId>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     rows_copied: u64,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     bytes_copied: u64,
     _charge: ByteReservation,
 }
@@ -157,6 +213,13 @@ impl LeaseTable {
     }
 
     /// Number of live table entries (expired-but-protected included).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -215,6 +278,13 @@ impl LeaseTable {
     }
 
     /// Mutable lookup with the same lease-loss contract.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     fn entry_mut(&mut self, lease: &LeaseId) -> Result<&mut LeaseEntry, CoreError> {
         self.entries
             .get_mut(lease)
@@ -257,6 +327,13 @@ impl LeaseTable {
     /// work re-arms only the interval, never the total lifetime. Use on an
     /// expired lease is `E_LEASE_LOST`; a silent bulk owner reports
     /// `E_CANCELLED` so the caller cancels the owner promptly.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn report_progress(
         &mut self,
         lease: &LeaseId,
@@ -287,6 +364,13 @@ impl LeaseTable {
 
     /// Accounts one page: validates row/position bounds, reserves exact bytes
     /// first, then records rows and copied bytes with checked arithmetic.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn account_page(
         &mut self,
         lease: &LeaseId,
@@ -397,6 +481,13 @@ impl LeaseTable {
     }
 
     /// Whether `lease` currently holds owner protection.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn owner_live(&self, lease: &LeaseId) -> bool {
         self.entries
@@ -405,12 +496,26 @@ impl LeaseTable {
     }
 
     /// Copied rows and bytes recorded for `lease`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn page_stats(&self, lease: &LeaseId) -> Result<(u64, u64), CoreError> {
         let entry = self.entry(lease)?;
         Ok((entry.rows_copied, entry.bytes_copied))
     }
 
     /// Minimum retained-operation floor over live leases for pruning.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn min_lease_floor(&self) -> Option<OperationId> {
         self.entries

@@ -30,46 +30,46 @@ use ruk_core::store::{PreparationBudget, Store};
 use super::tools::{TOOL_TABLE, Tool, call_on_store};
 
 /// The JSON-RPC version this server speaks.
-pub const JSONRPC_VERSION: &str = "2.0";
+pub(crate) const JSONRPC_VERSION: &str = "2.0";
 
 /// The MCP protocol version reported by `initialize`.
-pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+pub(crate) const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The server name reported by `initialize`.
-pub const SERVER_NAME: &str = "ruk";
+pub(crate) const SERVER_NAME: &str = "ruk";
 
 /// The server version reported by `initialize`.
-pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// JSON-RPC parse error: the document is not JSON.
-pub const PARSE_ERROR: i32 = -32700;
+pub(crate) const PARSE_ERROR: i32 = -32700;
 
 /// JSON-RPC invalid request: the document is JSON but not one request.
-pub const INVALID_REQUEST: i32 = -32600;
+pub(crate) const INVALID_REQUEST: i32 = -32600;
 
 /// JSON-RPC method not found.
-pub const METHOD_NOT_FOUND: i32 = -32601;
+pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
 
 /// JSON-RPC invalid params, including unknown tools and mistyped arguments.
-pub const INVALID_PARAMS: i32 = -32602;
+pub(crate) const INVALID_PARAMS: i32 = -32602;
 
 /// JSON-RPC internal error: the store or the transport failed.
-pub const INTERNAL_ERROR: i32 = -32603;
+pub(crate) const INTERNAL_ERROR: i32 = -32603;
 
 /// The `initialize` method name.
-pub const METHOD_INITIALIZE: &str = "initialize";
+pub(crate) const METHOD_INITIALIZE: &str = "initialize";
 
 /// The `notifications/initialized` notification name.
-pub const METHOD_INITIALIZED: &str = "notifications/initialized";
+pub(crate) const METHOD_INITIALIZED: &str = "notifications/initialized";
 
 /// The `tools/list` method name.
-pub const METHOD_TOOLS_LIST: &str = "tools/list";
+pub(crate) const METHOD_TOOLS_LIST: &str = "tools/list";
 
 /// The `tools/call` method name.
-pub const METHOD_TOOLS_CALL: &str = "tools/call";
+pub(crate) const METHOD_TOOLS_CALL: &str = "tools/call";
 
 /// The `ping` method name.
-pub const METHOD_PING: &str = "ping";
+pub(crate) const METHOD_PING: &str = "ping";
 
 /// One JSON-RPC 2.0 request or notification as received.
 #[derive(Debug, serde::Deserialize)]
@@ -205,7 +205,7 @@ struct ErrorData {
 
 /// The MCP stdio server bound to one repository root.
 #[derive(Clone, Debug)]
-pub struct Server {
+pub(crate) struct Server {
     repo: PathBuf,
 }
 
@@ -213,13 +213,17 @@ impl Server {
     /// Binds the server to a repository root. The store opens lazily, once
     /// per `tools/call`, exactly as the CLI commands open it.
     #[must_use]
-    pub fn new(repo: PathBuf) -> Self {
+    pub(crate) fn new(repo: PathBuf) -> Self {
         Self { repo }
     }
 
     /// The repository root this server opens.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
-    pub fn repo(&self) -> &Path {
+    pub(crate) fn repo(&self) -> &Path {
         &self.repo
     }
 
@@ -229,7 +233,7 @@ impl Server {
     /// with or without one) execute without answering and yield `None`.
     /// Oversized documents fail `E_LIMIT`; anything undecodable fails
     /// `PARSE_ERROR` or `INVALID_REQUEST`.
-    pub fn handle(&self, raw: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn handle(&self, raw: &[u8]) -> Option<Vec<u8>> {
         if raw.len() > MAX_CONTROL_FRAME_BYTES {
             let oversized = CoreError::new(
                 ErrorCode::ELimit,
@@ -285,9 +289,7 @@ impl Server {
             return None;
         }
         let response = self.answer(request.id, &method, request.params);
-        if response.id.is_none() {
-            return None;
-        }
+        response.id.as_ref()?;
         Some(render_response(&response))
     }
 
@@ -299,7 +301,11 @@ impl Server {
     ///
     /// # Errors
     /// `E_IO` when the reader or the writer fails.
-    pub fn serve_stdio(&self, reader: impl BufRead, writer: impl Write) -> Result<(), CoreError> {
+    pub(crate) fn serve_stdio(
+        &self,
+        reader: impl BufRead,
+        writer: impl Write,
+    ) -> Result<(), CoreError> {
         let mut reader = reader;
         let mut writer = writer;
         let mut buf = Vec::new();
@@ -431,7 +437,11 @@ impl Server {
 ///
 /// # Errors
 /// `E_IO` when the reader or the writer fails.
-pub fn serve(repo: &Path, reader: impl BufRead, writer: impl Write) -> Result<(), CoreError> {
+pub(crate) fn serve(
+    repo: &Path,
+    reader: impl BufRead,
+    writer: impl Write,
+) -> Result<(), CoreError> {
     Server::new(repo.to_path_buf()).serve_stdio(reader, writer)
 }
 
@@ -619,6 +629,7 @@ mod tests {
     use ruk_core::ids::HashKind;
     use ruk_core::ops::{DescribeRequest, NewRequest, NewResult};
     use ruk_core::protocol::{AttestListArgs, PageRequest, QueryArgs, RevsetText};
+    use ruk_core::store::{EventContext, EventSource};
 
     #[derive(Debug, serde::Serialize)]
     struct Envelope<P: serde::Serialize> {
@@ -733,7 +744,14 @@ mod tests {
             )
             .expect("prepare tree");
         let tree = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish tree");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tree");
         tree
     }
 

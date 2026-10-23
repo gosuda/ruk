@@ -13,15 +13,15 @@
 //! 10. Cancellation before publication and receiver drop after commit
 //! 11. Fail-closed ambiguous storage error handling
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jiff::SignedDuration;
 use tokio::sync::oneshot;
 
+use super::commit::{StoreFailureKind, classify_store_error};
 use super::*;
 use crate::bytes::ByteString;
 use crate::change::{ClaimId, RequestId, SessionId, WorkspaceId};
@@ -29,20 +29,19 @@ use crate::coord::cancel::cancellation;
 use crate::coord::clock::Clock;
 use crate::coord::oplog;
 use crate::coord::policy::{Policy, PolicySource, Principal};
-use crate::coord::receipt;
-use crate::coord::rows::{self, SessionRow, WorkspaceRow};
+use crate::coord::rows::{self, WorkspaceRow};
 use crate::coord::session::{SessionLive, SessionTable, prepare_open};
 use crate::error::ErrorCode;
 use crate::ids::HashKind;
 use crate::index::RepoPath;
 use crate::protocol::{
-    ClaimAcquireArgs, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimTtl, Method, Mutation,
+    ClaimAcquireArgs, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimTtl, Mutation,
     MutationOutcome, ReceiptRef, Reply, Request, RequestDigest, SessionOpenArgs, Timestamp,
     WorkspaceInit, WsNewArgs, WsNewReply,
 };
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
 use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject};
-use crate::store::{PreparationBudget, Store, StoreError};
+use crate::store::{EventContext, EventSource, PreparationBudget, Store, StoreError};
 use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp, WorkspaceState};
 
 static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -149,6 +148,11 @@ fn dummy_mutation_request(request_id: RequestId) -> (Request, Reply) {
     (req, reply)
 }
 
+fn ref_value(n: u8) -> Vec<u8> {
+    let oid = crate::ids::Oid::from_hex(&format!("{n:040x}")).expect("test oid");
+    crate::store::encode("ref target", &RefTarget::Direct(oid)).expect("encode test target")
+}
+
 fn make_candidate(
     session: Arc<SessionLive>,
     principal: Principal,
@@ -198,13 +202,13 @@ fn test_1_two_disjoint_requests_in_one_batch() {
         table: FactTable::Refs,
         key: b"refs/heads/branch-1".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-value-1".to_vec()),
+        value: Some(ref_value(1)),
     };
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/branch-2".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-value-2".to_vec()),
+        value: Some(ref_value(2)),
     };
 
     let cand1 = make_candidate(
@@ -282,13 +286,13 @@ fn test_2_per_session_activity_coalescing() {
         table: FactTable::Refs,
         key: b"refs/heads/feature-a".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-a".to_vec()),
+        value: Some(ref_value(11)),
     };
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/feature-b".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-b".to_vec()),
+        value: Some(ref_value(12)),
     };
 
     let cand1 = make_candidate(
@@ -347,7 +351,7 @@ fn test_3_exact_duplicate_coalescing_and_mismatched_digest() {
         table: FactTable::Refs,
         key: b"refs/heads/dedup".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"oid-dedup".to_vec()),
+        value: Some(ref_value(13)),
     };
 
     let cand1 = make_candidate(
@@ -524,6 +528,8 @@ fn test_4_stale_same_workspace_rejection_and_epoch_first_fencing() {
                 expected: FactExpectation::Absent,
                 value: Some(encoded_ws),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .unwrap();
 
@@ -692,7 +698,7 @@ fn test_6_receipt_replay_despite_expiry_or_stale_stamp() {
         table: FactTable::Refs,
         key: b"refs/heads/replay-branch".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"committed-value".to_vec()),
+        value: Some(ref_value(21)),
     };
 
     let cand = make_candidate(
@@ -820,11 +826,13 @@ fn test_8_atomic_domain_op_receipt_head_after_reopen() {
         .expect("prepare blob");
     let prep_oid = prep.oid();
 
+    let target_bytes =
+        crate::store::encode("ref target", &RefTarget::Direct(prep_oid)).expect("encode target");
     let fact = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/persisted".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(prep_oid.as_bytes().to_vec()),
+        value: Some(target_bytes.clone()),
     };
 
     let cand = make_candidate(session, principal, req_id, vec![prep], vec![fact]);
@@ -863,7 +871,7 @@ fn test_8_atomic_domain_op_receipt_head_after_reopen() {
         .fact(FactTable::Refs, b"refs/heads/persisted")
         .unwrap()
         .expect("ref fact persisted");
-    assert_eq!(ref_bytes, prep_oid.as_bytes());
+    assert_eq!(ref_bytes, target_bytes);
 
     // Verify op header exists
     let op_header = oplog::read_header(&reopened, op_id)
@@ -902,17 +910,19 @@ fn test_9_overlapping_candidates_deferred_with_owned_spools_intact() {
 
     let same_key = b"refs/heads/contended".to_vec();
 
+    let first = ref_value(31);
+    let second = ref_value(32);
     let fact1 = FactMutation {
         table: FactTable::Refs,
         key: same_key.clone(),
         expected: FactExpectation::Absent,
-        value: Some(b"first".to_vec()),
+        value: Some(first.clone()),
     };
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: same_key,
-        expected: FactExpectation::Value(b"first".to_vec()),
-        value: Some(b"second".to_vec()),
+        expected: FactExpectation::Value(first),
+        value: Some(second),
     };
 
     let cand1 = make_candidate(
@@ -998,7 +1008,7 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
         table: FactTable::Refs,
         key: b"refs/heads/cancelled".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"val".to_vec()),
+        value: Some(ref_value(25)),
     };
     let mut cand = make_candidate(
         Arc::clone(&session),
@@ -1038,11 +1048,12 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
     let (tx2, rx2) = oneshot::channel();
     drop(rx2); // Receiver dropped before publication begins
 
+    let survived = ref_value(26);
     let fact2 = FactMutation {
         table: FactTable::Refs,
         key: b"refs/heads/dropped-rx".to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(b"survives".to_vec()),
+        value: Some(survived.clone()),
     };
     let cand2 = make_candidate(
         session,
@@ -1071,7 +1082,7 @@ fn test_10_cancellation_before_publication_and_receiver_drop_after_commit() {
             .fact(FactTable::Refs, b"refs/heads/dropped-rx")
             .unwrap()
             .unwrap(),
-        b"survives"
+        survived
     );
 }
 
@@ -1217,6 +1228,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 paths,
                 mode: ClaimMode::Enforce,
                 expires_at: Timestamp::new(jiff::Timestamp::now()),
+                on_behalf_of: None,
             },
         }));
         let (handle, cancel) = cancellation();
@@ -1331,7 +1343,9 @@ fn branch_write_candidate(
         table: FactTable::Refs,
         key: name.as_bytes().to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(vec![oid_byte; 20]),
+        value: Some(
+            crate::store::encode("ref target", &RefTarget::Direct(oid)).expect("encode target"),
+        ),
     };
     let request_id = RequestId::generate();
     let (req, reply) = dummy_mutation_request(request_id);
@@ -1606,7 +1620,10 @@ fn symbolic_link_candidate(
         table: FactTable::Refs,
         key: name.as_bytes().to_vec(),
         expected: FactExpectation::Absent,
-        value: Some(target.as_bytes().to_vec()),
+        value: Some(
+            crate::store::encode("ref target", &RefTarget::Symbolic(target.clone()))
+                .expect("encode target"),
+        ),
     };
     let request_id = RequestId::generate();
     let (req, reply) = dummy_mutation_request(request_id);

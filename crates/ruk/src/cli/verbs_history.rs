@@ -40,7 +40,7 @@ use ruk_core::ops::NewRequest;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::ObjectKind as MergeLaneObjectKind;
 use ruk_core::store::Store as MergeLaneStore;
-use ruk_core::store::Store;
+use ruk_core::store::{EventContext, EventSource, Store};
 use ruk_core::workspace::HeadRef;
 use ruk_git::GitError;
 
@@ -57,6 +57,15 @@ use super::tree::{
 };
 use super::verbs_misc::{Mailmap, load_mailmap};
 use super::{Ctx, FlagSpec, collect, line};
+
+/// `(old path, new path, score)` rename pairing.
+type RenameScore = (Vec<u8>, Vec<u8>, u8);
+/// `(add index, old path, old entry, score)` merged rename winner.
+type MergeWinner = (usize, Vec<u8>, (TreeMode, Oid), u8);
+/// `(old body, new body)` blob bodies behind one pair.
+type PairBodies = (Option<Vec<u8>>, Option<Vec<u8>>);
+/// `(text, added, removed, binary, (old size, new size))` pair diff.
+type PairDiff = (Vec<u8>, usize, usize, bool, (usize, usize));
 
 /// Records staged changes as a commit, or rewrites `HEAD` with `--amend`.
 ///
@@ -515,7 +524,14 @@ fn refresh_tracked(ctx: &Ctx) -> Result<(), GitError> {
     let next = workspace.mutate_index(workspace.stamp)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(())
 }
 
@@ -671,7 +687,7 @@ fn read_log_file(ctx: &Ctx, spec: &str) -> Result<String, GitError> {
     if spec == "-" {
         return super::read_stdin_text(&ctx.env);
     }
-    std::fs::read_to_string(&spec).map_err(|err| GitError::Invalid {
+    std::fs::read_to_string(spec).map_err(|err| GitError::Invalid {
         detail: format!("could not read log file {spec:?}: {err}"),
     })
 }
@@ -805,9 +821,8 @@ fn resolve_commit_message(
                 let full =
                     String::from_utf8_lossy(commit_record(store, oid)?.message()).into_owned();
                 if subject.starts_with("amend!") {
-                    match full.split_once('\n') {
-                        Some((_, body)) => text.push_str(body.trim_start_matches('\n')),
-                        None => {}
+                    if let Some((_, body)) = full.split_once('\n') {
+                        text.push_str(body.trim_start_matches('\n'))
                     }
                 } else {
                     text.push_str(&full);
@@ -1009,7 +1024,12 @@ fn advance_head_to(ctx: &Ctx, new_oid: Oid) -> Result<(), GitError> {
             let next = workspace.move_head(workspace.stamp, HeadRef::Detached(new_oid))?;
             let mutation = workspace_mutation(raw.as_deref(), &next)?;
             store
-                .publish(Vec::new(), &[mutation])
+                .publish(
+                    Vec::new(),
+                    &[mutation],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .map_err(GitError::from)?;
             Ok(())
         }
@@ -1695,47 +1715,38 @@ pub(crate) fn walk_history_excluding(
 
 /// Finds every merge base of two tips: common ancestors that are not
 /// themselves ancestors of another common ancestor.
+///
+/// The walk lives in `ruk-core`; this adapter only supplies the
+/// replacement-aware graph access. Output is identical by construction:
+/// the local CLI walks unbounded.
 fn merge_bases_all(store: &Store, left: Oid, right: Oid) -> Result<Vec<Oid>, GitError> {
-    if left == right {
-        return Ok(vec![left]);
-    }
-    let left_set: HashSet<Oid> = walk_history(store, &[left], None)?
-        .into_iter()
-        .map(|(oid, _)| oid)
-        .collect();
-    let mut common = Vec::new();
-    for (oid, _) in walk_history(store, &[right], None)? {
-        if left_set.contains(&oid) {
-            common.push(oid);
-        }
-    }
-    minimize_bases(store, common)
+    let parents = |oid: Oid| commit_parents(store, oid);
+    let committer_time = |oid: Oid| Ok(super::state::commit_stamp(&commit_record(store, oid)?));
+    let mut budget = u64::MAX;
+    ruk_core::ops::compare::merge_bases_all(
+        &|oid| replace_redirect(store, oid),
+        &parents,
+        &committer_time,
+        &mut budget,
+        left,
+        right,
+    )
 }
 
 /// Drops duplicate and ancestor-dominated candidates, keeping the minimal
 /// base set in discovery order.
+///
+/// The check lives in `ruk-core`; the local CLI walks unbounded, so the
+/// surviving set matches the previous walk exactly.
 fn minimize_bases(store: &Store, candidates: Vec<Oid>) -> Result<Vec<Oid>, GitError> {
-    let mut seen = HashSet::new();
-    let mut unique = Vec::new();
-    for oid in candidates {
-        if seen.insert(oid) {
-            unique.push(oid);
-        }
-    }
-    let mut bases = Vec::new();
-    for cand in &unique {
-        let mut dominated = false;
-        for other in &unique {
-            if cand != other && is_ancestor(store, *cand, *other)? {
-                dominated = true;
-                break;
-            }
-        }
-        if !dominated {
-            bases.push(*cand);
-        }
-    }
-    Ok(bases)
+    let parents = |oid: Oid| commit_parents(store, oid);
+    let mut budget = u64::MAX;
+    ruk_core::ops::compare::minimize_bases(
+        &|oid| replace_redirect(store, oid),
+        &parents,
+        &mut budget,
+        candidates,
+    )
 }
 
 /// Collects every commit oid behind any ref, for `--all`. Non-commit
@@ -1744,10 +1755,11 @@ fn all_ref_tips(store: &Store) -> Result<Vec<Oid>, GitError> {
     let mut tips = Vec::new();
     let mut seen = HashSet::new();
     for (_, target) in list_refs(store)? {
-        if let Some(oid) = resolve_ref_target(store, Some(target))? {
-            if commit_record(store, oid).is_ok() && seen.insert(oid) {
-                tips.push(oid);
-            }
+        if let Some(oid) = resolve_ref_target(store, Some(target))?
+            && commit_record(store, oid).is_ok()
+            && seen.insert(oid)
+        {
+            tips.push(oid);
         }
     }
     Ok(tips)
@@ -2596,13 +2608,13 @@ fn decoration_map(store: &Store) -> Result<HashMap<Oid, Vec<String>>, GitError> 
         names.dedup();
     }
     let (workspace, _) = load_or_default(store)?;
-    if let HeadRef::Symbolic(name) = &workspace.head {
-        if let Some(oid) = resolve_ref_target(store, read_ref(store, name)?)? {
-            let full = name.to_utf8().unwrap_or_default().to_owned();
-            let entry = map.entry(oid).or_default();
-            entry.retain(|existing| existing != &full);
-            entry.insert(0, format!("HEAD -> {full}"));
-        }
+    if let HeadRef::Symbolic(name) = &workspace.head
+        && let Some(oid) = resolve_ref_target(store, read_ref(store, name)?)?
+    {
+        let full = name.to_utf8().unwrap_or_default().to_owned();
+        let entry = map.entry(oid).or_default();
+        entry.retain(|existing| existing != &full);
+        entry.insert(0, format!("HEAD -> {full}"));
     }
     Ok(map)
 }
@@ -3059,7 +3071,7 @@ fn message_subject(ctx: &Ctx, oid: &Oid) -> Result<String, GitError> {
     let store = ctx.store()?;
     let record = commit_record(store, *oid)?;
     let message = record.message();
-    Ok(String::from_utf8_lossy(&message)
+    Ok(String::from_utf8_lossy(message)
         .lines()
         .next()
         .unwrap_or_default()
@@ -3122,7 +3134,7 @@ fn no_sequencer(verb: &str, action: &str) -> Result<Vec<u8>, GitError> {
 /// Points the current branch at a tip when `HEAD` is still unborn.
 fn merge_into_unborn(ctx: &Ctx, rev: &str, tip: Oid) -> Result<Vec<u8>, GitError> {
     let store = ctx.store()?;
-    let (workspace, raw) = load_or_default(store)?;
+    let (workspace, _raw) = load_or_default(store)?;
     match workspace.head {
         HeadRef::Symbolic(name) => {
             super::state::apply_refs(
@@ -4132,12 +4144,13 @@ fn myers_hunks(a: &[&[u8]], b: &[&[u8]]) -> Option<Vec<Hunk>> {
                 b_end: bpos,
             },
         };
-        if let Some(last) = hunks.last_mut() {
-            if last.a_end == next.a_start && last.b_end == next.b_start {
-                last.a_end = next.a_end;
-                last.b_end = next.b_end;
-                continue;
-            }
+        if let Some(last) = hunks.last_mut()
+            && last.a_end == next.a_start
+            && last.b_end == next.b_start
+        {
+            last.a_end = next.a_end;
+            last.b_end = next.b_end;
+            continue;
         }
         hunks.push(next);
     }
@@ -4219,11 +4232,11 @@ fn diff3_merge(
     bounds.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(bounds.len());
     for bound in bounds {
-        if let Some(last) = merged.last_mut() {
-            if bound.0 <= last.1 {
-                last.1 = last.1.max(bound.1);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && bound.0 <= last.1
+        {
+            last.1 = last.1.max(bound.1);
+            continue;
         }
         merged.push(bound);
     }
@@ -4691,7 +4704,7 @@ fn detect_lane_renames(
     cache: &mut HashMap<Oid, Vec<u8>>,
     base: &BTreeMap<Vec<u8>, (TreeMode, Oid)>,
     side: &BTreeMap<Vec<u8>, (TreeMode, Oid)>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>, u8)>, GitError> {
+) -> Result<Vec<RenameScore>, GitError> {
     use super::rename::{RenameSide, pair_renames, similarity};
     let store = ctx.store()?;
     let mut dels: Vec<(Vec<u8>, TreeMode, Oid)> = Vec::new();
@@ -4862,11 +4875,16 @@ fn apply_merge_plan(ctx: &Ctx, plan: &MergePlan) -> Result<Vec<(Vec<u8>, IndexEn
     let (workspace, raw) = load_or_default(store)?;
     let next = workspace
         .mutate_index(workspace.stamp)
-        .map_err(|err| GitError::from(CoreError::from(err)))?;
+        .map_err(GitError::from)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(prepared, &mutations)
+        .publish(
+            prepared,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     sync_lane_worktree(ctx, &writes)?;
     Ok(staged)
@@ -5066,10 +5084,9 @@ fn guard_lane_worktree(
             Some(entry) if entry.mode() == FileMode::Gitlink
         );
         if !gitlink {
-            let staged_side: Option<(FileMode, Oid)> = match stage_zero.get(path.as_slice()) {
-                Some(entry) => Some((entry.mode(), entry.oid())),
-                None => None,
-            };
+            let staged_side: Option<(FileMode, Oid)> = stage_zero
+                .get(path.as_slice())
+                .map(|entry| (entry.mode(), entry.oid()));
             if staged_side != head_side {
                 blocked.push(String::from_utf8_lossy(path).into_owned());
                 continue;
@@ -5220,11 +5237,16 @@ fn restore_abort_index(ctx: &Ctx, verb: &str) -> Result<(), GitError> {
     let (workspace, raw_ws) = load_or_default(store)?;
     let next = workspace
         .mutate_index(workspace.stamp)
-        .map_err(|err| GitError::from(CoreError::from(err)))?;
+        .map_err(GitError::from)?;
     mutations.push(workspace_mutation(raw_ws.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
     store
-        .publish(Vec::new(), &mutations)
+        .publish(
+            Vec::new(),
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     // Restoring the pre-operation worktree must not delete files the user
     // created meanwhile: filter removals to snapshot paths only when the
@@ -5793,14 +5815,15 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
                 .filter_map(|head| head.as_git().copied())
             {
                 let parent = replace_redirect(store, parent);
-                if excluded.contains(&parent) && seen_boundary.insert(parent) {
-                    if let Ok(record) = commit_record(store, parent) {
-                        boundary.push((super::state::commit_stamp(&record), parent, record));
-                    }
+                if excluded.contains(&parent)
+                    && seen_boundary.insert(parent)
+                    && let Ok(record) = commit_record(store, parent)
+                {
+                    boundary.push((super::state::commit_stamp(&record), parent, record));
                 }
             }
         }
-        boundary.sort_by(|left, right| right.0.cmp(&left.0));
+        boundary.sort_by_key(|left| std::cmp::Reverse(left.0));
     }
     let graph = opts.is_set("graph");
     let source = opts.is_set("source");
@@ -5822,11 +5845,9 @@ pub(crate) fn log(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> {
             &decoration,
             source_text.as_deref().unwrap_or(""),
         )?;
-        if show_notes {
-            if let Some(blob) = notes_map.get(&shown.oid.to_hex()) {
-                let (_, body) = read_object_bytes(store, *blob)?;
-                block.extend_from_slice(&render_note(&body));
-            }
+        if show_notes && let Some(blob) = notes_map.get(&shown.oid.to_hex()) {
+            let (_, body) = read_object_bytes(store, *blob)?;
+            block.extend_from_slice(&render_note(&body));
         }
         if show_diffs {
             // Pathspecs bound each commit's diff; `--follow` tracks the
@@ -6091,10 +6112,11 @@ fn log_ref_tips(
         {
             continue;
         }
-        if let Some(oid) = resolve_ref_target(store, Some(target))? {
-            if commit_record(store, oid).is_ok() && seen.insert(oid) {
-                out.push((oid, short_ref_name(&full).to_owned()));
-            }
+        if let Some(oid) = resolve_ref_target(store, Some(target))?
+            && commit_record(store, oid).is_ok()
+            && seen.insert(oid)
+        {
+            out.push((oid, short_ref_name(&full).to_owned()));
         }
     }
     Ok(out)
@@ -6228,10 +6250,10 @@ fn follow_step(
     apply_pair_renames(ctx, &mut pairs, effective)?;
     for pair in &pairs {
         if pair.path == current {
-            if let Some(old) = &pair.old_path {
-                if old != current {
-                    return Ok(Some(old.clone()));
-                }
+            if let Some(old) = &pair.old_path
+                && old != current
+            {
+                return Ok(Some(old.clone()));
             }
             return Ok(Some(current.to_vec()));
         }
@@ -6373,7 +6395,7 @@ fn cherry_pick_filter(
         }
     }
     let mut out = Vec::with_capacity(shown.len());
-    for (shown, print) in shown.into_iter().zip(prints.iter()) {
+    for (shown, print) in shown.iter().zip(prints.iter()) {
         let duplicate = if shown.origin == left {
             right_counts.contains_key(print)
         } else if shown.origin == right {
@@ -6471,10 +6493,10 @@ fn topo_reorder(shown: Vec<ShownCommit>, tips: &[Oid]) -> Vec<ShownCommit> {
         let mut rest: Vec<Oid> = slots.keys().copied().collect();
         rest.sort();
         for oid in rest {
-            if emitted.insert(oid) {
-                if let Some(entry) = slots.remove(&oid) {
-                    out.push(entry);
-                }
+            if emitted.insert(oid)
+                && let Some(entry) = slots.remove(&oid)
+            {
+                out.push(entry);
             }
         }
     }
@@ -6553,7 +6575,7 @@ fn log_commit_extra(
 /// of that side with full line counts, and vice versa for deletions.
 fn split_offspec_renames(
     store: &Store,
-    changes: &mut Vec<FileChange>,
+    changes: &mut [FileChange],
     wants: &[Vec<u8>],
 ) -> Result<(), GitError> {
     for change in changes.iter_mut() {
@@ -6701,29 +6723,29 @@ fn commit_line_of(opts: &super::Collected) -> Result<CommitLine, GitError> {
     // An explicit `--pretty` always decides the shape: only `oneline`
     // keeps the short form, so `--pretty=full` (and its siblings) override
     // a bare `--oneline` flag the way a more specific spelling should.
-    if format.is_none() {
-        if let Some(text) = opts.single("pretty")? {
-            match text.as_str() {
-                "oneline" => oneline = true,
-                "short" | "medium" => oneline = false,
-                "full" => {
-                    oneline = false;
-                    pretty = PrettyKind::Full;
-                }
-                "fuller" => {
-                    oneline = false;
-                    pretty = PrettyKind::Fuller;
-                }
-                "email" => {
-                    oneline = false;
-                    pretty = PrettyKind::Email;
-                }
-                "raw" => {
-                    oneline = false;
-                    pretty = PrettyKind::Raw;
-                }
-                _ => format = parse_pretty_arg(&text)?,
+    if format.is_none()
+        && let Some(text) = opts.single("pretty")?
+    {
+        match text.as_str() {
+            "oneline" => oneline = true,
+            "short" | "medium" => oneline = false,
+            "full" => {
+                oneline = false;
+                pretty = PrettyKind::Full;
             }
+            "fuller" => {
+                oneline = false;
+                pretty = PrettyKind::Fuller;
+            }
+            "email" => {
+                oneline = false;
+                pretty = PrettyKind::Email;
+            }
+            "raw" => {
+                oneline = false;
+                pretty = PrettyKind::Raw;
+            }
+            _ => format = parse_pretty_arg(&text)?,
         }
     }
     let mut date = match opts.single("date")? {
@@ -7815,7 +7837,7 @@ fn apply_pair_renames(
     let mut del_side: Vec<RenameSide> = Vec::with_capacity(dels.len());
     for index in &dels {
         let pair = &pairs[*index];
-        let (mode, oid) = pair.old.expect("deletion has an old side");
+        let (_mode, oid) = pair.old.expect("deletion has an old side");
         let (_, body) = read_object_bytes(store, oid)?;
         del_side.push(RenameSide {
             path: pair.path.clone(),
@@ -7888,7 +7910,7 @@ fn apply_pair_renames(
         return Ok(());
     }
     let mut dead = vec![false; pairs.len()];
-    let mut merged: Vec<(usize, Vec<u8>, (TreeMode, Oid), u8)> = Vec::new();
+    let mut merged: Vec<MergeWinner> = Vec::new();
     for win in &winners {
         let del_index = dels[win.old];
         let add_index = adds[win.new];
@@ -8189,7 +8211,7 @@ struct CopySource {
 /// text uses the shared line-Dice [`similarity`]. Renames win over copies:
 /// callers run [`apply_pair_renames`] first, so consumed deletions never
 /// resurface here.
-fn apply_pair_copies(ctx: &Ctx, pairs: &mut Vec<TreePair>, threshold: u8) -> Result<(), GitError> {
+fn apply_pair_copies(ctx: &Ctx, pairs: &mut [TreePair], threshold: u8) -> Result<(), GitError> {
     const MAX_SCORE_BYTES: usize = 1 << 20;
     let store = ctx.store()?;
     let mut sources: Vec<CopySource> = Vec::new();
@@ -8239,7 +8261,7 @@ fn apply_pair_copies(ctx: &Ctx, pairs: &mut Vec<TreePair>, threshold: u8) -> Res
             else {
                 continue;
             };
-            let better = best.as_ref().map_or(true, |(_, prev)| score > *prev);
+            let better = best.as_ref().is_none_or(|(_, prev)| score > *prev);
             if better {
                 best = Some((source.path.clone(), score));
             }
@@ -8588,7 +8610,7 @@ pub(crate) fn tree_file_changes(
             sizes: (0, body.len()),
         });
     }
-    changes.sort_by(|left, right| display_path(left).cmp(&display_path(right)));
+    changes.sort_by_key(display_path);
     Ok(changes)
 }
 
@@ -8956,7 +8978,7 @@ fn render_pair_summary(hunks: &[CountedHunk]) -> Vec<u8> {
 /// (`new_bytes` worktree edits, `old_bytes`/`new_bytes` `--no-index`
 /// compares) override the object read, so repository-less compares never
 /// touch the store.
-fn pair_bodies(ctx: &Ctx, pair: &TreePair) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), GitError> {
+fn pair_bodies(ctx: &Ctx, pair: &TreePair) -> Result<PairBodies, GitError> {
     let old_body = match &pair.old_bytes {
         Some(bytes) => Some(bytes.clone()),
         None => match pair.old {
@@ -9000,7 +9022,7 @@ fn unified_pair(
     old: Option<&[u8]>,
     new: Option<&[u8]>,
     render: &PairRender,
-) -> Result<(Vec<u8>, usize, usize, bool, (usize, usize)), GitError> {
+) -> Result<PairDiff, GitError> {
     let new_name = String::from_utf8_lossy(&pair.path);
     // `--no-index` names its own old side; renames use the old path.
     let old_name = pair
@@ -9071,8 +9093,7 @@ fn unified_pair(
     let old_lines = old.map(split_lines).unwrap_or_default();
     let new_lines = new.map(split_lines).unwrap_or_default();
     let binary = !render.text
-        && (old.map_or(false, |body| body.contains(&0))
-            || new.map_or(false, |body| body.contains(&0)));
+        && (old.is_some_and(|body| body.contains(&0)) || new.is_some_and(|body| body.contains(&0)));
     if binary {
         let old_side = pair
             .old
@@ -10119,11 +10140,11 @@ pub(crate) fn rev_parse(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
         if *rev == "--" {
             continue;
         }
-        if opts.is_set("abbrev-ref") {
-            if let Some(short) = abbrev_branch(ctx, rev)? {
-                out.extend_from_slice(format!("{short}\n").as_bytes());
-                continue;
-            }
+        if opts.is_set("abbrev-ref")
+            && let Some(short) = abbrev_branch(ctx, rev)?
+        {
+            out.extend_from_slice(format!("{short}\n").as_bytes());
+            continue;
         }
         let oid = resolve_local(store, kind, rev)?;
         match short_len {
@@ -10131,7 +10152,7 @@ pub(crate) fn rev_parse(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
             Some(len) => {
                 let hex = oid.to_hex();
                 let end = len.min(hex.len());
-                out.extend_from_slice(hex[..end].as_bytes());
+                out.extend_from_slice(&hex.as_bytes()[..end]);
                 out.push(b'\n');
             }
         }

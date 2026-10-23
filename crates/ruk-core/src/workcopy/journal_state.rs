@@ -38,6 +38,13 @@ pub(crate) enum ApplyPhase {
     Applying,
     /// A journal is open and recovery found paths matching neither
     /// preimage nor target.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "journal recovery has no producer at this commit; retained for later changeset rows"
+        )
+    )]
     Recovery,
 }
 

@@ -6,6 +6,7 @@
 //! and own their own presentation.
 
 pub mod abandon;
+pub mod compare;
 pub mod describe;
 pub mod edit;
 pub mod new;
@@ -23,6 +24,10 @@ mod tests;
 use crate::store::types::{FactMutation, PreparedObject};
 
 pub use abandon::{AbandonRequest, AbandonResult, abandon, prepare_abandon};
+pub use compare::{
+    CompareOutcome, DEFAULT_COMPARE_MAX_COMMITS, compare, merge_base, merge_bases_all,
+    minimize_bases,
+};
 pub use describe::{ChangeDescription, CommitDescription, DescribeRequest, Description, describe};
 pub use edit::{EditRequest, EditResult, edit, prepare_edit};
 pub use new::{NewRequest, NewResult, new, prepare_new};

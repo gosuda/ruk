@@ -16,8 +16,9 @@
 //! - [`FactTable`] enumerates every approved mutable fact table except the
 //!   publication-owned objects/segments/generation tables.
 
-use crate::change::StoreId;
+use crate::change::{OperationId, SessionId, StoreId};
 use crate::ids::{HashKind, Oid};
+use crate::refdata::{RefName, RefTarget};
 use crate::store::spool::Spool;
 use serde::de::{self, Deserialize, Deserializer};
 
@@ -218,6 +219,16 @@ pub struct ReadObject {
     pub depth: u8,
 }
 
+/// One ref event this publication emitted, locating the operation the
+/// batch performed on its ref.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefEvent {
+    /// The ref whose mutation the event records.
+    pub name: Vec<u8>,
+    /// The event sequence assigned under the writer lock.
+    pub seq: u64,
+}
+
 /// Durable outcome of one publication.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Publication {
@@ -226,6 +237,8 @@ pub struct Publication {
     pub objects: Vec<Oid>,
     /// Metadata generation that committed this batch.
     pub generation: u64,
+    /// One entry per `Refs` fact the batch carried, in fact order.
+    pub ref_events: Vec<RefEvent>,
 }
 
 /// The approved mutable fact tables. Closed: a new table arrives only with
@@ -264,11 +277,16 @@ pub enum FactTable {
     Shallow,
     Pins,
     LfsObjects,
+    Events,
+    EventHead,
+    ServiceReceipts,
+    RepoMeta,
+    ReleasedTags,
 }
 
 impl FactTable {
     /// Every table, in schema order.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 32] = [
         Self::Refs,
         Self::RefConflicts,
         Self::RemoteObservations,
@@ -296,6 +314,11 @@ impl FactTable {
         Self::Shallow,
         Self::Pins,
         Self::LfsObjects,
+        Self::Events,
+        Self::EventHead,
+        Self::ServiceReceipts,
+        Self::RepoMeta,
+        Self::ReleasedTags,
     ];
 
     /// The exact on-disk table name from the core census.
@@ -329,9 +352,157 @@ impl FactTable {
             Self::Shallow => "shallow",
             Self::Pins => "pins",
             Self::LfsObjects => "lfs_objects",
+            Self::Events => "events",
+            Self::EventHead => "event_head",
+            Self::ServiceReceipts => "service_receipts",
+            Self::RepoMeta => "repo_meta",
+            Self::ReleasedTags => "released_tags",
         }
     }
 }
+
+/// What published one batch of ref mutations: the lane, the receive-pack
+/// path, a local command, or a lifecycle importer. Recorded on every ref
+/// event; never an authorization input.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub enum EventSource {
+    ReceivePack,
+    Lane,
+    LocalPush,
+    Fork,
+    Import,
+    Land,
+}
+
+/// Per-event attribution for one publication: the lane fills every field,
+/// every other publisher leaves the ones it does not have empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventContext {
+    /// The lane operation that moved the ref, if any.
+    pub operation: Option<OperationId>,
+    /// The idempotency key that moved the ref, if any.
+    pub request_id: Option<String>,
+    /// The session that moved the ref, if any.
+    pub session: Option<SessionId>,
+    /// Provenance the invoking call declared; recorded, never authorized on.
+    pub on_behalf_of: Option<String>,
+}
+
+/// One ref event: the `Events` row at the big-endian sequence key, naming
+/// the ref mutation that committed under the writer lock.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoreEvent {
+    /// The mutated ref name.
+    pub name: Vec<u8>,
+    /// The ref target before the batch, absent for creates.
+    pub old: Option<Vec<u8>>,
+    /// The ref target after the batch, absent for deletes.
+    pub new: Option<Vec<u8>>,
+    /// Unix millis the batch committed.
+    pub at: u64,
+    /// What published the batch.
+    pub source: EventSource,
+    /// The lane operation that moved the ref, if any.
+    pub operation: Option<OperationId>,
+    /// The idempotency key that moved the ref, if any.
+    pub request_id: Option<String>,
+    /// The session that moved the ref, if any.
+    pub session: Option<SessionId>,
+    /// Provenance the invoking call declared; recorded, never authorized on.
+    /// Appended last so older rows decode through [`StoreEventV1`].
+    /// Never surfaced in `TailedEvent`.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+}
+
+/// Pre-provenance ref event: the [`StoreEvent`] shape before the trailing
+/// `on_behalf_of` field. Decode-only outside tests, for rows written before
+/// provenance existed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoreEventV1 {
+    pub name: Vec<u8>,
+    pub old: Option<Vec<u8>>,
+    pub new: Option<Vec<u8>>,
+    pub at: u64,
+    pub source: EventSource,
+    pub operation: Option<OperationId>,
+    pub request_id: Option<String>,
+    pub session: Option<SessionId>,
+}
+
+/// Decodes one event ref-target cell: the postcard `RefTarget` stored in
+/// an event's `old`/`new` bytes.
+pub fn decode_event_target(raw: &[u8]) -> Result<RefTarget, crate::store::StoreError> {
+    crate::store::decode("event target", raw)
+}
+
+/// Decodes one `Events` row: the current shape first, then the
+/// pre-provenance shape with `on_behalf_of` absent.
+pub fn decode_store_event(raw: &[u8]) -> Result<StoreEvent, crate::store::StoreError> {
+    if let Ok(event) = crate::store::decode("event", raw) {
+        return Ok(event);
+    }
+    let old: StoreEventV1 = crate::store::decode("event", raw)?;
+    Ok(StoreEvent {
+        name: old.name,
+        old: old.old,
+        new: old.new,
+        at: old.at,
+        source: old.source,
+        operation: old.operation,
+        request_id: old.request_id,
+        session: old.session,
+        on_behalf_of: None,
+    })
+}
+
+/// The `EventHead` row: the event sequence horizon. `head` is the last
+/// assigned sequence (zero with no events); `oldest` is the oldest
+/// retained sequence, or `head + 1` when retention pruned everything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventHeadRow {
+    /// The last assigned event sequence.
+    pub head: u64,
+    /// The oldest retained event sequence.
+    pub oldest: u64,
+}
+
+/// The `EventHead` row key.
+pub const EVENT_HEAD_KEY: &[u8] = b"head";
+
+/// The `RepoMeta` row: repository-level metadata written once at init.
+/// `repo.init` persists the default branch here; `policy.set` extends the
+/// row with the landing policy, bumping `policy_generation` every write.
+/// Stores predating the policy fields decode through [`RepoMetaRowV0`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepoMetaRow {
+    /// The default branch name recorded at init.
+    pub default_branch: RefName,
+    /// Attestation predicates every landing candidate must carry.
+    /// Empty means landing is unconstrained.
+    #[serde(default)]
+    pub land_requirements: Vec<crate::protocol::AttestRequirement>,
+    /// Signers trusted to meet the landing requirements.
+    #[serde(default)]
+    pub trusted_signers: Vec<crate::protocol::SignerFingerprint>,
+    /// How many `policy.set` writes this row has seen.
+    #[serde(default)]
+    pub policy_generation: u64,
+}
+
+/// Pre-policy repository metadata: the [`RepoMetaRow`] shape before the
+/// trailing landing-policy fields. Decode-only, for stores written before
+/// `policy.set` existed; they read back with an empty policy at
+/// generation zero.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct RepoMetaRowV0 {
+    pub default_branch: RefName,
+}
+
+/// The `RepoMeta` row key.
+pub const REPO_META_KEY: &[u8] = b"meta";
 
 /// Conditional application of one fact mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -603,5 +774,51 @@ mod tests {
         bad[3] = 0xFF;
         assert_version("non-UTF-8 byte", &bad);
         assert_version("foreign content", b"not a store marker\n");
+    }
+
+    fn sample_event() -> StoreEvent {
+        StoreEvent {
+            name: b"refs/heads/main".to_vec(),
+            old: None,
+            new: Some(b"tip".to_vec()),
+            at: 1_000,
+            source: EventSource::ReceivePack,
+            operation: None,
+            request_id: Some("req-1".to_string()),
+            session: None,
+            on_behalf_of: Some("agent-x".to_string()),
+        }
+    }
+
+    #[test]
+    fn event_decode_reads_current_provenance() {
+        let event = sample_event();
+        let raw = crate::store::encode("event", &event).expect("encode");
+        let back = decode_store_event(&raw).expect("decode");
+        assert_eq!(back, event);
+    }
+
+    #[test]
+    fn event_decode_falls_back_to_pre_provenance_rows() {
+        let event = sample_event();
+        let old = StoreEventV1 {
+            name: event.name.clone(),
+            old: event.old.clone(),
+            new: event.new.clone(),
+            at: event.at,
+            source: event.source,
+            operation: event.operation,
+            request_id: event.request_id.clone(),
+            session: event.session,
+        };
+        let raw = crate::store::encode("event", &old).expect("encode v1");
+        assert!(
+            crate::store::decode::<StoreEvent>("event", &raw).is_err(),
+            "pre-provenance bytes must not decode as the current shape"
+        );
+        let back = decode_store_event(&raw).expect("fallback decodes");
+        assert_eq!(back.on_behalf_of, None);
+        assert_eq!(back.name, event.name);
+        assert_eq!(back.request_id, event.request_id);
     }
 }

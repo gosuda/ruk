@@ -25,7 +25,7 @@ use crate::merge::Merge;
 use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// What commit to rebase, where to place it, and which descendants to rewrite.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -92,7 +92,12 @@ pub struct RebaseResult {
 pub fn rebase(store: &Store, request: RebaseRequest) -> Result<RebaseResult, CoreError> {
     let prepared = prepare_rebase(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -482,7 +487,12 @@ mod tests {
                 .expect("prepare object");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish object");
             oid
         }

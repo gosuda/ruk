@@ -30,13 +30,14 @@ use serde::{Deserialize, Serialize};
 use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::bytes::ByteString;
 use crate::capability::Capabilities;
-use crate::change::{OperationId, RequestId, SessionId, WorkspaceId};
+use crate::change::{ClaimId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::commit::ProvenanceClaims;
 use crate::coord::policy::Principal;
 use crate::error::{CoreError, ErrorCode};
+use crate::index::RepoPath;
 use crate::protocol::{
-    IdentityClaim, MutationOutcome, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp,
-    Validate,
+    ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimReleaseReply, IdentityClaim, Method,
+    MutationOutcome, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp, Validate,
 };
 use crate::store::types::FactTable;
 use crate::store::{Store, StoreError};
@@ -272,14 +273,14 @@ pub(crate) fn decode_session(
     b: &[u8],
 ) -> Result<SessionRow, CoreError> {
     let row: SessionRow = decode(store, "session row", b)?;
-    if let Some(identity) = &row.identity {
-        if let Err(err) = identity.validate() {
-            return corrupt(
-                store,
-                "session row",
-                format!("invalid identity claim: {err}"),
-            );
-        }
+    if let Some(identity) = &row.identity
+        && let Err(err) = identity.validate()
+    {
+        return corrupt(
+            store,
+            "session row",
+            format!("invalid identity claim: {err}"),
+        );
     }
     Ok(row)
 }
@@ -353,6 +354,10 @@ impl ReceiptRow {
     }
 
     /// Read-only access to the wrapped reply.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn reply(&self) -> &Reply {
         &self.0
@@ -378,7 +383,17 @@ pub(crate) fn decode_receipt(
     key: &[u8; 32],
     b: &[u8],
 ) -> Result<ReceiptRow, CoreError> {
-    let reply: Reply = decode(store, "receipt row", b)?;
+    // Receipts committed before `ClaimRecord.on_behalf_of` fail the current
+    // decode: postcard is positional, so the missing trailing field reads as
+    // truncation. Retry them against the explicit legacy shapes, like
+    // `decode_workspace` retries with `LegacyWorkspaceRow`: a truncated
+    // new-shape row must fail the strict legacy decode and latch quarantine
+    // instead of mistranslating, so the restored byte is never trusted as a
+    // value on its own.
+    let reply: Reply = match crate::store::decode("receipt row", b) {
+        Ok(reply) => reply,
+        Err(_) => decode_legacy_claim_receipt(store, b)?,
+    };
     let mut s_bytes = [0_u8; 16];
     s_bytes.copy_from_slice(&key[..16]);
     let s = SessionId::from_bytes(s_bytes);
@@ -424,6 +439,130 @@ pub(crate) fn decode_receipt(
         return corrupt(store, "receipt row", "stored receipt has replayed == true");
     }
     Ok(ReceiptRow(reply))
+}
+
+/// Pre-provenance claim record: the [`ClaimRecord`] shape before the trailing
+/// `on_behalf_of` field. Decode-only, for receipts written before provenance
+/// existed; mirrors `LegacyWorkspaceRow`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct LegacyClaimRecord {
+    claim: ClaimId,
+    holder: SessionId,
+    paths: Vec<RepoPath>,
+    mode: ClaimMode,
+    expires_at: Timestamp,
+}
+
+/// Pre-provenance `claim.acquire` reply: outcome plus the legacy record.
+/// Decode-only; postcard-identical to the release shape, so the candidate
+/// variant always comes from the row's discriminant, never from a guess.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct LegacyClaimAcquireReply {
+    outcome: MutationOutcome,
+    claim: LegacyClaimRecord,
+}
+
+/// Pre-provenance `claim.release` reply: outcome plus the legacy record.
+/// Decode-only; see [`LegacyClaimAcquireReply`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct LegacyClaimReleaseReply {
+    outcome: MutationOutcome,
+    released: LegacyClaimRecord,
+}
+
+/// Upgrades one pre-field claim receipt after the current postcard decode
+/// failed, so these bytes are either a legacy claim receipt or corruption.
+///
+/// The restored None byte only identifies the candidate variant and locates
+/// the payload boundary; the returned value always comes from the strict
+/// legacy decode of the original bytes, so a truncated new-shape row fails
+/// here instead of mistranslating. Every rejection observes, latching
+/// quarantine exactly like any other corrupt receipt.
+///
+/// # Errors
+/// `E_CORRUPT` (quarantine latched) unless `b` is exactly a legacy
+/// `claim.acquire` or `claim.release` receipt.
+fn decode_legacy_claim_receipt(store: &Store, b: &[u8]) -> Result<Reply, CoreError> {
+    let mut extended = Vec::with_capacity(b.len() + 1);
+    extended.extend_from_slice(b);
+    extended.push(0x00);
+    let staged: Reply = decode(store, "receipt row", &extended)?;
+    let method = staged.method();
+    if !matches!(method, Method::ClaimAcquire | Method::ClaimRelease) {
+        return corrupt(
+            store,
+            "receipt row",
+            format!(
+                "stored reply for method `{}` is not a claim receipt",
+                method.as_str()
+            ),
+        );
+    }
+    // The staged value re-encodes to the extended bytes (canonical
+    // postcard), so the payload encoding locates the discriminant boundary
+    // without trusting the restored byte as a value.
+    let (outcome, record) = match &staged {
+        Reply::ClaimAcquire(acquire) => (&acquire.outcome, &acquire.claim),
+        Reply::ClaimRelease(release) => (&release.outcome, &release.released),
+        _ => {
+            return corrupt(
+                store,
+                "receipt row",
+                format!(
+                    "stored reply for method `{}` is not a claim receipt",
+                    method.as_str()
+                ),
+            );
+        }
+    };
+    let payload =
+        crate::store::encode("receipt row", &(outcome, record)).map_err(CoreError::from)?;
+    let Some(disc_len) = extended.len().checked_sub(payload.len()) else {
+        return corrupt(
+            store,
+            "receipt row",
+            "claim receipt payload exceeds its row",
+        );
+    };
+    let Some(rest) = b.get(disc_len..) else {
+        return corrupt(
+            store,
+            "receipt row",
+            "claim receipt discriminant exceeds its row",
+        );
+    };
+    let upgrade = |legacy: LegacyClaimRecord| ClaimRecord {
+        claim: legacy.claim,
+        holder: legacy.holder,
+        paths: legacy.paths,
+        mode: legacy.mode,
+        expires_at: legacy.expires_at,
+        on_behalf_of: None,
+    };
+    match method {
+        Method::ClaimAcquire => {
+            let legacy: LegacyClaimAcquireReply = decode(store, "receipt row", rest)?;
+            Ok(Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+                outcome: legacy.outcome,
+                claim: upgrade(legacy.claim),
+            })))
+        }
+        Method::ClaimRelease => {
+            let legacy: LegacyClaimReleaseReply = decode(store, "receipt row", rest)?;
+            Ok(Reply::ClaimRelease(Box::new(ClaimReleaseReply {
+                outcome: legacy.outcome,
+                released: upgrade(legacy.released),
+            })))
+        }
+        _ => corrupt(
+            store,
+            "receipt row",
+            format!(
+                "stored reply for method `{}` is not a claim receipt",
+                method.as_str()
+            ),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,17 +763,61 @@ pub(crate) struct OpHeader {
     pub(crate) parts: u64,
 }
 
-/// Decodes and validates an operation header row from committed bytes.
+/// Pre-provenance operation entry: the [`OperationEntry`] shape before the
+/// trailing `on_behalf_of` field. Decode-only, for stores written before
+/// provenance existed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OperationEntryV0 {
+    id: OperationId,
+    parent: Option<OperationId>,
+    session: Option<SessionId>,
+    method: Method,
+    committed_at: Timestamp,
+    undoes: Option<OperationId>,
+}
+
+/// Pre-summary operation entry: the [`OperationEntry`] shape before the
+/// trailing per-op `ref_deltas` and `attestation_subjects` fields.
+/// Decode-only, for rows written before summaries existed; they read back
+/// with empty summaries.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OperationEntryV1 {
+    id: OperationId,
+    parent: Option<OperationId>,
+    session: Option<SessionId>,
+    method: Method,
+    committed_at: Timestamp,
+    undoes: Option<OperationId>,
+    on_behalf_of: Option<String>,
+}
+
+/// Pre-summary operation header: part 0 with a [`OperationEntryV1`] entry.
+/// Decode-only, for rows written before summaries existed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OpHeaderV1 {
+    entry: OperationEntryV1,
+    deltas: u64,
+    stream_bytes: u64,
+    parts: u64,
+}
+
+/// Pre-provenance operation header: the [`OpHeader`] shape before the
+/// trailing entry field. Decode-only, for stores written before provenance
+/// existed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct OpHeaderV0 {
+    entry: OperationEntryV0,
+    deltas: u64,
+    stream_bytes: u64,
+    parts: u64,
+}
+
+/// Validates one decoded operation header row.
 ///
 /// # Errors
-/// `E_CORRUPT` and latches quarantine on byte corruption, operation ID mismatch,
+/// `E_CORRUPT` and latches quarantine on operation ID mismatch,
 /// non-positive delta count, non-positive stream size, or invalid parts count.
-pub(crate) fn decode_op_header(
-    store: &Store,
-    id: OperationId,
-    b: &[u8],
-) -> Result<OpHeader, CoreError> {
-    let header: OpHeader = decode(store, "op header", b)?;
+fn validate_op_header(store: &Store, id: OperationId, header: &OpHeader) -> Result<(), CoreError> {
     if header.entry.id != id {
         return corrupt(
             store,
@@ -666,6 +849,68 @@ pub(crate) fn decode_op_header(
             ),
         );
     }
+    Ok(())
+}
+
+/// Decodes and validates an operation header row from committed bytes.
+/// Rows written before provenance existed decode through the v0 shape with
+/// no provenance instead of latching quarantine.
+///
+/// # Errors
+/// `E_CORRUPT` and latches quarantine on byte corruption, operation ID mismatch,
+/// non-positive delta count, non-positive stream size, or invalid parts count.
+pub(crate) fn decode_op_header(
+    store: &Store,
+    id: OperationId,
+    b: &[u8],
+) -> Result<OpHeader, CoreError> {
+    let new_shape: Result<OpHeader, _> = crate::store::decode("op header", b);
+    if let Ok(header) = new_shape {
+        validate_op_header(store, id, &header)?;
+        return Ok(header);
+    }
+    if let Ok(old) = crate::store::decode("op header", b) {
+        let old: OpHeaderV1 = old;
+        let header = OpHeader {
+            entry: OperationEntry {
+                id: old.entry.id,
+                parent: old.entry.parent,
+                session: old.entry.session,
+                method: old.entry.method,
+                committed_at: old.entry.committed_at,
+                undoes: old.entry.undoes,
+                on_behalf_of: old.entry.on_behalf_of,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
+            },
+            deltas: old.deltas,
+            stream_bytes: old.stream_bytes,
+            parts: old.parts,
+        };
+        validate_op_header(store, id, &header)?;
+        return Ok(header);
+    }
+    let old: OpHeaderV0 = match crate::store::decode("op header", b) {
+        Ok(old) => old,
+        Err(_) => return corrupt(store, "op header", "malformed op header"),
+    };
+    let header = OpHeader {
+        entry: OperationEntry {
+            id: old.entry.id,
+            parent: old.entry.parent,
+            session: old.entry.session,
+            method: old.entry.method,
+            committed_at: old.entry.committed_at,
+            undoes: old.entry.undoes,
+            on_behalf_of: None,
+            ref_deltas: Vec::new(),
+            attestation_subjects: Vec::new(),
+        },
+        deltas: old.deltas,
+        stream_bytes: old.stream_bytes,
+        parts: old.parts,
+    };
+    validate_op_header(store, id, &header)?;
     Ok(header)
 }
 
@@ -703,11 +948,11 @@ mod tests {
     use crate::heads::Head;
     use crate::ids::{HashKind, Oid};
     use crate::protocol::{
-        BoundedList, Method, RequestDigest, ResultingStamp, SchemaArgs, SchemaReply, SchemaVersion,
-        WsTakeArgs, WsTakeReply,
+        BoundedList, Method, MutationOutcome, RequestDigest, SchemaArgs, SchemaReply,
+        SchemaVersion, WsTakeReply,
     };
     use crate::store::PreparationBudget;
-    use crate::workspace::{NativeWorkspace, Scope, WorkspaceStamp};
+    use crate::workspace::{NativeWorkspace, Scope};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1026,6 +1271,125 @@ mod tests {
     }
 
     #[test]
+    fn pre_provenance_claim_receipts_decode_with_no_on_behalf_of() {
+        use crate::protocol::{ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimReleaseReply};
+        let (_temp, store) = test_store("claim-legacy");
+        let s = SessionId::from_bytes([1; 16]);
+        let r = RequestId::from_bytes([2; 16]);
+        let outcome = MutationOutcome {
+            receipt: ReceiptRef {
+                session: s,
+                request_id: r,
+                digest: RequestDigest::from_bytes([3; 32]),
+                replayed: false,
+                retained_until: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+            operation: Some(OperationId(1)),
+            heads: empty_bounded_list(),
+            stamps: empty_bounded_list(),
+            warnings: empty_bounded_list(),
+            merge: None,
+            provenance: empty_bounded_list(),
+            identity: None,
+        };
+        let record = ClaimRecord {
+            claim: crate::change::ClaimId::generate(),
+            holder: s,
+            paths: vec![crate::index::RepoPath::new("src").expect("claim path")],
+            mode: ClaimMode::Enforce,
+            expires_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            on_behalf_of: None,
+        };
+        let key = receipt_key(s, r);
+        // New-shape bytes end in the trailing None discriminant; stripping
+        // it yields the exact pre-field encoding postcard wrote before.
+        for reply in [
+            Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+                outcome: outcome.clone(),
+                claim: record.clone(),
+            })),
+            Reply::ClaimRelease(Box::new(ClaimReleaseReply {
+                outcome: outcome.clone(),
+                released: record.clone(),
+            })),
+        ] {
+            let mut legacy = crate::store::encode("receipt row", &reply).expect("encode reply");
+            assert_eq!(legacy.pop(), Some(0x00), "trailing None is one byte");
+            let ReceiptRow(decoded) =
+                decode_receipt(&store, &key, &legacy).expect("legacy claim receipt decodes");
+            assert_eq!(decoded.method(), reply.method());
+            assert_eq!(decoded.outcome(), reply.outcome());
+            let decoded_record = match &decoded {
+                Reply::ClaimAcquire(acquire) => &acquire.claim,
+                Reply::ClaimRelease(release) => &release.released,
+                _ => panic!("legacy receipt keeps its claim method"),
+            };
+            assert_eq!(*decoded_record, record);
+            assert_eq!(decoded_record.on_behalf_of, None);
+        }
+        // The legacy retry must not latch quarantine: the store still
+        // serves reads after upgrading a shorter row.
+        store
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("store usable after legacy upgrade");
+    }
+
+    #[test]
+    fn torn_provenance_tails_stay_corrupt_and_quarantine() {
+        use crate::protocol::{ClaimAcquireReply, ClaimMode, ClaimRecord};
+        let (_temp, store) = test_store("claim-torn");
+        let s = SessionId::from_bytes([1; 16]);
+        let r = RequestId::from_bytes([2; 16]);
+        let outcome = MutationOutcome {
+            receipt: ReceiptRef {
+                session: s,
+                request_id: r,
+                digest: RequestDigest::from_bytes([3; 32]),
+                replayed: false,
+                retained_until: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+            operation: Some(OperationId(1)),
+            heads: empty_bounded_list(),
+            stamps: empty_bounded_list(),
+            warnings: empty_bounded_list(),
+            merge: None,
+            provenance: empty_bounded_list(),
+            identity: None,
+        };
+        let record = ClaimRecord {
+            claim: crate::change::ClaimId::generate(),
+            holder: s,
+            paths: vec![crate::index::RepoPath::new("src").expect("claim path")],
+            mode: ClaimMode::Enforce,
+            expires_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            on_behalf_of: Some("provenance".to_owned()),
+        };
+        let reply = Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+            outcome,
+            claim: record,
+        }));
+        let full = crate::store::encode("receipt row", &reply).expect("encode reply");
+        assert!(
+            full.ends_with(b"\x0aprovenance"),
+            "postcard strings are length-prefixed"
+        );
+        // Tear the provenance string off, leaving a bare Some discriminant:
+        // a naive retry with a restored None byte would decode Some("").
+        let mut torn = full;
+        torn.truncate(torn.len() - "provenance".len() - 1);
+        let key = receipt_key(s, r);
+        let err = decode_receipt(&store, &key, &torn).expect_err("torn provenance stays corrupt");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
+        assert_eq!(
+            store
+                .fact(FactTable::OpHead, OP_HEAD_KEY)
+                .expect_err("quarantined")
+                .code(),
+            ErrorCode::ECorrupt
+        );
+    }
+
+    #[test]
     fn store_observe_quarantine_on_trailing_bytes_and_corruption() {
         let (_temp, store) = test_store("quarantine");
 
@@ -1102,6 +1466,9 @@ mod tests {
             method: Method::WsTake,
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
+            on_behalf_of: None,
+            ref_deltas: Vec::new(),
+            attestation_subjects: Vec::new(),
         };
 
         // Zero deltas count rejected
@@ -1126,6 +1493,12 @@ mod tests {
     // Exact committed byte constants protecting v1 on-disk format compatibility.
     const GOLDEN_COORDINATOR_HEAD: &[u8] = &[0x00; 9];
     const GOLDEN_OP_HEADER: &[u8] = &[
+        1, 0, 1, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 0, 0, 0, 0, 0, 0, 1, 31, 1,
+    ];
+    const GOLDEN_OP_HEADER_V1: &[u8] = &[
+        1, 0, 1, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 0, 0, 0, 0, 1, 31, 1,
+    ];
+    const GOLDEN_OP_HEADER_V0: &[u8] = &[
         1, 0, 1, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 5, 0, 0, 0, 1, 31, 1,
     ];
     const GOLDEN_OP_DELTA: &[u8] = &[
@@ -1151,6 +1524,22 @@ mod tests {
     ];
 
     #[test]
+    fn persisted_table_names_survive_the_census_revision() {
+        for table in FactTable::ALL {
+            assert_eq!(
+                fact_table_from_name(table.table_name()),
+                Some(table),
+                "{table:?} round-trips through its persisted name"
+            );
+        }
+        assert_eq!(
+            fact_table_from_name("released_tags"),
+            Some(FactTable::ReleasedTags)
+        );
+        assert_eq!(fact_table_from_name("not_a_table"), None);
+    }
+
+    #[test]
     fn golden_byte_vectors_v1_compatibility() {
         let (_temp, store) = test_store("golden-v1");
 
@@ -1169,6 +1558,9 @@ mod tests {
             method: Method::WsTake,
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
+            on_behalf_of: None,
+            ref_deltas: Vec::new(),
+            attestation_subjects: Vec::new(),
         };
         let expected_header = OpHeader {
             entry: expected_entry,
@@ -1179,8 +1571,23 @@ mod tests {
         let decoded_header =
             decode_op_header(&store, OperationId(1), GOLDEN_OP_HEADER).expect("decode header");
         assert_eq!(decoded_header, expected_header);
+        assert_eq!(decoded_header.entry.ref_deltas, Vec::new());
+        assert_eq!(decoded_header.entry.attestation_subjects, Vec::new());
         let header_bytes = encode("op header", &expected_header).expect("encode header");
         assert_eq!(header_bytes.as_slice(), GOLDEN_OP_HEADER);
+
+        // The pre-summary shape decodes with empty summaries, never re-encodes
+        // to its own bytes: it is a compatibility source, not a format.
+        let decoded_v1 = decode_op_header(&store, OperationId(1), GOLDEN_OP_HEADER_V1)
+            .expect("decode v1 header");
+        assert_eq!(decoded_v1, expected_header);
+        assert_eq!(decoded_v1.entry.ref_deltas, Vec::new());
+        assert_eq!(decoded_v1.entry.attestation_subjects, Vec::new());
+
+        let decoded_v0 = decode_op_header(&store, OperationId(1), GOLDEN_OP_HEADER_V0)
+            .expect("decode v0 header");
+        assert_eq!(decoded_v0, expected_header);
+        assert_eq!(decoded_v0.entry.on_behalf_of, None);
 
         let expected_delta = OpDelta {
             table: "workspaces".to_owned(),

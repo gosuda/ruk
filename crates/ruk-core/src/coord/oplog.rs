@@ -15,7 +15,7 @@
 //! # Stream Layout
 //! The operation stream is the concatenation of:
 //! `[encoded_delta_length: u64 big-endian][postcard OpDelta]`
-//! for each tracked mutation delta. No outer `Vec<OpDelta>` wrapper is stored on disk.
+//! for each journaled mutation delta. No outer `Vec<OpDelta>` wrapper is stored on disk.
 //! One delta can span across multiple fragment boundaries.
 //!
 //! # Quarantine on Corruption
@@ -25,13 +25,16 @@
 
 use serde::Serialize;
 
+use crate::attestation::{is_order_key, is_statement_key, stored_statement_identity};
 use crate::change::{CheckedOperationId, OperationId, SessionId};
+use crate::coord::claims::CLOCK_KEY;
 use crate::coord::rows::{
     MAX_ENCODED_DELTA_BYTES, OP_FRAGMENT_MAX_BYTES, OpDelta, OpHeader, ROW_MAX_BYTES, corrupt,
     decode, decode_op_header, encode, fact_table_from_name, op_key,
 };
 use crate::error::{CoreError, ErrorCode};
-use crate::protocol::{Method, OperationEntry, Timestamp};
+use crate::protocol::{Method, OpAttestationSubject, OpRefDelta, OperationEntry, Timestamp};
+use crate::refdata::RefName;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable};
 
@@ -39,13 +42,14 @@ use crate::store::types::{FactExpectation, FactMutation, FactTable};
 // Tracked Table Census
 // ---------------------------------------------------------------------------
 
-/// Determines whether mutations to `table` are recorded in the coordinator operation log.
+/// Determines whether undo can invert mutations to `table`.
 ///
 /// Exhaustive match with no wildcard per the state proposal section 8 contract.
-/// Tracked tables: `Refs`, `RefConflicts`, `Changes`, `ChangeHistory`, `Workspaces`,
-/// `WsIndex`, and `Pins`. All other 20 tables in the census are untracked.
+/// Undoable tables: `Refs`, `RefConflicts`, `Changes`, `ChangeHistory`,
+/// `Workspaces`, `WsIndex`, and `Pins`. Journaled-but-not-undoable tables
+/// refuse undo with `E_UNDO_CONFLICT`, never corruption.
 #[must_use]
-pub(crate) fn tracked(table: FactTable) -> bool {
+pub(crate) fn undoable(table: FactTable) -> bool {
     match table {
         FactTable::Refs => true,
         FactTable::RefConflicts => true,
@@ -75,6 +79,56 @@ pub(crate) fn tracked(table: FactTable) -> bool {
         FactTable::Promisor => false,
         FactTable::Shallow => false,
         FactTable::LfsObjects => false,
+        FactTable::Events => false,
+        FactTable::EventHead => false,
+        FactTable::ServiceReceipts => false,
+        FactTable::RepoMeta => false,
+        FactTable::ReleasedTags => false,
+    }
+}
+
+/// Determines whether mutations to `table` are recorded in the coordinator operation log.
+///
+/// Exhaustive match with no wildcard per the state proposal section 8 contract.
+/// Journaled tables are the undoable seven plus `Claims`, `Attestations`,
+/// `PushPlans`, and `LandPlans`, so claim, attestation, push, and land
+/// mutations gain operation ids. Tables outside this set stay untracked.
+#[must_use]
+pub(crate) fn journaled(table: FactTable) -> bool {
+    match table {
+        FactTable::Refs => true,
+        FactTable::RefConflicts => true,
+        FactTable::Changes => true,
+        FactTable::ChangeHistory => true,
+        FactTable::Workspaces => true,
+        FactTable::WsIndex => true,
+        FactTable::Pins => true,
+        FactTable::Claims => true,
+        FactTable::Attestations => true,
+        FactTable::PushPlans => true,
+        FactTable::LandPlans => true,
+
+        FactTable::RemoteObservations => false,
+        FactTable::ImportedChanges => false,
+        FactTable::Commits => false,
+        FactTable::Ops => false,
+        FactTable::OpHead => false,
+        FactTable::WsStatus => false,
+        FactTable::WsDirs => false,
+        FactTable::Receipts => false,
+        FactTable::Sessions => false,
+        FactTable::PublishedHeads => false,
+        FactTable::Leases => false,
+        FactTable::WsApply => false,
+        FactTable::Reflogs => false,
+        FactTable::Promisor => false,
+        FactTable::Shallow => false,
+        FactTable::LfsObjects => false,
+        FactTable::Events => false,
+        FactTable::EventHead => false,
+        FactTable::ServiceReceipts => false,
+        FactTable::RepoMeta => false,
+        FactTable::ReleasedTags => false,
     }
 }
 
@@ -89,6 +143,7 @@ pub(crate) struct OpMeta {
     pub(crate) method: Method,
     pub(crate) committed_at: Timestamp,
     pub(crate) undoes: Option<OperationId>,
+    pub(crate) on_behalf_of: Option<String>,
 }
 
 /// Borrowed serialization view of a delta with postcard layout identical to [`OpDelta`].
@@ -191,19 +246,25 @@ impl<'w> postcard::ser_flavors::Flavor for FragmentFlavor<'w> {
     }
 }
 
-/// Records tracked fact changes into an operation log stream.
+/// Records journaled fact changes into an operation log stream.
 ///
 /// # Semantics
-/// - Untracked table mutations are skipped.
-/// - [`FactExpectation::Any`] is rejected for tracked mutations (`E_INVALID`).
+/// - Unjournaled table mutations are skipped.
+/// - [`FactExpectation::Any`] is rejected for journaled mutations (`E_INVALID`).
 /// - Guards and identical rewrites (`before == after`) are excluded.
-/// - If no tracked changes remain, returns `Ok(None)` and leaves `ops` untouched.
-/// - If tracked changes exist, allocates the next [`OperationId`] via `ops.allocate()`,
+/// - `Refs` deltas contribute per-op ref deltas; `Attestations` deltas
+///   contribute attested (kind, subject) pairs. Undecodable bytes fail the
+///   recording: summaries stay complete, never silently gapped.
+/// - If no journaled changes remain, returns `Ok(None)` and leaves `ops` untouched.
+/// - If journaled changes exist, allocates the next [`OperationId`] via `ops.allocate()`,
 ///   streams length-prefixed postcard deltas into 4 MiB fragments, and constructs
 ///   [`FactTable::Ops`] mutations with [`FactExpectation::Absent`].
 ///
 /// # Errors
 /// - [`crate::error::ErrorCode::EInvalid`] if an expectation is [`FactExpectation::Any`].
+/// - [`crate::error::ErrorCode::ECorrupt`] if a `Refs` or `Attestations`
+///   delta fails to decode: the coordinator built these bytes, so undecodable
+///   bytes are corruption caught before publication.
 /// - [`crate::error::ErrorCode::ECapacity`] if the operation ID counter is exhausted.
 pub(crate) fn record(
     ops: &mut CheckedOperationId,
@@ -212,9 +273,14 @@ pub(crate) fn record(
     changes: &[FactMutation],
 ) -> Result<Option<(OperationId, Vec<FactMutation>)>, CoreError> {
     let mut tracked_deltas: Vec<BorrowedOpDelta<'_>> = Vec::new();
+    let mut ref_deltas: Vec<OpRefDelta> = Vec::new();
+    let mut attestation_subjects: Vec<OpAttestationSubject> = Vec::new();
 
     for mutation in changes {
-        if !tracked(mutation.table) {
+        if !journaled(mutation.table) {
+            continue;
+        }
+        if is_ephemeral_fence(mutation) {
             continue;
         }
 
@@ -222,7 +288,7 @@ pub(crate) fn record(
             FactExpectation::Any => {
                 return Err(CoreError::new(
                     ErrorCode::EInvalid,
-                    "mutation expectation: FactExpectation::Any is rejected for tracked mutations: exact before-value expectation (Value or Absent) is required",
+                    "mutation expectation: FactExpectation::Any is rejected for journaled mutations: exact before-value expectation (Value or Absent) is required",
                 ));
             }
             FactExpectation::Absent => None,
@@ -234,6 +300,23 @@ pub(crate) fn record(
         // Exclude guards and identical rewrites
         if before == after {
             continue;
+        }
+
+        match mutation.table {
+            FactTable::Refs => {
+                ref_deltas.push(summarize_ref_delta(&mutation.key, before, after)?);
+            }
+            FactTable::Attestations => {
+                if is_statement_key(&mutation.key) {
+                    summarize_attestation(after.or(before), &mut attestation_subjects)?;
+                } else if !is_order_key(&mutation.key) {
+                    return Err(CoreError::new(
+                        ErrorCode::ECorrupt,
+                        "op summary: attestations key is in no known family",
+                    ));
+                }
+            }
+            _ => {}
         }
 
         tracked_deltas.push(BorrowedOpDelta {
@@ -290,6 +373,9 @@ pub(crate) fn record(
         method: meta.method,
         committed_at: meta.committed_at,
         undoes: meta.undoes,
+        on_behalf_of: meta.on_behalf_of,
+        ref_deltas,
+        attestation_subjects,
     };
     let header = OpHeader {
         entry,
@@ -334,6 +420,81 @@ pub(crate) fn record(
 // ---------------------------------------------------------------------------
 // Read Interface and Bounded Cursor
 // ---------------------------------------------------------------------------
+
+/// Internal bookkeeping rows publish with every batch but belong to no
+/// operation: the claim-clock fence advances monotonically, so journaling
+/// it would mint an operation for every noop batch and undo could never
+/// skip restoring it.
+///
+/// Snapshot isolation for the fence comes from the publication itself, not
+/// the operation log: readers that need the clock read the row directly.
+fn is_ephemeral_fence(mutation: &FactMutation) -> bool {
+    mutation.table == FactTable::Claims && mutation.key == CLOCK_KEY
+}
+
+/// Summarizes one journaled `Refs` delta as a per-op ref delta.
+///
+/// # Errors
+/// `E_CORRUPT` for a ref key or target that fails to decode: the coordinator
+/// built these bytes, so undecodable bytes are corruption caught before
+/// publication, never a silent metadata gap.
+fn summarize_ref_delta(
+    key: &[u8],
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> Result<OpRefDelta, CoreError> {
+    let name = RefName::new(key).map_err(|err| {
+        CoreError::new(
+            ErrorCode::ECorrupt,
+            format!("op summary: ref key is not a valid ref name: {err}"),
+        )
+    })?;
+    let decode_target = |what: &str, bytes: &[u8]| {
+        crate::store::decode("ref target", bytes).map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("op summary: {what} ref target fails to decode: {err}"),
+            )
+        })
+    };
+    let before = before
+        .map(|bytes| decode_target("before", bytes))
+        .transpose()?;
+    let after = after
+        .map(|bytes| decode_target("after", bytes))
+        .transpose()?;
+    Ok(OpRefDelta {
+        name,
+        before,
+        after,
+    })
+}
+
+/// Summarizes one journaled `Attestations` delta as an attested pair.
+///
+/// Pairs deduplicate: one operation touching one statement group twice still
+/// reports one subject.
+///
+/// # Errors
+/// `E_CORRUPT` for row bytes that fail to decode: the coordinator built
+/// these bytes, so undecodable bytes are corruption caught before
+/// publication, never a silent metadata gap.
+fn summarize_attestation(
+    bytes: Option<&[u8]>,
+    subjects: &mut Vec<OpAttestationSubject>,
+) -> Result<(), CoreError> {
+    let Some(bytes) = bytes else {
+        return Ok(());
+    };
+    let (kind, subject) = stored_statement_identity(bytes)?;
+    if !subjects
+        .iter()
+        .any(|seen| seen.kind == kind && seen.subject == subject)
+    {
+        subjects.push(OpAttestationSubject { kind, subject });
+    }
+    Ok(())
+}
 
 /// Reads and validates the operation header for `id`.
 ///
@@ -384,30 +545,53 @@ impl<'a> OpDeltaReader<'a> {
     }
 
     /// The validated header of this operation.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn header(&self) -> &OpHeader {
         &self.header
     }
 
     /// Number of deltas successfully read so far.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn deltas_read(&self) -> u64 {
         self.deltas_read
     }
 
     /// Number of raw stream bytes consumed so far.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn stream_bytes_read(&self) -> u64 {
         self.stream_bytes_read
     }
 
     /// Current part number being read.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     #[must_use]
     pub(crate) fn current_part(&self) -> u64 {
         self.current_part
     }
 
     /// Returns `true` when all deltas in the operation have been successfully read.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     #[must_use]
     pub(crate) fn is_finished(&self) -> bool {
         self.done
@@ -416,10 +600,10 @@ impl<'a> OpDeltaReader<'a> {
     }
 
     fn ensure_fragment_loaded(&mut self) -> Result<(), CoreError> {
-        if let Some(f) = &self.current_fragment {
-            if self.fragment_offset < f.len() {
-                return Ok(());
-            }
+        if let Some(f) = &self.current_fragment
+            && self.fragment_offset < f.len()
+        {
+            return Ok(());
         }
 
         if self.current_part > self.header.parts {
@@ -547,7 +731,7 @@ impl<'a> OpDeltaReader<'a> {
     /// - Announced delta length of zero or exceeding [`MAX_ENCODED_DELTA_BYTES`].
     /// - Announced delta length exceeding remaining stream bytes.
     /// - Postcard byte corruption or trailing bytes in delta envelope.
-    /// - Table name not present in the [`FactTable`] census or not [`tracked`].
+    /// - Table name not present in the [`FactTable`] census or not [`journaled`].
     /// - Delta missing both before and after content.
     /// - Delta with identical before and after content.
     /// - Row byte bounds exceeded (`ROW_MAX_BYTES`).
@@ -570,14 +754,14 @@ impl<'a> OpDeltaReader<'a> {
                 );
             }
 
-            if let Some(frag) = &self.current_fragment {
-                if self.fragment_offset < frag.len() {
-                    return corrupt(
-                        self.store,
-                        "op stream",
-                        "unconsumed trailing bytes in terminal fragment",
-                    );
-                }
+            if let Some(frag) = &self.current_fragment
+                && self.fragment_offset < frag.len()
+            {
+                return corrupt(
+                    self.store,
+                    "op stream",
+                    "unconsumed trailing bytes in terminal fragment",
+                );
             }
 
             let extra_key = op_key(self.id, self.header.parts + 1);
@@ -648,11 +832,11 @@ impl<'a> OpDeltaReader<'a> {
             );
         };
 
-        if !tracked(table) {
+        if !journaled(table) {
             return corrupt(
                 self.store,
                 "op delta",
-                format!("untracked table `{}` in delta", delta.table),
+                format!("unjournaled table `{}` in delta", delta.table),
             );
         }
 
@@ -667,17 +851,17 @@ impl<'a> OpDeltaReader<'a> {
             );
         }
 
-        if let (Some(b), Some(a)) = (&delta.before, &delta.after) {
-            if b == a {
-                return corrupt(
-                    self.store,
-                    "op delta",
-                    format!(
-                        "delta for table `{}` has identical before and after content",
-                        delta.table
-                    ),
-                );
-            }
+        if let (Some(b), Some(a)) = (&delta.before, &delta.after)
+            && b == a
+        {
+            return corrupt(
+                self.store,
+                "op delta",
+                format!(
+                    "delta for table `{}` has identical before and after content",
+                    delta.table
+                ),
+            );
         }
 
         let key_len = u64::try_from(delta.key.len())
@@ -753,8 +937,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::error::ErrorCode;
-    use crate::ids::HashKind;
-    use crate::store::PreparationBudget;
+    use crate::ids::{HashKind, Oid};
+    use crate::refdata::RefTarget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -799,13 +984,15 @@ mod tests {
             method: Method::WsTake,
             committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             undoes: None,
+            on_behalf_of: None,
         }
     }
 
     #[test]
-    fn tracked_table_census_is_exhaustive_and_accurate() {
+    fn journaled_table_census_is_exhaustive_and_accurate() {
         for table in FactTable::ALL {
-            let is_tracked = tracked(table);
+            let is_journaled = journaled(table);
+            let is_undoable = undoable(table);
             match table {
                 FactTable::Refs
                 | FactTable::RefConflicts
@@ -814,40 +1001,50 @@ mod tests {
                 | FactTable::Workspaces
                 | FactTable::WsIndex
                 | FactTable::Pins => {
-                    assert!(is_tracked, "expected {table:?} to be tracked");
+                    assert!(is_journaled, "expected {table:?} to be journaled");
+                    assert!(is_undoable, "expected {table:?} to be undoable");
+                }
+                FactTable::Claims
+                | FactTable::Attestations
+                | FactTable::PushPlans
+                | FactTable::LandPlans => {
+                    assert!(is_journaled, "expected {table:?} to be journaled");
+                    assert!(!is_undoable, "expected {table:?} to refuse undo");
                 }
                 FactTable::RemoteObservations
                 | FactTable::ImportedChanges
                 | FactTable::Commits
                 | FactTable::Ops
                 | FactTable::OpHead
-                | FactTable::Claims
                 | FactTable::WsStatus
                 | FactTable::WsDirs
                 | FactTable::Receipts
                 | FactTable::Sessions
-                | FactTable::Attestations
-                | FactTable::PushPlans
-                | FactTable::LandPlans
                 | FactTable::PublishedHeads
                 | FactTable::Leases
                 | FactTable::WsApply
                 | FactTable::Reflogs
                 | FactTable::Promisor
                 | FactTable::Shallow
-                | FactTable::LfsObjects => {
-                    assert!(!is_tracked, "expected {table:?} to be untracked");
+                | FactTable::LfsObjects
+                | FactTable::Events
+                | FactTable::EventHead
+                | FactTable::ServiceReceipts
+                | FactTable::RepoMeta
+                | FactTable::ReleasedTags => {
+                    assert!(!is_journaled, "expected {table:?} to be unjournaled");
+                    assert!(!is_undoable, "expected {table:?} to refuse undo");
                 }
             }
         }
     }
 
     #[test]
-    fn record_no_tracked_changes_returns_none_and_leaves_counter() {
+    fn record_skips_unjournaled_changes_and_leaves_counter() {
         let mut ops = CheckedOperationId::new(0, 100);
 
-        // Untracked tables
-        let untracked_changes = vec![
+        // Unjournaled tables
+        let unjournaled_changes = vec![
             FactMutation {
                 table: FactTable::Receipts,
                 key: vec![1, 2, 3],
@@ -861,11 +1058,11 @@ mod tests {
                 value: Some(vec![10, 11, 12]),
             },
         ];
-        let res = record(&mut ops, None, test_meta(), &untracked_changes).expect("record");
+        let res = record(&mut ops, None, test_meta(), &unjournaled_changes).expect("record");
         assert!(res.is_none());
         assert_eq!(ops.last(), None);
 
-        // Tracked tables with guards and identical rewrites
+        // Journaled tables with guards and identical rewrites
         let guard_changes = vec![
             FactMutation {
                 table: FactTable::Refs,
@@ -886,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn record_rejects_any_expectation_on_tracked_tables() {
+    fn record_rejects_any_expectation_on_journaled_tables() {
         let mut ops = CheckedOperationId::new(0, 100);
 
         let changes = vec![FactMutation {
@@ -909,7 +1106,7 @@ mod tests {
             table: FactTable::Refs,
             key: b"refs/heads/main".to_vec(),
             expected: FactExpectation::Absent,
-            value: Some(vec![1, 2, 3]),
+            value: Some(ref_target_bytes(1)),
         }];
 
         let err = record(&mut ops, None, test_meta(), &changes).expect_err("exhausted");
@@ -917,18 +1114,94 @@ mod tests {
         assert_eq!(ops.last(), Some(OperationId(5)));
     }
 
+    fn ref_target_bytes(n: u8) -> Vec<u8> {
+        let oid = Oid::from_hex(&format!("{n:040x}")).expect("test oid");
+        encode("ref target", &RefTarget::Direct(oid)).expect("encode test target")
+    }
+
+    #[test]
+    fn record_journals_claims_and_assigns_operation_ids() {
+        let mut ops = CheckedOperationId::new(0, 100);
+        let changes = vec![FactMutation {
+            table: FactTable::Claims,
+            key: b"claim".to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(vec![9, 9, 9]),
+        }];
+        let recorded = record(&mut ops, None, test_meta(), &changes)
+            .expect("record")
+            .expect("journaled claims gain an operation id");
+        assert_eq!(recorded.0, OperationId(1));
+        assert_eq!(ops.last(), Some(OperationId(1)));
+    }
+
+    #[test]
+    fn record_rejects_undecodable_ref_delta() {
+        let mut ops = CheckedOperationId::new(0, 100);
+        let changes = vec![FactMutation {
+            table: FactTable::Refs,
+            key: b"refs/heads/main".to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(vec![0xff, 0x00]),
+        }];
+        let err = record(&mut ops, None, test_meta(), &changes).expect_err("undecodable ref fails");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
+        assert_eq!(
+            ops.last(),
+            None,
+            "a failed summary leaves the counter untouched"
+        );
+    }
+
+    #[test]
+    fn record_summarizes_ref_delta_in_the_header() {
+        let (_temp, store) = test_store("ref-summary");
+        let mut ops = CheckedOperationId::new(0, 100);
+        let before = ref_target_bytes(7);
+        let after = ref_target_bytes(8);
+        let changes = vec![FactMutation {
+            table: FactTable::Refs,
+            key: b"refs/heads/main".to_vec(),
+            expected: FactExpectation::Value(before.clone()),
+            value: Some(after.clone()),
+        }];
+        let recorded = record(&mut ops, None, test_meta(), &changes)
+            .expect("record")
+            .expect("ref op recorded");
+        store
+            .publish(
+                Vec::new(),
+                &recorded.1,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
+        let header = read_header(&store, OperationId(1))
+            .expect("read header")
+            .expect("header present");
+        assert_eq!(header.entry.ref_deltas.len(), 1);
+        let delta = &header.entry.ref_deltas[0];
+        assert_eq!(delta.name.as_bytes(), b"refs/heads/main");
+        let want_before: RefTarget =
+            crate::store::decode("ref target", &before).expect("decode before target");
+        let want_after: RefTarget =
+            crate::store::decode("ref target", &after).expect("decode after target");
+        assert_eq!(delta.before, Some(want_before));
+        assert_eq!(delta.after, Some(want_after));
+        assert!(header.entry.attestation_subjects.is_empty());
+    }
+
     #[test]
     fn byte_exact_roundtrip_single_and_multiple_deltas() {
         let (_temp, store) = test_store("roundtrip-single");
         let mut ops = CheckedOperationId::new(0, 100);
 
-        let all_bytes: Vec<u8> = (0..=255).collect();
         let changes = vec![
             FactMutation {
                 table: FactTable::Refs,
                 key: b"refs/heads/main".to_vec(),
                 expected: FactExpectation::Absent,
-                value: Some(all_bytes.clone()),
+                value: Some(ref_target_bytes(3)),
             },
             FactMutation {
                 table: FactTable::Workspaces,
@@ -952,7 +1225,14 @@ mod tests {
         assert_eq!(ops.last(), Some(OperationId(1)));
 
         // Publish to real store
-        store.publish(Vec::new(), &recorded.1).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &recorded.1,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         // Read header
         let header = read_header(&store, OperationId(1))
@@ -969,7 +1249,7 @@ mod tests {
         assert_eq!(d1.table, "refs");
         assert_eq!(d1.key, b"refs/heads/main");
         assert_eq!(d1.before, None);
-        assert_eq!(d1.after, Some(all_bytes));
+        assert_eq!(d1.after, Some(ref_target_bytes(3)));
 
         let d2 = reader.next_delta().expect("read d2").expect("d2 present");
         assert_eq!(d2.table, "workspaces");
@@ -998,8 +1278,8 @@ mod tests {
         let large_val = vec![0x7a; large_size];
 
         let changes = vec![FactMutation {
-            table: FactTable::Refs,
-            key: b"refs/heads/huge".to_vec(),
+            table: FactTable::Workspaces,
+            key: vec![0xbb; 16],
             expected: FactExpectation::Absent,
             value: Some(large_val.clone()),
         }];
@@ -1016,7 +1296,14 @@ mod tests {
         // fragments count must be exactly 2
         assert_eq!(mutations.len(), 3); // header + part 1 + part 2
 
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let header = read_header(&store, id)
             .expect("read header")
@@ -1026,8 +1313,8 @@ mod tests {
 
         let mut reader = OpDeltaReader::new(&store, id, header);
         let delta = reader.next_delta().expect("read delta").expect("present");
-        assert_eq!(delta.table, "refs");
-        assert_eq!(delta.key, b"refs/heads/huge");
+        assert_eq!(delta.table, "workspaces");
+        assert_eq!(delta.key, vec![0xbb; 16]);
         assert_eq!(delta.before, None);
         assert_eq!(delta.after.expect("after").len(), large_size);
         assert!(reader.next_delta().expect("read end").is_none());
@@ -1059,6 +1346,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1079,7 +1369,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader.next_delta().expect_err("unknown table must fail");
@@ -1118,6 +1415,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1138,7 +1438,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader.next_delta().expect_err("untracked table must fail");
@@ -1167,6 +1474,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1187,7 +1497,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader
@@ -1220,6 +1537,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1240,7 +1560,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader
@@ -1269,6 +1596,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1,
             stream_bytes: (OP_FRAGMENT_MAX_BYTES as u64) + 100,
@@ -1290,7 +1620,14 @@ mod tests {
                 value: Some(part1),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader.next_delta().expect_err("missing part must fail");
@@ -1330,6 +1667,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1, // claims only 1 delta
             stream_bytes: stream.len() as u64,
@@ -1350,7 +1690,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let d = reader.next_delta().expect("read delta 1").expect("present");
@@ -1393,6 +1740,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1420,7 +1770,14 @@ mod tests {
                 value: Some(vec![1, 2, 3, 4]),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let d = reader.next_delta().expect("read delta 1").expect("present");
@@ -1462,6 +1819,9 @@ mod tests {
                 method: Method::WsTake,
                 committed_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
                 undoes: None,
+                on_behalf_of: None,
+                ref_deltas: Vec::new(),
+                attestation_subjects: Vec::new(),
             },
             deltas: 1,
             stream_bytes: stream.len() as u64,
@@ -1482,7 +1842,14 @@ mod tests {
                 value: Some(stream),
             },
         ];
-        store.publish(Vec::new(), &mutations).expect("publish");
+        store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish");
 
         let mut reader = OpDeltaReader::new(&store, OperationId(1), header);
         let err = reader

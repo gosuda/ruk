@@ -416,6 +416,10 @@ mod tests {
 
     use super::*;
 
+    type S1Case = (&'static str, fn(&mut [u8; S1_LEN]), ErrorCode);
+    type S2Case = (&'static str, fn(&mut [u8; S2_LEN]), ErrorCode);
+    type C1Case = (&'static str, fn(&mut [u8; C1_LEN]), ErrorCode);
+
     /// Drives one scenario on a fresh current-thread runtime. Manual builders
     /// keep the crate free of the Tokio macros feature.
     fn run(scenario: impl Future<Output = ()>) {
@@ -833,7 +837,7 @@ mod tests {
 
     #[test]
     fn malformed_server_proof_is_refused_by_client() {
-        let cases: [(&'static str, fn(&mut [u8; S1_LEN]), ErrorCode); 5] = [
+        let cases: [S1Case; 5] = [
             (
                 "magic",
                 |frame: &mut [u8; S1_LEN]| frame[0] ^= 0xff,
@@ -881,7 +885,7 @@ mod tests {
 
     #[test]
     fn malformed_verdict_is_refused_by_client() {
-        let cases: [(&'static str, fn(&mut [u8; S2_LEN]), ErrorCode); 5] = [
+        let cases: [S2Case; 5] = [
             (
                 "magic",
                 |frame: &mut [u8; S2_LEN]| frame[0] ^= 0xff,
@@ -935,7 +939,7 @@ mod tests {
 
     #[test]
     fn malformed_client_hello_is_refused_by_server() {
-        let cases: [(&'static str, fn(&mut [u8; C1_LEN]), ErrorCode); 4] = [
+        let cases: [C1Case; 4] = [
             (
                 "magic",
                 |frame: &mut [u8; C1_LEN]| frame[0] ^= 0xff,

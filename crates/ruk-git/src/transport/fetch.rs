@@ -33,7 +33,7 @@ use std::io::{Read, Write};
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::types::ObjectKind;
-use ruk_core::store::{FactMutation, Store};
+use ruk_core::store::{EventContext, EventSource, FactMutation, Store};
 
 use super::pack::{IngestLimits, Links, StagedPack, ingest_pack, object_links};
 use super::pktline::{self, PktReader, RemoteMessages, SidebandReader, send};
@@ -586,7 +586,7 @@ pub fn collect_haves_filtered(
         let bytes = match read_object(store, oid, WALK_OBJECT_BYTES) {
             Ok((ObjectKind::Commit, bytes)) => bytes,
             Ok(_) => continue,
-            Err(err) if matches!(err, GitError::NotFound { .. }) => continue,
+            Err(GitError::NotFound { .. }) => continue,
             Err(err) => return Err(err),
         };
         haves.push(oid);
@@ -746,7 +746,12 @@ pub fn publish_fetch(
 ) -> Result<ruk_core::store::types::Publication, GitError> {
     let mut facts = facts.to_vec();
     facts.extend(commit_record_facts(store, &staged)?);
-    Ok(store.publish(staged.into_objects(), &facts)?)
+    Ok(store.publish(
+        staged.into_objects(),
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    )?)
 }
 
 /// Compiles commit-record mutations for every commit staged in a pack.
@@ -769,12 +774,10 @@ pub fn commit_record_facts(
         if let Some((ObjectKind::Commit, payload)) = staged.payload(*oid) {
             batch
                 .observe_git_payload(payload.to_vec(), None)
-                .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+                .map_err(GitError::from)?;
         }
     }
-    batch
-        .into_mutations()
-        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))
+    batch.into_mutations().map_err(GitError::from)
 }
 
 #[cfg(test)]
@@ -1054,6 +1057,8 @@ mod tests {
         dest.publish(
             Vec::new(),
             &promisor_facts(b"origin", Filter::BlobNone, &[missing]).expect("row"),
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("promise the blob");
         assert!(
@@ -1180,7 +1185,12 @@ pub fn prefetch(
         }
         verify_closure(store, &received.staged, batch, None, &[], interrupt)?;
         let facts = prefetch_clears(batch);
-        store.publish(received.staged.into_objects(), &facts)?;
+        store.publish(
+            received.staged.into_objects(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
         delivered.extend(batch.iter().copied());
         batches += 1;
     }

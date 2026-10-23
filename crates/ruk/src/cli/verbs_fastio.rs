@@ -43,7 +43,7 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{IndexEntry, IndexFlags};
 use ruk_core::records::Records;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use ruk_core::store::{ObjectKind, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, Store};
 use ruk_git::GitError;
 
 use super::state::{
@@ -1481,10 +1481,10 @@ fn read_data(cursor: &mut Cursor<'_>, arg: &[u8]) -> Result<Vec<u8>, GitError> {
 /// Parses a fast-import file mode: full octal spellings plus the `644`
 /// and `755` shorthands.
 fn parse_file_mode(arg: &[u8]) -> Result<TreeMode, GitError> {
-    if let Some(mode) = TreeMode::parse(arg) {
-        if mode != TreeMode::Tree {
-            return Ok(mode);
-        }
+    if let Some(mode) = TreeMode::parse(arg)
+        && mode != TreeMode::Tree
+    {
+        return Ok(mode);
     }
     match arg {
         b"644" => Ok(TreeMode::Regular),
@@ -1629,7 +1629,14 @@ fn store_blob(store: &Store, body: &[u8]) -> Result<Oid, GitError> {
         .prepare(ObjectKind::Blob, body_len, std::io::Cursor::new(body), None)
         .map_err(GitError::from)?;
     let oid = prepared.oid();
-    store.publish(vec![prepared], &[]).map_err(GitError::from)?;
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     Ok(oid)
 }
 
@@ -1654,7 +1661,12 @@ fn store_commit(store: &Store, payload: &[u8]) -> Result<Oid, GitError> {
         .map_err(GitError::from)?;
     let done = batch.finish().map_err(GitError::from)?;
     store
-        .publish(done.prepared_objects, &done.mutations)
+        .publish(
+            done.prepared_objects,
+            &done.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(oid)
 }

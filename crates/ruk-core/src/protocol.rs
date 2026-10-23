@@ -57,6 +57,8 @@ use crate::index::RepoPath;
 use crate::merge::Merge;
 use crate::merge::composed::{MergeMode, MergeReport};
 use crate::refdata::{RefExpect, RefName, RefTarget};
+use crate::refs::RefEntry;
+use crate::store::types::EventSource;
 use crate::workspace::{HeadRef, Scope, WorkspaceStamp, WorkspaceState};
 
 /// Major protocol/schema version implemented by this build.
@@ -64,8 +66,12 @@ pub const SCHEMA_MAJOR: u32 = 1;
 
 /// Minor schema version within the current major; increments are additive.
 /// Minor 1 appends the `git.commit` lane method for per-repository commit
-/// batching; older readers refuse its frames as unknown methods.
-pub const SCHEMA_MINOR: u32 = 1;
+/// batching. Minor 2 appends the hosted forge methods (`repo.stat`,
+/// `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`,
+/// `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`,
+/// `claim.renew`, `policy.set`) and the `Admin` method kind; older readers
+/// refuse its frames as unknown methods.
+pub const SCHEMA_MINOR: u32 = 2;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -555,6 +561,45 @@ impl<T> Page<T> {
     }
 }
 
+/// A revision naming one commit: either a ref resolved at read time or a
+/// literal object id. Reads that accept revisions (tree, compare, archive,
+/// blame) take this shape instead of free-form strings.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitRev {
+    Ref(RefName),
+    Commit(Oid),
+}
+
+/// One stateless keyset page: rows plus the opaque position to resume
+/// after. Unlike [`Page`], the cursor binds no 30-second lease: the caller
+/// passes `next_after` back as the next request's `after`, so forge reads
+/// never hold lease state for pagination.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KeysetPage<T> {
+    pub items: Vec<T>,
+    /// The last returned key as raw bytes: a ref name for `refs.list`, an
+    /// entry name for `tree`. Absent when the listing is exhausted.
+    #[serde(default)]
+    pub next_after: Option<ByteString>,
+}
+
+impl<T> KeysetPage<T> {
+    /// Builds a page.
+    ///
+    /// # Errors
+    /// `E_LIMIT` when `items` exceeds [`MAX_PAGE_SIZE`].
+    pub fn new(items: Vec<T>, next_after: Option<ByteString>) -> Result<Self, CoreError> {
+        if items.len() > MAX_PAGE_SIZE {
+            return Err(limit_exceeded(format!(
+                "a keyset page holds at most {MAX_PAGE_SIZE} rows, got {}",
+                items.len()
+            )));
+        }
+        Ok(Self { items, next_after })
+    }
+}
+
 /// A bounded excerpt of a collection too large to return whole: at most
 /// [`MAX_PAGE_SIZE`] items, the true total, and whether anything was left out.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -686,6 +731,12 @@ pub struct StagedObject {
 pub struct StreamId(pub u64);
 
 /// Where a read reply's bytes are: in the frame, or on a stream.
+/// Producers must use `Streamed` for any body that would push the
+/// reply past [`MAX_CONTROL_FRAME_BYTES`]; the transport layer writes
+/// exactly `size` bytes on `stream` after the reply frame, and the
+/// caller correlates them by stream id. No served read produces one
+/// yet: every served page fits the control bound with room to spare,
+/// and the first bulk-body producer owns the delivery half.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ByteSource {
@@ -1138,6 +1189,9 @@ pub enum MethodKind {
     Read,
     /// Requires a session; carries a request id and a receipt.
     Mutation,
+    /// Dispatched before any coordinator call and gated by the daemon's
+    /// `admin_uids`; takes no session and no receipt.
+    Admin,
 }
 
 /// `schema`: the versioned schemas of the protocol.
@@ -1721,6 +1775,10 @@ pub struct ClaimRecord {
     pub paths: Vec<RepoPath>,
     pub mode: ClaimMode,
     pub expires_at: Timestamp,
+    /// Provenance the acquiring invocation declared; never an
+    /// authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2025,7 +2083,10 @@ pub struct PushReconcileReply {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LandPrepareArgs {
     pub change: ChangeRef,
-    pub remote: RemoteSpec,
+    /// Where to push the landed candidate; absent means this store.
+    /// A present remote refuses: the transport push leg is not served yet.
+    #[serde(default)]
+    pub remote: Option<RemoteSpec>,
     /// The target ref to land onto, e.g. `refs/heads/main`.
     pub target: RefName,
     #[serde(default)]
@@ -2037,6 +2098,10 @@ pub struct LandPrepareArgs {
 pub struct AttestRequirement {
     pub kind: AttestKind,
     pub result: AttestResult,
+    /// The latest `signed_at` this requirement accepts; absent never
+    /// expires. A later-signed match reports `Gap::Expired`.
+    #[serde(default)]
+    pub valid_until: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2116,6 +2181,29 @@ pub struct OpLogArgs {
     /// Paging state; absent starts at the newest operation.
     #[serde(default)]
     pub page: PageRequest,
+    /// Ascending cursor: only operations strictly after this id, oldest
+    /// first. Absent keeps the newest-first walk.
+    #[serde(default)]
+    pub after: Option<OperationId>,
+}
+
+/// One ref moved by an operation: the ref name plus its before and after
+/// targets. Recorded for lane (op-sourced) mutations from the operation's
+/// own ref deltas, so orchestration readers need no stream walk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpRefDelta {
+    pub name: RefName,
+    pub before: Option<RefTarget>,
+    pub after: Option<RefTarget>,
+}
+
+/// One attestation an operation recorded: the attested kind and subject.
+/// Recorded for lane (op-sourced) mutations from the operation's own
+/// attestation rows, so proof lists read subjects without a stream walk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpAttestationSubject {
+    pub kind: AttestKind,
+    pub subject: Oid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2127,6 +2215,15 @@ pub struct OperationEntry {
     pub committed_at: Timestamp,
     /// The operation this one inverts, if it is an undo.
     pub undoes: Option<OperationId>,
+    /// Provenance the invoking call declared; never an authorization input.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    /// Per-op ref deltas, in delta order within the operation.
+    #[serde(default)]
+    pub ref_deltas: Vec<OpRefDelta>,
+    /// Attested (kind, subject) pairs this operation recorded, deduplicated.
+    #[serde(default)]
+    pub attestation_subjects: Vec<OpAttestationSubject>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2390,6 +2487,9 @@ pub struct TreeEntry {
     pub name: ByteString,
     pub oid: Oid,
     pub kind: EntryKind,
+    /// Stored object length for blobs; absent for trees and gitlinks.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// One side of a conflicted file.
@@ -2523,12 +2623,18 @@ pub enum ErrorDetail {
 }
 
 /// The error body of a failed request. Callers branch on `code`.
+///
+/// The daemon's IPC `Error` frame carries this body. The trailing fields
+/// default so a payload written before they existed still decodes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorReply {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(default)]
     pub hints: Vec<String>,
+    #[serde(default)]
     pub fixes: Vec<Fix>,
+    #[serde(default)]
     pub detail: Option<ErrorDetail>,
 }
 
@@ -2582,8 +2688,19 @@ macro_rules! no_invariants {
     };
 }
 
+impl<T> Validate for KeysetPage<T> {}
+
 no_invariants!(
     SchemaArgs,
+    CommitRev,
+    RepoStatArgs,
+    TreeArgs,
+    RefsListArgs,
+    CompareArgs,
+    ArchiveArgs,
+    RemoteRefsArgs,
+    ClaimRenewArgs,
+    PolicySetArgs,
     SessionResumeArgs,
     WsScopeArgs,
     WsTakeArgs,
@@ -3035,6 +3152,360 @@ impl Validate for BlameArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Hosted forge methods (minor 2)
+// ---------------------------------------------------------------------------
+
+/// `repo.stat`: store identity, object format, default branch, quarantine
+/// latch, and the event horizon. Served from the store head; counts no
+/// refs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoStatArgs {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoStatReply {
+    pub view: ViewInfo,
+    pub store_id: StoreId,
+    pub object_format: HashKind,
+    #[serde(default)]
+    pub default_branch: Option<RefName>,
+    /// Whether committed corruption latched quarantine in this session.
+    pub quarantined: bool,
+    /// The oldest retained event sequence.
+    pub oldest: u64,
+    /// The last assigned event sequence.
+    pub head: u64,
+}
+
+/// `tree`: one directory listing with stateless keyset paging.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TreeArgs {
+    pub rev: CommitRev,
+    /// The directory to list; absent is the root.
+    #[serde(default)]
+    pub path: Option<RepoPath>,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+    /// Resume after this entry name; absent starts at the beginning.
+    #[serde(default)]
+    pub after: Option<ByteString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TreeReply {
+    pub view: ViewInfo,
+    pub entries: KeysetPage<TreeEntry>,
+}
+
+/// `refs.list`: ref names and targets with prefix and inclusive-start
+/// seek. Covers single-ref resolve, so no separate `ref.get` exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RefsListArgs {
+    /// Only names starting with these bytes; absent lists every ref.
+    #[serde(default)]
+    pub prefix: Option<ByteString>,
+    /// Resume after this name; absent starts at `prefix` (inclusive).
+    #[serde(default)]
+    pub after: Option<RefName>,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RefsListReply {
+    pub view: ViewInfo,
+    pub refs: KeysetPage<RefEntry>,
+    /// The event head the page was read under. Read before the page so it
+    /// never runs ahead of the events the page reflects.
+    pub as_of: u64,
+}
+
+/// `compare`: merge bases plus bounded ahead/behind counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompareArgs {
+    pub base: CommitRev,
+    pub head: CommitRev,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompareReply {
+    pub view: ViewInfo,
+    pub bases: Vec<Oid>,
+    pub ahead: u64,
+    pub behind: u64,
+    /// False when the walk exhausted its budget: counts are lower bounds.
+    pub exact: bool,
+}
+
+/// `search`: minimal contract; the dedicated search row defines budgets,
+/// pools, and lease cursors.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    pub pattern: String,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchHit {
+    pub path: RepoPath,
+    pub line: u64,
+    pub excerpt: ByteString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchReply {
+    pub view: ViewInfo,
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
+}
+
+/// The archive payloads the daemon streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveFormat {
+    Tar,
+    Zip,
+}
+
+/// `archive`: metadata for the streamed payload; bytes ride `Stdout`
+/// frames under the reply window, never the control frame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveArgs {
+    pub rev: CommitRev,
+    #[serde(default)]
+    pub format: Option<ArchiveFormat>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveReply {
+    pub view: ViewInfo,
+    pub commit: Oid,
+    pub format: ArchiveFormat,
+    pub content_type: String,
+}
+
+/// Longest `events.tail` wait: the only ref feed long-polls instead of
+/// holding a subscription.
+pub const MAX_TAIL_WAIT_MS: u32 = 30_000;
+
+/// `events.tail`: ref events strictly after `after`, long-polled. The
+/// only ref feed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventsTailArgs {
+    pub after: u64,
+    #[serde(default)]
+    pub limit: Option<PageLimit>,
+    /// Long-poll milliseconds; absent returns immediately.
+    #[serde(default)]
+    pub wait_ms: Option<u32>,
+    /// Only events whose ref name starts with these bytes.
+    #[serde(default)]
+    pub prefix: Option<ByteString>,
+}
+
+/// One ref event carried by `events.tail`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TailedEvent {
+    pub seq: u64,
+    pub name: ByteString,
+    #[serde(default)]
+    pub old: Option<RefTarget>,
+    #[serde(default)]
+    pub new: Option<RefTarget>,
+    pub at: u64,
+    pub source: EventSource,
+    #[serde(default)]
+    pub operation: Option<OperationId>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub session: Option<SessionId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EventsTailReply {
+    pub view: ViewInfo,
+    pub events: Vec<TailedEvent>,
+    /// The last assigned sequence at reply time.
+    pub head: u64,
+    /// The oldest retained sequence at reply time.
+    pub oldest: u64,
+    /// True when `after + 1` predates `oldest`: the caller missed events
+    /// and must resnapshot from `refs.list` with `as_of`.
+    pub expired: bool,
+}
+
+/// `remote.refs`: advertised refs of an explicit remote URL, never stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteRefsArgs {
+    pub url: RemoteUrl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteRefsReply {
+    pub view: ViewInfo,
+    pub refs: Vec<RefEntry>,
+}
+
+/// `claim.renew`: extends one held claim by a fresh lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimRenewArgs {
+    pub claim: ClaimId,
+    pub ttl: ClaimTtl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimRenewReply {
+    pub outcome: MutationOutcome,
+    pub claim: ClaimRecord,
+}
+
+/// `policy.set`: replaces the landing policy of the repository.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicySetArgs {
+    pub requirements: Vec<AttestRequirement>,
+    pub trusted_signers: Vec<SignerFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicySetReply {
+    pub outcome: MutationOutcome,
+    pub generation: u64,
+}
+
+/// `repo.init`: creates one repository store under a configured root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoInitArgs {
+    pub root: String,
+    pub path: String,
+    #[serde(default)]
+    pub object_format: Option<HashKind>,
+    #[serde(default)]
+    pub default_branch: Option<RefName>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoInitReply {
+    pub path: String,
+    pub store_id: StoreId,
+    pub object_format: HashKind,
+    pub default_branch: RefName,
+}
+
+/// `repo.delete`: tombstones one repository; a purge job removes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoDeleteArgs {
+    pub repo: String,
+    pub confirm_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoDeleteReply {
+    pub deleted_path: String,
+}
+
+/// `repo.rename`: moves one repository within its root; the store id is
+/// unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoRenameArgs {
+    pub repo: String,
+    pub new_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoRenameReply {
+    pub path: String,
+    pub previous_path: String,
+}
+
+/// Which refs a fork copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForkRefs {
+    All,
+    DefaultAndTags,
+    None,
+}
+
+/// `repo.fork`: copies one repository to a fresh store id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoForkArgs {
+    pub source: String,
+    pub path: String,
+    #[serde(default)]
+    pub refs: Option<ForkRefs>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoForkReply {
+    pub path: String,
+    pub store_id: StoreId,
+    pub refs_copied: u64,
+}
+
+fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
+    if text.is_empty() {
+        return Err(invalid(format!("{what} must not be empty")));
+    }
+    Ok(())
+}
+
+impl Validate for SearchArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        let bytes = self.pattern.len();
+        if bytes == 0 || bytes > 4096 {
+            return Err(invalid(format!(
+                "search pattern is 1..=4096 bytes, got {bytes}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for EventsTailArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        if let Some(wait_ms) = self.wait_ms
+            && wait_ms > MAX_TAIL_WAIT_MS
+        {
+            return Err(limit_exceeded(format!(
+                "tail wait is at most {MAX_TAIL_WAIT_MS} ms, got {wait_ms}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for RepoInitArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("init root", &self.root)?;
+        require_nonempty_text("init path", &self.path)
+    }
+}
+
+impl Validate for RepoDeleteArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("delete repo", &self.repo)?;
+        require_nonempty_text("delete confirm path", &self.confirm_path)
+    }
+}
+
+impl Validate for RepoRenameArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("rename repo", &self.repo)?;
+        require_nonempty_text("rename new path", &self.new_path)
+    }
+}
+
+impl Validate for RepoForkArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_nonempty_text("fork source", &self.source)?;
+        require_nonempty_text("fork path", &self.path)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The method table
 // ---------------------------------------------------------------------------
 
@@ -3049,7 +3520,7 @@ enum SessionRule {
 impl MethodKind {
     const fn session_rule(self) -> SessionRule {
         match self {
-            Self::Anonymous => SessionRule::Optional,
+            Self::Anonymous | Self::Admin => SessionRule::Optional,
             Self::Bootstrap => SessionRule::Forbidden,
             Self::Read | Self::Mutation => SessionRule::Required,
         }
@@ -3061,6 +3532,10 @@ macro_rules! digest_args {
     (Mutation, $params:expr) => {
         Some(postcard::to_allocvec(&$params.args))
     };
+    (Admin, $params:expr) => {{
+        let _ = &$params;
+        None
+    }};
     ($kind:ident, $params:expr) => {{
         let _ = &$params;
         None
@@ -3072,6 +3547,10 @@ macro_rules! request_id_of {
     (Mutation, $params:expr) => {
         Some($params.request_id)
     };
+    (Admin, $params:expr) => {{
+        let _ = &$params;
+        None
+    }};
     ($kind:ident, $params:expr) => {{
         let _ = &$params;
         None
@@ -3095,6 +3574,10 @@ macro_rules! outcome_of {
         let _ = &$result;
         None
     }};
+    (Admin, $result:expr) => {{
+        let _ = &$result;
+        None
+    }};
 }
 
 /// Mutable access to the outcome of a mutation reply.
@@ -3111,6 +3594,10 @@ macro_rules! outcome_of_mut {
         None
     }};
     (Read, $result:expr) => {{
+        let _ = $result;
+        None
+    }};
+    (Admin, $result:expr) => {{
         let _ = $result;
         None
     }};
@@ -3330,6 +3817,20 @@ method_table! {
     Blame, "blame", Read, BlameArgs, BlameReply;
     Query, "query", Read, QueryArgs, QueryReply;
     GitCommit, "git.commit", Mutation, Mutation<GitCommitArgs>, NewReply;
+    RepoStat, "repo.stat", Read, RepoStatArgs, RepoStatReply;
+    Tree, "tree", Read, TreeArgs, TreeReply;
+    RefsList, "refs.list", Read, RefsListArgs, RefsListReply;
+    Compare, "compare", Read, CompareArgs, CompareReply;
+    Search, "search", Read, SearchArgs, SearchReply;
+    Archive, "archive", Read, ArchiveArgs, ArchiveReply;
+    EventsTail, "events.tail", Read, EventsTailArgs, EventsTailReply;
+    RepoInit, "repo.init", Admin, RepoInitArgs, RepoInitReply;
+    RepoDelete, "repo.delete", Admin, RepoDeleteArgs, RepoDeleteReply;
+    RepoRename, "repo.rename", Admin, RepoRenameArgs, RepoRenameReply;
+    RepoFork, "repo.fork", Admin, RepoForkArgs, RepoForkReply;
+    RemoteRefs, "remote.refs", Read, RemoteRefsArgs, RemoteRefsReply;
+    ClaimRenew, "claim.renew", Mutation, Mutation<ClaimRenewArgs>, ClaimRenewReply;
+    PolicySet, "policy.set", Mutation, Mutation<PolicySetArgs>, PolicySetReply;
 }
 
 // ---------------------------------------------------------------------------
@@ -4017,6 +4518,59 @@ mod tests {
         assert_eq!(log_request(PageRequest::default()).request_id(), None);
     }
 
+    #[test]
+    fn admin_methods_take_no_session_and_no_receipt() {
+        for method in [
+            Method::RepoInit,
+            Method::RepoDelete,
+            Method::RepoRename,
+            Method::RepoFork,
+        ] {
+            assert_eq!(method.kind(), MethodKind::Admin);
+            assert!(!method.is_mutation());
+        }
+        let request = Request::RepoInit(Box::new(RepoInitArgs {
+            root: "default".to_string(),
+            path: "acme/hello".to_string(),
+            object_format: None,
+            default_branch: None,
+        }));
+        assert_eq!(request.request_id(), None);
+        assert_eq!(
+            request.digest_input_v1().expect("digestable"),
+            None,
+            "admin calls leave no digest for receipts"
+        );
+        let mut reply = Reply::RepoInit(Box::new(RepoInitReply {
+            path: "acme/hello".to_string(),
+            store_id: StoreId::generate(),
+            object_format: HashKind::Sha1,
+            default_branch: name("refs/heads/main"),
+        }));
+        assert_eq!(reply.outcome(), None);
+        assert!(reply.outcome_mut().is_none());
+
+        let bare = RequestEnvelope {
+            schema_version: SchemaVersion::current(),
+            session: None,
+            request,
+        };
+        assert!(bare.validate().is_ok());
+        let mut carried = bare.clone();
+        carried.session = Some(session());
+        assert!(carried.validate().is_ok());
+
+        let forbidden = Request::PolicySet(mutation(
+            1,
+            PolicySetArgs {
+                requirements: Vec::new(),
+                trusted_signers: Vec::new(),
+            },
+        ));
+        assert_eq!(forbidden.request_id(), Some(request_id(1)));
+        assert!(forbidden.digest_input_v1().expect("digestable").is_some());
+    }
+
     // ----- paging and inline bounds ---------------------------------------
 
     #[test]
@@ -4043,6 +4597,103 @@ mod tests {
                 "limit {limit}"
             );
         }
+    }
+
+    #[test]
+    fn commit_rev_uses_single_key_ref_or_commit_objects() {
+        let by_ref = CommitRev::Ref(name("refs/heads/main"));
+        let wire = sonic_rs::to_value(&by_ref).expect("json");
+        assert_eq!(wire, json!({"ref": "refs/heads/main"}));
+        let back: CommitRev = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, by_ref);
+
+        let by_id = CommitRev::Commit(oid(9));
+        let wire = sonic_rs::to_value(&by_id).expect("json");
+        assert_eq!(wire, json!({"commit": "09".repeat(20)}));
+        let back: CommitRev = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, by_id);
+
+        assert!(sonic_rs::from_str::<CommitRev>("{\"REF\": \"refs/heads/main\"}").is_err());
+        assert!(by_ref.validate().is_ok());
+        assert!(by_id.validate().is_ok());
+    }
+
+    #[test]
+    fn keyset_pages_are_stateless_and_bounded() {
+        let page = KeysetPage::new(vec![1_u32, 2], Some(ByteString::from("ff00"))).expect("page");
+        assert_eq!(page.next_after, Some(ByteString::from("ff00")));
+        let wire = sonic_rs::to_value(&page).expect("json");
+        assert_eq!(wire, json!({"items": [1, 2], "next_after": "ff00"}));
+        let back: KeysetPage<u32> = sonic_rs::from_value(&wire).expect("parse");
+        assert_eq!(back, page);
+
+        let terminal = KeysetPage::new(vec![1_u32], None).expect("terminal");
+        let wire = sonic_rs::to_value(&terminal).expect("json");
+        assert_eq!(wire["next_after"], json!(null));
+        assert!(terminal.validate().is_ok());
+
+        let over = (0..=MAX_PAGE_SIZE).collect::<Vec<_>>();
+        assert_eq!(
+            KeysetPage::new(over, None).expect_err("cap").code,
+            ErrorCode::ELimit
+        );
+    }
+
+    #[test]
+    fn shared_scalars_keep_their_wire_contracts() {
+        let utf8 = ByteString::from("refs/heads/main");
+        assert_eq!(
+            sonic_rs::to_value(&utf8).expect("json"),
+            json!("refs/heads/main")
+        );
+        let raw = ByteString::new(vec![0xff, 0xfe]);
+        assert_eq!(
+            sonic_rs::to_value(&raw).expect("json"),
+            json!({"hex": "fffe"})
+        );
+        let back: ByteString = sonic_rs::from_value(&json!({"hex": "fffe"})).expect("parse");
+        assert_eq!(back, raw);
+
+        let direct = RefTarget::Direct(oid(3));
+        assert_eq!(
+            sonic_rs::to_value(&direct).expect("json"),
+            json!({"direct": "03".repeat(20)})
+        );
+        let symbolic = RefTarget::Symbolic(name("refs/heads/main"));
+        assert_eq!(
+            sonic_rs::to_value(&symbolic).expect("json"),
+            json!({"symbolic": "refs/heads/main"})
+        );
+        assert!(sonic_rs::from_str::<RefTarget>("{\"Direct\": \"00\"}").is_err());
+    }
+
+    #[test]
+    fn events_tail_bounds_reject_over_limit_and_wait() {
+        let args = EventsTailArgs {
+            after: 0,
+            limit: Some(PageLimit::new(1000).expect("max page")),
+            wait_ms: Some(MAX_TAIL_WAIT_MS),
+            prefix: None,
+        };
+        assert!(args.validate().is_ok());
+
+        let over_wait = EventsTailArgs {
+            wait_ms: Some(MAX_TAIL_WAIT_MS + 1),
+            ..args.clone()
+        };
+        assert_eq!(
+            invalid_code(over_wait.validate()),
+            ErrorCode::ELimit,
+            "wait past 30000 ms is refused, not clamped"
+        );
+
+        assert!(PageLimit::new(1001).is_err());
+        let over_limit: Result<EventsTailArgs, _> =
+            sonic_rs::from_str("{\"after\":0,\"limit\":1001}");
+        assert!(over_limit.is_err(), "limit 1001 never decodes");
+        let at_limit: EventsTailArgs =
+            sonic_rs::from_str("{\"after\":0,\"limit\":1000}").expect("limit 1000 decodes");
+        assert!(at_limit.validate().is_ok());
     }
 
     #[test]
@@ -4880,6 +5531,7 @@ mod tests {
             paths: vec![path("src")],
             mode: ClaimMode::Advise,
             expires_at: timestamp("2026-10-17T13:00:00Z"),
+            on_behalf_of: None,
         };
         let release = Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: sample_outcome(),
@@ -5380,7 +6032,7 @@ mod tests {
                 MethodKind::Read => {
                     assert!(result_fields.contains_key(&"view"), "{}", method.as_str());
                 }
-                MethodKind::Anonymous | MethodKind::Bootstrap => {}
+                MethodKind::Anonymous | MethodKind::Bootstrap | MethodKind::Admin => {}
             }
         }
     }
@@ -5429,9 +6081,9 @@ mod tests {
             assert_eq!(method.is_mutation(), method.kind() == MethodKind::Mutation);
         }
         let required = [
+            "schema",
             "session.open",
             "session.resume",
-            "schema",
             "ws.new",
             "ws.scope",
             "ws.take",
@@ -5476,10 +6128,34 @@ mod tests {
             "blame",
             "query",
             "git.commit",
+            "repo.stat",
+            "tree",
+            "refs.list",
+            "compare",
+            "search",
+            "archive",
+            "events.tail",
+            "repo.init",
+            "repo.delete",
+            "repo.rename",
+            "repo.fork",
+            "remote.refs",
+            "claim.renew",
+            "policy.set",
         ];
         for method in required {
             assert!(names.contains(method), "missing method {method}");
         }
         assert_eq!(names.len(), required.len(), "methods beyond the contract");
+        // Order is part of the contract: a method's position in the table is
+        // its discriminant, so a reordered row changes the wire.
+        assert!(
+            Method::ALL
+                .iter()
+                .copied()
+                .map(Method::as_str)
+                .eq(required.iter().copied()),
+            "method table order differs from the contract order"
+        );
     }
 }

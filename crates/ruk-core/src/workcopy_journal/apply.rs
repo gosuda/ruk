@@ -31,7 +31,8 @@ use crate::change::WorkspaceId;
 use crate::error::{CoreError, ErrorCode};
 use crate::index::{FileMode, RepoPath};
 use crate::store::{
-    FactExpectation, FactMutation, FactTable, ObjectKind, PreparedObject, Store, StoreError,
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, ObjectKind,
+    PreparedObject, Store, StoreError,
 };
 use crate::workcopy::lfs::{self, LfsMode, MAX_POINTER_BYTES};
 use crate::workspace::{Scope, WorkspaceStamp};
@@ -210,7 +211,12 @@ pub(crate) fn begin_apply(
         fence.guard(),
     ];
     facts.extend(extra);
-    if let Err(err) = store.publish(objects, &facts) {
+    if let Err(err) = store.publish(
+        objects,
+        &facts,
+        EventSource::LocalPush,
+        &EventContext::default(),
+    ) {
         return Err(begin_conflict(store, workspace, err));
     }
     Ok(ApplySession {
@@ -633,7 +639,12 @@ impl<'a> Executor<'a> {
             self.fence.guard(),
         ];
         self.store
-            .publish(Vec::new(), &facts)
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(lease_conflict)?;
         self.journal = journal;
         self.row = bytes;
@@ -696,7 +707,12 @@ impl<'a> Executor<'a> {
         ];
         facts.extend(batch.extra);
         self.store
-            .publish(Vec::new(), &facts)
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(lease_conflict)?;
         Ok(ApplyOutcome {
             changed: self

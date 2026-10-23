@@ -317,7 +317,7 @@ impl Adapter for JsonAdapter {
     }
 
     fn separators(&self) -> &[u8] {
-        &[b',']
+        b","
     }
 }
 
@@ -328,6 +328,10 @@ impl Adapter for JsonAdapter {
 /// TOML table entries with dotted-key flattening and inline-table descent.
 #[derive(Debug)]
 pub struct TomlAdapter;
+
+/// Collected TOML entries: `(table_path, pair_key)` pairs, table paths, and
+/// multiline/key-value paths needing a second sweep.
+type TableEntries = (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
 impl TomlAdapter {
     /// Header path text of a `table` node: its first non-pair named child.
@@ -355,10 +359,7 @@ impl TomlAdapter {
 
     /// Collects `(table_path, pair_key)` entries and table paths, skipping
     /// array-of-table subtrees entirely.
-    fn entries(
-        tree: &ParsedTree,
-        source: &[u8],
-    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    fn entries(tree: &ParsedTree, source: &[u8]) -> TableEntries {
         let mut pairs = Vec::new();
         let mut tables = Vec::new();
         let mut multiline = Vec::new();
@@ -539,7 +540,7 @@ impl Adapter for TomlAdapter {
     }
 
     fn separators(&self) -> &[u8] {
-        &[b',']
+        b","
     }
 }
 
@@ -819,7 +820,7 @@ impl Adapter for YamlAdapter {
     }
 
     fn separators(&self) -> &[u8] {
-        &[b',']
+        b","
     }
 }
 
@@ -828,7 +829,7 @@ impl YamlAdapter {
         tree: &ParsedTree,
         source: &[u8],
         mapping: u32,
-        parent: &mut Vec<Vec<u8>>,
+        parent: &mut [Vec<u8>],
         out: &mut Vec<SourceUnit>,
         depth: usize,
     ) {
@@ -981,7 +982,7 @@ impl Adapter for CssAdapter {
     }
 
     fn separators(&self) -> &[u8] {
-        &[b';', b',']
+        b";,"
     }
 }
 

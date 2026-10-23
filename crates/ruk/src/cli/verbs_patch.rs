@@ -31,6 +31,7 @@ use ruk_core::heads::Head;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::index::{FileMode, IndexEntry, RepoPath, Stage, StatData};
 use ruk_core::ops::NewRequest;
+use ruk_core::store::{EventContext, EventSource};
 use ruk_git::GitError;
 
 use super::state::{
@@ -47,6 +48,13 @@ use super::verbs_history::{
     parse_log_revs, render_file_stat, stat_summary, tree_file_changes, walk_history_excluding,
 };
 use super::{Ctx, FlagSpec, collect, read_stdin_bytes};
+
+/// Path-to-content seed map from the `HEAD` tree.
+type SeedFileMap = BTreeMap<Vec<u8>, (TreeMode, Option<Vec<u8>>)>;
+/// `(old path, new path, result bytes, result mode, deleted)` apply result.
+type AmApplyResult = (Vec<u8>, Vec<u8>, Vec<u8>, FileMode, bool);
+/// `(index row, staged content plus lstat tuple)` touched entry.
+type TouchedEntry = (RepoPath, Option<(FileMode, Vec<u8>, Option<StatData>)>);
 
 // ---------------------------------------------------------------------------
 // shared text model
@@ -80,10 +88,8 @@ fn split_text(bytes: &[u8]) -> Vec<TextLine> {
             newline: true,
         })
         .collect();
-    if !trailing {
-        if let Some(last) = out.last_mut() {
-            last.newline = false;
-        }
+    if !trailing && let Some(last) = out.last_mut() {
+        last.newline = false;
     }
     out
 }
@@ -1576,6 +1582,10 @@ struct ApplyPlan {
     /// Result index mode.
     result_mode: FileMode,
     /// Create the path.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     is_new: bool,
     /// Remove the path.
     is_delete: bool,
@@ -1904,7 +1914,14 @@ fn execute_apply(ctx: &Ctx, plans: &[ApplyPlan], target: ApplyTarget) -> Result<
             .map_err(to_core_invalid)?;
         mutations.push(workspace_mutation(raw.as_deref(), &next)?);
         mutations.push(super::state::index_stamp_mutation()?);
-        store.publish(objects, &mutations).map_err(GitError::from)?;
+        store
+            .publish(
+                objects,
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .map_err(GitError::from)?;
     }
     if target != ApplyTarget::IndexOnly {
         for plan in plans {
@@ -2414,7 +2431,7 @@ fn seed_file_map(
     store: &ruk_core::store::Store,
     kind: HashKind,
     tree: Oid,
-) -> Result<BTreeMap<Vec<u8>, (TreeMode, Option<Vec<u8>>)>, GitError> {
+) -> Result<SeedFileMap, GitError> {
     let mut map = BTreeMap::new();
     for (path, mode, oid) in flatten_tree(store, kind, tree)? {
         let body = match mode {
@@ -2451,7 +2468,7 @@ fn am_apply_message(
     // written, so a failure leaves no partial state.
     // Each entry: pre-image path, post-image path, result bytes, result
     // mode, whether the path is deleted.
-    let mut results: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, FileMode, bool)> = Vec::new();
+    let mut results: Vec<AmApplyResult> = Vec::new();
     for file in &message.patches {
         let old_path = strip_path(&file.old_path, strip)?;
         // Deletions name `/dev/null` on the new side: every row mutation
@@ -2551,7 +2568,14 @@ fn am_apply_message(
         .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
     let tree = build_index_tree(store, kind, &merged_rows(&staged))?;
     let committer = identity(ctx, IdentityRole::Committer)?;
@@ -2568,7 +2592,7 @@ fn am_apply_message(
         provenance: None,
     };
     let applied = super::coordinator::commit_new(ctx, request, RequestId::generate())?;
-    let new_oid = applied
+    let _new_oid = applied
         .oid
         .or_else(|| applied.head.as_git().copied())
         .ok_or_else(|| GitError::Invalid {
@@ -2718,7 +2742,7 @@ fn am_continue(
     // Each entry: the index row plus staged content and its lstat tuple
     // (`None` removes it). The tuple is captured before the content read so
     // a concurrent edit can only stale it, never validate foreign bytes.
-    let mut touched: Vec<(RepoPath, Option<(FileMode, Vec<u8>, Option<StatData>)>)> = Vec::new();
+    let mut touched: Vec<TouchedEntry> = Vec::new();
     for file in &message.patches {
         let old_path = strip_path(&file.old_path, strip)?;
         let new_path = strip_path(&file.new_path, strip)?;
@@ -2796,7 +2820,14 @@ fn am_continue(
         .map_err(to_core_invalid)?;
     mutations.push(workspace_mutation(workspace_raw.as_deref(), &next)?);
     mutations.push(super::state::index_stamp_mutation()?);
-    store.publish(objects, &mutations).map_err(GitError::from)?;
+    store
+        .publish(
+            objects,
+            &mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .map_err(GitError::from)?;
     let staged = scan_index(store, kind)?;
     let tree = build_index_tree(store, kind, &merged_rows(&staged))?;
     let committer = identity(ctx, IdentityRole::Committer)?;
@@ -2813,7 +2844,7 @@ fn am_continue(
         provenance: None,
     };
     let applied = super::coordinator::commit_new(ctx, request, RequestId::generate())?;
-    let new_oid = applied
+    let _new_oid = applied
         .oid
         .or_else(|| applied.head.as_git().copied())
         .ok_or_else(|| GitError::Invalid {

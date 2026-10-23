@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::ids::{HashKind, Oid};
 use crate::store::delta::{apply_delta, clamp_copy_spans, encode_delta};
 use crate::store::error::StoreError;
+use crate::store::pinned::PinnedRoot;
 use crate::store::prepare::{EncodedSink, Failure, classify_sink, decode_record, prepare_object};
 use crate::store::segment::SegmentError;
 use crate::store::spool::{BudgetLimits, PreparationBudget, Spool, SpoolWriter};
@@ -100,6 +101,10 @@ fn varint(mut value: u64) -> Vec<u8> {
     }
 }
 
+fn pin_of(root: &Path) -> PinnedRoot {
+    PinnedRoot::open(root).expect("pin test store root")
+}
+
 fn prepare(
     budget: &Arc<PreparationBudget>,
     root: &Path,
@@ -108,6 +113,7 @@ fn prepare(
     data: &[u8],
     predecessor: Option<(Oid, &ReadObject)>,
 ) -> Result<PreparedObject, StoreError> {
+    let pin = pin_of(root);
     prepare_object(
         hash_kind,
         kind,
@@ -116,6 +122,7 @@ fn prepare(
         predecessor,
         budget,
         root,
+        &pin,
     )
 }
 
@@ -126,7 +133,8 @@ fn read_all(spool: &Spool) -> Vec<u8> {
 }
 
 fn spool_of(budget: &Arc<PreparationBudget>, root: &Path, bytes: &[u8]) -> Spool {
-    let mut writer = SpoolWriter::new(budget, root);
+    let pin = pin_of(root);
+    let mut writer = SpoolWriter::new(budget, root, &pin);
     writer.append(bytes).expect("append");
     writer.finish().expect("finish")
 }
@@ -160,6 +168,7 @@ fn decode_bytes(
     base: Option<(Oid, &Spool)>,
 ) -> Result<Spool, StoreError> {
     let encoded_len = len64(&encoded);
+    let pin = pin_of(root);
     decode_record(
         rec.hash_kind,
         rec.kind,
@@ -171,6 +180,7 @@ fn decode_bytes(
         base.map(|(oid, spool)| (oid, spool.view())),
         budget,
         root,
+        &pin,
     )
 }
 
@@ -397,9 +407,62 @@ fn spilled_payload_round_trips_and_every_byte_is_released() {
     assert_eq!(budget.in_use(), (0, 0));
 }
 
+/// A spill after a store-root swap lands in the pinned directory:
+/// scratch creates travel the pin, never the recorded path, and the
+/// read-back never resolves the swapped name.
+#[test]
+#[cfg(unix)]
+fn spilled_scratch_survives_a_store_root_swap() {
+    let root = TempRoot::new("spill-swap");
+    let budget = budget_with(limits(1024));
+    let pin = pin_of(root.path());
+    let mut writer = SpoolWriter::new(&budget, root.path(), &pin);
+    writer
+        .append(&noise(11, 512))
+        .expect("first half stays in memory");
+    // Swap the recorded name away and recreate it as an empty directory:
+    // the later spill must still land in the pinned directory.
+    let stashed = root.path().with_extension("stashed");
+    fs::rename(root.path(), &stashed).expect("stash live root");
+    fs::create_dir_all(root.path()).expect("recreate swapped name");
+    writer.append(&noise(12, 1024)).expect("second half spills");
+    let spool = writer.finish().expect("finish spilled spool");
+    assert!(
+        root.scratch_entries().is_empty(),
+        "no spill travels the swapped name"
+    );
+    let pinned: Vec<String> = fs::read_dir(stashed.join("scratch"))
+        .expect("pinned scratch exists")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(pinned.len(), 1, "the spill lands in the pinned dir");
+    let mut out = Vec::new();
+    spool
+        .view()
+        .read_to_end(&mut out)
+        .expect("read spilled spool by fd");
+    assert_eq!(out.len(), 512 + 1024);
+    drop(spool);
+    assert!(
+        fs::read_dir(stashed.join("scratch"))
+            .expect("pinned scratch still lists")
+            .next()
+            .is_none(),
+        "drop unlinks the pinned file by its recorded path"
+    );
+    fs::remove_dir_all(&stashed).expect("remove stashed root");
+}
+
 #[test]
 fn declared_length_mismatch_is_invalid_and_leaves_nothing() {
     let root = TempRoot::new("length");
+    let pin = pin_of(root.path());
     for (threshold, len) in [(256 * 1024, 1000_usize), (1024, 5000)] {
         let budget = budget_with(limits(threshold));
         let data = noise(2, len);
@@ -412,6 +475,7 @@ fn declared_length_mismatch_is_invalid_and_leaves_nothing() {
                 None,
                 &budget,
                 root.path(),
+                &pin,
             )
             .unwrap_err();
             assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
@@ -432,6 +496,7 @@ fn declared_length_mismatch_with_a_predecessor_is_invalid_too() {
         bytes: spool_of(&budget, root.path(), &base),
         depth: 0,
     };
+    let pin = pin_of(root.path());
     let err = prepare_object(
         HashKind::Sha1,
         ObjectKind::Blob,
@@ -440,6 +505,7 @@ fn declared_length_mismatch_with_a_predecessor_is_invalid_too() {
         Some((base_oid, &read)),
         &budget,
         root.path(),
+        &pin,
     )
     .unwrap_err();
     assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
@@ -464,6 +530,7 @@ fn admission_refuses_before_reading_a_single_byte() {
         ..BudgetLimits::default()
     });
     let touched = Cell::new(false);
+    let pin = pin_of(root.path());
     let err = prepare_object(
         HashKind::Sha1,
         ObjectKind::Blob,
@@ -472,6 +539,7 @@ fn admission_refuses_before_reading_a_single_byte() {
         None,
         &budget,
         root.path(),
+        &pin,
     )
     .unwrap_err();
     assert!(matches!(err, StoreError::Limit(_)), "{err:?}");
@@ -621,8 +689,9 @@ fn scratch_registration_is_idempotent_and_never_double_charges() {
     )
     .unwrap();
     let budget = default_budget();
-    budget.register_scratch(root.path()).unwrap();
-    budget.register_scratch(root.path()).unwrap();
+    let pin = pin_of(root.path());
+    budget.register_scratch(&pin, root.path()).unwrap();
+    budget.register_scratch(&pin, root.path()).unwrap();
     assert_eq!(budget.scratch_in_use(root.path()), Some(5000));
     assert_eq!(budget.in_use(), (0, 5000));
 }
@@ -970,6 +1039,7 @@ fn read_failures_keep_their_class() {
             after,
             error,
         };
+        let pin = pin_of(root.path());
         decode_record(
             HashKind::Sha1,
             ObjectKind::Blob,
@@ -981,6 +1051,7 @@ fn read_failures_keep_their_class() {
             None,
             &budget,
             root.path(),
+            &pin,
         )
     };
     let io_error = decode(|| io::Error::other("disk fell over"), 3).unwrap_err();
@@ -1008,6 +1079,7 @@ fn input_read_failure_is_io_and_releases_the_spool() {
         after: 50_000,
         error: || io::Error::other("source vanished"),
     };
+    let pin = pin_of(root.path());
     let err = prepare_object(
         HashKind::Sha1,
         ObjectKind::Blob,
@@ -1016,6 +1088,7 @@ fn input_read_failure_is_io_and_releases_the_spool() {
         None,
         &budget,
         root.path(),
+        &pin,
     )
     .unwrap_err();
     assert!(matches!(err, StoreError::Io(_)), "{err:?}");
@@ -1191,7 +1264,8 @@ fn copy_spans_shrink_to_encodable_offsets_instead_of_failing() {
 fn encoded_sink_refuses_u32_overflow_and_the_keep_threshold_before_writing() {
     let root = TempRoot::new("sink");
     let budget = default_budget();
-    let mut sink = EncodedSink::new(SpoolWriter::new(&budget, root.path()), None);
+    let pin = pin_of(root.path());
+    let mut sink = EncodedSink::new(SpoolWriter::new(&budget, root.path(), &pin), None);
     sink.preset_written(u64::from(u32::MAX) - 1);
     let err = sink.write(&[1, 2]).unwrap_err();
     match classify_sink(err) {
@@ -1200,7 +1274,7 @@ fn encoded_sink_refuses_u32_overflow_and_the_keep_threshold_before_writing() {
         Failure::OverThreshold => panic!("expected capacity"),
     }
 
-    let mut bounded = EncodedSink::new(SpoolWriter::new(&budget, root.path()), Some(4));
+    let mut bounded = EncodedSink::new(SpoolWriter::new(&budget, root.path(), &pin), Some(4));
     bounded.write_all(&[1, 2, 3, 4]).unwrap();
     let err = bounded.write(&[5]).unwrap_err();
     assert!(matches!(classify_sink(err), Failure::OverThreshold));
@@ -1251,7 +1325,8 @@ fn failed_spool_writer_stays_failed_and_releases() {
         memory_spool_threshold: 8,
         ..BudgetLimits::default()
     });
-    let mut writer = SpoolWriter::new(&budget, root.path());
+    let pin = pin_of(root.path());
+    let mut writer = SpoolWriter::new(&budget, root.path(), &pin);
     writer.append(&[0; 4]).unwrap();
     let err = writer.append(&[0; 200]).unwrap_err();
     assert!(matches!(err, StoreError::Limit(_)), "{err:?}");

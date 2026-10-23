@@ -309,6 +309,13 @@ impl Metadata {
     /// file, a mistyped census table, or a missing generation row;
     /// [`StoreError::Version`] for an unknown table or a file format
     /// that needs an offline upgrade.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
         Self::open_with_timeout(path, open_wait_timeout())
     }
@@ -703,6 +710,41 @@ impl Metadata {
         after: Option<&[u8]>,
         budget: FactPageBudget,
     ) -> Result<FactPage, StoreError> {
+        let lower: Bound<&[u8]> = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.fact_page_range(table, lower, None, budget)
+    }
+
+    /// A bounded page of raw fact rows under `prefix`, seeking inclusively
+    /// at the prefix when `after` is absent and exclusively after `after`
+    /// otherwise. Stops at the first key outside `prefix`, so prefix
+    /// listings never scan the whole namespace. `more` is true only while
+    /// rows under the prefix may remain.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for zero rows or bytes in `budget`;
+    /// [`StoreError::Limit`] if the first row alone exceeds the byte budget;
+    /// [`StoreError::Corrupt`] or [`StoreError::Storage`] for redb failures.
+    pub(crate) fn fact_page_prefixed(
+        &self,
+        table: FactTable,
+        after: Option<&[u8]>,
+        prefix: &[u8],
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
+        let lower: Bound<&[u8]> = match after {
+            Some(key) => Bound::Excluded(key),
+            None => Bound::Included(prefix),
+        };
+        self.fact_page_range(table, lower, Some(prefix), budget)
+    }
+
+    fn fact_page_range(
+        &self,
+        table: FactTable,
+        lower: Bound<&[u8]>,
+        prefix: Option<&[u8]>,
+        budget: FactPageBudget,
+    ) -> Result<FactPage, StoreError> {
         if budget.rows == 0 || budget.bytes == 0 {
             return Err(StoreError::Invalid(format!(
                 "fact page budget must specify non-zero rows and bytes, found rows={} bytes={}",
@@ -719,7 +761,6 @@ impl Metadata {
         let fact_table = txn
             .open_table(fact_definition(table))
             .map_err(table_error)?;
-        let lower: Bound<&[u8]> = after.map_or(Bound::Unbounded, |key| Bound::Excluded(key));
         let mut iter = fact_table
             .range::<&[u8]>((lower, Bound::Unbounded))
             .map_err(storage)?;
@@ -728,6 +769,12 @@ impl Metadata {
             let (key_guard, value_guard) = item.map_err(storage)?;
             let key = key_guard.value();
             let value = value_guard.value();
+
+            if let Some(prefix) = prefix
+                && !key.starts_with(prefix)
+            {
+                break;
+            }
 
             let row_bytes = key.len().checked_add(value.len()).ok_or_else(|| {
                 StoreError::Capacity("fact row key + value bytes overflow usize".to_owned())
@@ -745,6 +792,9 @@ impl Metadata {
                         budget.bytes
                     )));
                 }
+                // The current row matches the scan (a non-matching prefixed
+                // row breaks above) and is omitted from this page, so more
+                // rows remain regardless of what follows it.
                 more = true;
                 break;
             }
@@ -756,9 +806,12 @@ impl Metadata {
             accumulated_bytes = new_total;
 
             if rows.len() == max_rows || accumulated_bytes == budget.bytes {
-                if iter.next().transpose().map_err(storage)?.is_some() {
-                    more = true;
-                }
+                more = match iter.next().transpose().map_err(storage)? {
+                    None => false,
+                    Some((next_key, _)) => {
+                        prefix.is_none_or(|want| next_key.value().starts_with(want))
+                    }
+                };
                 break;
             }
         }
@@ -835,6 +888,21 @@ impl fmt::Debug for PublicationTxn {
 }
 
 impl PublicationTxn {
+    /// Applies further fact mutations to this open transaction: the event
+    /// rows and head bump the store appends to a publication carrying ref
+    /// mutations, atomically with the batch they describe.
+    ///
+    /// # Errors
+    /// [`StoreError::StaleFact`] on expectation mismatch, [`StoreError::Invalid`]
+    /// on duplicate keys, storage failures otherwise.
+    pub(crate) fn apply_more(&self, facts: &[FactMutation]) -> Result<(), StoreError> {
+        reject_duplicate_facts(facts)?;
+        for fact in facts {
+            apply_fact(&self.txn, fact)?;
+        }
+        Ok(())
+    }
+
     /// The locator for `oid` as of this transaction.
     pub(crate) fn get_object(&self, oid: &Oid) -> Result<Option<ObjectLocation>, StoreError> {
         lookup_object(&self.txn.open_table(OBJECTS).map_err(table_error)?, oid)
@@ -1033,18 +1101,37 @@ fn reject_duplicate_facts(facts: &[FactMutation]) -> Result<(), StoreError> {
 /// Verifies one expectation against the transaction's own view and applies
 /// the mutation. The publisher holds the only write transaction, so what is
 /// verified here is what the commit applies to.
+///
+/// Record rows are content-addressed: when the stored bytes already equal
+/// the written bytes, the replay converged and the write is skipped. This
+/// covers only the record tables; claims, refs, and every other table keep
+/// strict expectations, so a genuinely moved value still refuses.
 fn apply_fact(txn: &WriteTransaction, fact: &FactMutation) -> Result<(), StoreError> {
+    use FactTable::{ChangeHistory, Changes, Commits, ImportedChanges};
     let mut table = txn
         .open_table(fact_definition(fact.table))
         .map_err(table_error)?;
+    let stored = table.get(fact.key.as_slice()).map_err(storage)?;
+    let converged = match (fact.value.as_ref(), stored.as_ref()) {
+        (Some(value), Some(current)) => {
+            matches!(
+                fact.table,
+                Commits | Changes | ImportedChanges | ChangeHistory
+            ) && current.value() == value.as_slice()
+        }
+        _ => false,
+    };
+    if converged {
+        return Ok(());
+    }
     let stale = match &fact.expected {
         FactExpectation::Any => false,
-        FactExpectation::Absent => table.get(fact.key.as_slice()).map_err(storage)?.is_some(),
-        FactExpectation::Value(want) => table
-            .get(fact.key.as_slice())
-            .map_err(storage)?
-            .is_none_or(|stored| stored.value() != want.as_slice()),
+        FactExpectation::Absent => stored.is_some(),
+        FactExpectation::Value(want) => stored
+            .as_ref()
+            .is_none_or(|current| current.value() != want.as_slice()),
     };
+    drop(stored);
     if stale {
         return Err(StoreError::StaleFact {
             table: fact.table.table_name(),
@@ -1064,14 +1151,24 @@ fn apply_fact(txn: &WriteTransaction, fact: &FactMutation) -> Result<(), StoreEr
     Ok(())
 }
 
-/// Creates the `lfs_objects` and `pending_reservations` tables when the
-/// database predates those schema revisions, so an older store opens with
-/// the new tables empty instead of refusing. Every other census table keeps
-/// its existing meaning: a missing one is still damage, never silently
-/// recreated — recreating `objects` would orphan segment bytes behind
-/// vanished locators and turn damage into silent missing-object reads. A
-/// write transaction's `open_table` creates the table only when absent;
-/// existing tables and rows are untouched.
+/// Tables a schema revision may introduce into an older store: absence
+/// means the file predates the revision, so the table is created empty
+/// instead of refusing. Every other census table keeps its existing
+/// meaning: a missing one is still damage, never silently recreated —
+/// recreating `objects` would orphan segment bytes behind vanished
+/// locators and turn damage into silent missing-object reads. A write
+/// transaction's `open_table` creates the table only when absent; existing
+/// tables and rows are untouched.
+const REVISION_TABLES: [&str; 7] = [
+    "lfs_objects",
+    "pending_reservations",
+    "events",
+    "event_head",
+    "service_receipts",
+    "repo_meta",
+    "released_tags",
+];
+
 fn ensure_census(db: &Database) -> Result<(), StoreError> {
     // Fast path: the revision tables exist on every store written since
     // their introduction, so probe with a read transaction and only take
@@ -1086,7 +1183,7 @@ fn ensure_census(db: &Database) -> Result<(), StoreError> {
             .map_err(storage)?
             .map(|handle| handle.name().to_owned())
             .collect();
-        [FactTable::LfsObjects.table_name(), PENDING.name()]
+        REVISION_TABLES
             .into_iter()
             .filter(|want| !names.iter().any(|name| name == want))
             .map(str::to_owned)
@@ -1098,11 +1195,17 @@ fn ensure_census(db: &Database) -> Result<(), StoreError> {
     let mut txn = db.begin_write().map_err(txn_error)?;
     txn.set_durability(Durability::Immediate)?;
     for name in &missing {
-        if name == FactTable::LfsObjects.table_name() {
-            txn.open_table(fact_definition(FactTable::LfsObjects))
-                .map_err(table_error)?;
-        } else {
+        if name == PENDING.name() {
             txn.open_table(PENDING).map_err(table_error)?;
+        } else {
+            let table = FactTable::ALL
+                .into_iter()
+                .find(|table| table.table_name() == name)
+                .ok_or_else(|| {
+                    StoreError::Version(format!("metadata database holds unknown table {name}"))
+                })?;
+            txn.open_table(fact_definition(table))
+                .map_err(table_error)?;
         }
     }
     txn.commit()?;

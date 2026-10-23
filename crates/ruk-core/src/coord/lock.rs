@@ -220,6 +220,13 @@ impl StoreLock {
     /// Truncates and syncs the body, then drops the platform guard to
     /// unlock. A graceful-close I/O failure is propagated, never reported
     /// as a successful release.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn release(mut self) -> Result<(), CoreError> {
         let Some(inner) = self.inner.take() else {
             return Err(CoreError::new(
@@ -451,11 +458,11 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<LockSnapshot, CoreError> {
 /// Decodes one `address unix:<hex>` payload: even-length canonical
 /// lowercase hex within the socket-path byte budget.
 fn decode_unix_address(hex: &[u8]) -> Option<EndpointAddress> {
-    if hex.len() % 2 != 0 || hex.is_empty() || hex.len() / 2 > MAX_SOCKET_PATH_BYTES {
+    if !hex.len().is_multiple_of(2) || hex.is_empty() || hex.len() / 2 > MAX_SOCKET_PATH_BYTES {
         return None;
     }
     let mut raw = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.chunks_exact(2) {
+    for pair in hex.as_chunks::<2>().0 {
         raw.push((hex_val(pair[0])? << 4) | hex_val(pair[1])?);
     }
     if check_socket_bytes(&raw).is_err() {
@@ -483,7 +490,7 @@ fn decode_nonce(hex: &[u8]) -> Option<EndpointNonce> {
         return None;
     }
     let mut raw = [0u8; 32];
-    for (slot, pair) in raw.iter_mut().zip(hex.chunks_exact(2)) {
+    for (slot, pair) in raw.iter_mut().zip(hex.as_chunks::<2>().0) {
         *slot = (hex_val(pair[0])? << 4) | hex_val(pair[1])?;
     }
     Some(EndpointNonce(raw))
@@ -793,6 +800,7 @@ mod tests {
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(store.lock_path())
             .expect("pre-create lock");

@@ -258,12 +258,12 @@ fn mark_goods(ctx: &mut Ctx, goods: &[Oid]) -> Result<Vec<u8>, GitError> {
         }
     }
     check_compatible(store, bad, &merged)?;
-    if let Some(bad_oid) = bad {
-        if interesting(store, bad_oid, &merged)?.is_empty() {
-            return Err(GitError::Invalid {
-                detail: "contradictory marks leave no revisions to test".to_owned(),
-            });
-        }
+    if let Some(bad_oid) = bad
+        && interesting(store, bad_oid, &merged)?.is_empty()
+    {
+        return Err(GitError::Invalid {
+            detail: "contradictory marks leave no revisions to test".to_owned(),
+        });
     }
     write_goods(store, &merged)?;
     for oid in goods {
@@ -751,15 +751,15 @@ fn check_expected(store: &Store, head: Oid) -> Result<(), GitError> {
     if no_checkout_mode(store)? {
         return Ok(());
     }
-    if let Some(expected) = pseudo_read_oid(store, "BISECT_EXPECTED_REV")? {
-        if expected != head {
-            return Err(GitError::Invalid {
-                detail: format!(
-                    "not on the expected revision {}; check it out or pass an explicit revision",
-                    expected.to_hex(),
-                ),
-            });
-        }
+    if let Some(expected) = pseudo_read_oid(store, "BISECT_EXPECTED_REV")?
+        && expected != head
+    {
+        return Err(GitError::Invalid {
+            detail: format!(
+                "not on the expected revision {}; check it out or pass an explicit revision",
+                expected.to_hex(),
+            ),
+        });
     }
     Ok(())
 }

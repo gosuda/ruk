@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ruk_core::ids::{HashKind, Oid};
-use ruk_core::refdata::{RefName, RefTarget};
+use ruk_core::refdata::RefName;
 use ruk_core::refs::StoreRefs;
 use ruk_core::workspace::HeadRef;
 
@@ -53,8 +53,8 @@ fn notes_source(fixture: &Fixture) -> NotesSource {
     let target_tree = fixture.loose("tree", b"");
     let (_, target) = fixture.commit(target_tree, &[], b"", b"annotated\n");
     let hex = target.to_hex();
-    let (_, inner) = fixture.tree(&[(false, hex[2..].as_bytes(), blob)]);
-    let (_, root) = fixture.tree(&[(true, hex[..2].as_bytes(), inner)]);
+    let (_, inner) = fixture.tree(&[(false, &hex.as_bytes()[2..], blob)]);
+    let (_, root) = fixture.tree(&[(true, &hex.as_bytes()[..2], inner)]);
     let (_, notes) = fixture.commit(root, &[], b"", b"notes\n");
     fixture.write_ref("refs/notes/commits", notes);
     NotesSource {

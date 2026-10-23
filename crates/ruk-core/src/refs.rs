@@ -9,6 +9,7 @@ use crate::error::{CoreError, CoreModelError, ErrorCode};
 use crate::ids::{HashKind, Oid};
 use crate::index::reject_null_oid;
 use crate::merge::Merge;
+use crate::protocol::Timestamp;
 use crate::refdata::{
     RefChange, RefError, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
@@ -17,6 +18,7 @@ use crate::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Sto
 #[cfg(test)]
 mod tests;
 
+#[derive(Debug)]
 pub struct StoreRefs<'a> {
     store: &'a Store,
 }
@@ -92,6 +94,50 @@ pub struct RefEntry {
 pub struct RefPage {
     pub entries: Vec<RefEntry>,
     pub more: bool,
+}
+
+/// One page of refs under `prefix`, seeking inclusively at the prefix
+/// when `after` is absent and exclusively after `after` otherwise, so
+/// single-ref resolve and prefix listings never scan the namespace.
+pub fn page_refs_prefixed(
+    store: &Store,
+    prefix: &[u8],
+    after: Option<&RefName>,
+    limit: usize,
+) -> Result<RefPage, CoreError> {
+    if limit == 0 {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "ref page limit must be non-zero",
+        ));
+    }
+    if let Some(cursor) = after
+        && !cursor.as_bytes().starts_with(prefix)
+    {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "ref page cursor must stay under its prefix",
+        ));
+    }
+    let max_rows = limit.min(1000);
+    let budget = FactPageBudget::new(max_rows, MAX_CONTROL_FRAME_BYTES);
+    let page = store.fact_page_prefixed(
+        FactTable::Refs,
+        after.map(RefName::as_bytes),
+        prefix,
+        budget,
+    )?;
+    let mut entries = Vec::with_capacity(page.rows.len());
+    for row in page.rows {
+        let name = RefName::new(row.key)
+            .map_err(|err| corrupt_store(store, format!("stored ref key is invalid: {err}")))?;
+        let target = decode_stored_target(store, &name, &row.value)?;
+        entries.push(RefEntry { name, target });
+    }
+    Ok(RefPage {
+        entries,
+        more: page.more,
+    })
 }
 
 pub fn page_refs(store: &Store, after: Option<&[u8]>, limit: usize) -> Result<RefPage, CoreError> {
@@ -272,11 +318,9 @@ fn decode_stored_conflict(
 ) -> Result<Merge<Option<Oid>>, CoreError> {
     let res: Result<Merge<Option<Oid>>, StoreError> = (|| {
         let conflict: Merge<Option<Oid>> = crate::store::decode("ref conflict", bytes)?;
-        for term in conflict.adds().chain(conflict.removes()) {
-            if let Some(oid) = term {
-                reject_null_oid(*oid, "ref conflict")?;
-                oid.expect_kind(store.hash_kind(), "ref conflict")?;
-            }
+        for oid in conflict.adds().chain(conflict.removes()).flatten() {
+            reject_null_oid(*oid, "ref conflict")?;
+            oid.expect_kind(store.hash_kind(), "ref conflict")?;
         }
         if conflict.is_resolved() {
             return Err(StoreError::Corrupt(format!(
@@ -304,11 +348,9 @@ pub fn prepare_set_ref_conflict(
     name: &RefName,
     conflict: &Merge<Option<Oid>>,
 ) -> Result<FactMutation, CoreError> {
-    for term in conflict.adds().chain(conflict.removes()) {
-        if let Some(oid) = term {
-            reject_null_oid(*oid, "ref conflict")?;
-            oid.expect_kind(store.hash_kind(), "ref conflict")?;
-        }
+    for oid in conflict.adds().chain(conflict.removes()).flatten() {
+        reject_null_oid(*oid, "ref conflict")?;
+        oid.expect_kind(store.hash_kind(), "ref conflict")?;
     }
     if conflict.is_resolved() {
         return Err(CoreModelError::Invalid {
@@ -654,6 +696,20 @@ pub fn page_reflogs(
     }
 
     Ok(ReflogPage { entries, more })
+}
+
+/// One frozen release tag: the `ReleasedTags` row at key
+/// `refs/tags/<name>`, written when its release publishes and removed on
+/// delete, discard, compensation, or repair. The freeze gate (a later row)
+/// refuses every tag mutation path while a live marker exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleasedTagMarker {
+    /// The release that owns the freeze.
+    pub owner_release_id: String,
+    /// The tag target the freeze pins.
+    pub target_oid: Oid,
+    /// Wall time the freeze was written.
+    pub frozen_at: Timestamp,
 }
 
 /// Every object id named by any reflog record in the store, old and new.

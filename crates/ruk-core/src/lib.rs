@@ -24,6 +24,7 @@ pub mod capability;
 pub mod change;
 pub mod commit;
 pub mod conflict;
+pub mod contained;
 pub mod coord;
 pub mod error;
 mod graph;
@@ -37,9 +38,22 @@ pub mod protocol;
 pub mod records;
 pub mod refdata;
 pub mod refs;
+#[expect(
+    dead_code,
+    reason = "unwired subsystem; consumers land in later changeset rows"
+)]
+#[expect(
+    unreachable_pub,
+    reason = "unwired subsystem; public surface not yet re-exported"
+)]
 mod revset;
 pub mod store;
+pub mod tree;
 mod workcopy;
+#[expect(
+    dead_code,
+    reason = "unwired subsystem; consumers land in later changeset rows"
+)]
 mod workcopy_journal;
 pub mod workspace;
 

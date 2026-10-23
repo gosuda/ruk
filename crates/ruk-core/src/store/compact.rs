@@ -28,9 +28,10 @@ use std::fs::File;
 
 use super::durability;
 use super::metadata::PublicationTxn;
+use super::pinned::{PinnedRoot, segment_rel};
 use super::segment::{self, RecordPayload, SegmentWriter};
 use super::types::{Encoding, ObjectLocation, SegmentManifest};
-use super::{SEGMENTS_DIR, Store, StoreError};
+use super::{Store, StoreError};
 use crate::ids::Oid;
 
 /// What one [`Store::compact`] pass did.
@@ -236,11 +237,7 @@ impl Store {
         let mut backlog = CompactionBacklog::default();
         for manifest in self.observe(self.meta.all_manifests())? {
             if manifest.retired {
-                let path = self
-                    .root
-                    .join(SEGMENTS_DIR)
-                    .join(segment::segment_file_name(manifest.id));
-                if std::fs::metadata(&path).is_ok() {
+                if self.pin.exists(&segment_rel(manifest.id)) {
                     backlog.reclaimable += 1;
                 }
             } else if manifest.sealed && !open.contains(&manifest.id) {
@@ -291,7 +288,6 @@ impl Store {
         if retire.len() < 2 {
             return Ok(stats);
         }
-        let segments_dir = self.root.join(SEGMENTS_DIR);
         let mut staged = Staged {
             target,
             ..Staged::default()
@@ -319,9 +315,9 @@ impl Store {
             return Ok(stats);
         }
         for (oid, location, records_end) in &candidates {
-            let mut alloc = || self.create_segment_file(&segments_dir);
+            let mut alloc = || self.create_segment_file(&self.pin);
             self.copy_object(
-                &segments_dir,
+                &self.pin,
                 &mut staged,
                 &mut alloc,
                 *oid,
@@ -330,7 +326,7 @@ impl Store {
             )?;
         }
 
-        let new_generation = self.swap_segments(&segments_dir, &mut staged, &retire)?;
+        let new_generation = self.swap_segments(&self.pin, &mut staged, &retire)?;
         stats.objects_copied = staged.copied.len();
         stats.bytes_copied = staged.bytes_copied;
         stats.segments_created = staged.segments.len();
@@ -371,7 +367,7 @@ impl Store {
     /// failures are plain I/O errors: nothing committed, writer untouched.
     fn copy_object(
         &self,
-        segments_dir: &std::path::Path,
+        pin: &PinnedRoot,
         staged: &mut Staged,
         alloc: &mut impl FnMut() -> Result<FreshSegment, StoreError>,
         oid: Oid,
@@ -381,8 +377,8 @@ impl Store {
         if staged.copied.contains_key(&oid) {
             return Ok(());
         }
-        let path = segments_dir.join(segment::segment_file_name(location.segment));
-        let opened = File::open(&path).map_err(|err| {
+        let rel = segment_rel(location.segment);
+        let opened = pin.open_read(&rel).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 StoreError::Corrupt(format!(
                     "segment {} file is missing committed bytes of object {oid}",
@@ -406,7 +402,7 @@ impl Store {
         }
         // First pass: verify the checksum and learn the payload-only CRC
         // the fresh framing needs. Second pass streams the verified bytes.
-        let verify = File::open(&path).map_err(StoreError::Io)?;
+        let verify = pin.open_read(&rel).map_err(StoreError::Io)?;
         let payload_crc = RecordPayload::open(verify, location.offset, records_end)
             .and_then(|payload| payload.finish_with_payload_crc())
             .map_err(|err| self.compact_record_error(err, location.segment, &oid))?;
@@ -424,7 +420,7 @@ impl Store {
         let current = staged.current.as_mut().ok_or_else(|| {
             StoreError::Capacity("compaction could not allocate a fresh segment".to_owned())
         })?;
-        let source = File::open(&path).map_err(StoreError::Io)?;
+        let source = pin.open_read(&rel).map_err(StoreError::Io)?;
         let mut payload = RecordPayload::open(source, location.offset, records_end)
             .map_err(|err| self.compact_record_error(err, location.segment, &oid))?;
         let appended = current
@@ -490,12 +486,9 @@ impl Store {
 
     /// Creates one fresh segment file exclusively, advancing past names a
     /// racing publication won. Ids reserve under brief locks.
-    fn create_segment_file(
-        &self,
-        segments_dir: &std::path::Path,
-    ) -> Result<FreshSegment, StoreError> {
+    fn create_segment_file(&self, pin: &PinnedRoot) -> Result<FreshSegment, StoreError> {
         let mut take_id = || self.alloc_segment_id();
-        self.create_segment_file_lockfree(segments_dir, &mut take_id)
+        self.create_segment_file_lockfree(pin, &mut take_id)
     }
 
     /// Reserves one segment id under a brief writer lock.
@@ -517,21 +510,20 @@ impl Store {
     /// skipped orphans stay unknown files recovery ignores.
     fn create_segment_file_lockfree(
         &self,
-        segments_dir: &std::path::Path,
+        pin: &PinnedRoot,
         take_id: &mut impl FnMut() -> Result<u64, StoreError>,
     ) -> Result<FreshSegment, StoreError> {
         loop {
             let id = take_id()?;
-            let path = segments_dir.join(segment::segment_file_name(id));
-            match durability::create_file_published(&path) {
+            match pin.create_new(&segment_rel(id)) {
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(err) => return Err(StoreError::Io(err)),
                 Ok(file) => {
                     let writer = SegmentWriter::fresh(file).map_err(StoreError::from)?;
                     return Ok(FreshSegment { id, writer });
                 }
-                Err(StoreError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    continue;
-                }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -543,7 +535,7 @@ impl Store {
     /// closes the writer, mirroring publication.
     fn swap_segments(
         &self,
-        segments_dir: &std::path::Path,
+        pin: &PinnedRoot,
         staged: &mut Staged,
         retire: &HashSet<u64>,
     ) -> Result<u64, StoreError> {
@@ -552,7 +544,7 @@ impl Store {
         if let Some(reason) = writer.closed.as_ref() {
             return Err(StoreError::WriterClosed(reason.clone()));
         }
-        let outcome = self.swap_inner(segments_dir, staged, retire, &mut writer);
+        let outcome = self.swap_inner(pin, staged, retire, &mut writer);
         match outcome {
             Ok(generation) => Ok(generation),
             Err(err) => {
@@ -570,7 +562,7 @@ impl Store {
     /// here. Fresh ids allocate from the held lock, never re-locking.
     fn swap_inner(
         &self,
-        segments_dir: &std::path::Path,
+        pin: &PinnedRoot,
         staged: &mut Staged,
         retire: &HashSet<u64>,
         writer: &mut super::WriterState,
@@ -595,15 +587,8 @@ impl Store {
                         location.segment
                     ))
                 })?;
-            let mut alloc = || self.create_segment_file_lockfree(segments_dir, &mut take_id);
-            self.copy_object(
-                segments_dir,
-                staged,
-                &mut alloc,
-                oid,
-                &location,
-                stored.records_end,
-            )?;
+            let mut alloc = || self.create_segment_file_lockfree(pin, &mut take_id);
+            self.copy_object(pin, staged, &mut alloc, oid, &location, stored.records_end)?;
         }
         writer.next_segment_id = next_id.max(writer.next_segment_id);
         self.seal_current(staged)?;
@@ -611,7 +596,7 @@ impl Store {
             durability::sync_file(fresh.writer.get_ref())?;
         }
         if !staged.segments.is_empty() {
-            super::sync_entries(segments_dir)?;
+            pin.sync_segments_dir().map_err(StoreError::Io)?;
         }
         let new_generation = self
             .observe(self.meta.generation())?
@@ -688,12 +673,9 @@ impl Store {
             // cannot be removed. Segment ids never repeat, so the evicted
             // entry can never alias a newer segment.
             self.segment_fds.evict(manifest.id);
-            let path = self
-                .root
-                .join(SEGMENTS_DIR)
-                .join(segment::segment_file_name(manifest.id));
-            let len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-            if std::fs::remove_file(&path).is_ok() {
+            let rel = segment_rel(manifest.id);
+            let len = self.pin.metadata(&rel).map(|meta| meta.len()).unwrap_or(0);
+            if self.pin.unlink(&rel).is_ok() {
                 stats.segments_unlinked += 1;
                 stats_add(&mut stats.bytes_freed, len)?;
             }
@@ -753,7 +735,7 @@ mod tests {
     use super::*;
     use crate::ids::HashKind;
     use crate::store::types::ObjectKind;
-    use crate::store::{PreparationBudget, Store};
+    use crate::store::{EventContext, EventSource, PreparationBudget, Store};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -810,7 +792,14 @@ mod tests {
             .prepare(ObjectKind::Blob, len, bytes, None)
             .expect("prepare blob");
         let oid = prepared.oid();
-        store.publish(vec![prepared], &[]).expect("publish blob");
+        store
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish blob");
         oid
     }
 

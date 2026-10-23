@@ -38,7 +38,7 @@ pub(crate) struct Hashed {
 /// What a path held when it was hashed.
 #[derive(Debug)]
 pub(crate) enum Ingested {
-    Hashed(Hashed),
+    Hashed(Box<Hashed>),
     /// It disappeared or became a directory or special file.
     Gone,
 }
@@ -63,13 +63,13 @@ pub(crate) fn ingest(
         };
         match attempt? {
             Attempt::Done(blob, object, stable_stat) => {
-                return Ok(Ingested::Hashed(Hashed {
+                return Ok(Ingested::Hashed(Box::new(Hashed {
                     blob,
-                    object,
+                    object: *object,
                     stat: stable_stat.unwrap_or(current.0),
                     kind: current.1,
                     stable: stable_stat.is_some(),
-                }));
+                })));
             }
             Attempt::Moved => match relstat(&abs)? {
                 Some(next) => current = next,
@@ -89,7 +89,7 @@ pub(crate) fn ingest(
 enum Attempt {
     /// The blob, its prepared object, and the tuple when it held still
     /// (`None`: it moved during the read).
-    Done(Oid, PreparedObject, Option<FileStat>),
+    Done(Oid, Box<PreparedObject>, Option<FileStat>),
     /// The path is no longer the observed entry; observe it again.
     Moved,
 }
@@ -153,7 +153,7 @@ fn hash_file(store: &Store, abs: &Path, observed: FileStat) -> Result<Attempt, C
     let stable = after.is_some_and(|(now, _)| now == before);
     Ok(Attempt::Done(
         object.oid(),
-        object,
+        Box::new(object),
         stable.then_some(before),
     ))
 }
@@ -174,7 +174,7 @@ fn hash_symlink(store: &Store, abs: &Path, observed: FileStat) -> Result<Attempt
     let stable = after.is_some_and(|(now, kind)| kind == EntryKind::Symlink && now == observed);
     Ok(Attempt::Done(
         object.oid(),
-        object,
+        Box::new(object),
         stable.then_some(observed),
     ))
 }

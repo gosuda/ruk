@@ -18,10 +18,10 @@ use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate};
 use ruk_core::refs::prepare_set_ref_conflict;
 use ruk_core::refs::{ReflogKey, ReflogRecord, prepare_append_reflog, prepare_checked_transaction};
-use ruk_core::store::{ObjectKind, PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, PreparationBudget, Store};
 use ruk_core::workspace::HeadRef;
 
-use super::{ExportReport, ExportRequest, export_repository};
+use super::{ExportReport, ExportRequest, LossCategory, export_repository};
 use crate::GitError;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -60,7 +60,14 @@ fn put(store: &Store, kind: ObjectKind, bytes: &[u8]) -> Oid {
     let len = u64::try_from(bytes.len()).unwrap();
     let prepared = store.prepare(kind, len, bytes, None).unwrap();
     let oid = prepared.oid();
-    let publication = store.publish(vec![prepared], &[]).unwrap();
+    let publication = store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .unwrap();
     assert_eq!(publication.objects, vec![oid]);
     oid
 }
@@ -73,7 +80,14 @@ fn set_ref(store: &Store, name: &str, target: RefTarget) {
     };
     let transaction = RefTransaction::new(store.hash_kind(), vec![update]).unwrap();
     let prepared = prepare_checked_transaction(store, &transaction).unwrap();
-    store.publish(Vec::new(), &prepared.mutations).unwrap();
+    store
+        .publish(
+            Vec::new(),
+            &prepared.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .unwrap();
 }
 
 fn commit_bytes(tree: Oid, parents: &[Oid], message: &[u8]) -> Vec<u8> {
@@ -228,7 +242,17 @@ fn round_trip_commit_tree_blob_and_annotated_tag() {
         },
     )
     .unwrap();
-    assert!(report.is_lossless());
+    assert!(report.unexported_refs.is_empty());
+    for loss in &report.losses {
+        if loss.category == LossCategory::OperationLog {
+            assert_eq!(
+                loss.rows, 3,
+                "the two ref writes emit two events plus the head row"
+            );
+        } else {
+            assert_eq!(loss.rows, 0, "no {:?} rows are dropped", loss.category);
+        }
+    }
     assert_eq!(report.pack.objects, 4);
     assert_eq!(report.refs.packed, 2);
     let packed = std::fs::read(target.join("packed-refs")).unwrap();
@@ -265,7 +289,14 @@ fn conflicted_bookmark_is_named_never_exported() {
         ruk_core::merge::Merge::from_removes_adds([Some(other)], [Some(other), Some(built.commit)]);
     let name = RefName::new(b"refs/heads/conflicted" as &[u8]).unwrap();
     let mutation = prepare_set_ref_conflict(&store, &name, &conflict).unwrap();
-    store.publish(Vec::new(), &[mutation]).unwrap();
+    store
+        .publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .unwrap();
 
     let target = scratch.path("out.git");
     let report = export_repository(
@@ -462,7 +493,14 @@ fn reflogs_follow_exported_refs_only() {
     };
     let key = ReflogKey::new(name, OperationId(1), 0);
     let mutation = prepare_append_reflog(&store, &key, &record).unwrap();
-    store.publish(Vec::new(), &[mutation]).unwrap();
+    store
+        .publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .unwrap();
     let target = scratch.path("out.git");
     let report = export_repository(
         &store,

@@ -20,7 +20,7 @@ use ruk_core::conflict::{Signature, TzOffset};
 use ruk_core::ids::HashKind;
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::StoreRefs;
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{EventContext, EventSource, PreparationBudget, Store};
 use ruk_core::workspace::{GitCompatWorkspace, HeadRef, Scope};
 use ruk_git::GitError;
 use ruk_git::import::objects::source_hash_kind;
@@ -112,7 +112,12 @@ pub(crate) fn init(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
         let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(name), Scope::Full);
         let mutation = workspace_mutation(None, &workspace)?;
         store
-            .publish(Vec::new(), &[mutation])
+            .publish(
+                Vec::new(),
+                &[mutation],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     if opts.is_set("quiet") {
@@ -295,7 +300,7 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     })?;
     if StoreRefs::new(&dst_store)
         .get(&head_name)
-        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?
+        .map_err(GitError::from)?
         .is_none()
     {
         return Err(GitError::NotFound {
@@ -305,7 +310,12 @@ pub(crate) fn clone(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     let workspace = GitCompatWorkspace::new(HeadRef::Symbolic(head_name), Scope::Full);
     let mutation = workspace_mutation(None, &workspace)?;
     dst_store
-        .publish(Vec::new(), &[mutation])
+        .publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     config_write(&dst_store, &format!("remote.{origin}.url"), src)?;
     config_write(
@@ -442,7 +452,12 @@ pub(crate) fn migrate(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitErro
     let workspace = GitCompatWorkspace::new(head, Scope::Full);
     let mutation = workspace_mutation(None, &workspace)?;
     store
-        .publish(Vec::new(), &[mutation])
+        .publish(
+            Vec::new(),
+            &[mutation],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     import_remote_config(&git_dir, &store)?;
     let lfs = if lfs_mode == LfsMode::Full {
@@ -538,7 +553,12 @@ fn ingest_lfs_sidecar(
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     Ok(Some((stored, skipped)))
@@ -884,7 +904,7 @@ pub(crate) fn remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError
                     detail: format!("remote {name:?} already exists"),
                 });
             }
-            config_write(store, &format!("remote.{name}.url"), &url)?;
+            config_write(store, &format!("remote.{name}.url"), url)?;
             config_write(
                 store,
                 &format!("remote.{name}.fetch"),
@@ -1018,12 +1038,11 @@ fn list_remote_urls(store: &Store) -> Result<Vec<u8>, GitError> {
 fn all_remote_names(store: &Store) -> Result<Vec<String>, GitError> {
     let mut names = Vec::new();
     for (key, _) in config_list(store)? {
-        if let Some(rest) = key.strip_prefix("remote.") {
-            if let Some((name, _)) = rest.split_once('.') {
-                if !names.contains(&name.to_owned()) {
-                    names.push(name.to_owned());
-                }
-            }
+        if let Some(rest) = key.strip_prefix("remote.")
+            && let Some((name, _)) = rest.split_once('.')
+            && !names.contains(&name.to_owned())
+        {
+            names.push(name.to_owned());
         }
     }
     Ok(names)

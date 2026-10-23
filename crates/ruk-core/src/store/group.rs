@@ -38,7 +38,10 @@ use std::time::Duration;
 use crate::error::ErrorCode;
 use crate::ids::Oid;
 
-use super::{FactMutation, FactTable, PreparedObject, Publication, Store, StoreError, WriterState};
+use super::{
+    EventContext, EventSource, FactMutation, FactTable, PreparedObject, Publication, RefEvent,
+    Store, StoreError, WriterState,
+};
 
 /// Environment variable naming the linger window in milliseconds.
 const LINGER_ENV: &str = "RUK_COMMIT_LINGER_MS";
@@ -84,10 +87,12 @@ impl Ticket {
     }
 }
 
-/// One publication waiting for the writer.
+/// One publication waiting for the writer. `attribution` aligns 1:1 with
+/// `facts`: the source and context each fact commits under.
 pub(super) struct Submission {
     objects: Vec<PreparedObject>,
     facts: Vec<FactMutation>,
+    attribution: Vec<(EventSource, EventContext)>,
     ticket: Arc<Ticket>,
 }
 
@@ -103,11 +108,13 @@ impl Queue {
         &self,
         objects: Vec<PreparedObject>,
         facts: Vec<FactMutation>,
+        attribution: Vec<(EventSource, EventContext)>,
     ) -> Result<Arc<Ticket>, Submission> {
         let ticket = Arc::new(Ticket::default());
         let submission = Submission {
             objects,
             facts,
+            attribution,
             ticket: Arc::clone(&ticket),
         };
         let mut waiting = lock(&self.waiting);
@@ -198,7 +205,7 @@ impl StoreError {
             Self::Corrupt(detail) => Self::Corrupt(detail.clone()),
             Self::NotFound(detail) => Self::NotFound(detail.clone()),
             Self::StaleFact { table, key } => Self::StaleFact {
-                table: *table,
+                table,
                 key: key.clone(),
             },
             Self::WriterClosed(reason) => Self::WriterClosed(reason.clone()),
@@ -220,8 +227,9 @@ impl Store {
         &self,
         objects: Vec<PreparedObject>,
         facts: &[FactMutation],
+        attribution: Vec<(EventSource, EventContext)>,
     ) -> Outcome {
-        let ticket = match self.queue.push(objects, facts.to_vec()) {
+        let ticket = match self.queue.push(objects, facts.to_vec(), attribution) {
             Ok(ticket) => ticket,
             Err(submission) => return self.publish_alone(submission),
         };
@@ -258,7 +266,12 @@ impl Store {
             self.commit_group(&mut writer, group);
         }
         let objects: Vec<&PreparedObject> = submission.objects.iter().collect();
-        self.publish_locked(&mut writer, &objects, &submission.facts)
+        self.publish_locked(
+            &mut writer,
+            &objects,
+            &submission.facts,
+            &submission.attribution,
+        )
     }
 
     /// Commits one group and completes every member's ticket.
@@ -289,11 +302,26 @@ impl Store {
                 .iter()
                 .flat_map(|submission| submission.facts.iter().cloned())
                 .collect();
-            match self.publish_locked(writer, &objects, &facts) {
+            let attribution: Vec<(EventSource, EventContext)> = group
+                .iter()
+                .flat_map(|submission| submission.attribution.iter().cloned())
+                .collect();
+            match self.publish_locked(writer, &objects, &facts, &attribution) {
                 Ok(publication) => {
-                    return group
+                    // Event seqs align with the flattened Refs facts in
+                    // order, so each member takes the prefix matching its
+                    // own Refs fact count.
+                    let mut ref_events = publication.ref_events;
+                    let outcomes: Vec<Outcome> = group
                         .iter()
                         .map(|submission| {
+                            let take = submission
+                                .facts
+                                .iter()
+                                .filter(|fact| fact.table == FactTable::Refs)
+                                .count()
+                                .min(ref_events.len());
+                            let member_events: Vec<RefEvent> = ref_events.drain(..take).collect();
                             Ok(Publication {
                                 objects: submission
                                     .objects
@@ -301,9 +329,15 @@ impl Store {
                                     .map(PreparedObject::oid)
                                     .collect(),
                                 generation: publication.generation,
+                                ref_events: member_events,
                             })
                         })
                         .collect();
+                    debug_assert!(
+                        ref_events.is_empty(),
+                        "event seqs must align with the flattened Refs facts"
+                    );
+                    return outcomes;
                 }
                 Err(err) if writer.closed.is_some() || self.quarantine() => {
                     return group.iter().map(|_| Err(err.replica())).collect();
@@ -316,7 +350,12 @@ impl Store {
         let mut outcomes = Vec::with_capacity(group.len());
         for submission in group {
             let objects: Vec<&PreparedObject> = submission.objects.iter().collect();
-            outcomes.push(self.publish_locked(writer, &objects, &submission.facts));
+            outcomes.push(self.publish_locked(
+                writer,
+                &objects,
+                &submission.facts,
+                &submission.attribution,
+            ));
         }
         outcomes
     }

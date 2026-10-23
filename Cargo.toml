@@ -36,7 +36,7 @@ tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 # Internal typed values (core contract).
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
 redb = { version = "=4.4.0", default-features = false }
-zstd = { version = "=0.14.2", default-features = false }
+zstd = { version = "=0.14.3", default-features = false }
 crc32c = { version = "=0.6.8", default-features = false }
 atomicwrites = { version = "=0.4.4", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
@@ -59,7 +59,7 @@ rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs"
 # TLS with Mozilla roots; no platform glue (native-tls is out of scope).
 # Direct count stays at two: ring arrives transitively via the feature.
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "ring"] }
-webpki-roots = { version = "=1.0.9" }
+webpki-roots = { version = "=1.0.10" }
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading"] }
 ssh-key = { version = "=0.6.7", default-features = false, features = ["ed25519", "std"] }
 roaring = { version = "=0.11.5", default-features = false, features = ["std"] }

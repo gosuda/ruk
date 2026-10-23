@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::bytes::ByteString;
 use crate::change::ChangeId;
 use crate::commit::{NativeCommitInput, Provenance};
-use crate::conflict::{ExtraHeader, Signature};
+use crate::conflict::ExtraHeader;
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
 use crate::ids::Oid;
@@ -18,7 +18,7 @@ use crate::merge::Merge;
 use crate::ops::PreparedOp;
 use crate::records::Records;
 use crate::store::types::ObjectKind;
-use crate::store::{Store, StoreError};
+use crate::store::{EventContext, EventSource, Store, StoreError};
 
 /// Header name carrying the native change ID.
 const CHANGE_ID_HEADER: &[u8] = b"change-id";
@@ -64,7 +64,12 @@ pub struct SplitResult {
 pub fn split(store: &Store, request: SplitRequest) -> Result<SplitResult, CoreError> {
     let prepared = prepare_split(store, request)?;
     store
-        .publish(prepared.objects, &prepared.facts)
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(store_error)?;
     Ok(prepared.output)
 }
@@ -90,13 +95,13 @@ pub fn prepare_split(
             "first commit message contains a NUL byte",
         ));
     }
-    if let Some(msg) = &request.second_message {
-        if msg.as_bytes().contains(&0) {
-            return Err(CoreError::new(
-                ErrorCode::EInvalid,
-                "second commit message contains a NUL byte",
-            ));
-        }
+    if let Some(msg) = &request.second_message
+        && msg.as_bytes().contains(&0)
+    {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "second commit message contains a NUL byte",
+        ));
     }
 
     let records = Records::new(store);
@@ -210,7 +215,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::conflict::TzOffset;
+    use crate::conflict::{Signature, TzOffset};
     use crate::ids::HashKind;
     use crate::ops::{NewRequest, new};
     use crate::store::PreparationBudget;
@@ -251,7 +256,12 @@ mod tests {
                 .expect("prepare tree");
             let oid = prepared.oid();
             self.store
-                .publish(vec![prepared], &[])
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
                 .expect("publish tree");
             oid
         }

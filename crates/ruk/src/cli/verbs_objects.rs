@@ -27,7 +27,7 @@ use ruk_core::heads::Head;
 use ruk_core::index::Stage;
 use ruk_core::records::Records;
 use ruk_core::refdata::RefName;
-use ruk_core::store::{ObjectKind, Store};
+use ruk_core::store::{EventContext, EventSource, ObjectKind, Store};
 use ruk_git::GitError;
 
 use super::state::{IdentityRole, identity, merged_rows, scan_index};
@@ -131,7 +131,14 @@ fn hash_one(ctx: &Ctx, object_type: &str, body: &[u8], write: bool) -> Result<Ve
                     detail: "stored identity disagrees with the hash".to_owned(),
                 });
             }
-            store.publish(vec![prepared], &[]).map_err(GitError::from)?;
+            store
+                .publish(
+                    vec![prepared],
+                    &[],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .map_err(GitError::from)?;
         }
     }
     Ok(line(oid.to_hex().into_bytes()))
@@ -161,7 +168,12 @@ fn store_commit_object(store: &Store, payload: Vec<u8>) -> Result<ruk_core::ids:
         .map_err(GitError::from)?;
     let done = batch.finish().map_err(GitError::from)?;
     store
-        .publish(done.prepared_objects, &done.mutations)
+        .publish(
+            done.prepared_objects,
+            &done.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     Ok(oid)
 }
@@ -872,7 +884,12 @@ pub(crate) fn index_pack(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitE
     }
     let facts = ruk_git::transport::fetch::commit_record_facts(store, &staged)?;
     store
-        .publish(staged.into_objects(), &facts)
+        .publish(
+            staged.into_objects(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .map_err(GitError::from)?;
     out.extend_from_slice(format!("{label}: ok ({count} objects indexed)\n").as_bytes());
     Ok(out)
@@ -1030,7 +1047,7 @@ fn pack_exact_objects(
         }
         payloads.push((oid, object_kind, bytes));
     }
-    payloads.sort_by(|left, right| left.0.cmp(&right.0));
+    payloads.sort_by_key(|left| left.0);
     Ok(payloads)
 }
 
@@ -1175,7 +1192,7 @@ fn pack_closure(
         }
         out.push((oid, object_kind, bytes));
     }
-    out.sort_by(|left, right| left.0.cmp(&right.0));
+    out.sort_by_key(|left| left.0);
     Ok(out)
 }
 

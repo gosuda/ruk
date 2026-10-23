@@ -19,17 +19,18 @@
 //! - a legacy bare `.git` directory served as `repo_dir` (its hooks
 //!   already live at `.git/hooks/`, and Git-format endpoints are refused
 //!   elsewhere, so no special case is needed),
-//! - Forgejo repositories: Forgejo generates dispatcher scripts at exactly
-//!   `<repo>/hooks/<name>` which chain `hooks/<name>.d/*` (including its
-//!   internal `gitea` hook) — see `forgejo/modules/git/hook_generate.go`.
-//!   Executing the top-level script runs the whole chain, so no separate
-//!   `.d` handling exists here.
+//! - Host-managed repositories: the host generates dispatcher scripts at
+//!   exactly `<repo>/hooks/<name>` which chain `hooks/<name>.d/*`
+//!   (including its internal `gitea` hook) — see
+//!   `forgejo/modules/git/hook_generate.go`. Executing the top-level
+//!   script runs the whole chain, so no separate `.d` handling exists
+//!   here.
 //!
 //! Phase semantics mirror `git-receive-pack` (`git/builtin/receive-pack.c`):
 //!
 //! - `pre-receive` reads `<old> <new> <ref>` lines on stdin; a nonzero exit
 //!   refuses the whole push (every live ref reports `ng`).
-//! - `update` takes `<ref> <old> <new>` as argv (this is why Forgejo's own
+//! - `update` takes `<ref> <old> <new>` as argv (this is why the host's own
 //!   `update` dispatcher forwards `$1 $2 $3`); a nonzero exit refuses only
 //!   that ref, and the remaining refs still land.
 //! - `post-receive` reads the landed `<old> <new> <ref>` lines on stdin
@@ -37,13 +38,15 @@
 //!   never fails the push (protocol v0's report has no sideband slot for
 //!   it, so the message goes to server logs instead of the client).
 //!
-//! A missing script is a pass. Hooks inherit the server's environment plus
-//! `GIT_QUARANTINE_PATH`, `GIT_OBJECT_DIRECTORY` (the quarantine
-//! `objects/` dir, so hook `git` commands transparently see staged
-//! objects), `GIT_DIR` (the repository directory), and
-//! `RUK_QUARANTINE_MANIFEST` (the manifest path). Hook stdout is discarded;
-//! hook stderr supplies the refusal message. Every hook runs under
-//! [`HOOK_TIMEOUT`]; expiry kills the hook and refuses fail-closed.
+//! A missing script is a pass. Hooks run hermetic: the inherited
+//! environment clears, leaving exactly `PATH=/usr/bin:/bin`, `GIT_DIR`
+//! (the repository directory), `GIT_QUARANTINE_PATH`,
+//! `GIT_OBJECT_DIRECTORY` (the quarantine `objects/` dir, so hook `git`
+//! commands transparently see staged objects), `RUK_QUARANTINE_MANIFEST`
+//! (the manifest path), and the negotiated `GIT_PUSH_OPTION_*` lines.
+//! Hook stdout is discarded; hook stderr supplies the refusal message.
+//! Every hook runs under [`HOOK_TIMEOUT`]; expiry kills the hook and
+//! refuses fail-closed.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -78,6 +81,12 @@ pub struct ReceiveHooks {
     repo_dir: Option<PathBuf>,
     timeout: Duration,
     quarantine_parent: Option<PathBuf>,
+    proc_receive_prefixes: Vec<String>,
+}
+
+/// The default `proc-receive` diversion prefixes.
+fn default_proc_receive_prefixes() -> Vec<String> {
+    vec!["refs/for".to_owned()]
 }
 
 impl ReceiveHooks {
@@ -88,6 +97,7 @@ impl ReceiveHooks {
             repo_dir: None,
             timeout: HOOK_TIMEOUT,
             quarantine_parent: None,
+            proc_receive_prefixes: default_proc_receive_prefixes(),
         }
     }
 
@@ -99,7 +109,29 @@ impl ReceiveHooks {
             repo_dir: Some(repo_dir),
             timeout: HOOK_TIMEOUT,
             quarantine_parent: None,
+            proc_receive_prefixes: default_proc_receive_prefixes(),
         }
+    }
+
+    /// Overrides which ref prefixes divert to the `proc-receive` hook.
+    /// The default is `["refs/for"]`: `refs/pull/` pushes land as plain
+    /// refs unless a caller opts back in.
+    #[must_use]
+    pub fn with_proc_receive_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.proc_receive_prefixes = prefixes;
+        self
+    }
+
+    /// The configured `proc-receive` diversion prefixes.
+    #[must_use]
+    pub(crate) fn proc_receive_prefixes(&self) -> &[String] {
+        &self.proc_receive_prefixes
+    }
+
+    /// The configured quarantine parent, if any.
+    #[must_use]
+    pub(crate) fn quarantine_parent(&self) -> Option<PathBuf> {
+        self.quarantine_parent.clone()
     }
 
     /// Overrides the per-hook wall-clock budget. A zero timeout falls back
@@ -157,7 +189,7 @@ impl ReceiveHooks {
 /// return (refusal, unpack failure, cancellation) cleans up without a
 /// dedicated call.
 #[derive(Debug)]
-pub(crate) struct Quarantine {
+pub struct Quarantine {
     dir: PathBuf,
 }
 
@@ -188,23 +220,21 @@ impl Drop for Quarantine {
 static QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Materializes `staged` as loose objects plus a manifest under a fresh
-/// per-push directory, or returns `None` when hooks are disabled.
+/// per-push directory below `parent`, or returns `None` without touching
+/// the filesystem when `parent` is `None`. Callers stage only when their
+/// policy needs quarantine.
 ///
 /// The directory is created even with no staged objects (delete-only
 /// pushes still run hooks with `GIT_QUARANTINE_PATH` set, mirroring the
 /// oracle). Total bytes are bounded by the pack ingest limits that already
 /// bounded the staging, so no second quota is enforced here.
 pub(crate) fn stage_quarantine(
-    hooks: &ReceiveHooks,
+    parent: Option<PathBuf>,
     staged: Option<&StagedPack>,
 ) -> Result<Option<Quarantine>, GitError> {
-    if !hooks.enabled() {
+    let Some(parent) = parent else {
         return Ok(None);
-    }
-    let parent: PathBuf = hooks
-        .quarantine_parent
-        .clone()
-        .unwrap_or_else(std::env::temp_dir);
+    };
     let id = QUARANTINE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = parent.join(format!("ruk-quarantine-{}-{id}", std::process::id()));
     let io = |what: &str, err: std::io::Error| GitError::Io {
@@ -320,9 +350,12 @@ pub(crate) fn run_hook(
 ///
 /// One constructor so every phase (`pre-receive`, `update`,
 /// `post-receive`, `proc-receive`) exports identical variables.
-/// `GIT_PUSH_OPTION_COUNT` (plus `GIT_PUSH_OPTION_<i>`) is exported only
-/// when the client negotiated `push-options`, matching the oracle: an
-/// unnegotiated push exports neither the count nor any option.
+/// The environment is hermetic: everything inherited clears first,
+/// then exactly `PATH`, `GIT_DIR`, the quarantine inspection variables,
+/// and the negotiated push options are set. `GIT_PUSH_OPTION_COUNT`
+/// (plus `GIT_PUSH_OPTION_<i>`) is exported only when the client
+/// negotiated `push-options`, matching the oracle: an unnegotiated push
+/// exports neither the count nor any option.
 pub(crate) fn apply_hook_env(
     cmd: &mut Command,
     repo_dir: &Path,
@@ -330,6 +363,8 @@ pub(crate) fn apply_hook_env(
     push_options: &[String],
     negotiated: bool,
 ) {
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/bin");
     if let Some(q) = quarantine {
         cmd.env("GIT_QUARANTINE_PATH", q.dir());
         cmd.env("GIT_OBJECT_DIRECTORY", q.objects_dir());
@@ -367,6 +402,10 @@ const STDERR_GRACE: Duration = Duration::from_secs(5);
 /// channel under [`STDERR_GRACE`]; a reader that never delivers is
 /// abandoned (it exits on its own once every inheritor finally exits) and
 /// the push proceeds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the hook spawn shape: paths, quarantine, args, input, options, and timeout"
+)]
 fn execute(
     path: &Path,
     repo_dir: &Path,

@@ -24,6 +24,7 @@ use crate::store::types::{FactMutation, FactTable, ObjectKind};
 use crate::store::{PreparedObject, Store};
 
 /// A batch of Git commit observations with an in-memory pending overlay.
+#[derive(Debug)]
 pub struct ImportBatch<'a> {
     preparer: RecordBatchPreparer<'a>,
     outcomes: Vec<ImportOutcome>,

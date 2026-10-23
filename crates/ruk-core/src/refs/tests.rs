@@ -11,7 +11,9 @@ use crate::conflict::{Signature, TzOffset};
 use crate::ids::{HashKind, Oid};
 use crate::merge::Merge;
 use crate::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
-use crate::store::{FactExpectation, FactMutation, FactTable, PreparationBudget, Store};
+use crate::store::{
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, PreparationBudget, Store,
+};
 
 struct TestStore {
     root: PathBuf,
@@ -38,7 +40,12 @@ impl TestStore {
 
     fn publish_mutations(&self, facts: &[FactMutation]) {
         self.store
-            .publish(Vec::new(), facts)
+            .publish(
+                Vec::new(),
+                facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("publish test mutations");
     }
 }
@@ -788,4 +795,18 @@ fn test_byte_exact_reflog_recovery_and_bounded_continuation() {
     let huge_key = ReflogKey::new(main.clone(), OperationId(99), 0);
     let err = prepare_append_reflog(store, &huge_key, &huge_record).unwrap_err();
     assert_eq!(err.code, ErrorCode::ELimit);
+}
+
+#[test]
+fn released_tag_marker_round_trips_through_postcard() {
+    use crate::protocol::Timestamp;
+    let marker = ReleasedTagMarker {
+        owner_release_id: "rel-1".to_string(),
+        target_oid: Oid::from_bytes(&[0x11; 20]).expect("tag target"),
+        frozen_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+    };
+    let bytes = crate::store::encode("released_tags", &marker).expect("encode marker");
+    let decoded: ReleasedTagMarker =
+        crate::store::decode("released_tags", &bytes).expect("decode marker");
+    assert_eq!(decoded, marker);
 }

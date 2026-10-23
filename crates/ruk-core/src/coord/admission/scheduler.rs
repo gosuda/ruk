@@ -152,7 +152,7 @@ pub(super) struct Ticket {
 
 impl Ticket {
     pub(super) fn record(&mut self, units: u128) {
-        self.measured = self.measured.checked_add(units).unwrap_or(u128::MAX);
+        self.measured = self.measured.saturating_add(units);
     }
 
     pub(super) fn is_control(&self) -> bool {
@@ -352,6 +352,13 @@ impl Shared {
 
     /// Stops admission and refuses every queued waiter. Granted tickets keep
     /// their permits until they drop.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(super) fn close(&self) {
         let mut core = self.lock();
         if core.closed {
@@ -598,7 +605,7 @@ fn run_visit(
             break;
         };
         class.queued = class.queued.saturating_sub(1);
-        grant(shared, class, repo, key, c, waiter);
+        grant(shared, class, repo, c, waiter);
         outcome.granted = true;
     }
     if repo.queues[c].is_empty() {
@@ -714,7 +721,6 @@ fn grant(
     shared: &Arc<Shared>,
     class: &mut ClassCore,
     repo: &mut RepoCore,
-    key: u64,
     c: usize,
     waiter: Waiter,
 ) {
@@ -824,9 +830,8 @@ fn take_from(queue: &mut VecDeque<Waiter>, id: u64) -> Option<Waiter> {
 fn settle(deficit: i128, ticket: &Ticket) -> i128 {
     let total = ticket
         .measured
-        .checked_add(u128::from(ticket.request_bytes))
-        .unwrap_or(u128::MAX);
-    let overrun = total.checked_sub(u128::from(ticket.predicted)).unwrap_or(0);
+        .saturating_add(u128::from(ticket.request_bytes));
+    let overrun = total.saturating_sub(u128::from(ticket.predicted));
     let overrun = i128::try_from(overrun).unwrap_or(i128::MAX);
     deficit.checked_sub(overrun).unwrap_or(i128::MIN)
 }

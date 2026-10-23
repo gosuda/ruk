@@ -15,7 +15,7 @@ use crate::protocol::{
     AttestRequirement, AttestationRecord, AttestationStatus, PageLimit, SignerFingerprint,
     StatementDigest,
 };
-use crate::store::{FactExpectation, FactMutation, FactTable, Store};
+use crate::store::{EventContext, EventSource, FactExpectation, FactMutation, FactTable, Store};
 
 use super::fixtures::{
     TempStore, apply, digest_of, independent_fingerprint, key, kind, oid, open, public_bytes,
@@ -83,6 +83,7 @@ fn requirement(kind_text: &str, result_text: &str) -> AttestRequirement {
     AttestRequirement {
         kind: kind(kind_text),
         result: result(result_text),
+        valid_until: None,
     }
 }
 
@@ -373,7 +374,12 @@ fn a_prepared_publication_is_refused_when_its_rows_changed_underneath_it() {
 
     let stale = lab
         .store()
-        .publish(Vec::new(), &prepared.mutations)
+        .publish(
+            Vec::new(),
+            &prepared.mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
         .expect_err("the prepared rows are stale");
     assert_eq!(stale.code(), ErrorCode::EStale);
     assert_eq!(
@@ -678,6 +684,8 @@ fn a_stored_row_that_fails_reverification_is_corruption_and_latches_quarantine()
                 expected: FactExpectation::Absent,
                 value: Some(bytes),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("plant the unverifiable row");
 
@@ -811,6 +819,8 @@ fn a_stored_statement_without_its_order_row_is_corruption() {
                 expected: FactExpectation::Absent,
                 value: Some(row),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .expect("plant the statement row without its order row");
 

@@ -24,6 +24,30 @@ struct ClaimRow {
     record: ClaimRecord,
 }
 
+/// Current claim row version: rows carry the acquiring invocation's
+/// provenance.
+const CLAIM_ROW_VERSION: u8 = 2;
+
+/// Pre-provenance claim record: the [`ClaimRecord`] shape before the
+/// trailing `on_behalf_of` field. Decode-only outside tests.
+#[derive(Serialize, Deserialize)]
+struct ClaimRecordV1 {
+    claim: ClaimId,
+    holder: SessionId,
+    paths: Vec<RepoPath>,
+    mode: ClaimMode,
+    expires_at: Timestamp,
+}
+
+/// Pre-provenance claim row: version 1 rows predate provenance.
+/// Decode-only outside tests, for stores written before provenance existed.
+#[derive(Serialize, Deserialize)]
+struct ClaimRowV1 {
+    version: u8,
+    created: Timestamp,
+    record: ClaimRecordV1,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ClockRow {
     version: u8,
@@ -57,6 +81,10 @@ pub(crate) struct ClaimPage {
     pub(crate) next: Option<Vec<u8>>,
 }
 
+#[expect(
+    dead_code,
+    reason = "no caller at this commit; retained for later changeset rows"
+)]
 pub(crate) struct ClaimSweep {
     pub(crate) facts: Vec<FactMutation>,
     pub(crate) next: Option<Vec<u8>>,
@@ -142,6 +170,7 @@ pub(crate) fn seal_acquire(
     holder: SessionId,
     claim: ClaimId,
     args: ClaimAcquireArgs,
+    on_behalf_of: Option<String>,
 ) -> Result<ClaimChange, CoreError> {
     if holder == SessionId::nil() || claim == ClaimId::nil() {
         return Err(CoreError::new(
@@ -164,9 +193,10 @@ pub(crate) fn seal_acquire(
         paths,
         mode: args.mode,
         expires_at: Timestamp::new(expires),
+        on_behalf_of,
     };
     let row = ClaimRow {
-        version: 1,
+        version: CLAIM_ROW_VERSION,
         created: now,
         record,
     };
@@ -474,6 +504,7 @@ pub(crate) fn list_page_raw(
 
 /// Selects one bounded raw-record page. Commit all returned index deletions and
 /// the clock fence together under sole lane ownership.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R42"))]
 pub(crate) fn sweep_page(
     store: &Store,
     clock: &ClaimClock,
@@ -647,8 +678,32 @@ fn read_claim(store: &Store, claim: ClaimId) -> Result<Option<(Vec<u8>, ClaimRow
 }
 
 fn decode_claim(store: &Store, key: &[u8], raw: &[u8]) -> Result<ClaimRow, CoreError> {
-    let row: ClaimRow = store.observe(crate::store::decode("claim", raw))?;
-    if row.version != 1
+    let shaped: Result<ClaimRow, _> = crate::store::decode("claim", raw);
+    let row: ClaimRow = match shaped {
+        Ok(row) if row.version == CLAIM_ROW_VERSION => row,
+        _ => {
+            let old: ClaimRowV1 = match crate::store::decode("claim", raw) {
+                Ok(old) => old,
+                Err(_) => return Err(corrupt(store, "invalid claim record")),
+            };
+            if old.version != 1 {
+                return Err(corrupt(store, "invalid claim record"));
+            }
+            ClaimRow {
+                version: CLAIM_ROW_VERSION,
+                created: old.created,
+                record: ClaimRecord {
+                    claim: old.record.claim,
+                    holder: old.record.holder,
+                    paths: old.record.paths,
+                    mode: old.record.mode,
+                    expires_at: old.record.expires_at,
+                    on_behalf_of: None,
+                },
+            }
+        }
+    };
+    if row.version != CLAIM_ROW_VERSION
         || key != record_key(row.record.claim)
         || row.record.claim == ClaimId::nil()
         || row.record.holder == SessionId::nil()
@@ -732,6 +787,9 @@ pub(crate) enum ClaimSealKind {
     Release,
 }
 
+/// Lane publication parts from a settled claim seal.
+type SettledSealParts = (Vec<FactMutation>, BoundedList<Warning>, Option<ClaimRecord>);
+
 /// One seal envelope per lane mutation.
 ///
 /// The lane builds the envelope before mutation with
@@ -743,6 +801,10 @@ pub(crate) enum ClaimSealKind {
 #[derive(Debug)]
 pub(crate) struct ClaimSealEnvelope {
     /// Which seal function produced this envelope.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) kind: ClaimSealKind,
     /// Facts the lane publishes with the operation on settle.
     pub(crate) facts: Vec<FactMutation>,
@@ -795,8 +857,9 @@ impl ClaimSealEnvelope {
         holder: SessionId,
         claim: ClaimId,
         args: ClaimAcquireArgs,
+        on_behalf_of: Option<String>,
     ) -> Result<Self, CoreError> {
-        let change = seal_acquire(store, clock, holder, claim, args)?;
+        let change = seal_acquire(store, clock, holder, claim, args, on_behalf_of)?;
         Ok(Self {
             kind: ClaimSealKind::Acquire,
             facts: change.facts,
@@ -874,6 +937,7 @@ impl ClaimSealEnvelope {
         holder: SessionId,
         request: &crate::protocol::Request,
         prepared_claim: Option<ClaimId>,
+        on_behalf_of: Option<String>,
     ) -> Result<Self, CoreError> {
         match request {
             crate::protocol::Request::ClaimAcquire(inner) => Self::for_acquire(
@@ -882,6 +946,7 @@ impl ClaimSealEnvelope {
                 holder,
                 prepared_claim.unwrap_or_else(ClaimId::generate),
                 inner.args.clone(),
+                on_behalf_of,
             ),
             crate::protocol::Request::ClaimRelease(inner) => {
                 Self::for_release(store, clock, holder, inner.args.claim)
@@ -898,7 +963,7 @@ impl ClaimSealEnvelope {
     /// The lane publishes the facts atomically with the operation and reports
     /// the warnings and the changed record on the reply.
     #[must_use]
-    pub(crate) fn settle(self) -> (Vec<FactMutation>, BoundedList<Warning>, Option<ClaimRecord>) {
+    pub(crate) fn settle(self) -> SettledSealParts {
         let Self {
             facts,
             warnings,
@@ -912,6 +977,10 @@ impl ClaimSealEnvelope {
     ///
     /// Dropping the envelope aborts the same way; this spelling names the
     /// abort at the lane failure site.
+    #[expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )]
     pub(crate) fn abort(self) {}
 }
 
@@ -921,6 +990,13 @@ impl ClaimSealEnvelope {
 /// publishes on success, while [`ClaimSealGuard::abort`] and [`Drop`] discard
 /// on failure, so a seal never survives its operation either way.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) struct ClaimSealGuard {
     /// The held envelope until settle or abort.
     envelope: Option<ClaimSealEnvelope>,
@@ -929,6 +1005,13 @@ pub(crate) struct ClaimSealGuard {
 impl ClaimSealGuard {
     /// Holds `envelope` until settle or abort.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn new(envelope: ClaimSealEnvelope) -> Self {
         Self {
             envelope: Some(envelope),
@@ -940,9 +1023,14 @@ impl ClaimSealGuard {
     /// # Errors
     /// `E_INVALID` when the guard no longer holds its envelope; construction
     /// plus the consuming signatures make that unreachable in the lane.
-    pub(crate) fn settle(
-        mut self,
-    ) -> Result<(Vec<FactMutation>, BoundedList<Warning>, Option<ClaimRecord>), CoreError> {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
+    pub(crate) fn settle(mut self) -> Result<SettledSealParts, CoreError> {
         match self.envelope.take() {
             Some(envelope) => Ok(envelope.settle()),
             None => Err(CoreError::new(
@@ -956,12 +1044,26 @@ impl ClaimSealGuard {
     ///
     /// Dropping the guard aborts the same way; this spelling names the abort
     /// at the lane failure site.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn abort(mut self) {
         let _ = self.envelope.take();
     }
 
     /// Borrows the held envelope, when still held.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
     pub(crate) fn envelope(&self) -> Option<&ClaimSealEnvelope> {
         self.envelope.as_ref()
     }
@@ -1039,6 +1141,13 @@ pub(crate) fn authorize_claim_list_args(
 /// # Errors
 /// `E_FORBIDDEN` for another session's provenance without
 /// `read_intents.provenance`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller at this commit; retained for later changeset rows"
+    )
+)]
 pub(crate) fn authorize_provenance_read(
     caps: &crate::capability::Capabilities,
     viewer: SessionId,
@@ -1124,14 +1233,11 @@ pub(crate) fn next_claim_cursor(
     cursor: &crate::protocol::PageCursor,
     next: Option<Vec<u8>>,
 ) -> Option<crate::protocol::PageCursor> {
-    match next {
-        Some(position) => Some(crate::protocol::PageCursor {
-            store: cursor.store,
-            view: cursor.view,
-            query: cursor.query,
-            lease: cursor.lease,
-            position: crate::ByteString::from(position),
-        }),
-        None => None,
-    }
+    next.map(|position| crate::protocol::PageCursor {
+        store: cursor.store,
+        view: cursor.view,
+        query: cursor.query,
+        lease: cursor.lease,
+        position: crate::ByteString::from(position),
+    })
 }

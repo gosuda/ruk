@@ -28,6 +28,7 @@ use crate::store::types::{FactExpectation, FactMutation, FactTable, ObjectKind};
 use crate::store::{PreparedObject, Store};
 
 /// Tracks pending state of a change entry within a batch.
+#[derive(Debug)]
 pub(crate) struct PendingChange {
     pub(crate) initial_bytes: Option<Vec<u8>>,
     pub(crate) current_entry: ChangeEntry,
@@ -35,12 +36,14 @@ pub(crate) struct PendingChange {
 }
 
 /// Tracks pending state of an imported OID -> ChangeId mapping.
+#[derive(Debug)]
 pub(crate) struct PendingImported {
     pub(crate) change_id: ChangeId,
     pub(crate) is_new: bool,
 }
 
 /// In-memory overlay batch preparer for record mutations.
+#[derive(Debug)]
 pub struct RecordBatchPreparer<'a> {
     pub(crate) store: &'a Store,
     pub(crate) prepared_objects: Vec<PreparedObject>,
@@ -502,7 +505,7 @@ mod tests {
     use crate::ids::HashKind;
     use crate::merge::Merge;
     use crate::records::Records;
-    use crate::store::PreparationBudget;
+    use crate::store::{EventContext, EventSource, PreparationBudget};
 
     fn sample_signature(name: &str, stamp: i64) -> Signature {
         Signature {
@@ -568,7 +571,12 @@ mod tests {
 
         let batch = preparer.finish().expect("finish batch");
         store
-            .publish(batch.prepared_objects, &batch.mutations)
+            .publish(
+                batch.prepared_objects,
+                &batch.mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .expect("atomic publish");
 
         let rec_1 = records

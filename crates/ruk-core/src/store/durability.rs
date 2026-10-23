@@ -33,7 +33,7 @@
 //! - [`create_dir_all_synced`] returns only after the whole chain is durable.
 //!   First the deepest existing directory is canonicalized, and it and every
 //!   ancestor up to the mount root of its filesystem are synced. No existing
-//!   directory is trusted: another creator (a Ruk process, or Forgejo's
+//!   directory is trusted: another creator (a Ruk process, or a host's
 //!   `MkdirAll`) may have made it visible without syncing it. Then the
 //!   missing components are created top-down, each synced together with its
 //!   parent before any child is created in it. A lost `mkdir` race is
@@ -574,7 +574,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    pub fn sync_dir_makes_namespace_changes_durable_api() {
+    fn sync_dir_makes_namespace_changes_durable_api() {
         let root = temp_root("syncdir");
         let gone = root.join("missing.bin");
         let file = File::create(&gone).expect("create file");

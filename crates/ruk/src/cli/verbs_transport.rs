@@ -29,7 +29,9 @@ use ruk_core::change::PlanId;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefRead, RefTarget, RefUpdate};
 use ruk_core::refs::{StoreRefs, all_reflog_oids};
-use ruk_core::store::{FactExpectation, FactMutation, FactTable, ObjectKind, Store};
+use ruk_core::store::{
+    EventContext, EventSource, FactExpectation, FactMutation, FactTable, ObjectKind, Store,
+};
 use ruk_core::{LfsMode, mode_for_store};
 use ruk_git::GitError;
 use ruk_git::transport::archive::serve_upload_archive;
@@ -188,7 +190,7 @@ fn resolve_target(ctx: &Ctx, target: &str) -> Result<Target, GitError> {
 /// The source side of one fetch: a local store or a network endpoint.
 enum FetchSource {
     /// A local source store.
-    Local(Store),
+    Local(Box<Store>),
     /// A network endpoint (refs discover over a separate connection).
     Net(Endpoint),
     /// A smart-http base plus its upload-pack advertisement: discovery
@@ -254,36 +256,35 @@ fn extra_header_scope(name: &str) -> Option<Option<String>> {
 fn http_extra_headers(ctx: &Ctx, url: &str) -> Vec<(String, String)> {
     use ruk_git::transport::{credentials, http};
     let mut rows = credentials::http_extra_header_rows();
-    if let Ok(store) = ctx.store() {
-        if let Ok(pairs) = super::state::config_list(store) {
-            let mut scoped = Vec::new();
-            let mut unscoped = None;
-            for (name, value) in &pairs {
-                match extra_header_scope(name) {
-                    Some(None) => unscoped = Some(value.clone()),
-                    Some(Some(scope)) => scoped.push((scope, value.clone())),
-                    None => {}
-                }
+    if let Ok(store) = ctx.store()
+        && let Ok(pairs) = super::state::config_list(store)
+    {
+        let mut scoped = Vec::new();
+        let mut unscoped = None;
+        for (name, value) in &pairs {
+            match extra_header_scope(name) {
+                Some(None) => unscoped = Some(value.clone()),
+                Some(Some(scope)) => scoped.push((scope, value.clone())),
+                None => {}
             }
-            if let Some(value) = unscoped {
-                rows.push(http::ExtraHeaderRow { scope: None, value });
-            }
-            scoped.sort();
-            for (scope, value) in scoped {
-                rows.push(http::ExtraHeaderRow {
-                    scope: Some(scope),
-                    value,
-                });
-            }
+        }
+        if let Some(value) = unscoped {
+            rows.push(http::ExtraHeaderRow { scope: None, value });
+        }
+        scoped.sort();
+        for (scope, value) in scoped {
+            rows.push(http::ExtraHeaderRow {
+                scope: Some(scope),
+                value,
+            });
         }
     }
     for (key, value) in &ctx.cli_config {
-        match extra_header_scope(key) {
-            Some(scope) => rows.push(http::ExtraHeaderRow {
+        if let Some(scope) = extra_header_scope(key) {
+            rows.push(http::ExtraHeaderRow {
                 scope,
                 value: value.clone(),
-            }),
-            None => {}
+            })
         }
     }
     http::extra_headers_for_url(url, &rows)
@@ -320,7 +321,7 @@ pub(crate) fn run_fetch(
                 });
             }
             let advertised = advertise(&src)?;
-            (FetchSource::Local(src), advertised)
+            (FetchSource::Local(Box::new(src)), advertised)
         }
         Target::Net(endpoint) => match endpoint {
             Endpoint::Http { url, .. } => {
@@ -459,22 +460,21 @@ pub(crate) fn run_fetch(
         let oid = fetched.oid;
         let name = &fetched.name;
         let target = &fetched.target;
-        let current = dest_refs
-            .get(name)
-            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
-        if !plan.force_all && !fetched.force {
-            if let Some(old) = current_as_direct(&current) {
-                // Runs after phase one publishes, so the new tip's ancestry
-                // resolves from committed state. A lookup failure still
-                // aborts the fetch: only a proven non-ancestor refuses the
-                // ref, and the published objects stay either way.
-                if !is_ancestor(dest, old, oid)? {
-                    lines.push(format!(
-                        "! rejected {} (non-fast-forward)\n",
-                        name.to_utf8().unwrap_or_default()
-                    ));
-                    continue;
-                }
+        let current = dest_refs.get(name).map_err(GitError::from)?;
+        if !plan.force_all
+            && !fetched.force
+            && let Some(old) = current_as_direct(&current)
+        {
+            // Runs after phase one publishes, so the new tip's ancestry
+            // resolves from committed state. A lookup failure still
+            // aborts the fetch: only a proven non-ancestor refuses the
+            // ref, and the published objects stay either way.
+            if !is_ancestor(dest, old, oid)? {
+                lines.push(format!(
+                    "! rejected {} (non-fast-forward)\n",
+                    name.to_utf8().unwrap_or_default()
+                ));
+                continue;
             }
         }
         let expected = current.map(RefExpect::Present).unwrap_or(RefExpect::Absent);
@@ -491,9 +491,7 @@ pub(crate) fn run_fetch(
         ));
     }
     for name in &pruned {
-        let current = dest_refs
-            .get(name)
-            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+        let current = dest_refs.get(name).map_err(GitError::from)?;
         let Some(RefTarget::Direct(oid)) = current else {
             continue;
         };
@@ -533,7 +531,12 @@ pub(crate) fn run_fetch(
         // Ref updates only: the objects published in phase one stay even
         // when every update below is a prune delete or a refusal left no
         // updates at all.
-        dest.publish(Vec::new(), &ref_mutations)?;
+        dest.publish(
+            Vec::new(),
+            &ref_mutations,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )?;
     }
     let mut out = lines.concat().into_bytes();
     out.extend_from_slice(&write_fetch_head(ctx, &pairs)?);
@@ -963,15 +966,15 @@ fn expand_glob(
         let name = RefName::new(mapped).map_err(|err| GitError::Invalid {
             detail: format!("mapped ref refused: {err}"),
         })?;
-        if let RefTarget::Direct(oid) = &entry.target {
-            if entry.name.starts_with(b"refs/heads/") || entry.name.starts_with(b"refs/tags/") {
-                out.push(FetchedRef {
-                    oid: *oid,
-                    name,
-                    target: entry.target.clone(),
-                    force: spec.force,
-                });
-            }
+        if let RefTarget::Direct(oid) = &entry.target
+            && (entry.name.starts_with(b"refs/heads/") || entry.name.starts_with(b"refs/tags/"))
+        {
+            out.push(FetchedRef {
+                oid: *oid,
+                name,
+                target: entry.target.clone(),
+                force: spec.force,
+            });
         }
     }
     Ok(out)
@@ -990,19 +993,18 @@ fn resolve_advertised(
         format!("refs/tags/{src}"),
     ];
     for guess in &guesses {
-        match advertised
+        if let Some(entry) = advertised
             .iter()
             .find(|entry| String::from_utf8_lossy(&entry.name) == *guess)
         {
-            Some(entry) => match &entry.target {
+            match &entry.target {
                 RefTarget::Direct(oid) => return Ok((*oid, entry.target.clone())),
                 RefTarget::Symbolic(_) => {
                     return Err(GitError::Invalid {
                         detail: format!("cannot fetch unborn ref {src:?}"),
                     });
                 }
-            },
-            None => {}
+            }
         }
     }
     Oid::from_hex(src)
@@ -1030,11 +1032,7 @@ fn dwell_dest(store: &Store, text: &str) -> Result<RefName, GitError> {
         let name = RefName::new(candidate).map_err(|err| GitError::Invalid {
             detail: format!("bad destination ref: {err}"),
         })?;
-        if reader
-            .get(&name)
-            .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?
-            .is_some()
-        {
+        if reader.get(&name).map_err(GitError::from)?.is_some() {
             return Ok(name);
         }
     }
@@ -1127,6 +1125,8 @@ fn write_fetch_head(ctx: &Ctx, pairs: &[FetchedRef]) -> Result<Vec<u8>, GitError
                 expected,
                 value: Some(text.into_bytes()),
             }],
+            EventSource::LocalPush,
+            &EventContext::default(),
         )
         .map_err(GitError::from)?;
     Ok(Vec::new())
@@ -1523,7 +1523,7 @@ fn push_net(
             push_outcomes(ruk_git::transport::smart_http::push_pack(
                 base,
                 adv,
-                &store,
+                store,
                 &mut plan,
                 &request,
                 &Interrupt::none(),
@@ -1628,7 +1628,7 @@ fn mirror_push_updates(
 ) -> Vec<PushUpdate> {
     let zero = kind.zero_oid();
     let mut updates = Vec::new();
-    for mirror_update in push_mirror_updates(&local, &remote) {
+    for mirror_update in push_mirror_updates(local, remote) {
         updates.push(PushUpdate {
             name: mirror_update.name,
             old: mirror_update.old.unwrap_or(zero),
@@ -1677,9 +1677,7 @@ fn push_outcomes(outcomes: Vec<ruk_git::transport::push::RefOutcome>) -> Result<
 
 /// Reads the direct oid behind one destination ref, if it exists.
 fn peel_dest_oid(dest: &Store, name: &RefName) -> Result<Option<Oid>, GitError> {
-    let target = StoreRefs::new(dest)
-        .get(name)
-        .map_err(|err| GitError::from(ruk_core::error::CoreError::from(err)))?;
+    let target = StoreRefs::new(dest).get(name).map_err(GitError::from)?;
     match target {
         None => Ok(None),
         Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
@@ -1838,7 +1836,7 @@ enum ServeStore<'a> {
     /// The context store, borrowed.
     Open(&'a Store),
     /// A store opened from `<dir>` for this invocation.
-    Owned(Store),
+    Owned(Box<Store>),
 }
 
 impl std::ops::Deref for ServeStore<'_> {
@@ -1880,9 +1878,9 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
     if let Some(dir) = positionals.first() {
         let path = std::path::Path::new(dir);
         return match open_store_at(path) {
-            Ok(store) => Ok(ServeStore::Owned(store)),
+            Ok(store) => Ok(ServeStore::Owned(Box::new(store))),
             Err(first) => match open_local_store(path) {
-                Ok(store) => Ok(ServeStore::Owned(store)),
+                Ok(store) => Ok(ServeStore::Owned(Box::new(store))),
                 Err(_) => Err(first),
             },
         };
@@ -1895,7 +1893,7 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
     let mut dir = ctx.root.as_path();
     loop {
         if let Ok(store) = open_store_at(dir) {
-            return Ok(ServeStore::Owned(store));
+            return Ok(ServeStore::Owned(Box::new(store)));
         }
         match dir.parent() {
             Some(parent) => dir = parent,
@@ -1915,7 +1913,7 @@ fn serve_store<'a>(ctx: &'a Ctx, args: &[String]) -> Result<ServeStore<'a>, GitE
 /// link, as every other reader does. A dangling, cyclic, or over-deep chain
 /// advertises the zero OID. A store read failure is not unborn: it propagates,
 /// so a corrupt store never serves a false HEAD.
-fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
+pub(crate) fn serve_head(store: &Store) -> Result<HeadAdvertisement, GitError> {
     let (workspace, _) = load_or_default(store)?;
     match workspace.head.resolve(&StoreRefs::new(store)) {
         Ok(ruk_core::workspace::ResolvedHead::Detached(oid)) => {
@@ -3167,10 +3165,10 @@ pub(crate) fn fsck(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
             // oid (a tree through a tag, a blob, a tree itself): the
             // terminal is reachable, and a terminal tree walks its subtree.
             None => {
-                if let Some(&terminal) = visited.last() {
-                    if super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree {
-                        mark_tree(store, kind, terminal, &mut reachable)?;
-                    }
+                if let Some(&terminal) = visited.last()
+                    && super::tree::read_object_bytes(store, terminal)?.0 == ObjectKind::Tree
+                {
+                    mark_tree(store, kind, terminal, &mut reachable)?;
                 }
             }
         }
@@ -3420,7 +3418,12 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
     }
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     let mut out = String::from("{\"synced\": [");
@@ -3691,7 +3694,12 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
     )?;
     if !mutations.is_empty() {
         store
-            .publish(Vec::new(), &mutations)
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
             .map_err(GitError::from)?;
     }
     for (hex, error) in &missing {
@@ -3699,6 +3707,9 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
     }
     Ok(())
 }
+
+/// Outgoing LFS payloads by hex: already on the server, still to upload.
+type LfsObjectLists = (Vec<(String, u64)>, Vec<(String, u64)>);
 
 /// Uploads LFS payloads for one push's outgoing range: the `push --lfs`
 /// half of push-mirror sync. Scans the same wants-minus-haves closure the
@@ -3727,7 +3738,7 @@ fn push_lfs_upload(
     // entries carry canonical bytes, so pointer parsing needs no second
     // object read. Deletes carry nothing; an all-delete push uploads
     // nothing.
-    let (present, pending): (Vec<(String, u64)>, Vec<(String, u64)>) = {
+    let (present, pending): LfsObjectLists = {
         let store = ctx.store()?;
         if mode_for_store(store.root()) != LfsMode::Full {
             return Ok(());
@@ -4021,7 +4032,7 @@ fn sync_via_batch_upload_at(
                 let mut put_headers: Vec<(String, String)> = action_headers.clone();
                 if put_headers
                     .iter()
-                    .all(|(name, _)| name.to_ascii_lowercase() != "content-type")
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
                 {
                     put_headers.push((
                         "Content-Type".to_owned(),
@@ -4277,20 +4288,19 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                             // never print the row twice.
                             let file_names_head =
                                 adv.refs.iter().any(|entry| entry.name == b"HEAD");
-                            if !file_names_head {
-                                if let Some(pointed) =
+                            if !file_names_head
+                                && let Some(pointed) =
                                     ruk_git::transport::dumb_http::fetch_head_symref(
                                         &base,
                                         &extra_headers,
                                     )?
-                                {
-                                    refs.push(AdvertisedRef {
-                                        name: b"HEAD".to_vec(),
-                                        oid: None,
-                                        peeled: None,
-                                        symref_target: Some(pointed.into_bytes()),
-                                    });
-                                }
+                            {
+                                refs.push(AdvertisedRef {
+                                    name: b"HEAD".to_vec(),
+                                    oid: None,
+                                    peeled: None,
+                                    symref_target: Some(pointed.into_bytes()),
+                                });
                             }
                             refs.extend(adv.refs);
                             refs
@@ -4548,7 +4558,7 @@ mod archive_rewrap_tests {
     #[test]
     fn rewrap_prefix_tracks_pax_records() {
         // No slash: unsplittable, so the `x` path record carries the name.
-        let sub_path: Vec<u8> = core::iter::repeat(b'n').take(120).collect();
+        let sub_path: Vec<u8> = std::iter::repeat_n(b'n', 120).collect();
         let record = ext_record_bytes("path", &sub_path);
         let mut tar = member_bytes(b"h.paxheader", b'x', &record);
         tar.extend_from_slice(&raw_member(&sub_path[..100], b'0', b"data\n"));
@@ -4565,9 +4575,9 @@ mod archive_rewrap_tests {
     #[test]
     fn rewrap_unsplittable_rename_gains_a_pax_header() {
         // Splits (slash at 150) but not after the prefix moves it to 155.
-        let mut name = core::iter::repeat(b'a').take(150).collect::<Vec<u8>>();
+        let mut name = std::iter::repeat_n(b'a', 150).collect::<Vec<u8>>();
         name.push(b'/');
-        name.extend_from_slice(&core::iter::repeat(b'b').take(40).collect::<Vec<u8>>());
+        name.extend_from_slice(&std::iter::repeat_n(b'b', 40).collect::<Vec<u8>>());
         let tar = tar_of(&[(name.as_slice(), b'0', b"deep\n")]);
         let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
         let members = logical(&out);
