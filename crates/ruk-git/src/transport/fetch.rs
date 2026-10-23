@@ -30,6 +30,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 
+use ruk_core::ErrorCode;
 use ruk_core::ids::{HashKind, Oid};
 use ruk_core::refdata::{RefChange, RefExpect, RefName, RefTarget, RefUpdate};
 use ruk_core::store::types::ObjectKind;
@@ -481,7 +482,7 @@ pub(crate) fn verify_closure_in_scope(
         filter,
         shallow: scope.server_shallow.iter().copied().collect(),
         roots: scope.roots.iter().copied().collect(),
-        present: HashMap::new(),
+        kinds: HashMap::new(),
         missing_promisor: Vec::new(),
         missing_set: HashSet::new(),
         queue: VecDeque::new(),
@@ -511,13 +512,26 @@ pub(crate) fn verify_closure_in_scope(
     })
 }
 
-/// Every direct object id a ref in `store` currently names.
+fn commit_direct_tip(store: &Store, target: &RefTarget) -> Result<Option<Oid>, GitError> {
+    let RefTarget::Direct(oid) = target else {
+        return Ok(None);
+    };
+    match store.read(*oid) {
+        Ok(read) if read.kind == ObjectKind::Commit => Ok(Some(*oid)),
+        Ok(_) => Ok(None),
+        Err(err) if err.code() == ErrorCode::ENotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Every direct commit object id a ref in `store` currently names.
 ///
 /// These are the destination's existing ref tips: each became visible in one
 /// atomic publication with the objects justifying it, so a receive may treat
 /// them as closure roots instead of re-walking history that has already
 /// passed closure verification. Symbolic refs carry no object of their own
-/// and are skipped; the ref they point at is a row of its own.
+/// and are skipped; the ref they point at is a row of its own. Non-commit
+/// direct targets (such as tags to blobs or trees) are omitted.
 ///
 /// # Errors
 /// Store failures and corrupt ref rows.
@@ -527,8 +541,8 @@ pub(crate) fn existing_ref_tips(store: &Store) -> Result<Vec<Oid>, GitError> {
     loop {
         let page = ruk_core::refs::page_refs(store, after.as_deref(), 1000)?;
         for entry in &page.entries {
-            if let RefTarget::Direct(oid) = &entry.target {
-                tips.push(*oid);
+            if let Some(tip) = commit_direct_tip(store, &entry.target)? {
+                tips.push(tip);
             }
         }
         if !page.more {
@@ -552,7 +566,7 @@ struct Verifier<'a> {
     filter: Option<Filter>,
     shallow: HashSet<Oid>,
     roots: HashSet<Oid>,
-    present: HashMap<Oid, bool>,
+    kinds: HashMap<Oid, Option<ObjectKind>>,
     missing_promisor: Vec<Oid>,
     missing_set: HashSet<Oid>,
     queue: VecDeque<(Oid, ObjectKind)>,
@@ -560,16 +574,24 @@ struct Verifier<'a> {
 }
 
 impl Verifier<'_> {
-    fn available(&mut self, oid: Oid) -> Result<bool, GitError> {
-        if self.staged.contains(oid) {
-            return Ok(true);
+    fn object_kind(&mut self, oid: Oid) -> Result<Option<ObjectKind>, GitError> {
+        if let Some((kind, _)) = self.staged.payload(oid) {
+            return Ok(Some(kind));
         }
-        if let Some(hit) = self.present.get(&oid) {
+        if let Some(hit) = self.kinds.get(&oid) {
             return Ok(*hit);
         }
-        let present = has_object(self.store, oid)?;
-        self.present.insert(oid, present);
-        Ok(present)
+        let kind = match self.store.read(oid) {
+            Ok(read) => Some(read.kind),
+            Err(err) if err.code() == ErrorCode::ENotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        self.kinds.insert(oid, kind);
+        Ok(kind)
+    }
+
+    fn available(&mut self, oid: Oid) -> Result<bool, GitError> {
+        Ok(self.object_kind(oid)?.is_some())
     }
 
     fn bytes(&self, oid: Oid) -> Result<Vec<u8>, GitError> {
@@ -585,6 +607,11 @@ impl Verifier<'_> {
             self.interrupt.check("verifying the fetch closure")?;
             if !visited.insert(oid) {
                 continue;
+            }
+            if self.object_kind(oid)? != Some(kind) {
+                return Err(GitError::Corrupt {
+                    detail: format!("fetch object {oid} kind mismatch, expected {kind:?}"),
+                });
             }
             let bytes = self.bytes(oid)?;
             let links = object_links(kind, &bytes, self.store.hash_kind())?;
@@ -610,10 +637,11 @@ impl Verifier<'_> {
         for (link, link_kind, is_parent) in need {
             self.interrupt.check("verifying the fetch closure")?;
             if self.available(link)? {
-                // An existing ref tip is a closure root: its ancestry was
-                // verified when the ref landed, so stop here instead of
-                // re-reading verified history on every receive.
-                if !(is_parent && link_kind == ObjectKind::Commit && self.roots.contains(&link)) {
+                let is_root_commit = is_parent
+                    && link_kind == ObjectKind::Commit
+                    && self.roots.contains(&link)
+                    && self.object_kind(link)? == Some(ObjectKind::Commit);
+                if !is_root_commit {
                     self.queue.push_back((link, link_kind));
                 }
                 continue;
@@ -1461,6 +1489,84 @@ mod tests {
             walked, 3,
             "verification should only probe the existing root and shared tree"
         );
+    }
+
+    #[test]
+    fn commit_claiming_existing_blob_ref_as_parent_is_refused() {
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+        let tree = empty_tree(kind);
+        let (base, base_bytes) = commit_object(kind, tree, None, "base");
+        let blob_bytes = b"existing blob data";
+        let blob = kind
+            .hash_git_object("blob", blob_bytes)
+            .expect("blob object id");
+        publish_objects(
+            &store,
+            vec![
+                (tree, ObjectKind::Tree, Vec::new()),
+                (base, ObjectKind::Commit, base_bytes),
+                (blob, ObjectKind::Blob, blob_bytes.to_vec()),
+            ],
+        );
+        set_ref(&store, kind, b"refs/heads/main", base);
+        set_ref(&store, kind, b"refs/tags/blob-tag", blob);
+
+        let roots = existing_ref_tips(&store).expect("ref tips");
+        assert_eq!(roots, vec![base]);
+
+        let (bad_commit, bad_commit_bytes) =
+            commit_object(kind, tree, Some(blob), "claims blob as parent");
+        let staged = stage_objects(
+            &store,
+            vec![(bad_commit, ObjectKind::Commit, bad_commit_bytes)],
+        );
+        let scope = ClosureScope {
+            roots: &roots,
+            server_shallow: &[],
+        };
+        let err = verify_closure_in_scope(
+            &store,
+            &staged,
+            &[bad_commit],
+            scope,
+            None,
+            &Interrupt::none(),
+        )
+        .expect_err("commit claiming blob as parent must fail");
+        assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
+
+        let scope_with_blob_root = ClosureScope {
+            roots: &[blob],
+            server_shallow: &[],
+        };
+        let err = verify_closure_in_scope(
+            &store,
+            &staged,
+            &[bad_commit],
+            scope_with_blob_root,
+            None,
+            &Interrupt::none(),
+        )
+        .expect_err("shortcut must not bypass traversal when root is a blob");
+        assert!(matches!(err, GitError::Corrupt { .. }), "got {err:?}");
+
+        let (good_commit, good_commit_bytes) =
+            commit_object(kind, tree, Some(base), "valid commit parent");
+        let staged = stage_objects(
+            &store,
+            vec![(good_commit, ObjectKind::Commit, good_commit_bytes)],
+        );
+        let report = verify_closure_in_scope(
+            &store,
+            &staged,
+            &[good_commit],
+            scope,
+            None,
+            &Interrupt::none(),
+        )
+        .expect("commit-parented normal fetch still passes");
+        assert_eq!(report.wanted, vec![good_commit]);
     }
 }
 

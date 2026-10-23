@@ -125,7 +125,7 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
         depth,
         fetch_tags: opts.is_set("tags"),
         prune: opts.is_set("prune"),
-        auth,
+        auth: auth.clone(),
     };
     let (out, tips) = run_fetch(ctx, &remote_label, &spec_texts, plan)?;
     // Mirror LFS sync, after the refs moved: walks the newly-arrived tips
@@ -133,7 +133,7 @@ pub(crate) fn fetch(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
     // batch endpoint. Absence (no endpoint, non-`Full` policy) is silent;
     // per-object misses go to stderr; only a refused batch document fails.
     if want_lfs && !tips.is_empty() {
-        mirror_lfs_sync(ctx, &remote_label, &tips)?;
+        mirror_lfs_sync(ctx, &remote_label, &tips, &auth)?;
     }
     Ok(out)
 }
@@ -1491,7 +1491,7 @@ pub(crate) fn push(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError> 
                 super::verbs_hooks::run_pre_push(ctx, &remote_label, &url, &lines)?;
             }
             if flags.want_lfs {
-                push_lfs_upload(ctx, &updates, &remote_label)?;
+                push_lfs_upload(ctx, &updates, &remote_label, &flags.auth)?;
             }
             let store = ctx.store()?;
             let mut outcomes = push_local(store, &dest, target, kind, &flags, updates)?;
@@ -1727,7 +1727,7 @@ fn push_net(
     // LFS payloads ride the batch API, never the pack: upload the outgoing
     // range's verified payloads before the first pack byte moves.
     if flags.want_lfs {
-        push_lfs_upload(ctx, &updates, remote_label)?;
+        push_lfs_upload(ctx, &updates, remote_label, &flags.auth)?;
     }
     let store = ctx.store()?;
     let request = PushWireRequest {
@@ -1828,7 +1828,7 @@ fn push_mirror(
         return Ok(Vec::new());
     }
     if flags.want_lfs {
-        push_lfs_upload(ctx, &updates, remote_label)?;
+        push_lfs_upload(ctx, &updates, remote_label, &flags.auth)?;
     }
     let store = ctx.store()?;
     let request = PushWireRequest {
@@ -3400,22 +3400,27 @@ pub(crate) fn lfs_payload_sync(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>
                 }
             }
         }
-        None if !upload => sync_via_batch(
-            ctx,
-            store,
-            &pending,
-            &mut synced,
-            &mut missing,
-            &mut mutations,
-        )?,
+        None if !upload => {
+            let auth = AuthPolicy::ambient_in(ctx.env.vars.clone());
+            sync_via_batch(
+                ctx,
+                store,
+                &pending,
+                &mut synced,
+                &mut missing,
+                &mut mutations,
+                &auth,
+            )?;
+        }
         // `--upload` reads the sidecar, never `--from` (refused above):
         // offer every locally verified payload to the remote, reporting
         // pointers with no local bytes as missing.
         None => {
+            let auth = AuthPolicy::ambient_in(ctx.env.vars.clone());
             for (hex, _) in &pending {
                 missing.push((hex.clone(), "no local payload to upload".to_owned()));
             }
-            sync_via_batch_upload(ctx, store, &present, &mut uploaded, &mut missing)?;
+            sync_via_batch_upload(ctx, store, &present, &mut uploaded, &mut missing, &auth)?;
         }
     }
     if !mutations.is_empty() {
@@ -3478,6 +3483,13 @@ fn json_escape(text: &str) -> String {
     out
 }
 
+fn lfs_auth_header(url: &str, auth: &AuthPolicy) -> Option<(String, String)> {
+    match auth {
+        AuthPolicy::Explicit { auth } => auth.header_for(url),
+        AuthPolicy::Ambient { vars } => ruk_git::transport::http::auth_header(vars),
+    }
+}
+
 /// Downloads `pending` payloads through the git-lfs batch API at the
 /// configured endpoint (`lfs.url`, falling back to
 /// `remote.origin.lfsurl`): one `objects/batch` POST for the download
@@ -3497,6 +3509,7 @@ fn sync_via_batch(
     synced: &mut Vec<String>,
     missing: &mut Vec<(String, String)>,
     mutations: &mut Vec<FactMutation>,
+    auth: &AuthPolicy,
 ) -> Result<(), GitError> {
     let Some(endpoint) = ctx
         .config_get("lfs.url")
@@ -3513,7 +3526,29 @@ fn sync_via_batch(
     if pending.is_empty() {
         return Ok(());
     }
-    sync_via_batch_at(ctx, store, &endpoint, pending, synced, missing, mutations)
+    sync_via_batch_at(BatchDownload {
+        ctx,
+        store,
+        endpoint: &endpoint,
+        pending,
+        synced,
+        missing,
+        mutations,
+        auth,
+    })
+}
+
+/// One git-lfs batch download: the endpoint and authentication policy it
+/// runs under, the payloads it wants, and the out-vectors it fills.
+struct BatchDownload<'a> {
+    ctx: &'a Ctx,
+    store: &'a Store,
+    endpoint: &'a str,
+    pending: &'a [(String, u64)],
+    synced: &'a mut Vec<String>,
+    missing: &'a mut Vec<(String, String)>,
+    mutations: &'a mut Vec<FactMutation>,
+    auth: &'a AuthPolicy,
 }
 
 /// Downloads `pending` payloads through the git-lfs batch API at an
@@ -3524,17 +3559,19 @@ fn sync_via_batch(
 /// [`GitError::Invalid`] for a malformed endpoint or batch request,
 /// [`GitError::Offline`] when the batch endpoint refuses, plus transport
 /// failures from the HTTP client.
-fn sync_via_batch_at(
-    ctx: &Ctx,
-    store: &Store,
-    endpoint: &str,
-    pending: &[(String, u64)],
-    synced: &mut Vec<String>,
-    missing: &mut Vec<(String, String)>,
-    mutations: &mut Vec<FactMutation>,
-) -> Result<(), GitError> {
+fn sync_via_batch_at(call: BatchDownload<'_>) -> Result<(), GitError> {
     use ruk_core::store::lfs as sidecar;
     use ruk_git::transport::http::{self, BatchEntry};
+    let BatchDownload {
+        ctx,
+        store,
+        endpoint,
+        pending,
+        synced,
+        missing,
+        mutations,
+        auth,
+    } = call;
 
     let batch_url = format!("{}/objects/batch", endpoint.trim_end_matches('/'));
     let tls_roots = tls_roots_for(ctx)?;
@@ -3543,8 +3580,8 @@ fn sync_via_batch_at(
         ("Content-Type".to_owned(), http::LFS_JSON.to_owned()),
         ("Accept".to_owned(), http::LFS_JSON.to_owned()),
     ];
-    if let Some(auth) = http::auth_header(&ctx.env.vars) {
-        headers.push(auth);
+    if let Some(auth_hdr) = lfs_auth_header(&batch_url, auth) {
+        headers.push(auth_hdr);
     }
     let borrowed: Vec<(&str, &str)> = headers
         .iter()
@@ -3594,10 +3631,10 @@ fn sync_via_batch_at(
                 ..
             }) => {
                 let mut get_headers: Vec<(String, String)> = action_headers.clone();
-                if let Some(auth) = http::auth_header(&ctx.env.vars)
-                    && http::same_origin(&batch_url, href).unwrap_or(false)
+                if http::same_origin(&batch_url, href).unwrap_or(false)
+                    && let Some(auth_hdr) = lfs_auth_header(href, auth)
                 {
-                    get_headers.push(auth);
+                    get_headers.push(auth_hdr);
                 }
                 let tmp = tmp_dir.join(format!("dl-{hex}.{}", std::process::id()));
                 let target = TransferTarget {
@@ -3643,7 +3680,12 @@ fn sync_via_batch_at(
 /// [`GitError::Invalid`] for a malformed endpoint or batch request,
 /// [`GitError::Offline`] when the batch endpoint refuses, plus transport
 /// failures from the HTTP client.
-fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<(), GitError> {
+fn mirror_lfs_sync(
+    ctx: &mut Ctx,
+    remote_label: &str,
+    tips: &[Oid],
+    auth: &AuthPolicy,
+) -> Result<(), GitError> {
     use ruk_core::store::lfs as sidecar;
 
     let store = ctx.store()?;
@@ -3698,15 +3740,16 @@ fn mirror_lfs_sync(ctx: &mut Ctx, remote_label: &str, tips: &[Oid]) -> Result<()
     let mut synced = Vec::new();
     let mut missing: Vec<(String, String)> = Vec::new();
     let mut mutations = Vec::new();
-    sync_via_batch_at(
+    sync_via_batch_at(BatchDownload {
         ctx,
         store,
-        &endpoint,
-        &pending,
-        &mut synced,
-        &mut missing,
-        &mut mutations,
-    )?;
+        endpoint: &endpoint,
+        pending: &pending,
+        synced: &mut synced,
+        missing: &mut missing,
+        mutations: &mut mutations,
+        auth,
+    })?;
     if !mutations.is_empty() {
         store
             .publish(
@@ -3746,6 +3789,7 @@ fn push_lfs_upload(
     ctx: &mut Ctx,
     updates: &[PushUpdate],
     remote_label: &str,
+    auth: &AuthPolicy,
 ) -> Result<(), GitError> {
     use ruk_core::store::lfs as sidecar;
 
@@ -3805,7 +3849,15 @@ fn push_lfs_upload(
     let mut uploaded = Vec::new();
     {
         let store = ctx.store()?;
-        sync_via_batch_upload_at(ctx, store, &endpoint, &present, &mut uploaded, &mut missing)?;
+        sync_via_batch_upload_at(
+            ctx,
+            store,
+            &endpoint,
+            &present,
+            &mut uploaded,
+            &mut missing,
+            auth,
+        )?;
     }
     for (hex, error) in &missing {
         ctx.emit_stderr(format!("lfs: {hex} missing ({error})\n").as_bytes());
@@ -3956,6 +4008,7 @@ fn sync_via_batch_upload(
     present: &[(String, u64)],
     uploaded: &mut Vec<String>,
     missing: &mut Vec<(String, String)>,
+    auth: &AuthPolicy,
 ) -> Result<(), GitError> {
     if present.is_empty() {
         return Ok(());
@@ -3972,7 +4025,7 @@ fn sync_via_batch_upload(
         }
         return Ok(());
     };
-    sync_via_batch_upload_at(ctx, store, &endpoint, present, uploaded, missing)
+    sync_via_batch_upload_at(ctx, store, &endpoint, present, uploaded, missing, auth)
 }
 
 /// Uploads `present` payloads through the git-lfs batch API at an explicit
@@ -3990,6 +4043,7 @@ fn sync_via_batch_upload_at(
     present: &[(String, u64)],
     uploaded: &mut Vec<String>,
     missing: &mut Vec<(String, String)>,
+    auth: &AuthPolicy,
 ) -> Result<(), GitError> {
     use ruk_git::transport::http::{self, UploadEntry};
 
@@ -4003,8 +4057,8 @@ fn sync_via_batch_upload_at(
         ("Content-Type".to_owned(), http::LFS_JSON.to_owned()),
         ("Accept".to_owned(), http::LFS_JSON.to_owned()),
     ];
-    if let Some(auth) = http::auth_header(&ctx.env.vars) {
-        headers.push(auth);
+    if let Some(auth_hdr) = lfs_auth_header(&batch_url, auth) {
+        headers.push(auth_hdr);
     }
     let borrowed: Vec<(&str, &str)> = headers
         .iter()
@@ -4061,10 +4115,10 @@ fn sync_via_batch_upload_at(
                         "application/octet-stream".to_owned(),
                     ));
                 }
-                if let Some(auth) = http::auth_header(&ctx.env.vars)
-                    && http::same_origin(&batch_url, href).unwrap_or(false)
+                if http::same_origin(&batch_url, href).unwrap_or(false)
+                    && let Some(auth_hdr) = lfs_auth_header(href, auth)
                 {
-                    put_headers.push(auth);
+                    put_headers.push(auth_hdr);
                 }
                 let target = TransferTarget {
                     href,
@@ -4744,5 +4798,98 @@ mod archive_rewrap_tests {
         let mut target = Vec::new();
         link.read_to_end(&mut target).expect("target");
         assert_eq!(target, b"f.txt");
+    }
+}
+
+#[cfg(test)]
+mod lfs_auth_tests {
+    use super::*;
+    use ruk_git::transport::credentials::{TransportAuth, TransportAuthKind};
+    use std::collections::HashMap;
+
+    #[test]
+    fn explicit_policy_yields_header_on_matching_origin() {
+        let auth = TransportAuth {
+            origin: "https://git.example.com:443".to_owned(),
+            kind: TransportAuthKind::Bearer,
+            credential: "secret-token".to_owned(),
+        };
+        let policy = AuthPolicy::explicit(auth);
+        assert_eq!(
+            lfs_auth_header(
+                "https://git.example.com/repo.git/info/lfs/objects/batch",
+                &policy
+            ),
+            Some(("authorization".to_owned(), "Bearer secret-token".to_owned()))
+        );
+    }
+
+    #[test]
+    fn explicit_policy_fails_closed_on_origin_mismatch() {
+        let auth = TransportAuth {
+            origin: "https://git.example.com:443".to_owned(),
+            kind: TransportAuthKind::Bearer,
+            credential: "secret-token".to_owned(),
+        };
+        let policy = AuthPolicy::explicit(auth);
+        assert_eq!(
+            lfs_auth_header(
+                "https://other.example.com/repo.git/info/lfs/objects/batch",
+                &policy
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_policy_ignores_ambient_env_credentials() {
+        let auth = TransportAuth {
+            origin: "https://git.example.com:443".to_owned(),
+            kind: TransportAuthKind::Bearer,
+            credential: "injected-token".to_owned(),
+        };
+        let policy = AuthPolicy::explicit(auth);
+        assert_eq!(
+            lfs_auth_header(
+                "https://git.example.com/repo.git/info/lfs/objects/batch",
+                &policy
+            ),
+            Some((
+                "authorization".to_owned(),
+                "Bearer injected-token".to_owned()
+            ))
+        );
+        assert_eq!(
+            lfs_auth_header("https://s3.amazonaws.com/bucket/object", &policy),
+            None
+        );
+    }
+
+    #[test]
+    fn ambient_policy_reads_env_vars() {
+        let vars = HashMap::from([("GIT_LFS_AUTH_BEARER".to_owned(), "ambient-token".to_owned())]);
+        let policy = AuthPolicy::ambient_in(vars);
+        assert_eq!(
+            lfs_auth_header(
+                "https://git.example.com/repo.git/info/lfs/objects/batch",
+                &policy
+            ),
+            Some((
+                "authorization".to_owned(),
+                "Bearer ambient-token".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn ambient_policy_without_credentials_yields_none() {
+        let policy = AuthPolicy::ambient_in(HashMap::new());
+        assert_eq!(
+            lfs_auth_header(
+                "https://git.example.com/repo.git/info/lfs/objects/batch",
+                &policy
+            ),
+            None
+        );
     }
 }

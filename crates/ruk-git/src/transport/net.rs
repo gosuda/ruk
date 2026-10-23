@@ -437,16 +437,19 @@ fn remote_command(service: Service, path: &str) -> String {
 
 /// One SSH spawn: where to dial and what to run there.
 ///
-/// The pinned path dials a filtered literal IP (`login` carries
-/// `user@<ip>`) while `host_key_alias` roots host-key verification at the
-/// original hostname via `-o HostKeyAlias=`. The unpinned path leaves the
-/// alias empty and keeps the legacy argv shape exactly, so existing
-/// `GIT_SSH_COMMAND` scripts keep their positional arguments.
+/// The pinned path preserves the original hostname in `login` for
+/// SSH config matching while passing `-o Hostname=<ip>` to pin the
+/// connection and `-o HostKeyAlias=<host>` for host-key verification. The
+/// unpinned path leaves the alias empty and keeps the legacy argv shape
+/// exactly, so existing `GIT_SSH_COMMAND` scripts keep their positional
+/// arguments.
 struct SshDial<'a> {
-    /// Destination login: `user@host`, or `user@<pinned IP>` when pinned.
+    /// Destination login: `user@host` or `host`.
     login: String,
     /// Original hostname for `-o HostKeyAlias=`, set only when pinned.
     host_key_alias: Option<&'a str>,
+    /// Pinned destination IP for `-o Hostname=`, set only when pinned.
+    pinned_ip: Option<IpAddr>,
     /// Explicit `-p` port, if any.
     port: Option<u16>,
     /// Service to run on the far end.
@@ -461,16 +464,18 @@ impl<'a> SshDial<'a> {
         Self {
             login,
             host_key_alias: None,
+            pinned_ip: None,
             port,
             service,
             path,
         }
     }
 
-    /// Pinned dial: literal-IP destination with hostname trust preserved.
+    /// Pinned dial: preserves the hostname while pinning destination IP.
     fn pinned(
         login: String,
         host: &'a str,
+        pinned_ip: IpAddr,
         port: Option<u16>,
         service: Service,
         path: &'a str,
@@ -478,6 +483,7 @@ impl<'a> SshDial<'a> {
         Self {
             login,
             host_key_alias: Some(host),
+            pinned_ip: Some(pinned_ip),
             port,
             service,
             path,
@@ -487,8 +493,8 @@ impl<'a> SshDial<'a> {
 
 /// How to spawn the SSH connection: a program plus argv, or a shell line
 /// when `GIT_SSH_COMMAND` overrides the program (`git/connect.c`). A
-/// pinned dial adds `-o HostKeyAlias=<hostname>` ahead of the literal-IP
-/// destination; an unpinned dial keeps the legacy shape exactly.
+/// pinned dial adds `-o HostKeyAlias=<hostname>` and `-o Hostname=<ip>`
+/// ahead of the destination; an unpinned dial keeps the legacy shape exactly.
 fn ssh_invocation(
     dial: &SshDial<'_>,
     ssh_program: &str,
@@ -505,6 +511,10 @@ fn ssh_invocation(
                 line.push_str(" -o ");
                 line.push_str(&shell_quote(&format!("HostKeyAlias={alias}")));
             }
+            if let Some(ip) = dial.pinned_ip {
+                line.push_str(" -o ");
+                line.push_str(&shell_quote(&format!("Hostname={ip}")));
+            }
             line.push(' ');
             line.push_str(&shell_quote(&dial.login));
             line.push(' ');
@@ -520,6 +530,10 @@ fn ssh_invocation(
             if let Some(alias) = dial.host_key_alias {
                 argv.push("-o".to_owned());
                 argv.push(format!("HostKeyAlias={alias}"));
+            }
+            if let Some(ip) = dial.pinned_ip {
+                argv.push("-o".to_owned());
+                argv.push(format!("Hostname={ip}"));
             }
             argv.push(dial.login.clone());
             argv.push(remote);
@@ -744,10 +758,9 @@ fn ssh_spawn(
     })
 }
 
-/// Builds one pinned dial for a filtered address: the literal IP is the
-/// destination so the child never re-resolves the hostname onto an address
-/// the egress policy refused, while the hostname rides along for
-/// `HostKeyAlias`.
+/// Builds one pinned dial for a filtered address: the destination retains the
+/// original hostname for SSH config matching while `-o Hostname=` connects
+/// directly to the filtered IP and `-o HostKeyAlias=` verifies the host key.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for a dash-led user.
@@ -760,8 +773,9 @@ fn pinned_dial<'a>(
     path: &'a str,
 ) -> Result<SshDial<'a>, GitError> {
     Ok(SshDial::pinned(
-        ssh_login(&addr.ip().to_string(), user)?,
+        ssh_login(host, user)?,
         host,
+        addr.ip(),
         port,
         service,
         path,
@@ -921,10 +935,10 @@ impl Write for Stream {
 /// Smart-http never opens a duplex stream: its stateless request/response
 /// pairs run through [`super::smart_http`], so an HTTP endpoint here is
 /// an internal routing error, not a gap. The policy gates git-daemon
-/// dials and filters the resolved SSH addresses before spawning. SSH dials
-/// only those filtered addresses as literal IPs (the child never
-/// re-resolves the hostname) while `HostKeyAlias` keeps host-key
-/// verification rooted at the hostname.
+/// dials and filters the resolved SSH addresses before spawning. SSH pins
+/// only to those filtered addresses via `-o Hostname=` (the child never
+/// re-resolves the hostname) while keeping the original hostname for
+/// config selection and host-key verification.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
@@ -951,11 +965,6 @@ pub fn open_stream(
             let label = format!("ssh://{host}:{effective}");
             let resolved = resolve_addrs(&label, host, effective)?;
             let allowed = policy.filter_addrs(&label, &resolved)?;
-            // Pin the child onto the filtered addresses: handing `host`
-            // through would let ssh re-resolve it and dial an address the
-            // policy just refused. The literal IP is the destination while
-            // `HostKeyAlias` keeps host-key verification rooted at `host`;
-            // tries in order like the git-daemon dial below.
             let ssh_program = std::env::var("GIT_SSH").unwrap_or_else(|_| "ssh".to_owned());
             let ssh_command = std::env::var("GIT_SSH_COMMAND").ok();
             Ok(Stream::Ssh(ssh_dial_each(&label, &allowed, |addr| {
@@ -1387,13 +1396,12 @@ mod tests {
 
     #[test]
     fn ssh_pinned_invocation_pins_ip_with_host_key_alias() {
-        // Pinned dial: the destination is the literal filtered IP while
-        // `HostKeyAlias` roots host-key verification at the hostname.
         assert_eq!(
             ssh_invocation(
                 &SshDial::pinned(
-                    "git@93.184.216.34".to_owned(),
+                    "git@example.com".to_owned(),
                     "example.com",
+                    "93.184.216.34".parse().expect("ip"),
                     Some(2222),
                     Service::UploadPack,
                     "/srv/a.git",
@@ -1407,15 +1415,18 @@ mod tests {
                 "2222".to_owned(),
                 "-o".to_owned(),
                 "HostKeyAlias=example.com".to_owned(),
-                "git@93.184.216.34".to_owned(),
+                "-o".to_owned(),
+                "Hostname=93.184.216.34".to_owned(),
+                "git@example.com".to_owned(),
                 "git-upload-pack '/srv/a.git'".to_owned(),
             ])
         );
         assert_eq!(
             ssh_invocation(
                 &SshDial::pinned(
-                    "git@93.184.216.34".to_owned(),
+                    "git@example.com".to_owned(),
                     "example.com",
+                    "93.184.216.34".parse().expect("ip"),
                     None,
                     Service::ReceivePack,
                     "a.git",
@@ -1424,7 +1435,7 @@ mod tests {
                 Some("ssh -i key"),
             ),
             SshInvocation::Shell(
-                "ssh -i key -o 'HostKeyAlias=example.com' 'git@93.184.216.34' 'git-receive-pack '\\''a.git'\\'''"
+                "ssh -i key -o 'HostKeyAlias=example.com' -o 'Hostname=93.184.216.34' 'git@example.com' 'git-receive-pack '\\''a.git'\\'''"
                     .to_owned()
             )
         );
@@ -1472,9 +1483,6 @@ mod tests {
 
     #[test]
     fn ssh_pinned_spawn_dials_ip_with_host_key_alias() {
-        // End of the seam: the spawned ssh argv carries the literal
-        // filtered IP as the destination, with `HostKeyAlias` preserving
-        // the original hostname for host-key verification.
         let dir = std::env::temp_dir().join(format!(
             "ruk-net-pin-{}-{}",
             std::process::id(),
@@ -1511,7 +1519,7 @@ mod tests {
             "/srv/a.git",
         )
         .expect("pinned dial");
-        assert_eq!(dial.login, "git@93.184.216.34");
+        assert_eq!(dial.login, "git@example.com");
         let stream = ssh_spawn(&dial, script.to_str().expect("utf8"), None).expect("spawn");
         drop(stream);
         let lines: Vec<String> = std::fs::read_to_string(&seen)
@@ -1524,11 +1532,63 @@ mod tests {
             vec![
                 "-o".to_owned(),
                 "HostKeyAlias=example.com".to_owned(),
-                "git@93.184.216.34".to_owned(),
+                "-o".to_owned(),
+                "Hostname=93.184.216.34".to_owned(),
+                "git@example.com".to_owned(),
                 "git-upload-pack '/srv/a.git'".to_owned(),
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_pinned_preserves_hostname_for_ssh_config_matching() {
+        let addr_v4: SocketAddr = "192.0.2.1:22".parse().expect("addr v4");
+        let dial_v4 = pinned_dial(
+            &addr_v4,
+            "forge.example",
+            Some(22),
+            Some("git"),
+            Service::UploadPack,
+            "/org/repo.git",
+        )
+        .expect("pinned dial v4");
+        assert_eq!(dial_v4.login, "git@forge.example");
+        let invocation_exec = ssh_invocation(&dial_v4, "ssh", None);
+        assert_eq!(
+            invocation_exec,
+            SshInvocation::Exec(vec![
+                "ssh".to_owned(),
+                "-p".to_owned(),
+                "22".to_owned(),
+                "-o".to_owned(),
+                "HostKeyAlias=forge.example".to_owned(),
+                "-o".to_owned(),
+                "Hostname=192.0.2.1".to_owned(),
+                "git@forge.example".to_owned(),
+                "git-upload-pack '/org/repo.git'".to_owned(),
+            ])
+        );
+
+        let addr_v6: SocketAddr = "[2001:db8::1]:2222".parse().expect("addr v6");
+        let dial_v6 = pinned_dial(
+            &addr_v6,
+            "forge.example",
+            None,
+            None,
+            Service::ReceivePack,
+            "/org/repo.git",
+        )
+        .expect("pinned dial v6");
+        assert_eq!(dial_v6.login, "forge.example");
+        let invocation_shell = ssh_invocation(&dial_v6, "ssh", Some("ssh -v"));
+        assert_eq!(
+            invocation_shell,
+            SshInvocation::Shell(
+                "ssh -v -o 'HostKeyAlias=forge.example' -o 'Hostname=2001:db8::1' 'forge.example' 'git-receive-pack '\\''/org/repo.git'\\'''"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

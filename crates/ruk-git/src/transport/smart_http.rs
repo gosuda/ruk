@@ -210,12 +210,17 @@ pub fn policy_headers(
 ) -> Vec<(String, String)> {
     match auth {
         credentials::AuthPolicy::Explicit { auth } => {
-            let mut out: Vec<(String, String)> = extra_headers.to_vec();
-            out.extend(
-                extra
-                    .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
-            );
+            let mut out = Vec::with_capacity(extra_headers.len() + extra.len() + 1);
+            for (name, value) in extra_headers {
+                if !name.eq_ignore_ascii_case("authorization") {
+                    out.push((name.clone(), value.clone()));
+                }
+            }
+            for (name, value) in extra {
+                if !name.eq_ignore_ascii_case("authorization") {
+                    out.push(((*name).to_owned(), (*value).to_owned()));
+                }
+            }
             if let Some(header) = auth.header_for(url) {
                 out.push(header);
             }
@@ -1395,6 +1400,56 @@ mod tests {
                 "Basic YWxpY2U6czNjcmV0".to_owned()
             )]
         );
+    }
+
+    #[test]
+    fn policy_headers_explicit_filters_authorization() {
+        let matching_url = "https://example.com/repo.git";
+        let non_matching_url = "https://other.com/repo.git";
+        let origin = credentials::TransportAuth::origin_of(matching_url).expect("origin");
+        let explicit_auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: "injected-token".to_owned(),
+            origin,
+        });
+        let extra_headers = vec![
+            ("Authorization".to_owned(), "Basic ambient".to_owned()),
+            ("X-Custom-Header".to_owned(), "custom-val".to_owned()),
+        ];
+        let extra = &[("Accept", "*/*"), ("authorization", "extra-auth")];
+
+        let matched = policy_headers(matching_url, &explicit_auth, extra, &extra_headers);
+        let auth_headers: Vec<&(String, String)> = matched
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .collect();
+        assert_eq!(
+            auth_headers,
+            vec![&(
+                "authorization".to_owned(),
+                "Bearer injected-token".to_owned()
+            )]
+        );
+        assert!(matched.contains(&("X-Custom-Header".to_owned(), "custom-val".to_owned())));
+        assert!(matched.contains(&("Accept".to_owned(), "*/*".to_owned())));
+
+        let non_matched = policy_headers(non_matching_url, &explicit_auth, extra, &extra_headers);
+        let non_matched_auth: Vec<&(String, String)> = non_matched
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .collect();
+        assert!(non_matched_auth.is_empty());
+        assert!(non_matched.contains(&("X-Custom-Header".to_owned(), "custom-val".to_owned())));
+        assert!(non_matched.contains(&("Accept".to_owned(), "*/*".to_owned())));
+
+        let ambient_auth = credentials::AuthPolicy::Ambient {
+            vars: HashMap::new(),
+        };
+        let ambient = policy_headers(matching_url, &ambient_auth, extra, &extra_headers);
+        assert!(ambient.contains(&("Authorization".to_owned(), "Basic ambient".to_owned())));
+        assert!(ambient.contains(&("authorization".to_owned(), "extra-auth".to_owned())));
+        assert!(ambient.contains(&("X-Custom-Header".to_owned(), "custom-val".to_owned())));
+        assert!(ambient.contains(&("Accept".to_owned(), "*/*".to_owned())));
     }
 
     #[test]
