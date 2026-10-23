@@ -11,7 +11,7 @@ pub(crate) use super::windows::ensure_local_storage;
 #[cfg(unix)]
 pub(crate) use unix::{connect, ensure_local_storage};
 #[cfg(windows)]
-pub(crate) use windows::{WindowsEndpoint as Endpoint, connect};
+pub(crate) use windows::connect;
 
 #[cfg(unix)]
 pub(crate) type Incoming = tokio::net::UnixStream;

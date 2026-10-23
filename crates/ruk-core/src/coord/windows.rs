@@ -31,45 +31,42 @@ use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{
-    AsHandle, AsRawHandle, FromRawHandle, HandleOrInvalid, OwnedHandle, RawHandle,
-};
-use std::path::{Component, Path, PathBuf, Prefix};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, HandleOrInvalid, OwnedHandle, RawHandle};
+use std::path::{Component, Path, Prefix};
 
 use windows_sys::Win32::Foundation::{
-    BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_CANNOT_IMPERSONATE,
-    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION,
-    ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NO_DATA, ERROR_NO_TOKEN,
-    ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GetLastError,
-    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WIN32_ERROR,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_FUNCTION, ERROR_LOCK_VIOLATION, ERROR_NO_TOKEN, ERROR_NOT_SUPPORTED,
+    ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    LocalFree, WIN32_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    DACL_SECURITY_INFORMATION, GetSecurityInfo, OWNER_SECURITY_INFORMATION, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-    AclSizeInformation, CONTAINER_INHERIT_ACE, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
     GetSecurityDescriptorControl, GetTokenInformation, INHERIT_ONLY_ACE, IsValidAcl, IsValidSid,
-    NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
-    SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL,
-    TOKEN_ACCESS_MASK, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    PSID, RevertToSelf, SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_ACCESS_MASK,
+    TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, DRIVE_REMOTE, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_FIRST_PIPE_INSTANCE,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_DISK, GENERIC_READ, GENERIC_WRITE, GetDiskFreeSpaceExW,
-    GetDriveTypeW, GetFileInformationByHandle, GetFileType, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT, UnlockFileEx,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_TYPE_DISK, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetFileType,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING,
+    UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
 };
+use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+use windows_sys::core::BOOL;
 
 use crate::StoreId;
 use crate::error::{CoreError, ErrorCode};
@@ -1595,7 +1592,7 @@ mod tests {
             rt.block_on(async {
                 let store_id = StoreId::generate();
                 let pipe_name = generate_pipe_name(store_id).expect("pipe name");
-                let server = create_first_pipe_server(&pipe_name).expect("server");
+                let mut server = create_first_pipe_server(&pipe_name).expect("server");
 
                 let client_task = tokio::spawn(async move {
                     let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
@@ -1607,7 +1604,7 @@ mod tests {
 
                 server.connect().await.expect("connect");
                 let mut buf = [0u8; 1];
-                let _ = (&server).read(&mut buf).await.expect("read");
+                let _ = server.read(&mut buf).await.expect("read");
 
                 let sid = pipe_peer_sid(&server).expect("pipe peer SID");
                 assert!(sid.starts_with("S-1-"));
@@ -1636,7 +1633,8 @@ mod tests {
             let store_id = StoreId::generate();
             let pipe_name = generate_pipe_name(store_id).expect("pipe name");
 
-            let server = create_first_pipe_server(&pipe_name).expect("create first pipe server");
+            let mut server =
+                create_first_pipe_server(&pipe_name).expect("create first pipe server");
 
             let client_task = tokio::spawn(async move {
                 let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
@@ -1649,7 +1647,7 @@ mod tests {
 
             server.connect().await.expect("server connect");
             let mut buf = [0u8; 1];
-            let n = (&server).read(&mut buf).await.expect("server read");
+            let n = server.read(&mut buf).await.expect("server read");
             assert_eq!(n, 1);
 
             let peer_sid = pipe_peer_sid(&server).expect("inspect pipe peer SID");

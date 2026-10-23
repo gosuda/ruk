@@ -100,7 +100,7 @@ pub(super) fn read_body(path: &Path) -> Result<Vec<u8>, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -140,7 +140,7 @@ mod tests {
         let lock_path = store.lock_path();
 
         // 1. Initial acquire must succeed.
-        let mut owner = try_acquire(&lock_path)
+        let owner = try_acquire(&lock_path)
             .expect("first try_acquire")
             .expect("must acquire fresh lock");
 
