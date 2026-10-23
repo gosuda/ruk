@@ -806,6 +806,12 @@ pub(crate) fn blame_attribute(
             "blame needs a text file",
         ));
     };
+    if start_refs.len() > BLAME_MAX_POSITIONS {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            "blame walks more line positions than its bound",
+        ));
+    }
     let start_lines: Vec<Vec<u8>> = start_refs.iter().map(|line| line.to_vec()).collect();
     let mut versions: HashMap<Oid, Vec<Vec<u8>>> = HashMap::new();
     versions.insert(start_oid, start_lines.clone());
@@ -1175,6 +1181,20 @@ mod tests {
         let parent: Vec<&[u8]> = vec![b"a\n", b"C\n", b"c\n"];
         let map = parent_line_map(&current, &parent).expect("align");
         assert_eq!(map, vec![Some(0), None, Some(2)]);
+    }
+
+    #[test]
+    fn blame_refuses_a_file_over_the_position_bound_before_allocating() {
+        let temp = TempRoot::new("blame-bound");
+        let store = test_store(&temp);
+        // One past the position bound: refusal names the bound, not a
+        // crash from per-line allocation of millions of entries.
+        let line = b"x\n";
+        let huge = line.repeat(BLAME_MAX_POSITIONS + 1);
+        let (head, _) = put_file_commit(&store, Vec::new(), "huge", &huge);
+        let path = RepoPath::new("f.txt").expect("path");
+        let err = blame_attribute(&store, &head, &path).expect_err("over-bound file refuses");
+        assert_eq!(err.code, crate::error::ErrorCode::ELimit);
     }
 
     #[test]

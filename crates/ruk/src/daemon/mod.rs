@@ -2279,8 +2279,9 @@ async fn serve_git_service(
     // repository, since the upload half has no capability check of its
     // own.
     let needs_push_auth = req.service == GIT_SERVICE_RECEIVE_PACK && !req.advertise;
-    let needs_session_auth =
-        req.service == GIT_SERVICE_UPLOAD_PACK || req.service == GIT_SERVICE_UPLOAD_ARCHIVE;
+    let needs_session_auth = req.service == GIT_SERVICE_UPLOAD_PACK
+        || req.service == GIT_SERVICE_UPLOAD_ARCHIVE
+        || (req.service == GIT_SERVICE_RECEIVE_PACK && req.advertise);
     if needs_push_auth || needs_session_auth {
         let session = match req.session_id.as_deref() {
             Some(text) => match text.parse::<SessionId>() {

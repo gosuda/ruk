@@ -13,7 +13,7 @@
 //! through `shutdown_and_drain`, which awaits every lane runner so the
 //! drain completes before the runtime drops.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -46,6 +46,11 @@ struct RepoEntry {
 struct RegistryInner {
     /// Opaque handle to repository entry.
     entries: HashMap<String, RepoEntry>,
+    /// Canonical repository paths mid-deletion: the entry is gone and the
+    /// tombstone rename has not completed, so opening rejects with
+    /// `E_CONFLICTED` instead of re-registering a store deletion then
+    /// removes. Cleared once the rename lands or fails.
+    deleting: HashSet<PathBuf>,
     /// Refs blocked by an unresolved push plan: `(canonical repo path,
     /// ref name)` to the `Uncertain` plan that owns the block. A new push
     /// to a blocked ref refuses with `E_PUSH_UNCERTAIN` until the owning
@@ -141,6 +146,7 @@ impl Registry {
             roots: canonical,
             inner: Mutex::new(RegistryInner {
                 entries: HashMap::new(),
+                deleting: HashSet::new(),
                 uncertain_pushes: HashMap::new(),
                 inflight_pushes: HashMap::new(),
             }),
@@ -772,6 +778,8 @@ impl Registry {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
+            inner.deleting.insert(repo_root.clone());
+            inner.deleting.insert(store.clone());
             let taken = take_entry_by_path(&mut inner, &store);
             if let Some((_, entry)) = &taken {
                 let busy = entry
@@ -781,6 +789,8 @@ impl Registry {
                 if busy {
                     if let Some((handle, entry)) = taken {
                         inner.entries.insert(handle, entry);
+                        inner.deleting.remove(&repo_root);
+                        inner.deleting.remove(&store);
                     }
                     return Err(CoreError::new(
                         ErrorCode::EConflicted,
@@ -794,12 +804,20 @@ impl Registry {
             coordinator.shutdown();
         }
         let tombstone = tombstone_for(&repo_root, self.next_handle.fetch_add(1, Ordering::Relaxed));
-        std::fs::rename(&repo_root, &tombstone).map_err(|err| {
+        let clear_deleting = |root: &Path, store_path: &Path| {
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.deleting.remove(root);
+                inner.deleting.remove(store_path);
+            }
+        };
+        let renamed = std::fs::rename(&repo_root, &tombstone).map_err(|err| {
             CoreError::new(
                 ErrorCode::EIo,
                 format!("repository tombstone failed: {err}"),
             )
-        })?;
+        });
+        clear_deleting(&repo_root, &store);
+        renamed?;
         std::fs::remove_dir_all(&tombstone).map_err(|err| {
             CoreError::new(ErrorCode::EIo, format!("repository removal failed: {err}"))
         })?;
@@ -2122,6 +2140,12 @@ impl Registry {
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?;
+        if inner.deleting.contains(canonical) {
+            return Err(CoreError::new(
+                ErrorCode::EConflicted,
+                "repository deletion is in flight",
+            ));
+        }
         for (handle, entry) in inner.entries.iter_mut() {
             if entry.path == canonical {
                 entry.last_used = Instant::now();
@@ -2570,6 +2594,38 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".tombstone-")),
             "no tombstone remains"
         );
+    }
+
+    #[test]
+    fn open_refuses_while_deletion_is_in_flight() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        registry
+            .create_repo(&init_args(&root, "acme/racy"))
+            .expect("repo inits");
+        let repo_root = root.join("acme/racy");
+        let store = repo_root.join(".ruk");
+
+        // Simulate the delete window: entry taken, rename not yet run.
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            inner.deleting.insert(repo_root.clone());
+            inner.deleting.insert(store.clone());
+        }
+        let err = registry
+            .open_by_path(&repo_root)
+            .expect_err("open during deletion refuses");
+        assert_eq!(err.code, ruk_core::ErrorCode::EConflicted);
+
+        // The reservation clears and the open succeeds again.
+        {
+            let mut inner = registry.inner.lock().expect("lock");
+            inner.deleting.remove(&repo_root);
+            inner.deleting.remove(&store);
+        }
+        registry
+            .open_by_path(&repo_root)
+            .expect("open after the window resumes");
     }
 
     #[test]

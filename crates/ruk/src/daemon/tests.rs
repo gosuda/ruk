@@ -823,31 +823,15 @@ async fn git_service_advertise_matches_oracle_refs() {
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
-    // Upload advertisements authenticate the session, so the upload arm
-    // carries a real one; the receive-pack arm keeps presence-only ids.
+    // Every advertisement authenticates a session held by this peer, so
+    // both arms carry the real one.
     let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
     let (stdout, _) = driver.run_typed(7, &payload).await;
     let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
     let session = opened.session.to_string();
 
     for service in ["upload-pack", "receive-pack"] {
-        let payload = if service == "upload-pack" {
-            git_open_payload(
-                service,
-                &store_repo,
-                true,
-                Some(&session),
-                Some("req-adv-up"),
-            )
-        } else {
-            git_open_payload(
-                service,
-                &store_repo,
-                true,
-                Some("sess-adv"),
-                Some("req-adv"),
-            )
-        };
+        let payload = git_open_payload(service, &store_repo, true, Some(&session), Some("req-adv"));
         let stream_id = if service == "upload-pack" { 1 } else { 3 };
         let (stdout, exit) = driver.run_git(stream_id, &payload, &[]).await;
         assert_eq!(exit.exit_code, 0, "{service} advertise exits zero");
@@ -1081,6 +1065,41 @@ async fn git_service_sessionless_upload_pack_refused() {
     let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
     let (report, _) = driver.expect_git_refused(1, &payload).await;
     assert_eq!(report.code, ErrorCode::EInvalid);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_sessionless_receive_pack_advertise_refused() {
+    let root = temp_root("recv-adv-no-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // An unknown session id with receive-pack advertisement must refuse
+    // before any ref names reach the peer.
+    // A well-formed but unknown session id must refuse before the
+    // advertisement reaches the peer.
+    let unknown = "01234567-89ab-cdef-0123-456789abcdef";
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        true,
+        Some(unknown),
+        Some("req-1"),
+    );
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
 
     drop(driver);
     task.abort();
