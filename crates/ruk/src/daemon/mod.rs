@@ -808,6 +808,9 @@ const DEFAULT_MAX_PUSH_OPTIONS: u64 = 256;
 
 /// Per-stream ingest quotas of one git-service envelope. Absent fields take
 /// the daemon defaults; the daemon-side digest covers the effective values.
+/// Every field clamps to its server-owned maximum (the `DEFAULT_MAX_*`
+/// caps below) at `Open` decode, so a client can narrow but never widen a
+/// quota.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GitLimits {
     /// Largest total pack bytes accepted.
@@ -874,6 +877,20 @@ impl Default for GitLimits {
 }
 
 impl GitLimits {
+    /// Clamps every quota to its server-owned maximum. A client-supplied
+    /// value above the daemon default (including `u64::MAX`) falls back to
+    /// that default; narrower values pass through untouched.
+    fn clamped(&self) -> Self {
+        Self {
+            max_pack_bytes: self.max_pack_bytes.min(DEFAULT_MAX_PACK_BYTES),
+            max_objects: self.max_objects.min(DEFAULT_MAX_OBJECTS),
+            max_object_bytes: self.max_object_bytes.min(DEFAULT_MAX_OBJECT_BYTES),
+            max_delta_depth: self.max_delta_depth.min(DEFAULT_MAX_DELTA_DEPTH),
+            max_stdin_bytes: self.max_stdin_bytes.min(DEFAULT_MAX_STDIN_BYTES),
+            max_push_options: self.max_push_options.min(DEFAULT_MAX_PUSH_OPTIONS),
+        }
+    }
+
     /// Builds the receive-pack bounds from the effective envelope quotas.
     /// Operator values wider than the ingest counters saturate instead of
     /// refusing the stream.
@@ -932,7 +949,7 @@ pub(crate) struct CommandOpen {
     /// Store directory path or opaque handle from a previous open: the
     /// directory holding the store format file, not the worktree root.
     pub repository: String,
-    /// The service session; required for `receive-pack`.
+    /// The service session; required on every git-service open.
     #[serde(default)]
     pub session_id: Option<String>,
     /// The idempotency key; required for `receive-pack`.
@@ -1920,6 +1937,17 @@ fn spawn_stream(
     }
 }
 
+/// Decodes one git-service `Open` with server-owned quota maxima applied:
+/// client narrowing passes through, widening falls back to the daemon
+/// defaults. Both the collected and the streaming paths observe the
+/// returned limits, so the clamp lives here instead of at each use.
+#[cfg(unix)]
+fn decode_git_open(open_payload: &[u8]) -> Result<CommandOpen, CoreError> {
+    let mut open = ipc::decode_control::<CommandOpen>(open_payload)?;
+    open.limits = open.limits.clamped();
+    Ok(open)
+}
+
 /// Serves one stream to its terminal frame: an argv-style command stream
 /// or a typed invocation. Every error ends the stream with an `Error`
 /// plus its terminal frame; the connection stays open for other streams.
@@ -1932,7 +1960,7 @@ async fn serve_stream(
     refs: &ConnectionRefs,
     peer: ipc::PeerIdentity,
 ) {
-    if let Ok(command) = ipc::decode_control::<CommandOpen>(&open_payload) {
+    if let Ok(command) = decode_git_open(&open_payload) {
         serve_git_service(&mut input, task_cancel, sink, command, refs, peer.uid).await;
         return;
     }
@@ -2209,6 +2237,22 @@ async fn serve_git_service(
         .await;
         return;
     }
+    // Upload opens name a repository but carry no digest or receipt of
+    // their own, so a missing session must fail before the repository
+    // opens rather than after the first body byte.
+    if (req.service == GIT_SERVICE_UPLOAD_PACK || req.service == GIT_SERVICE_UPLOAD_ARCHIVE)
+        && req.session_id.as_deref().unwrap_or("").is_empty()
+    {
+        let _ = send_error_exit(
+            sink,
+            &Error::Core(CoreError::new(
+                ErrorCode::EInvalid,
+                "upload-pack and upload-archive need their session id",
+            )),
+        )
+        .await;
+        return;
+    }
     let repo_ref = req.repository.clone();
     let registry = Arc::clone(&refs.registry);
     let opened = refs
@@ -2227,6 +2271,55 @@ async fn serve_git_service(
             return;
         }
     };
+    // Sessions authenticate before `Accepted`, so neither bodies nor
+    // advertisements flow to a peer that merely names a repository.
+    // Non-advertise receive-pack proves its push capabilities up front
+    // instead of after collecting the body; every upload open (advertise
+    // included) proves an active session held by this peer on the opened
+    // repository, since the upload half has no capability check of its
+    // own.
+    let needs_push_auth = req.service == GIT_SERVICE_RECEIVE_PACK && !req.advertise;
+    let needs_session_auth =
+        req.service == GIT_SERVICE_UPLOAD_PACK || req.service == GIT_SERVICE_UPLOAD_ARCHIVE;
+    if needs_push_auth || needs_session_auth {
+        let session = match req.session_id.as_deref() {
+            Some(text) => match text.parse::<SessionId>() {
+                Ok(session) => session,
+                Err(_) => {
+                    let _ = send_error_exit(
+                        sink,
+                        &Error::Core(CoreError::new(ErrorCode::EInvalid, "malformed session id")),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            None => {
+                let _ = send_error_exit(
+                    sink,
+                    &Error::Core(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "git services need their session id",
+                    )),
+                )
+                .await;
+                return;
+            }
+        };
+        let principal = Principal::from_peer_uid(peer_uid);
+        let auth = if needs_push_auth {
+            coordinator
+                .git_push_capabilities(&principal, session, &token)
+                .await
+                .map(|_| ())
+        } else {
+            coordinator.check_session(&principal, session, &token).await
+        };
+        if let Err(err) = auth {
+            let _ = send_error_exit(sink, &Error::Core(err)).await;
+            return;
+        }
+    }
     let accepted_id = req.request_id.clone().unwrap_or_default();
     let accepted = CommandAccepted {
         stream_id,
@@ -4919,10 +5012,16 @@ pub(crate) async fn dispatch_method(
                     ipc::encode_control(&ReplyEnvelope::success(None, reply))
                 }
                 ruk_core::protocol::MethodKind::Mutation => {
-                    // Repo-wide landing policy is an admin function, like
-                    // the repo.* methods: a session alone must not rewrite
-                    // it, so the check runs before any preparation.
-                    if method == Method::PolicySet && !caller.is_admin() {
+                    // Repo-wide landing policy and release-freeze markers are
+                    // admin functions, like the repo.* methods: a session alone
+                    // must not rewrite them, so the check runs before any
+                    // preparation (and before the committed-reply replay inside
+                    // `prepare_for_dispatch`).
+                    if (method == Method::PolicySet
+                        || method == Method::ReleaseFreezeSet
+                        || method == Method::ReleaseFreezeClear)
+                        && !caller.is_admin()
+                    {
                         return Err(CoreError::new(
                             ErrorCode::EForbidden,
                             format!("method `{}` needs an admin peer", method.as_str()),

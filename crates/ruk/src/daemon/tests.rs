@@ -823,16 +823,31 @@ async fn git_service_advertise_matches_oracle_refs() {
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
+    // Upload advertisements authenticate the session, so the upload arm
+    // carries a real one; the receive-pack arm keeps presence-only ids.
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
 
     for service in ["upload-pack", "receive-pack"] {
-        let ids = service == "receive-pack";
-        let payload = git_open_payload(
-            service,
-            &store_repo,
-            true,
-            ids.then_some("sess-adv"),
-            ids.then_some("req-adv"),
-        );
+        let payload = if service == "upload-pack" {
+            git_open_payload(
+                service,
+                &store_repo,
+                true,
+                Some(&session),
+                Some("req-adv-up"),
+            )
+        } else {
+            git_open_payload(
+                service,
+                &store_repo,
+                true,
+                Some("sess-adv"),
+                Some("req-adv"),
+            )
+        };
         let stream_id = if service == "upload-pack" { 1 } else { 3 };
         let (stdout, exit) = driver.run_git(stream_id, &payload, &[]).await;
         assert_eq!(exit.exit_code, 0, "{service} advertise exits zero");
@@ -896,7 +911,11 @@ async fn git_service_request_matches_oracle_objects() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     let (stdout, exit) = driver.run_git(1, &payload, &[request]).await;
     assert_eq!(exit.exit_code, 0);
     assert_eq!(exit.outcome, "Completed");
@@ -931,7 +950,12 @@ async fn git_service_upload_pack_answers_before_eof() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -1038,6 +1062,267 @@ async fn git_service_receive_pack_needs_session_and_request() {
     drop(driver);
     task.abort();
 }
+#[tokio::test]
+async fn git_service_sessionless_upload_pack_refused() {
+    let root = temp_root("upload-no-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_sessionless_upload_archive_refused() {
+    let root = temp_root("archive-no-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-archive", &store_repo, false, None, None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_upload_pack_refused_before_accepted() {
+    let root = temp_root("upload-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // A random session is not the missing-session shape: it passes the
+    // presence gate and must still fail authentication before `Accepted`.
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&unknown), None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_upload_archive_refused_before_accepted() {
+    let root = temp_root("archive-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload("upload-archive", &store_repo, false, Some(&unknown), None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_upload_advertise_refused() {
+    let root = temp_root("upload-adv-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // Advertisements authenticate too: a random session fails before
+    // `Accepted`, not merely a missing id.
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, true, Some(&unknown), None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_receive_pack_refused_before_body() {
+    let root = temp_root("receive-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // Authentication precedes `Accepted`, so no body is collected from an
+    // unauthenticated peer: the refusal arrives with no body sent.
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&unknown),
+        Some("req-unknown-1"),
+    );
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[test]
+fn git_limits_clamp_to_server_maxima() {
+    // A hostile envelope demanding `u64::MAX` everywhere lands on the
+    // daemon defaults instead of growing a `Vec` without bound.
+    let saturated = GitLimits {
+        max_pack_bytes: u64::MAX,
+        max_objects: u64::MAX,
+        max_object_bytes: u64::MAX,
+        max_delta_depth: u64::MAX,
+        max_stdin_bytes: u64::MAX,
+        max_push_options: u64::MAX,
+    };
+    assert_eq!(saturated.clamped(), GitLimits::default());
+
+    // Narrowing a quota still passes through: the clamp is a ceiling,
+    // not a reset.
+    let narrowed = GitLimits {
+        max_push_options: 0,
+        max_stdin_bytes: 1,
+        ..GitLimits::default()
+    };
+    assert_eq!(narrowed.clamped(), narrowed);
+
+    // The daemon decode path itself applies the clamp: a client-sent
+    // `u64::MAX` stdin bound arrives at the daemon cap with no manual
+    // clamping by the caller.
+    let wire = sonic_rs::to_string(&CommandOpen {
+        service: "upload-pack".to_owned(),
+        repository: "/tmp/repo".to_owned(),
+        session_id: None,
+        request_id: None,
+        git_protocol: String::new(),
+        advertise: false,
+        stdout_credit: 0,
+        limits: saturated,
+        on_behalf_of: None,
+    })
+    .expect("open encodes");
+    let decoded = super::decode_git_open(wire.as_bytes()).expect("open decodes");
+    assert_eq!(
+        decoded.limits.max_stdin_bytes,
+        super::DEFAULT_MAX_STDIN_BYTES
+    );
+    assert_eq!(decoded.limits, GitLimits::default());
+}
+
+#[tokio::test]
+async fn release_freeze_needs_an_admin_peer() {
+    let root = temp_root("freeze-admin");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(1, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let set_args = sonic_rs::to_string(&ruk_core::protocol::ReleaseFreezeSetArgs {
+        name: RefName::new("refs/tags/v1".to_string()).expect("tag name"),
+        owner_release_id: "rel-1".to_owned(),
+        target_oid: commit,
+        frozen_at: ruk_core::protocol::Timestamp::parse("1970-01-01T00:00:00Z")
+            .expect("freeze time"),
+    })
+    .expect("freeze set args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "release.freeze.set",
+        Some(&RequestId::generate().to_string()),
+        Some(set_args),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(3, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+    let clear_args = sonic_rs::to_string(&ruk_core::protocol::ReleaseFreezeClearArgs {
+        name: RefName::new("refs/tags/v1".to_string()).expect("tag name"),
+        owner_release_id: "rel-1".to_owned(),
+    })
+    .expect("freeze clear args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "release.freeze.clear",
+        Some(&RequestId::generate().to_string()),
+        Some(clear_args),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(5, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+    drop(driver);
+    task.abort();
+}
 
 #[tokio::test]
 async fn git_service_delete_only_receive_pack_round_trip() {
@@ -1083,7 +1368,7 @@ async fn git_service_delete_only_receive_pack_round_trip() {
     let text = String::from_utf8(stdout).expect("report is text");
     assert!(text.contains("unpack ok"), "report lands: {text}");
 
-    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let advert = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (stdout, exit) = driver.run_git(5, &advert, &[]).await;
     assert_eq!(exit.exit_code, 0);
     let refs = parse_advertised_refs(&stdout, "upload-pack");
@@ -1114,12 +1399,17 @@ async fn git_service_streams_progress_while_sibling_waits() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
 
-    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let advert = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
     assert_eq!(
         exit.exit_code, 0,
@@ -1549,7 +1839,12 @@ async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -1560,7 +1855,7 @@ async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
     assert!(exit.cancelled);
     assert_eq!(exit.outcome, "CancelledBeforeCommit");
 
-    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let advert = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
     assert_eq!(exit.exit_code, 0, "a sibling stream survives the cancel");
     assert!(!stdout.is_empty());
@@ -1704,7 +1999,12 @@ async fn git_service_advertise_routes_by_protocol() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let v0 = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let v0 = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (v0_out, exit) = driver.run_git(1, &v0, &[]).await;
     assert_eq!(exit.exit_code, 0);
 
@@ -1712,7 +2012,7 @@ async fn git_service_advertise_routes_by_protocol() {
         "upload-pack",
         &store_repo,
         true,
-        None,
+        Some(&session),
         None,
         "version=2",
         None,
@@ -3286,7 +3586,11 @@ async fn small_stdin_frames_within_window_are_not_refused() {
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     assert_eq!(driver.recv().await.kind, FrameKind::Accepted);
     for chunk in &chunks {
@@ -3727,7 +4031,11 @@ async fn frame_kind_9_rejected_on_any_stream() {
 
     let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
     handshake(&mut driver).await;
-    let payload = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -3767,8 +4075,13 @@ async fn hook_frames_misplaced_on_git_stdin_are_refused() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
     for (stream_id, kind) in [(1u64, FrameKind::HookCall), (3u64, FrameKind::HookReply)] {
-        let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+        let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
         driver.send(FrameKind::Open, stream_id, &payload).await;
         let accepted = driver.recv().await;
         assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -6376,7 +6689,12 @@ async fn streaming_cancel_after_stdin_ends_connection_promptly() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
