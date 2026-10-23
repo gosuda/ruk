@@ -379,15 +379,18 @@ impl Registry {
         Ok(())
     }
 
-    /// Clears the guard for `refs` after a reconcile observed the remote:
-    /// the observation resolves the uncertainty the block stood for, so a
-    /// follow-up push may proceed on the observed state.
+    /// Clears the guard `plan` owns for `refs` after a reconcile observed
+    /// the remote: the observation resolves the uncertainty the block
+    /// stood for, so a follow-up push may proceed on the observed state.
+    /// Entries owned by another plan stay blocked, mirroring
+    /// [`Registry::note_push_terminal`].
     ///
     /// # Errors
     /// `E_IO` when the guard lock is poisoned.
     pub(crate) fn note_push_reconciled(
         &self,
         repo: &Path,
+        plan: PlanId,
         refs: &[Vec<u8>],
     ) -> Result<(), CoreError> {
         let mut inner = self
@@ -395,9 +398,10 @@ impl Registry {
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
-            inner
-                .uncertain_pushes
-                .remove(&(repo.to_path_buf(), name.clone()));
+            let key = (repo.to_path_buf(), name.clone());
+            if inner.uncertain_pushes.get(&key) == Some(&plan) {
+                inner.uncertain_pushes.remove(&key);
+            }
         }
         Ok(())
     }
@@ -585,6 +589,47 @@ impl Registry {
         Ok((repo_root, store))
     }
 
+    /// Refuses destructive repository operations on anything but an actual
+    /// store: the derived repository root must not be a configured root,
+    /// and the resolved store directory must carry its format file or
+    /// already back an opened coordinator. A bare registered handle is not
+    /// enough: handles are created for any path before the store opens,
+    /// and a failed open leaves the handle behind. A namespace directory
+    /// merely containing repositories has neither marker, and a `root/.ruk`
+    /// spelling derives the configured root itself, so both refuse before
+    /// any tombstone rename or removal runs.
+    ///
+    /// # Errors
+    /// `E_FORBIDDEN` for a configured root, `E_INVALID` when the target
+    /// is not a repository store, `E_IO` when the registry lock is poisoned.
+    fn validate_store_target(&self, repo_root: &Path, store: &Path) -> Result<(), CoreError> {
+        if self.roots.iter().any(|root| repo_root == root.as_path()) {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "repository is a configured root",
+            ));
+        }
+        // Mirrors the `format` marker `Store::create` writes at the store
+        // root (`FORMAT_FILE` stays private to `ruk_core::store`).
+        if store.join("format").is_file() {
+            return Ok(());
+        }
+        let opened = self
+            .inner
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?
+            .entries
+            .values()
+            .any(|entry| entry.path == store && entry.coordinator.is_some());
+        if opened {
+            return Ok(());
+        }
+        Err(CoreError::new(
+            ErrorCode::EInvalid,
+            "repository path is not a repository store",
+        ))
+    }
+
     /// Creates one repository beneath `args.root` at `args.path`.
     ///
     /// The destination must be absent; `Store::create` enforces the same
@@ -719,6 +764,7 @@ impl Registry {
             ));
         }
         let (repo_root, store) = self.resolve_repo_and_store(Path::new(&args.repo))?;
+        self.validate_store_target(&repo_root, &store)?;
         let path = repo_root
             .to_str()
             .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
@@ -785,6 +831,7 @@ impl Registry {
     ) -> Result<ruk_core::protocol::RepoRenameReply, CoreError> {
         use ruk_core::protocol::RepoRenameReply;
         let (repo_root, store) = self.resolve_repo_and_store(Path::new(&args.repo))?;
+        self.validate_store_target(&repo_root, &store)?;
         let root = self
             .roots
             .iter()
@@ -1098,6 +1145,7 @@ impl Registry {
                 FactTable::ImportedChanges,
                 map_err,
             )?);
+            rows.extend(Self::page_fork_table(store, FactTable::Shallow, map_err)?);
             rows.extend(Self::page_fork_table(
                 store,
                 FactTable::LfsObjects,
@@ -1235,6 +1283,7 @@ impl Registry {
             FactTable::Changes,
             FactTable::ChangeHistory,
             FactTable::ImportedChanges,
+            FactTable::Shallow,
             FactTable::LfsObjects,
         ] {
             for (row_table, key, _) in Self::page_fork_table(store, table, map_err)? {
@@ -2524,6 +2573,81 @@ mod tests {
     }
 
     #[test]
+    fn remove_and_rename_refuse_namespace_dirs_and_roots() {
+        use ruk_core::error::ErrorCode;
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        registry
+            .create_repo(&init_args(&root, "acme/one"))
+            .expect("first repo inits");
+        registry
+            .create_repo(&init_args(&root, "acme/two"))
+            .expect("second repo inits");
+        let namespace = canonical
+            .join("acme")
+            .to_str()
+            .expect("utf8 path")
+            .to_owned();
+        let refused = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: namespace.clone(),
+                confirm_path: namespace.clone(),
+            })
+            .expect_err("namespace delete refuses");
+        assert_eq!(refused.code, ErrorCode::EInvalid);
+        assert!(
+            canonical.join("acme/one").join(".ruk").is_dir(),
+            "first repo survives the refused delete"
+        );
+        assert!(
+            canonical.join("acme/two").join(".ruk").is_dir(),
+            "second repo survives the refused delete"
+        );
+        let rename_refused = registry
+            .rename_repo(&ruk_core::protocol::RepoRenameArgs {
+                repo: namespace.clone(),
+                new_path: "acme/renamed".to_owned(),
+            })
+            .expect_err("namespace rename refuses");
+        assert_eq!(rename_refused.code, ErrorCode::EInvalid);
+        assert!(
+            !canonical.join("acme/renamed").exists(),
+            "no rename destination appears"
+        );
+        let root_arg = canonical.to_str().expect("utf8 root").to_owned();
+        let root_refused = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: root_arg.clone(),
+                confirm_path: root_arg.clone(),
+            })
+            .expect_err("root delete refuses");
+        assert_eq!(root_refused.code, ErrorCode::EForbidden);
+        // A `.ruk` child directly under the root must not turn the root
+        // into a deletion target: the derived repository root is still the
+        // configured root itself.
+        std::fs::create_dir_all(canonical.join(".ruk")).expect("root store dir stages");
+        let dotted = canonical
+            .join(".ruk")
+            .to_str()
+            .expect("utf8 path")
+            .to_owned();
+        for spelling in [&root_arg, &dotted] {
+            let err = registry
+                .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                    repo: spelling.to_string(),
+                    confirm_path: spelling.to_string(),
+                })
+                .expect_err("root with a .ruk child still refuses");
+            assert_eq!(err.code, ErrorCode::EForbidden);
+        }
+        assert!(
+            canonical.join("acme/one").join(".ruk").is_dir(),
+            "first repo survives the refused root delete"
+        );
+    }
+
+    #[test]
     fn rename_repo_via_store_path_hits_busy_and_moves_root() {
         use ruk_core::error::ErrorCode;
         let root = scratch_root();
@@ -3564,6 +3688,44 @@ mod tests {
             .fact_page(FactTable::Refs, None, FactPageBudget::new(16, 65536))
             .expect("refs page");
         assert!(page.rows.is_empty());
+    }
+
+    #[test]
+    fn repo_fork_copies_shallow_markers() {
+        let root = scratch_root();
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let seed = seed_fork_source(&registry, &root, "acme/hello");
+        let shallow_key = seed.blob_a.as_bytes().to_vec();
+        {
+            let budget = Arc::new(PreparationBudget::reference_defaults());
+            let store = Store::open(&seed.canonical.join(".ruk"), budget).expect("source opens");
+            store
+                .publish(
+                    Vec::new(),
+                    &[FactMutation {
+                        table: FactTable::Shallow,
+                        key: shallow_key.clone(),
+                        expected: FactExpectation::Absent,
+                        value: Some(Vec::new()),
+                    }],
+                    EventSource::LocalPush,
+                    &EventContext::default(),
+                )
+                .expect("shallow marker publishes");
+        }
+        let dest = root.join("acme/fork-shallow");
+        registry
+            .fork_repo(&fork_args(&seed.canonical, &dest, None))
+            .expect("fork serves");
+        let budget = Arc::new(PreparationBudget::reference_defaults());
+        let forked = Store::open(&dest.join(".ruk"), budget).expect("fork opens");
+        assert_eq!(
+            forked
+                .fact(FactTable::Shallow, &shallow_key)
+                .expect("shallow reads"),
+            Some(Vec::new()),
+            "the shallow marker survives the fork"
+        );
     }
 
     #[cfg(unix)]
