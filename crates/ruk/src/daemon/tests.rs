@@ -7358,6 +7358,8 @@ fn measured_incompressible_commit(
         &store,
         kind,
         &plan,
+        u64::MAX,
+        u64::MAX,
         &ruk_git::transport::Interrupt::none(),
     )
     .expect("count");

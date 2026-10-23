@@ -4627,7 +4627,11 @@ async fn serve_typed_archive(stream: ArchiveStream<'_>) {
                     let kind = store.hash_kind();
                     let interrupt = ruk_git::transport::Interrupt::none().with_cancel(count_flag);
                     let plan = plan_commit_archive(store, kind, commit).map_err(CoreError::from)?;
-                    let size = count_commit_tar(store, kind, &plan, &interrupt)
+                    let (tar_cap, zip_cap) = match format {
+                        ArchiveFormat::Tar => (cap, u64::MAX),
+                        ArchiveFormat::Zip => (u64::MAX, cap),
+                    };
+                    let size = count_commit_tar(store, kind, &plan, tar_cap, zip_cap, &interrupt)
                         .map_err(CoreError::from)?;
                     Ok::<_, CoreError>((plan, size))
                 })

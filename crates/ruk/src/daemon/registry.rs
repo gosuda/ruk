@@ -20,12 +20,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ruk_core::MAX_CONTROL_FRAME_BYTES;
 use ruk_core::change::{PlanId, RequestId, SessionId};
 use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::search::{SearchPool, SearchPoolConfig};
-use ruk_core::store::{PreparationBudget, Store};
+use ruk_core::store::{FactPageBudget, FactTable, PreparationBudget, Store};
 use ruk_git::transport::net::EgressPolicy;
+use ruk_git::transport::push::{PushPlanRecord, PushState};
 
 /// One registered repository: its canonical path, its hosted coordinator
 /// once opened, and its last-use instant for idle eviction.
@@ -55,9 +57,8 @@ struct RegistryInner {
     /// ref name)` to the `Uncertain` plan that owns the block. A new push
     /// to a blocked ref refuses with `E_PUSH_UNCERTAIN` until the owning
     /// plan reaches a terminal `Confirmed`/`Rejected` state or a reconcile
-    /// observes the remote and clears the block. In-memory only: a daemon
-    /// restart drops every block, so a restarted daemon may push over a ref
-    /// whose prior plan is still `Uncertain` elsewhere.
+    /// observes the remote and clears the block. Restored from durable
+    /// `PushPlans` rows when the repository is opened.
     uncertain_pushes: HashMap<(PathBuf, Vec<u8>), PlanId>,
     /// Push idempotency keys with a job past replay: `(session, request
     /// id)` to the entry its waiters sleep on. A duplicate waits for
@@ -343,10 +344,8 @@ impl Registry {
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "push guard lock is poisoned"))?;
         for name in refs {
-            if let Some(plan) = inner
-                .uncertain_pushes
-                .get(&(repo.to_path_buf(), name.clone()))
-            {
+            let key = (repo.to_path_buf(), name.clone());
+            if let Some(plan) = inner.uncertain_pushes.get(&key) {
                 let noun = String::from_utf8_lossy(name);
                 return Err(CoreError::new(
                     ErrorCode::EPushUncertain,
@@ -2026,19 +2025,20 @@ impl Registry {
                 .entries
                 .get(handle)
                 .is_none_or(|entry| entry.path != canonical);
-        let entry = inner
-            .entries
-            .get_mut(handle)
-            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository handle is unknown"))?;
         if reserved {
             return Err(CoreError::new(
                 ErrorCode::EConflicted,
                 "repository deletion or rename is in flight",
             ));
         }
-        if let Some(coordinator) = entry.coordinator.as_ref() {
-            entry.last_used = Instant::now();
-            return Ok(Arc::clone(coordinator));
+        {
+            let entry = inner.entries.get_mut(handle).ok_or_else(|| {
+                CoreError::new(ErrorCode::ENotFound, "repository handle is unknown")
+            })?;
+            if let Some(coordinator) = entry.coordinator.as_ref() {
+                entry.last_used = Instant::now();
+                return Ok(Arc::clone(coordinator));
+            }
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let store = match pinned.open_path() {
@@ -2061,6 +2061,7 @@ impl Registry {
         )
         .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
         pinned.verify_open(&canonical)?;
+        Self::restore_uncertain_pushes(&mut inner.uncertain_pushes, &canonical, &store)?;
         let owner = match pinned.owner_uid() {
             Some(uid) => Principal::from_peer_uid(uid),
             None => Self::repository_owner(&canonical)?,
@@ -2079,6 +2080,10 @@ impl Registry {
             .set_event_retention_seconds(self.event_retention_seconds.load(Ordering::Relaxed));
         coordinator.set_compare_max_commits(self.compare_max_commits.load(Ordering::Relaxed));
         spawn_retention(&runtime, &coordinator, self.retention_interval_ms());
+        let entry = inner
+            .entries
+            .get_mut(handle)
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "repository handle is unknown"))?;
         entry.coordinator = Some(Arc::clone(&coordinator));
         entry.runner = Some(runner);
         entry.last_used = Instant::now();
@@ -2126,6 +2131,48 @@ impl Registry {
             ErrorCode::EHosted,
             "coordinator hosting needs a Unix owner identity",
         ))
+    }
+
+    /// Restores outstanding uncertain push guards from durable plan state.
+    fn restore_uncertain_pushes(
+        uncertain_pushes: &mut HashMap<(PathBuf, Vec<u8>), PlanId>,
+        canonical: &Path,
+        store: &Store,
+    ) -> Result<(), CoreError> {
+        let kind = store.hash_kind();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let budget = FactPageBudget::new(1024, MAX_CONTROL_FRAME_BYTES);
+            let page = store
+                .fact_page(FactTable::PushPlans, after.as_deref(), budget)
+                .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+            for row in &page.rows {
+                let raw_id = <[u8; 16]>::try_from(row.key.as_slice()).map_err(|_| {
+                    CoreError::new(ErrorCode::ECorrupt, "stored push plan key is not 16 bytes")
+                })?;
+                let plan_id = PlanId::from_bytes(raw_id);
+                let plan = PushPlanRecord::decode(plan_id, kind, &row.value).map_err(|err| {
+                    CoreError::new(
+                        ErrorCode::ECorrupt,
+                        format!("stored push plan {plan_id} is corrupt: {err}"),
+                    )
+                })?;
+                if matches!(plan.state, PushState::Uncertain | PushState::Sending) {
+                    for update in &plan.updates {
+                        let key = (canonical.to_path_buf(), update.name.clone());
+                        uncertain_pushes.insert(key, plan.id);
+                    }
+                }
+            }
+            if !page.more || page.rows.is_empty() {
+                break;
+            }
+            let Some(last) = page.rows.last() else {
+                break;
+            };
+            after = Some(last.key.clone());
+        }
+        Ok(())
     }
 
     /// Opens `requested` by path, returning its opaque handle.
@@ -4014,5 +4061,75 @@ mod tests {
         let budget = Arc::new(PreparationBudget::reference_defaults());
         let forked = Store::open(&dest.join(".ruk"), budget).expect("fork opens");
         assert_eq!(read_blob(&forked, seed.blob_a), b"hello fork");
+    }
+
+    #[test]
+    fn open_restores_uncertain_push_guards_across_restart() {
+        use ruk_core::HashKind;
+        use ruk_core::change::PlanId;
+        use ruk_core::error::ErrorCode;
+        use ruk_git::transport::push::{PushPlanRecord, PushUpdate};
+
+        let root = scratch_root();
+        let repo_path = root.join("repo-a");
+        let store_dir = repo_path.join(".ruk");
+        let store = Store::create(
+            &store_dir,
+            HashKind::Sha256,
+            Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("scratch store initializes");
+
+        let plan_id = PlanId::generate();
+        let guarded_ref = b"refs/heads/main".to_vec();
+        let unguarded_ref = b"refs/heads/feature".to_vec();
+        let updates = vec![PushUpdate {
+            name: guarded_ref.clone(),
+            old: HashKind::Sha256.zero_oid(),
+            new: HashKind::Sha256.zero_oid(),
+        }];
+        let mut plan = PushPlanRecord::prepare(plan_id, b"origin".to_vec(), false, updates);
+        plan.begin_send().expect("begin_send");
+        plan.mark_uncertain();
+        let mutation = plan
+            .persist_mutation(HashKind::Sha256, None)
+            .expect("mutation encodes");
+        store
+            .publish(
+                Vec::new(),
+                &[mutation],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("plan persists");
+        drop(store);
+
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime starts");
+        registry.set_runtime(runtime.handle().clone());
+
+        let (_handle, path, _coord) = registry
+            .open(repo_path.to_str().expect("scratch path is UTF-8"))
+            .expect("open restores repository and guards");
+
+        let err = registry
+            .push_guard_check(&path, std::slice::from_ref(&guarded_ref))
+            .expect_err("uncertain push plan guards ref after restart");
+        assert_eq!(err.code, ErrorCode::EPushUncertain);
+        assert!(err.to_string().contains(&plan_id.to_string()));
+
+        registry
+            .push_guard_check(&path, std::slice::from_ref(&unguarded_ref))
+            .expect("unguarded ref passes");
+
+        registry
+            .note_push_reconciled(&path, plan_id, std::slice::from_ref(&guarded_ref))
+            .expect("reconcile clears guard");
+        registry
+            .push_guard_check(&path, std::slice::from_ref(&guarded_ref))
+            .expect("cleared ref passes");
     }
 }

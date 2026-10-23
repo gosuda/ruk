@@ -276,12 +276,44 @@ fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// The injected credential this call authenticates with, if any: a server
-/// echoing it back in an error body must not leak it into the refusal.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(char::from(ALPHABET[usize::from(b0 >> 2)]));
+        out.push(char::from(
+            ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
+        ));
+        if chunk.len() > 1 {
+            out.push(char::from(
+                ALPHABET[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))],
+            ));
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(char::from(ALPHABET[usize::from(b2 & 0x3f)]));
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 fn auth_secrets(auth: &credentials::AuthPolicy) -> Vec<String> {
     match auth {
         credentials::AuthPolicy::Explicit { auth } if !auth.credential.is_empty() => {
-            vec![auth.credential.clone()]
+            match auth.kind {
+                credentials::TransportAuthKind::Basic => {
+                    let encoded = base64_encode(auth.credential.as_bytes());
+                    vec![format!("Basic {encoded}"), encoded, auth.credential.clone()]
+                }
+                credentials::TransportAuthKind::Bearer => vec![auth.credential.clone()],
+                credentials::TransportAuthKind::None => Vec::new(),
+            }
         }
         _ => Vec::new(),
     }
@@ -1716,6 +1748,73 @@ mod tests {
             assert!(body_preview.len() <= 512, "status {status}");
             server.join().expect("server");
         }
+    }
+
+    #[test]
+    fn auth_secrets_redacts_basic_wire_forms_and_preserves_bearer() {
+        let basic = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Basic,
+            credential: "user:pass".to_owned(),
+            origin: "https://host.example:443".to_owned(),
+        });
+        let secrets = auth_secrets(&basic);
+        assert_eq!(
+            secrets,
+            vec![
+                "Basic dXNlcjpwYXNz".to_owned(),
+                "dXNlcjpwYXNz".to_owned(),
+                "user:pass".to_owned(),
+            ]
+        );
+        let preview = scrubbed_preview(b"auth failed: Basic dXNlcjpwYXNz rejected", &secrets);
+        assert_eq!(preview, "auth failed: [redacted] rejected");
+        let preview_b64 = scrubbed_preview(b"auth failed: token dXNlcjpwYXNz rejected", &secrets);
+        assert_eq!(preview_b64, "auth failed: token [redacted] rejected");
+        let preview_raw = scrubbed_preview(b"auth failed: credential user:pass rejected", &secrets);
+        assert_eq!(preview_raw, "auth failed: credential [redacted] rejected");
+
+        let headers = vec![(
+            "location".to_owned(),
+            "https://host.example/login?echo=Basic dXNlcjpwYXNz".to_owned(),
+        )];
+        let (_, loc) = refusal_facts(&headers, &secrets);
+        assert_eq!(
+            loc,
+            Some("https://host.example/login?echo=[redacted]".to_owned())
+        );
+
+        let headers_full = vec![("location".to_owned(), "Basic dXNlcjpwYXNz".to_owned())];
+        let (_, loc_full) = refusal_facts(&headers_full, &secrets);
+        assert_eq!(loc_full, Some("[redacted]".to_owned()));
+
+        let bearer = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: "secret-token".to_owned(),
+            origin: "https://host.example:443".to_owned(),
+        });
+        let bearer_secrets = auth_secrets(&bearer);
+        assert_eq!(bearer_secrets, vec!["secret-token".to_owned()]);
+        let bearer_preview = scrubbed_preview(b"token secret-token expired", &bearer_secrets);
+        assert_eq!(bearer_preview, "token [redacted] expired");
+
+        let empty = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Basic,
+            credential: String::new(),
+            origin: "https://host.example:443".to_owned(),
+        });
+        assert!(auth_secrets(&empty).is_empty());
+
+        let none = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::None,
+            credential: "some-cred".to_owned(),
+            origin: "https://host.example:443".to_owned(),
+        });
+        assert!(auth_secrets(&none).is_empty());
+
+        let ambient = credentials::AuthPolicy::Ambient {
+            vars: HashMap::new(),
+        };
+        assert!(auth_secrets(&ambient).is_empty());
     }
 
     #[test]

@@ -190,6 +190,7 @@ pub fn serve_upload_archive<R: Read, W: Write>(
         interrupt,
         measure: false,
         zip_bound: 0,
+        cap: u64::MAX,
     };
     if let Some(commit) = commit
         && let Err(err) = walk.tar.emit_global(commit)
@@ -321,6 +322,7 @@ pub struct ArchiveSize {
 /// and closing zero block is tallied, and no payload is read.
 struct CountSink {
     count: u64,
+    cap: u64,
 }
 
 impl TarSink for CountSink {
@@ -329,6 +331,14 @@ impl TarSink for CountSink {
             detail: "archive chunk does not fit the byte count".to_owned(),
         })?;
         self.count = self.count.saturating_add(width);
+        if self.count > self.cap {
+            return Err(GitError::Limit {
+                detail: format!(
+                    "archive of {} bytes exceeds the {}-byte cap",
+                    self.count, self.cap
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -344,27 +354,44 @@ impl TarSink for CountSink {
 /// Measures the stream one archived commit produces, without emitting any
 /// byte. Blob bodies are charged by `object_len` and never read; the walk
 /// reads only trees and symlink targets. The daemon compares the figure for
-/// the requested format against `archive_max_bytes` before the first frame.
+/// the requested format against `archive_max_bytes` before the first frame,
+/// capping the served format's measure (`u64::MAX` for the other) so the
+/// counting walk stops as soon as that measure passes the cap.
 ///
 /// # Errors
-/// The walk's own failures: unpublished objects, corrupt trees, interrupts.
+/// [`GitError::Limit`] when the running size of a capped format exceeds its
+/// cap, plus the walk's own failures: unpublished objects, corrupt trees,
+/// interrupts.
 pub fn count_commit_tar(
     store: &Store,
     kind: HashKind,
     plan: &ArchivePlan,
+    tar_cap: u64,
+    zip_cap: u64,
     interrupt: &Interrupt,
 ) -> Result<ArchiveSize, GitError> {
+    if ZIP_END_FIXED > zip_cap {
+        return Err(GitError::Limit {
+            detail: format!(
+                "zip archive bound of {ZIP_END_FIXED} bytes exceeds the {zip_cap}-byte cap"
+            ),
+        });
+    }
     let mut walk = TreeWalk {
         store,
         kind,
         tar: TarWriter {
-            sink: CountSink { count: 0 },
+            sink: CountSink {
+                count: 0,
+                cap: tar_cap,
+            },
             mtime: plan.mtime,
         },
         pending: Vec::new(),
         interrupt,
         measure: true,
         zip_bound: 0,
+        cap: zip_cap,
     };
     if let Err(err) = walk.tar.emit_global(plan.commit) {
         return Err(stream_failed(walk, err));
@@ -406,6 +433,7 @@ pub fn stream_commit_tar<S: TarSink>(
         interrupt,
         measure: false,
         zip_bound: 0,
+        cap: u64::MAX,
     };
     if let Err(err) = walk.tar.emit_global(plan.commit) {
         return Err(stream_failed(walk, err));
@@ -677,6 +705,7 @@ struct TreeWalk<'s, S: TarSink> {
     measure: bool,
     /// Counting pass: the running zip upper bound over entries seen so far.
     zip_bound: u64,
+    cap: u64,
 }
 
 impl<S: TarSink> TreeWalk<'_, S> {
@@ -712,19 +741,29 @@ impl<S: TarSink> TreeWalk<'_, S> {
 
     /// Charges one entry to the zip bound. Only the counting pass measures;
     /// the streaming walk pays nothing.
-    fn charge_zip(&mut self, name_len: usize, data_len: u64) {
+    fn charge_zip(&mut self, name_len: usize, data_len: u64) -> Result<(), GitError> {
         if self.measure {
             let name = u64::try_from(name_len).expect("usize fits in u64");
             self.zip_bound = self
                 .zip_bound
                 .saturating_add(zip_entry_bound(name, data_len));
+            if self.zip_bound.saturating_add(ZIP_END_FIXED) > self.cap {
+                return Err(GitError::Limit {
+                    detail: format!(
+                        "zip archive bound of {} bytes exceeds the {}-byte cap",
+                        self.zip_bound.saturating_add(ZIP_END_FIXED),
+                        self.cap,
+                    ),
+                });
+            }
         }
+        Ok(())
     }
 
     /// Writes every queued directory record, outermost first.
     fn flush_pending(&mut self) -> Result<(), GitError> {
         for dir in std::mem::take(&mut self.pending) {
-            self.charge_zip(dir.path.len(), 0);
+            self.charge_zip(dir.path.len(), 0)?;
             self.tar.emit_dir(dir.oid, &dir.path, dir.mode)?;
         }
         Ok(())
@@ -738,7 +777,7 @@ impl<S: TarSink> TreeWalk<'_, S> {
                 // Gitlinks become plain directory records and are never
                 // descended into, exactly like the oracle.
                 path.push(b'/');
-                self.charge_zip(path.len(), 0);
+                self.charge_zip(path.len(), 0)?;
                 self.tar.emit_dir(entry.oid, &path, entry.mode)?;
             }
             0o120000 => {
@@ -746,16 +785,16 @@ impl<S: TarSink> TreeWalk<'_, S> {
                 if obj_kind != ObjectKind::Blob {
                     return Err(corrupt(format!("symlink {} is not a blob", entry.oid)));
                 }
-                self.tar
-                    .emit_symlink(entry.oid, &path, entry.mode, &target)?;
                 self.charge_zip(
                     path.len(),
                     u64::try_from(target.len()).expect("usize fits in u64"),
-                );
+                )?;
+                self.tar
+                    .emit_symlink(entry.oid, &path, entry.mode, &target)?;
             }
             0o100000 => {
                 let len = self.blob_len(entry.oid)?;
-                self.charge_zip(path.len(), len);
+                self.charge_zip(path.len(), len)?;
                 self.tar.begin_file(entry.oid, &path, entry.mode, len)?;
                 self.stream_blob(entry.oid, len)?;
                 self.tar.end_body(len)?;
@@ -1686,12 +1725,91 @@ mod tests {
         }
     }
 
+    fn shared_dag_plan(store: &Store, kind: HashKind, k: usize, depth: usize) -> ArchivePlan {
+        let blob = put(store, ObjectKind::Blob, b"shared leaf payload\n");
+        let mut current_tree = put(
+            store,
+            ObjectKind::Tree,
+            &tree_bytes(&[(b"leaf.txt", 0o100644, blob)]),
+        );
+        for _ in 0..depth {
+            let names: Vec<Vec<u8>> = (0..k).map(|i| format!("c{i}").into_bytes()).collect();
+            let entries: Vec<(&[u8], u32, Oid)> = names
+                .iter()
+                .map(|name| (name.as_slice(), 0o040000, current_tree))
+                .collect();
+            current_tree = put(store, ObjectKind::Tree, &tree_bytes(&entries));
+        }
+        let commit = put(
+            store,
+            ObjectKind::Commit,
+            &commit_bytes(current_tree, &[], MTIME),
+        );
+        plan_commit_archive(store, kind, commit).expect("plan")
+    }
+
+    #[test]
+    fn shared_subtree_dag_refuses_when_cap_exceeded_and_exact_under_cap() {
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+
+        let plan = shared_dag_plan(&store, kind, 4, 6);
+        let tiny_cap = 1000;
+        let err = count_commit_tar(&store, kind, &plan, tiny_cap, u64::MAX, &Interrupt::none())
+            .expect_err("tiny cap must abort DAG walk early");
+        assert_eq!(err.code(), ruk_core::error::ErrorCode::ELimit);
+        assert!(
+            err.to_string().contains("exceeds the 1000-byte cap"),
+            "error should name the cap: {err}"
+        );
+
+        let counted = count_commit_tar(&store, kind, &plan, u64::MAX, u64::MAX, &Interrupt::none())
+            .expect("under cap");
+        let mut streamed = Vec::new();
+        stream_commit_tar(
+            &store,
+            kind,
+            &plan,
+            &Interrupt::none(),
+            Collect(&mut streamed),
+        )
+        .expect("stream");
+        assert!(counted.tar > 0);
+        assert_eq!(
+            counted.tar,
+            u64::try_from(streamed.len()).expect("length fits in u64")
+        );
+
+        let exploding_plan = shared_dag_plan(&store, kind, 4, 16);
+        let err = count_commit_tar(
+            &store,
+            kind,
+            &exploding_plan,
+            tiny_cap,
+            u64::MAX,
+            &Interrupt::none(),
+        )
+        .expect_err("tiny cap must abort explosive DAG walk early");
+        assert_eq!(err.code(), ruk_core::error::ErrorCode::ELimit);
+        assert!(
+            err.to_string().contains("exceeds the 1000-byte cap"),
+            "error should name the cap: {err}"
+        );
+    }
+
     #[test]
     fn measured_count_matches_streamed_bytes() {
         let fx = fixture();
         let plan = plan_commit_archive(&fx.store, fx.kind, fx.commit).expect("plan");
-        let counted =
-            count_commit_tar(&fx.store, fx.kind, &plan, &Interrupt::none()).expect("count");
+        let counted = count_commit_tar(
+            &fx.store,
+            fx.kind,
+            &plan,
+            u64::MAX,
+            u64::MAX,
+            &Interrupt::none(),
+        )
+        .expect("count");
         let mut streamed = Vec::new();
         stream_commit_tar(
             &fx.store,

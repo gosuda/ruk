@@ -1829,6 +1829,27 @@ pub struct ClaimAcquireArgs {
     pub subject: Option<ClaimSubject>,
 }
 
+#[derive(Serialize)]
+struct LegacyClaimAcquireDigestArgs<'a> {
+    paths: &'a [RepoPath],
+    ttl: ClaimTtl,
+    mode: ClaimMode,
+}
+
+impl ClaimAcquireArgs {
+    pub(crate) fn to_digest_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
+        if self.subject.is_none() {
+            postcard::to_allocvec(&LegacyClaimAcquireDigestArgs {
+                paths: &self.paths,
+                ttl: self.ttl,
+                mode: self.mode,
+            })
+        } else {
+            postcard::to_allocvec(self)
+        }
+    }
+}
+
 /// A held claim.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimRecord {
@@ -1926,6 +1947,40 @@ pub struct AttestStatement {
 pub struct AttestAddArgs {
     pub statement: AttestStatement,
     pub signature: AttestSignature,
+}
+
+#[derive(Serialize)]
+struct LegacyAttestStatementDigest<'a> {
+    subject: Oid,
+    kind: &'a AttestKind,
+    result: &'a AttestResult,
+    signed_at: Timestamp,
+    supersedes: Option<StatementDigest>,
+}
+
+#[derive(Serialize)]
+struct LegacyAttestAddDigestArgs<'a> {
+    statement: LegacyAttestStatementDigest<'a>,
+    signature: &'a AttestSignature,
+}
+
+impl AttestAddArgs {
+    pub(crate) fn to_digest_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
+        if self.statement.evidence.is_none() {
+            postcard::to_allocvec(&LegacyAttestAddDigestArgs {
+                statement: LegacyAttestStatementDigest {
+                    subject: self.statement.subject,
+                    kind: &self.statement.kind,
+                    result: &self.statement.result,
+                    signed_at: self.statement.signed_at,
+                    supersedes: self.statement.supersedes,
+                },
+                signature: &self.signature,
+            })
+        } else {
+            postcard::to_allocvec(self)
+        }
+    }
 }
 
 /// Whether a verified statement currently counts.
@@ -3893,14 +3948,20 @@ impl MethodKind {
 
 /// The postcard encoding of a mutation's arguments (never its request id).
 macro_rules! digest_args {
-    (Mutation, $params:expr) => {
+    (Mutation, AttestAdd, $params:expr) => {
+        Some($params.args.to_digest_postcard())
+    };
+    (Mutation, ClaimAcquire, $params:expr) => {
+        Some($params.args.to_digest_postcard())
+    };
+    (Mutation, $variant:ident, $params:expr) => {
         Some(postcard::to_allocvec(&$params.args))
     };
-    (Admin, $params:expr) => {{
+    (Admin, $variant:ident, $params:expr) => {{
         let _ = &$params;
         None
     }};
-    ($kind:ident, $params:expr) => {{
+    ($kind:ident, $variant:ident, $params:expr) => {{
         let _ = &$params;
         None
     }};
@@ -4060,7 +4121,7 @@ macro_rules! method_table {
             /// `E_INVALID` when the arguments cannot be encoded.
             pub fn digest_input_v1(&self) -> Result<Option<Vec<u8>>, CoreError> {
                 let args = match self {
-                    $(Self::$variant(params) => digest_args!($kind, params),)+
+                    $(Self::$variant(params) => digest_args!($kind, $variant, params),)+
                 };
                 let Some(args) = args else {
                     return Ok(None);
@@ -5672,6 +5733,149 @@ mod tests {
         );
         let open = Request::SessionOpen(Box::default());
         assert!(open.digest_input_v1().expect("ok").is_none());
+    }
+
+    #[test]
+    fn legacy_args_preserve_digest_when_new_trailing_options_are_none() {
+        use sha2::{Digest, Sha256};
+
+        #[derive(Serialize)]
+        struct LegacyAttestStatementWire {
+            subject: Oid,
+            kind: AttestKind,
+            result: AttestResult,
+            signed_at: Timestamp,
+            supersedes: Option<StatementDigest>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyAttestAddArgsWire {
+            statement: LegacyAttestStatementWire,
+            signature: AttestSignature,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyClaimAcquireArgsWire {
+            paths: Vec<RepoPath>,
+            ttl: ClaimTtl,
+            mode: ClaimMode,
+        }
+
+        let stmt = statement("review", "pass");
+        let signature = AttestSignature::new(format!("{SIGNATURE_BEGIN}\nAAAA\n{SIGNATURE_END}\n"))
+            .expect("signature");
+        let legacy_attest_args = LegacyAttestAddArgsWire {
+            statement: LegacyAttestStatementWire {
+                subject: stmt.subject,
+                kind: stmt.kind.clone(),
+                result: stmt.result.clone(),
+                signed_at: stmt.signed_at,
+                supersedes: stmt.supersedes,
+            },
+            signature: signature.clone(),
+        };
+        let legacy_attest_bytes =
+            postcard::to_allocvec(&legacy_attest_args).expect("legacy attest encode");
+
+        let current_attest_none = AttestAddArgs {
+            statement: stmt.clone(),
+            signature: signature.clone(),
+        };
+        assert!(current_attest_none.statement.evidence.is_none());
+        let current_attest_none_bytes = current_attest_none
+            .to_digest_postcard()
+            .expect("digest encode");
+        assert_eq!(current_attest_none_bytes, legacy_attest_bytes);
+
+        let raw_current_attest_bytes =
+            postcard::to_allocvec(&current_attest_none).expect("raw encode");
+        assert_ne!(raw_current_attest_bytes, legacy_attest_bytes);
+
+        let mut expected_attest_input = Vec::new();
+        push_field(&mut expected_attest_input, DIGEST_DOMAIN_V1).expect("push");
+        push_field(&mut expected_attest_input, b"attest.add").expect("push");
+        push_field(&mut expected_attest_input, &legacy_attest_bytes).expect("push");
+
+        let req_attest_none = Request::AttestAdd(mutation(1, current_attest_none));
+        let req_attest_none_input = req_attest_none
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_eq!(req_attest_none_input, expected_attest_input);
+
+        let mut current_attest_some = stmt.clone();
+        current_attest_some.evidence = Some(StatementDigest::from_bytes([0x42; 32]));
+        let req_attest_some = Request::AttestAdd(mutation(
+            1,
+            AttestAddArgs {
+                statement: current_attest_some,
+                signature,
+            },
+        ));
+        let req_attest_some_input = req_attest_some
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_ne!(req_attest_none_input, req_attest_some_input);
+
+        let legacy_claim_args = LegacyClaimAcquireArgsWire {
+            paths: vec![path("src"), path("tests")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+        };
+        let legacy_claim_bytes =
+            postcard::to_allocvec(&legacy_claim_args).expect("legacy claim encode");
+
+        let current_claim_none = ClaimAcquireArgs {
+            paths: vec![path("src"), path("tests")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+            subject: None,
+        };
+        let current_claim_none_bytes = current_claim_none
+            .to_digest_postcard()
+            .expect("digest encode");
+        assert_eq!(current_claim_none_bytes, legacy_claim_bytes);
+
+        let raw_current_claim_bytes =
+            postcard::to_allocvec(&current_claim_none).expect("raw encode");
+        assert_ne!(raw_current_claim_bytes, legacy_claim_bytes);
+
+        let mut expected_claim_input = Vec::new();
+        push_field(&mut expected_claim_input, DIGEST_DOMAIN_V1).expect("push");
+        push_field(&mut expected_claim_input, b"claim.acquire").expect("push");
+        push_field(&mut expected_claim_input, &legacy_claim_bytes).expect("push");
+
+        let req_claim_none = Request::ClaimAcquire(mutation(1, current_claim_none));
+        let req_claim_none_input = req_claim_none
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_eq!(req_claim_none_input, expected_claim_input);
+
+        let current_claim_some = ClaimAcquireArgs {
+            paths: vec![path("src"), path("tests")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+            subject: Some(ClaimSubject::Task(
+                TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+            )),
+        };
+        let req_claim_some = Request::ClaimAcquire(mutation(1, current_claim_some));
+        let req_claim_some_input = req_claim_some
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_ne!(req_claim_none_input, req_claim_some_input);
+
+        assert_eq!(
+            Sha256::digest(&req_attest_none_input).as_slice(),
+            Sha256::digest(&expected_attest_input).as_slice()
+        );
+        assert_eq!(
+            Sha256::digest(&req_claim_none_input).as_slice(),
+            Sha256::digest(&expected_claim_input).as_slice()
+        );
     }
 
     fn statement(kind: &str, result: &str) -> AttestStatement {
