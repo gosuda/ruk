@@ -28,8 +28,9 @@ use crate::revset::eval::glob_match;
 use crate::store::Store;
 use crate::workcopy::tree::TreeMode;
 
-/// Most undecided files one `search` walk collects before it seals the
-/// page. Decided files skip free, so resumption always advances.
+/// Most traversal visits one `search` walk charges before it seals the
+/// page: descended directories plus undecided files. Decided files and
+/// fully decided subtrees skip free, so resumption always advances.
 pub(crate) const SEARCH_MAX_WALK_FILES: usize = 100_000;
 
 /// Deepest directory one `search` walk descends; deeper trees refuse.
@@ -146,6 +147,13 @@ pub(crate) struct SearchWalk {
     pub frontier: Option<Vec<u8>>,
     /// Blobs skipped past [`SEARCH_SKIP_BLOB_BYTES`] without payload reads.
     pub prefilter_skipped: u64,
+    /// Traversal visits charged against [`SEARCH_MAX_WALK_FILES`]:
+    /// descended directories plus undecided files.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "observed by traversal-budget regression tests")
+    )]
+    pub visits: usize,
 }
 
 /// Decides whether `path` survives the §2 filter: under the selected paths,
@@ -195,6 +203,15 @@ fn dir_selected(paths: &PathSelection, dir: &[u8]) -> bool {
     }
 }
 
+/// Decides whether directory `dir` (with trailing slash) holds only decided
+/// files: the resume ceiling sits past the whole prefix without naming a
+/// path inside it, so every file below skips and the descent charges
+/// nothing. Resumption therefore never re-pays a sealed prefix and the
+/// frontier strictly advances past every seal.
+fn dir_below_resume(resume: WalkResume<'_>, dir: &[u8]) -> bool {
+    !resume.below.is_empty() && !resume.below.starts_with(dir) && dir < resume.below
+}
+
 /// Where one `search` walk resumes: files at or below the ceiling stay
 /// undecided, everything else skips free without counting at the bound.
 #[derive(Clone, Copy, Debug)]
@@ -205,10 +222,21 @@ pub(crate) struct WalkResume<'a> {
     pub equal: bool,
 }
 
+/// What one `search` walk seals against instead of refusing: caller
+/// cancellation plus the page deadline, checked at every tree level.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WalkLimits<'a> {
+    /// Caller cancellation; a fired token seals the walk.
+    pub cancel: &'a Cancel,
+    /// Page deadline; a passed instant seals the walk.
+    pub deadline: StdInstant,
+}
+
 /// Walk state threaded through one recursive descent.
 struct WalkState<'a> {
     args: &'a SearchArgs,
     resume: WalkResume<'a>,
+    limits: WalkLimits<'a>,
     ordered: Vec<(Vec<u8>, Oid)>,
     collected: usize,
     prefilter_skipped: u64,
@@ -220,6 +248,15 @@ struct WalkState<'a> {
 /// byte order: levels parse in git order and each selected subdirectory
 /// is walked before its later siblings. The bound therefore seals at a
 /// true prefix frontier, and resumption never skips an unvisited path.
+///
+/// Every descended directory charges the traversal budget alongside
+/// undecided files, so shared-subtree fan-out seals instead of expanding
+/// exponentially. Fully decided subtrees skip free without charging, so a
+/// resumed walk never re-pays the sealed prefix: it descends into the
+/// sealed prefix with a fresh budget, the frontier strictly advances, and
+/// re-entry always makes progress instead of sealing forever.
+/// Cancellation and a passed deadline seal at the current prefix frontier
+/// exactly like the file bound does.
 ///
 /// # Errors
 /// `E_CORRUPT` for a damaged tree, `E_LIMIT` past the depth bound.
@@ -237,6 +274,16 @@ fn walk_tree_level(
             format!("search tree is deeper than {SEARCH_MAX_TREE_DEPTH}"),
         ));
     }
+    if state.limits.cancel.check().is_err() || StdInstant::now() >= state.limits.deadline {
+        // Seal at the current prefix frontier exactly like the file bound
+        // does: the next page resumes after the sealed prefix instead of
+        // refusing. The root names the empty prefix, a restart cursor the
+        // next page serves with fresh per-page limits; without it an early
+        // seal would present as a complete page and drop every path.
+        state.complete = false;
+        state.frontier = Some(prefix.to_vec());
+        return Ok(());
+    }
     for item in tree_items(store, kind, oid)? {
         if !state.complete {
             return Ok(());
@@ -247,6 +294,24 @@ fn walk_tree_level(
             TreeMode::Tree => {
                 if dir_selected(&state.args.paths, &path) {
                     path.push(b'/');
+                    if dir_below_resume(state.resume, &path) {
+                        // Fully decided: every file below already skips,
+                        // so the descent charges nothing and resumption
+                        // never re-pays the sealed prefix.
+                        continue;
+                    }
+                    // Directory visits charge the traversal budget
+                    // alongside undecided files: fan-out over shared
+                    // subtrees seals here instead of expanding
+                    // exponentially. The seal names the directory prefix;
+                    // resumption descends into it with a fresh budget, so
+                    // the frontier strictly advances past the seal.
+                    state.collected = state.collected.saturating_add(1);
+                    if state.collected > SEARCH_MAX_WALK_FILES {
+                        state.complete = false;
+                        state.frontier = Some(path);
+                        return Ok(());
+                    }
                     walk_tree_level(store, kind, item.oid, &path, depth + 1, state)?;
                 } else {
                     state.frontier = Some(path);
@@ -299,10 +364,14 @@ fn walk_tree_level(
 ///
 /// The descent recurses in place, so visited paths stay in global byte
 /// order: a bound seal always names a true prefix frontier, and
-/// resumption never skips an unvisited path. Only undecided files count
-/// at the bound, so resumption always advances past the sealed frontier.
-/// Blobs past [`SEARCH_SKIP_BLOB_BYTES`] never load; the walk reports
-/// their count instead of refusing.
+/// resumption never skips an unvisited path. Descended directories and
+/// undecided files share the [`SEARCH_MAX_WALK_FILES`] traversal budget,
+/// so shared-subtree fan-out seals instead of expanding exponentially;
+/// decided files and fully decided subtrees skip free, so resumption
+/// always advances past the sealed frontier. Blobs past
+/// [`SEARCH_SKIP_BLOB_BYTES`] never load; the walk reports their count
+/// instead of refusing. Cancellation and a passed `deadline` seal the
+/// walk at the current prefix frontier instead of refusing.
 ///
 /// # Errors
 /// `E_CORRUPT` for a damaged tree, `E_LIMIT` past the depth bound.
@@ -312,10 +381,12 @@ pub(crate) fn collect_search_candidates(
     root: Oid,
     args: &SearchArgs,
     resume: WalkResume<'_>,
+    limits: WalkLimits<'_>,
 ) -> Result<SearchWalk, CoreError> {
     let mut state = WalkState {
         args,
         resume,
+        limits,
         ordered: Vec::new(),
         collected: 0,
         prefilter_skipped: 0,
@@ -329,6 +400,7 @@ pub(crate) fn collect_search_candidates(
         complete: state.complete,
         frontier: state.frontier,
         prefilter_skipped: state.prefilter_skipped,
+        visits: state.collected,
     })
 }
 
@@ -945,8 +1017,18 @@ pub fn search_content_local(
         below: skip_before.0.as_slice(),
         equal: skip_before.1 == 0 && !skip_before.0.is_empty(),
     };
-    let walk = collect_search_candidates(store, store.hash_kind(), root, args, resume)?;
     let (_guard, cancel) = cancellation();
+    let walk = collect_search_candidates(
+        store,
+        store.hash_kind(),
+        root,
+        args,
+        resume,
+        WalkLimits {
+            cancel: &cancel,
+            deadline,
+        },
+    )?;
     let stop = Arc::new(AtomicBool::new(false));
     let mut fold = SearchFold::new(
         limit,
@@ -1447,8 +1529,19 @@ mod tests {
             below: &[],
             equal: false,
         };
-        let walk = collect_search_candidates(&store, store.hash_kind(), root, &args, resume)
-            .expect("walk collects");
+        let (_walk_guard, walk_cancel) = crate::coord::cancellation();
+        let walk = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            resume,
+            WalkLimits {
+                cancel: &walk_cancel,
+                deadline: StdInstant::now() + Duration::from_secs(60),
+            },
+        )
+        .expect("walk collects");
         assert!(walk.complete);
         assert_eq!(walk.entries.len(), 3);
         assert_eq!(walk.prefilter_skipped, 1);
@@ -1496,11 +1589,18 @@ mod tests {
             below: &[],
             equal: false,
         };
+        let (_walk_guard, walk_cancel) = crate::coord::cancellation();
+        let walk_deadline = StdInstant::now() + Duration::from_secs(60);
+        let limits = || WalkLimits {
+            cancel: &walk_cancel,
+            deadline: walk_deadline,
+        };
         let mut args = search_args(literal("needle"));
         args.globs = vec!["**/*.rs".to_string()];
         args.exclude_globs = vec!["vendor/**".to_string()];
-        let walk = collect_search_candidates(&store, store.hash_kind(), root, &args, resume)
-            .expect("walk collects");
+        let walk =
+            collect_search_candidates(&store, store.hash_kind(), root, &args, resume, limits())
+                .expect("walk collects");
         let mut paths: Vec<Vec<u8>> = walk.entries.iter().map(|(path, _)| path.clone()).collect();
         paths.sort();
         assert_eq!(paths, vec![b"src/a.rs".to_vec()]);
@@ -1515,11 +1615,168 @@ mod tests {
                 below: &[],
                 equal: false,
             },
+            limits(),
         )
         .expect("walk collects");
         let mut paths: Vec<Vec<u8>> = walk.entries.iter().map(|(path, _)| path.clone()).collect();
         paths.sort();
         assert_eq!(paths, vec![b"src/a.rs".to_vec(), b"src/b.txt".to_vec()]);
+    }
+
+    #[test]
+    fn walk_dir_budget_seals_shared_fan_out() {
+        use crate::index::FileMode;
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("fanout");
+        let blob = put_blob(&store, b"needle\n");
+        // Every level names two directories sharing one child tree, so an
+        // unbudgeted walk visits 2^24 paths. All files filter out, leaving
+        // only directory visits to charge the traversal budget.
+        let mut child = put_tree(
+            &store,
+            &[("f.txt", TreeMode::File(FileMode::Regular), blob)],
+        );
+        for _ in 0..24 {
+            child = put_tree(
+                &store,
+                &[("l", TreeMode::Tree, child), ("r", TreeMode::Tree, child)],
+            );
+        }
+        let mut args = search_args(literal("needle"));
+        args.exclude_globs = vec!["**".to_string()];
+        let (_guard, cancel) = crate::coord::cancellation();
+        let started = StdInstant::now();
+        let walk = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            child,
+            &args,
+            WalkResume {
+                below: &[],
+                equal: false,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(60),
+            },
+        )
+        .expect("fan-out seals");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "fan-out stays wall-clock bounded"
+        );
+        assert!(!walk.complete, "directory visits seal the fan-out");
+        assert!(
+            walk.entries.len() <= SEARCH_MAX_WALK_FILES,
+            "collection stays within the traversal budget"
+        );
+        assert!(walk.entries.is_empty(), "excluded files collect nothing");
+        assert!(
+            walk.visits > 10_000 && walk.visits <= SEARCH_MAX_WALK_FILES + 1,
+            "directory fan-out charges a bounded visit count"
+        );
+        assert!(
+            walk.frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.ends_with(b"/")),
+            "seal names a directory prefix frontier"
+        );
+    }
+
+    #[test]
+    fn walk_seals_on_cancel_or_deadline() {
+        use crate::index::FileMode;
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("seal");
+        let blob = put_blob(&store, b"needle\n");
+        let root = put_tree(
+            &store,
+            &[("a.txt", TreeMode::File(FileMode::Regular), blob)],
+        );
+        let args = search_args(literal("needle"));
+        let resume = WalkResume {
+            below: &[],
+            equal: false,
+        };
+        let started = StdInstant::now();
+        // A fired token seals instead of walking.
+        let (handle, cancelled) = crate::coord::cancellation();
+        handle.cancel();
+        let walk = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            resume,
+            WalkLimits {
+                cancel: &cancelled,
+                deadline: StdInstant::now() + Duration::from_secs(60),
+            },
+        )
+        .expect("cancel seals instead of refusing");
+        assert!(!walk.complete, "cancellation seals the walk");
+        assert_eq!(
+            walk.frontier,
+            Some(Vec::new()),
+            "early seal keeps a restart cursor"
+        );
+        // An expired deadline seals the same way.
+        let (_live_guard, live) = crate::coord::cancellation();
+        let walk = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            resume,
+            WalkLimits {
+                cancel: &live,
+                deadline: StdInstant::now() - Duration::from_secs(1),
+            },
+        )
+        .expect("deadline seals instead of refusing");
+        assert!(!walk.complete, "deadline seals the walk");
+        assert_eq!(
+            walk.frontier,
+            Some(Vec::new()),
+            "early seal keeps a restart cursor"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "seals stay wall-clock bounded"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn walk_depth_bound_still_refuses() {
+        use crate::index::FileMode;
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("depth");
+        let blob = put_blob(&store, b"needle\n");
+        let mut child = put_tree(
+            &store,
+            &[("f.txt", TreeMode::File(FileMode::Regular), blob)],
+        );
+        for _ in 0..(SEARCH_MAX_TREE_DEPTH + 2) {
+            child = put_tree(&store, &[("d", TreeMode::Tree, child)]);
+        }
+        let (_guard, cancel) = crate::coord::cancellation();
+        let err = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            child,
+            &search_args(literal("needle")),
+            WalkResume {
+                below: &[],
+                equal: false,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(60),
+            },
+        )
+        .expect_err("depth refuses");
+        assert_eq!(err.code, ErrorCode::ELimit);
     }
 
     #[test]
