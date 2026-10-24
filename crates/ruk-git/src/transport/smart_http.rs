@@ -331,6 +331,20 @@ fn scrubbed_preview(preview: &[u8], secrets: &[String]) -> String {
     text[..end].to_owned()
 }
 
+fn scrub_outcome_reason(reason: &str, secrets: &[String]) -> String {
+    let userinfo = credentials::scrub_userinfo(reason);
+    let scrubbed = credentials::scrub_secrets(userinfo.as_bytes(), secrets);
+    String::from_utf8_lossy(&scrubbed).into_owned()
+}
+
+fn scrub_outcomes(outcomes: &mut [RefOutcome], secrets: &[String]) {
+    for outcome in outcomes {
+        if let super::push::RefResult::Rejected { reason } = &mut outcome.result {
+            *reason = scrub_outcome_reason(reason, secrets);
+        }
+    }
+}
+
 /// The honest refusal behind one non-2xx RPC status: 401/403 forbid
 /// (rotate the token), 404 misses, 429 limits, 3xx moves, anything else is
 /// offline. The status classifies the [`GitError::Http`] code, and the
@@ -942,10 +956,11 @@ fn push_pack_inner(
         interrupt,
     } = call;
     let kind = store.hash_kind();
+    let secrets = auth_secrets(auth);
     let caps = &adv.capabilities;
     let report_v2 = caps.has("report-status-v2");
     if !report_v2 && !caps.has("report-status") {
-        let outcomes: Vec<RefOutcome> = req
+        let mut outcomes: Vec<RefOutcome> = req
             .updates
             .iter()
             .map(|update| RefOutcome {
@@ -956,6 +971,7 @@ fn push_pack_inner(
                 },
             })
             .collect();
+        scrub_outcomes(&mut outcomes, &secrets);
         plan.refuse_locally(outcomes.clone())?;
         push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
         return Ok(outcomes);
@@ -1007,11 +1023,13 @@ fn push_pack_inner(
                 },
             });
         }
+        scrub_outcomes(&mut outcomes, &secrets);
         plan.refuse_locally(outcomes.clone())?;
         push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
         return Ok(outcomes);
     }
     if live.is_empty() {
+        scrub_outcomes(&mut outcomes, &secrets);
         plan.refuse_locally(outcomes.clone())?;
         push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
         return Ok(outcomes);
@@ -1167,6 +1185,7 @@ fn push_pack_inner(
                         reason: status_err.to_string(),
                     },
                 }));
+                scrub_outcomes(&mut refused, &secrets);
                 plan.finalize(refused.clone())?;
                 push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
                 return Ok(refused);
@@ -1188,6 +1207,7 @@ fn push_pack_inner(
     push::check_report_covers_live(&live, &server)?;
     let mut report = server;
     report.extend(outcomes);
+    scrub_outcomes(&mut report, &secrets);
     plan.finalize(report.clone())?;
     push::persist(store, plan, kind, push::current_encoding(store, plan)?)?;
     Ok(report)
@@ -2767,6 +2787,134 @@ mod tests {
             "pack must stream, not buffer: {:?}",
             requests[0].head
         );
+    }
+
+    #[test]
+    fn transport_persists_scrubbed_report_reasons() {
+        use super::super::push::{PushUpdate, PushWireRequest};
+        use super::super::session::test_support::store_with_pack;
+        use ruk_core::change::PlanId;
+
+        let kind = HashKind::Sha1;
+        let pack = include_bytes!("fixtures/basic.pack").to_vec();
+        let store = store_with_pack(kind, &pack);
+        let zero = kind.zero_oid();
+        let mut adv_body = Vec::new();
+        pktline::encode_data(&mut adv_body, b"# service=git-receive-pack\n").expect("frame");
+        pktline::encode_flush(&mut adv_body);
+        let first = format!(
+            "{} capabilities^{{}}\0{}\n",
+            zero.to_hex(),
+            "report-status-v2 report-status side-band-64k delete-refs ofs-delta object-format=sha1",
+        );
+        pktline::encode_data(&mut adv_body, first.as_bytes()).expect("frame");
+        pktline::encode_flush(&mut adv_body);
+
+        let secret = "injected-secret-token-12345";
+        let ng_line = format!("ng refs/heads/x rejected token {secret}\n");
+        let mut report = sideband_frame(b"unpack ok\n");
+        report.extend_from_slice(&sideband_frame(ng_line.as_bytes()));
+        report.extend_from_slice(b"0000");
+
+        let (base, server) = fake_smart_server(vec![
+            (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    SmartService::ReceivePack.advertisement_type(),
+                )],
+                adv_body,
+                false,
+            ),
+            (
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    SmartService::ReceivePack.result_type(),
+                )],
+                report,
+                false,
+            ),
+        ]);
+        let auth = credentials::AuthPolicy::explicit(credentials::TransportAuth {
+            kind: credentials::TransportAuthKind::Bearer,
+            credential: secret.to_owned(),
+            origin: credentials::TransportAuth::origin_of(&base).expect("origin"),
+        });
+        let adv = discover(
+            &base,
+            SmartService::ReceivePack,
+            kind,
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("discover");
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/x".to_vec(),
+            old: zero,
+            new: oid(FOUR),
+        }];
+        let req = PushWireRequest {
+            updates: updates.clone(),
+            atomic: false,
+        };
+        let plan_id = PlanId::generate();
+        let mut plan = PushPlanRecord::prepare(plan_id, base.as_bytes().to_vec(), false, updates);
+        let outcomes = push_pack(
+            &base,
+            &adv,
+            &store,
+            &mut plan,
+            &req,
+            RpcCall {
+                extra: &[],
+                auth: &auth,
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("push_pack returns report outcomes");
+        assert_eq!(outcomes.len(), 1);
+        let super::push::RefResult::Rejected { reason } = &outcomes[0].result else {
+            panic!("expected rejected: {outcomes:?}");
+        };
+        assert!(!reason.contains(secret), "outcome leaked secret: {reason}");
+        assert!(reason.contains("[redacted]"));
+
+        let super::push::RefResult::Rejected {
+            reason: in_memory_reason,
+        } = &plan.outcomes[0].result
+        else {
+            panic!("expected rejected in plan outcomes: {plan:?}");
+        };
+        assert!(
+            !in_memory_reason.contains(secret),
+            "in-memory plan leaked secret: {in_memory_reason}"
+        );
+        assert!(in_memory_reason.contains("[redacted]"));
+
+        let persisted_bytes = push::current_encoding(&store, &plan)
+            .expect("read fact")
+            .expect("plan persisted");
+        let persisted = PushPlanRecord::decode(plan_id, kind, &persisted_bytes).expect("decode");
+        let super::push::RefResult::Rejected {
+            reason: persisted_reason,
+        } = &persisted.outcomes[0].result
+        else {
+            panic!("expected rejected in persisted plan: {persisted:?}");
+        };
+        assert!(
+            !persisted_reason.contains(secret),
+            "persisted plan leaked secret: {persisted_reason}"
+        );
+        assert!(persisted_reason.contains("[redacted]"));
+        let _ = server.join();
     }
 
     #[test]

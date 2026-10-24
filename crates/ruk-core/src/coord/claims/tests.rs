@@ -387,8 +387,79 @@ fn live_holders_exports_only_live_holders() {
     .expect("reacquire");
     publish(&change, &fixture);
     assert_eq!(
-        live_holders(&fixture.store, &fixture.claims).expect("holders"),
+        live_holders(&fixture.store, &fixture.claims, &[holder(1), holder(2)]).expect("holders"),
         vec![holder(2)]
+    );
+}
+
+#[test]
+fn retention_holder_check_is_bounded_to_selected_sessions() {
+    let fixture = Fixture::new();
+    for i in 10..60u8 {
+        let p = format!("seeded-path-{i}");
+        let change = seal_acquire(
+            &fixture.store,
+            &fixture.claims,
+            holder(i),
+            claim(i),
+            task_args(&[&p], 60),
+            None,
+        )
+        .expect("acquire background claim");
+        publish(&change, &fixture);
+    }
+
+    let live_change = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(1),
+        claim(1),
+        task_args(&["live-path"], 60),
+        None,
+    )
+    .expect("acquire live claim");
+    publish(&live_change, &fixture);
+
+    let expired_change = seal_acquire(
+        &fixture.store,
+        &fixture.claims,
+        holder(2),
+        claim(2),
+        task_args(&["expired-path"], 10),
+        None,
+    )
+    .expect("acquire expired claim");
+    publish(&expired_change, &fixture);
+
+    fixture
+        .clock
+        .advance_injected(Duration::from_secs(20), None)
+        .expect("advance clock past expired claim");
+
+    let empty_before = fixture.store.io_stats();
+    let empty_holders =
+        live_holders(&fixture.store, &fixture.claims, &[]).expect("empty candidates");
+    assert!(empty_holders.is_empty());
+    let empty_after = fixture.store.io_stats();
+    assert_eq!(empty_after.fact_page_calls, empty_before.fact_page_calls);
+    assert_eq!(empty_after.fact_rows, empty_before.fact_rows);
+
+    let before = fixture.store.io_stats();
+    let protected = live_holders(
+        &fixture.store,
+        &fixture.claims,
+        &[holder(1), holder(2), holder(3)],
+    )
+    .expect("bounded holders lookup");
+    assert_eq!(protected, vec![holder(1)]);
+
+    let after = fixture.store.io_stats();
+    let page_calls = after.fact_page_calls - before.fact_page_calls;
+    let fact_rows = after.fact_rows - before.fact_rows;
+    assert!(page_calls <= 3);
+    assert!(
+        fact_rows <= 6,
+        "holder lookups must read at most a couple of rows per candidate, got {fact_rows}"
     );
 }
 

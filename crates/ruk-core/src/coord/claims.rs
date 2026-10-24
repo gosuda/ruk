@@ -678,47 +678,49 @@ pub(crate) fn sweep_page(
     })
 }
 
-/// Exports the holder sessions of live claims.
-///
-/// Hosted maintenance calls this before sweeping sessions so holders of
-/// unexpired claims survive: their sessions stay resumable across rukie
-/// restarts, which is what lets task claims outlive any one session's idle
-/// lifetime. Expired claims confer no protection even when their rows have
-/// not been swept yet.
-///
-/// # Errors
-/// `E_CORRUPT` on a damaged index or record, `E_LIMIT` past the work budget.
-pub(crate) fn live_holders(store: &Store, clock: &ClaimClock) -> Result<Vec<SessionId>, CoreError> {
+pub(crate) fn live_holders(
+    store: &Store,
+    clock: &ClaimClock,
+    candidates: &[SessionId],
+) -> Result<Vec<SessionId>, CoreError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
     let now = clock.now()?;
     let budget = FactPageBudget::new(MAX_PAGE_SIZE, MAX_CONTROL_FRAME_BYTES);
+    let mut unique_candidates = candidates.to_vec();
+    unique_candidates.sort();
+    unique_candidates.dedup();
     let mut holders = Vec::new();
-    let mut after = Some(b"R".to_vec());
-    loop {
-        let page = store.fact_page(FactTable::Claims, after.as_deref(), budget)?;
-        if page.rows.is_empty() {
-            break;
-        }
-        let mut work = Work::new();
-        let mut ended = false;
-        for item in &page.rows {
-            if !item.key.starts_with(b"R") {
-                ended = true;
+    let mut work = Work::new();
+    for holder in unique_candidates {
+        let prefix = holder_prefix(holder);
+        let mut after = None;
+        loop {
+            let page =
+                store.fact_page_prefixed(FactTable::Claims, after.as_deref(), &prefix, budget)?;
+            if page.rows.is_empty() {
                 break;
             }
-            work.charge(
-                item.key
-                    .len()
-                    .checked_add(item.value.len())
-                    .ok_or_else(limit)?,
-            )?;
-            let row = decode_claim(store, &item.key, &item.value)?;
-            if row.record.expires_at > now {
-                holders.push(row.record.holder);
+            let mut found_live = false;
+            for item in &page.rows {
+                work.charge(
+                    item.key
+                        .len()
+                        .checked_add(item.value.len())
+                        .ok_or_else(limit)?,
+                )?;
+                let (_, row) = indexed_claim(store, &item.key, &item.value, &mut work)?;
+                if row.record.expires_at > now {
+                    holders.push(holder);
+                    found_live = true;
+                    break;
+                }
+                after = Some(item.key.clone());
             }
-            after = Some(item.key.clone());
-        }
-        if ended || !page.more {
-            break;
+            if found_live || !page.more {
+                break;
+            }
         }
     }
     holders.sort();

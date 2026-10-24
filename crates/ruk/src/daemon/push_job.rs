@@ -423,12 +423,12 @@ impl<'a> PushJob<'a> {
 /// across the send: without `Clone`, the send closure owns it outright,
 /// so a dropped invocation cannot release the key while its orphaned
 /// worker still sends.
-struct BlockingJob {
-    coordinator: Arc<HostedCoordinator>,
-    session: SessionId,
-    registry: Arc<Registry>,
-    repo: PathBuf,
-    key_half: Option<PushKeyWorkerHalf>,
+pub(crate) struct BlockingJob {
+    pub(crate) coordinator: Arc<HostedCoordinator>,
+    pub(crate) session: SessionId,
+    pub(crate) registry: Arc<Registry>,
+    pub(crate) repo: PathBuf,
+    pub(crate) key_half: Option<PushKeyWorkerHalf>,
 }
 
 impl BlockingJob {
@@ -680,13 +680,14 @@ impl BlockingJob {
     /// resolves the new tip, pins the CAS expectation, and applies the
     /// fast-forward gate. Returns `None` for a non-fast-forward update,
     /// which the caller reports as a local refusal without sending.
-    fn translate_update(
+    pub(crate) fn translate_update(
         &self,
         advertised: &[AdvertisedLocalRef],
         update: &ruk_core::protocol::PushUpdate,
     ) -> Result<Option<PushUpdate>, CoreError> {
         let store = self.coordinator.store();
-        let zero = store.hash_kind().zero_oid();
+        let kind = store.hash_kind();
+        let zero = kind.zero_oid();
         let name = update.remote_ref.as_bytes().to_vec();
         let entry = advertised.iter().find(|entry| entry.name == name);
         let advertised_tip = match entry {
@@ -711,6 +712,22 @@ impl BlockingJob {
             Some(RemoteExpect::Present { oid }) => oid,
             None => advertised_tip.unwrap_or(zero),
         };
+        if let PushSource::Commit { oid } = &update.source {
+            oid.expect_kind(kind, "push source commit")
+                .map_err(|err| CoreError::new(ErrorCode::EInvalid, err.to_string()))?;
+        }
+        if let Some(RemoteExpect::Present { oid }) = update.expected_old {
+            oid.expect_kind(kind, "push expected old")
+                .map_err(|err| CoreError::new(ErrorCode::EInvalid, err.to_string()))?;
+        }
+        if new != zero {
+            new.expect_kind(kind, "push new OID")
+                .map_err(|err| CoreError::new(ErrorCode::EInvalid, err.to_string()))?;
+        }
+        if old != zero {
+            old.expect_kind(kind, "push old OID")
+                .map_err(|err| CoreError::new(ErrorCode::EInvalid, err.to_string()))?;
+        }
         if !update.force
             && old != zero
             && new != zero
@@ -1839,6 +1856,137 @@ mod tests {
         assert_eq!(persisted_plan.state, PlanState::Confirmed);
         assert_eq!(persisted_plan.updates, updates);
         assert_eq!(persisted_plan.outcomes, report);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sha1_new_oid_refused_on_sha256_store() {
+        let root = std::env::temp_dir().join(format!("ruk-push-oid-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
+        let store = Arc::new(
+            Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+        );
+        let peer = Principal::from_peer_uid(1000);
+        let coordinator = Arc::new(
+            HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+        );
+        let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+        let job = BlockingJob {
+            coordinator: Arc::clone(&coordinator),
+            session: SessionId::generate(),
+            registry: Arc::clone(&registry),
+            repo: root.clone(),
+            key_half: None,
+        };
+
+        let sha1_new = Oid::from_bytes(&[0x11; 20]).expect("sha1 oid");
+        let update = ruk_core::protocol::PushUpdate {
+            remote_ref: RefName::new("refs/heads/feature".to_owned()).expect("valid ref name"),
+            source: PushSource::Commit { oid: sha1_new },
+            expected_old: Some(RemoteExpect::Absent),
+            force: false,
+        };
+
+        let err = job
+            .translate_update(&[], &update)
+            .expect_err("SHA-1 new OID on SHA-256 store must be refused");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+
+        let page_budget = ruk_core::store::FactPageBudget::new(1024, 65536);
+        let page = store
+            .fact_page(FactTable::PushPlans, None, page_budget)
+            .expect("page");
+        assert!(page.rows.is_empty(), "PushPlans must be empty");
+
+        drop(job);
+        drop(coordinator);
+        drop(store);
+
+        let reopen_budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
+        let reopened =
+            Store::open(&root.join(".ruk"), reopen_budget).expect("store reopens cleanly");
+        let page_after = reopened
+            .fact_page(
+                FactTable::PushPlans,
+                None,
+                ruk_core::store::FactPageBudget::new(1024, 65536),
+            )
+            .expect("page after reopen");
+        assert!(page_after.rows.is_empty(), "PushPlans stays empty");
+        drop(reopened);
+
+        let _handle = registry
+            .open_by_path(&root)
+            .expect("reopen repository succeeds");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sha1_expected_old_refused_on_sha256_store() {
+        let root = std::env::temp_dir().join(format!("ruk-push-oid-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
+        let store = Arc::new(
+            Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+        );
+        let peer = Principal::from_peer_uid(1000);
+        let coordinator = Arc::new(
+            HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+        );
+        let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+        let job = BlockingJob {
+            coordinator: Arc::clone(&coordinator),
+            session: SessionId::generate(),
+            registry: Arc::clone(&registry),
+            repo: root.clone(),
+            key_half: None,
+        };
+
+        let sha256_new = oid_fill(0x33);
+        let sha1_old = Oid::from_bytes(&[0x22; 20]).expect("sha1 oid");
+        let update = ruk_core::protocol::PushUpdate {
+            remote_ref: RefName::new("refs/heads/main".to_owned()).expect("valid ref name"),
+            source: PushSource::Commit { oid: sha256_new },
+            expected_old: Some(RemoteExpect::Present { oid: sha1_old }),
+            force: false,
+        };
+
+        let err = job
+            .translate_update(&[], &update)
+            .expect_err("SHA-1 expected old OID on SHA-256 store must be refused");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+
+        let page_budget = ruk_core::store::FactPageBudget::new(1024, 65536);
+        let page = store
+            .fact_page(FactTable::PushPlans, None, page_budget)
+            .expect("page");
+        assert!(page.rows.is_empty(), "PushPlans must be empty");
+
+        drop(job);
+        drop(coordinator);
+        drop(store);
+
+        let reopen_budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
+        let reopened =
+            Store::open(&root.join(".ruk"), reopen_budget).expect("store reopens cleanly");
+        let page_after = reopened
+            .fact_page(
+                FactTable::PushPlans,
+                None,
+                ruk_core::store::FactPageBudget::new(1024, 65536),
+            )
+            .expect("page after reopen");
+        assert!(page_after.rows.is_empty(), "PushPlans stays empty");
+        drop(reopened);
+
+        let _handle = registry
+            .open_by_path(&root)
+            .expect("reopen repository succeeds");
 
         let _ = std::fs::remove_dir_all(&root);
     }

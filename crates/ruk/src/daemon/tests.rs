@@ -7808,3 +7808,128 @@ fn fork_links_sync_segment_dirs_before_metadata() {
     read.bytes.read_to_end(&mut bytes).expect("read spool");
     assert_eq!(bytes, b"hello world");
 }
+
+#[test]
+fn sha1_new_oid_refused_on_sha256_store() {
+    use super::push_job::BlockingJob;
+    use ruk_core::coord::{HostedCoordinator, Principal};
+    use ruk_core::ids::HashKind;
+    use ruk_core::protocol::{PushSource, PushUpdate, RemoteExpect};
+    use ruk_core::refdata::RefName;
+
+    let root = temp_root("sha1-new-on-sha256");
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Arc::new(
+        Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+    );
+    let peer = Principal::from_peer_uid(1000);
+    let coordinator = Arc::new(
+        HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+    );
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+    let job = BlockingJob {
+        coordinator: Arc::clone(&coordinator),
+        session: SessionId::generate(),
+        registry: Arc::clone(&registry),
+        repo: root.clone(),
+        key_half: None,
+    };
+
+    let sha1_new = Oid::from_bytes(&[0x11; 20]).expect("sha1 oid");
+    let update = PushUpdate {
+        remote_ref: RefName::new("refs/heads/feature".to_owned()).expect("valid ref name"),
+        source: PushSource::Commit { oid: sha1_new },
+        expected_old: Some(RemoteExpect::Absent),
+        force: false,
+    };
+
+    let err = job
+        .translate_update(&[], &update)
+        .expect_err("SHA-1 new OID on SHA-256 store must be refused");
+    assert_eq!(err.code, ErrorCode::EInvalid);
+
+    let page_budget = FactPageBudget::new(1024, 65536);
+    let page = store
+        .fact_page(FactTable::PushPlans, None, page_budget)
+        .expect("page");
+    assert!(page.rows.is_empty(), "PushPlans must be empty");
+
+    drop(job);
+    drop(coordinator);
+    drop(store);
+
+    let reopen_budget = Arc::new(PreparationBudget::reference_defaults());
+    let reopened = Store::open(&root.join(".ruk"), reopen_budget).expect("store reopens cleanly");
+    let page_after = reopened
+        .fact_page(FactTable::PushPlans, None, FactPageBudget::new(1024, 65536))
+        .expect("page after reopen");
+    assert!(page_after.rows.is_empty(), "PushPlans stays empty");
+    drop(reopened);
+
+    let _handle = registry
+        .open_by_path(&root)
+        .expect("reopen repository succeeds");
+}
+
+#[test]
+fn sha1_expected_old_refused_on_sha256_store() {
+    use super::push_job::BlockingJob;
+    use ruk_core::coord::{HostedCoordinator, Principal};
+    use ruk_core::ids::HashKind;
+    use ruk_core::protocol::{PushSource, PushUpdate, RemoteExpect};
+    use ruk_core::refdata::RefName;
+
+    let root = temp_root("sha1-old-on-sha256");
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Arc::new(
+        Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+    );
+    let peer = Principal::from_peer_uid(1000);
+    let coordinator = Arc::new(
+        HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+    );
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+    let job = BlockingJob {
+        coordinator: Arc::clone(&coordinator),
+        session: SessionId::generate(),
+        registry: Arc::clone(&registry),
+        repo: root.clone(),
+        key_half: None,
+    };
+
+    let sha256_new = Oid::from_bytes(&[0x33; 32]).expect("sha256 oid");
+    let sha1_old = Oid::from_bytes(&[0x22; 20]).expect("sha1 oid");
+    let update = PushUpdate {
+        remote_ref: RefName::new("refs/heads/main".to_owned()).expect("valid ref name"),
+        source: PushSource::Commit { oid: sha256_new },
+        expected_old: Some(RemoteExpect::Present { oid: sha1_old }),
+        force: false,
+    };
+
+    let err = job
+        .translate_update(&[], &update)
+        .expect_err("SHA-1 expected old OID on SHA-256 store must be refused");
+    assert_eq!(err.code, ErrorCode::EInvalid);
+
+    let page_budget = FactPageBudget::new(1024, 65536);
+    let page = store
+        .fact_page(FactTable::PushPlans, None, page_budget)
+        .expect("page");
+    assert!(page.rows.is_empty(), "PushPlans must be empty");
+
+    drop(job);
+    drop(coordinator);
+    drop(store);
+
+    let reopen_budget = Arc::new(PreparationBudget::reference_defaults());
+    let reopened = Store::open(&root.join(".ruk"), reopen_budget).expect("store reopens cleanly");
+    let page_after = reopened
+        .fact_page(FactTable::PushPlans, None, FactPageBudget::new(1024, 65536))
+        .expect("page after reopen");
+    assert!(page_after.rows.is_empty(), "PushPlans stays empty");
+    drop(reopened);
+
+    let _handle = registry
+        .open_by_path(&root)
+        .expect("reopen repository succeeds");
+}

@@ -3344,11 +3344,16 @@ impl HostedCoordinator {
             claim_after.as_deref(),
             FactPageBudget::new(128, 256 * 1024),
         )?;
-        // Holder guard: sessions holding unexpired claims stay resumable so
-        // task claims survive restarts. The guard reads live holders after
-        // the claim sweep is selected but before anything publishes, and it
-        // fails the pass rather than sweeping unguarded.
-        let holders = live_holders(&self.store, &claim_clock)?;
+        let deletion_candidates: Vec<SessionId> = sessions_page
+            .deletions
+            .iter()
+            .filter_map(|deletion| {
+                <[u8; 16]>::try_from(deletion.key.as_slice())
+                    .ok()
+                    .map(SessionId::from_bytes)
+            })
+            .collect();
+        let holders = live_holders(&self.store, &claim_clock, &deletion_candidates)?;
         sessions_page
             .deletions
             .retain(|deletion| !session_holds_live_claim(&holders, &deletion.key));
