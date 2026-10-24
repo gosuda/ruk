@@ -154,4 +154,29 @@ mod tests {
             .expect_err("bad name refuses");
         assert_eq!(err.code, ruk_core::error::ErrorCode::ECorrupt);
     }
+
+    #[test]
+    fn advertised_head_filtered_before_mapping_preserves_valid_refs() {
+        use ruk_git::transport::refadv::AdvertisedRef;
+        let oid = Oid::from_bytes(&[7u8; 32]).expect("oid parses");
+        let wire = vec![
+            AdvertisedRef {
+                name: b"HEAD".to_vec(),
+                oid: Some(oid),
+                peeled: None,
+                symref_target: Some(b"refs/heads/main".to_vec()),
+            },
+            AdvertisedRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: Some(oid),
+                peeled: None,
+                symref_target: None,
+            },
+        ];
+        let local = ruk_git::transport::net::to_local_refs(wire).expect("to_local_refs succeeds");
+        let rows = map_entries(&local).expect("map_entries succeeds without corrupt error");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name.as_bytes(), b"refs/heads/main");
+        assert!(matches!(rows[0].target, RefTarget::Direct(tip) if tip == oid));
+    }
 }

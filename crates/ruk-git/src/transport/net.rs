@@ -1131,17 +1131,48 @@ pub fn fetch_archive_stream<R: Read + Write>(stream: R, rev: &str) -> Result<Vec
 pub fn to_local_refs(refs: Vec<AdvertisedRef>) -> Result<Vec<AdvertisedLocalRef>, GitError> {
     let mut out = Vec::new();
     for entry in refs {
-        if entry.name.ends_with(b"^{}") {
+        if !entry.name.starts_with(b"refs/") || entry.name.ends_with(b"^{}") {
             continue;
         }
-        let target = match (entry.oid, entry.symref_target) {
-            (Some(oid), _) => RefTarget::Direct(oid),
-            (None, Some(pointed)) => {
+        let target = match (entry.symref_target, entry.oid) {
+            (Some(pointed), _) => {
                 let name = RefName::new(pointed).map_err(|err| GitError::Invalid {
                     detail: format!("advertised symref target refused: {err}"),
                 })?;
                 RefTarget::Symbolic(name)
             }
+            (None, Some(oid)) => RefTarget::Direct(oid),
+            (None, None) => continue,
+        };
+        out.push(AdvertisedLocalRef {
+            name: entry.name,
+            target,
+        });
+    }
+    Ok(out)
+}
+
+/// Maps wire refs onto advertised rows for listing commands (`ls-remote`),
+/// preserving `HEAD` while filtering pseudo-refs and peeled dupes.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a symref target that is not a ref name.
+pub fn to_ls_remote_refs(refs: Vec<AdvertisedRef>) -> Result<Vec<AdvertisedLocalRef>, GitError> {
+    let mut out = Vec::new();
+    for entry in refs {
+        if (!entry.name.starts_with(b"refs/") && entry.name != b"HEAD")
+            || entry.name.ends_with(b"^{}")
+        {
+            continue;
+        }
+        let target = match (entry.symref_target, entry.oid) {
+            (Some(pointed), _) => {
+                let name = RefName::new(pointed).map_err(|err| GitError::Invalid {
+                    detail: format!("advertised symref target refused: {err}"),
+                })?;
+                RefTarget::Symbolic(name)
+            }
+            (None, Some(oid)) => RefTarget::Direct(oid),
             (None, None) => continue,
         };
         out.push(AdvertisedLocalRef {
@@ -2056,8 +2087,113 @@ mod tests {
             },
         ])
         .expect("map");
-        assert_eq!(refs.len(), 2);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, b"refs/heads/main");
         assert_eq!(refs[0].target, RefTarget::Direct(tip));
+    }
+
+    #[test]
+    fn to_local_refs_filters_head_and_unknown_pseudo_refs() {
+        let tip = sha1("b7ee0f83149b8f52744bf4de0bc706afcd5302c8");
+        let target_name = RefName::new(b"refs/heads/main".to_vec()).expect("valid ref name");
+        let refs = to_local_refs(vec![
+            AdvertisedRef {
+                name: b"HEAD".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: Some(b"refs/heads/main".to_vec()),
+            },
+            AdvertisedRef {
+                name: b"FETCH_HEAD".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"custom-pseudo".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/heads/alias".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: Some(b"refs/heads/main".to_vec()),
+            },
+            AdvertisedRef {
+                name: b"refs/tags/v1.0".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+        ])
+        .expect("map succeeds");
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].name, b"refs/heads/main");
+        assert_eq!(refs[0].target, RefTarget::Direct(tip));
+        assert_eq!(refs[1].name, b"refs/heads/alias");
+        assert_eq!(refs[1].target, RefTarget::Symbolic(target_name));
+        assert_eq!(refs[2].name, b"refs/tags/v1.0");
+        assert_eq!(refs[2].target, RefTarget::Direct(tip));
+    }
+
+    #[test]
+    fn to_ls_remote_refs_preserves_head_and_filters_pseudo_refs() {
+        let tip = sha1("b7ee0f83149b8f52744bf4de0bc706afcd5302c8");
+        let target_name = RefName::new(b"refs/heads/main".to_vec()).expect("valid ref name");
+        let refs = to_ls_remote_refs(vec![
+            AdvertisedRef {
+                name: b"HEAD".to_vec(),
+                oid: None,
+                peeled: None,
+                symref_target: Some(b"refs/heads/main".to_vec()),
+            },
+            AdvertisedRef {
+                name: b"FETCH_HEAD".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"custom-pseudo".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/tags/v1.0".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/tags/v1.0^{}".to_vec(),
+                oid: Some(tip),
+                peeled: Some(tip),
+                symref_target: None,
+            },
+        ])
+        .expect("map succeeds");
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].name, b"HEAD");
+        assert_eq!(refs[0].target, RefTarget::Symbolic(target_name));
+        assert_eq!(refs[1].name, b"refs/heads/main");
+        assert_eq!(refs[1].target, RefTarget::Direct(tip));
+        assert_eq!(refs[2].name, b"refs/tags/v1.0");
+        assert_eq!(refs[2].target, RefTarget::Direct(tip));
     }
 
     #[test]

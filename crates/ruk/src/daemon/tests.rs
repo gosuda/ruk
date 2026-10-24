@@ -7634,3 +7634,59 @@ fn fork_copy_syncs_payloads_before_metadata() {
     read.bytes.read_to_end(&mut bytes).expect("read spool");
     assert_eq!(bytes, b"hello world");
 }
+
+#[test]
+fn repo_fork_syncs_destination_directory_and_reopens_store() {
+    use ruk_core::protocol::ForkRefs;
+
+    let root = temp_root("fork-dest-sync");
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let repo_args = ruk_core::protocol::RepoInitArgs {
+        root: root.to_str().expect("UTF-8").to_owned(),
+        path: "source".to_owned(),
+        object_format: None,
+        default_branch: None,
+    };
+    let created = registry
+        .create_repo(&repo_args)
+        .expect("source repo creates");
+    let source_path = PathBuf::from(&created.path);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&source_path.join(".ruk"), budget.clone()).expect("open store");
+
+    let prepared = store
+        .prepare(ObjectKind::Blob, 16, &b"destination sync"[..], None)
+        .expect("prepare");
+    let blob_oid = prepared.oid();
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
+    store.close().expect("close");
+    drop(store);
+
+    let dest_path = root.join("dest-synced");
+    let fork_args = RepoForkArgs {
+        source: source_path.to_str().expect("UTF-8").to_owned(),
+        path: dest_path.to_str().expect("UTF-8").to_owned(),
+        refs: Some(ForkRefs::None),
+    };
+    let reply = registry
+        .fork_repo(&fork_args)
+        .expect("fork succeeds and syncs destination directory");
+    assert_eq!(reply.path, dest_path.to_str().expect("UTF-8"));
+
+    assert!(dest_path.exists());
+    assert!(dest_path.join(".ruk").exists());
+    let dest_store = Store::open(&dest_path.join(".ruk"), budget)
+        .expect("destination store reopens cleanly after sync");
+    let mut read = dest_store.read(blob_oid).expect("payload preserved");
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    read.bytes.read_to_end(&mut bytes).expect("read spool");
+    assert_eq!(bytes, b"destination sync");
+}

@@ -1427,20 +1427,46 @@ pub(crate) fn glob_match(pattern: &[u8], path: &[u8]) -> bool {
 /// spans zero or more segments; a trailing `/**` requires at least one more
 /// segment, so `src/**` means "files under src/", never a root file named
 /// `src` itself.
+fn step_glob_row(
+    pattern: &[u8],
+    is_trailing: bool,
+    segments: &[&[u8]],
+    curr: &[bool],
+    next: &mut [bool],
+) {
+    let s_len = segments.len();
+    if pattern != b"**" {
+        next[s_len] = false;
+        for si in 0..s_len {
+            next[si] = segment_match(pattern, segments[si]) && curr[si + 1];
+        }
+        return;
+    }
+    if is_trailing {
+        next[..s_len].fill(true);
+        next[s_len] = false;
+        return;
+    }
+    next[s_len] = curr[s_len];
+    for si in (0..s_len).rev() {
+        next[si] = curr[si] || next[si + 1];
+    }
+}
+
 fn match_segments(patterns: &[&[u8]], segments: &[&[u8]]) -> bool {
     if patterns.is_empty() {
         return segments.is_empty();
     }
-    if patterns[0] == b"**" {
-        if patterns.len() == 1 {
-            return !segments.is_empty();
-        }
-        return (0..=segments.len()).any(|skip| match_segments(&patterns[1..], &segments[skip..]));
+    let p_len = patterns.len();
+    let s_len = segments.len();
+    let mut curr = vec![false; s_len + 1];
+    curr[s_len] = true;
+    let mut next = vec![false; s_len + 1];
+    for pi in (0..p_len).rev() {
+        step_glob_row(patterns[pi], pi == p_len - 1, segments, &curr, &mut next);
+        std::mem::swap(&mut curr, &mut next);
     }
-    if segments.is_empty() || !segment_match(patterns[0], segments[0]) {
-        return false;
-    }
-    match_segments(&patterns[1..], &segments[1..])
+    curr[0]
 }
 
 /// Matches one pattern segment against one path segment.
@@ -2117,6 +2143,47 @@ mod tests {
         assert_eq!(literal_dir_prefix(b"src/**/*.rs"), b"src");
         assert_eq!(literal_dir_prefix(b"*.rs"), b"");
         assert_eq!(literal_dir_prefix(b"src/main.rs"), b"src/main.rs");
+    }
+
+    #[test]
+    fn glob_matching_is_bounded_on_repeated_wildcard_dirs() {
+        let pattern = (0..20).map(|_| "**/").collect::<String>() + "missing";
+        let path = (0..21)
+            .map(|i| format!("seg{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let started = std::time::Instant::now();
+        let matched = glob_match(pattern.as_bytes(), path.as_bytes());
+        let elapsed = started.elapsed();
+        assert!(!matched);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "matcher took too long: {elapsed:?}"
+        );
+        let legit = glob_match(pattern.as_bytes(), b"x/missing");
+        assert!(legit);
+        let direct = glob_match(b"**/missing", b"x/missing");
+        assert!(direct);
+    }
+
+    #[test]
+    fn glob_matching_wildcard_zero_and_multi_segment() {
+        assert!(glob_match(b"**/file.txt", b"file.txt"));
+        assert!(glob_match(b"**/file.txt", b"a/file.txt"));
+        assert!(glob_match(b"**/file.txt", b"a/b/c/file.txt"));
+        assert!(!glob_match(b"**/file.txt", b"other.txt"));
+        assert!(!glob_match(b"**/file.txt", b"a/b/c/other.txt"));
+        assert!(glob_match(b"a/**/b", b"a/b"));
+        assert!(glob_match(b"a/**/b", b"a/x/b"));
+        assert!(glob_match(b"a/**/b", b"a/x/y/z/b"));
+        assert!(!glob_match(b"a/**/b", b"a/b/c"));
+        assert!(!glob_match(b"a/**/b", b"other/b"));
+        assert!(glob_match(b"src/**", b"src/main.rs"));
+        assert!(glob_match(b"src/**", b"src/a/b/c.rs"));
+        assert!(!glob_match(b"src/**", b"src"));
+        assert!(!glob_match(b"src/**", b"other/main.rs"));
+        assert!(glob_match(b"**", b"a"));
+        assert!(glob_match(b"**", b"a/b/c"));
     }
 
     /// Real tree objects: R0 has the empty tree, R1 adds five files under src/.

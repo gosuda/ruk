@@ -1583,6 +1583,7 @@ impl Registry {
         })?;
         let _ = std::fs::remove_dir(install.container);
         let verified = (|| {
+            fsync_dir(install.destination)?;
             if let Some(parent) = install.destination.parent() {
                 fsync_dir(parent)?;
             }

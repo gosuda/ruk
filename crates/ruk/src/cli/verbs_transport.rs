@@ -4463,7 +4463,7 @@ pub(crate) fn ls_remote(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitEr
                     },
                 )?,
             };
-            net::to_local_refs(refs)?
+            net::to_ls_remote_refs(refs)?
         }
     };
     Ok(render_ls_remote(

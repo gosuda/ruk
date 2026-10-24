@@ -1445,6 +1445,49 @@ mod tests {
     }
 
     #[test]
+    fn glob_matching_is_bounded_on_repeated_wildcard_dirs() {
+        let pattern = (0..20).map(|_| "**/").collect::<String>() + "missing";
+        let path = (0..21)
+            .map(|i| format!("seg{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let started = StdInstant::now();
+        let matched = glob_match(pattern.as_bytes(), path.as_bytes());
+        let elapsed = started.elapsed();
+        assert!(!matched);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "matcher took too long: {elapsed:?}"
+        );
+        let legit = glob_match(pattern.as_bytes(), b"x/missing");
+        assert!(legit);
+        let direct = glob_match(b"**/missing", b"x/missing");
+        assert!(direct);
+        let selected = path_selected(&PathSelection::All, &[pattern], &[], path.as_bytes());
+        assert!(!selected);
+    }
+
+    #[test]
+    fn glob_matching_wildcard_zero_and_multi_segment() {
+        assert!(glob_match(b"**/file.txt", b"file.txt"));
+        assert!(glob_match(b"**/file.txt", b"a/file.txt"));
+        assert!(glob_match(b"**/file.txt", b"a/b/c/file.txt"));
+        assert!(!glob_match(b"**/file.txt", b"other.txt"));
+        assert!(!glob_match(b"**/file.txt", b"a/b/c/other.txt"));
+        assert!(glob_match(b"a/**/b", b"a/b"));
+        assert!(glob_match(b"a/**/b", b"a/x/b"));
+        assert!(glob_match(b"a/**/b", b"a/x/y/z/b"));
+        assert!(!glob_match(b"a/**/b", b"a/b/c"));
+        assert!(!glob_match(b"a/**/b", b"other/b"));
+        assert!(glob_match(b"src/**", b"src/main.rs"));
+        assert!(glob_match(b"src/**", b"src/a/b/c.rs"));
+        assert!(!glob_match(b"src/**", b"src"));
+        assert!(!glob_match(b"src/**", b"other/main.rs"));
+        assert!(glob_match(b"**", b"a"));
+        assert!(glob_match(b"**", b"a/b/c"));
+    }
+
+    #[test]
     fn pool_refuses_empty_and_oversized_permits() {
         SearchPool::new(SearchPoolConfig { permits: 0 }).expect_err("zero refuses");
         SearchPool::new(SearchPoolConfig {

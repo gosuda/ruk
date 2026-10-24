@@ -1050,7 +1050,7 @@ fn encode_reply(id: Option<RequestId>, reply: Reply) -> Result<Vec<u8>, CoreErro
 }
 
 pub(crate) fn to_core(err: GitError) -> CoreError {
-    CoreError::new(err.code(), err.to_string())
+    err.to_core_error()
 }
 
 struct TranslatedPush {
@@ -1451,5 +1451,37 @@ mod tests {
         registry
             .push_guard_check(&root, std::slice::from_ref(&name))
             .expect("owning plan's reconcile clears");
+    }
+
+    #[test]
+    fn to_core_preserves_http_error_detail_into_error_reply() {
+        use ruk_core::protocol::{ErrorDetail, ErrorReply};
+        let err = GitError::Http {
+            detail: "HTTP 429 Too Many Requests".to_owned(),
+            status: 429,
+            retry_after_seconds: Some(42),
+            location: Some("https://mirror.example/retry".to_owned()),
+            body_preview: "rate limited, slow down".to_owned(),
+        };
+        let core = to_core(err);
+        let Some(box_detail) = &core.detail else {
+            panic!("to_core dropped structured detail from GitError::Http");
+        };
+        let ErrorDetail::Http {
+            status,
+            retry_after_seconds,
+            location,
+            body_preview,
+        } = &**box_detail
+        else {
+            panic!("expected ErrorDetail::Http variant");
+        };
+        assert_eq!(*status, 429);
+        assert_eq!(*retry_after_seconds, Some(42));
+        assert_eq!(location.as_deref(), Some("https://mirror.example/retry"));
+        assert_eq!(body_preview, "rate limited, slow down");
+
+        let reply = ErrorReply::from_core(&core);
+        assert_eq!(reply.detail, Some((**box_detail).clone()));
     }
 }
