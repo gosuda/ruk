@@ -56,7 +56,8 @@ use ruk_core::{HashKind, Oid};
 use ruk_git::GitError;
 use ruk_git::transport::Interrupt;
 use ruk_git::transport::credentials::{
-    AuthPolicy, TransportAuthKind, hermetic_vars, refuse_url_userinfo,
+    AuthPolicy, TransportAuthKind, hermetic_vars, refuse_url_userinfo, scrub_secrets,
+    scrub_userinfo,
 };
 use ruk_git::transport::net::{self, EgressPolicy, Endpoint};
 use ruk_git::transport::push::{
@@ -563,6 +564,7 @@ impl BlockingJob {
     ) -> Result<SentPush, CoreError> {
         let store = self.coordinator.store();
         let kind = store.hash_kind();
+        let secrets = auth_secrets(&bridge.auth);
         let TranslatedPush {
             wire,
             mut early,
@@ -571,8 +573,8 @@ impl BlockingJob {
             http,
         } = prepared;
         if withheld {
-            let (state, refs) = map_outcomes(plan.state, &early)?;
-            return self.finish_send(plan, state, refs);
+            let (state, refs) = map_outcomes(plan.state, &early, &secrets)?;
+            return self.finish_send(plan, state, refs, &secrets);
         }
         if wire.updates.is_empty() {
             if early.is_empty() {
@@ -585,8 +587,8 @@ impl BlockingJob {
             // the prepared plan as locally rejected with its per-ref
             // reasons instead of stranding it without a receipt.
             plan.refuse_locally(early.clone()).map_err(to_core)?;
-            let (state, refs) = map_outcomes(plan.state, &early)?;
-            return self.finish_send(plan, state, refs);
+            let (state, refs) = map_outcomes(plan.state, &early, &secrets)?;
+            return self.finish_send(plan, state, refs, &secrets);
         }
         let outcome = match http {
             Some(HttpAdv { base, adv }) => smart_http::push_pack(
@@ -620,8 +622,8 @@ impl BlockingJob {
         match outcome {
             Ok(mut outcomes) => {
                 outcomes.append(&mut early);
-                let (state, refs) = map_outcomes(plan.state, &outcomes)?;
-                self.finish_send(plan, state, refs)
+                let (state, refs) = map_outcomes(plan.state, &outcomes, &secrets)?;
+                self.finish_send(plan, state, refs, &secrets)
             }
             Err(err) => {
                 if plan.state == PlanState::Prepared {
@@ -629,8 +631,8 @@ impl BlockingJob {
                 }
                 tracing::warn!(error = %err, "ruk push: send failed after first persist");
                 let outcomes = send_failure_outcomes(early, &wire);
-                let (state, refs) = map_outcomes(plan.state, &outcomes)?;
-                self.finish_send(plan, state, refs)
+                let (state, refs) = map_outcomes(plan.state, &outcomes, &secrets)?;
+                self.finish_send(plan, state, refs, &secrets)
             }
         }
     }
@@ -639,10 +641,12 @@ impl BlockingJob {
     /// builds the terminal reply.
     fn finish_send(
         &self,
-        plan: PushPlanRecord,
+        mut plan: PushPlanRecord,
         state: PushState,
         refs: Vec<PushRefOutcome>,
+        secrets: &[String],
     ) -> Result<SentPush, CoreError> {
+        scrub_plan_outcomes(&mut plan, secrets);
         let store = self.coordinator.store();
         let kind = store.hash_kind();
         let plan_id = plan.id;
@@ -910,6 +914,61 @@ fn send_failure_outcomes(mut early: Vec<RefOutcome>, wire: &PushWireRequest) -> 
     early
 }
 
+fn scrub_outcome_reason(reason: &str, secrets: &[String]) -> String {
+    let userinfo = scrub_userinfo(reason);
+    let scrubbed = scrub_secrets(userinfo.as_bytes(), secrets);
+    String::from_utf8_lossy(&scrubbed).into_owned()
+}
+
+fn scrub_plan_outcomes(plan: &mut PushPlanRecord, secrets: &[String]) {
+    for outcome in &mut plan.outcomes {
+        if let RefResult::Rejected { reason } = &mut outcome.result {
+            *reason = scrub_outcome_reason(reason, secrets);
+        }
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(char::from(ALPHABET[usize::from(b0 >> 2)]));
+        out.push(char::from(
+            ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
+        ));
+        if chunk.len() > 1 {
+            out.push(char::from(
+                ALPHABET[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))],
+            ));
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(char::from(ALPHABET[usize::from(b2 & 0x3f)]));
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn auth_secrets(auth: &AuthPolicy) -> Vec<String> {
+    match auth {
+        AuthPolicy::Explicit { auth } if !auth.credential.is_empty() => match auth.kind {
+            TransportAuthKind::Basic => {
+                let encoded = base64_encode(auth.credential.as_bytes());
+                vec![format!("Basic {encoded}"), encoded, auth.credential.clone()]
+            }
+            TransportAuthKind::Bearer => vec![auth.credential.clone()],
+            TransportAuthKind::None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 /// Maps transport outcomes plus the terminal plan state to reply rows: an
 /// `Uncertain` plan marks every ref without a verdict uncertain, while a
 /// rejection keeps its verdict — under `Uncertain` the only rejections
@@ -918,6 +977,7 @@ fn send_failure_outcomes(mut early: Vec<RefOutcome>, wire: &PushWireRequest) -> 
 fn map_outcomes(
     state: PlanState,
     outcomes: &[RefOutcome],
+    secrets: &[String],
 ) -> Result<(PushState, Vec<PushRefOutcome>), CoreError> {
     let wire = wire_state(state);
     let mut refs = Vec::with_capacity(outcomes.len());
@@ -930,7 +990,7 @@ fn map_outcomes(
         })?;
         let status = match &outcome.result {
             RefResult::Rejected { reason } => PushRefStatus::Rejected {
-                reason: reason.clone(),
+                reason: scrub_outcome_reason(reason, secrets),
             },
             RefResult::Ok if state == PlanState::Uncertain => PushRefStatus::Uncertain,
             RefResult::Ok => PushRefStatus::Confirmed { new: None },
@@ -1143,7 +1203,7 @@ mod tests {
                 },
             },
         ];
-        let (state, refs) = map_outcomes(PlanState::Confirmed, &outcomes).expect("maps");
+        let (state, refs) = map_outcomes(PlanState::Confirmed, &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Confirmed);
         assert!(matches!(refs[0].status, PushRefStatus::Confirmed { .. }));
         assert!(matches!(refs[1].status, PushRefStatus::Rejected { .. }));
@@ -1157,7 +1217,7 @@ mod tests {
                 reason: "rejected a (non-fast-forward)".to_owned(),
             },
         }];
-        let (state, refs) = map_outcomes(PlanState::Rejected, &outcomes).expect("maps");
+        let (state, refs) = map_outcomes(PlanState::Rejected, &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Rejected);
         assert!(matches!(refs[0].status, PushRefStatus::Rejected { .. }));
     }
@@ -1168,7 +1228,7 @@ mod tests {
             name: b"refs/heads/a".to_vec(),
             result: RefResult::Ok,
         }];
-        let (_, refs) = map_outcomes(PlanState::Uncertain, &outcomes).expect("maps");
+        let (_, refs) = map_outcomes(PlanState::Uncertain, &outcomes, &[]).expect("maps");
         assert!(matches!(refs[0].status, PushRefStatus::Uncertain));
     }
 
@@ -1186,7 +1246,7 @@ mod tests {
                 },
             },
         ];
-        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes).expect("maps");
+        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Uncertain);
         assert!(matches!(refs[0].status, PushRefStatus::Uncertain));
         assert!(matches!(refs[1].status, PushRefStatus::Rejected { .. }));
@@ -1216,7 +1276,7 @@ mod tests {
             ],
         };
         let outcomes = send_failure_outcomes(early, &wire);
-        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes).expect("maps");
+        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Uncertain);
         assert_eq!(refs.len(), 3);
         assert!(matches!(refs[0].status, PushRefStatus::Rejected { .. }));
@@ -1239,7 +1299,7 @@ mod tests {
                 result: RefResult::Ok,
             },
         ];
-        let err = map_outcomes(PlanState::Confirmed, &outcomes)
+        let err = map_outcomes(PlanState::Confirmed, &outcomes, &[])
             .expect_err("a malformed outcome name refuses the whole row");
         assert_eq!(err.code, ErrorCode::ECorrupt);
     }
@@ -1483,5 +1543,167 @@ mod tests {
 
         let reply = ErrorReply::from_core(&core);
         assert_eq!(reply.detail, Some((**box_detail).clone()));
+    }
+
+    #[test]
+    fn auth_secrets_redacts_basic_and_bearer_forms() {
+        let basic = AuthPolicy::explicit(TransportAuth {
+            kind: TransportAuthKind::Basic,
+            credential: "user:pass".to_owned(),
+            origin: "https://mirror.example".to_owned(),
+        });
+        assert_eq!(
+            auth_secrets(&basic),
+            vec![
+                "Basic dXNlcjpwYXNz".to_owned(),
+                "dXNlcjpwYXNz".to_owned(),
+                "user:pass".to_owned(),
+            ]
+        );
+
+        let bearer = AuthPolicy::explicit(TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "secret-token".to_owned(),
+            origin: "https://mirror.example".to_owned(),
+        });
+        assert_eq!(auth_secrets(&bearer), vec!["secret-token".to_owned()]);
+
+        let empty = AuthPolicy::explicit(TransportAuth {
+            kind: TransportAuthKind::Basic,
+            credential: String::new(),
+            origin: "https://mirror.example".to_owned(),
+        });
+        assert!(auth_secrets(&empty).is_empty());
+
+        let none = AuthPolicy::explicit(TransportAuth {
+            kind: TransportAuthKind::None,
+            credential: "some-cred".to_owned(),
+            origin: "https://mirror.example".to_owned(),
+        });
+        assert!(auth_secrets(&none).is_empty());
+
+        let ambient = AuthPolicy::ambient_in(hermetic_vars());
+        assert!(auth_secrets(&ambient).is_empty());
+    }
+
+    #[test]
+    fn report_reasons_are_scrubbed_with_invocation_secrets() {
+        let root = std::env::temp_dir().join(format!("ruk-push-redact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
+        let store = Arc::new(
+            Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+        );
+        let peer = Principal::from_peer_uid(1000);
+        let coordinator = Arc::new(
+            HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+        );
+        let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+        let job = BlockingJob {
+            coordinator,
+            session: SessionId::generate(),
+            registry,
+            repo: root.clone(),
+            key_half: None,
+        };
+
+        let secret = "injected-secret-token-12345";
+        let auth = AuthPolicy::explicit(TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: secret.to_owned(),
+            origin: "https://mirror.example".to_owned(),
+        });
+        let secrets = auth_secrets(&auth);
+
+        let canned_reason = format!("ng refs/heads/main rejected token {secret}");
+        let report = vec![RefOutcome {
+            name: b"refs/heads/main".to_vec(),
+            result: RefResult::Rejected {
+                reason: canned_reason,
+            },
+        }];
+
+        let plan_id = PlanId::generate();
+        let mut plan = PushPlanRecord::prepare(
+            plan_id,
+            b"https://mirror.example/repo.git".to_vec(),
+            false,
+            vec![PushUpdate {
+                name: b"refs/heads/main".to_vec(),
+                old: HashKind::Sha256.zero_oid(),
+                new: oid_fill(1),
+            }],
+        );
+        plan.begin_send().expect("begin send");
+        plan.finalize(report.clone()).expect("finalize");
+
+        let (state, refs) = map_outcomes(plan.state, &report, &secrets).expect("maps");
+        assert_eq!(state, PushState::Rejected);
+        let sent = job
+            .finish_send(plan, state, refs, &secrets)
+            .expect("finish send");
+
+        let reply_reason = match &sent.reply.refs.items.first().unwrap().status {
+            PushRefStatus::Rejected { reason } => reason.as_str(),
+            other => panic!("expected rejected status, got {other:?}"),
+        };
+        assert!(
+            !reply_reason.contains(secret),
+            "reply reason leaked secret: {reply_reason}"
+        );
+        assert!(reply_reason.contains("[redacted]"));
+
+        let plan_bytes = sent.terminal_fact.value.expect("terminal fact has value");
+        let persisted_plan =
+            PushPlanRecord::decode(plan_id, HashKind::Sha256, &plan_bytes).expect("decodes");
+        let persisted_reason = match &persisted_plan.outcomes[0].result {
+            RefResult::Rejected { reason } => reason.as_str(),
+            other => panic!("expected rejected outcome, got {other:?}"),
+        };
+        assert!(
+            !persisted_reason.contains(secret),
+            "persisted plan leaked secret: {persisted_reason}"
+        );
+        assert!(persisted_reason.contains("[redacted]"));
+
+        let basic_user_pass = "admin:supersecret";
+        let basic_auth = AuthPolicy::explicit(TransportAuth {
+            kind: TransportAuthKind::Basic,
+            credential: basic_user_pass.to_owned(),
+            origin: "https://mirror.example".to_owned(),
+        });
+        let basic_secrets = auth_secrets(&basic_auth);
+        let basic_report = vec![RefOutcome {
+            name: b"refs/heads/main".to_vec(),
+            result: RefResult::Rejected {
+                reason: "declined Basic YWRtaW46c3VwZXJzZWNyZXQ= by server".to_owned(),
+            },
+        }];
+        let mut basic_plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://mirror.example/repo.git".to_vec(),
+            false,
+            vec![PushUpdate {
+                name: b"refs/heads/main".to_vec(),
+                old: HashKind::Sha256.zero_oid(),
+                new: oid_fill(1),
+            }],
+        );
+        basic_plan.begin_send().expect("begin send");
+        basic_plan.finalize(basic_report.clone()).expect("finalize");
+        let (basic_state, basic_refs) =
+            map_outcomes(basic_plan.state, &basic_report, &basic_secrets).expect("maps");
+        let basic_sent = job
+            .finish_send(basic_plan, basic_state, basic_refs, &basic_secrets)
+            .expect("finish send");
+        let basic_reply_reason = match &basic_sent.reply.refs.items.first().unwrap().status {
+            PushRefStatus::Rejected { reason } => reason.as_str(),
+            other => panic!("expected rejected status, got {other:?}"),
+        };
+        assert!(!basic_reply_reason.contains("YWRtaW46c3VwZXJzZWNyZXQ="));
+        assert!(basic_reply_reason.contains("[redacted]"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

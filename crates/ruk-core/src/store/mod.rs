@@ -1425,10 +1425,6 @@ impl Store {
         for row in &page.rows {
             let event: StoreEvent = decode_store_event(&row.value)?;
             if event.at >= cutoff_millis {
-                // The first kept row ends the prunable prefix. `at` is wall
-                // clock: after a backward step a later row can carry an old
-                // stamp, and pruning it would leave a hole above `oldest`
-                // that a follower skips with no expired signal.
                 kept = Some(Self::seq_from_event_key(&row.key)?);
                 break;
             }

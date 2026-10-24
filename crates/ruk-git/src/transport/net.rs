@@ -569,12 +569,18 @@ const SSH_EXIT_GRACE: Duration = Duration::from_secs(30);
 pub struct SshStream {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
-    /// Owns the spawned ssh so Drop can kill-and-reap it after taking the pipes.
     child: Child,
+    buffered: Vec<u8>,
 }
 
 impl Read for SshStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.buffered.is_empty() {
+            let n = self.buffered.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.buffered[..n]);
+            self.buffered.drain(..n);
+            return Ok(n);
+        }
         match self.stdout.as_mut() {
             Some(o) => o.read(buf),
             None => Ok(0),
@@ -755,6 +761,7 @@ fn ssh_spawn(
         stdin: Some(stdin),
         stdout: Some(stdout),
         child,
+        buffered: Vec::new(),
     })
 }
 
@@ -806,6 +813,72 @@ fn ssh_dial_each(
     Err(last_err.unwrap_or_else(|| GitError::Io {
         detail: format!("cannot ssh to {label}: no addresses to try"),
     }))
+}
+
+fn ssh_verify_connection(
+    mut stream: SshStream,
+    label: &str,
+    addr: &SocketAddr,
+    service: Service,
+    timeout: Duration,
+) -> Result<SshStream, GitError> {
+    if service == Service::UploadArchive {
+        if let Ok(Some(status)) = stream.child.try_wait()
+            && !status.success()
+        {
+            return Err(GitError::Io {
+                detail: format!("cannot ssh to {label} ({addr}): {status}"),
+            });
+        }
+        return Ok(stream);
+    }
+    let mut stdout = stream.stdout.take().ok_or_else(|| GitError::Io {
+        detail: format!("{label} has no stdout pipe"),
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_handle = std::thread::Builder::new()
+        .name("ruk-ssh-probe".to_owned())
+        .spawn(move || {
+            let mut buf = [0u8; 1024];
+            let res = stdout.read(&mut buf);
+            let _ = tx.send((stdout, res, buf));
+        })
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot spawn ssh probe: {err}"),
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok((stdout, Ok(n), buf)) => {
+            let _ = thread_handle.join();
+            stream.stdout = Some(stdout);
+            if n == 0 {
+                let _ = stream.child.kill();
+                let status = stream.child.wait().ok();
+                return Err(GitError::Io {
+                    detail: format!(
+                        "cannot ssh to {label} ({addr}): connection closed before banner ({status:?})"
+                    ),
+                });
+            }
+            stream.buffered = buf[..n].to_vec();
+            Ok(stream)
+        }
+        Ok((stdout, Err(err), _)) => {
+            let _ = thread_handle.join();
+            stream.stdout = Some(stdout);
+            let _ = stream.child.kill();
+            let _ = stream.child.wait();
+            Err(GitError::Io {
+                detail: format!("cannot ssh to {label} ({addr}): {err}"),
+            })
+        }
+        Err(_) => {
+            let _ = stream.child.kill();
+            let _ = stream.child.wait();
+            Err(GitError::Io {
+                detail: format!("cannot ssh to {label} ({addr}): timed out waiting for connection"),
+            })
+        }
+    }
 }
 
 /// Builds the git-daemon request as one pkt-line: 4-hex length prefix
@@ -967,12 +1040,21 @@ pub fn open_stream(
             let allowed = policy.filter_addrs(&label, &resolved)?;
             let ssh_program = std::env::var("GIT_SSH").unwrap_or_else(|_| "ssh".to_owned());
             let ssh_command = std::env::var("GIT_SSH_COMMAND").ok();
+            let deadline = Instant::now() + Duration::from_secs(30);
             Ok(Stream::Ssh(ssh_dial_each(&label, &allowed, |addr| {
-                ssh_spawn(
+                interrupt.check("connecting to the remote")?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(GitError::Io {
+                        detail: format!("cannot ssh to {label}: dial budget exhausted"),
+                    });
+                }
+                let stream = ssh_spawn(
                     &pinned_dial(addr, host, *port, user.as_deref(), service, path)?,
                     &ssh_program,
                     ssh_command.as_deref(),
-                )
+                )?;
+                ssh_verify_connection(stream, &label, addr, service, remaining)
             })?))
         }
         Endpoint::Git { host, port, path } => Ok(Stream::Tcp(git_connect(
@@ -1510,6 +1592,80 @@ mod tests {
         })
         .expect_err("spy always fails");
         assert_eq!(seen, vec![allowed, second]);
+    }
+
+    #[test]
+    fn ssh_dial_retries_after_connection_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-net-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let closed_port = listener.local_addr().expect("port").port();
+        drop(listener);
+
+        let serving_port = closed_port.wrapping_add(1);
+        let tip = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+        let adv_path = dir.join("adv.bin");
+        std::fs::write(&adv_path, advertisement_bytes(tip)).expect("adv");
+
+        let script = dir.join("fake-ssh-retry.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nport=\"\"\nwhile [ $# -gt 0 ]; do\n    if [ \"$1\" = \"-p\" ]; then\n        port=\"$2\"\n        shift 2\n    else\n        shift\n    fi\ndone\nif [ \"$port\" = \"{closed_port}\" ]; then\n    echo \"ssh: connect to host 127.0.0.1 port {closed_port}: Connection refused\" >&2\n    exit 255\nfi\ncat \"{}\"\n",
+                adv_path.display()
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let refused_addr: SocketAddr = format!("127.0.0.1:{closed_port}").parse().expect("addr");
+        let serving_addr: SocketAddr = format!("127.0.0.1:{serving_port}").parse().expect("addr");
+        let label = "ssh://example.com:22";
+
+        let mut seen = Vec::new();
+        let stream = ssh_dial_each(label, &[refused_addr, serving_addr], |addr| {
+            seen.push(*addr);
+            let dial = pinned_dial(
+                addr,
+                "example.com",
+                Some(addr.port()),
+                Some("git"),
+                Service::UploadPack,
+                "/srv/a.git",
+            )?;
+            let stream = ssh_spawn(&dial, script.to_str().expect("utf8"), None)?;
+            ssh_verify_connection(
+                stream,
+                label,
+                addr,
+                Service::UploadPack,
+                Duration::from_secs(5),
+            )
+        })
+        .expect("dial succeeds via second address");
+
+        assert_eq!(seen, vec![refused_addr, serving_addr]);
+        let refs =
+            to_local_refs(discover(stream, HashKind::Sha1, &Interrupt::none()).expect("discover"))
+                .expect("map");
+        assert!(refs.iter().any(|entry| entry.name == b"refs/heads/main"
+            && entry.target == RefTarget::Direct(sha1(tip))));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -53,6 +53,7 @@
 //! symlink `0777`), splits a 135-byte path across prefix/name, and drops
 //! a childless linked empty tree without a record.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
 use ruk_core::ids::{HashKind, Oid};
@@ -70,6 +71,7 @@ use crate::{GitError, parse_oid, require_kind};
 
 /// Largest client argument count, mirroring the oracle's `MAX_ARGS`.
 const MAX_ARGS: usize = 64;
+const MAX_WALK_TREES: usize = 100_000;
 /// Verified-read bound for structural objects and archived blobs, matching
 /// the walk bound the push and fetch halves use.
 const WALK_OBJECT_BYTES: u64 = 512 << 20;
@@ -191,6 +193,8 @@ pub fn serve_upload_archive<R: Read, W: Write>(
         measure: false,
         zip_bound: 0,
         cap: u64::MAX,
+        empty_trees: HashSet::new(),
+        trees_visited: 0,
     };
     if let Some(commit) = commit
         && let Err(err) = walk.tar.emit_global(commit)
@@ -392,6 +396,8 @@ pub fn count_commit_tar(
         measure: true,
         zip_bound: 0,
         cap: zip_cap,
+        empty_trees: HashSet::new(),
+        trees_visited: 0,
     };
     if let Err(err) = walk.tar.emit_global(plan.commit) {
         return Err(stream_failed(walk, err));
@@ -434,6 +440,8 @@ pub fn stream_commit_tar<S: TarSink>(
         measure: false,
         zip_bound: 0,
         cap: u64::MAX,
+        empty_trees: HashSet::new(),
+        trees_visited: 0,
     };
     if let Err(err) = walk.tar.emit_global(plan.commit) {
         return Err(stream_failed(walk, err));
@@ -706,20 +714,35 @@ struct TreeWalk<'s, S: TarSink> {
     /// Counting pass: the running zip upper bound over entries seen so far.
     zip_bound: u64,
     cap: u64,
+    empty_trees: HashSet<Oid>,
+    trees_visited: usize,
 }
 
 impl<S: TarSink> TreeWalk<'_, S> {
     /// Walks one tree depth-first in stored order. Directories queue their
     /// record and recurse; ascending past a still-queued directory drops it,
     /// which is how childless directories leave no record.
-    fn walk_tree(&mut self, tree: Oid, base: &[u8]) -> Result<(), GitError> {
+    fn walk_tree(&mut self, tree: Oid, base: &[u8]) -> Result<bool, GitError> {
+        if self.empty_trees.contains(&tree) {
+            return Ok(false);
+        }
+        self.trees_visited = self.trees_visited.saturating_add(1);
+        if self.trees_visited > MAX_WALK_TREES {
+            return Err(GitError::Limit {
+                detail: format!("archive tree traversal exceeded the {MAX_WALK_TREES}-tree bound"),
+            });
+        }
         let (obj_kind, bytes) = read_object(self.store, tree, WALK_OBJECT_BYTES)?;
         if obj_kind != ObjectKind::Tree {
             return Err(corrupt(format!("object {tree} is not a tree")));
         }
+        let mut has_content = false;
         for entry in parse_tree_entries(tree, &bytes, self.kind)? {
             self.interrupt.check("archiving the tree")?;
             if entry.mode & 0o170000 == 0o040000 {
+                if self.empty_trees.contains(&entry.oid) {
+                    continue;
+                }
                 let mut path = base.to_vec();
                 path.extend_from_slice(&entry.name);
                 path.push(b'/');
@@ -729,14 +752,21 @@ impl<S: TarSink> TreeWalk<'_, S> {
                     path: path.clone(),
                     mode: entry.mode,
                 });
-                self.walk_tree(entry.oid, &path)?;
+                let child_has_content = self.walk_tree(entry.oid, &path)?;
                 self.pending.truncate(depth);
+                if child_has_content {
+                    has_content = true;
+                }
             } else {
+                has_content = true;
                 self.flush_pending()?;
                 self.emit_entry(&entry, base)?;
             }
         }
-        Ok(())
+        if !has_content {
+            self.empty_trees.insert(tree);
+        }
+        Ok(has_content)
     }
 
     /// Charges one entry to the zip bound. Only the counting pass measures;
@@ -1794,6 +1824,46 @@ mod tests {
         assert!(
             err.to_string().contains("exceeds the 1000-byte cap"),
             "error should name the cap: {err}"
+        );
+    }
+
+    fn empty_dag_plan(store: &Store, kind: HashKind, depth: usize) -> ArchivePlan {
+        let mut current_tree = put(store, ObjectKind::Tree, &[]);
+        for _ in 0..depth {
+            let entries = [
+                (&b"left"[..], 0o040000, current_tree),
+                (&b"right"[..], 0o040000, current_tree),
+            ];
+            current_tree = put(store, ObjectKind::Tree, &tree_bytes(&entries));
+        }
+        let commit = put(
+            store,
+            ObjectKind::Commit,
+            &commit_bytes(current_tree, &[], MTIME),
+        );
+        plan_commit_archive(store, kind, commit).expect("plan")
+    }
+
+    #[test]
+    fn empty_subtree_dag_is_bounded_during_counting() {
+        let kind = HashKind::Sha1;
+        let store = test_store(kind);
+
+        let plan = empty_dag_plan(&store, kind, 21);
+        let counted = count_commit_tar(&store, kind, &plan, u64::MAX, u64::MAX, &Interrupt::none())
+            .expect("counting an empty subtree DAG must complete bounded");
+        let mut streamed = Vec::new();
+        stream_commit_tar(
+            &store,
+            kind,
+            &plan,
+            &Interrupt::none(),
+            Collect(&mut streamed),
+        )
+        .expect("streaming an empty subtree DAG must complete bounded");
+        assert_eq!(
+            counted.tar,
+            u64::try_from(streamed.len()).expect("length fits in u64")
         );
     }
 

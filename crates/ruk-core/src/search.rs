@@ -313,7 +313,12 @@ fn walk_tree_level(
                         return Ok(());
                     }
                     walk_tree_level(store, kind, item.oid, &path, depth + 1, state)?;
-                    if state.complete {
+                    if state.complete
+                        && !state
+                            .frontier
+                            .as_ref()
+                            .is_some_and(|f| f.starts_with(&path))
+                    {
                         state.frontier = Some(path);
                     }
                 } else {
@@ -2114,6 +2119,83 @@ mod tests {
                 .iter()
                 .any(|(path, _)| path.as_slice() == b"z.txt"),
             "the matching file after the directory is collected on resume"
+        );
+    }
+
+    #[test]
+    fn walk_frontier_skips_completed_empty_subtree_dirs() {
+        use crate::index::FileMode;
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("completed-empty-dirs");
+        let blob = put_blob(&store, b"needle\n");
+        let empty = put_tree(&store, &[]);
+        let dir_count = SEARCH_MAX_WALK_FILES - 1;
+        let mut sub_entries: Vec<(String, TreeMode, Oid)> = (0..dir_count)
+            .map(|index| (format!("d{index:07}"), TreeMode::Tree, empty))
+            .collect();
+        sub_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let named_sub: Vec<(&str, TreeMode, Oid)> = sub_entries
+            .iter()
+            .map(|(name, mode, oid)| (name.as_str(), *mode, *oid))
+            .collect();
+        let a_tree = put_tree(&store, &named_sub);
+        let root = put_tree(
+            &store,
+            &[
+                ("a", TreeMode::Tree, a_tree),
+                ("z.txt", TreeMode::File(FileMode::Regular), blob),
+            ],
+        );
+        let args = search_args(literal("needle"));
+        let (_guard, cancel) = crate::coord::cancellation();
+        let walk = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            WalkResume {
+                below: &[],
+                equal: false,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(600),
+            },
+        )
+        .expect("walk seals");
+        assert!(
+            !walk.complete,
+            "traversal budget seals at the trailing root file"
+        );
+        let frontier = walk.frontier.expect("sealed walk names its frontier");
+        assert_ne!(
+            frontier.as_slice(),
+            b"a/",
+            "frontier must advance past a/ to the deepest completed subdirectory"
+        );
+        let expected_frontier = format!("a/d{:07}/", dir_count - 1);
+        assert_eq!(frontier.as_slice(), expected_frontier.as_bytes());
+        let resumed = collect_search_candidates(
+            &store,
+            store.hash_kind(),
+            root,
+            &args,
+            WalkResume {
+                below: frontier.as_slice(),
+                equal: true,
+            },
+            WalkLimits {
+                cancel: &cancel,
+                deadline: StdInstant::now() + Duration::from_secs(600),
+            },
+        )
+        .expect("resumed walk succeeds");
+        assert!(
+            resumed
+                .entries
+                .iter()
+                .any(|(path, _)| path.as_slice() == b"z.txt"),
+            "resumed walk reaches z.txt after skipping completed empty subtrees"
         );
     }
 
