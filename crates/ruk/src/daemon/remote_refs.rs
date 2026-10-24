@@ -21,6 +21,7 @@ use ruk_core::protocol::{Method, RemoteRefsReply, Reply, ReplyEnvelope, Request}
 use ruk_core::refdata::RefName;
 use ruk_core::refs::RefEntry;
 use ruk_git::transport::credentials::refuse_url_userinfo;
+use ruk_git::transport::session::Service;
 
 use super::push_job::{CancelBridge, discover_advertised, to_core};
 use super::{ConnectionRefs, InvocationOpen, decode_request_args};
@@ -69,6 +70,7 @@ pub(crate) async fn run_remote_refs(
                 &bridge.auth,
                 &bridge.egress,
                 &bridge.interrupt,
+                Service::UploadPack,
             )?;
             let view = coordinator_job.view()?;
             let entries = map_entries(&advertised)?;

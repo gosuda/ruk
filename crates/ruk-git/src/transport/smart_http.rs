@@ -1134,7 +1134,7 @@ fn push_pack_inner(
     // Closes the stateless round after the pack (`git/send-pack.c`
     // appends it the same way); the server reads the pack to the end of
     // the POST body and this flush stays unread.
-    {
+    if pack_outcome.is_ok() {
         use std::io::Write as _;
         upload.write_all(b"0000").map_err(|err| GitError::Io {
             detail: format!("cannot close the push round: {err}"),

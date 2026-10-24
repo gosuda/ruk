@@ -187,6 +187,9 @@ impl<'a> PushJob<'a> {
             }
         };
 
+        if let Some(reply) = self.replay_committed(&request)? {
+            return encode_reply(Some(request_id), reply);
+        }
         let url = push_url(&args.args.remote)?;
         let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
         refuse_url_userinfo(url, &bridge.auth).map_err(to_core)?;
@@ -514,6 +517,7 @@ impl BlockingJob {
             &bridge.auth,
             &bridge.egress,
             &bridge.interrupt,
+            Service::ReceivePack,
         )
     }
 
@@ -791,6 +795,7 @@ pub(crate) fn discover_advertised(
     auth: &AuthPolicy,
     egress: &EgressPolicy,
     interrupt: &Interrupt,
+    service: Service,
 ) -> Result<Vec<AdvertisedLocalRef>, CoreError> {
     let kind = store.hash_kind();
     let endpoint = net::parse_endpoint(url).map_err(to_core)?;
@@ -805,7 +810,11 @@ pub(crate) fn discover_advertised(
             let base = smart_http::normalize_base(http_url).map_err(to_core)?;
             let adv = smart_http::discover(
                 &base,
-                smart_http::SmartService::ReceivePack,
+                match service {
+                    Service::ReceivePack => smart_http::SmartService::ReceivePack,
+                    Service::UploadPack => smart_http::SmartService::UploadPack,
+                    Service::UploadArchive => smart_http::SmartService::UploadArchive,
+                },
                 kind,
                 RpcCall {
                     extra: &[],
@@ -821,7 +830,7 @@ pub(crate) fn discover_advertised(
         _ => {
             let refs = net::discover_endpoint(
                 &endpoint,
-                Service::ReceivePack,
+                service,
                 kind,
                 smart_http::RpcCall {
                     extra: &[],
@@ -1238,8 +1247,15 @@ mod tests {
         let egress = EgressPolicy::deny_private();
         let interrupt = Interrupt::none();
         for url in ["/tmp/elsewhere/repo", &root.display().to_string()] {
-            let err = discover_advertised(&store, url, &auth, &egress, &interrupt)
-                .expect_err("a local path refuses before any dial");
+            let err = discover_advertised(
+                &store,
+                url,
+                &auth,
+                &egress,
+                &interrupt,
+                Service::ReceivePack,
+            )
+            .expect_err("a local path refuses before any dial");
             assert_eq!(err.code, ErrorCode::EInvalid);
         }
         let _ = std::fs::remove_dir_all(&root);
