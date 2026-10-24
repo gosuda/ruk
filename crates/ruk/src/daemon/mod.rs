@@ -2882,6 +2882,12 @@ async fn serve_hosted_receive(h: HostedReceive<'_>) {
     drop(policy);
     tokio::pin!(serve);
     let mut deliver = true;
+    // Breaks with `None` when the frame task abandons the pump while
+    // the serve still runs; the loop then stops selecting and the
+    // drain below owns the bridge. Awaiting `serve` inside an arm
+    // instead would let the pump stop answering a blocked hook
+    // exchange: the deadline lives only here, so the serve would hang
+    // with its receipt unwritten.
     let outcome: Result<(Vec<u8>, Vec<u64>), CoreError> = loop {
         tokio::select! {
             done = &mut serve => {
@@ -3241,6 +3247,24 @@ async fn await_git_round<T>(
     }
 }
 
+/// One streaming `upload-pack` round: every input the stream task needs,
+/// grouped so the entry point takes a single argument. The stream task
+/// owns the only mutable borrows; the blocking serve owns its socket end.
+#[cfg(unix)]
+struct StreamingUpload<'a> {
+    input: &'a mut StreamInput,
+    sink: &'a StreamSink,
+    credits: &'a mut ipc::StreamCredits,
+    cancel_guard: &'a CancelHandle,
+    token: Cancel,
+    cancel_flag: Arc<AtomicBool>,
+    refs: &'a ConnectionRefs,
+    coordinator: Arc<HostedCoordinator>,
+    git_protocol: String,
+    limits: GitLimits,
+    request_id: String,
+}
+
 fn run_git_service(
     coordinator: &std::sync::Arc<ruk_core::coord::HostedCoordinator>,
     service: &str,
@@ -3308,24 +3332,6 @@ fn run_git_service(
         }
     }
     Ok(out)
-}
-
-/// One streaming `upload-pack` round: every input the stream task needs,
-/// grouped so the entry point takes a single argument. The stream task
-/// owns the only mutable borrows; the blocking serve owns its socket end.
-#[cfg(unix)]
-struct StreamingUpload<'a> {
-    input: &'a mut StreamInput,
-    sink: &'a StreamSink,
-    credits: &'a mut ipc::StreamCredits,
-    cancel_guard: &'a CancelHandle,
-    token: Cancel,
-    cancel_flag: Arc<AtomicBool>,
-    refs: &'a ConnectionRefs,
-    coordinator: Arc<HostedCoordinator>,
-    git_protocol: String,
-    limits: GitLimits,
-    request_id: String,
 }
 
 /// Ends one streaming round with an error frame plus its terminal frame.

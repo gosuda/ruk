@@ -605,8 +605,10 @@ impl Registry {
     /// any tombstone rename or removal runs.
     ///
     /// # Errors
-    /// `E_FORBIDDEN` for a configured root, `E_INVALID` when the target
-    /// is not a repository store, `E_IO` when the registry lock is poisoned.
+    /// `E_FORBIDDEN` for a configured root, `E_INVALID` when the store
+    /// directory is absent, `E_NOT_FOUND` when the directory exists but its
+    /// format file is missing, unreadable, or does not parse as a store
+    /// format, `E_IO` when the registry lock is poisoned.
     fn validate_store_target(&self, repo_root: &Path, store: &Path) -> Result<(), CoreError> {
         if self.roots.iter().any(|root| repo_root == root.as_path()) {
             return Err(CoreError::new(
@@ -614,24 +616,75 @@ impl Registry {
                 "repository is a configured root",
             ));
         }
-        // Mirrors the `format` marker `Store::create` writes at the store
-        // root (`FORMAT_FILE` stays private to `ruk_core::store`).
-        if store.join("format").is_file() {
-            return Ok(());
+        if !store.is_dir() {
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository path is not a repository store",
+            ));
         }
-        let opened = self
+        if !store.join(Store::format_file()).is_file() {
+            if store.file_name().is_some_and(|name| name == ".ruk") {
+                return Err(CoreError::new(
+                    ErrorCode::ENotFound,
+                    "repository store format is missing",
+                ));
+            }
+            let opened = self
+                .inner
+                .lock()
+                .map_err(|_| {
+                    CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+                })?
+                .entries
+                .values()
+                .any(|entry| entry.path == store && entry.coordinator.is_some());
+            if opened {
+                return Ok(());
+            }
+            return Err(CoreError::new(
+                ErrorCode::EInvalid,
+                "repository path is not a repository store",
+            ));
+        }
+        use std::io::Read as _;
+        const MAX_FORMAT_BYTES: u64 = 128;
+        let bytes = {
+            let file = std::fs::File::open(store.join(Store::format_file())).map_err(|err| {
+                CoreError::new(
+                    ErrorCode::ENotFound,
+                    format!("repository store format is not readable: {err}"),
+                )
+            })?;
+            let mut limited = Vec::new();
+            file.take(MAX_FORMAT_BYTES + 1)
+                .read_to_end(&mut limited)
+                .map_err(|err| {
+                    CoreError::new(
+                        ErrorCode::ENotFound,
+                        format!("repository store format is not readable: {err}"),
+                    )
+                })?;
+            limited
+        };
+        Store::parses_format(&bytes).map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("repository store format does not parse: {err}"),
+            )
+        })?;
+        let registered = self
             .inner
             .lock()
             .map_err(|_| CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned"))?
             .entries
             .values()
-            .any(|entry| entry.path == store && entry.coordinator.is_some());
-        if opened {
+            .any(|entry| entry.path == store);
+        if registered {
             return Ok(());
         }
         Err(CoreError::new(
-            ErrorCode::EInvalid,
-            "repository path is not a repository store",
+            ErrorCode::ENotFound,
+            "repository is not registered",
         ))
     }
 
@@ -747,10 +800,11 @@ impl Registry {
     /// the busy check, and the filesystem tombstone renames the
     /// repository root. The entry leaves the handle table under the
     /// registry lock while no invocation holds its coordinator (counted
-    /// through the shared ownership the eviction pass uses), so new opens
-    /// miss and racing deletes serialize. The coordinator shuts down
-    /// outside the lock, then the directory renames to a tombstone and is
-    /// removed: a crash between the two leaves the tombstone for the
+    /// through the shared ownership the eviction pass uses), and its path
+    /// stays reserved until retirement finishes. New opens refuse that path
+    /// and racing deletes serialize. The coordinator shuts down outside the
+    /// lock, then the directory renames to a tombstone and is removed: a
+    /// crash between the two leaves the tombstone for the
     /// startup sweep. `confirm_path` must name the same repository.
     ///
     /// # Errors
@@ -773,7 +827,7 @@ impl Registry {
         let path = repo_root
             .to_str()
             .ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "repository path is not UTF-8"))?;
-        let retired = {
+        let (retired, handle, entry) = {
             let mut inner = self.inner.lock().map_err(|_| {
                 CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
             })?;
@@ -785,50 +839,64 @@ impl Registry {
             }
             inner.deleting.insert(repo_root.clone());
             inner.deleting.insert(store.clone());
-            let taken = take_entry_by_path(&mut inner, &store);
-            if let Some((_, entry)) = &taken {
-                let busy = entry
-                    .coordinator
-                    .as_ref()
-                    .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
-                if busy {
-                    if let Some((handle, entry)) = taken {
-                        inner.entries.insert(handle, entry);
-                        inner.deleting.remove(&repo_root);
-                        inner.deleting.remove(&store);
-                    }
-                    return Err(CoreError::new(
-                        ErrorCode::EConflicted,
-                        "repository has invocations in flight",
-                    ));
-                }
+            let Some((handle, mut entry)) = take_entry_by_path(&mut inner, &store) else {
+                inner.deleting.remove(&repo_root);
+                inner.deleting.remove(&store);
+                return Err(CoreError::new(
+                    ErrorCode::ENotFound,
+                    "repository is not registered",
+                ));
+            };
+            let busy = entry
+                .coordinator
+                .as_ref()
+                .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
+            if busy {
+                inner.entries.insert(handle, entry);
+                inner.deleting.remove(&repo_root);
+                inner.deleting.remove(&store);
+                return Err(CoreError::new(
+                    ErrorCode::EConflicted,
+                    "repository has invocations in flight",
+                ));
             }
-            taken.and_then(|(_, entry)| entry.coordinator)
+            let retired = entry.coordinator.take();
+            (retired, handle, entry)
         };
-        if let Some(coordinator) = retired {
+        if let Some(coordinator) = &retired {
             coordinator.shutdown();
         }
         let tombstone = tombstone_for(&repo_root, self.next_handle.fetch_add(1, Ordering::Relaxed));
-        let clear_deleting = |root: &Path, store_path: &Path| {
+        let renamed = std::fs::rename(&repo_root, &tombstone);
+        if let Err(err) = renamed {
             if let Ok(mut inner) = self.inner.lock() {
-                inner.deleting.remove(root);
-                inner.deleting.remove(store_path);
+                inner.entries.insert(handle, entry);
+                inner.deleting.remove(&repo_root);
+                inner.deleting.remove(&store);
             }
-        };
-        let renamed = std::fs::rename(&repo_root, &tombstone).map_err(|err| {
-            CoreError::new(
+            return Err(CoreError::new(
                 ErrorCode::EIo,
                 format!("repository tombstone failed: {err}"),
-            )
-        });
-        clear_deleting(&repo_root, &store);
-        renamed?;
-        std::fs::remove_dir_all(&tombstone).map_err(|err| {
-            CoreError::new(ErrorCode::EIo, format!("repository removal failed: {err}"))
-        })?;
-        if let Some(parent) = repo_root.parent() {
-            fsync_dir(parent)?;
+            ));
         }
+        let retirement_result = std::fs::remove_dir_all(&tombstone)
+            .map_err(|err| {
+                CoreError::new(ErrorCode::EIo, format!("repository removal failed: {err}"))
+            })
+            .and_then(|()| {
+                if let Some(parent) = repo_root.parent() {
+                    fsync_dir(parent)?;
+                }
+                Ok(())
+            });
+        {
+            let mut inner = self.inner.lock().map_err(|_| {
+                CoreError::new(ErrorCode::EIo, "repository registry lock is poisoned")
+            })?;
+            inner.deleting.remove(&repo_root);
+            inner.deleting.remove(&store);
+        }
+        retirement_result?;
         Ok(RepoDeleteReply {
             deleted_path: path.to_owned(),
         })
@@ -936,35 +1004,37 @@ impl Registry {
             }
             inner.deleting.insert(repo_root.clone());
             inner.deleting.insert(store.clone());
-            if let Some(entry) = entry_by_path_mut(&mut inner, &store) {
-                let busy = entry
-                    .coordinator
-                    .as_ref()
-                    .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
-                if busy {
-                    drop(inner);
-                    self.clear_deleting(&[&repo_root, &store]);
-                    return Err(CoreError::new(
-                        ErrorCode::EConflicted,
-                        "repository has invocations in flight",
-                    ));
-                }
-                let coordinator = entry.coordinator.take();
-                entry.runner.take();
-                let prior = std::mem::replace(&mut entry.path, updated.clone());
-                entry.last_used = Instant::now();
-                (coordinator, Some(prior))
-            } else {
-                (None, None)
+            let Some(entry) = entry_by_path_mut(&mut inner, &store) else {
+                inner.deleting.remove(&repo_root);
+                inner.deleting.remove(&store);
+                return Err(CoreError::new(
+                    ErrorCode::ENotFound,
+                    "repository is not registered",
+                ));
+            };
+            let busy = entry
+                .coordinator
+                .as_ref()
+                .is_some_and(|coordinator| Arc::strong_count(coordinator) > 1);
+            if busy {
+                inner.deleting.remove(&repo_root);
+                inner.deleting.remove(&store);
+                return Err(CoreError::new(
+                    ErrorCode::EConflicted,
+                    "repository has invocations in flight",
+                ));
             }
+            let coordinator = entry.coordinator.take();
+            entry.runner.take();
+            let prior = std::mem::replace(&mut entry.path, updated.clone());
+            entry.last_used = Instant::now();
+            (coordinator, prior)
         };
         if let Some(coordinator) = retired {
             coordinator.shutdown();
         }
         if let Err(err) = std::fs::rename(&repo_root, &destination) {
-            if let Some(prior) = prior {
-                self.restore_rename_binding(&updated, prior);
-            }
+            self.restore_rename_binding(&updated, prior);
             self.clear_deleting(&[&repo_root, &store]);
             return Err(CoreError::new(
                 ErrorCode::EIo,
@@ -2655,6 +2725,111 @@ mod tests {
             })
             .expect_err("confirmation mismatch refuses");
         assert_eq!(mismatch.code, ErrorCode::EInvalid);
+    }
+
+    #[test]
+    fn remove_repo_refuses_unregistered_and_unformatted_paths() {
+        use ruk_core::error::ErrorCode;
+        use ruk_core::ids::HashKind;
+        use ruk_core::store::{PreparationBudget, Store};
+
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+
+        let grouping = canonical.join("team");
+        std::fs::create_dir_all(grouping.join(".ruk")).expect("grouping directory exists");
+        let grouping_path = grouping
+            .to_str()
+            .expect("grouping path is UTF-8")
+            .to_owned();
+        let grouping_error = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: grouping_path.clone(),
+                confirm_path: grouping_path,
+            })
+            .expect_err("unformatted grouping directory refuses deletion");
+        assert_eq!(grouping_error.code, ErrorCode::ENotFound);
+        assert!(grouping.exists(), "grouping directory remains intact");
+
+        let unregistered = canonical.join("stray-store");
+        let store = Store::create(
+            &unregistered,
+            HashKind::Sha256,
+            std::sync::Arc::new(PreparationBudget::reference_defaults()),
+        )
+        .expect("stray store is valid");
+        drop(store);
+        let unregistered_path = unregistered
+            .to_str()
+            .expect("unregistered path is UTF-8")
+            .to_owned();
+        let unregistered_error = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: unregistered_path.clone(),
+                confirm_path: unregistered_path,
+            })
+            .expect_err("valid but unregistered store refuses deletion");
+        assert_eq!(unregistered_error.code, ErrorCode::ENotFound);
+        assert!(unregistered.exists(), "unregistered store remains intact");
+    }
+
+    #[test]
+    fn path_open_cannot_reregister_while_deleting() {
+        use ruk_core::error::ErrorCode;
+
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let path = canonical.join("repo-a/.ruk");
+        std::fs::create_dir_all(&path).expect("store directory exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let handle = registry.open_by_path(&path).expect("path registers");
+        {
+            let mut inner = registry.inner.lock().expect("registry lock holds");
+            assert!(inner.entries.remove(&handle).is_some());
+            inner.deleting.insert(path.clone());
+        }
+
+        let error = registry
+            .open_by_path(&path)
+            .expect_err("open refuses while deletion is reserved");
+        assert_eq!(error.code, ErrorCode::EConflicted);
+        assert_eq!(registry.len().expect("registry lock holds"), 0);
+    }
+
+    #[test]
+    fn remove_repo_restores_handle_when_tombstone_rename_fails() {
+        use ruk_core::error::ErrorCode;
+
+        let root = scratch_root();
+        let canonical = std::fs::canonicalize(&root).expect("scratch root exists");
+        let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+        let created = registry
+            .create_repo(&init_args(&root, "gone"))
+            .expect("init creates");
+        let repo_root = std::path::Path::new(&created.path);
+        let store = repo_root.join(".ruk");
+        let handle = registry.open_by_path(&store).expect("store path registers");
+
+        let tombstone =
+            super::tombstone_for(repo_root, registry.next_handle.load(Ordering::Relaxed));
+        std::fs::create_dir_all(&tombstone).expect("tombstone collision exists");
+        std::fs::write(tombstone.join("blocker"), b"keep rename from replacing it")
+            .expect("tombstone is nonempty");
+
+        let error = registry
+            .remove_repo(&ruk_core::protocol::RepoDeleteArgs {
+                repo: created.path.clone(),
+                confirm_path: created.path,
+            })
+            .expect_err("existing tombstone refuses rename");
+        assert_eq!(error.code, ErrorCode::EIo);
+        assert_eq!(
+            registry
+                .open_by_handle(&handle)
+                .expect("failed deletion keeps its handle"),
+            canonical.join("gone/.ruk")
+        );
     }
 
     #[test]

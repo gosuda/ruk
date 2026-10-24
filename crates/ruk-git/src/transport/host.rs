@@ -159,6 +159,18 @@ impl HookServer {
     pub async fn recv(&mut self) -> Option<HookExchange> {
         self.receiver.recv().await
     }
+
+    /// Fails closed when the pump abandons the bridge: every queued
+    /// exchange is discarded so its sender's reply slot drops, and the
+    /// blocked policy exchange fails into a whole-push refusal. The
+    /// serve then completes and the outcome records as a receipt.
+    pub fn fail_closed(&mut self) {
+        self.receiver.close();
+        while self.receiver.try_recv().is_ok() {
+            // Dropping each queued exchange drops its oneshot sender,
+            // which is the fail-closed signal.
+        }
+    }
 }
 
 /// Builds one bridge: the policy sends exchanges, the pump relays them.
