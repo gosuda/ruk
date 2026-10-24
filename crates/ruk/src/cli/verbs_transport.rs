@@ -2510,7 +2510,7 @@ fn rewrap_archive_tar(
     let mut held_path: Option<Vec<u8>> = None;
     for (member, typeflag) in &members {
         if *typeflag == b'x' {
-            if let Some(path) = pax_path_record(&member.data) {
+            if let Some(path) = pax_path_record(&member.data)? {
                 held_path = Some(path);
             }
             names.push(None);
@@ -2612,7 +2612,7 @@ fn rewrap_archive_tar(
                     continue;
                 }
                 if let Some(synth) = match prefix {
-                    Some(prefix) => rename_member(&mut member, &mut pending, prefix),
+                    Some(prefix) => rename_member(&mut member, &mut pending, prefix)?,
                     None => None,
                 } {
                     emit_member(&mut out, &synth);
@@ -2659,11 +2659,15 @@ fn rename_member(
     member: &mut TarMember,
     pending: &mut Option<TarMember>,
     prefix: &[u8],
-) -> Option<TarMember> {
-    let logical = pending
+) -> Result<Option<TarMember>, GitError> {
+    let logical = match pending
         .as_ref()
-        .and_then(|describer| pax_path_record(&describer.data))
-        .unwrap_or_else(|| header_name(&member.header));
+        .map(|describer| pax_path_record(&describer.data))
+        .transpose()?
+    {
+        Some(Some(path)) => path,
+        _ => header_name(&member.header),
+    };
     let trailing_slash = logical.ends_with(b"/");
     let stem = logical.strip_suffix(b"/").unwrap_or(&logical);
     let mut renamed = prefix.to_vec();
@@ -2677,20 +2681,20 @@ fn rename_member(
         checksum_header(&mut describer.header);
         truncate_header(&mut member.header, &renamed);
         checksum_header(&mut member.header);
-        return None;
+        return Ok(None);
     }
     if let Some((name_prefix, name)) = split_tar_name(&renamed) {
         write_split_name(&mut member.header, name_prefix, name);
         checksum_header(&mut member.header);
-        return None;
+        return Ok(None);
     }
     let record = ext_record_bytes("path", &renamed);
     truncate_header(&mut member.header, &renamed);
     checksum_header(&mut member.header);
-    Some(TarMember {
+    Ok(Some(TarMember {
         header: pax_header_bytes(&record),
         data: record,
-    })
+    }))
 }
 
 /// Writes ustar name/prefix fields, zeroing the previous contents first.
@@ -4634,7 +4638,8 @@ mod archive_rewrap_tests {
     }
 
     /// Logical (flag, path, payload) triples with `x` records resolved.
-    fn logical(tar: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+    type LogicalEntry = (u8, Vec<u8>, Vec<u8>);
+    fn logical(tar: &[u8]) -> Result<Vec<LogicalEntry>, GitError> {
         let mut out = Vec::new();
         let mut pos = 0;
         let mut pending: Option<Vec<u8>> = None;
@@ -4653,13 +4658,17 @@ mod archive_rewrap_tests {
                 pending = Some(data);
                 continue;
             }
-            let path = match pending.take().and_then(|records| pax_path_record(&records)) {
-                Some(path) => path,
-                None => header_name(&header),
+            let path = match pending
+                .take()
+                .map(|records| pax_path_record(&records))
+                .transpose()?
+            {
+                Some(Some(path)) => path,
+                _ => header_name(&header),
             };
             out.push((flag, path, data));
         }
-        out
+        Ok(out)
     }
 
     #[test]
@@ -4671,7 +4680,7 @@ mod archive_rewrap_tests {
             (b"sub/b.txt", b'0', b"b\n"),
         ]);
         let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
-        let members = logical(&out);
+        let members = logical(&out).expect("logical");
         assert_eq!(members[0].0, b'g');
         assert_eq!(members[0].1, b"pax_global_header");
         let named: Vec<Vec<u8>> = members[1..]
@@ -4698,6 +4707,7 @@ mod archive_rewrap_tests {
         ]);
         let limited = rewrap_archive_tar(tar, None, &["sub".to_owned()]).expect("rewrap");
         let names: Vec<Vec<u8>> = logical(&limited)
+            .expect("logical")
             .iter()
             .map(|(_, path, _)| path.clone())
             .collect();
@@ -4713,7 +4723,7 @@ mod archive_rewrap_tests {
         tar.extend_from_slice(&raw_member(&sub_path[..100], b'0', b"data\n"));
         tar.extend_from_slice(&[0u8; 1024]);
         let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
-        let members = logical(&out);
+        let members = logical(&out).expect("logical");
         assert_eq!(members.len(), 1);
         let mut wanted = b"lead/".to_vec();
         wanted.extend_from_slice(&sub_path);
@@ -4729,7 +4739,7 @@ mod archive_rewrap_tests {
         name.extend_from_slice(&std::iter::repeat_n(b'b', 40).collect::<Vec<u8>>());
         let tar = tar_of(&[(name.as_slice(), b'0', b"deep\n")]);
         let out = rewrap_archive_tar(tar, Some(b"lead/"), &[]).expect("rewrap");
-        let members = logical(&out);
+        let members = logical(&out).expect("logical");
         assert_eq!(members.len(), 1);
         let mut wanted = b"lead/".to_vec();
         wanted.extend_from_slice(&name);

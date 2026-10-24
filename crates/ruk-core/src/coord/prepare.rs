@@ -858,10 +858,6 @@ fn release_freeze_set_parts(
 ) -> Result<Parts, CoreError> {
     let store = ctx.store;
     let session = ctx.session;
-    // Session binding is a precondition, not the authorization itself:
-    // release authorization is enforced by the daemon admin gate before
-    // dispatch (beside the `PolicySet` check). The sessionless legacy path
-    // supplies no identity row, so it refuses here before any store read.
     let _row = ctx.session_row.ok_or_else(|| {
         uncovered(
             "release.freeze.set",
@@ -897,9 +893,6 @@ fn release_freeze_clear_parts(
 ) -> Result<Parts, CoreError> {
     let store = ctx.store;
     let session = ctx.session;
-    // Same session-binding precondition as the set arm: the owner string
-    // below tie-breaks competing releases but never authorizes, so the
-    // sessionless path refuses before the absent-row no-op could succeed.
     let _row = ctx.session_row.ok_or_else(|| {
         uncovered(
             "release.freeze.clear",
