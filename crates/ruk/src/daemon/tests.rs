@@ -6243,7 +6243,8 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
     use super::{Caller, InvocationOpen, dispatch_admin, registry::Registry};
 
     let root = temp_root("admin-dispatch");
-    let registry = Registry::new(vec![root.clone()]).expect("registry opens");
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry opens"));
+    let executor = BoundedExecutor::new(1).expect("executor");
     let root_str = root.to_str().expect("utf8 root").to_owned();
     let init_args = ruk_core::protocol::RepoInitArgs {
         root: root_str,
@@ -6266,7 +6267,7 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         principal: &Principal::from_peer_uid(1000),
         admin_uids: &[1000],
     };
-    let bytes = dispatch_admin(&registry, admin, &open, Method::RepoInit)
+    let bytes = dispatch_admin(&registry, &executor, admin, &open, Method::RepoInit)
         .await
         .expect("admin repo.init serves");
     let envelope: ReplyEnvelope = ipc::decode_control(&bytes).expect("reply decodes");
@@ -6283,7 +6284,7 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         principal: &Principal::from_peer_uid(2000),
         admin_uids: &[1000],
     };
-    let err = dispatch_admin(&registry, outsider, &open, Method::RepoInit)
+    let err = dispatch_admin(&registry, &executor, outsider, &open, Method::RepoInit)
         .await
         .expect_err("non-admin refused");
     assert_eq!(err.code, ErrorCode::EForbidden);
@@ -6311,9 +6312,32 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         principal: &Principal::from_peer_uid(1000),
         admin_uids: &[1000],
     };
-    let bytes = dispatch_admin(&registry, admin, &forked, Method::RepoFork)
-        .await
-        .expect("admin repo.fork serves");
+    let (holding_tx, holding_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let blocker = {
+        let exec = executor.clone();
+        tokio::spawn(async move {
+            let _ = exec
+                .run(move || {
+                    let _ = holding_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                })
+                .await;
+        })
+    };
+    holding_rx.await.expect("blocker holds permit");
+    assert_eq!(executor.available(), 0);
+
+    let dispatch_fut = dispatch_admin(&registry, &executor, admin, &forked, Method::RepoFork);
+    tokio::pin!(dispatch_fut);
+    tokio::select! {
+        _ = &mut dispatch_fut => panic!("fork must wait for executor permit"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    let _ = release_tx.send(());
+    let bytes = dispatch_fut.await.expect("admin repo.fork serves");
+    let _ = blocker.await;
+    assert_eq!(executor.available(), 1);
     let envelope: ReplyEnvelope = ipc::decode_control(&bytes).expect("reply decodes");
     let ReplyBody::Success(Reply::RepoFork(forked)) = envelope.body else {
         panic!("repo.fork must answer its own reply");
@@ -7689,4 +7713,98 @@ fn repo_fork_syncs_destination_directory_and_reopens_store() {
     use std::io::Read as _;
     read.bytes.read_to_end(&mut bytes).expect("read spool");
     assert_eq!(bytes, b"destination sync");
+}
+
+#[test]
+fn fork_links_sync_segment_dirs_before_metadata() {
+    use ruk_core::protocol::ForkRefs;
+    use ruk_core::store::lfs::{self, LfsObjectRecord};
+    use ruk_core::store::{FactExpectation, FactMutation};
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = temp_root("fork-links-sync");
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let repo_args = ruk_core::protocol::RepoInitArgs {
+        root: root.to_str().expect("UTF-8").to_owned(),
+        path: "source".to_owned(),
+        object_format: None,
+        default_branch: None,
+    };
+    let created = registry
+        .create_repo(&repo_args)
+        .expect("source repo creates");
+    let source_path = PathBuf::from(&created.path);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&source_path.join(".ruk"), budget.clone()).expect("open store");
+
+    let lfs_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let source_sidecar =
+        lfs::sidecar_path(&source_path.join(".ruk"), lfs_hex).expect("lfs sidecar path resolves");
+    std::fs::create_dir_all(source_sidecar.parent().expect("sidecar parent"))
+        .expect("lfs directories create");
+    std::fs::write(&source_sidecar, b"").expect("empty lfs payload stages");
+    assert!(lfs::sidecar_verified(&source_path.join(".ruk"), lfs_hex, 0));
+
+    let prepared = store
+        .prepare(ObjectKind::Blob, 11, &b"hello world"[..], None)
+        .expect("prepare");
+    let blob_oid = prepared.oid();
+    store
+        .publish(
+            vec![prepared],
+            &[FactMutation {
+                table: FactTable::LfsObjects,
+                key: lfs::record_key(lfs_hex),
+                expected: FactExpectation::Absent,
+                value: Some(lfs::encode_record(&LfsObjectRecord {
+                    size: 0,
+                    complete: true,
+                })),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
+    store.close().expect("close");
+    drop(store);
+
+    let dest_path = root.join("dest-linked");
+    let link_calls = Arc::new(AtomicUsize::new(0));
+    let link_count = Arc::clone(&link_calls);
+    let link_fn = move |from: &Path, to: &Path| -> std::io::Result<()> {
+        link_count.fetch_add(1, Ordering::SeqCst);
+        std::fs::hard_link(from, to)
+    };
+    let fork_args = RepoForkArgs {
+        source: source_path.to_str().expect("UTF-8").to_owned(),
+        path: dest_path.to_str().expect("UTF-8").to_owned(),
+        refs: Some(ForkRefs::All),
+    };
+    let reply = registry
+        .fork_repo_with_link(&fork_args, &link_fn, &super::registry::staging_sibling)
+        .expect("fork succeeds with hard links");
+    assert_eq!(reply.lfs_linked, 1);
+    assert!(reply.segments_copied.is_empty());
+    assert!(link_calls.load(Ordering::SeqCst) >= 1);
+
+    let dest_sidecar =
+        lfs::sidecar_path(&dest_path.join(".ruk"), lfs_hex).expect("dest sidecar path resolves");
+    assert_eq!(
+        std::fs::metadata(&source_sidecar)
+            .expect("source metadata")
+            .ino(),
+        std::fs::metadata(&dest_sidecar)
+            .expect("dest metadata")
+            .ino(),
+        "same-filesystem fork must link payload to the same inode"
+    );
+
+    let dest_store =
+        Store::open(&dest_path.join(".ruk"), budget).expect("fork store opens cleanly");
+    let mut read = dest_store.read(blob_oid).expect("payload preserved");
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    read.bytes.read_to_end(&mut bytes).expect("read spool");
+    assert_eq!(bytes, b"hello world");
 }

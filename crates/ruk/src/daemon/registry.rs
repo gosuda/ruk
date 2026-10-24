@@ -1427,14 +1427,19 @@ impl Registry {
         let stale = |detail: &str| CoreError::new(ErrorCode::EStale, detail.to_owned());
         let mut linked = Vec::new();
         let mut copied = Vec::new();
+        let mut installed = Vec::new();
         for manifest in &snapshot.sealed_manifests {
             let from = install.source.segment_path(manifest.id);
             let to = staging_store.segment_path(manifest.id);
             match link_or_copy(install.link, &from, &to) {
-                Ok(LinkOutcome::Linked) => linked.push(manifest.id),
+                Ok(LinkOutcome::Linked) => {
+                    linked.push(manifest.id);
+                    installed.push(manifest.id);
+                }
                 Ok(LinkOutcome::Copied) => {
                     sync_copied_file(&to, manifest.id)?;
                     copied.push(manifest.id);
+                    installed.push(manifest.id);
                 }
                 Err(err) => {
                     return Err(CoreError::new(
@@ -1444,7 +1449,7 @@ impl Registry {
                 }
             }
         }
-        sync_copied_dirs(&copied, |id| staging_store.segment_path(id))?;
+        sync_copied_dirs(&installed, |id| staging_store.segment_path(id))?;
         let tail_oids: Vec<ruk_core::ids::Oid> =
             snapshot.tail.iter().map(|(oid, _)| *oid).collect();
         staging_store
@@ -1518,10 +1523,11 @@ impl Registry {
         }
         let mut facts = Vec::new();
         let mut lfs_linked = 0u64;
+        let mut synced_lfs_dirs = std::collections::HashSet::new();
         for (table, key, value) in &snapshot.rows {
             let mut publish = true;
             if *table == FactTable::LfsObjects {
-                publish = link_lfs_payload(install, key, value)?;
+                publish = link_lfs_payload(install, key, value, &mut synced_lfs_dirs)?;
                 if publish {
                     lfs_linked += 1;
                 }
@@ -1534,6 +1540,9 @@ impl Registry {
                     value: Some(value.clone()),
                 });
             }
+        }
+        for dir in &synced_lfs_dirs {
+            fsync_dir(dir)?;
         }
         for chunk in facts.chunks(512) {
             staging_store
@@ -1782,6 +1791,7 @@ fn link_lfs_payload(
     install: &ForkInstall<'_>,
     key: &[u8],
     value: &[u8],
+    synced_dirs: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<bool, CoreError> {
     let Some(record) = ruk_core::store::lfs::decode_record(value) else {
         return Ok(false);
@@ -1817,15 +1827,14 @@ fn link_lfs_payload(
     })?;
     if matches!(outcome, LinkOutcome::Copied) {
         sync_copied_payload(&to, hex)?;
-        let mut curr = to.parent();
-        while let Some(parent) = curr {
-            if parent == install.staging {
-                fsync_dir(parent)?;
-                break;
-            }
-            fsync_dir(parent)?;
-            curr = parent.parent();
+    }
+    let mut curr = to.parent();
+    while let Some(parent) = curr {
+        synced_dirs.insert(parent.to_path_buf());
+        if parent == install.staging {
+            break;
         }
+        curr = parent.parent();
     }
     Ok(true)
 }

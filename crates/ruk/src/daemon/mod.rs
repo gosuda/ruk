@@ -4198,7 +4198,13 @@ async fn typed_stream(
     };
     let dispatch: std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, CoreError>> + Send + '_>> =
         if method.kind() == ruk_core::protocol::MethodKind::Admin {
-            Box::pin(dispatch_admin(&refs.registry, caller, open, method))
+            Box::pin(dispatch_admin(
+                &refs.registry,
+                &refs.executor,
+                caller,
+                open,
+                method,
+            ))
         } else {
             let Some(coordinator) = coordinator.as_ref() else {
                 fail(Error::Core(CoreError::new(
@@ -4905,7 +4911,8 @@ fn cancelled(err: &CoreError) -> bool {
 /// arguments, `E_HOSTED` where no dispatch path serves the method, plus
 /// the registry's own failures.
 pub(crate) async fn dispatch_admin(
-    registry: &Registry,
+    registry: &Arc<Registry>,
+    executor: &BoundedExecutor,
     caller: Caller<'_>,
     open: &InvocationOpen,
     method: Method,
@@ -4922,12 +4929,13 @@ pub(crate) async fn dispatch_admin(
         open.request_id.as_deref(),
     )?;
     request.validate()?;
-    dispatch_admin_method(registry, method, &request)
+    dispatch_admin_method(registry, executor, method, &request).await
 }
 
 /// Routes one authorized admin request to its registry producer.
-fn dispatch_admin_method(
-    registry: &Registry,
+async fn dispatch_admin_method(
+    registry: &Arc<Registry>,
+    executor: &BoundedExecutor,
     method: Method,
     request: &Request,
 ) -> Result<Vec<u8>, CoreError> {
@@ -4954,7 +4962,9 @@ fn dispatch_admin_method(
             ))
         }
         (Method::RepoFork, Request::RepoFork(args)) => {
-            let reply = registry.fork_repo(args)?;
+            let registry = Arc::clone(registry);
+            let args = args.as_ref().clone();
+            let reply = executor.run(move || registry.fork_repo(&args)).await??;
             ipc::encode_control(&ReplyEnvelope::success(
                 None,
                 Reply::RepoFork(Box::new(reply)),

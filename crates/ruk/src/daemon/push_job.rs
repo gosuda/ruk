@@ -573,7 +573,7 @@ impl BlockingJob {
             http,
         } = prepared;
         if withheld {
-            let (state, refs) = map_outcomes(plan.state, &early, &secrets)?;
+            let (state, refs) = map_outcomes(plan.state, &plan.updates, &early, &secrets)?;
             return self.finish_send(plan, state, refs, &secrets);
         }
         if wire.updates.is_empty() {
@@ -587,7 +587,7 @@ impl BlockingJob {
             // the prepared plan as locally rejected with its per-ref
             // reasons instead of stranding it without a receipt.
             plan.refuse_locally(early.clone()).map_err(to_core)?;
-            let (state, refs) = map_outcomes(plan.state, &early, &secrets)?;
+            let (state, refs) = map_outcomes(plan.state, &plan.updates, &early, &secrets)?;
             return self.finish_send(plan, state, refs, &secrets);
         }
         let outcome = match http {
@@ -622,7 +622,7 @@ impl BlockingJob {
         match outcome {
             Ok(mut outcomes) => {
                 outcomes.append(&mut early);
-                let (state, refs) = map_outcomes(plan.state, &outcomes, &secrets)?;
+                let (state, refs) = map_outcomes(plan.state, &plan.updates, &outcomes, &secrets)?;
                 self.finish_send(plan, state, refs, &secrets)
             }
             Err(err) => {
@@ -631,7 +631,7 @@ impl BlockingJob {
                 }
                 tracing::warn!(error = %err, "ruk push: send failed after first persist");
                 let outcomes = send_failure_outcomes(early, &wire);
-                let (state, refs) = map_outcomes(plan.state, &outcomes, &secrets)?;
+                let (state, refs) = map_outcomes(plan.state, &plan.updates, &outcomes, &secrets)?;
                 self.finish_send(plan, state, refs, &secrets)
             }
         }
@@ -976,6 +976,7 @@ fn auth_secrets(auth: &AuthPolicy) -> Vec<String> {
 /// server outcomes when it marks the plan.
 fn map_outcomes(
     state: PlanState,
+    updates: &[PushUpdate],
     outcomes: &[RefOutcome],
     secrets: &[String],
 ) -> Result<(PushState, Vec<PushRefOutcome>), CoreError> {
@@ -993,7 +994,15 @@ fn map_outcomes(
                 reason: scrub_outcome_reason(reason, secrets),
             },
             RefResult::Ok if state == PlanState::Uncertain => PushRefStatus::Uncertain,
-            RefResult::Ok => PushRefStatus::Confirmed { new: None },
+            RefResult::Ok => {
+                let new = updates
+                    .iter()
+                    .find(|update| update.name == outcome.name)
+                    .and_then(|update| {
+                        (update.new != update.new.kind().zero_oid()).then_some(update.new)
+                    });
+                PushRefStatus::Confirmed { new }
+            }
         };
         refs.push(PushRefOutcome { remote_ref, status });
     }
@@ -1191,6 +1200,18 @@ mod tests {
 
     #[test]
     fn map_outcomes_reports_each_server_verdict() {
+        let updates = vec![
+            PushUpdate {
+                name: b"refs/heads/a".to_vec(),
+                old: oid_fill(1),
+                new: oid_fill(2),
+            },
+            PushUpdate {
+                name: b"refs/heads/b".to_vec(),
+                old: oid_fill(1),
+                new: oid_fill(3),
+            },
+        ];
         let outcomes = vec![
             RefOutcome {
                 name: b"refs/heads/a".to_vec(),
@@ -1203,9 +1224,15 @@ mod tests {
                 },
             },
         ];
-        let (state, refs) = map_outcomes(PlanState::Confirmed, &outcomes, &[]).expect("maps");
+        let (state, refs) =
+            map_outcomes(PlanState::Confirmed, &updates, &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Confirmed);
-        assert!(matches!(refs[0].status, PushRefStatus::Confirmed { .. }));
+        assert_eq!(
+            refs[0].status,
+            PushRefStatus::Confirmed {
+                new: Some(oid_fill(2)),
+            }
+        );
         assert!(matches!(refs[1].status, PushRefStatus::Rejected { .. }));
     }
 
@@ -1217,23 +1244,33 @@ mod tests {
                 reason: "rejected a (non-fast-forward)".to_owned(),
             },
         }];
-        let (state, refs) = map_outcomes(PlanState::Rejected, &outcomes, &[]).expect("maps");
+        let (state, refs) = map_outcomes(PlanState::Rejected, &[], &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Rejected);
         assert!(matches!(refs[0].status, PushRefStatus::Rejected { .. }));
     }
 
     #[test]
     fn map_outcomes_uncertain_forces_every_ref_uncertain() {
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/a".to_vec(),
+            old: oid_fill(1),
+            new: oid_fill(2),
+        }];
         let outcomes = vec![RefOutcome {
             name: b"refs/heads/a".to_vec(),
             result: RefResult::Ok,
         }];
-        let (_, refs) = map_outcomes(PlanState::Uncertain, &outcomes, &[]).expect("maps");
+        let (_, refs) = map_outcomes(PlanState::Uncertain, &updates, &outcomes, &[]).expect("maps");
         assert!(matches!(refs[0].status, PushRefStatus::Uncertain));
     }
 
     #[test]
     fn map_outcomes_uncertain_preserves_local_rejections() {
+        let updates = vec![PushUpdate {
+            name: b"refs/heads/sent".to_vec(),
+            old: oid_fill(1),
+            new: oid_fill(2),
+        }];
         let outcomes = vec![
             RefOutcome {
                 name: b"refs/heads/sent".to_vec(),
@@ -1246,7 +1283,8 @@ mod tests {
                 },
             },
         ];
-        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes, &[]).expect("maps");
+        let (state, refs) =
+            map_outcomes(PlanState::Uncertain, &updates, &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Uncertain);
         assert!(matches!(refs[0].status, PushRefStatus::Uncertain));
         assert!(matches!(refs[1].status, PushRefStatus::Rejected { .. }));
@@ -1276,7 +1314,8 @@ mod tests {
             ],
         };
         let outcomes = send_failure_outcomes(early, &wire);
-        let (state, refs) = map_outcomes(PlanState::Uncertain, &outcomes, &[]).expect("maps");
+        let (state, refs) =
+            map_outcomes(PlanState::Uncertain, &wire.updates, &outcomes, &[]).expect("maps");
         assert_eq!(state, PushState::Uncertain);
         assert_eq!(refs.len(), 3);
         assert!(matches!(refs[0].status, PushRefStatus::Rejected { .. }));
@@ -1299,7 +1338,7 @@ mod tests {
                 result: RefResult::Ok,
             },
         ];
-        let err = map_outcomes(PlanState::Confirmed, &outcomes, &[])
+        let err = map_outcomes(PlanState::Confirmed, &[], &outcomes, &[])
             .expect_err("a malformed outcome name refuses the whole row");
         assert_eq!(err.code, ErrorCode::ECorrupt);
     }
@@ -1638,7 +1677,8 @@ mod tests {
         plan.begin_send().expect("begin send");
         plan.finalize(report.clone()).expect("finalize");
 
-        let (state, refs) = map_outcomes(plan.state, &report, &secrets).expect("maps");
+        let (state, refs) =
+            map_outcomes(plan.state, &plan.updates, &report, &secrets).expect("maps");
         assert_eq!(state, PushState::Rejected);
         let sent = job
             .finish_send(plan, state, refs, &secrets)
@@ -1692,8 +1732,13 @@ mod tests {
         );
         basic_plan.begin_send().expect("begin send");
         basic_plan.finalize(basic_report.clone()).expect("finalize");
-        let (basic_state, basic_refs) =
-            map_outcomes(basic_plan.state, &basic_report, &basic_secrets).expect("maps");
+        let (basic_state, basic_refs) = map_outcomes(
+            basic_plan.state,
+            &basic_plan.updates,
+            &basic_report,
+            &basic_secrets,
+        )
+        .expect("maps");
         let basic_sent = job
             .finish_send(basic_plan, basic_state, basic_refs, &basic_secrets)
             .expect("finish send");
@@ -1703,6 +1748,97 @@ mod tests {
         };
         assert!(!basic_reply_reason.contains("YWRtaW46c3VwZXJzZWNyZXQ="));
         assert!(basic_reply_reason.contains("[redacted]"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn confirmed_outcomes_carry_the_applied_tip() {
+        let root = std::env::temp_dir().join(format!("ruk-push-tip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch fits");
+        let budget = Arc::new(ruk_core::store::PreparationBudget::reference_defaults());
+        let store = Arc::new(
+            Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+        );
+        let peer = Principal::from_peer_uid(1000);
+        let coordinator = Arc::new(
+            HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+        );
+        let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+        let job = BlockingJob {
+            coordinator,
+            session: SessionId::generate(),
+            registry,
+            repo: root.clone(),
+            key_half: None,
+        };
+
+        let zero = HashKind::Sha256.zero_oid();
+        let created_oid = oid_fill(7);
+        let deleted_old_oid = oid_fill(8);
+        let plan_id = PlanId::generate();
+        let updates = vec![
+            PushUpdate {
+                name: b"refs/heads/feature".to_vec(),
+                old: zero,
+                new: created_oid,
+            },
+            PushUpdate {
+                name: b"refs/heads/obsolete".to_vec(),
+                old: deleted_old_oid,
+                new: zero,
+            },
+        ];
+        let report = vec![
+            RefOutcome {
+                name: b"refs/heads/feature".to_vec(),
+                result: RefResult::Ok,
+            },
+            RefOutcome {
+                name: b"refs/heads/obsolete".to_vec(),
+                result: RefResult::Ok,
+            },
+        ];
+        let mut plan = PushPlanRecord::prepare(
+            plan_id,
+            b"https://mirror.example/repo.git".to_vec(),
+            false,
+            updates.clone(),
+        );
+        plan.begin_send().expect("begin send");
+        plan.finalize(report.clone()).expect("finalize");
+
+        let (state, refs) = map_outcomes(plan.state, &plan.updates, &report, &[]).expect("maps");
+        assert_eq!(state, PushState::Confirmed);
+        assert_eq!(
+            refs[0].status,
+            PushRefStatus::Confirmed {
+                new: Some(created_oid),
+            }
+        );
+        assert_eq!(refs[1].status, PushRefStatus::Confirmed { new: None });
+
+        let sent = job
+            .finish_send(plan, state, refs, &[])
+            .expect("finish send");
+        assert_eq!(
+            sent.reply.refs.items[0].status,
+            PushRefStatus::Confirmed {
+                new: Some(created_oid),
+            }
+        );
+        assert_eq!(
+            sent.reply.refs.items[1].status,
+            PushRefStatus::Confirmed { new: None }
+        );
+
+        let plan_bytes = sent.terminal_fact.value.expect("terminal fact has value");
+        let persisted_plan =
+            PushPlanRecord::decode(plan_id, HashKind::Sha256, &plan_bytes).expect("decodes");
+        assert_eq!(persisted_plan.state, PlanState::Confirmed);
+        assert_eq!(persisted_plan.updates, updates);
+        assert_eq!(persisted_plan.outcomes, report);
 
         let _ = std::fs::remove_dir_all(&root);
     }
