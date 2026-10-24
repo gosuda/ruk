@@ -7468,3 +7468,169 @@ async fn archive_cap_binds_each_format_by_its_own_size() {
     drop(driver);
     task.abort();
 }
+
+#[test]
+fn reconciled_push_guard_stays_clear_after_restart() {
+    use ruk_core::HashKind;
+    use ruk_core::change::PlanId;
+    use ruk_core::error::ErrorCode;
+    use ruk_git::transport::push::{PushPlanRecord, PushUpdate};
+
+    let root = temp_root("reconciled-restart");
+    let repo_path = root.join("repo-a");
+    let store_dir = repo_path.join(".ruk");
+    let store = Store::create(
+        &store_dir,
+        HashKind::Sha256,
+        Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .expect("scratch store initializes");
+
+    let plan_id_1 = PlanId::generate();
+    let ref_1 = b"refs/heads/main".to_vec();
+    let updates_1 = vec![PushUpdate {
+        name: ref_1.clone(),
+        old: HashKind::Sha256.zero_oid(),
+        new: HashKind::Sha256.zero_oid(),
+    }];
+    let mut plan_1 = PushPlanRecord::prepare(plan_id_1, b"origin".to_vec(), false, updates_1);
+    plan_1.begin_send().expect("begin_send");
+    plan_1.mark_uncertain();
+    let mutation_1 = plan_1
+        .persist_mutation(HashKind::Sha256, None)
+        .expect("mutation encodes");
+
+    let plan_id_2 = PlanId::generate();
+    let ref_2 = b"refs/heads/feature".to_vec();
+    let updates_2 = vec![PushUpdate {
+        name: ref_2.clone(),
+        old: HashKind::Sha256.zero_oid(),
+        new: HashKind::Sha256.zero_oid(),
+    }];
+    let mut plan_2 = PushPlanRecord::prepare(plan_id_2, b"origin".to_vec(), false, updates_2);
+    plan_2.begin_send().expect("begin_send");
+    plan_2.mark_uncertain();
+    let mutation_2 = plan_2
+        .persist_mutation(HashKind::Sha256, None)
+        .expect("mutation encodes");
+    let marker_fact = super::push_job::reconciliation_marker_fact(plan_id_2);
+
+    store
+        .publish(
+            Vec::new(),
+            &[mutation_1, mutation_2, marker_fact],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("plans persist");
+    drop(store);
+
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime starts");
+    registry.set_runtime(runtime.handle().clone());
+
+    let (_handle, path, _coord) = registry
+        .open(repo_path.to_str().expect("scratch path is UTF-8"))
+        .expect("open restores repository and guards");
+
+    let err = registry
+        .push_guard_check(&path, std::slice::from_ref(&ref_1))
+        .expect_err("uncertain un-reconciled push plan guards ref after restart");
+    assert_eq!(err.code, ErrorCode::EPushUncertain);
+    assert!(err.to_string().contains(&plan_id_1.to_string()));
+
+    registry
+        .push_guard_check(&path, std::slice::from_ref(&ref_2))
+        .expect("reconciled push guard stays clear after restart");
+}
+
+#[test]
+fn fork_copy_syncs_payloads_before_metadata() {
+    use ruk_core::protocol::ForkRefs;
+
+    let root = temp_root("fork-copy-sync");
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let repo_args = ruk_core::protocol::RepoInitArgs {
+        root: root.to_str().expect("UTF-8").to_owned(),
+        path: "source".to_owned(),
+        object_format: None,
+        default_branch: None,
+    };
+    let created = registry
+        .create_repo(&repo_args)
+        .expect("source repo creates");
+    let source_path = PathBuf::from(&created.path);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&source_path.join(".ruk"), budget.clone()).expect("open store");
+
+    use ruk_core::store::lfs::{self, LfsObjectRecord};
+    use ruk_core::store::{FactExpectation, FactMutation};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let lfs_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let source_sidecar =
+        lfs::sidecar_path(&source_path.join(".ruk"), lfs_hex).expect("lfs sidecar path resolves");
+    std::fs::create_dir_all(source_sidecar.parent().expect("sidecar parent"))
+        .expect("lfs directories create");
+    std::fs::write(&source_sidecar, b"").expect("empty lfs payload stages");
+    assert!(lfs::sidecar_verified(&source_path.join(".ruk"), lfs_hex, 0));
+
+    let prepared = store
+        .prepare(ObjectKind::Blob, 11, &b"hello world"[..], None)
+        .expect("prepare");
+    let blob_oid = prepared.oid();
+    store
+        .publish(
+            vec![prepared],
+            &[FactMutation {
+                table: FactTable::LfsObjects,
+                key: lfs::record_key(lfs_hex),
+                expected: FactExpectation::Absent,
+                value: Some(lfs::encode_record(&LfsObjectRecord {
+                    size: 0,
+                    complete: true,
+                })),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
+    store.close().expect("close");
+    drop(store);
+
+    let dest_path = root.join("dest");
+    let exdev =
+        |_: &Path, _: &Path| -> std::io::Result<()> { Err(std::io::Error::from_raw_os_error(18)) };
+    let fork_args = RepoForkArgs {
+        source: source_path.to_str().expect("UTF-8").to_owned(),
+        path: dest_path.to_str().expect("UTF-8").to_owned(),
+        refs: Some(ForkRefs::All),
+    };
+    let reply = registry
+        .fork_repo_with_link(&fork_args, &exdev, &super::registry::staging_sibling)
+        .expect("fork succeeds with copy fallback");
+    assert_eq!(reply.lfs_linked, 1);
+
+    let dest_sidecar =
+        lfs::sidecar_path(&dest_path.join(".ruk"), lfs_hex).expect("dest sidecar path resolves");
+    assert_ne!(
+        std::fs::metadata(&source_sidecar)
+            .expect("source metadata")
+            .ino(),
+        std::fs::metadata(&dest_sidecar)
+            .expect("dest metadata")
+            .ino(),
+        "cross-device fallback must copy payload to a fresh inode"
+    );
+
+    let dest_store =
+        Store::open(&dest_path.join(".ruk"), budget).expect("fork store opens cleanly");
+    let mut read = dest_store.read(blob_oid).expect("payload preserved");
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    read.bytes.read_to_end(&mut bytes).expect("read spool");
+    assert_eq!(bytes, b"hello world");
+}

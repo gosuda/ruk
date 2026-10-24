@@ -1170,6 +1170,10 @@ pub fn search_content_local(
         },
     )?;
     let stop = Arc::new(AtomicBool::new(false));
+    let scan_budget = Arc::new(ScanBudget::new(
+        max_bytes,
+        u64::from(args.budget.effective_max_blobs()),
+    ));
     let mut fold = SearchFold::new(
         limit,
         &args.budget,
@@ -1191,7 +1195,7 @@ pub fn search_content_local(
             stop: Arc::clone(&stop),
             cancel: cancel.clone(),
             deadline,
-            scan_budget: Arc::new(ScanBudget::new(u64::MAX, u64::MAX)),
+            scan_budget: Arc::clone(&scan_budget),
             claim_after: None,
             claim_done: Arc::new(AtomicBool::new(false)),
         };
@@ -2630,5 +2634,113 @@ mod tests {
             handle.await.expect("scan joins");
         }
         assert!(peak.load(AtomicOrdering::SeqCst) <= 2);
+    }
+
+    #[test]
+    fn local_search_seals_at_the_requested_blob_budget() {
+        use crate::index::FileMode;
+        use crate::protocol::{PageLimit, PageRequest, RevisionRef};
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("local-blob-budget");
+        let first_blob = put_blob(&store, b"needle first\n");
+        let second_blob = put_blob(&store, b"needle second\n");
+        let third_blob = put_blob(&store, b"needle third\n");
+        let root = put_tree(
+            &store,
+            &[
+                ("a.txt", TreeMode::File(FileMode::Regular), first_blob),
+                ("b.txt", TreeMode::File(FileMode::Regular), second_blob),
+                ("c.txt", TreeMode::File(FileMode::Regular), third_blob),
+            ],
+        );
+        let head = commit_tree(&store, root, Vec::new());
+        let args = SearchArgs {
+            at: RevisionRef::Head { head },
+            pattern: literal("needle"),
+            case_insensitive: false,
+            paths: PathSelection::All,
+            globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            budget: SearchBudget {
+                max_bytes_scanned: None,
+                max_blobs: Some(1),
+                deadline_ms: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::try_from(100).ok(),
+                cursor: None,
+            },
+        };
+        let page = search_content_local(&store, &args).expect("local search completes");
+        assert!(
+            page.truncated,
+            "a single-blob budget must seal with more blobs remaining"
+        );
+        assert_eq!(
+            page.exhausted,
+            ScanExhaustion::Budget,
+            "sealed by budget, not by row limit or deadline"
+        );
+        assert_eq!(page.hits.len(), 1, "only the first blob's hit is returned");
+        assert_eq!(
+            page.scanned_blobs, 1,
+            "the shared budget must prevent scanning beyond the first blob"
+        );
+    }
+
+    #[test]
+    fn local_search_seals_at_the_requested_byte_budget() {
+        use crate::index::FileMode;
+        use crate::protocol::{PageLimit, PageRequest, RevisionRef};
+        use crate::workcopy::tree::TreeMode;
+        let (_temp, store) = test_store("local-byte-budget");
+        let first_blob = put_blob(&store, b"needle alpha\n");
+        let second_blob = put_blob(&store, b"needle beta\n");
+        let third_blob = put_blob(&store, b"needle gamma\n");
+        let root = put_tree(
+            &store,
+            &[
+                ("a.txt", TreeMode::File(FileMode::Regular), first_blob),
+                ("b.txt", TreeMode::File(FileMode::Regular), second_blob),
+                ("c.txt", TreeMode::File(FileMode::Regular), third_blob),
+            ],
+        );
+        let head = commit_tree(&store, root, Vec::new());
+        let args = SearchArgs {
+            at: RevisionRef::Head { head },
+            pattern: literal("needle"),
+            case_insensitive: false,
+            paths: PathSelection::All,
+            globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            budget: SearchBudget {
+                max_bytes_scanned: Some(14),
+                max_blobs: None,
+                deadline_ms: None,
+            },
+            page: PageRequest {
+                limit: PageLimit::try_from(100).ok(),
+                cursor: None,
+            },
+        };
+        let page = search_content_local(&store, &args).expect("local search completes");
+        assert!(
+            page.truncated,
+            "a tight byte budget must seal with more blobs remaining"
+        );
+        assert_eq!(
+            page.exhausted,
+            ScanExhaustion::Budget,
+            "sealed by budget, not by row limit or deadline"
+        );
+        assert!(
+            page.scanned_blobs <= 2,
+            "the shared byte budget must prevent scanning all three blobs (got {})",
+            page.scanned_blobs
+        );
+        assert!(
+            page.next.is_some(),
+            "a resumable cursor must be present after byte-budget seal"
+        );
     }
 }

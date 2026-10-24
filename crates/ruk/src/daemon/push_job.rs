@@ -51,7 +51,7 @@ use ruk_core::protocol::{
 };
 use ruk_core::records::Records;
 use ruk_core::refdata::{RefName, RefTarget};
-use ruk_core::store::{FactTable, Store};
+use ruk_core::store::{FactExpectation, FactMutation, FactTable, Store};
 use ruk_core::{HashKind, Oid};
 use ruk_git::GitError;
 use ruk_git::transport::Interrupt;
@@ -342,7 +342,7 @@ impl<'a> PushJob<'a> {
                     request,
                     reply: reply.clone(),
                     objects: Vec::new(),
-                    facts: Vec::new(),
+                    facts: vec![reconciliation_marker_fact(plan_id)],
                     workspace_fence: None,
                     ref_transaction: None,
                     ref_dependencies: Vec::new(),
@@ -1022,6 +1022,26 @@ fn pending_outcome(session: SessionId, request_id: RequestId) -> MutationOutcome
         merge: None,
         provenance: BoundedList::complete(Vec::new()).expect("empty provenance fits"),
         identity: None,
+    }
+}
+
+const RECONCILIATION_MARKER_PREFIX: &[u8] = b"push-reconciled\x00";
+const RECONCILIATION_MARKER_VERSION: u8 = 0x01;
+
+pub(crate) fn reconciliation_marker_key(plan: PlanId) -> Vec<u8> {
+    let id = plan.as_bytes();
+    let mut key = Vec::with_capacity(RECONCILIATION_MARKER_PREFIX.len() + id.len());
+    key.extend_from_slice(RECONCILIATION_MARKER_PREFIX);
+    key.extend_from_slice(id);
+    key
+}
+
+pub(crate) fn reconciliation_marker_fact(plan: PlanId) -> FactMutation {
+    FactMutation {
+        table: FactTable::RemoteObservations,
+        key: reconciliation_marker_key(plan),
+        expected: FactExpectation::Any,
+        value: Some(vec![RECONCILIATION_MARKER_VERSION]),
     }
 }
 

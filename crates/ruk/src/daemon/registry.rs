@@ -1021,7 +1021,7 @@ impl Registry {
     ///
     /// # Errors
     /// As for [`Registry::fork_repo`].
-    fn fork_repo_with_link(
+    pub(crate) fn fork_repo_with_link(
         &self,
         args: &ruk_core::protocol::RepoForkArgs,
         link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
@@ -1432,7 +1432,10 @@ impl Registry {
             let to = staging_store.segment_path(manifest.id);
             match link_or_copy(install.link, &from, &to) {
                 Ok(LinkOutcome::Linked) => linked.push(manifest.id),
-                Ok(LinkOutcome::Copied) => copied.push(manifest.id),
+                Ok(LinkOutcome::Copied) => {
+                    sync_copied_file(&to, manifest.id)?;
+                    copied.push(manifest.id);
+                }
                 Err(err) => {
                     return Err(CoreError::new(
                         ErrorCode::EIo,
@@ -1441,6 +1444,7 @@ impl Registry {
                 }
             }
         }
+        sync_copied_dirs(&copied, |id| staging_store.segment_path(id))?;
         let tail_oids: Vec<ruk_core::ids::Oid> =
             snapshot.tail.iter().map(|(oid, _)| *oid).collect();
         staging_store
@@ -1804,19 +1808,74 @@ fn link_lfs_payload(
             )
         })?;
     }
-    link_or_copy(install.link, &from, &to).map_err(|err| {
+    let outcome = link_or_copy(install.link, &from, &to).map_err(|err| {
         CoreError::new(
             ErrorCode::EIo,
             format!("fork links lfs payload {hex}: {err}"),
         )
     })?;
+    if matches!(outcome, LinkOutcome::Copied) {
+        sync_copied_payload(&to, hex)?;
+        let mut curr = to.parent();
+        while let Some(parent) = curr {
+            if parent == install.staging {
+                fsync_dir(parent)?;
+                break;
+            }
+            fsync_dir(parent)?;
+            curr = parent.parent();
+        }
+    }
     Ok(true)
+}
+
+fn sync_copied_file(path: &Path, segment_id: u64) -> Result<(), CoreError> {
+    let file = std::fs::File::open(path).map_err(|err| {
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("fork cannot reopen copied segment {segment_id}: {err}"),
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("fork cannot sync copied segment {segment_id}: {err}"),
+        )
+    })
+}
+
+fn sync_copied_payload(path: &Path, hex: &str) -> Result<(), CoreError> {
+    let file = std::fs::File::open(path).map_err(|err| {
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("fork cannot reopen copied lfs payload {hex}: {err}"),
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        CoreError::new(
+            ErrorCode::EIo,
+            format!("fork cannot sync copied lfs payload {hex}: {err}"),
+        )
+    })
+}
+
+fn sync_copied_dirs<F: Fn(u64) -> PathBuf>(ids: &[u64], path_fn: F) -> Result<(), CoreError> {
+    let mut synced: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for id in ids {
+        if let Some(parent) = path_fn(*id).parent() {
+            let parent = parent.to_path_buf();
+            if synced.insert(parent.clone()) {
+                fsync_dir(&parent)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One fork staging sibling for `destination`: the file name plus a fresh
 /// random uuid, so every attempt mints a fresh name and a leftover staging
 /// directory never blocks a retry.
-fn staging_sibling(destination: &Path) -> PathBuf {
+pub(crate) fn staging_sibling(destination: &Path) -> PathBuf {
     let file = destination
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -2158,9 +2217,27 @@ impl Registry {
                     )
                 })?;
                 if matches!(plan.state, PushState::Uncertain | PushState::Sending) {
-                    for update in &plan.updates {
-                        let key = (canonical.to_path_buf(), update.name.clone());
-                        uncertain_pushes.insert(key, plan.id);
+                    let marker_key = super::push_job::reconciliation_marker_key(plan.id);
+                    let marker_row = store
+                        .fact(FactTable::RemoteObservations, &marker_key)
+                        .map_err(|err| CoreError::new(err.code(), err.to_string()))?;
+                    let reconciled = match marker_row {
+                        None => false,
+                        Some(bytes) if bytes == [0x01] => true,
+                        Some(_) => {
+                            return Err(CoreError::new(
+                                ErrorCode::ECorrupt,
+                                format!(
+                                    "stored reconciliation marker for plan {plan_id} is corrupt"
+                                ),
+                            ));
+                        }
+                    };
+                    if !reconciled {
+                        for update in &plan.updates {
+                            let key = (canonical.to_path_buf(), update.name.clone());
+                            uncertain_pushes.insert(key, plan.id);
+                        }
                     }
                 }
             }
