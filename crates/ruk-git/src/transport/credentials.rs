@@ -37,10 +37,13 @@
 //! [`auth_header_for_url_with`] instead of spawning processes.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use super::http;
 
@@ -259,15 +262,16 @@ pub(crate) fn scope_matches(pattern: &str, url: &str) -> bool {
     rest.starts_with(['/', '?', '#'])
 }
 
-/// Expands a leading `~/` against `$HOME`. A bare `~` without a home is no
-/// program at all.
-fn expand_home(path: &str) -> Option<String> {
+/// Expands a leading `~/` against the caller map's `HOME`, never the
+/// process environment: helper programs resolve inside the same hermetic
+/// map as config paths. A bare `~` without a home is no program at all.
+fn expand_home_in(path: &str, vars: &HashMap<String, String>) -> Option<String> {
     if !path.starts_with('~') {
         return Some(path.to_owned());
     }
-    let home = std::env::var_os("HOME")?;
+    let home = vars.get("HOME")?;
     if path == "~" {
-        return Some(home.to_string_lossy().into_owned());
+        return Some(home.clone());
     }
     let rest = path.strip_prefix("~/")?;
     Some(
@@ -286,7 +290,7 @@ fn expand_home(path: &str) -> Option<String> {
 /// run. Bare built-in names (`store`, `cache`, ...) resolve to
 /// `git-credential-<name>` binaries, which this crate never executes: a
 /// named gap (`None`).
-fn classify_helper(value: &str) -> Option<(String, Vec<String>)> {
+fn classify_helper(value: &str, vars: &HashMap<String, String>) -> Option<(String, Vec<String>)> {
     let value = value.trim();
     if value.is_empty() {
         return None;
@@ -302,7 +306,7 @@ fn classify_helper(value: &str) -> Option<(String, Vec<String>)> {
     if !first.contains('/') && !first.starts_with('~') {
         return None;
     }
-    let program = expand_home(first)?;
+    let program = expand_home_in(first, vars)?;
     Some((program, words.map(str::to_owned).collect()))
 }
 
@@ -311,7 +315,11 @@ fn classify_helper(value: &str) -> Option<(String, Vec<String>)> {
 /// top-level row always. An empty value resets the chain, the way git's
 /// `helper =` (empty) clears previously accumulated helpers
 /// (`git/credential.c` appends in config read order).
-fn helper_commands_for(url: &str, entries: &[CredentialHelperRow]) -> Vec<(String, Vec<String>)> {
+fn helper_commands_for(
+    url: &str,
+    entries: &[CredentialHelperRow],
+    vars: &HashMap<String, String>,
+) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     for entry in entries {
         if entry.value.trim().is_empty() {
@@ -323,7 +331,7 @@ fn helper_commands_for(url: &str, entries: &[CredentialHelperRow]) -> Vec<(Strin
         {
             continue;
         }
-        if let Some(command) = classify_helper(&entry.value)
+        if let Some(command) = classify_helper(&entry.value, vars)
             && out.len() < MAX_HELPERS
         {
             out.push(command);
@@ -414,7 +422,7 @@ fn helper_commands_in(url: &str, vars: &HashMap<String, String>) -> Vec<(String,
         };
         entries.extend(parse_config_entries(text));
     }
-    helper_commands_for(url, &entries)
+    helper_commands_for(url, &entries, vars)
 }
 
 /// Whether `(program, args)` names a `!` shell helper: exactly
@@ -435,8 +443,18 @@ fn shell_command_line(line: &str, op: &str) -> String {
 /// Spawns one external helper as `<program> <op> <args...>` — or, for a `!`
 /// shell helper, as `sh -c "<command> <op>"` — with `input` on stdin,
 /// bounded by [`HELPER_TIMEOUT`] on a monotonic deadline. A refusal, a
-/// non-zero exit, an unreadable answer, or a timeout is `None`.
-fn run_helper_op(program: &str, args: &[String], op: &str, input: &[u8]) -> Option<Vec<u8>> {
+/// non-zero exit, an unreadable answer, or a timeout is `None`. The child
+/// inherits only `vars` plus `GIT_TERMINAL_PROMPT=0` (`PATH` resolves
+/// from `vars` when present, else the platform exec default), so ambient
+/// process credentials never leak into a helper a daemon job did not
+/// configure.
+fn run_helper_op_in(
+    program: &str,
+    args: &[String],
+    op: &str,
+    input: &[u8],
+    vars: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
     let mut command = if is_shell_helper(program, args) {
         let mut shell = Command::new("sh");
         shell.arg("-c").arg(shell_command_line(&args[1], op));
@@ -450,6 +468,13 @@ fn run_helper_op(program: &str, args: &[String], op: &str, input: &[u8]) -> Opti
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .env_clear()
+        .envs(vars)
+        .env(
+            "PATH",
+            vars.get("PATH")
+                .map_or("/usr/local/bin:/usr/bin:/bin", String::as_str),
+        )
         .env("GIT_TERMINAL_PROMPT", "0")
         .spawn()
         .ok()?;
@@ -518,9 +543,21 @@ pub fn credential_fill_with(
 }
 
 /// The three-argument seam the URL fill keeps: the operation is always
-/// `get`, so `store`/`erase` callers use [`run_helper_op`] directly.
+/// `get`, so `store`/`erase` callers use [`run_helper_op_in`] directly.
 fn run_helper(program: &str, args: &[String], input: &[u8]) -> Option<Vec<u8>> {
-    run_helper_op(program, args, "get", input)
+    run_helper_op_in(program, args, "get", input, &std::env::vars().collect())
+}
+
+/// The hermetic sibling of [`run_helper`]: the helper child inherits only
+/// `vars`, so Ambient transport calls resolve helpers without ambient
+/// process credentials.
+fn run_helper_in(
+    program: &str,
+    args: &[String],
+    input: &[u8],
+    vars: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    run_helper_op_in(program, args, "get", input, vars)
 }
 
 /// Fills credentials for `url` through the live config plus live helper
@@ -699,7 +736,9 @@ pub fn credential_fill_desc(
     if helpers.is_empty() {
         return None;
     }
-    credential_fill_desc_with(desc, &helpers, run_helper_op)
+    credential_fill_desc_with(desc, &helpers, |program, args, op, input| {
+        run_helper_op_in(program, args, op, input, vars)
+    })
 }
 
 /// Approves a parsed description through the live helpers (`store` across
@@ -707,7 +746,9 @@ pub fn credential_fill_desc(
 /// are silent: there is nothing to report back to a `store` caller.
 pub fn credential_approve_desc(desc: &[(String, String)], vars: &HashMap<String, String>) {
     let helpers = helper_chain_for_in(desc, vars);
-    credential_store_op_desc_with(desc, "store", &helpers, run_helper_op);
+    credential_store_op_desc_with(desc, "store", &helpers, |program, args, op, input| {
+        run_helper_op_in(program, args, op, input, vars)
+    });
 }
 
 /// Rejects a parsed description through the live helpers (`erase` across
@@ -715,7 +756,9 @@ pub fn credential_approve_desc(desc: &[(String, String)], vars: &HashMap<String,
 /// `store` sibling.
 pub fn credential_reject_desc(desc: &[(String, String)], vars: &HashMap<String, String>) {
     let helpers = helper_chain_for_in(desc, vars);
-    credential_store_op_desc_with(desc, "erase", &helpers, run_helper_op);
+    credential_store_op_desc_with(desc, "erase", &helpers, |program, args, op, input| {
+        run_helper_op_in(program, args, op, input, vars)
+    });
 }
 
 /// Standard-alphabet base64 with padding for one Basic value (the same
@@ -775,6 +818,376 @@ pub fn auth_header_for_url(url: &str, vars: &HashMap<String, String>) -> Option<
         return http::git_auth_header(vars);
     }
     auth_header_for_url_with(url, vars, &helpers, run_helper)
+}
+
+/// Which credential source one transport call may consult. `Explicit`
+/// sends only the injected credential: the helper chain and ambient
+/// environment are skipped entirely (H4b fail closed). `Ambient`
+/// resolves helpers from `vars`, then falls back to `vars` Bearer/Basic.
+/// Threaded through every smart-http RPC so no request smuggles process
+/// globals past the caller.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AuthPolicy {
+    /// Exactly one injected credential; helpers and env never consulted.
+    Explicit {
+        /// The injected credential, scoped to its origin.
+        auth: TransportAuth,
+    },
+    /// Helper chain from `vars`, then `vars` Bearer/Basic.
+    Ambient {
+        /// The caller-owned environment map, hermetic under test.
+        vars: HashMap<String, String>,
+    },
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        Self::Ambient {
+            vars: HashMap::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Explicit { auth } => formatter
+                .debug_struct("Explicit")
+                .field("auth", auth)
+                .finish(),
+            Self::Ambient { vars } => {
+                let count = vars.len();
+                formatter
+                    .debug_struct("Ambient")
+                    .field("vars", &format!("<{count} entries>"))
+                    .finish()
+            }
+        }
+    }
+}
+
+impl AuthPolicy {
+    /// Only the injected credential; helpers and the environment stay out.
+    #[must_use]
+    pub fn explicit(auth: TransportAuth) -> Self {
+        Self::Explicit { auth }
+    }
+
+    /// Helpers plus environment from the process map.
+    #[must_use]
+    pub fn ambient() -> Self {
+        Self::Ambient {
+            vars: std::env::vars().collect(),
+        }
+    }
+
+    /// Helpers plus environment from the caller-owned map.
+    #[must_use]
+    pub fn ambient_in(vars: HashMap<String, String>) -> Self {
+        Self::Ambient { vars }
+    }
+}
+
+/// The hermetic environment for daemon transport jobs: no system config,
+/// no global override, no home. [`config_paths_in`] resolves no files
+/// under this map, so a hosted job consults exactly its injected
+/// credential and nothing on disk.
+#[must_use]
+pub fn hermetic_vars() -> HashMap<String, String> {
+    HashMap::from([
+        ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+        ("GIT_CONFIG_GLOBAL".to_owned(), String::new()),
+        ("HOME".to_owned(), String::new()),
+    ])
+}
+
+/// Owned request headers for the Ambient policy: resolved
+/// `extra_headers` plus `extra`, plus the helper-then-environment auth
+/// header for `url` when either carries credentials. The single Ambient
+/// assembly point, so smart-http RPCs never consult the process
+/// environment behind the caller's back.
+#[must_use]
+pub fn ambient_headers_for_url(
+    url: &str,
+    vars: &HashMap<String, String>,
+    extra: &[(&str, &str)],
+    extra_headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    let helpers = helper_commands_in(url, vars);
+    let mut out: Vec<(String, String)> = extra_headers.to_vec();
+    out.extend(
+        extra
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+    );
+    if let Some(header) = auth_header_for_url_with(url, vars, &helpers, |program, args, input| {
+        run_helper_in(program, args, input, vars)
+    }) {
+        out.push(header);
+    }
+    out
+}
+
+/// The `Authorization` header `policy` yields for `url`. `Explicit`
+/// returns only the injected credential inside its origin and never runs
+/// `runner`; `Ambient` tries the helper chain, then the environment map.
+///
+/// `runner` answers one helper invocation the way [`run_helper`] does;
+/// tests inject a stub. An Explicit policy ignores it completely, so a
+/// panicking stub proves the chain stayed skipped.
+#[must_use]
+pub fn resolve_auth_header(
+    url: &str,
+    policy: &AuthPolicy,
+    helpers: &[(String, Vec<String>)],
+    runner: impl Fn(&str, &[String], &[u8]) -> Option<Vec<u8>>,
+) -> Option<(String, String)> {
+    match policy {
+        AuthPolicy::Explicit { auth } => auth.header_for(url),
+        AuthPolicy::Ambient { vars } => auth_header_for_url_with(url, vars, helpers, runner),
+    }
+}
+
+/// Whether `url` carries userinfo (`user[:password]@`) in its authority.
+#[must_use]
+pub fn url_has_userinfo(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+/// Refuses a remote URL that embeds credentials under an explicit injected
+/// credential: userinfo is never parsed as a credential (C18). The error
+/// names the cause and never echoes the URL, so the embedded secret cannot
+/// leave through it. Ambient calls keep their historical behavior.
+///
+/// # Errors
+/// [`crate::GitError::Invalid`] for userinfo under [`AuthPolicy::Explicit`].
+pub fn refuse_url_userinfo(url: &str, policy: &AuthPolicy) -> Result<(), crate::GitError> {
+    if matches!(policy, AuthPolicy::Explicit { .. }) && url_has_userinfo(url) {
+        return Err(crate::GitError::Invalid {
+            detail: "remote URL embeds credentials; pass them through --auth-stdin".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Replaces every `scheme://user[:password]@` in free bytes with `scheme://`,
+/// so a credential pasted into a URL never reaches stderr or a stored row.
+/// Works on bytes: non-UTF-8 content passes through unchanged, and every cut
+/// ends at an ASCII delimiter, so UTF-8 validity is preserved.
+#[must_use]
+pub fn scrub_userinfo_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(index) = rest.windows(3).position(|window| window == b"://") {
+        let (head, tail) = rest.split_at(index + 3);
+        out.extend_from_slice(head);
+        let end = tail
+            .iter()
+            .position(|byte| {
+                matches!(byte, b'/' | b'?' | b'#' | b'"' | b'\'') || byte.is_ascii_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let (authority, after) = tail.split_at(end);
+        match authority.iter().rposition(|byte| *byte == b'@') {
+            Some(at) => out.extend_from_slice(&authority[at + 1..]),
+            None => out.extend_from_slice(authority),
+        }
+        rest = after;
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// Text form of [`scrub_userinfo_bytes`].
+#[must_use]
+pub fn scrub_userinfo(text: &str) -> String {
+    String::from_utf8_lossy(&scrub_userinfo_bytes(text.as_bytes())).into_owned()
+}
+
+/// Replaces every occurrence of each non-empty `secret` in `bytes` with
+/// `[redacted]`: an injected credential's value must never reach stderr or
+/// an error string, even when a server echoes it back.
+#[must_use]
+pub fn scrub_secrets(bytes: &[u8], secrets: &[String]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        out = replace_all(&out, secret.as_bytes(), b"[redacted]");
+    }
+    out
+}
+
+fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            out.extend_from_slice(with);
+            index += needle.len();
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// How one call authenticates to a remote. `None` sends nothing; any other
+/// kind sends exactly one `Authorization` header and never consults helpers
+/// or the environment (H4b fail closed). SSH key injection stays deferred.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportAuthKind {
+    /// No credential: anonymous, or ambient resolution downstream.
+    #[default]
+    None,
+    /// HTTP Basic: `credential` is `user:password` in the clear.
+    Basic,
+    /// Bearer token: `credential` is the token in the clear.
+    Bearer,
+}
+
+/// A credential injected on one call for remote authentication.
+///
+/// The secret travels only toward the transport job that needs it: [`fmt::Debug`]
+/// redacts it, and digest helpers take only parsed commands plus limits,
+/// so it never enters argument digests, receipts, or logs. `origin`
+/// scopes it to one `scheme://host[:port]`; a cross-origin redirect drops
+/// it instead of forwarding it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportAuth {
+    /// Which header the credential becomes, or none.
+    #[serde(default)]
+    pub kind: TransportAuthKind,
+    /// The secret: `user:password` for basic, the token for bearer.
+    #[serde(default)]
+    pub credential: String,
+    /// The `scheme://host[:port]` this credential may be sent to.
+    #[serde(default)]
+    pub origin: String,
+}
+
+impl fmt::Debug for TransportAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransportAuth")
+            .field("kind", &self.kind)
+            .field("credential", &"[redacted]")
+            .field("origin", &self.origin)
+            .finish()
+    }
+}
+
+impl TransportAuth {
+    /// No credential: anonymous, or ambient resolution downstream.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Fails closed on a half-specified credential: an explicit kind needs
+    /// both the secret and a well-formed origin scope; `None` carries
+    /// nothing and always passes.
+    ///
+    /// # Errors
+    /// [`crate::GitError::Invalid`] naming the missing half.
+    pub fn validate(&self) -> Result<(), crate::GitError> {
+        if self.kind == TransportAuthKind::None {
+            return Ok(());
+        }
+        if self.credential.is_empty() {
+            return Err(crate::GitError::Invalid {
+                detail: "injected transport auth needs its credential".to_owned(),
+            });
+        }
+        let scoped = Self::origin_of(&format!("{}/", self.origin));
+        if scoped.as_deref() != Some(self.origin.as_str()) {
+            return Err(crate::GitError::Invalid {
+                detail: "injected transport auth needs a scheme://host[:port] origin".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The `Authorization` header for `url`, only when `url` stays inside
+    /// the credential's origin scope. A cross-origin `url` yields nothing:
+    /// the caller drops the credential instead of forwarding it.
+    #[must_use]
+    pub fn header_for(&self, url: &str) -> Option<(String, String)> {
+        match self.kind {
+            TransportAuthKind::None => None,
+            TransportAuthKind::Basic | TransportAuthKind::Bearer => {
+                if self.credential.is_empty() {
+                    return None;
+                }
+                let origin = Self::origin_of(url)?;
+                if origin != self.origin {
+                    return None;
+                }
+                let credential = self.credential.as_str();
+                let value = match self.kind {
+                    TransportAuthKind::Basic => {
+                        let encoded = base64_encode(credential.as_bytes());
+                        format!("Basic {encoded}")
+                    }
+                    TransportAuthKind::Bearer => format!("Bearer {credential}"),
+                    TransportAuthKind::None => return None,
+                };
+                Some(("authorization".to_owned(), value))
+            }
+        }
+    }
+
+    /// The origin scope of one `http(s)` URL: lowercase
+    /// `scheme://host:port` with browser defaults (80/443) filled in, the
+    /// same normalization [`super::http::same_origin`] compares. Userinfo
+    /// never enters the scope. `None` for non-HTTP URLs.
+    #[must_use]
+    pub fn origin_of(url: &str) -> Option<String> {
+        let (scheme, rest) = url.split_once("://")?;
+        let scheme = scheme.to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return None;
+        }
+        let authority = rest.split('/').next()?;
+        let hostport = authority.rsplit('@').next().unwrap_or_default();
+        let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
+            let end = bracketed.find(']')?;
+            let host = bracketed[..end].to_ascii_lowercase();
+            if host.is_empty() {
+                return None;
+            }
+            let port = match bracketed[end + 1..].strip_prefix(':') {
+                Some(text) => text.parse::<u16>().ok()?,
+                None if end + 1 == bracketed.len() => 0,
+                None => return None,
+            };
+            (host, port)
+        } else if let Some((host, text)) = hostport.rsplit_once(':')
+            && !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            if host.is_empty() {
+                return None;
+            }
+            (host.to_ascii_lowercase(), text.parse::<u16>().ok()?)
+        } else {
+            if hostport.is_empty() {
+                return None;
+            }
+            (hostport.to_ascii_lowercase(), 0)
+        };
+        let port = if port == 0 {
+            if scheme == "https" { 443 } else { 80 }
+        } else {
+            port
+        };
+        Some(format!("{scheme}://{host}:{port}"))
+    }
 }
 
 #[cfg(test)]
@@ -863,18 +1276,19 @@ mod tests {
         );
         // File order, not scoped-first: git appends in config read order,
         // so the top-level helper answers before the scoped one.
-        let chain = helper_commands_for("https://host.x/sub/a", &entries);
+        let empty: HashMap<String, String> = HashMap::new();
+        let chain = helper_commands_for("https://host.x/sub/a", &entries, &empty);
         assert_eq!(
             chain,
             vec![external_helper("/bin/top"), external_helper("/bin/scoped")]
         );
-        let other = helper_commands_for("https://elsewhere.x/a", &entries);
+        let other = helper_commands_for("https://elsewhere.x/a", &entries, &empty);
         assert_eq!(other, vec![external_helper("/bin/top")]);
         let reset = parse_config_entries(
             "[credential]\n\thelper = /bin/a\n\thelper =\n\thelper = /bin/b\n",
         );
         assert_eq!(
-            helper_commands_for("https://host.x/a", &reset),
+            helper_commands_for("https://host.x/a", &reset, &empty),
             vec![external_helper("/bin/b")]
         );
     }
@@ -887,7 +1301,8 @@ mod tests {
         // Bare built-in names and the empty `!` stay gaps; only the shell
         // helper classifies, as `sh -c <line>` (the live layer appends
         // ` get`, mirroring `git/credential.c` `credential_do`).
-        let chain = helper_commands_for("https://host.x/a", &entries);
+        let empty: HashMap<String, String> = HashMap::new();
+        let chain = helper_commands_for("https://host.x/a", &entries, &empty);
         assert_eq!(
             chain,
             vec![(
@@ -915,15 +1330,15 @@ mod tests {
         assert!(scope_matches("https://host.x/sub", "https://host.x/sub/a"));
         assert!(!scope_matches("https://host", "https://hostile.x/a"));
         assert!(!scope_matches("", "https://host.x/a"));
-        assert_eq!(classify_helper("~/bin/helper --flag"), {
-            let home = std::env::var_os("HOME").map(|home| {
-                PathBuf::from(home)
-                    .join("bin/helper")
-                    .to_string_lossy()
-                    .into_owned()
-            });
-            home.map(|program| (program, vec!["--flag".to_owned()]))
-        });
+        assert_eq!(
+            classify_helper("~/bin/helper --flag", &vars(&[("HOME", "/home/u")])),
+            Some(("/home/u/bin/helper".to_owned(), vec!["--flag".to_owned()]))
+        );
+        assert_eq!(
+            classify_helper("~/bin/helper", &HashMap::new()),
+            None,
+            "no HOME in the map means no program"
+        );
     }
 
     #[test]
@@ -1017,7 +1432,7 @@ mod tests {
         // `-c` string as one argument, never as an argv element before it.
         let out = run_helper(
             "sh",
-            &["-c".to_owned(), "echo hello".to_owned()],
+            &["-c".to_owned(), "cat >/dev/null; echo hello".to_owned()],
             b"protocol=https\nhost=h\n\n",
         )
         .expect("shell helper answers");
@@ -1142,6 +1557,188 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn injected_auth_debug_redacts_the_secret() {
+        let auth = TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "tok_s3cret".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("Bearer"), "{rendered:?}");
+        assert!(rendered.contains("https://host.x:443"), "{rendered:?}");
+        assert!(!rendered.contains("tok_s3cret"), "{rendered:?}");
+    }
+
+    #[test]
+    fn injected_auth_validate_fails_closed() {
+        TransportAuth::none()
+            .validate()
+            .expect("none carries nothing");
+        for auth in [
+            TransportAuth {
+                kind: TransportAuthKind::Bearer,
+                credential: String::new(),
+                origin: "https://host.x:443".to_owned(),
+            },
+            TransportAuth {
+                kind: TransportAuthKind::Basic,
+                credential: "alice:pw".to_owned(),
+                origin: String::new(),
+            },
+            TransportAuth {
+                kind: TransportAuthKind::Bearer,
+                credential: "tok".to_owned(),
+                origin: "not an origin".to_owned(),
+            },
+        ] {
+            auth.validate().expect_err("half-specified auth must fail");
+        }
+        TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "tok".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        }
+        .validate()
+        .expect("full credential passes");
+    }
+
+    #[test]
+    fn injected_auth_stays_inside_its_origin() {
+        let auth = TransportAuth {
+            kind: TransportAuthKind::Basic,
+            credential: "alice:pw".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        };
+        let (name, value) = auth
+            .header_for("https://host.x/a.git")
+            .expect("same origin sends");
+        assert_eq!(name, "authorization");
+        assert_eq!(value, "Basic YWxpY2U6cHc=");
+        assert_eq!(
+            auth.header_for("http://host.x/a.git"),
+            None,
+            "scheme downgrade drops the credential"
+        );
+        assert_eq!(
+            auth.header_for("https://other.x/a.git"),
+            None,
+            "cross origin drops the credential"
+        );
+        assert_eq!(
+            auth.header_for("https://alice:pw@host.x/a.git"),
+            Some((name.clone(), value.clone())),
+            "userinfo in the URL never widens the scope"
+        );
+        assert_eq!(TransportAuth::none().header_for("https://host.x/a"), None);
+    }
+
+    #[test]
+    fn scrub_userinfo_drops_every_userinfo_form() {
+        assert_eq!(
+            scrub_userinfo("fetch https://ada:CANARY@host.x/r.git failed"),
+            "fetch https://host.x/r.git failed"
+        );
+        assert_eq!(scrub_userinfo("ssh://git@host/x"), "ssh://host/x");
+        assert_eq!(
+            scrub_userinfo("https://host.x/a?u=p@q"),
+            "https://host.x/a?u=p@q"
+        );
+        assert_eq!(scrub_userinfo("no url here"), "no url here");
+        assert_eq!(
+            scrub_userinfo_bytes(b"\xff://u:p@h/\xfe"),
+            b"\xff://h/\xfe".to_vec(),
+            "non-UTF-8 bytes pass through unchanged"
+        );
+        assert_eq!(
+            scrub_userinfo_bytes(b"x https://ada:CANARY@h/r"),
+            b"x https://h/r".to_vec()
+        );
+    }
+
+    #[test]
+    fn explicit_auth_refuses_url_userinfo_without_echoing_it() {
+        let explicit = AuthPolicy::explicit(TransportAuth::none());
+        let err = refuse_url_userinfo("https://ada:CANARY-s3cret@host.x/r.git", &explicit)
+            .expect_err("explicit auth refuses userinfo");
+        assert!(!err.to_string().contains("CANARY-s3cret"), "{err}");
+        assert!(refuse_url_userinfo("https://host.x/r.git", &explicit).is_ok());
+        assert!(
+            refuse_url_userinfo(
+                "https://ada:CANARY@host.x/r.git",
+                &AuthPolicy::ambient_in(HashMap::new()),
+            )
+            .is_ok(),
+            "ambient calls keep their historical behavior"
+        );
+    }
+
+    #[test]
+    fn scrub_secrets_redacts_every_occurrence_and_ignores_empty() {
+        let secrets = vec!["CANARY-tok".to_owned(), String::new()];
+        assert_eq!(
+            scrub_secrets(b"Bearer CANARY-tok and CANARY-tok", &secrets),
+            b"Bearer [redacted] and [redacted]".to_vec()
+        );
+        assert_eq!(scrub_secrets(b"no secret", &secrets), b"no secret".to_vec());
+    }
+
+    #[test]
+    fn hermetic_vars_resolve_no_config_files() {
+        let hermetic = hermetic_vars();
+        assert!(config_paths_in(&hermetic).is_empty());
+        assert_eq!(
+            helper_commands_in("https://host.x/a", &hermetic),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn explicit_policy_ignores_helpers_and_the_environment() {
+        let auth = TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "injected".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        };
+        let policy = AuthPolicy::explicit(auth);
+        let helpers = vec![external_helper("/bin/helper")];
+        let header = resolve_auth_header("https://host.x/a.git", &policy, &helpers, |_, _, _| {
+            panic!("explicit policy never runs helpers")
+        });
+        assert_eq!(
+            header,
+            Some(("authorization".to_owned(), "Bearer injected".to_owned()))
+        );
+        let rendered = format!("{policy:?}");
+        assert!(!rendered.contains("injected"), "{rendered:?}");
+        assert!(!rendered.contains("ambient-token"), "{rendered:?}");
+    }
+
+    #[test]
+    fn ambient_policy_falls_back_to_its_own_vars() {
+        let policy =
+            AuthPolicy::ambient_in(vars(&[("GIT_AUTH_USER", "u"), ("GIT_AUTH_PASSWORD", "p")]));
+        let header = resolve_auth_header("https://host.x/a.git", &policy, &[], |_, _, _| None);
+        assert_eq!(
+            header,
+            Some(("authorization".to_owned(), "Basic dTpw".to_owned()))
+        );
+    }
+
+    #[test]
+    fn injected_auth_origin_of_normalizes_ports() {
+        assert_eq!(
+            TransportAuth::origin_of("https://host.x/a.git"),
+            Some("https://host.x:443".to_owned())
+        );
+        assert_eq!(
+            TransportAuth::origin_of("http://host.x:8080/a"),
+            Some("http://host.x:8080".to_owned())
+        );
+        assert_eq!(TransportAuth::origin_of("ssh://host.x/a"), None);
+        assert_eq!(TransportAuth::origin_of("https://"), None);
     }
 
     #[test]

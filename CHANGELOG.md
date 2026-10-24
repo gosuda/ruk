@@ -6,6 +6,11 @@ Entries describe implemented, unreleased functionality.
 
 ### Added
 
+- Receive-pack closure verification stops at existing direct ref tips whose closures were verified when published. Newly introduced commits and their own trees, links, and parents remain fully verified; unrelated committed objects are not accepted as exclusion roots.
+
+- Protocol schema minor 4 adds `release.freeze.set` and `release.freeze.clear`, bringing the method count to 63. A release owner can freeze a tag at one target and clear its marker. Tag mutations, imports, CLI ref writes, undo, and pushes refuse frozen tags with the owner named. Marker guards publish atomically with ref changes; an atomic push refuses every sibling when any tag is frozen.
+
+- Protocol schema minor 3: `repo.fork` serves a staged fork. Sealed segments hardlink into the fork (a cross-device link copies and is reported), tail objects re-publish base-first, and facts copy under full CAS revalidation. The destination carries the forked generation, the default branch, and the refs the `refs` selection keeps; freeze markers, attestations, and live coordination state stay behind.
 - Protocol schema minor 2 with the `Admin` method kind and 14 hosted forge methods (`repo.stat`, `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`, `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`, `claim.renew`, `policy.set`), bringing the `ruk model` contract count to 61. Admin methods dispatch before any coordinator call, gated by `admin_uids`, with no session and no receipt; unserved arms refuse `E_HOSTED`.
 - `ruk model` command rendering the draft 2020-12 JSON schema for the Ruk core protocol, including framing boundaries, the 30-code closed error registry, object formats, and 61 protocol method contracts.
 - `ruk encode-conflict` command converting JSON `ConflictRecordInput` documents into byte-exact framed binary `conflict-v1` records for SHA-1 and SHA-256 repositories.
@@ -25,6 +30,7 @@ Entries describe implemented, unreleased functionality.
 
 ### Changed
 
+- **Breaking:** `release.freeze.set` now requires the tag to exist at the pinned target: an absent tag or a tag at another target is refused with `E_STALE` naming the live tag. A fresh freeze publishes a `Refs` guard (exact serialized `RefTarget` bytes, never the raw oid) alongside the marker create, so a tag that moves after prepare fails the freeze publish with `E_STALE`; a retry with the same owner and target stays a marker-only rewrite of the stored bytes. A live marker is removed only by owner-checked `release.freeze.clear`.
 - **Breaking:** renamed `ruk forgejo serve` to `ruk serve`. No alias or shim remains.
 - **Breaking:** unknown daemon config keys now refuse startup. Every key in the daemon config must be known.
 - **Breaking:** an empty `allowed_uids` now refuses hosted startup and denies every peer. At least one authorized peer uid is required.

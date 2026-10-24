@@ -1,20 +1,21 @@
 //! Pinned store-directory file access.
 //!
 //! [`PinnedRoot`] keeps one directory descriptor for the store root,
-//! opened when the store opens. Every later segment-file open, create,
-//! metadata probe, unlink, and directory sync travels that descriptor
-//! through `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, so a
-//! symlink swapped into the recorded path after open cannot redirect the
-//! access: the kernel refuses symlink components instead of following
-//! them. A refused access fails closed as I/O; it never serves bytes
-//! from outside the pinned directory.
+//! opened when the store opens. On Linux and Android, every later
+//! segment-file open, create, metadata probe, unlink, and directory sync
+//! travels that descriptor through `openat2` with
+//! `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, so the kernel refuses
+//! symlink components instead of following them. On other Unix targets,
+//! helpers use two `openat` steps with `O_NOFOLLOW` per component. A
+//! refused access fails closed as I/O; it never serves bytes from outside
+//! the pinned directory. Path-only metadata operations use the recorded
+//! path on those targets.
 //!
-//! Without the descriptor (non-Linux builds, or callers that never
-//! pinned) every helper falls back to the recorded path, preserving the
-//! historical behavior. A kernel without `openat2` (`ENOSYS`) opens in
-//! two steps against the held descriptor — the parent with `O_NOFOLLOW`,
-//! then the final name with `O_NOFOLLOW` inside it — so no step traverses
-//! a symlink there either. Any other refusal stays an error.
+//! Without a descriptor (non-Unix builds, or callers that never pinned),
+//! every helper falls back to the recorded path, preserving the
+//! historical behavior. Linux kernels without `openat2` (`ENOSYS`) use
+//! the same two-step `openat` fallback against the held descriptor. Any
+//! other refusal stays an error.
 //!
 //! Scope: segment files and scratch spools (`store_root/scratch`)
 //! travel the descriptor; LFS sidecars (`store_root/lfs/objects`)
@@ -50,26 +51,37 @@ pub(crate) struct PinnedRoot {
 }
 
 impl PinnedRoot {
-    /// Holds `dir` for later segment access. Fails closed when the
-    /// directory cannot be held: without the descriptor no later access
-    /// could be pinned. The descriptor is `O_PATH`: it names the
-    /// directory for `openat2`/`openat`/`unlinkat` without data access,
-    /// so it also reopens `/proc/self/fd` links of `O_PATH` descriptors
-    /// the registry holds, where an `O_RDONLY` reopen is refused.
+    /// Holds `dir` for later segment access. Unix targets fail closed if
+    /// the directory cannot be held. Non-Unix targets keep the recorded
+    /// path and use path-based access.
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android"),
+        doc = "On Linux and Android the descriptor is `O_PATH`: it names the directory for `openat2`/`openat`/`unlinkat` without data access, so it also reopens `/proc/self/fd` links of `O_PATH` descriptors the registry holds, where an `O_RDONLY` reopen is refused."
+    )]
+    #[cfg_attr(
+        all(unix, not(any(target_os = "linux", target_os = "android"))),
+        doc = "Other Unix targets use an `O_RDONLY` directory descriptor for fd-relative operations. `proc_subpath` is unavailable there, so path-only metadata opens use the recorded path."
+    )]
     ///
     /// # Errors
     /// [`StoreError::Io`] when `dir` is not an accessible directory.
     pub(super) fn open(dir: &Path) -> Result<Self, StoreError> {
         #[cfg(unix)]
         {
-            let fd = rustix::fs::open(
-                dir,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let flags = {
                 rustix::fs::OFlags::PATH
                     | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(|err| StoreError::Io(io::Error::from(err)))?;
+                    | rustix::fs::OFlags::CLOEXEC
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let flags = {
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+            };
+            let fd = rustix::fs::open(dir, flags, rustix::fs::Mode::empty())
+                .map_err(|err| StoreError::Io(io::Error::from(err)))?;
             Ok(Self {
                 record: dir.to_path_buf(),
                 fd: Some(fd),
@@ -83,21 +95,20 @@ impl PinnedRoot {
         }
     }
 
-    /// A process-local path naming `name` inside the pinned directory:
-    /// `/proc/self/fd/<n>/<name>` while a descriptor is held, so file
-    /// APIs that only take paths (like the metadata database open) still
-    /// travel the pin instead of the recorded path. Absent without a
-    /// descriptor.
+    /// On Linux, a process-local path naming `name` inside the pinned
+    /// directory: `/proc/self/fd/<n>/<name>` while a descriptor is held,
+    /// so path-only APIs can travel the pin. Other targets return `None`;
+    /// path-only metadata opens use the recorded path.
     #[must_use]
     pub(super) fn proc_subpath(&self, name: &str) -> Option<PathBuf> {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             use std::os::unix::io::AsRawFd as _;
             self.fd
                 .as_ref()
                 .map(|fd| PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())).join(name))
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = name;
             None
@@ -292,13 +303,11 @@ impl PinnedRoot {
         self.sync_dir(segments_dir())
     }
 
-    /// Opens `rel` through `openat2` with `RESOLVE_BENEATH |
-    /// RESOLVE_NO_SYMLINKS`: `Ok(Some)` on success, `Ok(None)` when the
-    /// caller must use the recorded path (no descriptor held), and `Err`
-    /// for every other refusal, including symlink components and escapes.
-    /// Without `openat2` (`ENOSYS`) the open goes through plain `openat`
-    /// in two steps — the parent with `O_NOFOLLOW`, then the final name
-    /// with `O_NOFOLLOW` inside it — so no step traverses a symlink.
+    /// Opens `rel` through `openat2` on Linux with `RESOLVE_BENEATH |
+    /// RESOLVE_NO_SYMLINKS`, or through two `openat` steps with
+    /// `O_NOFOLLOW` per component on other Unix targets. `Ok(Some)` means
+    /// the open succeeded; `Ok(None)` means the recorded path is needed
+    /// because no descriptor is held. Every other refusal is an error.
     #[cfg(unix)]
     fn open_at_optional(&self, rel: &Path, flags: rustix::fs::OFlags) -> io::Result<Option<File>> {
         let Some(fd) = self.fd.as_ref() else {
@@ -306,27 +315,34 @@ impl PinnedRoot {
         };
         check_rel(rel)?;
         use rustix::fd::AsFd as _;
-        match rustix::fs::openat2(
-            fd.as_fd(),
-            rel,
-            flags,
-            create_mode(flags),
-            rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS,
-        ) {
-            Ok(child) => Ok(Some(File::from(child))),
-            Err(rustix::io::Errno::NOSYS) => {
-                Ok(Some(self.open_at_nosys(fd.as_fd(), rel, flags)?))
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            match rustix::fs::openat2(
+                fd.as_fd(),
+                rel,
+                flags,
+                create_mode(flags),
+                rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(child) => Ok(Some(File::from(child))),
+                Err(rustix::io::Errno::NOSYS) => {
+                    Ok(Some(self.open_at_nofollow(fd.as_fd(), rel, flags)?))
+                }
+                Err(err) => Err(io::Error::from(err)),
             }
-            Err(err) => Err(io::Error::from(err)),
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            Ok(Some(self.open_at_nofollow(fd.as_fd(), rel, flags)?))
         }
     }
 
-    /// Two-step fallback without `openat2`: the parent opens with
-    /// `O_NOFOLLOW`, then the final name opens with `O_NOFOLLOW` inside
-    /// it. Every caller shape here is `segments/<name>` or a bare
-    /// `segments`, so one parent level suffices.
+    /// Two-step `openat` path: the parent opens with `O_NOFOLLOW`, then
+    /// the final name opens with `O_NOFOLLOW` inside it. Every caller
+    /// shape here is `segments/<name>` or a bare `segments`, so one
+    /// parent level suffices.
     #[cfg(unix)]
-    fn open_at_nosys(
+    fn open_at_nofollow(
         &self,
         fd: rustix::fd::BorrowedFd<'_>,
         rel: &Path,
@@ -359,7 +375,8 @@ impl PinnedRoot {
     }
 
     /// Opens the single-component `dir` below the held descriptor without
-    /// following a symlink, through `openat2` (`O_NOFOLLOW` without it).
+    /// following a symlink, through `openat2` on Linux and `openat` with
+    /// `O_NOFOLLOW` on other Unix targets.
     #[cfg(unix)]
     fn open_dir_nosymlink(
         &self,
@@ -367,22 +384,35 @@ impl PinnedRoot {
         dir: &Path,
     ) -> io::Result<rustix::fd::OwnedFd> {
         use rustix::fs::OFlags;
-        match rustix::fs::openat2(
-            fd,
-            dir,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-            rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS,
-        ) {
-            Ok(child) => Ok(child),
-            Err(rustix::io::Errno::NOSYS) => rustix::fs::openat(
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            match rustix::fs::openat2(
+                fd,
+                dir,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+                rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(child) => Ok(child),
+                Err(rustix::io::Errno::NOSYS) => rustix::fs::openat(
+                    fd,
+                    dir,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(io::Error::from),
+                Err(err) => Err(io::Error::from(err)),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            rustix::fs::openat(
                 fd,
                 dir,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )
-            .map_err(io::Error::from),
-            Err(err) => Err(io::Error::from(err)),
+            .map_err(io::Error::from)
         }
     }
 
@@ -486,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn proc_subpath_survives_a_parent_swap() {
         let outer = std::env::temp_dir().join(format!("ruk-pinned-{}-procsub", std::process::id()));
         let _ = std::fs::remove_dir_all(&outer);

@@ -6,8 +6,8 @@ use super::clock::Clock;
 use crate::change::{ClaimId, SessionId};
 use crate::index::RepoPath;
 use crate::protocol::{
-    BoundedList, ClaimAcquireArgs, ClaimMode, ClaimRecord, MAX_CLAIM_TTL_SECONDS, MAX_PAGE_SIZE,
-    Timestamp, Warning,
+    BoundedList, ClaimAcquireArgs, ClaimMode, ClaimRecord, ClaimSubject, MAX_CLAIM_TTL_SECONDS,
+    MAX_PAGE_SIZE, MAX_TASK_CLAIM_TTL_SECONDS, Timestamp, Warning,
 };
 use crate::store::{FactExpectation, FactMutation, FactPageBudget, FactTable, Store, StoreError};
 use crate::{CoreError, ErrorCode, MAX_CONTROL_FRAME_BYTES};
@@ -24,9 +24,29 @@ struct ClaimRow {
     record: ClaimRecord,
 }
 
-/// Current claim row version: rows carry the acquiring invocation's
-/// provenance.
-const CLAIM_ROW_VERSION: u8 = 2;
+/// Current claim row version: rows carry a task/change subject key.
+const CLAIM_ROW_VERSION: u8 = 3;
+
+/// Pre-subject claim record: the [`ClaimRecord`] shape before the trailing
+/// `subject` field. Decode-only outside tests.
+#[derive(Serialize, Deserialize)]
+struct ClaimRecordV2 {
+    claim: ClaimId,
+    holder: SessionId,
+    paths: Vec<RepoPath>,
+    mode: ClaimMode,
+    expires_at: Timestamp,
+    on_behalf_of: Option<String>,
+}
+
+/// Pre-subject claim row: version 2 rows predate task-keyed claims.
+/// Decode-only outside tests, for stores written before CS-R42 existed.
+#[derive(Serialize, Deserialize)]
+struct ClaimRowV2 {
+    version: u8,
+    created: Timestamp,
+    record: ClaimRecordV2,
+}
 
 /// Pre-provenance claim record: the [`ClaimRecord`] shape before the
 /// trailing `on_behalf_of` field. Decode-only outside tests.
@@ -81,10 +101,6 @@ pub(crate) struct ClaimPage {
     pub(crate) next: Option<Vec<u8>>,
 }
 
-#[expect(
-    dead_code,
-    reason = "no caller at this commit; retained for later changeset rows"
-)]
 pub(crate) struct ClaimSweep {
     pub(crate) facts: Vec<FactMutation>,
     pub(crate) next: Option<Vec<u8>>,
@@ -161,6 +177,29 @@ impl ClaimClock {
     }
 }
 
+/// Refuses a task-lease lifetime on a subject-less claim.
+///
+/// Path-only claims stay capped at one hour; only task-keyed claims may
+/// use the longer task ceiling. The wire type accepts both ranges so one
+/// decoding path serves both scopes.
+///
+/// # Errors
+/// `E_INVALID` for a path-only claim above the hourly ceiling.
+pub(crate) fn validate_claim_ttl(
+    subject: Option<&ClaimSubject>,
+    seconds: u32,
+) -> Result<(), CoreError> {
+    if subject.is_none() && seconds > MAX_CLAIM_TTL_SECONDS {
+        return Err(CoreError::new(
+            ErrorCode::EInvalid,
+            format!(
+                "claim ttl {seconds} exceeds {MAX_CLAIM_TTL_SECONDS} seconds without a task subject"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The caller holds sole lane ownership until these facts commit. Current
 /// session policy is checked by the caller. Claim-changing batches must not
 /// share a publication without a consistent accepted-update overlay.
@@ -178,6 +217,7 @@ pub(crate) fn seal_acquire(
             "claim identities must not be nil",
         ));
     }
+    validate_claim_ttl(args.subject.as_ref(), args.ttl.seconds())?;
     let paths = canonical_paths(args.paths)?;
     let (now, mut facts) = clock.fence(store)?;
     let warnings = check_paths(store, holder, &paths, now)?;
@@ -194,6 +234,7 @@ pub(crate) fn seal_acquire(
         mode: args.mode,
         expires_at: Timestamp::new(expires),
         on_behalf_of,
+        subject: args.subject,
     };
     let row = ClaimRow {
         version: CLAIM_ROW_VERSION,
@@ -254,6 +295,74 @@ pub(crate) fn seal_release(
     remove_record(store, &row, raw, &mut facts)?;
     Ok(ClaimChange {
         record: row.record,
+        facts,
+        warnings: BoundedList::complete(Vec::new())?,
+    })
+}
+
+/// Renews one held claim for a fresh lifetime window.
+///
+/// Only the holder can renew, and only while the claim still lives: an
+/// expired claim stays expired so its holder re-acquires instead of reviving
+/// a lapsed lease. The renewal starts a fresh window at the seal instant
+/// (`created` advances with `expires_at`) so repeated renewals keep a task
+/// claim alive; paths, mode, holder, provenance, and subject carry over
+/// unchanged. The caller holds sole lane ownership through publication.
+///
+/// # Errors
+/// `E_NOT_FOUND` for an unknown claim, `E_FORBIDDEN` for another session's
+/// claim, `E_STALE` for an expired claim, `E_INVALID` for a path-only
+/// renewal above the hourly ceiling.
+pub(crate) fn seal_renew(
+    store: &Store,
+    clock: &ClaimClock,
+    holder: SessionId,
+    claim: ClaimId,
+    seconds: u32,
+) -> Result<ClaimChange, CoreError> {
+    let (raw, row) = read_claim(store, claim)?
+        .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "claim does not exist"))?;
+    if row.record.holder != holder {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            "claim belongs to another session",
+        ));
+    }
+    let (now, mut facts) = clock.fence(store)?;
+    if row.record.expires_at <= now {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            "claim has expired; acquire a fresh claim",
+        ));
+    }
+    validate_claim_ttl(row.record.subject.as_ref(), seconds)?;
+    let expires = now
+        .instant()
+        .checked_add(jiff::SignedDuration::from_secs(i64::from(seconds)))
+        .map_err(|err| CoreError::new(ErrorCode::EInvalid, err.to_string()))?;
+    let record = ClaimRecord {
+        claim: row.record.claim,
+        holder: row.record.holder,
+        paths: row.record.paths.clone(),
+        mode: row.record.mode,
+        expires_at: Timestamp::new(expires),
+        on_behalf_of: row.record.on_behalf_of.clone(),
+        subject: row.record.subject.clone(),
+    };
+    let renewed = ClaimRow {
+        version: CLAIM_ROW_VERSION,
+        created: now,
+        record,
+    };
+    let encoded = crate::store::encode("claim", &renewed)?;
+    facts.push(FactMutation {
+        table: FactTable::Claims,
+        key: record_key(claim),
+        expected: FactExpectation::Value(raw),
+        value: Some(encoded),
+    });
+    Ok(ClaimChange {
+        record: renewed.record,
         facts,
         warnings: BoundedList::complete(Vec::new())?,
     })
@@ -502,9 +611,23 @@ pub(crate) fn list_page_raw(
     Ok(ClaimPage { records, next })
 }
 
+/// Length of a claim-record key: the `R` tag plus one claim identity.
+/// Index keys (holder, path) are longer, and the clock key is shorter, so
+/// this shape selects record deletions out of a sweep page.
+const RECORD_KEY_LEN: usize = 17;
+
+/// True for a claim-record key, as opposed to an index or clock key.
+#[must_use]
+pub(crate) fn is_record_key(key: &[u8]) -> bool {
+    key.len() == RECORD_KEY_LEN && key.first() == Some(&b'R')
+}
+
 /// Selects one bounded raw-record page. Commit all returned index deletions and
 /// the clock fence together under sole lane ownership.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired in CS-R42"))]
+///
+/// The fence rides along only when the page selected deletions: a clean
+/// page returns no facts at all, so maintenance passes over live claims
+/// stay idle instead of publishing a lone fence fact every interval.
 pub(crate) fn sweep_page(
     store: &Store,
     clock: &ClaimClock,
@@ -514,7 +637,8 @@ pub(crate) fn sweep_page(
     validate_budget(budget)?;
     let after = checked_position(b"R", after)?;
     let page = store.fact_page(FactTable::Claims, Some(after), budget)?;
-    let (now, mut facts) = clock.fence(store)?;
+    let (now, fence) = clock.fence(store)?;
+    let mut facts = Vec::new();
     let mut last = None;
     let mut ended = false;
     let mut work = Work::new();
@@ -543,7 +667,65 @@ pub(crate) fn sweep_page(
     } else {
         None
     };
-    Ok(ClaimSweep { facts, next })
+    if facts.is_empty() {
+        return Ok(ClaimSweep { facts, next });
+    }
+    let mut ordered = fence;
+    ordered.extend(facts);
+    Ok(ClaimSweep {
+        facts: ordered,
+        next,
+    })
+}
+
+pub(crate) fn live_holders(
+    store: &Store,
+    clock: &ClaimClock,
+    candidates: &[SessionId],
+) -> Result<Vec<SessionId>, CoreError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let now = clock.now()?;
+    let budget = FactPageBudget::new(MAX_PAGE_SIZE, MAX_CONTROL_FRAME_BYTES);
+    let mut unique_candidates = candidates.to_vec();
+    unique_candidates.sort();
+    unique_candidates.dedup();
+    let mut holders = Vec::new();
+    let mut work = Work::new();
+    for holder in unique_candidates {
+        let prefix = holder_prefix(holder);
+        let mut after = None;
+        loop {
+            let page =
+                store.fact_page_prefixed(FactTable::Claims, after.as_deref(), &prefix, budget)?;
+            if page.rows.is_empty() {
+                break;
+            }
+            let mut found_live = false;
+            for item in &page.rows {
+                work.charge(
+                    item.key
+                        .len()
+                        .checked_add(item.value.len())
+                        .ok_or_else(limit)?,
+                )?;
+                let (_, row) = indexed_claim(store, &item.key, &item.value, &mut work)?;
+                if row.record.expires_at > now {
+                    holders.push(holder);
+                    found_live = true;
+                    break;
+                }
+                after = Some(item.key.clone());
+            }
+            if found_live || !page.more {
+                break;
+            }
+        }
+    }
+    holders.sort();
+    holders.dedup();
+    Ok(holders)
 }
 
 fn next_in_prefix(
@@ -641,9 +823,14 @@ fn row_keys(record: &ClaimRecord) -> Result<Vec<Vec<u8>>, CoreError> {
 }
 
 fn record_key(claim: ClaimId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(17);
+    let mut key = Vec::with_capacity(RECORD_KEY_LEN);
     key.push(b'R');
     key.extend_from_slice(claim.as_bytes());
+    debug_assert_eq!(
+        key.len(),
+        RECORD_KEY_LEN,
+        "record keys stay one tag byte plus one claim identity"
+    );
     key
 }
 
@@ -682,24 +869,44 @@ fn decode_claim(store: &Store, key: &[u8], raw: &[u8]) -> Result<ClaimRow, CoreE
     let row: ClaimRow = match shaped {
         Ok(row) if row.version == CLAIM_ROW_VERSION => row,
         _ => {
-            let old: ClaimRowV1 = match crate::store::decode("claim", raw) {
-                Ok(old) => old,
-                Err(_) => return Err(corrupt(store, "invalid claim record")),
-            };
-            if old.version != 1 {
-                return Err(corrupt(store, "invalid claim record"));
-            }
-            ClaimRow {
-                version: CLAIM_ROW_VERSION,
-                created: old.created,
-                record: ClaimRecord {
-                    claim: old.record.claim,
-                    holder: old.record.holder,
-                    paths: old.record.paths,
-                    mode: old.record.mode,
-                    expires_at: old.record.expires_at,
-                    on_behalf_of: None,
-                },
+            let v2: Result<ClaimRowV2, _> = crate::store::decode("claim", raw);
+            if let Ok(old) = v2
+                && old.version == 2
+            {
+                ClaimRow {
+                    version: CLAIM_ROW_VERSION,
+                    created: old.created,
+                    record: ClaimRecord {
+                        claim: old.record.claim,
+                        holder: old.record.holder,
+                        paths: old.record.paths,
+                        mode: old.record.mode,
+                        expires_at: old.record.expires_at,
+                        on_behalf_of: old.record.on_behalf_of,
+                        subject: None,
+                    },
+                }
+            } else {
+                let old: ClaimRowV1 = match crate::store::decode("claim", raw) {
+                    Ok(old) => old,
+                    Err(_) => return Err(corrupt(store, "invalid claim record")),
+                };
+                if old.version != 1 {
+                    return Err(corrupt(store, "invalid claim record"));
+                }
+                ClaimRow {
+                    version: CLAIM_ROW_VERSION,
+                    created: old.created,
+                    record: ClaimRecord {
+                        claim: old.record.claim,
+                        holder: old.record.holder,
+                        paths: old.record.paths,
+                        mode: old.record.mode,
+                        expires_at: old.record.expires_at,
+                        on_behalf_of: None,
+                        subject: None,
+                    },
+                }
             }
         }
     };
@@ -711,15 +918,18 @@ fn decode_claim(store: &Store, key: &[u8], raw: &[u8]) -> Result<ClaimRow, CoreE
     {
         return Err(corrupt(store, "invalid claim record"));
     }
+    let ceiling = if row.record.subject.is_some() {
+        MAX_TASK_CLAIM_TTL_SECONDS
+    } else {
+        MAX_CLAIM_TTL_SECONDS
+    };
     let maximum = row
         .created
         .instant()
-        .checked_add(jiff::SignedDuration::from_secs(i64::from(
-            MAX_CLAIM_TTL_SECONDS,
-        )))
+        .checked_add(jiff::SignedDuration::from_secs(i64::from(ceiling)))
         .map_err(|_| corrupt(store, "claim lifetime overflows"))?;
     if row.record.expires_at.instant() > maximum {
-        return Err(corrupt(store, "claim lifetime exceeds one hour"));
+        return Err(corrupt(store, "claim lifetime exceeds its scope ceiling"));
     }
     let mut previous: Option<&RepoPath> = None;
     for path in &row.record.paths {
@@ -785,6 +995,8 @@ pub(crate) enum ClaimSealKind {
     Acquire,
     /// Removes a claim record.
     Release,
+    /// Extends a held claim for a fresh lifetime window.
+    Renew,
 }
 
 /// Lane publication parts from a settled claim seal.
@@ -888,6 +1100,28 @@ impl ClaimSealEnvelope {
         })
     }
 
+    /// Seals a claim renewal of `claim` for `holder` for `seconds`.
+    ///
+    /// # Errors
+    /// `E_NOT_FOUND` for an unknown claim, `E_FORBIDDEN` for another
+    /// holder's claim, `E_STALE` for an expired claim, `E_INVALID` for a
+    /// path-only renewal above the hourly ceiling.
+    pub(crate) fn for_renew(
+        store: &Store,
+        clock: &ClaimClock,
+        holder: SessionId,
+        claim: ClaimId,
+        seconds: u32,
+    ) -> Result<Self, CoreError> {
+        let change = seal_renew(store, clock, holder, claim, seconds)?;
+        Ok(Self {
+            kind: ClaimSealKind::Renew,
+            facts: change.facts,
+            warnings: change.warnings,
+            record: Some(change.record),
+        })
+    }
+
     /// Declares the path set one request seals.
     ///
     /// Write operations name their edit paths, resolve names its path,
@@ -915,7 +1149,8 @@ impl ClaimSealEnvelope {
     /// Seals one lane mutation for `holder`.
     ///
     /// Claim acquire operations seal a fresh record, claim release operations
-    /// seal the named record's removal, and every other operation seals its
+    /// seal the named record's removal, claim renew operations seal the
+    /// record's fresh lifetime window, and every other operation seals its
     /// declared paths. The lane publishes the envelope facts with the
     /// operation on settle and drops them on abort; see [`ClaimSealGuard`].
     /// The sealed record and advisory warnings report back through
@@ -951,6 +1186,13 @@ impl ClaimSealEnvelope {
             crate::protocol::Request::ClaimRelease(inner) => {
                 Self::for_release(store, clock, holder, inner.args.claim)
             }
+            crate::protocol::Request::ClaimRenew(inner) => Self::for_renew(
+                store,
+                clock,
+                holder,
+                inner.args.claim,
+                inner.args.ttl.seconds(),
+            ),
             _ => {
                 let paths = Self::mutation_paths(request);
                 Self::for_write(store, clock, holder, &paths)

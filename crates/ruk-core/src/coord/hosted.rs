@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use std::time::Instant as StdInstant;
@@ -36,9 +36,10 @@ use super::admission::{
     WorkResources, run_blocking,
 };
 pub use super::cancel::{Cancel, CancelHandle, cancellation};
+use super::claims::sweep_page as sweep_claims_page;
 use super::claims::{
-    ClaimClock, LeasedClaimPage, authorize_claim_list_args, list_page, list_page_raw,
-    next_claim_cursor,
+    ClaimClock, LeasedClaimPage, authorize_claim_list_args, is_record_key, list_page,
+    list_page_raw, live_holders, next_claim_cursor,
 };
 use super::clock::Clock;
 use super::lane::{
@@ -67,25 +68,33 @@ use crate::capability::{Capabilities, ReadAccess};
 use crate::change::{LeaseId, OperationId, RequestId, SessionId, WorkspaceId};
 use crate::error::{CoreError, ErrorCode};
 use crate::heads::Head;
-use crate::ids::Oid;
+use crate::ids::{HashKind, Oid};
 use crate::protocol::{
-    AttestListArgs, AttestListReply, BlameArgs, BlameHunk, BlameReply, ChangeHead,
-    ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitRev, CommitSummary, CompareArgs,
-    CompareReply, DEFAULT_PAGE_SIZE, DiffArgs, DiffBlob, DiffBody, DiffKind, DiffReply,
-    EventsTailArgs, EventsTailReply, FileArgs, FileBody, FileDiff, FileReply, KeysetPage, LogArgs,
-    LogReply, MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor, PageLimit,
-    PathChangeKind, PathSelection, PathStatus, QueryArgs, QueryDigest, QueryMatch, QueryReply,
-    ReconnectSecret, RefsListArgs, RefsListReply, Reply, RepoStatReply, Request, RevisionRef,
-    SessionAuthority, SessionOpenArgs, SessionResumeArgs, SessionResumeReply, ShowArgs, ShowBody,
-    ShowReply, ShowTarget, SnapshotPolicy, StatusArgs, StatusReply, TailedEvent, Timestamp,
-    TreeArgs, TreeEntry, TreeReply, ViewInfo,
+    ArchiveArgs, ArchiveFormat, ArchiveReply, AttestListArgs, AttestListReply, BlameArgs,
+    BlameHunk, BlameReply, ChangeHead, ClaimHolderFilter, ClaimListArgs, ClaimListReply, CommitRev,
+    CommitSummary, CompareArgs, CompareReply, DEFAULT_PAGE_SIZE, DiffArgs, DiffBlob, DiffBody,
+    DiffKind, DiffReply, EventsTailArgs, EventsTailReply, FileArgs, FileBody, FileDiff, FileReply,
+    KeysetPage, LogArgs, LogReply, MAX_PAGE_SIZE, Method, OpLogArgs, OpLogReply, Page, PageCursor,
+    PageLimit, PathChangeKind, PathSelection, PathStatus, QueryArgs, QueryDigest, QueryMatch,
+    QueryReply, ReconnectSecret, RefsListArgs, RefsListReply, Reply, RepoStatReply, Request,
+    RevisionRef, ScanExhaustion, SearchArgs, SearchReply, SessionAuthority, SessionOpenArgs,
+    SessionResumeArgs, SessionResumeReply, ShowArgs, ShowBody, ShowReply, ShowTarget,
+    SnapshotPolicy, StatusArgs, StatusReply, TailedEvent, Timestamp, TreeArgs, TreeEntry,
+    TreeReply, ViewInfo,
 };
 use crate::refdata::{RefName, RefTransaction};
 use crate::refs::page_refs_prefixed;
+use crate::search::{
+    ScanBudget, SearchFold, SearchPool, SearchPoolConfig, ShardOutput, ShardScan, WalkLimits,
+    WalkResume, build_search_matcher, collect_search_candidates, decode_search_position,
+    encode_search_position, scan_search_shard, seal_search_fold, search_deadline, search_hit,
+    search_query_digest, shard_search_entries,
+};
 use crate::store::CompactionStats;
 use crate::store::FactPageBudget;
 use crate::store::Store;
-use crate::store::types::{FactMutation, FactTable, PreparedObject, StoreEvent};
+use crate::store::StoreError;
+use crate::store::types::{FactMutation, FactTable, ObjectKind, PreparedObject, StoreEvent};
 use crate::workspace::WorkspaceStamp;
 
 /// What [`HostedCoordinator::prepare_for_dispatch`] returns: either the stored
@@ -176,10 +185,17 @@ pub struct HostedCoordinator {
     page_guards: Mutex<HashMap<LeaseId, (OwnerGuard, StdInstant)>>,
     event_retention_seconds: AtomicU64,
     compare_max_commits: AtomicU64,
+    search_pool: Arc<SearchPool>,
+    search_max_scan_bytes: AtomicU64,
     /// Resume key for the service-receipt sweep rotation. In memory
     /// only: a restart re-scans from the first key, which delays but
     /// never breaks convergence, and no head-schema change is needed.
     receipt_sweep_cursor: Mutex<Option<Vec<u8>>>,
+    /// Resume key for the claim sweep rotation. In memory only, like the
+    /// service-receipt cursor: a restart re-scans from the first record,
+    /// which delays but never breaks convergence, and the `OpHead`
+    /// encoding stays untouched.
+    claim_sweep_cursor: Mutex<Option<Vec<u8>>>,
 }
 
 impl core::fmt::Debug for HostedCoordinator {
@@ -272,9 +288,31 @@ impl HostedCoordinator {
             leases,
             page_guards: Mutex::new(HashMap::new()),
             event_retention_seconds: AtomicU64::new(DEFAULT_EVENT_RETENTION_SECONDS),
+            search_pool: Arc::new(SearchPool::new(SearchPoolConfig::default())?),
+            search_max_scan_bytes: AtomicU64::new(crate::search::DEFAULT_SEARCH_MAX_SCAN_BYTES),
             compare_max_commits,
             receipt_sweep_cursor: Mutex::new(None),
+            claim_sweep_cursor: Mutex::new(None),
         })
+    }
+
+    /// Replaces the search worker pool, injecting the daemon's configured
+    /// size. The default pool scans with
+    /// [`SearchPoolConfig::DEFAULT_PERMITS`] permits.
+    #[must_use]
+    pub fn with_search_pool(mut self, pool: SearchPool) -> Self {
+        self.search_pool = Arc::new(pool);
+        self
+    }
+
+    /// Caps decoded bytes one `search` page scans, in bytes.
+    ///
+    /// `serve` calls this once from the daemon configuration; each
+    /// coordinator opened afterwards scans within this ceiling. The page
+    /// seals with a cursor instead of refusing, so the ceiling never
+    /// surfaces `E_LIMIT`.
+    pub fn set_search_max_scan_bytes(&self, bytes: u64) {
+        self.search_max_scan_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Sets the horizon pruning event rows, in seconds.
@@ -606,10 +644,11 @@ impl HostedCoordinator {
     /// resources, authorizes it against the session's negotiated capabilities,
     /// and runs the read implementation. `op.log`, `claim.list`,
     /// `attest.list`, `refs.list`, `events.tail`, `file`, `show`, `log`,
-    /// `diff`, `blame`, `query`, and `status` have implementations; every
-    /// other read runs the same session checks and then names its missing
-    /// implementation with [`ErrorCode::EHosted`], so an unknown session
-    /// still reports `E_FORBIDDEN` rather than a missing-impl error.
+    /// `diff`, `blame`, `query`, `status`, `repo.stat`, `tree`, and `search`
+    /// have implementations; every other read runs the same session checks
+    /// and then names its missing implementation with [`ErrorCode::EHosted`],
+    /// so an unknown session still reports `E_FORBIDDEN` rather than a
+    /// missing-impl error.
     ///
     /// Capability mapping follows the existing handlers rather than a
     /// blanket table: ordinary reads authorize as [`ReadAccess::Objects`],
@@ -753,6 +792,10 @@ impl HostedCoordinator {
                 let reply = self.read_repo_stat()?;
                 Ok(Reply::RepoStat(Box::new(reply)))
             }
+            Request::Search(args) => {
+                let reply = self.read_search(session, &args, cancel, times.mono).await?;
+                Ok(Reply::Search(Box::new(reply)))
+            }
             Request::Tree(args) => {
                 let reply = self.read_tree(&args)?;
                 Ok(Reply::Tree(Box::new(reply)))
@@ -760,6 +803,10 @@ impl HostedCoordinator {
             Request::Compare(args) => {
                 let reply = self.read_compare(&args)?;
                 Ok(Reply::Compare(Box::new(reply)))
+            }
+            Request::Archive(args) => {
+                let reply = self.read_archive(&args)?;
+                Ok(Reply::Archive(Box::new(reply)))
             }
             other => Err(CoreError::new(
                 ErrorCode::EHosted,
@@ -781,6 +828,200 @@ impl HostedCoordinator {
     /// `E_CORRUPT` for a damaged head row.
     pub fn view(&self) -> Result<ViewInfo, CoreError> {
         current_view(&self.store)
+    }
+
+    /// Serves one `search` page: path-ordered matching lines over the
+    /// resolved revision tree, scanned on the core-owned pool.
+    ///
+    /// The walk enumerates in path-byte order, dedupes identical blobs,
+    /// and scans contiguous shards concurrently; emission stays in shard
+    /// order, so completion order never changes emitted rows. Over-cap wire
+    /// budgets already refused in [`Validate`]; the daemon scan ceiling
+    /// seals the page with a cursor instead of refusing. Reads hold no
+    /// lane and publish nothing.
+    ///
+    /// # Errors
+    /// - [`ErrorCode::EInvalid`] for a bad pattern, glob, budget, or cursor
+    ///   position, or a workspace revision.
+    /// - [`ErrorCode::EForbidden`] on a cursor binding mismatch or a stale
+    ///   view: the client restarts from a fresh first page.
+    /// - [`ErrorCode::ELeaseLost`] on an unknown, retired, or expired lease.
+    /// - [`ErrorCode::ECancelled`] once `cancel` fires.
+    /// - [`ErrorCode::EIo`] when a shard task fails.
+    /// - [`ErrorCode::ECorrupt`] for a damaged tree.
+    async fn read_search(
+        &self,
+        viewer: SessionId,
+        args: &SearchArgs,
+        cancel: &Cancel,
+        now: StdInstant,
+    ) -> Result<SearchReply, CoreError> {
+        let (view_first, root) = resolve_search_root(&self.store, &args.at)?;
+        let query = search_query_digest(root, args);
+        let cursor_view = args.page.cursor.as_ref().map(|cursor| cursor.view);
+        let mut skip_before = (Vec::new(), 0);
+        if let Some(cursor) = args.page.cursor.as_ref() {
+            let want = CursorWant {
+                store: self.store.store_id(),
+                session: viewer,
+                view: view_first.view,
+                query,
+            };
+            self.leases.check_cursor(cursor, &want, now)?;
+            let (scan_after, emit_after) = decode_search_position(&cursor.position)?;
+            skip_before = match (scan_after, emit_after) {
+                (Some(scan), Some((_, line))) => (scan, line),
+                (Some(scan), None) => (scan, 0),
+                (None, _) => (Vec::new(), 0),
+            };
+        }
+        let limit = args.page.effective_limit();
+        let max_bytes = args
+            .budget
+            .effective_max_bytes()
+            .min(self.search_max_scan_bytes.load(Ordering::Relaxed));
+        let deadline = search_deadline(now, &args.budget);
+        let matcher = build_search_matcher(&args.pattern, args.case_insensitive)?;
+        let walk_resume = WalkResume {
+            below: skip_before.0.as_slice(),
+            equal: skip_before.1 == 0 && !skip_before.0.is_empty(),
+        };
+        let walk = collect_search_candidates(
+            &self.store,
+            self.store.hash_kind(),
+            root,
+            args,
+            walk_resume,
+            WalkLimits { cancel, deadline },
+        )?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let scan_budget = Arc::new(ScanBudget::new(
+            max_bytes,
+            u64::from(args.budget.effective_max_blobs()),
+        ));
+        let mut fold = SearchFold::new(
+            limit,
+            &args.budget,
+            max_bytes,
+            deadline,
+            skip_before.clone(),
+        );
+        fold.add_skipped(walk.prefilter_skipped);
+        let mut shards = shard_search_entries(walk.entries).into_iter().enumerate();
+        let mut set: tokio::task::JoinSet<(usize, Result<ShardOutput, CoreError>)> =
+            tokio::task::JoinSet::new();
+        let mut reorder: std::collections::HashMap<usize, Result<ShardOutput, CoreError>> =
+            std::collections::HashMap::new();
+        let mut claim_flags: Vec<Arc<AtomicBool>> = Vec::new();
+        let mut next_fold = 0usize;
+        let mut launching = true;
+        while launching || !set.is_empty() {
+            cancel.check()?;
+            if launching {
+                let permit: Option<tokio::sync::OwnedSemaphorePermit> = if set.is_empty() {
+                    Some(self.search_pool.acquire_owned().await?)
+                } else {
+                    tokio::select! {
+                        permit = self.search_pool.acquire_owned() => Some(permit?),
+                        joined = set.join_next() => {
+                            if let Some(joined) = joined {
+                                let (index, out) = joined.map_err(|_| {
+                                    CoreError::new(ErrorCode::EIo, "search shard failed")
+                                })?;
+                                reorder.insert(index, out);
+                            }
+                            None
+                        }
+                    }
+                };
+                let mut shards_left = true;
+                if let Some(permit) = permit {
+                    if let Some((index, shard)) = shards.next() {
+                        claim_flags.resize(index + 1, Arc::new(AtomicBool::new(false)));
+                        let claim_after = index
+                            .checked_sub(1)
+                            .and_then(|prior| claim_flags.get(prior))
+                            .cloned();
+                        let claim_done = Arc::clone(&claim_flags[index]);
+                        let store = Arc::clone(&self.store);
+                        let job = ShardScan {
+                            shard,
+                            matcher: matcher.clone(),
+                            row_cap: limit.saturating_add(1),
+                            skip_before: skip_before.clone(),
+                            stop: Arc::clone(&stop),
+                            cancel: cancel.clone(),
+                            deadline,
+                            scan_budget: scan_budget.clone(),
+                            claim_after,
+                            claim_done,
+                        };
+                        set.spawn_blocking(move || {
+                            let _permit = permit;
+                            (index, scan_search_shard(&store, &job))
+                        });
+                    } else {
+                        shards_left = false;
+                    }
+                }
+                if !shards_left {
+                    launching = false;
+                }
+            } else if let Some(joined) = set.join_next().await {
+                let (index, out) =
+                    joined.map_err(|_| CoreError::new(ErrorCode::EIo, "search shard failed"))?;
+                reorder.insert(index, out);
+            }
+            while let Some(out) = reorder.remove(&next_fold) {
+                fold.push_shard(out?);
+                next_fold += 1;
+                if fold.sealed() {
+                    stop.store(true, Ordering::SeqCst);
+                    launching = false;
+                    set.detach_all();
+                    reorder.clear();
+                    break;
+                }
+            }
+        }
+        let view = current_view(&self.store)?;
+        if let Some(first) = cursor_view
+            && view.view != first
+        {
+            return Err(CoreError::new(
+                ErrorCode::EForbidden,
+                "search cursor names a stale view: open a fresh first page",
+            ));
+        }
+        let sealed = seal_search_fold(fold, walk.complete, walk.frontier);
+        let mut hits = Vec::with_capacity(sealed.rows.len().min(limit));
+        for row in sealed.rows.iter().take(limit) {
+            hits.push(search_hit(row)?);
+        }
+        let next = match sealed.resume {
+            None => None,
+            Some((scan_after, emit_after)) => {
+                let emit = emit_after
+                    .as_ref()
+                    .map(|(path, line)| (path.as_slice(), *line));
+                let position = encode_search_position(Some(&scan_after), emit)?;
+                Some(self.mint_read_lease(viewer, view.view, query, position.as_bytes(), now)?)
+            }
+        };
+        let truncated = next.is_some();
+        Ok(SearchReply {
+            view,
+            hits: Page::new(hits, next)?,
+            truncated,
+            exhausted: if truncated {
+                sealed.exhausted
+            } else {
+                ScanExhaustion::None
+            },
+            scanned_blobs: sealed.scanned_blobs,
+            scanned_bytes: sealed.scanned_bytes,
+            skipped_blobs: sealed.skipped_blobs,
+        })
     }
 
     /// Serves one `repo.stat` read: store identity, object format, default
@@ -805,6 +1046,38 @@ impl HostedCoordinator {
             oldest,
             head,
         })
+    }
+
+    /// Follows one ref's symbolic targets to the direct object they name.
+    ///
+    /// At most 16 hops: deeper chains refuse as too symbolic. Unknown refs
+    /// refuse `E_NOT_FOUND`. The tree and archive resolvers share this
+    /// chase so a symbolic fix lands once.
+    fn resolve_named_oid(&self, name: &RefName) -> Result<Oid, CoreError> {
+        let mut target = self
+            .store
+            .fact(crate::store::types::FactTable::Refs, name.as_bytes())?
+            .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+            .and_then(|raw| crate::store::decode("ref target", &raw).map_err(CoreError::from))?;
+        let mut oid = None;
+        for _ in 0..16 {
+            match target {
+                crate::refdata::RefTarget::Direct(found) => {
+                    oid = Some(found);
+                    break;
+                }
+                crate::refdata::RefTarget::Symbolic(next) => {
+                    target = self
+                        .store
+                        .fact(crate::store::types::FactTable::Refs, next.as_bytes())?
+                        .ok_or_else(|| CoreError::new(ErrorCode::ENotFound, "unknown ref"))
+                        .and_then(|raw| {
+                            crate::store::decode("ref target", &raw).map_err(CoreError::from)
+                        })?;
+                }
+            }
+        }
+        oid.ok_or_else(|| CoreError::new(ErrorCode::EInvalid, "ref is too deeply symbolic"))
     }
 
     /// Resolves one ref to the commit it names, chasing symbolic links.
@@ -884,6 +1157,94 @@ impl HostedCoordinator {
         })
     }
 
+    /// Serves one `archive` read: the metadata of the streamed payload.
+    ///
+    /// The daemon streams the tar or zip body itself as `Stdout` frames
+    /// under the reply credit window; this reply carries the pinned commit,
+    /// the negotiated format, and the media type the `Accepted` frame
+    /// echoes. Only commits archive: refs chase symbols to a commit and
+    /// object ids peel through tags to one, so the commit the body walks
+    /// is pinned before the first byte. Reads hold no lane and publish
+    /// nothing.
+    fn read_archive(&self, args: &ArchiveArgs) -> Result<ArchiveReply, CoreError> {
+        let commit = self.resolve_archive_rev(&args.rev)?;
+        let format = args.format.unwrap_or(ArchiveFormat::Tar);
+        Ok(ArchiveReply {
+            view: current_view(&self.store)?,
+            commit,
+            format,
+            content_type: format.content_type().to_string(),
+        })
+    }
+
+    /// Resolves one archive revision to its commit.
+    ///
+    /// A ref follows symbolic targets to a direct object; a literal object
+    /// id peels through tags to the commit behind them. Bare trees, blobs,
+    /// and conflicts refuse: the typed archive names its commit, so only
+    /// commits (reached directly or through tags) resolve.
+    fn resolve_archive_rev(&self, rev: &CommitRev) -> Result<Oid, CoreError> {
+        let mut current = match rev {
+            CommitRev::Ref(name) => self.resolve_named_oid(name).map_err(|err| {
+                if err.code == ErrorCode::ENotFound {
+                    CoreError::new(ErrorCode::ENotFound, "unknown revision")
+                } else {
+                    err
+                }
+            })?,
+            CommitRev::Commit(oid) => {
+                oid.expect_kind(self.store.hash_kind(), "archive revision")
+                    .map_err(CoreError::from)?;
+                *oid
+            }
+        };
+        for _ in 0..32 {
+            let mut object = self.store.read(current).map_err(|err| match err {
+                StoreError::NotFound(_) => CoreError::new(ErrorCode::ENotFound, "unknown revision"),
+                other => CoreError::from(other),
+            })?;
+            let width = usize::try_from(object.bytes.len()).map_err(|_| {
+                CoreError::new(
+                    ErrorCode::ELimit,
+                    "archive revision object exceeds the read bound",
+                )
+            })?;
+            if width > MAX_CONTROL_FRAME_BYTES {
+                return Err(CoreError::new(
+                    ErrorCode::ELimit,
+                    "archive revision object exceeds the read bound",
+                ));
+            }
+            use std::io::Read as _;
+            let mut bytes = Vec::new();
+            object.bytes.read_to_end(&mut bytes).map_err(|err| {
+                CoreError::new(ErrorCode::EIo, format!("reading archive object: {err}"))
+            })?;
+            match object.kind {
+                ObjectKind::Commit => return Ok(current),
+                ObjectKind::Tag => {
+                    current = tag_target_oid(current, &bytes, self.store.hash_kind())?;
+                }
+                ObjectKind::Tree => {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "typed archive names a commit; this revision is a tree",
+                    ));
+                }
+                _ => {
+                    return Err(CoreError::new(
+                        ErrorCode::EInvalid,
+                        "typed archive names a commit; this revision is not one",
+                    ));
+                }
+            }
+        }
+        Err(CoreError::new(
+            ErrorCode::ECorrupt,
+            "tag chain behind the archive revision does not end",
+        ))
+    }
+
     /// Resolves one compare revision to its commit.
     ///
     /// Refs chase symbolic links like tree reads; literal commits must
@@ -929,11 +1290,25 @@ impl HostedCoordinator {
                     "compare commit is missing from the store",
                 )
             })?;
-            Ok(record
-                .parents()
-                .iter()
-                .filter_map(|head| head.as_git().copied())
-                .collect())
+            let boundary = crate::coord::reads::shallow_boundary(&self.store, &Head::Git { oid })?;
+            let mut listed = Vec::new();
+            for head in record.parents() {
+                let Some(parent_oid) = head.as_git().copied() else {
+                    continue;
+                };
+                match records.get_commit(&Head::Git { oid: parent_oid }) {
+                    Ok(Some(_)) => listed.push(parent_oid),
+                    Ok(None) if boundary => {}
+                    Ok(None) => {
+                        return Err(CoreError::new(
+                            ErrorCode::ENotFound,
+                            "compare commit parent is missing from the store",
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(listed)
         };
         let committer_time = |oid: Oid| -> Result<i64, CoreError> {
             let record = records.get_commit(&Head::Git { oid })?.ok_or_else(|| {
@@ -1121,7 +1496,7 @@ impl HostedCoordinator {
     /// Serves one `show` read: a commit with its record, or one object.
     /// Reads hold no lane and publish nothing.
     fn read_show(&self, args: &ShowArgs) -> Result<ShowReply, CoreError> {
-        use super::reads::{change_head, head_commit, inline_body};
+        use super::reads::{bounded_object_bytes, change_head, head_commit, inline_body};
         use crate::store::types::ObjectKind as StoreKind;
         let view = current_view(&self.store)?;
         let body = match &args.target {
@@ -1143,8 +1518,11 @@ impl HostedCoordinator {
                 }
             }
             ShowTarget::Object { oid } => {
-                let mut object = self.store.read(*oid).map_err(CoreError::from)?;
-                let kind = match object.kind {
+                // The length check runs before the object loads: a
+                // multi-gibibyte blob must refuse before allocating a
+                // body the control frame could never carry.
+                let (store_kind, bytes) = bounded_object_bytes(&self.store, *oid)?;
+                let kind = match store_kind {
                     StoreKind::Blob => crate::protocol::ObjectKind::Blob,
                     StoreKind::Tree => crate::protocol::ObjectKind::Tree,
                     StoreKind::Commit => crate::protocol::ObjectKind::Commit,
@@ -1156,12 +1534,6 @@ impl HostedCoordinator {
                         ));
                     }
                 };
-                let mut bytes = Vec::new();
-                use std::io::Read as _;
-                object
-                    .bytes
-                    .read_to_end(&mut bytes)
-                    .map_err(|err| CoreError::new(ErrorCode::EIo, err.to_string()))?;
                 let size = u64::try_from(bytes.len()).map_err(|_| {
                     CoreError::new(ErrorCode::EInvalid, "object size overflows u64")
                 })?;
@@ -1800,7 +2172,7 @@ impl HostedCoordinator {
                     });
                 }
                 paths.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
-                let query = self.status_query_digest(workspace);
+                let query = self.status_result_digest(workspace, &paths);
                 let total = paths.len();
                 let start = match args.page.cursor.as_ref() {
                     None => 0,
@@ -1852,10 +2224,20 @@ impl HostedCoordinator {
     }
 
     /// Hashes one status workspace into its lease digest.
-    fn status_query_digest(&self, workspace: WorkspaceId) -> QueryDigest {
+    /// Digest binding one status page's lease to the exact sorted result
+    /// it sliced. A continuation recomputes it over its own crawl, so a
+    /// worktree that changed between pages invalidates the cursor
+    /// instead of offsetting into a different list.
+    fn status_result_digest(&self, workspace: WorkspaceId, paths: &[PathStatus]) -> QueryDigest {
         let mut hasher = Sha256::new();
-        hasher.update(b"ruk.status/v1\x00");
+        hasher.update(b"ruk.status/result/v1\x00");
         hasher.update(workspace.as_bytes());
+        for status in paths {
+            hasher.update(status.path.as_bytes());
+            hasher.update([u8::from(status.conflicted)]);
+            hasher.update([status.change as u8]);
+            hasher.update(b"\x00");
+        }
         QueryDigest::from_bytes(hasher.finalize().into())
     }
 
@@ -2200,6 +2582,7 @@ impl HostedCoordinator {
         let filter = crate::attestation::StatementFilter {
             subject: args.subject,
             kind: args.kind.clone(),
+            kind_prefix: args.kind_prefix.clone(),
             signer: args.signer.clone(),
             include_superseded: args.include_superseded,
         };
@@ -2493,7 +2876,7 @@ fn claim_query_digest(holder: ClaimHolderFilter) -> QueryDigest {
 
 fn attest_query_digest(args: &AttestListArgs) -> QueryDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"ruk.attest.list/v1\x00");
+    hasher.update(b"ruk.attest.list/v2\x00");
     match args.subject {
         None => hasher.update([0x00]),
         Some(oid) => {
@@ -2508,6 +2891,14 @@ fn attest_query_digest(args: &AttestListArgs) -> QueryDigest {
         Some(kind) => {
             hasher.update([0x01]);
             hasher.update(kind.as_str().as_bytes());
+            hasher.update([0x00]);
+        }
+    }
+    match args.kind_prefix.as_ref() {
+        None => hasher.update([0x00]),
+        Some(prefix) => {
+            hasher.update([0x01]);
+            hasher.update(prefix.as_str().as_bytes());
             hasher.update([0x00]);
         }
     }
@@ -2878,6 +3269,10 @@ pub struct RetentionReport {
     pub service_receipts_examined: usize,
     /// Expired service receipt rows deleted through the lane in this pass.
     pub service_receipts_deleted: usize,
+    /// Expired claim records deleted through the lane in this pass. Each
+    /// record also removes its holder and path indexes; those index
+    /// deletions and the clock fence are facts, not counted rows.
+    pub claims_deleted: usize,
 }
 
 impl RetentionReport {
@@ -2888,6 +3283,7 @@ impl RetentionReport {
             && self.sessions_deleted == 0
             && self.events_deleted == 0
             && self.service_receipts_deleted == 0
+            && self.claims_deleted == 0
             && self.leases_expired == 0
     }
 }
@@ -2898,12 +3294,15 @@ impl HostedCoordinator {
     /// Loads the persisted `head.sweep` cursors from the `OpHead` singleton
     /// (the same `decode_head` load path `read_oplog` uses; no second cursor
     /// store exists), evaluates `sweep_page` for receipts then sessions under
-    /// the coordinator's conservative [`RetentionClock`], and publishes the
+    /// the coordinator's conservative [`RetentionClock`], sweeps one bounded
+    /// claim page through the claim rotation cursor, spares the sessions of
+    /// live claim holders so task claims survive restarts, and publishes the
     /// exact-CAS deletions plus the merged next cursors as one
     /// `InternalPayload::Sweep` candidate admitted under
     /// [`RequestClass::Maintenance`]. The lane commit installs the cursors
     /// into `head.sweep` under sole publication ownership and adjusts the
-    /// retention ledger through `apply_facts`.
+    /// retention ledger through `apply_facts` (claim facts are untracked and
+    /// pass through).
     ///
     /// Idle passes (no deletions and cursors unchanged) skip lane publication
     /// entirely so the head row is not rewritten every interval.
@@ -2924,12 +3323,40 @@ impl HostedCoordinator {
             None => CoordinatorHead::default(),
         };
         let receipts_page = sweep_page(&self.store, SweepTable::Receipts, loaded.sweep, now)?;
-        let sessions_page = sweep_page(
+        let mut sessions_page = sweep_page(
             &self.store,
             SweepTable::Sessions,
             receipts_page.cursors,
             now,
         )?;
+        // Claim sweep: one bounded page per pass through the lane, advancing
+        // the in-memory rotation cursor. Without this caller expired claim
+        // rows and their indexes would accumulate toward `E_LIMIT`.
+        let claim_clock = ClaimClock::open(&self.store, self.clock.clone())?;
+        let claim_after = self
+            .claim_sweep_cursor
+            .lock()
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "claim sweep cursor is poisoned"))?
+            .clone();
+        let claims_sweep = sweep_claims_page(
+            &self.store,
+            &claim_clock,
+            claim_after.as_deref(),
+            FactPageBudget::new(128, 256 * 1024),
+        )?;
+        let deletion_candidates: Vec<SessionId> = sessions_page
+            .deletions
+            .iter()
+            .filter_map(|deletion| {
+                <[u8; 16]>::try_from(deletion.key.as_slice())
+                    .ok()
+                    .map(SessionId::from_bytes)
+            })
+            .collect();
+        let holders = live_holders(&self.store, &claim_clock, &deletion_candidates)?;
+        sessions_page
+            .deletions
+            .retain(|deletion| !session_holds_live_claim(&holders, &deletion.key));
         // In-memory read leases expire here as well as at read entry. The
         // sweep fires cancellation on lapsed authority; dropping the expired
         // owner guards retires the slots without touching any fact table.
@@ -2972,6 +3399,11 @@ impl HostedCoordinator {
             })? = next_after;
             Ok(())
         }
+        let claims_deleted = claims_sweep
+            .facts
+            .iter()
+            .filter(|fact| fact.table == FactTable::Claims && is_record_key(&fact.key))
+            .count();
         let report = RetentionReport {
             receipts_examined: receipts_page.examined_rows,
             receipts_deleted: receipts_page.deletions.len(),
@@ -2982,21 +3414,26 @@ impl HostedCoordinator {
             leases_expired,
             service_receipts_examined: receipt_sweep.examined,
             service_receipts_deleted: receipt_sweep.deletions.len(),
+            claims_deleted,
         };
         // Lease expiry never publishes: it frees in-memory guards only. The
-        // lane commit runs only when durable receipts/sessions/events need it.
+        // lane commit runs only when durable receipts/sessions/events/claims
+        // need it.
         let durable_empty = report.receipts_deleted == 0
             && report.sessions_deleted == 0
             && report.events_deleted == 0
-            && report.service_receipts_deleted == 0;
+            && report.service_receipts_deleted == 0
+            && report.claims_deleted == 0;
         if durable_empty && sessions_page.cursors == loaded.sweep {
             advance_receipt_cursor(self, receipt_sweep.next_after)?;
+            advance_claim_cursor(self, claims_sweep.next)?;
             return Ok(report);
         }
         let mut facts = receipts_page.deletions;
         facts.extend(sessions_page.deletions);
         facts.extend(event_deletions);
         facts.extend(receipt_sweep.deletions);
+        facts.extend(claims_sweep.facts);
         let mut payload_bytes: usize = 0;
         for fact in &facts {
             payload_bytes = payload_bytes.saturating_add(fact.key.len());
@@ -3013,6 +3450,7 @@ impl HostedCoordinator {
         )?;
         self.lane.submit_internal(candidate).await?;
         advance_receipt_cursor(self, receipt_sweep.next_after)?;
+        advance_claim_cursor(self, claims_sweep.next)?;
         Ok(report)
     }
 
@@ -3061,22 +3499,66 @@ impl HostedCoordinator {
     }
 }
 
+/// Advances the in-memory claim sweep rotation cursor. A finished rotation
+/// (`None`) restarts from the first record on the next pass.
+fn advance_claim_cursor(
+    coordinator: &HostedCoordinator,
+    next_after: Option<Vec<u8>>,
+) -> Result<(), CoreError> {
+    *coordinator
+        .claim_sweep_cursor
+        .lock()
+        .map_err(|_| CoreError::new(ErrorCode::EIo, "claim sweep cursor is poisoned"))? =
+        next_after;
+    Ok(())
+}
+
+/// True when a session-sweep deletion names a holder of a live claim.
+///
+/// Session keys are 16 raw UUID bytes; anything else is not a holder and
+/// stays deletable.
+fn session_holds_live_claim(holders: &[SessionId], key: &[u8]) -> bool {
+    let Ok(id): Result<[u8; 16], _> = key.try_into() else {
+        return false;
+    };
+    holders.contains(&SessionId::from_bytes(id))
+}
+
 /// Names the missing read path of one uncovered method for its refusal.
 ///
 /// Every arm names the absent producer rather than gesturing at coverage,
 /// so a caller learns which machinery would serve the method.
 fn read_gap(method: Method) -> &'static str {
     match method {
-        Method::Compare => "compare needs a merge-base walk with bounded ahead and behind counts",
-        Method::Search => {
-            "search needs the core-owned search pool plus lease cursors over bounded parallel scans"
-        }
-        Method::Archive => "archive needs a streaming body writer under the reply credit window",
         Method::RemoteRefs => {
             "remote.refs needs an ls-refs round-trip against an explicit remote URL"
         }
-        _ => "only search, archive, and remote.refs lack hosted read arms",
+        _ => "this method has no hosted read implementation",
     }
+}
+
+/// Reads the peeled target out of a tag object: the `object <hex>` line.
+/// Anything else is a damaged tag, never a silent miss.
+fn tag_target_oid(tag: Oid, bytes: &[u8], kind: HashKind) -> Result<Oid, CoreError> {
+    let line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let hex = line
+        .strip_prefix(b"object ")
+        .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, format!("tag {tag} names no target")))?;
+    Oid::from_bytes_hex(hex)
+        .map_err(|err| {
+            CoreError::new(
+                ErrorCode::ECorrupt,
+                format!("tag {tag} names an unparsable target: {err}"),
+            )
+        })
+        .and_then(|oid| {
+            oid.expect_kind(kind, "archive tag target")
+                .map_err(CoreError::from)?;
+            Ok(oid)
+        })
 }
 
 /// Resolves one revision to its root tree: the shared root every
@@ -3885,6 +4367,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_continuation_refuses_a_changed_worktree() {
+        use crate::protocol::{PageRequest, SnapshotPolicy, StatusArgs};
+        use crate::workspace::{NativeWorkspace, Scope, WorkspaceState};
+        let (temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (_head_a, head_b, _) = read_fixtures(coord.store());
+        let change_b = crate::change::ChangeId::from_bytes([9; 16]);
+        let wt = temp.0.join("wt-cont");
+        std::fs::create_dir_all(&wt).expect("worktree dir");
+        std::fs::write(wt.join("a.txt"), b"dirty-a\n").expect("write a");
+        std::fs::write(wt.join("b.txt"), b"dirty-b\n").expect("write b");
+        let id = WorkspaceId::generate();
+        publish_workspace_row(
+            &coord,
+            id,
+            WorkspaceState::Native(NativeWorkspace::new(change_b, head_b, Scope::Full)),
+            session,
+            wt.to_str().expect("utf8 root"),
+        );
+        let first = status_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            StatusArgs {
+                workspace: Some(id),
+                snapshot: SnapshotPolicy::Skip,
+                page: PageRequest {
+                    limit: Some(page_limit_1()),
+                    cursor: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(first.paths.items.len(), 1, "page one slices one path");
+        let cursor = first.paths.next.clone().expect("continuation lease");
+        std::fs::remove_file(wt.join("a.txt")).expect("restore a");
+        let refused = coord
+            .read(
+                &owner,
+                session,
+                Request::Status(Box::new(StatusArgs {
+                    workspace: Some(id),
+                    snapshot: SnapshotPolicy::Skip,
+                    page: PageRequest {
+                        limit: Some(page_limit_1()),
+                        cursor: Some(cursor),
+                    },
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("a changed worktree invalidates the cursor");
+        assert_eq!(refused.code, crate::error::ErrorCode::EForbidden);
+    }
+
+    #[tokio::test]
     async fn status_reports_skip_crawl_and_refuses_auto() {
         use crate::index::RepoPath;
         use crate::protocol::{PageRequest, SnapshotPolicy, StatusArgs};
@@ -4206,6 +4752,162 @@ mod tests {
         assert_eq!(unknown.code, ErrorCode::ENotFound);
     }
 
+    async fn archive_of(
+        coord: &HostedCoordinator,
+        owner: &Principal,
+        session: SessionId,
+        cancel: &Cancel,
+        args: crate::protocol::ArchiveArgs,
+    ) -> crate::protocol::ArchiveReply {
+        let reply = coord
+            .read(owner, session, Request::Archive(Box::new(args)), cancel)
+            .await
+            .expect("archive serves");
+        let Reply::Archive(meta) = reply else {
+            panic!("archive must answer its own reply");
+        };
+        *meta
+    }
+
+    #[tokio::test]
+    async fn archive_resolves_commit_ref_and_tag_revisions() {
+        use crate::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+        let (_temp, coord, owner) = coordinator();
+        let _runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let (_, head_b, _) = read_fixtures(coord.store());
+        let commit = match head_b {
+            Head::Git { oid } => oid,
+            Head::Conflicted { .. } => panic!("fixture head is git"),
+        };
+        seed_ref_oid(&coord, "refs/heads/main", commit);
+        let by_commit = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Commit(commit),
+                format: None,
+            },
+        )
+        .await;
+        assert_eq!(by_commit.commit, commit);
+        assert_eq!(by_commit.format, ArchiveFormat::Tar);
+        assert_eq!(by_commit.content_type, "application/x-tar");
+        let by_ref = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Ref(RefName::new("refs/heads/main").expect("ref")),
+                format: Some(ArchiveFormat::Zip),
+            },
+        )
+        .await;
+        assert_eq!(by_ref.commit, commit);
+        assert_eq!(by_ref.format, ArchiveFormat::Zip);
+        assert_eq!(by_ref.content_type, "application/zip");
+        let mut tag_bytes = Vec::new();
+        tag_bytes.extend_from_slice(b"object ");
+        tag_bytes.extend_from_slice(commit.to_hex().as_bytes());
+        tag_bytes.extend_from_slice(
+            b"\ntype commit\ntag v1\ntagger ada <ada@example.com> 1700000000 +0000\n\nrelease\n",
+        );
+        let length = u64::try_from(tag_bytes.len()).expect("object length");
+        let prepared = coord
+            .store()
+            .prepare(
+                crate::store::types::ObjectKind::Tag,
+                length,
+                tag_bytes.as_slice(),
+                None,
+            )
+            .expect("prepare tag");
+        let tag = prepared.oid();
+        coord
+            .store()
+            .publish(
+                vec![prepared],
+                &[],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish tag");
+        seed_ref_oid(&coord, "refs/tags/v1", tag);
+        let by_tag = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Ref(RefName::new("refs/tags/v1").expect("ref")),
+                format: None,
+            },
+        )
+        .await;
+        assert_eq!(by_tag.commit, commit, "tags peel to their commit");
+        let by_tag_oid = archive_of(
+            &coord,
+            &owner,
+            session,
+            &cancel,
+            ArchiveArgs {
+                rev: CommitRev::Commit(tag),
+                format: None,
+            },
+        )
+        .await;
+        assert_eq!(by_tag_oid.commit, commit);
+        let unknown = coord
+            .read(
+                &owner,
+                session,
+                Request::Archive(Box::new(ArchiveArgs {
+                    rev: CommitRev::Ref(RefName::new("refs/heads/nope").expect("ref")),
+                    format: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown ref refuses");
+        assert_eq!(unknown.code, ErrorCode::ENotFound);
+        let missing = Oid::from_bytes(&[0xab; 20]).expect("fixture oid");
+        let absent = coord
+            .read(
+                &owner,
+                session,
+                Request::Archive(Box::new(ArchiveArgs {
+                    rev: CommitRev::Commit(missing),
+                    format: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("unknown commit refuses");
+        assert_eq!(absent.code, ErrorCode::ENotFound);
+        let tree = crate::coord::reads::head_tree(coord.store(), &head_b).expect("tree");
+        let bare = coord
+            .read(
+                &owner,
+                session,
+                Request::Archive(Box::new(ArchiveArgs {
+                    rev: CommitRev::Commit(tree),
+                    format: None,
+                })),
+                &cancel,
+            )
+            .await
+            .expect_err("bare tree refuses: the typed archive names a commit");
+        assert_eq!(bare.code, ErrorCode::EInvalid);
+    }
     #[tokio::test]
     async fn head_tree_refuses_conflicted_heads() {
         let (_temp, coord, _owner) = coordinator();
@@ -5063,6 +5765,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_sweep_deletes_expired_task_claims_and_spares_live_holders() {
+        let (_temp, coord, _) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+
+        // An expired task-keyed claim from two hours ago: the sweep must
+        // delete its record and indexes through the lane. It seeds first,
+        // while no claim-clock fence exists yet, so the injected past clock
+        // anchors the seal in the past; a later fence would max the window
+        // back to the present.
+        let past_wall = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(2))
+            .expect("past wall");
+        let past = ClaimClock::open(
+            coord.store(),
+            crate::coord::clock::Clock::injected(past_wall, std::time::Instant::now()),
+        )
+        .expect("past claim clock");
+        let dead = seal_acquire(
+            coord.store(),
+            &past,
+            SessionId::from_bytes([0xCC; 16]),
+            ClaimId::from_bytes([9; 16]),
+            crate::protocol::ClaimAcquireArgs {
+                paths: vec![RepoPath::new("old").expect("valid path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: Some(crate::protocol::ClaimSubject::Task(
+                    crate::protocol::TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+                )),
+            },
+            None,
+        )
+        .expect("seal expired task claim");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &dead.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("seed expired claim");
+
+        // A live path-only claim: the sweep must keep its record and, by
+        // keeping its holder listed, spare the holder's session row below.
+        let holder = SessionId::from_bytes([0xBB; 16]);
+        seed_claims(&coord, holder, &[(3, "live")]);
+
+        // The holder's session already lapsed past its horizon, exactly the
+        // row the session sweep would delete without the holder guard.
+        let session_key_bytes = session_key(holder);
+        let session_row = SessionRow {
+            principal: Principal::from_peer_uid(1000),
+            identity: None,
+            claims: ProvenanceClaims::default(),
+            capabilities: Capabilities::default(),
+            secret_hash: [0x55; 32],
+            authority: SessionAuthority::ReceiptsOnly {
+                receipts_until: Timestamp::new(past_wall),
+            },
+        };
+        let encoded_session = encode("session row", &session_row).expect("encode session");
+        let stored_bytes = u64::try_from(session_key_bytes.len() + encoded_session.len())
+            .expect("session row size fits u64");
+        let seeded = CoordinatorHead {
+            last_op: None,
+            retained: Retained {
+                receipts: Usage::default(),
+                sessions: Usage {
+                    rows: 1,
+                    stored_bytes,
+                },
+                ops: Usage::default(),
+            },
+            sweep: SweepCursors {
+                receipts: None,
+                sessions: Some([0x00; 16]),
+            },
+        };
+        let encoded_head = encode("coordinator head", &seeded).expect("encode head");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[
+                    FactMutation {
+                        table: FactTable::Sessions,
+                        key: session_key_bytes.to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(encoded_session),
+                    },
+                    FactMutation {
+                        table: FactTable::OpHead,
+                        key: OP_HEAD_KEY.to_vec(),
+                        expected: FactExpectation::Absent,
+                        value: Some(encoded_head),
+                    },
+                ],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("seed lapsed session and ledger");
+
+        let report = coord
+            .retention_sweep(&cancel)
+            .await
+            .expect("sweep publishes through the lane");
+        assert_eq!(
+            report.claims_deleted, 1,
+            "exactly the expired task claim record sweeps, got {report:?}"
+        );
+        assert_eq!(
+            report.sessions_deleted, 0,
+            "the live claim holder must survive the session sweep"
+        );
+        assert!(
+            crate::coord::claims::read_record(coord.store(), ClaimId::from_bytes([9; 16]))
+                .expect("read dead")
+                .is_none(),
+            "expired task claim must delete through the lane"
+        );
+        assert!(
+            crate::coord::claims::read_record(coord.store(), ClaimId::from_bytes([3; 16]))
+                .expect("read live")
+                .is_some(),
+            "live claim must survive its own sweep"
+        );
+        assert!(
+            coord
+                .store()
+                .fact(FactTable::Sessions, &session_key_bytes)
+                .expect("read session")
+                .is_some(),
+            "a session holding a live claim must survive the sweep"
+        );
+
+        coord.shutdown();
+        runner.abort();
+    }
+
+    #[tokio::test]
     async fn retention_sweep_prunes_service_receipts_at_configured_horizon() {
         let (_temp, coord, _) = coordinator();
         let runner = coord
@@ -5276,6 +6122,7 @@ mod tests {
                     paths: vec![path],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
                 None,
             )
@@ -5344,6 +6191,7 @@ mod tests {
                 result: AttestResult::new("pass").expect("result"),
                 signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
                 supersedes: None,
+                evidence: None,
             };
             let args = sign_statement(&key, statement);
             let open = |_: crate::attestation::Progress| Ok::<(), CoreError>(());
@@ -5600,6 +6448,7 @@ mod tests {
             result: AttestResult::new("pass").expect("result"),
             signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
             supersedes: None,
+            evidence: None,
         };
         let args = sign_statement(&attest_key(), statement);
         let request = Request::AttestAdd(Box::new(WireMutation {
@@ -5937,6 +6786,66 @@ mod tests {
             )
             .expect("publish commit");
         head.as_git().copied().expect("native commit head")
+    }
+
+    #[tokio::test]
+    async fn compare_honors_shallow_boundary_parents() {
+        let (_temp, coord, owner) = coordinator();
+        let runner = coord
+            .spawn_on(&tokio::runtime::Handle::current())
+            .expect("spawn lane");
+        let (_guard, cancel) = cancellation();
+        let (session, _) = coord
+            .open_session(&owner, &SessionOpenArgs::default(), &cancel)
+            .await
+            .expect("open session");
+        let absent = Oid::from_hex("1111111111111111111111111111111111111111").expect("oid");
+        let boundary = publish_parented_commit(coord.store(), 100, &[absent], "boundary");
+        coord
+            .store()
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Shallow,
+                    key: boundary.as_bytes().to_vec(),
+                    expected: FactExpectation::Any,
+                    value: Some(Vec::new()),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("shallow marker inserts");
+        let child = publish_parented_commit(coord.store(), 200, &[boundary], "child");
+        let same = CompareArgs {
+            base: CommitRev::Commit(boundary),
+            head: CommitRev::Commit(boundary),
+            limit: None,
+        };
+        let reply = coord
+            .read(&owner, session, Request::Compare(Box::new(same)), &cancel)
+            .await
+            .expect("a shallow tip compares with itself");
+        let Reply::Compare(compared) = reply else {
+            panic!("compare must answer its own reply");
+        };
+        assert!(compared.exact, "identical tips compare exactly");
+        assert_eq!(compared.ahead, 0);
+        assert_eq!(compared.behind, 0);
+        let across = CompareArgs {
+            base: CommitRev::Commit(boundary),
+            head: CommitRev::Commit(child),
+            limit: None,
+        };
+        let reply = coord
+            .read(&owner, session, Request::Compare(Box::new(across)), &cancel)
+            .await
+            .expect("a shallow boundary compares with its child");
+        let Reply::Compare(compared) = reply else {
+            panic!("compare must answer its own reply");
+        };
+        assert_eq!(compared.ahead, 1);
+        assert_eq!(compared.behind, 0);
+        drop(runner);
     }
 
     #[tokio::test]
@@ -6776,6 +7685,10 @@ mod tests {
             },
             RetentionReport {
                 service_receipts_deleted: 1,
+                ..RetentionReport::default()
+            },
+            RetentionReport {
+                claims_deleted: 1,
                 ..RetentionReport::default()
             },
             RetentionReport {

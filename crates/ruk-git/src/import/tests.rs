@@ -103,6 +103,74 @@ struct TestOids {
 }
 
 #[test]
+fn import_refuses_a_frozen_tag_without_publishing_refs() {
+    use ruk_core::protocol::Timestamp;
+    use ruk_core::refdata::{RefChange, RefExpect, RefTransaction, RefUpdate};
+    use ruk_core::refs::{ReleasedTagMarker, prepare_checked_transaction, prepare_release_freeze};
+    use ruk_core::store::EventContext;
+
+    let (fixture, store, oids) = loose_repo();
+    let name = ref_name("refs/tags/v1");
+    let seed = RefTransaction::new(
+        HashKind::Sha1,
+        vec![RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Absent,
+            change: RefChange::Set(RefTarget::Direct(oids.foreign)),
+        }],
+    )
+    .expect("seed tag transaction");
+    let prepared = prepare_checked_transaction(&store, &seed).expect("prepare seed tag");
+    store
+        .publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed tag");
+    let seeded = store
+        .fact(FactTable::Refs, name.as_bytes())
+        .expect("read seeded tag")
+        .expect("seeded tag present");
+    let marker = ReleasedTagMarker {
+        owner_release_id: "rel-1".to_owned(),
+        target_oid: oids.foreign,
+        frozen_at: Timestamp::parse("1970-01-01T00:00:00Z").expect("timestamp"),
+    };
+    let freeze = prepare_release_freeze(&store, &name, &marker).expect("freeze");
+    store
+        .publish(
+            Vec::new(),
+            &freeze,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish freeze");
+    let error = import_repository(
+        &store,
+        &fixture.request(1, b"origin"),
+        &ImportProgress::new(),
+        &mut DirectPublish(&store),
+    )
+    .expect_err("frozen import");
+    assert!(error.to_string().contains("rel-1"), "{error}");
+    assert_eq!(
+        store
+            .fact(FactTable::Refs, name.as_bytes())
+            .expect("read tag"),
+        Some(seeded),
+        "the preexisting frozen tag survives a refused import"
+    );
+    assert!(
+        store
+            .fact(FactTable::Refs, b"refs/heads/main")
+            .expect("read main")
+            .is_none()
+    );
+}
+
+#[test]
 fn loose_import_preserves_bytes_and_refs() {
     let (fixture, store, oids) = loose_repo();
     let progress = ImportProgress::new();

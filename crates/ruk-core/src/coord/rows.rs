@@ -470,67 +470,93 @@ struct LegacyClaimReleaseReply {
     released: LegacyClaimRecord,
 }
 
-/// Upgrades one pre-field claim receipt after the current postcard decode
-/// failed, so these bytes are either a legacy claim receipt or corruption.
-///
-/// The restored None byte only identifies the candidate variant and locates
-/// the payload boundary; the returned value always comes from the strict
-/// legacy decode of the original bytes, so a truncated new-shape row fails
-/// here instead of mistranslating. Every rejection observes, latching
-/// quarantine exactly like any other corrupt receipt.
-///
-/// # Errors
-/// `E_CORRUPT` (quarantine latched) unless `b` is exactly a legacy
-/// `claim.acquire` or `claim.release` receipt.
-fn decode_legacy_claim_receipt(store: &Store, b: &[u8]) -> Result<Reply, CoreError> {
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct PreSubjectClaimRecord {
+    claim: ClaimId,
+    holder: SessionId,
+    paths: Vec<RepoPath>,
+    mode: ClaimMode,
+    expires_at: Timestamp,
+    on_behalf_of: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct PreSubjectClaimAcquireReply {
+    outcome: MutationOutcome,
+    claim: PreSubjectClaimRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct PreSubjectClaimReleaseReply {
+    outcome: MutationOutcome,
+    released: PreSubjectClaimRecord,
+}
+
+fn try_decode_pre_subject(b: &[u8]) -> Option<Reply> {
     let mut extended = Vec::with_capacity(b.len() + 1);
     extended.extend_from_slice(b);
     extended.push(0x00);
-    let staged: Reply = decode(store, "receipt row", &extended)?;
+    let staged: Reply = crate::store::decode("receipt row", &extended).ok()?;
     let method = staged.method();
     if !matches!(method, Method::ClaimAcquire | Method::ClaimRelease) {
-        return corrupt(
-            store,
-            "receipt row",
-            format!(
-                "stored reply for method `{}` is not a claim receipt",
-                method.as_str()
-            ),
-        );
+        return None;
     }
-    // The staged value re-encodes to the extended bytes (canonical
-    // postcard), so the payload encoding locates the discriminant boundary
-    // without trusting the restored byte as a value.
     let (outcome, record) = match &staged {
         Reply::ClaimAcquire(acquire) => (&acquire.outcome, &acquire.claim),
         Reply::ClaimRelease(release) => (&release.outcome, &release.released),
-        _ => {
-            return corrupt(
-                store,
-                "receipt row",
-                format!(
-                    "stored reply for method `{}` is not a claim receipt",
-                    method.as_str()
-                ),
-            );
+        _ => return None,
+    };
+    let payload = crate::store::encode("receipt row", &(outcome, record)).ok()?;
+    let disc_len = extended.len().checked_sub(payload.len())?;
+    let rest = b.get(disc_len..)?;
+    let upgrade = |pre: PreSubjectClaimRecord| ClaimRecord {
+        claim: pre.claim,
+        holder: pre.holder,
+        paths: pre.paths,
+        mode: pre.mode,
+        expires_at: pre.expires_at,
+        on_behalf_of: pre.on_behalf_of,
+        subject: None,
+    };
+    match method {
+        Method::ClaimAcquire => {
+            let pre: PreSubjectClaimAcquireReply =
+                crate::store::decode("receipt row", rest).ok()?;
+            Some(Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+                outcome: pre.outcome,
+                claim: upgrade(pre.claim),
+            })))
         }
+        Method::ClaimRelease => {
+            let pre: PreSubjectClaimReleaseReply =
+                crate::store::decode("receipt row", rest).ok()?;
+            Some(Reply::ClaimRelease(Box::new(ClaimReleaseReply {
+                outcome: pre.outcome,
+                released: upgrade(pre.released),
+            })))
+        }
+        _ => None,
+    }
+}
+
+fn try_decode_pre_provenance(b: &[u8]) -> Option<Reply> {
+    let mut extended = Vec::with_capacity(b.len() + 2);
+    extended.extend_from_slice(b);
+    extended.push(0x00);
+    extended.push(0x00);
+    let staged: Reply = crate::store::decode("receipt row", &extended).ok()?;
+    let method = staged.method();
+    if !matches!(method, Method::ClaimAcquire | Method::ClaimRelease) {
+        return None;
+    }
+    let (outcome, record) = match &staged {
+        Reply::ClaimAcquire(acquire) => (&acquire.outcome, &acquire.claim),
+        Reply::ClaimRelease(release) => (&release.outcome, &release.released),
+        _ => return None,
     };
-    let payload =
-        crate::store::encode("receipt row", &(outcome, record)).map_err(CoreError::from)?;
-    let Some(disc_len) = extended.len().checked_sub(payload.len()) else {
-        return corrupt(
-            store,
-            "receipt row",
-            "claim receipt payload exceeds its row",
-        );
-    };
-    let Some(rest) = b.get(disc_len..) else {
-        return corrupt(
-            store,
-            "receipt row",
-            "claim receipt discriminant exceeds its row",
-        );
-    };
+    let payload = crate::store::encode("receipt row", &(outcome, record)).ok()?;
+    let disc_len = extended.len().checked_sub(payload.len())?;
+    let rest = b.get(disc_len..)?;
     let upgrade = |legacy: LegacyClaimRecord| ClaimRecord {
         claim: legacy.claim,
         holder: legacy.holder,
@@ -538,31 +564,39 @@ fn decode_legacy_claim_receipt(store: &Store, b: &[u8]) -> Result<Reply, CoreErr
         mode: legacy.mode,
         expires_at: legacy.expires_at,
         on_behalf_of: None,
+        subject: None,
     };
     match method {
         Method::ClaimAcquire => {
-            let legacy: LegacyClaimAcquireReply = decode(store, "receipt row", rest)?;
-            Ok(Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+            let legacy: LegacyClaimAcquireReply = crate::store::decode("receipt row", rest).ok()?;
+            Some(Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
                 outcome: legacy.outcome,
                 claim: upgrade(legacy.claim),
             })))
         }
         Method::ClaimRelease => {
-            let legacy: LegacyClaimReleaseReply = decode(store, "receipt row", rest)?;
-            Ok(Reply::ClaimRelease(Box::new(ClaimReleaseReply {
+            let legacy: LegacyClaimReleaseReply = crate::store::decode("receipt row", rest).ok()?;
+            Some(Reply::ClaimRelease(Box::new(ClaimReleaseReply {
                 outcome: legacy.outcome,
                 released: upgrade(legacy.released),
             })))
         }
-        _ => corrupt(
-            store,
-            "receipt row",
-            format!(
-                "stored reply for method `{}` is not a claim receipt",
-                method.as_str()
-            ),
-        ),
+        _ => None,
     }
+}
+
+fn decode_legacy_claim_receipt(store: &Store, b: &[u8]) -> Result<Reply, CoreError> {
+    if let Some(reply) = try_decode_pre_subject(b) {
+        return Ok(reply);
+    }
+    if let Some(reply) = try_decode_pre_provenance(b) {
+        return Ok(reply);
+    }
+    corrupt(
+        store,
+        "receipt row",
+        "stored claim receipt matches neither pre-subject nor pre-provenance legacy shape",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,10 +1333,12 @@ mod tests {
             mode: ClaimMode::Enforce,
             expires_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             on_behalf_of: None,
+            subject: None,
         };
         let key = receipt_key(s, r);
-        // New-shape bytes end in the trailing None discriminant; stripping
-        // it yields the exact pre-field encoding postcard wrote before.
+        // New-shape bytes end in two trailing None discriminants
+        // (on_behalf_of then subject); stripping both yields the exact
+        // pre-field encoding postcard wrote before.
         for reply in [
             Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
                 outcome: outcome.clone(),
@@ -1315,6 +1351,7 @@ mod tests {
         ] {
             let mut legacy = crate::store::encode("receipt row", &reply).expect("encode reply");
             assert_eq!(legacy.pop(), Some(0x00), "trailing None is one byte");
+            assert_eq!(legacy.pop(), Some(0x00), "second trailing None is one byte");
             let ReceiptRow(decoded) =
                 decode_receipt(&store, &key, &legacy).expect("legacy claim receipt decodes");
             assert_eq!(decoded.method(), reply.method());
@@ -1332,6 +1369,143 @@ mod tests {
         store
             .fact(FactTable::OpHead, OP_HEAD_KEY)
             .expect("store usable after legacy upgrade");
+    }
+
+    const GOLDEN_PRE_SUBJECT_CLAIM_RECEIPT: &[u8] = &[
+        24, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 16, 34, 34, 34, 34,
+        34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 32, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51,
+        51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 0,
+        0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 68, 68, 68, 68, 68, 68, 68, 68,
+        68, 68, 68, 68, 68, 68, 68, 68, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+        17, 17, 1, 3, 115, 114, 99, 0, 0, 0, 1, 8, 97, 103, 101, 110, 116, 45, 118, 49,
+    ];
+    const GOLDEN_PRE_PROVENANCE_CLAIM_RECEIPT: &[u8] = &[
+        24, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 16, 34, 34, 34, 34,
+        34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 32, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51,
+        51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 0,
+        0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 68, 68, 68, 68, 68, 68, 68, 68,
+        68, 68, 68, 68, 68, 68, 68, 68, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+        17, 17, 1, 3, 115, 114, 99, 0, 0, 0,
+    ];
+    const GOLDEN_TRUNCATED_CURRENT_CLAIM_RECEIPT: &[u8] = &[
+        24, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 16, 34, 34, 34, 34,
+        34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 32, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51,
+        51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 0,
+        0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 68, 68, 68, 68, 68, 68, 68, 68,
+        68, 68, 68, 68, 68, 68, 68, 68, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+        17, 17, 1, 3, 115, 114, 99, 0, 0, 0, 1, 8, 97, 103, 101, 110,
+    ];
+
+    #[test]
+    fn exact_byte_fixtures_legacy_and_truncated_receipts() {
+        let (_temp, store) = test_store("exact-bytes");
+        let s = SessionId::from_bytes([0x11; 16]);
+        let r = RequestId::from_bytes([0x22; 16]);
+        let key = receipt_key(s, r);
+
+        let ReceiptRow(decoded) = decode_receipt(&store, &key, GOLDEN_PRE_SUBJECT_CLAIM_RECEIPT)
+            .expect("pre-subject decodes");
+        let Reply::ClaimAcquire(acquire) = decoded else {
+            panic!("expected claim acquire");
+        };
+        assert_eq!(acquire.claim.on_behalf_of, Some("agent-v1".to_owned()));
+        assert_eq!(acquire.claim.subject, None);
+        store
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("store usable after pre-subject decode");
+
+        let ReceiptRow(decoded_prov) =
+            decode_receipt(&store, &key, GOLDEN_PRE_PROVENANCE_CLAIM_RECEIPT)
+                .expect("pre-provenance decodes");
+        let Reply::ClaimAcquire(acquire_prov) = decoded_prov else {
+            panic!("expected claim acquire");
+        };
+        assert_eq!(acquire_prov.claim.on_behalf_of, None);
+        assert_eq!(acquire_prov.claim.subject, None);
+        store
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("store usable after pre-provenance decode");
+
+        let err = decode_receipt(&store, &key, GOLDEN_TRUNCATED_CURRENT_CLAIM_RECEIPT)
+            .expect_err("truncated quarantines");
+        assert_eq!(err.code, ErrorCode::ECorrupt);
+        assert_eq!(
+            store
+                .fact(FactTable::OpHead, OP_HEAD_KEY)
+                .expect_err("quarantined")
+                .code(),
+            ErrorCode::ECorrupt
+        );
+    }
+
+    #[test]
+    fn pre_subject_claim_receipts_decode_with_on_behalf_of_preserved() {
+        use crate::protocol::{ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimReleaseReply};
+        let (_temp, store) = test_store("claim-pre-subject");
+        let s = SessionId::from_bytes([1; 16]);
+        let r = RequestId::from_bytes([2; 16]);
+        let outcome = MutationOutcome {
+            receipt: ReceiptRef {
+                session: s,
+                request_id: r,
+                digest: RequestDigest::from_bytes([3; 32]),
+                replayed: false,
+                retained_until: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+            operation: Some(OperationId(1)),
+            heads: empty_bounded_list(),
+            stamps: empty_bounded_list(),
+            warnings: empty_bounded_list(),
+            merge: None,
+            provenance: empty_bounded_list(),
+            identity: None,
+        };
+        let record = ClaimRecord {
+            claim: crate::change::ClaimId::generate(),
+            holder: s,
+            paths: vec![crate::index::RepoPath::new("src").expect("claim path")],
+            mode: ClaimMode::Enforce,
+            expires_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            on_behalf_of: Some("provenance-agent".to_owned()),
+            subject: None,
+        };
+        let key = receipt_key(s, r);
+        for reply in [
+            Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
+                outcome: outcome.clone(),
+                claim: record.clone(),
+            })),
+            Reply::ClaimRelease(Box::new(ClaimReleaseReply {
+                outcome: outcome.clone(),
+                released: record.clone(),
+            })),
+        ] {
+            let mut pre_subject =
+                crate::store::encode("receipt row", &reply).expect("encode reply");
+            assert_eq!(
+                pre_subject.pop(),
+                Some(0x00),
+                "trailing subject None is one byte"
+            );
+            let ReceiptRow(decoded) = decode_receipt(&store, &key, &pre_subject)
+                .expect("pre-subject claim receipt decodes");
+            assert_eq!(decoded.method(), reply.method());
+            assert_eq!(decoded.outcome(), reply.outcome());
+            let decoded_record = match &decoded {
+                Reply::ClaimAcquire(acquire) => &acquire.claim,
+                Reply::ClaimRelease(release) => &release.released,
+                _ => panic!("pre-subject receipt keeps its claim method"),
+            };
+            assert_eq!(*decoded_record, record);
+            assert_eq!(
+                decoded_record.on_behalf_of,
+                Some("provenance-agent".to_owned())
+            );
+            assert_eq!(decoded_record.subject, None);
+        }
+        store
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("store usable after pre-subject upgrade");
     }
 
     #[test]
@@ -1363,19 +1537,28 @@ mod tests {
             mode: ClaimMode::Enforce,
             expires_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
             on_behalf_of: Some("provenance".to_owned()),
+            subject: None,
         };
         let reply = Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
             outcome,
             claim: record,
         }));
         let full = crate::store::encode("receipt row", &reply).expect("encode reply");
+        // The subject's trailing None discriminant sits after the provenance
+        // string; strip it before the length check on the provenance tail.
+        let mut without_subject = full;
+        assert_eq!(
+            without_subject.pop(),
+            Some(0x00),
+            "subject None is one byte"
+        );
         assert!(
-            full.ends_with(b"\x0aprovenance"),
+            without_subject.ends_with(b"\x0aprovenance"),
             "postcard strings are length-prefixed"
         );
         // Tear the provenance string off, leaving a bare Some discriminant:
         // a naive retry with a restored None byte would decode Some("").
-        let mut torn = full;
+        let mut torn = without_subject;
         torn.truncate(torn.len() - "provenance".len() - 1);
         let key = receipt_key(s, r);
         let err = decode_receipt(&store, &key, &torn).expect_err("torn provenance stays corrupt");

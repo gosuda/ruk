@@ -84,7 +84,7 @@
 //! committed, and the exact fact expectations add point compare-and-swap
 //! as a second layer.
 
-use super::claims::{ClaimClock, canonical_paths, read_record};
+use super::claims::{ClaimClock, canonical_paths, read_record, validate_claim_ttl};
 use super::land::{LandPrepareRequest, prepare_land_plan};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -119,18 +119,19 @@ use crate::protocol::{
     AbandonArgs, AttestAddArgs, AttestAddReply, BookmarkDeleteArgs, BookmarkDeleteReply,
     BookmarkResolution, BookmarkResolveArgs, BookmarkResolveReply, BookmarkSetArgs,
     BookmarkSetReply, BookmarkTarget, BoundedList, ChangeHead, ChangeRef, ClaimAcquireArgs,
-    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, DescribeArgs, EditArgs,
-    EditReply, EffectiveIdentity, GitCommitArgs, HeadRewrite, IdentityClaim, IdentitySource,
-    LandExecuteArgs, LandExecuteReply, LandLocalState, LandPrepareArgs, LandPrepareReply,
-    MutationOutcome, NewArgs, NewReply, PinArgs, PinReply, PolicySetArgs, PolicySetReply,
-    PushRefOutcome, PushRefStatus, RebaseArgs, RebaseScope, ReceiptRef, Reply, Request,
-    RequestDigest, RewriteReply, SnapshotArgs, SquashArgs, TagDeleteArgs, TagDeleteReply,
-    TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply, Validate, WorkspaceBinding,
-    WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs, WsNewReply, WsRecoverArgs,
-    WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
+    ClaimAcquireReply, ClaimRecord, ClaimReleaseArgs, ClaimReleaseReply, ClaimRenewArgs,
+    ClaimRenewReply, DescribeArgs, EditArgs, EditReply, EffectiveIdentity, GitCommitArgs,
+    HeadRewrite, IdentityClaim, IdentitySource, LandExecuteArgs, LandExecuteReply, LandLocalState,
+    LandPrepareArgs, LandPrepareReply, MutationOutcome, NewArgs, NewReply, PinArgs, PinReply,
+    PolicySetArgs, PolicySetReply, PushRefOutcome, PushRefStatus, RebaseArgs, RebaseScope,
+    ReceiptRef, Reply, Request, RequestDigest, RewriteReply, SnapshotArgs, SquashArgs,
+    TagDeleteArgs, TagDeleteReply, TagSetArgs, TagSetReply, Timestamp, UnpinArgs, UnpinReply,
+    Validate, WorkspaceBinding, WorkspaceInit, WriteArgs, WsDropArgs, WsDropReply, WsNewArgs,
+    WsNewReply, WsRecoverArgs, WsScopeArgs, WsScopeReply, WsTakeArgs, WsTakeReply,
 };
 use crate::protocol::{
-    Content, PathSelection, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
+    Content, PathSelection, ReleaseFreezeClearArgs, ReleaseFreezeClearReply, ReleaseFreezeSetArgs,
+    ReleaseFreezeSetReply, RemainingConflict, Resolution, ResolveArgs, ResolveReply, RevertArgs,
     RevertReply, SplitArgs, SplitPlacement, UndoArgs, UndoReply,
 };
 use crate::records::Records;
@@ -140,7 +141,10 @@ use crate::records::types::{ChangeEntry, ChangeState};
 use crate::refdata::{
     RefChange, RefExpect, RefName, RefRead, RefTarget, RefTransaction, RefUpdate,
 };
-use crate::refs::{StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked};
+use crate::refs::{
+    ReleasedTagMarker, StoreRefs, prepare_checked_transaction, prepare_clear_ref_conflict_checked,
+    prepare_release_freeze, prepare_release_unfreeze,
+};
 use crate::store::ObjectKind;
 use crate::store::Store;
 use crate::store::types::{FactExpectation, FactMutation, FactTable, PreparedObject};
@@ -169,7 +173,10 @@ pub(crate) struct PrepareContext<'a> {
     /// Wall clock for signature timestamps; absent on the legacy path.
     pub(crate) clock: Option<&'a Clock>,
     /// Monotonic claim clock for claim sealing; absent on the legacy path.
-    #[expect(dead_code, reason = "wired in CS-R42 (claim sealing)")]
+    #[expect(
+        dead_code,
+        reason = "reserved for a later row; preparation predicts without sealing"
+    )]
     pub(crate) claim_clock: Option<&'a ClaimClock>,
     /// Admission policy for land preparation; absent on the legacy path.
     #[expect(dead_code, reason = "wired in CS-R38/40/44 (land preparation)")]
@@ -258,6 +265,8 @@ pub(crate) fn prepare_mutation_with(
         Request::BookmarkResolve(m) => bookmark_resolve_parts(ctx, m.request_id, &m.args)?,
         Request::TagSet(m) => tag_set_parts(ctx, m.request_id, &m.args)?,
         Request::TagDelete(m) => tag_delete_parts(ctx, m.request_id, &m.args)?,
+        Request::ReleaseFreezeSet(m) => release_freeze_set_parts(ctx, m.request_id, &m.args)?,
+        Request::ReleaseFreezeClear(m) => release_freeze_clear_parts(ctx, m.request_id, &m.args)?,
         Request::Pin(m) => pin_parts(ctx, m.request_id, &m.args)?,
         Request::Unpin(m) => unpin_parts(ctx, m.request_id, &m.args)?,
         Request::AttestAdd(m) => attest_add_parts(ctx, m.request_id, &m.args)?,
@@ -265,6 +274,7 @@ pub(crate) fn prepare_mutation_with(
         Request::GitCommit(m) => git_commit_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimAcquire(m) => claim_acquire_parts(ctx, m.request_id, &m.args)?,
         Request::ClaimRelease(m) => claim_release_parts(ctx, m.request_id, &m.args)?,
+        Request::ClaimRenew(m) => claim_renew_parts(ctx, m.request_id, &m.args)?,
         Request::WsNew(m) => ws_new_parts(ctx, m.request_id, &m.args)?,
         Request::WsScope(m) => ws_scope_parts(ctx, m.request_id, &m.args)?,
         Request::WsTake(m) => ws_take_parts(ctx, m.request_id, &m.args)?,
@@ -372,6 +382,7 @@ fn check_ref_update(
     store: &Store,
     update: RefUpdate,
 ) -> Result<(Vec<FactMutation>, RefTransaction), CoreError> {
+    crate::refs::check_tag_unfrozen(store, &update.name)?;
     let transaction =
         RefTransaction::new(store.hash_kind(), vec![update]).map_err(CoreError::from)?;
     transaction.check(&StoreRefs::new(store))?;
@@ -839,6 +850,73 @@ fn tag_delete_parts(
         fence: None,
     })
 }
+
+fn release_freeze_set_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ReleaseFreezeSetArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "release.freeze.set",
+            "release.freeze.set needs the session identity row, which this path does not supply",
+        )
+    })?;
+    let marker = ReleasedTagMarker {
+        owner_release_id: args.owner_release_id.clone(),
+        target_oid: args.target_oid,
+        frozen_at: args.frozen_at,
+    };
+    let facts = prepare_release_freeze(store, &args.name, &marker)?;
+    Ok(Parts {
+        reply: Reply::ReleaseFreezeSet(Box::new(ReleaseFreezeSetReply {
+            outcome: pending_outcome(session, request_id),
+            name: args.name.clone(),
+            owner_release_id: args.owner_release_id.clone(),
+            target_oid: args.target_oid,
+            frozen_at: args.frozen_at,
+        })),
+        objects: Vec::new(),
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+fn release_freeze_clear_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ReleaseFreezeClearArgs,
+) -> Result<Parts, CoreError> {
+    let store = ctx.store;
+    let session = ctx.session;
+    let _row = ctx.session_row.ok_or_else(|| {
+        uncovered(
+            "release.freeze.clear",
+            "release.freeze.clear needs the session identity row, which this path does not supply",
+        )
+    })?;
+    let facts = vec![prepare_release_unfreeze(
+        store,
+        &args.name,
+        &args.owner_release_id,
+    )?];
+    Ok(Parts {
+        reply: Reply::ReleaseFreezeClear(Box::new(ReleaseFreezeClearReply {
+            outcome: pending_outcome(session, request_id),
+            name: args.name.clone(),
+        })),
+        objects: Vec::new(),
+        facts,
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
 /// Mints the empty tree when absent and stages one empty-tree commit through
 /// `ops::prepare_new`, synthesizing author and committer from `over` (the
 /// operation override) or the session identity.
@@ -1212,6 +1290,7 @@ fn claim_acquire_parts(
     for path in &paths {
         row.capabilities.require_claim(path)?;
     }
+    validate_claim_ttl(args.subject.as_ref(), args.ttl.seconds())?;
     let now = jiff::Timestamp::now();
     let expires_at = Timestamp::new(
         now.checked_add(jiff::SignedDuration::from_secs(i64::from(
@@ -1229,6 +1308,7 @@ fn claim_acquire_parts(
                 mode: args.mode,
                 expires_at,
                 on_behalf_of: ctx.on_behalf_of.clone(),
+                subject: args.subject.clone(),
             },
         })),
         objects: Vec::new(),
@@ -1265,6 +1345,66 @@ fn claim_release_parts(
         reply: Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: pending_outcome(session, request_id),
             released: record,
+        })),
+        objects: Vec::new(),
+        facts: Vec::new(),
+        transaction: None,
+        dependencies: Vec::new(),
+        fence: None,
+    })
+}
+
+/// Prepares `claim.renew` without sealing: reads the stored record for an
+/// early holder and liveness check and predicts the renewed reply. The lane
+/// re-reads and seals authoritatively at commit time and overwrites the
+/// record.
+///
+/// # Errors
+/// - [`ErrorCode::ENotFound`] for an unknown claim.
+/// - [`ErrorCode::EForbidden`] for another session's claim.
+/// - [`ErrorCode::EStale`] for an expired claim.
+/// - [`ErrorCode::EInvalid`] for a path-only renewal above the hourly ceiling.
+fn claim_renew_parts(
+    ctx: &PrepareContext<'_>,
+    request_id: RequestId,
+    args: &ClaimRenewArgs,
+) -> Result<Parts, CoreError> {
+    let session = ctx.session;
+    let Some(record) = read_record(ctx.store, args.claim)? else {
+        return Err(CoreError::new(ErrorCode::ENotFound, "claim does not exist"));
+    };
+    if record.holder != session {
+        return Err(CoreError::new(
+            ErrorCode::EForbidden,
+            "claim belongs to another session",
+        ));
+    }
+    let now = jiff::Timestamp::now();
+    if record.expires_at <= Timestamp::new(now) {
+        return Err(CoreError::new(
+            ErrorCode::EStale,
+            "claim has expired; acquire a fresh claim",
+        ));
+    }
+    validate_claim_ttl(record.subject.as_ref(), args.ttl.seconds())?;
+    let expires_at = Timestamp::new(
+        now.checked_add(jiff::SignedDuration::from_secs(i64::from(
+            args.ttl.seconds(),
+        )))
+        .unwrap_or(now),
+    );
+    Ok(Parts {
+        reply: Reply::ClaimRenew(Box::new(ClaimRenewReply {
+            outcome: pending_outcome(session, request_id),
+            claim: ClaimRecord {
+                claim: record.claim,
+                holder: record.holder,
+                paths: record.paths,
+                mode: record.mode,
+                expires_at,
+                on_behalf_of: record.on_behalf_of,
+                subject: record.subject,
+            },
         })),
         objects: Vec::new(),
         facts: Vec::new(),
@@ -4103,7 +4243,7 @@ mod tests {
             })),
         )
         .expect("tag.delete prepares on a present ref");
-        assert_eq!(prepared.facts.len(), 1);
+        assert_eq!(prepared.facts.len(), 2);
         let fact = &prepared.facts[0];
         assert_eq!(fact.table, crate::store::types::FactTable::Refs);
         assert!(fact.value.is_none());
@@ -4156,6 +4296,7 @@ mod tests {
                 paths: vec![RepoPath::new("src").expect("test path")],
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
         }));
         let err =
@@ -4328,6 +4469,199 @@ mod tests {
         assert_eq!(err.code, ErrorCode::EInvalid);
     }
 
+    fn release_freeze_request(tag: &str, owner: &str, target: Oid) -> Request {
+        Request::ReleaseFreezeSet(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ReleaseFreezeSetArgs {
+                name: name(tag),
+                owner_release_id: owner.to_owned(),
+                target_oid: target,
+                frozen_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+        }))
+    }
+
+    fn release_clear_request(tag: &str, owner: &str) -> Request {
+        Request::ReleaseFreezeClear(Box::new(WireMutation {
+            request_id: request_id(),
+            args: ReleaseFreezeClearArgs {
+                name: name(tag),
+                owner_release_id: owner.to_owned(),
+            },
+        }))
+    }
+
+    fn plain_tag_set_request(tag: &str, target: Oid) -> Request {
+        Request::TagSet(Box::new(WireMutation {
+            request_id: request_id(),
+            args: TagSetArgs {
+                name: name(tag),
+                target,
+                annotation: None,
+                expected: RefExpect::Absent,
+            },
+        }))
+    }
+
+    fn tag_delete_request(tag: &str, target: Oid) -> Request {
+        Request::TagDelete(Box::new(WireMutation {
+            request_id: request_id(),
+            args: TagDeleteArgs {
+                name: name(tag),
+                expected: RefExpect::Present(RefTarget::Direct(target)),
+            },
+        }))
+    }
+
+    fn publish_prepared(store: &Store, facts: &[FactMutation]) {
+        store
+            .publish(
+                Vec::new(),
+                facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish prepared facts");
+    }
+
+    #[test]
+    fn released_tag_freeze_gates_tag_mutations_until_its_owner_clears() {
+        let (_temp, store, session) = fixture();
+        let (_, _, target) = seed_commit(&store, None);
+
+        let tag = prepare_mutation(
+            &store,
+            session,
+            plain_tag_set_request("refs/tags/v1", target),
+        )
+        .expect("the frozen tag exists before release.freeze.set");
+        publish_prepared(&store, &tag.facts);
+
+        // Freeze and clear require the session identity row; the legacy
+        // sessionless path cannot supply it.
+        let row = session_row(None);
+        let ctx = full_ctx(&store, session, Some(&row), None, None);
+
+        let frozen = prepare_mutation_with(
+            &ctx,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect("release.freeze.set prepares");
+        assert!(matches!(frozen.reply, Reply::ReleaseFreezeSet(_)));
+        assert_eq!(
+            frozen.facts.len(),
+            2,
+            "a fresh freeze pins the live tag row plus the marker row"
+        );
+        publish_prepared(&store, &frozen.facts);
+
+        let retry = prepare_mutation_with(
+            &ctx,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect("the same owner and target retries");
+        assert_eq!(
+            retry.facts.len(),
+            1,
+            "an idempotent retry guards the marker row"
+        );
+        assert!(matches!(
+            retry.facts[0].expected,
+            crate::store::types::FactExpectation::Value(_)
+        ));
+
+        let other_owner = prepare_mutation_with(
+            &ctx,
+            release_freeze_request("refs/tags/v1", "rel-2", target),
+        )
+        .expect_err("another owner is refused");
+        assert_eq!(other_owner.code, ErrorCode::EForbidden);
+        assert!(
+            other_owner.message.contains("rel-1"),
+            "{}",
+            other_owner.message
+        );
+
+        let set = prepare_mutation(
+            &store,
+            session,
+            plain_tag_set_request("refs/tags/v1", target),
+        )
+        .expect_err("a plain tag.set is refused while frozen");
+        assert_eq!(set.code, ErrorCode::EForbidden);
+        assert!(set.message.contains("rel-1"), "{}", set.message);
+
+        let delete = prepare_mutation(&store, session, tag_delete_request("refs/tags/v1", target))
+            .expect_err("tag.delete is refused while frozen");
+        assert_eq!(delete.code, ErrorCode::EForbidden);
+        assert!(delete.message.contains("rel-1"), "{}", delete.message);
+
+        let refused_clear =
+            prepare_mutation_with(&ctx, release_clear_request("refs/tags/v1", "rel-2"))
+                .expect_err("another owner cannot clear");
+        assert_eq!(refused_clear.code, ErrorCode::EForbidden);
+        assert!(
+            refused_clear.message.contains("rel-1"),
+            "{}",
+            refused_clear.message
+        );
+
+        let cleared = prepare_mutation_with(&ctx, release_clear_request("refs/tags/v1", "rel-1"))
+            .expect("the owner clears");
+        publish_prepared(&store, &cleared.facts);
+
+        let unfrozen = prepare_mutation(
+            &store,
+            session,
+            Request::TagSet(Box::new(WireMutation {
+                request_id: request_id(),
+                args: TagSetArgs {
+                    name: name("refs/tags/v1"),
+                    target,
+                    annotation: None,
+                    expected: RefExpect::Present(RefTarget::Direct(target)),
+                },
+            })),
+        )
+        .expect("tag.set prepares once the marker is gone");
+        assert!(
+            unfrozen
+                .facts
+                .iter()
+                .any(|fact| fact.table == crate::store::types::FactTable::ReleasedTags),
+            "the tag.set keeps its freeze guard in the same publish"
+        );
+    }
+
+    #[test]
+    fn release_freeze_set_without_session_row_is_refused() {
+        let (_temp, store, session) = fixture();
+        let (_, _, target) = seed_commit(&store, None);
+        // The gate runs before the tag-liveness read: even a well-formed
+        // request for a committable target refuses on the sessionless path.
+        let err = prepare_mutation(
+            &store,
+            session,
+            release_freeze_request("refs/tags/v1", "rel-1", target),
+        )
+        .expect_err("sessionless freeze setup is refused before any store read");
+        assert_eq!(err.code, ErrorCode::EHosted);
+    }
+
+    #[test]
+    fn release_freeze_clear_without_session_row_is_refused() {
+        let (_temp, store, session) = fixture();
+        // No marker row exists, so the old path returned a no-op success;
+        // the session gate now refuses before that no-op could succeed.
+        let err = prepare_mutation(
+            &store,
+            session,
+            release_clear_request("refs/tags/v1", "rel-1"),
+        )
+        .expect_err("sessionless clear is refused even with no marker row");
+        assert_eq!(err.code, ErrorCode::EHosted);
+    }
+
     #[test]
     fn tag_set_annotation_renders_tag_object() {
         let (_temp, store, session) = fixture();
@@ -4389,7 +4723,7 @@ mod tests {
             panic!("tag.set must answer its own reply");
         };
         assert_eq!(reply.target, RefTarget::Direct(expected_oid));
-        assert_eq!(prepared.facts.len(), 1);
+        assert_eq!(prepared.facts.len(), 2);
         assert!(prepared.ref_transaction.is_some());
 
         // Without an annotation tagger the session identity fills in.
@@ -4587,6 +4921,7 @@ mod tests {
             result: AttestResult::new("pass").expect("result"),
             signed_at: Timestamp::parse("2026-10-17T12:00:00Z").expect("timestamp"),
             supersedes: None,
+            evidence: None,
         };
         let payload = statement
             .canonical_payload_v1(HashKind::Sha1)
@@ -5695,6 +6030,7 @@ mod tests {
                     ],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5726,6 +6062,7 @@ mod tests {
                     paths: vec![RepoPath::new("src").expect("test path")],
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5741,6 +6078,7 @@ mod tests {
                     paths: Vec::new(),
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::Enforce,
+                    subject: None,
                 },
             })),
         )
@@ -5763,6 +6101,7 @@ mod tests {
                 paths: vec![RepoPath::new("src").expect("test path")],
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
             None,
         )
@@ -5823,6 +6162,134 @@ mod tests {
         )
         .expect_err("foreign claim is forbidden");
         assert_eq!(err.code, ErrorCode::EForbidden);
+    }
+
+    #[test]
+    fn claim_renew_predicts_the_renewed_record() {
+        let (_temp, store, session) = fixture();
+        // The lapsed claim seals first, while no claim-clock fence exists
+        // yet, so the fixed clock anchors it in the past; a later fence
+        // would max the window back to the present.
+        let past = crate::coord::claims::ClaimClock::open(&store, fixed_clock())
+            .expect("past claim clock opens");
+        let lapsed = crate::coord::claims::seal_acquire(
+            &store,
+            &past,
+            session,
+            ClaimId::generate(),
+            ClaimAcquireArgs {
+                paths: vec![RepoPath::new("old").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: None,
+            },
+            None,
+        )
+        .expect("seal lapsed claim");
+        store
+            .publish(
+                Vec::new(),
+                &lapsed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish lapsed claim");
+        let clock = crate::coord::clock::Clock::system();
+        let claims =
+            crate::coord::claims::ClaimClock::open(&store, clock).expect("claim clock opens");
+        let subject = Some(crate::protocol::ClaimSubject::Task(
+            crate::protocol::TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+        ));
+        let sealed = crate::coord::claims::seal_acquire(
+            &store,
+            &claims,
+            session,
+            ClaimId::generate(),
+            ClaimAcquireArgs {
+                paths: vec![RepoPath::new("src").expect("test path")],
+                ttl: ClaimTtl::new(60).expect("ttl"),
+                mode: ClaimMode::Enforce,
+                subject: subject.clone(),
+            },
+            None,
+        )
+        .expect("seal fixture claim");
+        store
+            .publish(
+                Vec::new(),
+                &sealed.facts,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("publish fixture claim");
+
+        // The legacy path serves renewals: prediction reads the record and
+        // extends its window, and the lane re-seals authoritatively.
+        let prepared = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: sealed.record.claim,
+                    ttl: ClaimTtl::new(120).expect("ttl"),
+                },
+            })),
+        )
+        .expect("claim.renew prepares");
+        let Reply::ClaimRenew(reply) = prepared.reply else {
+            panic!("claim.renew must answer its own reply");
+        };
+        assert_eq!(reply.claim.subject, subject);
+        assert_eq!(reply.claim.holder, session);
+        assert_eq!(reply.claim.paths, sealed.record.paths);
+        assert!(prepared.facts.is_empty());
+
+        // An unknown claim is not found.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: ClaimId::generate(),
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("unknown claim is not found");
+        assert_eq!(err.code, ErrorCode::ENotFound);
+
+        // Another session's claim is forbidden.
+        let holder = SessionId::generate();
+        let err = prepare_mutation(
+            &store,
+            holder,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: sealed.record.claim,
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("foreign claim is forbidden");
+        assert_eq!(err.code, ErrorCode::EForbidden);
+
+        // An expired claim predicts stale, matching the lane seal.
+        let err = prepare_mutation(
+            &store,
+            session,
+            Request::ClaimRenew(Box::new(WireMutation {
+                request_id: request_id(),
+                args: ClaimRenewArgs {
+                    claim: lapsed.record.claim,
+                    ttl: ClaimTtl::new(60).expect("ttl"),
+                },
+            })),
+        )
+        .expect_err("expired claim is stale");
+        assert_eq!(err.code, ErrorCode::EStale);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod archive_zip;
 mod cli;
 mod daemon;
 mod mcp;

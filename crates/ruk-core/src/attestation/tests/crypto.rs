@@ -13,8 +13,8 @@ use crate::protocol::{
 };
 
 use super::fixtures::{
-    SshSigParts, armor, ecdsa_key_blob, ed25519_key_blob, independent_fingerprint, key, kind,
-    named_signature_blob, oid, public_bytes, result, rsa_key_blob, sign, sign_for,
+    SshSigParts, armor, ecdsa_key_blob, ed25519_key_blob, evidenced, independent_fingerprint, key,
+    kind, named_signature_blob, oid, public_bytes, result, rsa_key_blob, sign, sign_for, sign_v1,
     sk_ed25519_key_blob, sshsig_binary, statement,
 };
 
@@ -28,10 +28,11 @@ fn review_pass() -> AttestStatement {
     statement(subject(), "review", "pass", SIGNED_AT, None)
 }
 
-/// The canonical payload the verifier reconstructs for `statement`.
+/// The canonical payload the verifier reconstructs for `statement`: the v2
+/// payload new signatures cover.
 fn payload_of(statement: &AttestStatement) -> Vec<u8> {
     statement
-        .canonical_payload_v1(HashKind::Sha1)
+        .canonical_payload_v2(HashKind::Sha1)
         .expect("canonical payload")
 }
 
@@ -168,6 +169,10 @@ fn any_tampered_payload_field_invalidates_the_signature() {
         },
         AttestStatement {
             supersedes: Some(StatementDigest::from_bytes([3; 32])),
+            ..original.clone()
+        },
+        AttestStatement {
+            evidence: Some(StatementDigest::from_bytes([5; 32])),
             ..original
         },
     ];
@@ -335,4 +340,61 @@ fn a_subject_of_the_wrong_width_is_an_object_format_refusal() {
         HashAlg::Sha256,
     );
     assert_eq!(refusal(&args), ErrorCode::EObjectFormat);
+}
+
+#[test]
+fn a_v1_signature_over_an_evidenceless_statement_stays_verifiable() {
+    let signer = key(0x11);
+    let args = sign_v1(&signer, review_pass());
+    let verified = verify_statement(HashKind::Sha1, &args).expect("v1 signature verifies");
+    let mut digest = [0_u8; 32];
+    let v1 = review_pass()
+        .canonical_payload_v1(HashKind::Sha1)
+        .expect("v1 payload");
+    digest.copy_from_slice(&Sha256::digest(&v1));
+    assert_eq!(verified.digest().as_bytes(), &digest);
+}
+
+#[test]
+fn an_evidence_digest_is_bound_to_the_v2_signature() {
+    let signer = key(0x11);
+    let evidence = StatementDigest::from_bytes([7; 32]);
+    let bound = evidenced(subject(), "ci", "pass", SIGNED_AT, Some(evidence));
+    let args = sign(&signer, bound.clone());
+    let verified = verify_statement(HashKind::Sha1, &args).expect("v2 signature verifies");
+    let mut digest = [0_u8; 32];
+    let v2 = bound
+        .canonical_payload_v2(HashKind::Sha1)
+        .expect("v2 payload");
+    digest.copy_from_slice(&Sha256::digest(&v2));
+    assert_eq!(verified.digest().as_bytes(), &digest);
+}
+
+#[test]
+fn stripping_evidence_from_a_v2_signature_is_refused() {
+    let signer = key(0x11);
+    let evidence = StatementDigest::from_bytes([7; 32]);
+    let bound = evidenced(subject(), "ci", "pass", SIGNED_AT, Some(evidence));
+    let signed = sign(&signer, bound.clone());
+    let stripped = AttestAddArgs {
+        statement: AttestStatement {
+            evidence: None,
+            ..bound
+        },
+        signature: signed.signature.clone(),
+    };
+    assert_eq!(refusal(&stripped), ErrorCode::EInvalid);
+}
+
+#[test]
+fn evidence_cannot_be_added_under_a_v1_signature() {
+    let signer = key(0x11);
+    let signed = sign_v1(&signer, review_pass());
+    let mut upgraded = review_pass();
+    upgraded.evidence = Some(StatementDigest::from_bytes([7; 32]));
+    let forged = AttestAddArgs {
+        statement: upgraded,
+        signature: signed.signature.clone(),
+    };
+    assert_eq!(refusal(&forged), ErrorCode::EInvalid);
 }

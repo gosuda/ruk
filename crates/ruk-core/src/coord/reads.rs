@@ -65,8 +65,28 @@ pub(crate) fn revision_tree(store: &Store, at: &RevisionRef) -> Result<Oid, Core
 /// tree cannot force an unbounded allocation on the read path.
 pub(crate) const READ_MAX_BYTES: u64 = 16_777_216;
 
+/// Whether `head` is a recorded shallow-fetch boundary whose absent
+/// parents are intentional rather than corrupt. Only git commits carry
+/// shallow markers; anything else keeps the strict missing-parent
+/// refusal.
+pub(crate) fn shallow_boundary(store: &Store, head: &Head) -> Result<bool, CoreError> {
+    let Head::Git { oid } = head else {
+        return Ok(false);
+    };
+    store
+        .fact(crate::store::types::FactTable::Shallow, oid.as_bytes())
+        .map(|row| row.is_some())
+        .map_err(CoreError::from)
+}
+
 /// Reads one object fully, refusing bodies past [`READ_MAX_BYTES`].
-fn bounded_object_bytes(store: &Store, oid: Oid) -> Result<Vec<u8>, CoreError> {
+///
+/// The length check runs before the object loads, so a hostile blob or
+/// tree cannot force an unbounded allocation on the read path.
+pub(crate) fn bounded_object_bytes(
+    store: &Store,
+    oid: Oid,
+) -> Result<(ObjectKind, Vec<u8>), CoreError> {
     if store
         .object_len(oid)
         .map_err(CoreError::from)?
@@ -78,6 +98,7 @@ fn bounded_object_bytes(store: &Store, oid: Oid) -> Result<Vec<u8>, CoreError> {
         ));
     }
     let object = store.read(oid).map_err(CoreError::from)?;
+    let kind = object.kind;
     let mut bytes = Vec::new();
     object
         .bytes
@@ -92,7 +113,7 @@ fn bounded_object_bytes(store: &Store, oid: Oid) -> Result<Vec<u8>, CoreError> {
             "object exceeds the hosted read bound",
         ));
     }
-    Ok(bytes)
+    Ok((kind, bytes))
 }
 
 /// Reads one blob fully, refusing other objects.
@@ -104,7 +125,7 @@ pub(crate) fn blob_bytes(store: &Store, oid: Oid) -> Result<Vec<u8>, CoreError> 
             "path names a non-blob object",
         ));
     }
-    bounded_object_bytes(store, oid)
+    bounded_object_bytes(store, oid).map(|(_, bytes)| bytes)
 }
 
 /// Inline content, refusing bodies past the control frame bound.
@@ -133,7 +154,7 @@ pub(crate) fn tree_items(
             "tree object has the wrong kind",
         ));
     }
-    let bytes = bounded_object_bytes(store, root)?;
+    let (_, bytes) = bounded_object_bytes(store, root)?;
     let mut items = parse_tree(kind, &bytes)?;
     items.sort_by(git_order);
     Ok(items)
@@ -343,7 +364,7 @@ pub(crate) fn unified_patch(
                 .position(|(op, _)| *op != LcsOp::Match);
             match following {
                 None => {
-                    hunk_end = tagged.len();
+                    hunk_end = (hunk_end + DIFF_CONTEXT).min(tagged.len());
                     break;
                 }
                 Some(gap) if gap > 2 * DIFF_CONTEXT => {
@@ -427,9 +448,15 @@ pub(crate) fn flatten_tree(
 ) -> Result<BTreeMap<Vec<u8>, (TreeMode, Oid)>, CoreError> {
     let mut flat: BTreeMap<Vec<u8>, (TreeMode, Oid)> = BTreeMap::new();
     let mut stack: Vec<(Vec<u8>, Oid)> = vec![(Vec::new(), root)];
+    let mut visited: usize = 0;
     while let Some((prefix, oid)) = stack.pop() {
         for item in tree_items(store, kind, oid)? {
-            if flat.len() >= DIFF_MAX_ENTRIES {
+            // Charge every visited entry, directories included: nested
+            // directories never land in `flat`, so counting files alone
+            // lets a small tree DAG force exponentially many visits while
+            // `flat` stays empty.
+            visited = visited.saturating_add(1);
+            if visited > DIFF_MAX_ENTRIES {
                 return Err(CoreError::new(
                     ErrorCode::ELimit,
                     "diff visits more entries than its bound",
@@ -570,12 +597,20 @@ pub(crate) fn build_graph_index(store: &Store) -> Result<GraphIndex, CoreError> 
     }
     let mut children_of: BTreeMap<Head, Vec<Head>> = BTreeMap::new();
     let mut open_parents: BTreeMap<Head, usize> = BTreeMap::new();
+    let mut kept_parents: BTreeMap<Head, Vec<Head>> = BTreeMap::new();
     for (head, (_, parents)) in &parents_of {
         let mut open = 0;
+        let mut kept = Vec::with_capacity(parents.len());
         for parent in parents {
             if parents_of.contains_key(parent) {
                 open += 1;
                 children_of.entry(*parent).or_default().push(*head);
+                kept.push(*parent);
+            } else if shallow_boundary(store, head)? {
+                // A shallow boundary's absent parents are intentional:
+                // the fetch verifier accepts the same gap, so drop the
+                // edge from the order and the index instead of refusing
+                // the whole graph.
             } else {
                 return Err(CoreError::new(
                     ErrorCode::ECorrupt,
@@ -584,6 +619,7 @@ pub(crate) fn build_graph_index(store: &Store) -> Result<GraphIndex, CoreError> 
             }
         }
         open_parents.insert(*head, open);
+        kept_parents.insert(*head, kept);
     }
     let mut ready: Vec<Head> = open_parents
         .iter()
@@ -593,11 +629,14 @@ pub(crate) fn build_graph_index(store: &Store) -> Result<GraphIndex, CoreError> 
     let mut builder = GraphIndexBuilder::new(GraphIndex::empty(store.hash_kind()));
     let mut ordered = 0;
     while let Some(head) = ready.pop() {
-        let (change, parents) = parents_of
+        let (change, _) = parents_of
             .get(&head)
             .cloned()
             .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "commit graph lost a head"))?;
-        builder.add_commit(head, change, &parents, Vec::new())?;
+        let kept = kept_parents
+            .get(&head)
+            .ok_or_else(|| CoreError::new(ErrorCode::ECorrupt, "commit graph lost a head"))?;
+        builder.add_commit(head, change, kept, Vec::new())?;
         ordered += 1;
         if let Some(children) = children_of.remove(&head) {
             for child in children {
@@ -767,6 +806,12 @@ pub(crate) fn blame_attribute(
             "blame needs a text file",
         ));
     };
+    if start_refs.len() > BLAME_MAX_POSITIONS {
+        return Err(CoreError::new(
+            ErrorCode::ELimit,
+            "blame walks more line positions than its bound",
+        ));
+    }
     let start_lines: Vec<Vec<u8>> = start_refs.iter().map(|line| line.to_vec()).collect();
     let mut versions: HashMap<Oid, Vec<Vec<u8>>> = HashMap::new();
     versions.insert(start_oid, start_lines.clone());
@@ -1131,11 +1176,45 @@ mod tests {
     }
 
     #[test]
+    fn unified_patch_caps_trailing_context_in_the_final_hunk() {
+        let old: Vec<&[u8]> = vec![b"line\n"; 10];
+        let mut new = old.clone();
+        new[0] = b"CHANGED\n";
+        let ops = lcs_align(&old, &new).expect("align");
+        let patch = unified_patch("a/f", "b/f", &old, &new, &ops);
+        let text = String::from_utf8(patch).expect("patch is UTF-8");
+        let body_lines = text
+            .lines()
+            .filter(|line| line.starts_with(' ') || line.starts_with('+') || line.starts_with('-'))
+            .count();
+        assert_eq!(
+            body_lines,
+            1 + 2 * DIFF_CONTEXT,
+            "the final hunk keeps only its context window: {text}"
+        );
+        assert!(!text.contains("line\nline"), "no runaway tail: {text}");
+    }
+
+    #[test]
     fn parent_line_map_aligns_once_per_pair() {
         let current: Vec<&[u8]> = vec![b"a\n", b"b\n", b"c\n"];
         let parent: Vec<&[u8]> = vec![b"a\n", b"C\n", b"c\n"];
         let map = parent_line_map(&current, &parent).expect("align");
         assert_eq!(map, vec![Some(0), None, Some(2)]);
+    }
+
+    #[test]
+    fn blame_refuses_a_file_over_the_position_bound_before_allocating() {
+        let temp = TempRoot::new("blame-bound");
+        let store = test_store(&temp);
+        // One past the position bound: refusal names the bound, not a
+        // crash from per-line allocation of millions of entries.
+        let line = b"x\n";
+        let huge = line.repeat(BLAME_MAX_POSITIONS + 1);
+        let (head, _) = put_file_commit(&store, Vec::new(), "huge", &huge);
+        let path = RepoPath::new("f.txt").expect("path");
+        let err = blame_attribute(&store, &head, &path).expect_err("over-bound file refuses");
+        assert_eq!(err.code, crate::error::ErrorCode::ELimit);
     }
 
     #[test]
@@ -1219,5 +1298,97 @@ mod tests {
             text.contains("-two\n\\ No newline at end of file\n"),
             "marker follows the line: {text}"
         );
+    }
+
+    #[test]
+    fn flatten_tree_charges_directory_visits() {
+        let temp = TempRoot::new("dir-budget");
+        let store = test_store(&temp);
+        // Sixteen levels of paired directories sharing one child: each
+        // level doubles the visits while no file ever flattens, so a
+        // file-only bound would walk past a hundred thousand entries.
+        let mut child = put_tree(&store, &[]);
+        for _ in 0..16 {
+            child = put_tree(
+                &store,
+                &[("a", TreeMode::Tree, child), ("b", TreeMode::Tree, child)],
+            );
+        }
+        let err = flatten_tree(&store, store.hash_kind(), child)
+            .expect_err("directory visits exceed the diff bound");
+        assert_eq!(err.code, ErrorCode::ELimit);
+        let blob = put_blob(&store, b"small\n");
+        let flat = put_tree(
+            &store,
+            &[("f.txt", TreeMode::File(FileMode::Regular), blob)],
+        );
+        let entries = flatten_tree(&store, store.hash_kind(), flat).expect("small tree flattens");
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn build_graph_index_drops_shallow_boundary_edges() {
+        use crate::records::keys::head_key;
+        use crate::store::types::{FactExpectation, FactMutation, FactTable};
+        use crate::store::{EventContext, EventSource};
+        let temp = TempRoot::new("shallow-graph");
+        let store = test_store(&temp);
+        let (parent, _) = put_file_commit(&store, Vec::new(), "base", b"base\n");
+        let (child, _) = put_file_commit(&store, vec![parent], "child", b"child\n");
+        // Simulate the shallow boundary: the parent row leaves the
+        // table while the child keeps its original parent ids.
+        let parent_key = head_key(&parent);
+        let parent_raw = store
+            .fact(FactTable::Commits, &parent_key)
+            .expect("parent row reads")
+            .expect("parent row exists");
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Commits,
+                    key: parent_key,
+                    expected: FactExpectation::Value(parent_raw),
+                    value: None,
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("parent row deletes");
+        let err = match build_graph_index(&store) {
+            Ok(_) => panic!("absent parent is corrupt"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, ErrorCode::ECorrupt);
+        let Head::Git { oid } = child else {
+            panic!("test commit is a git head");
+        };
+        store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::Shallow,
+                    key: oid.as_bytes().to_vec(),
+                    expected: FactExpectation::Any,
+                    value: Some(Vec::new()),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("shallow marker inserts");
+        build_graph_index(&store).expect("boundary edge drops");
+    }
+
+    #[test]
+    fn bounded_object_bytes_refuses_before_loading() {
+        let temp = TempRoot::new("bounded-read");
+        let store = test_store(&temp);
+        let big = put_blob(&store, &vec![b'x'; 16_777_217]);
+        let err = bounded_object_bytes(&store, big).expect_err("oversize object refuses");
+        assert_eq!(err.code, ErrorCode::ELimit);
+        let small = put_blob(&store, b"small\n");
+        let (kind, bytes) = bounded_object_bytes(&store, small).expect("small object loads");
+        assert_eq!(kind, ObjectKind::Blob);
+        assert_eq!(bytes, b"small\n");
     }
 }

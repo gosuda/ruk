@@ -62,7 +62,7 @@ use crate::refdata::{
     RefChange, RefExpect, RefName, RefTarget, RefTransaction, RefUpdate, resolve,
 };
 use crate::refs::{StoreRefs, prepare_checked_transaction};
-use crate::store::types::{FactExpectation, FactMutation, FactTable};
+use crate::store::types::{FactExpectation, FactMutation, FactTable, REPO_META_KEY};
 use crate::store::{EventContext, EventSource, Store, decode, encode};
 
 /// How long a land plan stays executable after creation.
@@ -349,7 +349,9 @@ pub(super) fn land_prepare(
 
 /// Stages one land plan execution without publishing it: validates the
 /// stored plan against live state and builds the exact ref move plus the
-/// plan-row deletion. The lane publishes the facts atomically with the
+/// plan-row deletion plus a `RepoMeta` guard rewriting the policy row read
+/// at validation, so a concurrent `policy.set` fails the publish as stale.
+/// The lane publishes the facts atomically with the
 /// receipt, so a second execution loses the plan-row race instead of
 /// double-landing.
 ///
@@ -397,10 +399,10 @@ pub(super) fn prepare_land_execute(
             "land plan expired; re-prepare",
         ));
     }
-    let current_generation = store
-        .repo_meta()
-        .map_err(CoreError::from)?
-        .map_or(0, |meta| meta.policy_generation);
+    let current_meta = store.repo_meta_raw().map_err(CoreError::from)?;
+    let current_generation = current_meta
+        .as_ref()
+        .map_or(0, |(meta, _)| meta.policy_generation);
     if current_generation != stored.policy_generation {
         return Err(CoreError::new(
             ErrorCode::EStale,
@@ -459,6 +461,16 @@ pub(super) fn prepare_land_execute(
         key: plan_key(plan).to_vec(),
         expected: FactExpectation::Value(stored_bytes),
         value: None,
+    });
+    let (repo_meta_expected, repo_meta_value) = match current_meta {
+        Some((_, raw)) => (FactExpectation::Value(raw.clone()), Some(raw)),
+        None => (FactExpectation::Absent, None),
+    };
+    mutations.push(FactMutation {
+        table: FactTable::RepoMeta,
+        key: REPO_META_KEY.to_vec(),
+        expected: repo_meta_expected,
+        value: repo_meta_value,
     });
     let outcome = LandOutcome {
         plan: stored.plan,
@@ -553,6 +565,7 @@ mod tests {
                 result: AttestResult::new("pass").expect("result"),
                 signed_at: Timestamp::parse(SIGNED_AT).expect("timestamp"),
                 supersedes: None,
+                evidence: None,
             };
             let payload = statement
                 .canonical_payload_v1(HashKind::Sha1)
@@ -722,6 +735,64 @@ mod tests {
             err.message.contains("policy changed"),
             "names the invalidation: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn prepared_land_goes_stale_on_concurrent_policy_bump() {
+        let lab = Lab::new();
+        lab.open_target();
+        let checkpoint = |_: Progress| Ok::<(), CoreError>(());
+        let plan = land_prepare(&lab.store, lab.request(None), &checkpoint)
+            .expect("prepare records the attempt");
+        let candidate = plan.candidate().expect("prepared candidate");
+        let (_, mutations) = prepare_land_execute(
+            &lab.store,
+            plan.plan,
+            candidate,
+            Timestamp::parse(SIGNED_AT).expect("now"),
+            &checkpoint,
+        )
+        .expect("execute stages before the concurrent bump");
+        assert!(
+            mutations.iter().any(|mutation| {
+                matches!(mutation.table, FactTable::RepoMeta)
+                    && mutation.key.as_slice() == crate::store::types::REPO_META_KEY
+            }),
+            "staged execution carries the RepoMeta guard",
+        );
+        let bumped = crate::store::types::RepoMetaRow {
+            default_branch: crate::refdata::RefName::new("refs/heads/main").expect("branch"),
+            land_requirements: Vec::new(),
+            trusted_signers: Vec::new(),
+            policy_generation: 1,
+        };
+        let bytes = crate::store::encode("repo meta", &bumped).expect("encode policy");
+        lab.store
+            .publish(
+                Vec::new(),
+                &[FactMutation {
+                    table: FactTable::RepoMeta,
+                    key: crate::store::types::REPO_META_KEY.to_vec(),
+                    expected: FactExpectation::Any,
+                    value: Some(bytes),
+                }],
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect("bump the land policy");
+        let err = lab
+            .store
+            .publish(
+                Vec::new(),
+                &mutations,
+                EventSource::LocalPush,
+                &EventContext::default(),
+            )
+            .expect_err("a concurrent policy bump fails the staged publish");
+        assert!(
+            matches!(err, crate::store::StoreError::StaleFact { .. }),
+            "concurrent bump fails the publish as stale, got: {err:?}",
         );
     }
 }

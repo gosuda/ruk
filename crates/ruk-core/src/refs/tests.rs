@@ -797,6 +797,7 @@ fn test_byte_exact_reflog_recovery_and_bounded_continuation() {
     assert_eq!(err.code, ErrorCode::ELimit);
 }
 
+/// Pins the marker codec, not freeze enforcement or publication behavior.
 #[test]
 fn released_tag_marker_round_trips_through_postcard() {
     use crate::protocol::Timestamp;
@@ -809,4 +810,271 @@ fn released_tag_marker_round_trips_through_postcard() {
     let decoded: ReleasedTagMarker =
         crate::store::decode("released_tags", &bytes).expect("decode marker");
     assert_eq!(decoded, marker);
+}
+
+fn released_marker(owner: &str, target: Oid) -> ReleasedTagMarker {
+    ReleasedTagMarker {
+        owner_release_id: owner.to_owned(),
+        target_oid: target,
+        frozen_at: crate::protocol::Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+    }
+}
+
+fn seed_tag(ts: &TestStore, name: &RefName, target: Oid) {
+    let encoded =
+        crate::store::encode("ref target", &RefTarget::Direct(target)).expect("encode target");
+    ts.publish_mutations(&[FactMutation {
+        table: FactTable::Refs,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Absent,
+        value: Some(encoded),
+    }]);
+}
+
+fn freeze_tag(ts: &TestStore, name: &RefName, marker: &ReleasedTagMarker) {
+    seed_tag(ts, name, marker.target_oid);
+    let freezes = prepare_release_freeze(ts.store(), name, marker).expect("prepare freeze");
+    ts.publish_mutations(&freezes);
+}
+
+#[test]
+fn released_tag_freeze_is_create_if_absent_and_idempotent_per_owner_and_target() {
+    let ts = TestStore::new("released-freeze-create", HashKind::Sha1);
+    let store = ts.store();
+    let name = RefName::new("refs/tags/v1").expect("tag name");
+    let target = test_oid(HashKind::Sha1, b"release target");
+    let marker = released_marker("rel-1", target);
+
+    seed_tag(&ts, &name, target);
+    let live_bytes = store
+        .fact(FactTable::Refs, name.as_bytes())
+        .expect("read live tag")
+        .expect("live tag seeded");
+    let freezes = prepare_release_freeze(store, &name, &marker).expect("prepare freeze");
+    assert_eq!(
+        freezes.len(),
+        2,
+        "create pins the live Refs row plus the marker"
+    );
+    assert_eq!(freezes[0].table, FactTable::Refs);
+    assert!(
+        matches!(&freezes[0].expected, FactExpectation::Value(have) if have == &live_bytes),
+        "Refs guard expects the stored serialized target"
+    );
+    assert_eq!(freezes[0].value.as_deref(), Some(live_bytes.as_slice()));
+    assert_eq!(freezes[1].table, FactTable::ReleasedTags);
+    assert!(matches!(freezes[1].expected, FactExpectation::Absent));
+    ts.publish_mutations(&freezes);
+    assert_eq!(
+        released_tag_marker(store, &name).expect("read marker"),
+        Some(marker.clone())
+    );
+
+    let retry = prepare_release_freeze(store, &name, &marker).expect("retry prepare");
+    assert_eq!(
+        retry.len(),
+        1,
+        "retry is marker-only; the Refs pin is already published"
+    );
+    assert!(
+        matches!(retry[0].expected, FactExpectation::Value(_)),
+        "same owner and target is an idempotent, row-guarded write"
+    );
+}
+
+#[test]
+fn released_tag_freeze_refuses_another_owner_or_another_target() {
+    let ts = TestStore::new("released-freeze-refuse", HashKind::Sha1);
+    let store = ts.store();
+    let name = RefName::new("refs/tags/v1").expect("tag name");
+    let target = test_oid(HashKind::Sha1, b"release target");
+    freeze_tag(&ts, &name, &released_marker("rel-1", target));
+
+    let other_owner = prepare_release_freeze(store, &name, &released_marker("rel-2", target))
+        .expect_err("another owner is refused");
+    assert_eq!(other_owner.code, ErrorCode::EForbidden);
+    assert!(
+        other_owner.message.contains("rel-1"),
+        "{}",
+        other_owner.message
+    );
+
+    let moved = test_oid(HashKind::Sha1, b"moved target");
+    let other_target = prepare_release_freeze(store, &name, &released_marker("rel-1", moved))
+        .expect_err("same owner at another target is refused");
+    assert_eq!(other_target.code, ErrorCode::EStale);
+    assert!(
+        other_target.message.contains("refs/tags/v1"),
+        "{}",
+        other_target.message
+    );
+}
+
+#[test]
+fn released_tag_freeze_refuses_without_a_live_tag_at_target() {
+    let ts = TestStore::new("released-freeze-unborn", HashKind::Sha1);
+    let store = ts.store();
+    let name = RefName::new("refs/tags/v1").expect("tag name");
+    let target = test_oid(HashKind::Sha1, b"release target");
+    let absent = prepare_release_freeze(store, &name, &released_marker("rel-1", target))
+        .expect_err("freezing an unborn tag is refused");
+    assert_eq!(absent.code, ErrorCode::EStale);
+    assert!(
+        absent.message.contains("refs/tags/v1"),
+        "{}",
+        absent.message
+    );
+
+    let ts2 = TestStore::new("released-freeze-mismatch", HashKind::Sha1);
+    let store2 = ts2.store();
+    seed_tag(&ts2, &name, test_oid(HashKind::Sha1, b"other target"));
+    let moved = prepare_release_freeze(store2, &name, &released_marker("rel-1", target))
+        .expect_err("freezing at a stale target is refused");
+    assert_eq!(moved.code, ErrorCode::EStale);
+    assert!(moved.message.contains("refs/tags/v1"), "{}", moved.message);
+}
+
+#[test]
+fn released_tag_clear_is_owner_checked_and_removes_the_row() {
+    let ts = TestStore::new("released-freeze-clear", HashKind::Sha1);
+    let store = ts.store();
+    let name = RefName::new("refs/tags/v1").expect("tag name");
+    let target = test_oid(HashKind::Sha1, b"release target");
+    freeze_tag(&ts, &name, &released_marker("rel-1", target));
+
+    let refused =
+        prepare_release_unfreeze(store, &name, "rel-2").expect_err("another owner cannot clear");
+    assert_eq!(refused.code, ErrorCode::EForbidden);
+    assert!(refused.message.contains("rel-1"), "{}", refused.message);
+
+    let clear = prepare_release_unfreeze(store, &name, "rel-1").expect("owner clear prepares");
+    ts.publish_mutations(&[clear]);
+    assert_eq!(
+        released_tag_marker(store, &name).expect("read marker"),
+        None
+    );
+    let absent =
+        prepare_release_unfreeze(store, &name, "rel-1").expect("clear without a row prepares");
+    assert!(
+        matches!(absent.expected, FactExpectation::Absent) && absent.value.is_none(),
+        "no row is a no-op guarded by absence"
+    );
+}
+
+#[test]
+fn check_tag_unfrozen_refuses_only_while_a_marker_is_live() {
+    let ts = TestStore::new("released-freeze-check", HashKind::Sha1);
+    let store = ts.store();
+    let name = RefName::new("refs/tags/v1").expect("tag name");
+    let branch = RefName::new("refs/heads/main").expect("branch name");
+    let target = test_oid(HashKind::Sha1, b"release target");
+
+    check_tag_unfrozen(store, &name).expect("no marker passes");
+    assert!(
+        tag_freeze_guards(store, &[&branch])
+            .expect("guards for a branch")
+            .is_empty(),
+        "names outside refs/tags/ carry no guard"
+    );
+
+    freeze_tag(&ts, &name, &released_marker("rel-1", target));
+    let err = check_tag_unfrozen(store, &name).expect_err("frozen tag refuses");
+    assert_eq!(err.code, ErrorCode::EForbidden);
+    assert_eq!(
+        err.message,
+        "tag `refs/tags/v1` is frozen by release `rel-1`"
+    );
+    let refused = tag_freeze_guards(store, &[&name]).expect_err("guard refuses a frozen tag");
+    assert_eq!(refused.code, ErrorCode::EForbidden);
+}
+
+#[test]
+fn tag_freeze_guard_fails_a_publish_that_raced_a_freeze() {
+    let ts = TestStore::new("released-freeze-race", HashKind::Sha1);
+    let store = ts.store();
+    let name = RefName::new("refs/tags/v1").expect("tag name");
+    let target = test_oid(HashKind::Sha1, b"tag commit");
+    let moved = test_oid(HashKind::Sha1, b"moved tag commit");
+    seed_tag(&ts, &name, target);
+
+    let guards = tag_freeze_guards(store, &[&name]).expect("guard while unfrozen");
+    assert_eq!(guards.len(), 1);
+    let transaction = RefTransaction::new(
+        HashKind::Sha1,
+        vec![RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Present(RefTarget::Direct(target)),
+            change: RefChange::Set(RefTarget::Direct(moved)),
+        }],
+    )
+    .expect("tag transaction");
+    let facts = check_and_prepare(store, &transaction)
+        .expect("prepare tag ref")
+        .into_mutations();
+    let freezes = prepare_release_freeze(store, &name, &released_marker("rel-1", target))
+        .expect("freeze the live tag");
+    ts.publish_mutations(&freezes);
+    let err = store
+        .publish(
+            Vec::new(),
+            &facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect_err("the stale guard fails the publish");
+    assert_eq!(err.code(), ErrorCode::EStale);
+    assert_eq!(
+        StoreRefs::new(store).get(&name).expect("read ref"),
+        Some(RefTarget::Direct(target)),
+        "a refused publish moves no ref"
+    );
+}
+#[test]
+fn release_freeze_publish_fails_when_tag_moves_after_prepare() {
+    let ts = TestStore::new("release-freeze-ref-race", HashKind::Sha1);
+    let store = ts.store();
+    let name = RefName::new("refs/tags/v1").expect("tag name");
+    let target = test_oid(HashKind::Sha1, b"release target");
+    let moved = test_oid(HashKind::Sha1, b"competing target");
+    let before =
+        crate::store::encode("ref target", &RefTarget::Direct(target)).expect("encode target");
+    ts.publish_mutations(&[FactMutation {
+        table: FactTable::Refs,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Absent,
+        value: Some(before.clone()),
+    }]);
+    let freezes = prepare_release_freeze(store, &name, &released_marker("rel-1", target))
+        .expect("prepare freeze at initial target");
+    assert_eq!(
+        freezes.len(),
+        2,
+        "freeze pins the Refs row it was prepared against"
+    );
+    ts.publish_mutations(&[FactMutation {
+        table: FactTable::Refs,
+        key: name.as_bytes().to_vec(),
+        expected: FactExpectation::Value(before),
+        value: Some(
+            crate::store::encode("ref target", &RefTarget::Direct(moved))
+                .expect("encode competing target"),
+        ),
+    }]);
+    let err = store
+        .publish(
+            Vec::new(),
+            &freezes,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect_err("a moved tag stales the freeze publication");
+    assert_eq!(err.code(), ErrorCode::EStale);
+    assert_eq!(
+        released_tag_marker(store, &name).expect("read marker"),
+        None
+    );
+    assert_eq!(
+        StoreRefs::new(store).get(&name).expect("read tag"),
+        Some(RefTarget::Direct(moved))
+    );
 }

@@ -34,11 +34,15 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, timeout};
 
-use super::cancel::{Cancel, cancellation};
+use super::cancel::Cancel;
+#[cfg(unix)]
+use super::cancel::cancellation;
 use super::endpoint::{self, Incoming, Outgoing};
 use super::handshake;
 use super::hosted::{DispatchReady, HostedCoordinator};
-use super::lock::{Acquisition, EndpointAddress, EndpointNonce, LockBody, LockSnapshot, StoreLock};
+#[cfg(unix)]
+use super::lock::EndpointAddress;
+use super::lock::{Acquisition, EndpointNonce, LockBody, LockSnapshot, StoreLock};
 use super::transport;
 use crate::attestation::Progress;
 use crate::change::SessionId;

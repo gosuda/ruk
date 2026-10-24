@@ -343,6 +343,10 @@ pub(crate) fn plan_refs(
                 }
             }
             RefDecision::Conflicted { local } => {
+                facts.extend(ruk_core::refs::tag_freeze_guards(
+                    store,
+                    &[&candidate.name],
+                )?);
                 let base_oid = base.as_ref().and_then(direct);
                 let merge = ruk_core::merge::Merge::from_removes_adds(
                     [base_oid],

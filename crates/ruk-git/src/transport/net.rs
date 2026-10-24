@@ -21,7 +21,7 @@
 //! (git:// request shape), `git/builtin/ls-remote.c` (discovery).
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -206,6 +206,224 @@ pub fn dumb_http_gap(url: &str) -> GitError {
     }
 }
 
+/// Which addresses one remote dial may open: an explicit per-call
+/// allowlist over a default-deny of non-public addresses. Every dial
+/// re-resolves and re-checks, so a rebinding answer is refused even when
+/// an earlier answer for the same host passed.
+#[derive(Clone, Debug, Default)]
+pub struct EgressPolicy {
+    allowed: Vec<AllowedNet>,
+}
+
+/// One allowlist entry: an exact address or a CIDR prefix.
+#[derive(Clone, Debug)]
+enum AllowedNet {
+    Addr(IpAddr),
+    Cidr(IpAddr, u8),
+}
+
+impl EgressPolicy {
+    /// Default-deny: only globally public addresses dial, with no
+    /// allowlist entries.
+    #[must_use]
+    pub fn deny_private() -> Self {
+        Self::default()
+    }
+
+    /// Allows one exact address (loopback test servers, pinned intranet
+    /// mirrors) alongside the public ranges.
+    #[must_use]
+    pub fn allow(mut self, addr: IpAddr) -> Self {
+        self.allowed.push(AllowedNet::Addr(addr));
+        self
+    }
+
+    /// Allows the loopback addresses explicitly dialed by tests and local
+    /// development servers.
+    #[must_use]
+    pub fn allow_loopback(mut self) -> Self {
+        self.allowed
+            .push(AllowedNet::Addr(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        self.allowed
+            .push(AllowedNet::Addr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        self
+    }
+
+    /// Allows one CIDR prefix (`10.0.0.0/8`) for intranet mirrors whose
+    /// addresses resolve dynamically.
+    ///
+    /// # Errors
+    /// [`GitError::Invalid`] for an unparsable prefix or width.
+    pub fn allow_cidr(mut self, cidr: &str) -> Result<Self, GitError> {
+        let (net, bits) = cidr.split_once('/').ok_or_else(|| GitError::Invalid {
+            detail: format!("egress allowlist entry is not CIDR: {cidr:?}"),
+        })?;
+        let net: IpAddr = net.parse().map_err(|_| GitError::Invalid {
+            detail: format!("egress allowlist entry has no address: {cidr:?}"),
+        })?;
+        let bits: u8 = bits.parse().map_err(|_| GitError::Invalid {
+            detail: format!("egress allowlist entry has no width: {cidr:?}"),
+        })?;
+        let max = match net {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if bits > max {
+            return Err(GitError::Invalid {
+                detail: format!("egress allowlist width exceeds /{max}: {cidr:?}"),
+            });
+        }
+        self.allowed.push(AllowedNet::Cidr(net, bits));
+        Ok(self)
+    }
+
+    /// Whether `ip` may be dialed: allowlisted, or globally public.
+    /// IPv4 embeddings (mapped, 6to4, Teredo, NAT64) are judged by the
+    /// inner address, so a public-looking wrapper around a private target
+    /// never passes.
+    #[must_use]
+    pub fn allows(&self, ip: IpAddr) -> bool {
+        if self.allowed.iter().any(|entry| match entry {
+            AllowedNet::Addr(addr) => *addr == ip,
+            AllowedNet::Cidr(net, bits) => cidr_contains(*net, *bits, ip),
+        }) {
+            return true;
+        }
+        public_ip(ip)
+    }
+
+    /// Keeps the dialable subset of one resolution answer, refusing when
+    /// every answer is denied. Runs on every dial, including redirect
+    /// hops, so DNS rebinding cannot smuggle a private target past an
+    /// earlier public answer.
+    ///
+    /// # Errors
+    /// [`GitError::Invalid`] when no answer survives the policy.
+    pub fn filter_addrs(
+        &self,
+        label: &str,
+        addrs: &[SocketAddr],
+    ) -> Result<Vec<SocketAddr>, GitError> {
+        let kept: Vec<SocketAddr> = addrs
+            .iter()
+            .copied()
+            .filter(|addr| self.allows(addr.ip()))
+            .collect();
+        if kept.is_empty() {
+            let refused: Vec<String> = addrs.iter().map(|addr| addr.ip().to_string()).collect();
+            return Err(GitError::Invalid {
+                detail: format!("egress policy refuses {label}: {}", refused.join(", ")),
+            });
+        }
+        Ok(kept)
+    }
+}
+
+/// Whether `net/bits` contains `ip` (same family only).
+fn cidr_contains(net: IpAddr, bits: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) if bits <= 32 => {
+            if bits == 0 {
+                return true;
+            }
+            let shift = 32 - bits;
+            (u32::from(net) >> shift) == (u32::from(ip) >> shift)
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) if bits <= 128 => {
+            if bits == 0 {
+                return true;
+            }
+            let shift = 128 - bits;
+            (u128::from(net) >> shift) == (u128::from(ip) >> shift)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ip` is globally dialable: nothing loopback, private,
+/// link-local, unspecified, broadcast, multicast, documentation,
+/// reserved, benchmarking, or carrier-grade shared.
+fn public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => public_v4(addr),
+        IpAddr::V6(addr) => match embedded_v4(addr) {
+            Some(inner) => public_v4(inner),
+            None => public_v6(addr),
+        },
+    }
+}
+
+fn public_v4(addr: Ipv4Addr) -> bool {
+    let [first, second, third, _] = addr.octets();
+    if first == 0
+        || first == 10
+        || first == 100 && (second & 0xc0) == 0x40
+        || first == 127
+        || first == 169 && second == 254
+        || first == 172 && (second & 0xf0) == 0x10
+        || first == 192 && second == 0 && (third == 0 || third == 2)
+        || first == 192 && second == 88 && third == 99
+        || first == 192 && second == 168
+        || first == 198 && (second & 0xfe) == 0x12
+        || first == 198 && second == 51 && third == 100
+        || first == 203 && second == 0 && third == 113
+        || first & 0xf0 == 0xe0
+        || first & 0xf0 == 0xf0
+    {
+        return false;
+    }
+    !addr.is_loopback()
+        && !addr.is_private()
+        && !addr.is_link_local()
+        && !addr.is_unspecified()
+        && !addr.is_broadcast()
+        && !addr.is_multicast()
+}
+
+/// Unwraps the IPv4 a v6 address embeds: mapped (`::ffff:0:0/96`), 6to4
+/// (`2002::/16`), Teredo (`2001::/32`), and well-known NAT64
+/// (`64:ff9b::/96`).
+fn embedded_v4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = addr.segments();
+    let octets = addr.octets();
+    if octets[..10] == [0; 10] && octets[10..12] == [0xff, 0xff] {
+        return Some(Ipv4Addr::from(
+            u32::from(segments[6]) << 16 | u32::from(segments[7]),
+        ));
+    }
+    if segments[0] == 0x2002 {
+        let [a, b] = segments[1].to_be_bytes();
+        let [c, d] = segments[2].to_be_bytes();
+        return Some(Ipv4Addr::new(a, b, c, d));
+    }
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        let obfuscated = u32::from(segments[6]) << 16 | u32::from(segments[7]);
+        return Some(Ipv4Addr::from(!obfuscated));
+    }
+    if segments[0] == 0x64 && segments[1] == 0xff9b && segments[2] == 0 {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        return Some(Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
+fn public_v6(addr: Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    let [first, second, ..] = segments;
+    if first & 0xff00 == 0xff00
+        || first & 0xffc0 == 0xfe80
+        || first & 0xfe00 == 0xfc00
+        || first == 0x2001 && second == 0x0db8
+        || first == 0x2001 && second & 0xfe00 == 0
+        || addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+    {
+        return false;
+    }
+    true
+}
 /// Single-quotes `text` for a remote shell: safe for paths starting with
 /// `-`, which then cannot mask as command-line arguments.
 fn shell_quote(text: &str) -> String {
@@ -217,36 +435,107 @@ fn remote_command(service: Service, path: &str) -> String {
     format!("{} {}", service.name(), shell_quote(path))
 }
 
-/// How to spawn the SSH connection: a program plus argv, or a shell line
-/// when `GIT_SSH_COMMAND` overrides the program (`git/connect.c`).
-fn ssh_invocation(
-    login: &str,
+/// One SSH spawn: where to dial and what to run there.
+///
+/// The pinned path preserves the original hostname in `login` for
+/// SSH config matching while passing `-o Hostname=<ip>` to pin the
+/// connection and `-o HostKeyAlias=<host>` for host-key verification. The
+/// unpinned path leaves the alias empty and keeps the legacy argv shape
+/// exactly, so existing `GIT_SSH_COMMAND` scripts keep their positional
+/// arguments.
+struct SshDial<'a> {
+    /// Destination login: `user@host` or `host`.
+    login: String,
+    /// Original hostname for `-o HostKeyAlias=`, set only when pinned.
+    host_key_alias: Option<&'a str>,
+    /// Pinned destination IP for `-o Hostname=`, set only when pinned.
+    pinned_ip: Option<IpAddr>,
+    /// Explicit `-p` port, if any.
     port: Option<u16>,
+    /// Service to run on the far end.
     service: Service,
-    path: &str,
+    /// Repository path on the far end.
+    path: &'a str,
+}
+
+impl<'a> SshDial<'a> {
+    /// Unpinned dial: the hostname stays the destination, no alias flags.
+    fn direct(login: String, port: Option<u16>, service: Service, path: &'a str) -> Self {
+        Self {
+            login,
+            host_key_alias: None,
+            pinned_ip: None,
+            port,
+            service,
+            path,
+        }
+    }
+
+    /// Pinned dial: preserves the hostname while pinning destination IP.
+    fn pinned(
+        login: String,
+        host: &'a str,
+        pinned_ip: IpAddr,
+        port: Option<u16>,
+        service: Service,
+        path: &'a str,
+    ) -> Self {
+        Self {
+            login,
+            host_key_alias: Some(host),
+            pinned_ip: Some(pinned_ip),
+            port,
+            service,
+            path,
+        }
+    }
+}
+
+/// How to spawn the SSH connection: a program plus argv, or a shell line
+/// when `GIT_SSH_COMMAND` overrides the program (`git/connect.c`). A
+/// pinned dial adds `-o HostKeyAlias=<hostname>` and `-o Hostname=<ip>`
+/// ahead of the destination; an unpinned dial keeps the legacy shape exactly.
+fn ssh_invocation(
+    dial: &SshDial<'_>,
     ssh_program: &str,
     ssh_command: Option<&str>,
 ) -> SshInvocation {
-    let remote = remote_command(service, path);
+    let remote = remote_command(dial.service, dial.path);
     match ssh_command {
         Some(command) if !command.is_empty() => {
             let mut line = command.to_owned();
-            if let Some(port) = port {
+            if let Some(port) = dial.port {
                 line.push_str(&format!(" -p {port}"));
             }
+            if let Some(alias) = dial.host_key_alias {
+                line.push_str(" -o ");
+                line.push_str(&shell_quote(&format!("HostKeyAlias={alias}")));
+            }
+            if let Some(ip) = dial.pinned_ip {
+                line.push_str(" -o ");
+                line.push_str(&shell_quote(&format!("Hostname={ip}")));
+            }
             line.push(' ');
-            line.push_str(&shell_quote(login));
+            line.push_str(&shell_quote(&dial.login));
             line.push(' ');
             line.push_str(&shell_quote(&remote));
             SshInvocation::Shell(line)
         }
         _ => {
             let mut argv = vec![ssh_program.to_owned()];
-            if let Some(port) = port {
+            if let Some(port) = dial.port {
                 argv.push("-p".to_owned());
                 argv.push(port.to_string());
             }
-            argv.push(login.to_owned());
+            if let Some(alias) = dial.host_key_alias {
+                argv.push("-o".to_owned());
+                argv.push(format!("HostKeyAlias={alias}"));
+            }
+            if let Some(ip) = dial.pinned_ip {
+                argv.push("-o".to_owned());
+                argv.push(format!("Hostname={ip}"));
+            }
+            argv.push(dial.login.clone());
             argv.push(remote);
             SshInvocation::Exec(argv)
         }
@@ -280,12 +569,18 @@ const SSH_EXIT_GRACE: Duration = Duration::from_secs(30);
 pub struct SshStream {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
-    /// Owns the spawned ssh so Drop can kill-and-reap it after taking the pipes.
     child: Child,
+    buffered: Vec<u8>,
 }
 
 impl Read for SshStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.buffered.is_empty() {
+            let n = self.buffered.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.buffered[..n]);
+            self.buffered.drain(..n);
+            return Ok(n);
+        }
         match self.stdout.as_mut() {
             Some(o) => o.read(buf),
             None => Ok(0),
@@ -419,9 +714,25 @@ pub fn ssh_connect_with(
     ssh_program: &str,
     ssh_command: Option<&str>,
 ) -> Result<SshStream, GitError> {
-    let login = ssh_login(host, user)?;
-    let what = format!("ssh to {login}");
-    let mut command = match ssh_invocation(&login, port, service, path, ssh_program, ssh_command) {
+    ssh_spawn(
+        &SshDial::direct(ssh_login(host, user)?, port, service, path),
+        ssh_program,
+        ssh_command,
+    )
+}
+
+/// Spawns one SSH child from an already-built dial: the single spawn site
+/// behind [`ssh_connect_with`] and the pinned dial below.
+///
+/// # Errors
+/// [`GitError::Io`] when the command cannot spawn.
+fn ssh_spawn(
+    dial: &SshDial<'_>,
+    ssh_program: &str,
+    ssh_command: Option<&str>,
+) -> Result<SshStream, GitError> {
+    let what = format!("ssh to {}", dial.login);
+    let mut command = match ssh_invocation(dial, ssh_program, ssh_command) {
         SshInvocation::Exec(argv) => {
             let mut command = Command::new(&argv[0]);
             command.args(&argv[1..]);
@@ -450,7 +761,124 @@ pub fn ssh_connect_with(
         stdin: Some(stdin),
         stdout: Some(stdout),
         child,
+        buffered: Vec::new(),
     })
+}
+
+/// Builds one pinned dial for a filtered address: the destination retains the
+/// original hostname for SSH config matching while `-o Hostname=` connects
+/// directly to the filtered IP and `-o HostKeyAlias=` verifies the host key.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a dash-led user.
+fn pinned_dial<'a>(
+    addr: &SocketAddr,
+    host: &'a str,
+    port: Option<u16>,
+    user: Option<&str>,
+    service: Service,
+    path: &'a str,
+) -> Result<SshDial<'a>, GitError> {
+    Ok(SshDial::pinned(
+        ssh_login(host, user)?,
+        host,
+        addr.ip(),
+        port,
+        service,
+        path,
+    ))
+}
+
+/// Tries the filtered SSH addresses in order, returning the first child
+/// that spawns. `dial` performs one pinned attempt and only ever sees
+/// addresses the egress policy already kept, so a refused address never
+/// reaches the ssh spawn.
+///
+/// # Errors
+/// The last attempt's error, or [`GitError::Io`] when `allowed` is empty
+/// (the empty-filter refusal in [`EgressPolicy::filter_addrs`] normally
+/// fires first).
+fn ssh_dial_each(
+    label: &str,
+    allowed: &[SocketAddr],
+    mut dial: impl FnMut(&SocketAddr) -> Result<SshStream, GitError>,
+) -> Result<SshStream, GitError> {
+    let mut last_err: Option<GitError> = None;
+    for addr in allowed {
+        match dial(addr) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| GitError::Io {
+        detail: format!("cannot ssh to {label}: no addresses to try"),
+    }))
+}
+
+fn ssh_verify_connection(
+    mut stream: SshStream,
+    label: &str,
+    addr: &SocketAddr,
+    service: Service,
+    timeout: Duration,
+) -> Result<SshStream, GitError> {
+    if service == Service::UploadArchive {
+        if let Ok(Some(status)) = stream.child.try_wait()
+            && !status.success()
+        {
+            return Err(GitError::Io {
+                detail: format!("cannot ssh to {label} ({addr}): {status}"),
+            });
+        }
+        return Ok(stream);
+    }
+    let mut stdout = stream.stdout.take().ok_or_else(|| GitError::Io {
+        detail: format!("{label} has no stdout pipe"),
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_handle = std::thread::Builder::new()
+        .name("ruk-ssh-probe".to_owned())
+        .spawn(move || {
+            let mut buf = [0u8; 1024];
+            let res = stdout.read(&mut buf);
+            let _ = tx.send((stdout, res, buf));
+        })
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot spawn ssh probe: {err}"),
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok((stdout, Ok(n), buf)) => {
+            let _ = thread_handle.join();
+            stream.stdout = Some(stdout);
+            if n == 0 {
+                let _ = stream.child.kill();
+                let status = stream.child.wait().ok();
+                return Err(GitError::Io {
+                    detail: format!(
+                        "cannot ssh to {label} ({addr}): connection closed before banner ({status:?})"
+                    ),
+                });
+            }
+            stream.buffered = buf[..n].to_vec();
+            Ok(stream)
+        }
+        Ok((stdout, Err(err), _)) => {
+            let _ = thread_handle.join();
+            stream.stdout = Some(stdout);
+            let _ = stream.child.kill();
+            let _ = stream.child.wait();
+            Err(GitError::Io {
+                detail: format!("cannot ssh to {label} ({addr}): {err}"),
+            })
+        }
+        Err(_) => {
+            let _ = stream.child.kill();
+            let _ = stream.child.wait();
+            Err(GitError::Io {
+                detail: format!("cannot ssh to {label} ({addr}): timed out waiting for connection"),
+            })
+        }
+    }
 }
 
 /// Builds the git-daemon request as one pkt-line: 4-hex length prefix
@@ -476,6 +904,21 @@ fn git_request(service: Service, host: &str, port: Option<u16>, path: &str) -> V
     out
 }
 
+fn resolve_addrs(label: &str, host: &str, port: u16) -> Result<Vec<SocketAddr>, GitError> {
+    let resolved: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot resolve {label}: {err}"),
+        })?
+        .collect();
+    if resolved.is_empty() {
+        return Err(GitError::Io {
+            detail: format!("cannot resolve {label}: no addresses"),
+        });
+    }
+    Ok(resolved)
+}
+
 /// Dials a git daemon and sends the service request.
 ///
 /// # Errors
@@ -485,12 +928,37 @@ pub fn git_connect(
     port: Option<u16>,
     service: Service,
     path: &str,
+    policy: &EgressPolicy,
 ) -> Result<TcpStream, GitError> {
-    let stream = TcpStream::connect((host, port.unwrap_or(GIT_DAEMON_PORT))).map_err(|err| {
-        GitError::Io {
-            detail: format!("cannot reach git://{host}: {err}"),
+    let effective = port.unwrap_or(GIT_DAEMON_PORT);
+    let label = format!("git://{host}:{effective}");
+    let resolved = resolve_addrs(&label, host, effective)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last_err = String::from("no addresses tried");
+    let mut dialed = None;
+    for addr in policy.filter_addrs(&label, &resolved)? {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            last_err = String::from("egress dial budget exhausted");
+            break;
         }
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(stream) => {
+                dialed = Some(stream);
+                break;
+            }
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    let stream = dialed.ok_or_else(|| GitError::Io {
+        detail: format!("cannot reach {label} within 30s: {last_err}"),
     })?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .and(stream.set_write_timeout(Some(std::time::Duration::from_secs(30))))
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot arm timeouts on {label}: {err}"),
+        })?;
     let request = git_request(service, host, port, path);
     (&stream as &TcpStream)
         .write_all(&request)
@@ -534,32 +1002,64 @@ impl Write for Stream {
     }
 }
 
-/// Opens one duplex stream to a network endpoint: SSH spawns, git dials.
+/// Opens one duplex stream to a network endpoint: SSH spawns pinned onto
+/// its filtered addresses, and git dials under the same policy.
 ///
 /// Smart-http never opens a duplex stream: its stateless request/response
 /// pairs run through [`super::smart_http`], so an HTTP endpoint here is
-/// an internal routing error, not a gap.
+/// an internal routing error, not a gap. The policy gates git-daemon
+/// dials and filters the resolved SSH addresses before spawning. SSH pins
+/// only to those filtered addresses via `-o Hostname=` (the child never
+/// re-resolves the hostname) while keeping the original hostname for
+/// config selection and host-key verification.
 ///
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
-/// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
-pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitError> {
+/// those elsewhere), or when egress policy refuses SSH or git addresses;
+/// [`GitError::Cancelled`] when the interrupt is
+/// already tripped, [`GitError::Io`] when the peer cannot be reached.
+/// The dial itself does not observe the flag mid-connect; `git_connect`
+/// bounds it with timeouts.
+pub fn open_stream(
+    endpoint: &Endpoint,
+    service: Service,
+    policy: &EgressPolicy,
+    interrupt: &Interrupt,
+) -> Result<Stream, GitError> {
+    interrupt.check("connecting to the remote")?;
     match endpoint {
         Endpoint::Ssh {
             host,
             port,
             user,
             path,
-        } => Ok(Stream::Ssh(ssh_connect(
-            host,
-            *port,
-            user.as_deref(),
-            service,
-            path,
-        )?)),
-        Endpoint::Git { host, port, path } => {
-            Ok(Stream::Tcp(git_connect(host, *port, service, path)?))
+        } => {
+            let effective = port.unwrap_or(22);
+            let label = format!("ssh://{host}:{effective}");
+            let resolved = resolve_addrs(&label, host, effective)?;
+            let allowed = policy.filter_addrs(&label, &resolved)?;
+            let ssh_program = std::env::var("GIT_SSH").unwrap_or_else(|_| "ssh".to_owned());
+            let ssh_command = std::env::var("GIT_SSH_COMMAND").ok();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            Ok(Stream::Ssh(ssh_dial_each(&label, &allowed, |addr| {
+                interrupt.check("connecting to the remote")?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(GitError::Io {
+                        detail: format!("cannot ssh to {label}: dial budget exhausted"),
+                    });
+                }
+                let stream = ssh_spawn(
+                    &pinned_dial(addr, host, *port, user.as_deref(), service, path)?,
+                    &ssh_program,
+                    ssh_command.as_deref(),
+                )?;
+                ssh_verify_connection(stream, &label, addr, service, remaining)
+            })?))
         }
+        Endpoint::Git { host, port, path } => Ok(Stream::Tcp(git_connect(
+            host, *port, service, path, policy,
+        )?)),
         Endpoint::Local { .. } => Err(GitError::Invalid {
             detail: "local endpoints need no network stream".to_owned(),
         }),
@@ -576,12 +1076,14 @@ pub fn open_stream(endpoint: &Endpoint, service: Service) -> Result<Stream, GitE
 /// this sends one too, on both the v0 and v2 arms.
 ///
 /// # Errors
-/// Grammar failures are [`GitError::Corrupt`].
+/// [`GitError::Cancelled`] when the interrupt trips mid-read, grammar
+/// failures are [`GitError::Corrupt`].
 pub fn discover<R: Read + Write>(
     stream: R,
     kind: HashKind,
+    interrupt: &Interrupt,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
-    let mut pkt = PktReader::new(stream, Interrupt::none());
+    let mut pkt = PktReader::new(stream, interrupt.clone());
     let refs = match refadv::read_initial(&mut pkt, kind)? {
         Initial::Refs(advertisement) => advertisement.refs,
         Initial::V2(caps) => {
@@ -603,12 +1105,14 @@ pub fn discover<R: Read + Write>(
 /// advertisement, hangs up.
 ///
 /// # Errors
-/// Routing errors from [`open_stream`], grammar failures from [`discover`]
-/// or the smart-http advertisement parse.
+/// Routing errors from [`open_stream`], cancellation from `call`'s
+/// interrupt, grammar failures from [`discover`] or the smart-http
+/// advertisement parse.
 pub fn discover_endpoint(
     endpoint: &Endpoint,
     service: Service,
     kind: HashKind,
+    call: super::smart_http::RpcCall<'_>,
 ) -> Result<Vec<AdvertisedRef>, GitError> {
     match endpoint {
         Endpoint::Http { url, .. } => {
@@ -618,11 +1122,13 @@ pub fn discover_endpoint(
                 Service::ReceivePack => super::smart_http::SmartService::ReceivePack,
                 Service::UploadArchive => super::smart_http::SmartService::UploadArchive,
             };
-            // No repo config reaches this layer, so no `http.extraHeader`
-            // rows join here; the verbs pass them explicitly.
-            Ok(super::smart_http::discover(&base, smart, kind, &[])?.refs)
+            Ok(super::smart_http::discover(&base, smart, kind, call)?.refs)
         }
-        _ => discover(open_stream(endpoint, service)?, kind),
+        _ => discover(
+            open_stream(endpoint, service, call.egress, call.interrupt)?,
+            kind,
+            call.interrupt,
+        ),
     }
 }
 
@@ -635,8 +1141,12 @@ pub fn discover_endpoint(
 /// # Errors
 /// [`GitError::Invalid`] for local or HTTP endpoints (the caller routes
 /// those elsewhere), [`GitError::Io`] when the peer cannot be reached.
-pub fn open_archive_stream(endpoint: &Endpoint) -> Result<Stream, GitError> {
-    open_stream(endpoint, Service::UploadArchive)
+pub fn open_archive_stream(
+    endpoint: &Endpoint,
+    policy: &EgressPolicy,
+    interrupt: &Interrupt,
+) -> Result<Stream, GitError> {
+    open_stream(endpoint, Service::UploadArchive, policy, interrupt)
 }
 
 /// Runs one `upload-archive` session over an open stream: sends the
@@ -703,17 +1213,48 @@ pub fn fetch_archive_stream<R: Read + Write>(stream: R, rev: &str) -> Result<Vec
 pub fn to_local_refs(refs: Vec<AdvertisedRef>) -> Result<Vec<AdvertisedLocalRef>, GitError> {
     let mut out = Vec::new();
     for entry in refs {
-        if entry.name.ends_with(b"^{}") {
+        if !entry.name.starts_with(b"refs/") || entry.name.ends_with(b"^{}") {
             continue;
         }
-        let target = match (entry.oid, entry.symref_target) {
-            (Some(oid), _) => RefTarget::Direct(oid),
-            (None, Some(pointed)) => {
+        let target = match (entry.symref_target, entry.oid) {
+            (Some(pointed), _) => {
                 let name = RefName::new(pointed).map_err(|err| GitError::Invalid {
                     detail: format!("advertised symref target refused: {err}"),
                 })?;
                 RefTarget::Symbolic(name)
             }
+            (None, Some(oid)) => RefTarget::Direct(oid),
+            (None, None) => continue,
+        };
+        out.push(AdvertisedLocalRef {
+            name: entry.name,
+            target,
+        });
+    }
+    Ok(out)
+}
+
+/// Maps wire refs onto advertised rows for listing commands (`ls-remote`),
+/// preserving `HEAD` while filtering pseudo-refs and peeled dupes.
+///
+/// # Errors
+/// [`GitError::Invalid`] for a symref target that is not a ref name.
+pub fn to_ls_remote_refs(refs: Vec<AdvertisedRef>) -> Result<Vec<AdvertisedLocalRef>, GitError> {
+    let mut out = Vec::new();
+    for entry in refs {
+        if (!entry.name.starts_with(b"refs/") && entry.name != b"HEAD")
+            || entry.name.ends_with(b"^{}")
+        {
+            continue;
+        }
+        let target = match (entry.symref_target, entry.oid) {
+            (Some(pointed), _) => {
+                let name = RefName::new(pointed).map_err(|err| GitError::Invalid {
+                    detail: format!("advertised symref target refused: {err}"),
+                })?;
+                RefTarget::Symbolic(name)
+            }
+            (None, Some(oid)) => RefTarget::Direct(oid),
             (None, None) => continue,
         };
         out.push(AdvertisedLocalRef {
@@ -769,12 +1310,33 @@ mod tests {
         }
         // Local endpoints route to the store, never to a stream.
         assert!(
-            open_archive_stream(&Endpoint::Local {
-                path: PathBuf::from("/srv/a.git"),
-            })
+            open_archive_stream(
+                &Endpoint::Local {
+                    path: PathBuf::from("/srv/a.git"),
+                },
+                &EgressPolicy::deny_private(),
+                &Interrupt::none(),
+            )
             .is_err(),
             "local archive needs no stream"
         );
+
+        // A tripped interrupt fails before any dial: an unroutable host
+        // would otherwise hold the call on its connect timeout.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interrupt = Interrupt::none().with_cancel(std::sync::Arc::clone(&flag));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = open_archive_stream(
+            &Endpoint::Git {
+                host: "unroutable.invalid".to_owned(),
+                port: None,
+                path: "/srv/a.git".to_owned(),
+            },
+            &EgressPolicy::deny_private(),
+            &interrupt,
+        )
+        .expect_err("a tripped interrupt stops the dial");
+        assert!(matches!(err, GitError::Cancelled { .. }), "got {err:?}");
         let stream = ssh_connect_with(
             "far.test",
             None,
@@ -884,10 +1446,12 @@ mod tests {
     fn ssh_invocation_honors_env_overrides() {
         assert_eq!(
             ssh_invocation(
-                "git@host.x",
-                Some(2222),
-                Service::UploadPack,
-                "/srv/a.git",
+                &SshDial::direct(
+                    "git@host.x".to_owned(),
+                    Some(2222),
+                    Service::UploadPack,
+                    "/srv/a.git",
+                ),
                 "ssh",
                 None,
             ),
@@ -901,10 +1465,7 @@ mod tests {
         );
         assert_eq!(
             ssh_invocation(
-                "host.x",
-                None,
-                Service::ReceivePack,
-                "a.git",
+                &SshDial::direct("host.x".to_owned(), None, Service::ReceivePack, "a.git"),
                 "ssh",
                 Some("ssh -i key"),
             ),
@@ -944,6 +1505,277 @@ mod tests {
             ),
             Err(GitError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn ssh_pinned_invocation_pins_ip_with_host_key_alias() {
+        assert_eq!(
+            ssh_invocation(
+                &SshDial::pinned(
+                    "git@example.com".to_owned(),
+                    "example.com",
+                    "93.184.216.34".parse().expect("ip"),
+                    Some(2222),
+                    Service::UploadPack,
+                    "/srv/a.git",
+                ),
+                "ssh",
+                None,
+            ),
+            SshInvocation::Exec(vec![
+                "ssh".to_owned(),
+                "-p".to_owned(),
+                "2222".to_owned(),
+                "-o".to_owned(),
+                "HostKeyAlias=example.com".to_owned(),
+                "-o".to_owned(),
+                "Hostname=93.184.216.34".to_owned(),
+                "git@example.com".to_owned(),
+                "git-upload-pack '/srv/a.git'".to_owned(),
+            ])
+        );
+        assert_eq!(
+            ssh_invocation(
+                &SshDial::pinned(
+                    "git@example.com".to_owned(),
+                    "example.com",
+                    "93.184.216.34".parse().expect("ip"),
+                    None,
+                    Service::ReceivePack,
+                    "a.git",
+                ),
+                "ssh",
+                Some("ssh -i key"),
+            ),
+            SshInvocation::Shell(
+                "ssh -i key -o 'HostKeyAlias=example.com' -o 'Hostname=93.184.216.34' 'git@example.com' 'git-receive-pack '\\''a.git'\\'''"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn ssh_dial_only_reaches_filtered_addresses_in_order() {
+        // A DNS answer mixing an allowlisted IP with a refused one: the
+        // policy keeps only the allowed address, and the dial loop offers
+        // only filtered addresses to the ssh spawn seam.
+        let allowed: SocketAddr = "93.184.216.34:22".parse().expect("allowed addr");
+        let refused: SocketAddr = "10.0.0.1:22".parse().expect("refused addr");
+        let policy = EgressPolicy::deny_private().allow(allowed.ip());
+        let label = "ssh://example.com:22";
+        let filtered = policy
+            .filter_addrs(label, &[allowed, refused])
+            .expect("policy keeps the allowed answer");
+        assert_eq!(filtered, vec![allowed]);
+
+        // The refused address never reaches the spawn seam; every filtered
+        // address is tried in order (each failure falls through).
+        let mut seen = Vec::new();
+        let err = ssh_dial_each(label, &filtered, |addr| {
+            seen.push(*addr);
+            Err(GitError::Io {
+                detail: "spy refuses to spawn".to_owned(),
+            })
+        })
+        .expect_err("spy always fails");
+        assert_eq!(seen, vec![allowed]);
+        assert!(matches!(err, GitError::Io { .. }), "got {err:?}");
+
+        // Several allowed addresses are all tried, in order.
+        let second: SocketAddr = "93.184.216.35:22".parse().expect("second addr");
+        let mut seen = Vec::new();
+        ssh_dial_each(label, &[allowed, second], |addr| {
+            seen.push(*addr);
+            Err(GitError::Io {
+                detail: "spy refuses to spawn".to_owned(),
+            })
+        })
+        .expect_err("spy always fails");
+        assert_eq!(seen, vec![allowed, second]);
+    }
+
+    #[test]
+    fn ssh_dial_retries_after_connection_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-net-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let closed_port = listener.local_addr().expect("port").port();
+        drop(listener);
+
+        let serving_port = closed_port.wrapping_add(1);
+        let tip = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+        let adv_path = dir.join("adv.bin");
+        std::fs::write(&adv_path, advertisement_bytes(tip)).expect("adv");
+
+        let script = dir.join("fake-ssh-retry.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nport=\"\"\nwhile [ $# -gt 0 ]; do\n    if [ \"$1\" = \"-p\" ]; then\n        port=\"$2\"\n        shift 2\n    else\n        shift\n    fi\ndone\nif [ \"$port\" = \"{closed_port}\" ]; then\n    echo \"ssh: connect to host 127.0.0.1 port {closed_port}: Connection refused\" >&2\n    exit 255\nfi\ncat \"{}\"\n",
+                adv_path.display()
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let refused_addr: SocketAddr = format!("127.0.0.1:{closed_port}").parse().expect("addr");
+        let serving_addr: SocketAddr = format!("127.0.0.1:{serving_port}").parse().expect("addr");
+        let label = "ssh://example.com:22";
+
+        let mut seen = Vec::new();
+        let stream = ssh_dial_each(label, &[refused_addr, serving_addr], |addr| {
+            seen.push(*addr);
+            let dial = pinned_dial(
+                addr,
+                "example.com",
+                Some(addr.port()),
+                Some("git"),
+                Service::UploadPack,
+                "/srv/a.git",
+            )?;
+            let stream = ssh_spawn(&dial, script.to_str().expect("utf8"), None)?;
+            ssh_verify_connection(
+                stream,
+                label,
+                addr,
+                Service::UploadPack,
+                Duration::from_secs(5),
+            )
+        })
+        .expect("dial succeeds via second address");
+
+        assert_eq!(seen, vec![refused_addr, serving_addr]);
+        let refs =
+            to_local_refs(discover(stream, HashKind::Sha1, &Interrupt::none()).expect("discover"))
+                .expect("map");
+        assert!(refs.iter().any(|entry| entry.name == b"refs/heads/main"
+            && entry.target == RefTarget::Direct(sha1(tip))));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_pinned_spawn_dials_ip_with_host_key_alias() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruk-net-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let seen = dir.join("argv.txt");
+        let script = dir.join("fake-ssh-pin.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                seen.display()
+            ),
+        )
+        .expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+        let addr: SocketAddr = "93.184.216.34:22".parse().expect("addr");
+        let dial = pinned_dial(
+            &addr,
+            "example.com",
+            None,
+            Some("git"),
+            Service::UploadPack,
+            "/srv/a.git",
+        )
+        .expect("pinned dial");
+        assert_eq!(dial.login, "git@example.com");
+        let stream = ssh_spawn(&dial, script.to_str().expect("utf8"), None).expect("spawn");
+        drop(stream);
+        let lines: Vec<String> = std::fs::read_to_string(&seen)
+            .expect("argv log")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "-o".to_owned(),
+                "HostKeyAlias=example.com".to_owned(),
+                "-o".to_owned(),
+                "Hostname=93.184.216.34".to_owned(),
+                "git@example.com".to_owned(),
+                "git-upload-pack '/srv/a.git'".to_owned(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_pinned_preserves_hostname_for_ssh_config_matching() {
+        let addr_v4: SocketAddr = "192.0.2.1:22".parse().expect("addr v4");
+        let dial_v4 = pinned_dial(
+            &addr_v4,
+            "forge.example",
+            Some(22),
+            Some("git"),
+            Service::UploadPack,
+            "/org/repo.git",
+        )
+        .expect("pinned dial v4");
+        assert_eq!(dial_v4.login, "git@forge.example");
+        let invocation_exec = ssh_invocation(&dial_v4, "ssh", None);
+        assert_eq!(
+            invocation_exec,
+            SshInvocation::Exec(vec![
+                "ssh".to_owned(),
+                "-p".to_owned(),
+                "22".to_owned(),
+                "-o".to_owned(),
+                "HostKeyAlias=forge.example".to_owned(),
+                "-o".to_owned(),
+                "Hostname=192.0.2.1".to_owned(),
+                "git@forge.example".to_owned(),
+                "git-upload-pack '/org/repo.git'".to_owned(),
+            ])
+        );
+
+        let addr_v6: SocketAddr = "[2001:db8::1]:2222".parse().expect("addr v6");
+        let dial_v6 = pinned_dial(
+            &addr_v6,
+            "forge.example",
+            None,
+            None,
+            Service::ReceivePack,
+            "/org/repo.git",
+        )
+        .expect("pinned dial v6");
+        assert_eq!(dial_v6.login, "forge.example");
+        let invocation_shell = ssh_invocation(&dial_v6, "ssh", Some("ssh -v"));
+        assert_eq!(
+            invocation_shell,
+            SshInvocation::Shell(
+                "ssh -v -o 'HostKeyAlias=forge.example' -o 'Hostname=2001:db8::1' 'forge.example' 'git-receive-pack '\\''/org/repo.git'\\'''"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
@@ -1021,7 +1853,9 @@ mod tests {
             Some(script.to_str().expect("utf8")),
         )
         .expect("spawn");
-        let refs = to_local_refs(discover(stream, HashKind::Sha1).expect("discover")).expect("map");
+        let refs =
+            to_local_refs(discover(stream, HashKind::Sha1, &Interrupt::none()).expect("discover"))
+                .expect("map");
         assert!(refs.iter().any(|entry| entry.name == b"refs/heads/main"
             && entry.target == RefTarget::Direct(sha1(tip))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1169,7 +2003,21 @@ mod tests {
             path: "/srv/a.git".to_owned(),
         };
         let refs = to_local_refs(
-            discover_endpoint(&endpoint, Service::UploadPack, HashKind::Sha1).expect("discover"),
+            discover_endpoint(
+                &endpoint,
+                Service::UploadPack,
+                HashKind::Sha1,
+                super::super::smart_http::RpcCall {
+                    extra: &[],
+                    auth: &crate::transport::credentials::AuthPolicy::explicit(
+                        crate::transport::credentials::TransportAuth::none(),
+                    ),
+                    egress: &EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
+                    interrupt: &Interrupt::none(),
+                },
+            )
+            .expect("discover"),
         )
         .expect("map");
         assert!(refs.iter().any(|entry| entry.name == b"refs/heads/main"));
@@ -1253,8 +2101,14 @@ mod tests {
             .expect("serve");
         });
         let dest = test_store(kind);
-        let stream =
-            git_connect("127.0.0.1", Some(port), Service::UploadPack, "/srv/a.git").expect("dial");
+        let stream = git_connect(
+            "127.0.0.1",
+            Some(port),
+            Service::UploadPack,
+            "/srv/a.git",
+            &EgressPolicy::deny_private().allow_loopback(),
+        )
+        .expect("dial");
         let request = fetch::FetchWireRequest {
             wants: vec![sha1(FOUR)],
             haves: Vec::new(),
@@ -1336,8 +2190,14 @@ mod tests {
         };
         let mut plan =
             PushPlanRecord::prepare(PlanId::generate(), b"peer".to_vec(), false, updates);
-        let stream =
-            git_connect("127.0.0.1", Some(port), Service::ReceivePack, "/srv/a.git").expect("dial");
+        let stream = git_connect(
+            "127.0.0.1",
+            Some(port),
+            Service::ReceivePack,
+            "/srv/a.git",
+            &EgressPolicy::deny_private().allow_loopback(),
+        )
+        .expect("dial");
         let outcomes = push_over(
             stream,
             &client,
@@ -1383,7 +2243,250 @@ mod tests {
             },
         ])
         .expect("map");
-        assert_eq!(refs.len(), 2);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, b"refs/heads/main");
         assert_eq!(refs[0].target, RefTarget::Direct(tip));
+    }
+
+    #[test]
+    fn to_local_refs_filters_head_and_unknown_pseudo_refs() {
+        let tip = sha1("b7ee0f83149b8f52744bf4de0bc706afcd5302c8");
+        let target_name = RefName::new(b"refs/heads/main".to_vec()).expect("valid ref name");
+        let refs = to_local_refs(vec![
+            AdvertisedRef {
+                name: b"HEAD".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: Some(b"refs/heads/main".to_vec()),
+            },
+            AdvertisedRef {
+                name: b"FETCH_HEAD".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"custom-pseudo".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/heads/alias".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: Some(b"refs/heads/main".to_vec()),
+            },
+            AdvertisedRef {
+                name: b"refs/tags/v1.0".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+        ])
+        .expect("map succeeds");
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].name, b"refs/heads/main");
+        assert_eq!(refs[0].target, RefTarget::Direct(tip));
+        assert_eq!(refs[1].name, b"refs/heads/alias");
+        assert_eq!(refs[1].target, RefTarget::Symbolic(target_name));
+        assert_eq!(refs[2].name, b"refs/tags/v1.0");
+        assert_eq!(refs[2].target, RefTarget::Direct(tip));
+    }
+
+    #[test]
+    fn to_ls_remote_refs_preserves_head_and_filters_pseudo_refs() {
+        let tip = sha1("b7ee0f83149b8f52744bf4de0bc706afcd5302c8");
+        let target_name = RefName::new(b"refs/heads/main".to_vec()).expect("valid ref name");
+        let refs = to_ls_remote_refs(vec![
+            AdvertisedRef {
+                name: b"HEAD".to_vec(),
+                oid: None,
+                peeled: None,
+                symref_target: Some(b"refs/heads/main".to_vec()),
+            },
+            AdvertisedRef {
+                name: b"FETCH_HEAD".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"custom-pseudo".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/tags/v1.0".to_vec(),
+                oid: Some(tip),
+                peeled: None,
+                symref_target: None,
+            },
+            AdvertisedRef {
+                name: b"refs/tags/v1.0^{}".to_vec(),
+                oid: Some(tip),
+                peeled: Some(tip),
+                symref_target: None,
+            },
+        ])
+        .expect("map succeeds");
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].name, b"HEAD");
+        assert_eq!(refs[0].target, RefTarget::Symbolic(target_name));
+        assert_eq!(refs[1].name, b"refs/heads/main");
+        assert_eq!(refs[1].target, RefTarget::Direct(tip));
+        assert_eq!(refs[2].name, b"refs/tags/v1.0");
+        assert_eq!(refs[2].target, RefTarget::Direct(tip));
+    }
+
+    #[test]
+    fn egress_denies_non_public_addresses() {
+        let policy = EgressPolicy::deny_private();
+        for denied in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:192.168.1.1",
+            "::ffff:127.0.0.1",
+            "2002:c0a8:101::",
+            "64:ff9b::c0a8:101",
+        ] {
+            let ip: IpAddr = denied.parse().expect("test address parses");
+            assert!(!policy.allows(ip), "{denied} must not dial");
+        }
+        for allowed in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2001:4860:4860::8888",
+            "::ffff:808:808",
+        ] {
+            let ip: IpAddr = allowed.parse().expect("test address parses");
+            assert!(policy.allows(ip), "{allowed} must dial");
+        }
+    }
+
+    #[test]
+    fn egress_unwraps_embedded_ipv4() {
+        let policy = EgressPolicy::deny_private();
+        let teredo_private = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0xffff, 0x3fff, 0xfdfd);
+        assert!(
+            !policy.allows(IpAddr::V6(teredo_private)),
+            "teredo wrapping private space must not dial"
+        );
+        let teredo_public = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0xffff, 0xf7f7, 0xf7f7);
+        assert!(
+            policy.allows(IpAddr::V6(teredo_public)),
+            "teredo wrapping public space must dial"
+        );
+    }
+
+    #[test]
+    fn egress_allowlist_permits_listed_ranges() {
+        let policy = EgressPolicy::deny_private()
+            .allow("127.0.0.1".parse().expect("loopback parses"))
+            .allow_cidr("10.0.0.0/8")
+            .expect("cidr parses");
+        assert!(policy.allows("127.0.0.1".parse().expect("ip")));
+        assert!(policy.allows("10.20.30.40".parse().expect("ip")));
+        assert!(policy.allows("10.255.255.255".parse().expect("ip")));
+        assert!(policy.allows("11.0.0.1".parse().expect("public stays dialable")));
+        assert!(!policy.allows("192.168.1.1".parse().expect("ip")));
+        assert!(
+            EgressPolicy::deny_private()
+                .allow_cidr("not-a-cidr")
+                .is_err()
+        );
+        assert!(
+            EgressPolicy::deny_private()
+                .allow_cidr("10.0.0.0/33")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn egress_refuses_rebinding_answers() {
+        let policy = EgressPolicy::deny_private();
+        let public: SocketAddr = "93.184.215.14:80".parse().expect("public addr");
+        let rebound: SocketAddr = "127.0.0.1:80".parse().expect("loopback addr");
+        assert_eq!(
+            policy.filter_addrs("host", &[public]).expect("first"),
+            [public]
+        );
+        assert_eq!(
+            policy
+                .filter_addrs("host", &[public, rebound])
+                .expect("mixed"),
+            [public]
+        );
+        assert!(
+            policy.filter_addrs("host", &[rebound]).is_err(),
+            "a rebound loopback answer must not dial"
+        );
+    }
+
+    #[test]
+    fn open_stream_refuses_ssh_outside_egress_allowlist() {
+        let endpoint = Endpoint::Ssh {
+            host: "192.0.2.1".to_owned(),
+            port: Some(22),
+            user: None,
+            path: "/srv/a.git".to_owned(),
+        };
+        let policy = EgressPolicy::deny_private()
+            .allow_cidr("10.0.0.0/8")
+            .expect("CIDR parses");
+        let err = open_stream(&endpoint, Service::UploadPack, &policy, &Interrupt::none())
+            .expect_err("denied SSH host is refused before spawn");
+        assert!(
+            matches!(&err, GitError::Invalid { detail } if detail.starts_with("egress policy refuses ssh://192.0.2.1:22")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn open_stream_allows_ssh_inside_egress_allowlist() {
+        let endpoint = Endpoint::Ssh {
+            host: "127.0.0.1".to_owned(),
+            port: Some(1),
+            user: None,
+            path: "/srv/a.git".to_owned(),
+        };
+        let policy = EgressPolicy::deny_private()
+            .allow_cidr("127.0.0.0/8")
+            .expect("CIDR parses");
+        if let Err(err) = open_stream(&endpoint, Service::UploadPack, &policy, &Interrupt::none()) {
+            assert!(
+                !matches!(&err, GitError::Invalid { detail } if detail.starts_with("egress policy refuses")),
+                "allowlisted SSH host was refused by egress policy: {err:?}"
+            );
+        }
     }
 }

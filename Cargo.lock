@@ -2465,6 +2465,7 @@ name = "ruk"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "jiff",
  "regex",
  "ruk-core",
  "ruk-git",
@@ -2472,6 +2473,7 @@ dependencies = [
  "sonic-rs",
  "tokio",
  "toml",
+ "tracing",
  "zip",
 ]
 
@@ -2492,6 +2494,7 @@ dependencies = [
  "postcard",
  "proptest",
  "redb",
+ "regex",
  "roaring",
  "rustix 1.1.5",
  "schemars",

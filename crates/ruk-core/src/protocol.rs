@@ -70,8 +70,18 @@ pub const SCHEMA_MAJOR: u32 = 1;
 /// `tree`, `refs.list`, `compare`, `search`, `archive`, `events.tail`,
 /// `repo.init`, `repo.delete`, `repo.rename`, `repo.fork`, `remote.refs`,
 /// `claim.renew`, `policy.set`) and the `Admin` method kind; older readers
-/// refuse its frames as unknown methods.
-pub const SCHEMA_MINOR: u32 = 2;
+/// refuse its frames as unknown methods. Minor 3 appends the task-keyed
+/// claim subject (`ClaimRecord.subject`) and the task-lease lifetime
+/// ceiling; minor-2 readers cannot decode subject-carrying claim rows.
+/// It adds the `result` field to the `archive` invocation's `Accepted`
+/// frame (commit, format, content type). The field is serde-defaulted, so
+/// minor-2 readers decode the frame unchanged and simply ignore the
+/// metadata. It also gives `repo.fork` its served reply: the forked
+/// generation, sealed and tail object counts, the hardlinked and copied
+/// segment ids, and the linked LFS payload count.
+/// Minor 4 appends `release.freeze.set` and `release.freeze.clear`;
+/// minor-3 readers refuse their frames as unknown methods.
+pub const SCHEMA_MINOR: u32 = 4;
 
 /// Bytes in a control-frame length prefix.
 pub const FRAME_PREFIX_BYTES: usize = 4;
@@ -85,8 +95,15 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// Largest accepted page limit; more is rejected, never clamped.
 pub const MAX_PAGE_SIZE: usize = 1000;
 
-/// Longest claim lifetime in seconds (one hour).
+/// Longest path-only claim lifetime in seconds (one hour). Task-keyed
+/// claims name a subject that outlives one operator session, so they may
+/// use [`MAX_TASK_CLAIM_TTL_SECONDS`] instead.
 pub const MAX_CLAIM_TTL_SECONDS: u32 = 3600;
+
+/// Longest task-keyed claim lifetime in seconds (one day). Only records
+/// carrying a [`ClaimSubject`] may use lifetimes above
+/// [`MAX_CLAIM_TTL_SECONDS`]; the seal enforces the scope.
+pub const MAX_TASK_CLAIM_TTL_SECONDS: u32 = 24 * 3600;
 
 /// Longest accepted revset text.
 pub const MAX_REVSET_BYTES: usize = 64 * 1024;
@@ -99,6 +116,7 @@ pub const REQUEST_DIGEST_VERSION: u8 = 1;
 
 const DIGEST_DOMAIN_V1: &[u8] = b"ruk-request-digest-v1";
 const ATTEST_PAYLOAD_DOMAIN_V1: &[u8] = b"ruk-attest-payload-v1";
+const ATTEST_PAYLOAD_DOMAIN_V2: &[u8] = b"ruk-attest-payload-v2";
 
 fn invalid(detail: impl Into<String>) -> CoreError {
     CoreError::new(ErrorCode::EInvalid, detail)
@@ -855,6 +873,16 @@ bounded_text! {
 }
 
 bounded_text! {
+    /// A rukie task (intent) identity naming one task-keyed claim.
+    pub struct TaskKey {
+        schema: "TaskKey",
+        max: 128,
+        doc: "Task key: 1..=128 bytes without control characters; the subject key renders as `task:<id>`.",
+        check: no_controls,
+    }
+}
+
+bounded_text! {
     /// An armored SSH signature over an attestation payload.
     pub struct AttestSignature {
         schema: "AttestSignature",
@@ -864,7 +892,9 @@ bounded_text! {
     }
 }
 
-/// How long a claim lasts: `1..=`[`MAX_CLAIM_TTL_SECONDS`] seconds.
+/// How long a claim lasts: `1..=`[`MAX_TASK_CLAIM_TTL_SECONDS`] seconds.
+/// Lifetimes above [`MAX_CLAIM_TTL_SECONDS`] are task-lease scope only; the
+/// claim seal refuses them on records without a [`ClaimSubject`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]
 pub struct ClaimTtl(u32);
@@ -873,12 +903,12 @@ impl ClaimTtl {
     /// Validates a lifetime in seconds.
     ///
     /// # Errors
-    /// Zero, or longer than one hour.
+    /// Zero, or longer than one day.
     pub fn new(seconds: u32) -> Result<Self, CoreModelError> {
-        if seconds == 0 || seconds > MAX_CLAIM_TTL_SECONDS {
+        if seconds == 0 || seconds > MAX_TASK_CLAIM_TTL_SECONDS {
             return Err(model_invalid(
                 "claim ttl",
-                format!("{seconds} is outside 1..={MAX_CLAIM_TTL_SECONDS} seconds"),
+                format!("{seconds} is outside 1..={MAX_TASK_CLAIM_TTL_SECONDS} seconds"),
             ));
         }
         Ok(Self(seconds))
@@ -914,8 +944,8 @@ impl JsonSchema for ClaimTtl {
         json_schema!({
             "type": "integer",
             "minimum": 1,
-            "maximum": MAX_CLAIM_TTL_SECONDS,
-            "description": "Claim lifetime in seconds, at most one hour."
+            "maximum": MAX_TASK_CLAIM_TTL_SECONDS,
+            "description": "Claim lifetime in seconds, at most one day for task-keyed claims."
         })
     }
 }
@@ -1758,6 +1788,33 @@ pub enum ClaimMode {
     Advise,
 }
 
+/// What a claim is held for: the task/change subject key alongside paths.
+///
+/// A task-keyed claim carries `task:<id>` so one record covers the intent's
+/// declared paths across rukie restarts; a change-keyed claim names the Ruk
+/// change under review. Path-only claims carry no subject and stay capped
+/// at [`MAX_CLAIM_TTL_SECONDS`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimSubject {
+    /// A rukie task (intent); the subject key renders as `task:<id>`.
+    Task(TaskKey),
+    /// The Ruk change under review; the subject key is the change id.
+    Change(ChangeId),
+}
+
+impl ClaimSubject {
+    /// The canonical subject-key string rukie correlates against:
+    /// `task:<id>` for tasks, the change id for changes.
+    #[must_use]
+    pub fn subject_key(&self) -> String {
+        match self {
+            Self::Task(task) => format!("task:{task}"),
+            Self::Change(change) => change.to_string(),
+        }
+    }
+}
+
 /// `claim.acquire`: each path claims itself and everything below it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimAcquireArgs {
@@ -1765,6 +1822,32 @@ pub struct ClaimAcquireArgs {
     pub ttl: ClaimTtl,
     #[serde(default)]
     pub mode: ClaimMode,
+    /// Task/change subject for task-keyed claims; absent for path-only
+    /// claims. Only subject-carrying acquisitions may use task-lease
+    /// lifetimes above [`MAX_CLAIM_TTL_SECONDS`].
+    #[serde(default)]
+    pub subject: Option<ClaimSubject>,
+}
+
+#[derive(Serialize)]
+struct LegacyClaimAcquireDigestArgs<'a> {
+    paths: &'a [RepoPath],
+    ttl: ClaimTtl,
+    mode: ClaimMode,
+}
+
+impl ClaimAcquireArgs {
+    pub(crate) fn to_digest_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
+        if self.subject.is_none() {
+            postcard::to_allocvec(&LegacyClaimAcquireDigestArgs {
+                paths: &self.paths,
+                ttl: self.ttl,
+                mode: self.mode,
+            })
+        } else {
+            postcard::to_allocvec(self)
+        }
+    }
 }
 
 /// A held claim.
@@ -1779,6 +1862,11 @@ pub struct ClaimRecord {
     /// authorization input.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// Task/change subject for task-keyed claims; absent for path-only
+    /// claims. Renewals preserve it; releases and sweeps drop the record
+    /// with it.
+    #[serde(default)]
+    pub subject: Option<ClaimSubject>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1830,6 +1918,10 @@ pub struct ClaimListReply {
 // ---------------------------------------------------------------------------
 
 /// What a signer attests about one exact object.
+///
+/// `evidence` is appended last so the postcard encoding of every earlier
+/// field is unchanged; stored v1 rows decode through the versioned fallback
+/// in `attestation::rows`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestStatement {
     pub subject: Oid,
@@ -1840,14 +1932,55 @@ pub struct AttestStatement {
     /// The earlier statement this one explicitly supersedes.
     #[serde(default)]
     pub supersedes: Option<StatementDigest>,
+    /// The SHA-256 of an external blob this statement binds, such as a CI
+    /// log. `None` and `Some(zero)` differ on the wire: absence encodes as an
+    /// empty field, presence as exactly 32 bytes.
+    #[serde(default)]
+    pub evidence: Option<StatementDigest>,
 }
 
-/// `attest.add`: the signature is over [`AttestStatement::canonical_payload_v1`]
+/// `attest.add`: the signature is over [`AttestStatement::canonical_payload_v2`]
 /// in namespace `ruk-attest`; private keys never reach the coordinator.
+/// Statements without evidence signed over
+/// [`AttestStatement::canonical_payload_v1`] stay verifiable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestAddArgs {
     pub statement: AttestStatement,
     pub signature: AttestSignature,
+}
+
+#[derive(Serialize)]
+struct LegacyAttestStatementDigest<'a> {
+    subject: Oid,
+    kind: &'a AttestKind,
+    result: &'a AttestResult,
+    signed_at: Timestamp,
+    supersedes: Option<StatementDigest>,
+}
+
+#[derive(Serialize)]
+struct LegacyAttestAddDigestArgs<'a> {
+    statement: LegacyAttestStatementDigest<'a>,
+    signature: &'a AttestSignature,
+}
+
+impl AttestAddArgs {
+    pub(crate) fn to_digest_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
+        if self.statement.evidence.is_none() {
+            postcard::to_allocvec(&LegacyAttestAddDigestArgs {
+                statement: LegacyAttestStatementDigest {
+                    subject: self.statement.subject,
+                    kind: &self.statement.kind,
+                    result: &self.statement.result,
+                    signed_at: self.statement.signed_at,
+                    supersedes: self.statement.supersedes,
+                },
+                signature: &self.signature,
+            })
+        } else {
+            postcard::to_allocvec(self)
+        }
+    }
 }
 
 /// Whether a verified statement currently counts.
@@ -1880,6 +2013,11 @@ pub struct AttestAddReply {
 }
 
 /// `attest.list`.
+///
+/// `kind` selects one exact kind; `kind_prefix` selects every kind starting
+/// with the prefix, for CI dashboards scanning `ci/` verdicts. Both set
+/// filters combine: a statement matches when its kind equals `kind` and
+/// starts with `kind_prefix`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttestListArgs {
     #[serde(default)]
@@ -1892,6 +2030,11 @@ pub struct AttestListArgs {
     pub include_superseded: bool,
     #[serde(default)]
     pub page: PageRequest,
+    /// Only kinds starting with this prefix. Appended last so the postcard
+    /// encoding of every earlier field is unchanged; the field is optional,
+    /// so older JSON without it decodes to no prefix filter.
+    #[serde(default)]
+    pub kind_prefix: Option<AttestKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2620,6 +2763,44 @@ pub enum ErrorDetail {
         state: PushState,
         refs: BoundedList<PushRefOutcome>,
     },
+    /// An HTTP failure with the facts a caller needs to classify it: the
+    /// status, the `Retry-After` delay when the server sent one, the
+    /// redirect target for 3xx, and a scrubbed body preview capped at 512
+    /// bytes. Appended after `Push`, so existing encodings are unchanged.
+    Http {
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        location: Option<String>,
+        body_preview: String,
+    },
+    /// A detail this build does not model: tolerated so newer writers do
+    /// not break older readers. Never constructed locally.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ErrorDetail {
+    /// Builds the [`ErrorDetail::Http`] variant, truncating `preview` to
+    /// 512 bytes on a character boundary. The caller scrubs `preview` and
+    /// `location` first; this only bounds the size.
+    #[must_use]
+    pub fn http_detail(
+        status: u16,
+        retry_after_seconds: Option<u64>,
+        location: Option<String>,
+        preview: &str,
+    ) -> Self {
+        let mut end = preview.len().min(512);
+        while !preview.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self::Http {
+            status,
+            retry_after_seconds,
+            location,
+            body_preview: preview[..end].to_owned(),
+        }
+    }
 }
 
 /// The error body of a failed request. Callers branch on `code`.
@@ -2639,7 +2820,7 @@ pub struct ErrorReply {
 }
 
 impl ErrorReply {
-    /// The wire form of a core error, with no fixes or detail attached.
+    /// The wire form of a core error, preserving its detail when present.
     #[must_use]
     pub fn from_core(error: &CoreError) -> Self {
         Self {
@@ -2647,7 +2828,7 @@ impl ErrorReply {
             message: error.message.clone(),
             hints: error.hints.clone(),
             fixes: Vec::new(),
-            detail: None,
+            detail: error.detail.as_deref().cloned(),
         }
     }
 
@@ -3049,6 +3230,20 @@ impl Validate for TagDeleteArgs {
     }
 }
 
+impl Validate for ReleaseFreezeSetArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_namespace("a released tag", &self.name, b"refs/tags/")?;
+        require_nonempty_text("release.freeze.set owner", &self.owner_release_id)
+    }
+}
+
+impl Validate for ReleaseFreezeClearArgs {
+    fn validate(&self) -> Result<(), CoreError> {
+        require_namespace("a released tag", &self.name, b"refs/tags/")?;
+        require_nonempty_text("release.freeze.clear owner", &self.owner_release_id)
+    }
+}
+
 impl Validate for ClaimAcquireArgs {
     fn validate(&self) -> Result<(), CoreError> {
         require_nonempty("claim paths", &self.paths)?;
@@ -3238,27 +3433,144 @@ pub struct CompareReply {
     pub exact: bool,
 }
 
-/// `search`: minimal contract; the dedicated search row defines budgets,
-/// pools, and lease cursors.
+/// Longest `search` needle or regex, in bytes.
+pub const SEARCH_PATTERN_MAX_BYTES: usize = 4096;
+
+/// Most include plus exclude globs one `search` request carries.
+pub const SEARCH_MAX_GLOBS: usize = 32;
+
+/// Longest single `search` glob, in bytes.
+pub const SEARCH_GLOB_MAX_BYTES: usize = 1024;
+
+/// Decoded blob bytes one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_MAX_BYTES_SCANNED: u64 = 268_435_456;
+
+/// Most decoded blob bytes one `search` page scans; over-cap budgets refuse.
+pub const SEARCH_MAX_BYTES_SCANNED: u64 = 1_073_741_824;
+
+/// Unique blobs one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_MAX_BLOBS: u32 = 100_000;
+
+/// Milliseconds one `search` page scans absent an explicit budget.
+pub const SEARCH_DEFAULT_DEADLINE_MS: u64 = 5_000;
+
+/// Most milliseconds one `search` page scans; over-cap budgets refuse.
+pub const SEARCH_MAX_DEADLINE_MS: u64 = 30_000;
+
+/// Blobs larger than this skip the scan without payload reads.
+pub const SEARCH_SKIP_BLOB_BYTES: u64 = 524_288;
+
+/// Longest match preview a `search` hit carries, in bytes.
+pub const SEARCH_PREVIEW_MAX_BYTES: usize = 1024;
+
+/// `search`: byte-exact or regex code search over one revision's tree,
+/// served from the core-owned search pool with lease-bound cursors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SearchArgs {
-    pub pattern: String,
-    #[serde(default)]
-    pub limit: Option<PageLimit>,
+#[serde(rename_all = "lowercase")]
+pub enum SearchPattern {
+    /// Byte-exact needle; empty needles refuse.
+    Literal(ByteString),
+    /// Rust regex syntax over raw line bytes; empty patterns refuse.
+    Regex(String),
 }
 
+/// Scan budget of one `search` page: every field optional wire-wise, absent
+/// means the default. Over-cap values refuse; they never clamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchBudget {
+    /// Decoded blob bytes scanned before the page seals.
+    #[serde(default)]
+    pub max_bytes_scanned: Option<u64>,
+    /// Unique blobs scanned before the page seals.
+    #[serde(default)]
+    pub max_blobs: Option<u32>,
+    /// Milliseconds before the page seals.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+}
+
+impl SearchBudget {
+    /// The decoded-byte bound the scan enforces.
+    #[must_use]
+    pub fn effective_max_bytes(&self) -> u64 {
+        self.max_bytes_scanned
+            .unwrap_or(SEARCH_DEFAULT_MAX_BYTES_SCANNED)
+    }
+
+    /// The unique-blob bound the scan enforces.
+    #[must_use]
+    pub fn effective_max_blobs(&self) -> u32 {
+        self.max_blobs.unwrap_or(SEARCH_DEFAULT_MAX_BLOBS)
+    }
+
+    /// The millisecond bound the scan enforces.
+    #[must_use]
+    pub fn effective_deadline_ms(&self) -> u64 {
+        self.deadline_ms.unwrap_or(SEARCH_DEFAULT_DEADLINE_MS)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// Head or change revision; a workspace revision refuses.
+    pub at: RevisionRef,
+    /// Byte-exact needle or regex over raw line bytes.
+    pub pattern: SearchPattern,
+    /// Fold ASCII case before matching.
+    #[serde(default)]
+    pub case_insensitive: bool,
+    /// Which tree paths the scan visits.
+    pub paths: PathSelection,
+    /// Include globs; empty searches every selected path.
+    #[serde(default)]
+    pub globs: Vec<String>,
+    /// Exclude globs; any match drops the path.
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
+    /// Scan budget; absent fields take the defaults.
+    #[serde(default)]
+    pub budget: SearchBudget,
+    /// Rows wanted and the lease-bound continuation.
+    #[serde(default)]
+    pub page: PageRequest,
+}
+
+/// One matching line: 1-based line and byte-column numbers with the first
+/// kibibyte of the line. Lines past the preview bound carry a trailing
+/// `...` marker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SearchHit {
     pub path: RepoPath,
-    pub line: u64,
-    pub excerpt: ByteString,
+    pub line: u32,
+    pub column: u32,
+    pub preview: ByteString,
+    pub blob: Oid,
 }
 
+/// Why a `search` page sealed before covering its tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanExhaustion {
+    /// The page covers its tree; no budget ran out.
+    None,
+    /// The byte or blob budget ran out at the sealed frontier.
+    Budget,
+    /// The deadline passed at the sealed frontier.
+    Deadline,
+}
+
+/// `search`: one path-ordered page of matching lines with lease-bound
+/// continuation. `truncated` mirrors `hits.next.is_some()`; exhaustion
+/// seals the page with a cursor instead of refusing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SearchReply {
     pub view: ViewInfo,
-    pub hits: Vec<SearchHit>,
+    pub hits: Page<SearchHit>,
     pub truncated: bool,
+    pub exhausted: ScanExhaustion,
+    pub scanned_blobs: u64,
+    pub scanned_bytes: u64,
+    pub skipped_blobs: u64,
 }
 
 /// The archive payloads the daemon streams.
@@ -3267,6 +3579,17 @@ pub struct SearchReply {
 pub enum ArchiveFormat {
     Tar,
     Zip,
+}
+
+impl ArchiveFormat {
+    /// The media type of the streamed payload.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Tar => "application/x-tar",
+            Self::Zip => "application/zip",
+        }
+    }
 }
 
 /// `archive`: metadata for the streamed payload; bytes ride `Stdout`
@@ -3375,6 +3698,45 @@ pub struct PolicySetReply {
     pub generation: u64,
 }
 
+/// `release.freeze.set`: writes the released-tag marker that freezes one tag
+/// at its live target for one release. The tag must already exist at the
+/// pinned target: an absent tag or a tag at another target is refused with
+/// `E_STALE` naming the live tag, and the freeze publishes a `Refs` guard
+/// with the marker so a tag that moves after prepare fails the publish with
+/// `E_STALE`. A different owner, or the same owner at a different target,
+/// is refused; the same owner at the same target is a no-op success.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeSetArgs {
+    pub name: RefName,
+    pub owner_release_id: String,
+    pub target_oid: Oid,
+    pub frozen_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeSetReply {
+    pub outcome: MutationOutcome,
+    pub name: RefName,
+    pub owner_release_id: String,
+    pub target_oid: Oid,
+    pub frozen_at: Timestamp,
+}
+
+/// `release.freeze.clear`: removes the released-tag marker of one tag when
+/// the named release owns it, the sole path that removes a live marker. No
+/// marker is a no-op success; another owner is refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeClearArgs {
+    pub name: RefName,
+    pub owner_release_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseFreezeClearReply {
+    pub outcome: MutationOutcome,
+    pub name: RefName,
+}
+
 /// `repo.init`: creates one repository store under a configured root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepoInitArgs {
@@ -3429,7 +3791,9 @@ pub enum ForkRefs {
     None,
 }
 
-/// `repo.fork`: copies one repository to a fresh store id.
+/// `repo.fork`: copies one repository to a fresh store id. Sealed segments
+/// hardlink into the fork (a cross-device link copies and is reported);
+/// tail objects re-publish base-first; facts copy under full revalidation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepoForkArgs {
     pub source: String,
@@ -3442,7 +3806,15 @@ pub struct RepoForkArgs {
 pub struct RepoForkReply {
     pub path: String,
     pub store_id: StoreId,
+    pub source_generation: u64,
+    pub objects: u64,
+    pub sealed_objects: u64,
+    pub tail_objects: u64,
     pub refs_copied: u64,
+    pub segments_linked: Vec<u64>,
+    pub segments_copied: Vec<u64>,
+    pub lfs_linked: u64,
+    pub generation: u64,
 }
 
 fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
@@ -3454,13 +3826,60 @@ fn require_nonempty_text(what: &str, text: &str) -> Result<(), CoreError> {
 
 impl Validate for SearchArgs {
     fn validate(&self) -> Result<(), CoreError> {
-        let bytes = self.pattern.len();
-        if bytes == 0 || bytes > 4096 {
+        let raw: &[u8] = match &self.pattern {
+            SearchPattern::Literal(needle) => needle.as_bytes(),
+            SearchPattern::Regex(pattern) => pattern.as_bytes(),
+        };
+        if raw.is_empty() || raw.len() > SEARCH_PATTERN_MAX_BYTES {
             return Err(invalid(format!(
-                "search pattern is 1..=4096 bytes, got {bytes}"
+                "search pattern is 1..={SEARCH_PATTERN_MAX_BYTES} bytes, got {}",
+                raw.len()
             )));
         }
-        Ok(())
+        if let SearchPattern::Regex(pattern) = &self.pattern {
+            regex::bytes::RegexBuilder::new(pattern)
+                .case_insensitive(self.case_insensitive)
+                .build()
+                .map_err(|err| invalid(format!("search regex is invalid: {err}")))?;
+        }
+        let globs = self.globs.len().saturating_add(self.exclude_globs.len());
+        if globs > SEARCH_MAX_GLOBS {
+            return Err(invalid(format!(
+                "search carries at most {SEARCH_MAX_GLOBS} globs, got {globs}"
+            )));
+        }
+        for glob in self.globs.iter().chain(self.exclude_globs.iter()) {
+            if glob.is_empty() || glob.len() > SEARCH_GLOB_MAX_BYTES {
+                return Err(invalid(format!(
+                    "search globs are 1..={SEARCH_GLOB_MAX_BYTES} bytes, got {}",
+                    glob.len()
+                )));
+            }
+        }
+        if let Some(max) = self.budget.max_bytes_scanned
+            && max > SEARCH_MAX_BYTES_SCANNED
+        {
+            return Err(invalid(format!(
+                "search scans at most {SEARCH_MAX_BYTES_SCANNED} bytes, got {max}"
+            )));
+        }
+        if self.budget.max_bytes_scanned == Some(0)
+            || self.budget.max_blobs == Some(0)
+            || self.budget.deadline_ms == Some(0)
+        {
+            return Err(invalid(
+                "search scan budgets are at least one byte, one blob, and one millisecond",
+            ));
+        }
+        if let Some(deadline) = self.budget.deadline_ms
+            && deadline > SEARCH_MAX_DEADLINE_MS
+        {
+            return Err(invalid(format!(
+                "search waits at most {SEARCH_MAX_DEADLINE_MS} ms, got {deadline}"
+            )));
+        }
+        self.paths.validate()?;
+        self.page.validate()
     }
 }
 
@@ -3529,14 +3948,20 @@ impl MethodKind {
 
 /// The postcard encoding of a mutation's arguments (never its request id).
 macro_rules! digest_args {
-    (Mutation, $params:expr) => {
+    (Mutation, AttestAdd, $params:expr) => {
+        Some($params.args.to_digest_postcard())
+    };
+    (Mutation, ClaimAcquire, $params:expr) => {
+        Some($params.args.to_digest_postcard())
+    };
+    (Mutation, $variant:ident, $params:expr) => {
         Some(postcard::to_allocvec(&$params.args))
     };
-    (Admin, $params:expr) => {{
+    (Admin, $variant:ident, $params:expr) => {{
         let _ = &$params;
         None
     }};
-    ($kind:ident, $params:expr) => {{
+    ($kind:ident, $variant:ident, $params:expr) => {{
         let _ = &$params;
         None
     }};
@@ -3696,7 +4121,7 @@ macro_rules! method_table {
             /// `E_INVALID` when the arguments cannot be encoded.
             pub fn digest_input_v1(&self) -> Result<Option<Vec<u8>>, CoreError> {
                 let args = match self {
-                    $(Self::$variant(params) => digest_args!($kind, params),)+
+                    $(Self::$variant(params) => digest_args!($kind, $variant, params),)+
                 };
                 let Some(args) = args else {
                     return Ok(None);
@@ -3831,6 +4256,8 @@ method_table! {
     RemoteRefs, "remote.refs", Read, RemoteRefsArgs, RemoteRefsReply;
     ClaimRenew, "claim.renew", Mutation, Mutation<ClaimRenewArgs>, ClaimRenewReply;
     PolicySet, "policy.set", Mutation, Mutation<PolicySetArgs>, PolicySetReply;
+    ReleaseFreezeSet, "release.freeze.set", Mutation, Mutation<ReleaseFreezeSetArgs>, ReleaseFreezeSetReply;
+    ReleaseFreezeClear, "release.freeze.clear", Mutation, Mutation<ReleaseFreezeClearArgs>, ReleaseFreezeClearReply;
 }
 
 // ---------------------------------------------------------------------------
@@ -4126,17 +4553,27 @@ pub fn control_frame_len(prefix: [u8; FRAME_PREFIX_BYTES]) -> Result<usize, Core
 // ---------------------------------------------------------------------------
 
 impl AttestStatement {
-    /// The canonical payload that is signed (namespace `ruk-attest`): seven
-    /// length-prefixed fields (4-byte big-endian length each) in this order:
-    /// domain separator, object format name, exact OID bytes, kind, result,
-    /// UTC timestamp text, and the superseded statement digest (empty when
-    /// the statement supersedes nothing; otherwise exactly 32 bytes, so
+    /// The canonical v1 payload that is signed (namespace `ruk-attest`):
+    /// seven length-prefixed fields (4-byte big-endian length each) in this
+    /// order: domain separator, object format name, exact OID bytes, kind,
+    /// result, UTC timestamp text, and the superseded statement digest (empty
+    /// when the statement supersedes nothing; otherwise exactly 32 bytes, so
     /// absence and presence cannot be confused). Length prefixes make the
     /// field boundaries unambiguous: `("a", "bc")` and `("ab", "c")` differ.
     ///
+    /// Only evidenceless statements have a v1 payload: v1 cannot bind
+    /// evidence, so signing one would silently drop it. New signatures cover
+    /// [`Self::canonical_payload_v2`]; v1 stays verifiable for old ones.
+    ///
     /// # Errors
     /// `E_OBJECT_FORMAT` when the subject's width is not `format`'s.
+    /// `E_INVALID` when the statement carries evidence, which v1 cannot bind.
     pub fn canonical_payload_v1(&self, format: HashKind) -> Result<Vec<u8>, CoreError> {
+        if self.evidence.is_some() {
+            return Err(invalid(
+                "an attestation carrying evidence has no v1 payload: sign the v2 payload",
+            ));
+        }
         if self.subject.kind() != format {
             return Err(CoreError::new(
                 ErrorCode::EObjectFormat,
@@ -4161,6 +4598,52 @@ impl AttestStatement {
             superseded,
         ];
         let mut payload = Vec::with_capacity(128);
+        for field in fields {
+            push_field(&mut payload, field)?;
+        }
+        Ok(payload)
+    }
+
+    /// The canonical v2 payload that is signed (namespace `ruk-attest`):
+    /// eight length-prefixed fields (4-byte big-endian length each) in this
+    /// order: the v2 domain separator, object format name, exact OID bytes,
+    /// kind, result, UTC timestamp text, the superseded statement digest,
+    /// and the bound evidence digest. Either digest field is empty when
+    /// absent and exactly 32 bytes when present, so absence and presence
+    /// cannot be confused and `None` differs from a zero digest.
+    ///
+    /// # Errors
+    /// `E_OBJECT_FORMAT` when the subject's width is not `format`'s.
+    pub fn canonical_payload_v2(&self, format: HashKind) -> Result<Vec<u8>, CoreError> {
+        if self.subject.kind() != format {
+            return Err(CoreError::new(
+                ErrorCode::EObjectFormat,
+                format!(
+                    "attestation subject is a {} object but the repository is {format}",
+                    self.subject.kind()
+                ),
+            ));
+        }
+        let timestamp = self.signed_at.to_string();
+        let superseded: &[u8] = match &self.supersedes {
+            Some(digest) => digest.as_bytes(),
+            None => &[],
+        };
+        let evidence: &[u8] = match &self.evidence {
+            Some(digest) => digest.as_bytes(),
+            None => &[],
+        };
+        let fields: [&[u8]; 8] = [
+            ATTEST_PAYLOAD_DOMAIN_V2,
+            format.format_name().as_bytes(),
+            self.subject.as_bytes(),
+            self.kind.as_str().as_bytes(),
+            self.result.as_str().as_bytes(),
+            timestamp.as_bytes(),
+            superseded,
+            evidence,
+        ];
+        let mut payload = Vec::with_capacity(160);
         for field in fields {
             push_field(&mut payload, field)?;
         }
@@ -4206,6 +4689,7 @@ pub fn model_schema_json() -> Schema {
             "page_default": DEFAULT_PAGE_SIZE,
             "page_max": MAX_PAGE_SIZE,
             "claim_ttl_seconds": MAX_CLAIM_TTL_SECONDS,
+            "task_claim_ttl_seconds": MAX_TASK_CLAIM_TTL_SECONDS,
         },
         "framing": {
             "length_prefix_bytes": FRAME_PREFIX_BYTES,
@@ -5018,13 +5502,15 @@ mod tests {
     }
 
     #[test]
-    fn claim_lifetimes_are_between_one_second_and_one_hour() {
+    fn claim_lifetimes_are_between_one_second_and_one_day() {
         assert!(ClaimTtl::new(1).is_ok());
         assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS).is_ok());
+        assert!(ClaimTtl::new(MAX_TASK_CLAIM_TTL_SECONDS).is_ok());
         assert!(ClaimTtl::new(0).is_err());
-        assert!(ClaimTtl::new(MAX_CLAIM_TTL_SECONDS + 1).is_err());
+        assert!(ClaimTtl::new(MAX_TASK_CLAIM_TTL_SECONDS + 1).is_err());
         assert!(sonic_rs::from_str::<ClaimTtl>("3600").is_ok());
-        assert!(sonic_rs::from_str::<ClaimTtl>("3601").is_err());
+        assert!(sonic_rs::from_str::<ClaimTtl>("86400").is_ok());
+        assert!(sonic_rs::from_str::<ClaimTtl>("86401").is_err());
         let acquire = |paths: Vec<RepoPath>| {
             Request::ClaimAcquire(mutation(
                 1,
@@ -5032,6 +5518,7 @@ mod tests {
                     paths,
                     ttl: ClaimTtl::new(60).expect("ttl"),
                     mode: ClaimMode::default(),
+                    subject: None,
                 },
             ))
             .validate()
@@ -5040,6 +5527,31 @@ mod tests {
         assert!(acquire(vec![]).is_err());
         assert!(acquire(vec![path("src"), path("src")]).is_err());
         assert_eq!(ClaimMode::default(), ClaimMode::Enforce);
+    }
+
+    #[test]
+    fn claim_subject_keys_render_canonically() {
+        let task = ClaimSubject::Task(TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task"));
+        assert_eq!(task.subject_key(), "task:01JATASKKEYEXAMPLE000000001");
+        let change = ClaimSubject::Change(ChangeId::from_bytes([7; 16]));
+        assert_eq!(
+            change.subject_key(),
+            ChangeId::from_bytes([7; 16]).to_string()
+        );
+        assert!(TaskKey::new("has\0nul").is_err());
+        assert!(TaskKey::new("has\nnewline").is_err());
+        let wired = sonic_rs::to_value(&ClaimAcquireArgs {
+            paths: vec![path("src")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+            subject: Some(task),
+        })
+        .expect("subject args encode");
+        let back: ClaimAcquireArgs = sonic_rs::from_value(&wired).expect("subject args decode");
+        assert_eq!(
+            back.subject.expect("subject").subject_key(),
+            "task:01JATASKKEYEXAMPLE000000001"
+        );
     }
 
     #[test]
@@ -5223,6 +5735,149 @@ mod tests {
         assert!(open.digest_input_v1().expect("ok").is_none());
     }
 
+    #[test]
+    fn legacy_args_preserve_digest_when_new_trailing_options_are_none() {
+        use sha2::{Digest, Sha256};
+
+        #[derive(Serialize)]
+        struct LegacyAttestStatementWire {
+            subject: Oid,
+            kind: AttestKind,
+            result: AttestResult,
+            signed_at: Timestamp,
+            supersedes: Option<StatementDigest>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyAttestAddArgsWire {
+            statement: LegacyAttestStatementWire,
+            signature: AttestSignature,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyClaimAcquireArgsWire {
+            paths: Vec<RepoPath>,
+            ttl: ClaimTtl,
+            mode: ClaimMode,
+        }
+
+        let stmt = statement("review", "pass");
+        let signature = AttestSignature::new(format!("{SIGNATURE_BEGIN}\nAAAA\n{SIGNATURE_END}\n"))
+            .expect("signature");
+        let legacy_attest_args = LegacyAttestAddArgsWire {
+            statement: LegacyAttestStatementWire {
+                subject: stmt.subject,
+                kind: stmt.kind.clone(),
+                result: stmt.result.clone(),
+                signed_at: stmt.signed_at,
+                supersedes: stmt.supersedes,
+            },
+            signature: signature.clone(),
+        };
+        let legacy_attest_bytes =
+            postcard::to_allocvec(&legacy_attest_args).expect("legacy attest encode");
+
+        let current_attest_none = AttestAddArgs {
+            statement: stmt.clone(),
+            signature: signature.clone(),
+        };
+        assert!(current_attest_none.statement.evidence.is_none());
+        let current_attest_none_bytes = current_attest_none
+            .to_digest_postcard()
+            .expect("digest encode");
+        assert_eq!(current_attest_none_bytes, legacy_attest_bytes);
+
+        let raw_current_attest_bytes =
+            postcard::to_allocvec(&current_attest_none).expect("raw encode");
+        assert_ne!(raw_current_attest_bytes, legacy_attest_bytes);
+
+        let mut expected_attest_input = Vec::new();
+        push_field(&mut expected_attest_input, DIGEST_DOMAIN_V1).expect("push");
+        push_field(&mut expected_attest_input, b"attest.add").expect("push");
+        push_field(&mut expected_attest_input, &legacy_attest_bytes).expect("push");
+
+        let req_attest_none = Request::AttestAdd(mutation(1, current_attest_none));
+        let req_attest_none_input = req_attest_none
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_eq!(req_attest_none_input, expected_attest_input);
+
+        let mut current_attest_some = stmt.clone();
+        current_attest_some.evidence = Some(StatementDigest::from_bytes([0x42; 32]));
+        let req_attest_some = Request::AttestAdd(mutation(
+            1,
+            AttestAddArgs {
+                statement: current_attest_some,
+                signature,
+            },
+        ));
+        let req_attest_some_input = req_attest_some
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_ne!(req_attest_none_input, req_attest_some_input);
+
+        let legacy_claim_args = LegacyClaimAcquireArgsWire {
+            paths: vec![path("src"), path("tests")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+        };
+        let legacy_claim_bytes =
+            postcard::to_allocvec(&legacy_claim_args).expect("legacy claim encode");
+
+        let current_claim_none = ClaimAcquireArgs {
+            paths: vec![path("src"), path("tests")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+            subject: None,
+        };
+        let current_claim_none_bytes = current_claim_none
+            .to_digest_postcard()
+            .expect("digest encode");
+        assert_eq!(current_claim_none_bytes, legacy_claim_bytes);
+
+        let raw_current_claim_bytes =
+            postcard::to_allocvec(&current_claim_none).expect("raw encode");
+        assert_ne!(raw_current_claim_bytes, legacy_claim_bytes);
+
+        let mut expected_claim_input = Vec::new();
+        push_field(&mut expected_claim_input, DIGEST_DOMAIN_V1).expect("push");
+        push_field(&mut expected_claim_input, b"claim.acquire").expect("push");
+        push_field(&mut expected_claim_input, &legacy_claim_bytes).expect("push");
+
+        let req_claim_none = Request::ClaimAcquire(mutation(1, current_claim_none));
+        let req_claim_none_input = req_claim_none
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_eq!(req_claim_none_input, expected_claim_input);
+
+        let current_claim_some = ClaimAcquireArgs {
+            paths: vec![path("src"), path("tests")],
+            ttl: ClaimTtl::new(60).expect("ttl"),
+            mode: ClaimMode::Enforce,
+            subject: Some(ClaimSubject::Task(
+                TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+            )),
+        };
+        let req_claim_some = Request::ClaimAcquire(mutation(1, current_claim_some));
+        let req_claim_some_input = req_claim_some
+            .digest_input_v1()
+            .expect("digest ok")
+            .expect("mutation has digest");
+        assert_ne!(req_claim_none_input, req_claim_some_input);
+
+        assert_eq!(
+            Sha256::digest(&req_attest_none_input).as_slice(),
+            Sha256::digest(&expected_attest_input).as_slice()
+        );
+        assert_eq!(
+            Sha256::digest(&req_claim_none_input).as_slice(),
+            Sha256::digest(&expected_claim_input).as_slice()
+        );
+    }
+
     fn statement(kind: &str, result: &str) -> AttestStatement {
         AttestStatement {
             subject: oid(7),
@@ -5230,6 +5885,7 @@ mod tests {
             result: AttestResult::new(result).expect("result"),
             signed_at: timestamp("2026-10-17T12:00:00Z"),
             supersedes: None,
+            evidence: None,
         }
     }
 
@@ -5293,6 +5949,60 @@ mod tests {
             .canonical_payload_v1(HashKind::Sha256)
             .expect_err("a sha1 subject in a sha256 repository");
         assert_eq!(err.code, ErrorCode::EObjectFormat);
+    }
+
+    #[test]
+    fn attestation_payload_v2_has_eight_fields_and_binds_evidence() {
+        let plain = statement("a", "bc");
+        let payload = plain.canonical_payload_v2(HashKind::Sha1).expect("payload");
+        let fields = split_fields(&payload);
+        assert_eq!(fields.len(), 8);
+        assert_eq!(fields[0], ATTEST_PAYLOAD_DOMAIN_V2);
+        assert_eq!(fields[1], b"sha1");
+        assert_eq!(fields[2], oid(7).as_bytes());
+        assert_eq!(fields[3], b"a");
+        assert_eq!(fields[4], b"bc");
+        assert_eq!(fields[5], b"2026-10-17T12:00:00Z");
+        assert!(fields[6].is_empty());
+        assert!(fields[7].is_empty());
+
+        // The domain bump alone separates the versions: the same statement
+        // signs different bytes under v1 and v2.
+        let v1 = plain
+            .canonical_payload_v1(HashKind::Sha1)
+            .expect("v1 payload");
+        assert_ne!(v1, payload);
+
+        // Evidence is covered: one byte changes the payload.
+        let digest = |byte: u8| StatementDigest::from_bytes([byte; 32]);
+        let bound = |evidence: Option<StatementDigest>| {
+            let mut with = statement("a", "bc");
+            with.evidence = evidence;
+            with.canonical_payload_v2(HashKind::Sha1).expect("payload")
+        };
+        assert_ne!(payload, bound(Some(digest(1))));
+        assert_ne!(bound(Some(digest(1))), bound(Some(digest(2))));
+        // Absence and a zero digest are distinct on the wire.
+        assert_eq!(split_fields(&bound(Some(digest(0))))[7], vec![0_u8; 32]);
+        assert_ne!(payload, bound(Some(digest(0))));
+    }
+
+    #[test]
+    fn attestation_payload_v2_rejects_a_subject_of_the_wrong_object_format() {
+        let err = statement("a", "b")
+            .canonical_payload_v2(HashKind::Sha256)
+            .expect_err("a sha1 subject in a sha256 repository");
+        assert_eq!(err.code, ErrorCode::EObjectFormat);
+    }
+
+    #[test]
+    fn attestation_payload_v1_refuses_a_statement_carrying_evidence() {
+        let mut with = statement("a", "b");
+        with.evidence = Some(StatementDigest::from_bytes([9; 32]));
+        let err = with
+            .canonical_payload_v1(HashKind::Sha1)
+            .expect_err("v1 cannot bind evidence");
+        assert_eq!(err.code, ErrorCode::EInvalid);
     }
 
     #[test]
@@ -5532,6 +6242,9 @@ mod tests {
             mode: ClaimMode::Advise,
             expires_at: timestamp("2026-10-17T13:00:00Z"),
             on_behalf_of: None,
+            subject: Some(ClaimSubject::Task(
+                TaskKey::new("01JATASKKEYEXAMPLE000000001").expect("task key"),
+            )),
         };
         let release = Reply::ClaimRelease(Box::new(ClaimReleaseReply {
             outcome: sample_outcome(),
@@ -5983,6 +6696,7 @@ mod tests {
         assert_eq!(doc["limits"]["page_default"], 100);
         assert_eq!(doc["limits"]["page_max"], 1000);
         assert_eq!(doc["limits"]["claim_ttl_seconds"], 3600);
+        assert_eq!(doc["limits"]["task_claim_ttl_seconds"], 24 * 3600);
         assert_eq!(doc["framing"]["length_prefix_bytes"], 4);
         let registry = doc["error_codes"].as_array().expect("error codes");
         assert_eq!(registry.len(), ErrorCode::ALL.len());
@@ -6142,6 +6856,8 @@ mod tests {
             "remote.refs",
             "claim.renew",
             "policy.set",
+            "release.freeze.set",
+            "release.freeze.clear",
         ];
         for method in required {
             assert!(names.contains(method), "missing method {method}");
@@ -6157,5 +6873,35 @@ mod tests {
                 .eq(required.iter().copied()),
             "method table order differs from the contract order"
         );
+    }
+
+    #[test]
+    fn release_freeze_args_require_tag_namespace_and_owner() {
+        let target = Oid::from_bytes(&[0x11; 20]).expect("freeze target");
+        let frozen_at = Timestamp::new(jiff::Timestamp::UNIX_EPOCH);
+        let tag = RefName::new("refs/tags/v1").expect("tag name");
+        let branch = RefName::new("refs/heads/main").expect("branch name");
+        let set = |name: RefName, owner: &str| ReleaseFreezeSetArgs {
+            name,
+            owner_release_id: owner.to_owned(),
+            target_oid: target,
+            frozen_at,
+        };
+        assert!(set(tag.clone(), "rel-1").validate().is_ok());
+        let err = set(branch.clone(), "rel-1")
+            .validate()
+            .expect_err("namespace");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = set(tag.clone(), "").validate().expect_err("owner");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let clear = |name: RefName, owner: &str| ReleaseFreezeClearArgs {
+            name,
+            owner_release_id: owner.to_owned(),
+        };
+        assert!(clear(tag.clone(), "rel-1").validate().is_ok());
+        let err = clear(branch, "rel-1").validate().expect_err("namespace");
+        assert_eq!(err.code, ErrorCode::EInvalid);
+        let err = clear(tag, "").validate().expect_err("owner");
+        assert_eq!(err.code, ErrorCode::EInvalid);
     }
 }

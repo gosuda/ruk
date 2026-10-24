@@ -1203,6 +1203,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 paths: paths.clone(),
                 ttl: ClaimTtl::new(60).expect("ttl"),
                 mode: ClaimMode::Enforce,
+                subject: None,
             },
         }));
         let reply = Reply::ClaimAcquire(Box::new(ClaimAcquireReply {
@@ -1229,6 +1230,7 @@ fn test_12_overlapping_claim_acquires_serialize_across_batches() {
                 mode: ClaimMode::Enforce,
                 expires_at: Timestamp::new(jiff::Timestamp::now()),
                 on_behalf_of: None,
+                subject: None,
             },
         }));
         let (handle, cancel) = cancellation();
@@ -1768,5 +1770,175 @@ fn test_18_symbolic_cycle_halves_serialize_across_batches() {
     assert!(
         accumulator3.can_admit(&right_item),
         "links sharing one target must share one batch"
+    );
+}
+
+/// Tag and freeze for one tag never share a batch: `tag.set` moves the
+/// `Refs` row while guarding the `ReleasedTags` row absent, and the new
+/// `release.freeze.set` pins the live tag with a `Refs` guard plus its
+/// `ReleasedTags` marker. Both touch the same `Refs` key and the same
+/// `ReleasedTags` key, so `has_key_conflict` (via `can_admit`) defers the
+/// second in either arrival order.
+#[test]
+fn test_19_tag_set_and_release_freeze_set_for_same_tag_serialize() {
+    let (_temp, store, _clock, session_table, _policy_source, principal, idle) =
+        ref_test_setup("tag-freeze-conflict");
+    let session1 = test_session(&session_table, &principal, idle);
+    let session2 = test_session(&session_table, &principal, idle);
+    let session3 = test_session(&session_table, &principal, idle);
+    let session4 = test_session(&session_table, &principal, idle);
+
+    let name = RefName::new("refs/tags/v1").expect("valid tag name");
+    let live_oid = crate::ids::Oid::from_bytes(&[0x11; 20]).expect("test oid");
+    let live_target = RefTarget::Direct(live_oid);
+    let live_bytes = crate::store::encode("ref target", &live_target).expect("encode live target");
+    // Real store fixture: the live tag freeze requires.
+    store
+        .publish(
+            Vec::new(),
+            &[FactMutation {
+                table: FactTable::Refs,
+                key: name.as_bytes().to_vec(),
+                expected: FactExpectation::Absent,
+                value: Some(live_bytes.clone()),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("seed live tag");
+
+    // Real `tag.set` facts: move the live tag, guarding the marker absent.
+    let moved_oid = crate::ids::Oid::from_bytes(&[0x22; 20]).expect("test oid");
+    let tag_transaction = RefTransaction::new(
+        HashKind::Sha1,
+        vec![RefUpdate {
+            name: name.clone(),
+            expected: RefExpect::Present(live_target.clone()),
+            change: RefChange::Set(RefTarget::Direct(moved_oid)),
+        }],
+    )
+    .expect("valid tag transaction");
+    let tag_facts = crate::refs::prepare_checked_transaction(&store, &tag_transaction)
+        .expect("prepare tag.set")
+        .into_mutations();
+    assert!(
+        tag_facts
+            .iter()
+            .any(|fact| fact.table == FactTable::Refs && fact.key == name.as_bytes()),
+        "tag.set touches the tag Refs row"
+    );
+
+    // Real `release.freeze.set` facts: the new Vec API pins the live tag
+    // with a Refs guard plus its ReleasedTags marker.
+    let marker = crate::refs::ReleasedTagMarker {
+        owner_release_id: "rel-1".to_owned(),
+        target_oid: live_oid,
+        frozen_at: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+    };
+    let freeze_facts = crate::refs::prepare_release_freeze(&store, &name, &marker)
+        .expect("prepare freeze at the live target");
+    assert_eq!(
+        freeze_facts.len(),
+        2,
+        "fresh freeze carries the Refs guard plus the marker"
+    );
+    assert!(
+        freeze_facts
+            .iter()
+            .any(|fact| fact.table == FactTable::Refs && fact.key == name.as_bytes()),
+        "freeze carries the Refs guard driving has_key_conflict"
+    );
+    assert!(
+        freeze_facts
+            .iter()
+            .any(|fact| fact.table == FactTable::ReleasedTags && fact.key == name.as_bytes()),
+        "freeze carries the ReleasedTags marker"
+    );
+
+    // Direct `has_key_conflict`: the freeze touches keys the tag batch holds.
+    {
+        let mut touched: std::collections::HashMap<FactTable, std::collections::HashSet<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for fact in &tag_facts {
+            touched
+                .entry(fact.table)
+                .or_default()
+                .insert(fact.key.clone());
+        }
+        let probe = make_candidate(
+            Arc::clone(&session1),
+            principal.clone(),
+            RequestId::generate(),
+            Vec::new(),
+            freeze_facts.clone(),
+        );
+        let probe_item = BatchItem::Mutation {
+            candidate: Box::new(probe),
+            reply_tx: None,
+        };
+        assert!(
+            probe_item.has_key_conflict(&touched),
+            "freeze after tag.set hits the same Refs/ReleasedTags keys"
+        );
+    }
+
+    let tag_candidate = make_candidate(
+        session1,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        tag_facts.clone(),
+    );
+    let freeze_candidate = make_candidate(
+        session2,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        freeze_facts.clone(),
+    );
+    let tag_item = BatchItem::Mutation {
+        candidate: Box::new(tag_candidate),
+        reply_tx: None,
+    };
+    let freeze_item = BatchItem::Mutation {
+        candidate: Box::new(freeze_candidate),
+        reply_tx: None,
+    };
+    let mut accumulator = BatchAccumulator::new();
+    assert!(accumulator.can_admit(&tag_item));
+    accumulator.add(tag_item);
+    assert!(
+        !accumulator.can_admit(&freeze_item),
+        "freeze.set after tag.set on the same tag must defer"
+    );
+
+    let freeze_candidate2 = make_candidate(
+        session3,
+        principal.clone(),
+        RequestId::generate(),
+        Vec::new(),
+        freeze_facts,
+    );
+    let tag_candidate2 = make_candidate(
+        session4,
+        principal,
+        RequestId::generate(),
+        Vec::new(),
+        tag_facts,
+    );
+    let freeze_item2 = BatchItem::Mutation {
+        candidate: Box::new(freeze_candidate2),
+        reply_tx: None,
+    };
+    let tag_item2 = BatchItem::Mutation {
+        candidate: Box::new(tag_candidate2),
+        reply_tx: None,
+    };
+    let mut accumulator2 = BatchAccumulator::new();
+    assert!(accumulator2.can_admit(&freeze_item2));
+    accumulator2.add(freeze_item2);
+    assert!(
+        !accumulator2.can_admit(&tag_item2),
+        "tag.set after freeze.set on the same tag must defer"
     );
 }

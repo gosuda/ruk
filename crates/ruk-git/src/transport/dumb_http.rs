@@ -39,13 +39,13 @@ use ruk_core::store::types::ObjectKind;
 #[cfg(test)]
 use ruk_core::store::{EventContext, EventSource};
 
-use super::credentials;
 use super::fetch::{FetchWireRequest, ReceivedPack};
+use super::has_object;
 use super::http;
 use super::pack::{IngestLimits, ingest_pack, object_links, stage_local_objects};
 use super::pktline::RemoteMessages;
 use super::refadv::{AdvertisedRef, Advertisement, Capabilities, ProtocolVersion};
-use super::{Interrupt, has_object};
+use super::smart_http::{RpcCall, policy_headers};
 use crate::{GitError, parse_oid_for};
 
 /// Cap on pack files followed per fetch; the object count inside them is
@@ -82,38 +82,6 @@ fn check_status(url: &str, status: u16) -> Result<(), GitError> {
     Err(GitError::Offline { detail })
 }
 
-/// Builds owned request headers from `extra_headers` (resolved
-/// `http.extraHeader` rows for `url`) plus `extra` plus the helper-then-
-/// environment auth header for `url`, when either carries credentials.
-/// Live callers pass the process environment.
-#[must_use]
-pub fn request_headers(
-    url: &str,
-    vars: &HashMap<String, String>,
-    extra: &[(&str, &str)],
-    extra_headers: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = extra_headers.to_vec();
-    out.extend(
-        extra
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
-    );
-    if let Some((name, value)) = credentials::auth_header_for_url(url, vars) {
-        out.push((name, value));
-    }
-    out
-}
-
-/// Collects the process environment for [`request_headers`].
-fn live_headers(
-    url: &str,
-    extra: &[(&str, &str)],
-    extra_headers: &[(String, String)],
-) -> Vec<(String, String)> {
-    request_headers(url, &std::env::vars().collect(), extra, extra_headers)
-}
-
 /// Borrows owned headers for the HTTP client.
 fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
     headers
@@ -124,10 +92,11 @@ fn borrow(headers: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// GETs `url` into memory, returning status plus body. Error statuses sink
 /// nothing (the client reports them); callers map statuses per route.
-fn get(url: &str, extra_headers: &[(String, String)]) -> Result<(u16, Vec<u8>), GitError> {
-    let owned = live_headers(url, &[("Accept", "*/*")], extra_headers);
+fn get(url: &str, call: RpcCall<'_>) -> Result<(u16, Vec<u8>), GitError> {
+    let owned = policy_headers(url, call.auth, &[("Accept", "*/*")], call.extra);
     let mut body = Vec::new();
-    let (status, _) = http::get_to_writer(url, &borrow(&owned), &mut body)?;
+    let (status, _, _) =
+        http::get_to_writer(url, &borrow(&owned), &mut body, call.egress, call.tls_roots)?;
     Ok((status, body))
 }
 
@@ -231,12 +200,9 @@ pub fn parse_head_symref(body: &[u8]) -> Option<String> {
 ///
 /// # Errors
 /// Transport failures from the HTTP client.
-pub fn fetch_head_symref(
-    base: &str,
-    extra_headers: &[(String, String)],
-) -> Result<Option<String>, GitError> {
+pub fn fetch_head_symref(base: &str, call: RpcCall<'_>) -> Result<Option<String>, GitError> {
     let url = dumb_head_url(base);
-    let (status, body) = get(&url, extra_headers)?;
+    let (status, body) = get(&url, call)?;
     if status == 404 {
         return Ok(None);
     }
@@ -255,13 +221,9 @@ pub fn fetch_head_symref(
 /// # Errors
 /// Transport failures from the HTTP client and grammar failures from the
 /// text parse.
-pub fn discover(
-    base: &str,
-    kind: HashKind,
-    extra_headers: &[(String, String)],
-) -> Result<Advertisement, GitError> {
+pub fn discover(base: &str, kind: HashKind, call: RpcCall<'_>) -> Result<Advertisement, GitError> {
     let url = dumb_refs_url(base);
-    let (status, body) = get(&url, extra_headers)?;
+    let (status, body) = get(&url, call)?;
     check_status(&url, status)?;
     Ok(Advertisement {
         version: ProtocolVersion::V0,
@@ -291,9 +253,9 @@ fn pack_names(body: &[u8]) -> Vec<String> {
 /// Lists the pack files a dumb server holds: GETs `objects/info/packs`. A
 /// 404 means no pack list (pack-less repositories answer that way), which
 /// is an empty list, not an error; other error statuses propagate.
-fn list_packs(base: &str, extra_headers: &[(String, String)]) -> Result<Vec<String>, GitError> {
+fn list_packs(base: &str, call: RpcCall<'_>) -> Result<Vec<String>, GitError> {
     let url = format!("{base}/objects/info/packs");
-    let (status, body) = get(&url, extra_headers)?;
+    let (status, body) = get(&url, call)?;
     if status == 404 {
         return Ok(Vec::new());
     }
@@ -353,12 +315,12 @@ fn fetch_loose(
     base: &str,
     oid: Oid,
     max_bytes: u64,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<(ObjectKind, Vec<u8>), GitError> {
     let hex = oid.to_hex();
     let (fan, rest) = hex.split_at(2);
     let url = format!("{base}/objects/{fan}/{rest}");
-    let (status, body) = get(&url, extra_headers)?;
+    let (status, body) = get(&url, call)?;
     match status {
         _ if http::is_success(status) => {}
         404 => {
@@ -386,10 +348,10 @@ fn fetch_pack_file(
     base: &str,
     name: &str,
     max_bytes: u64,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<Option<Vec<u8>>, GitError> {
     let url = format!("{base}/objects/pack/{name}");
-    let (status, body) = get(&url, extra_headers)?;
+    let (status, body) = get(&url, call)?;
     if status == 404 {
         return Ok(None);
     }
@@ -415,12 +377,12 @@ fn collect_pack_objects(
     store: &Store,
     kind: HashKind,
     limits: IngestLimits,
-    interrupt: &Interrupt,
     warnings: &mut Vec<String>,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<Vec<(Oid, ObjectKind, Vec<u8>)>, GitError> {
+    let interrupt = call.interrupt;
     let mut triples = Vec::new();
-    let names = list_packs(base, extra_headers)?;
+    let names = list_packs(base, call)?;
     if names.len() > MAX_PACK_FILES {
         return Err(GitError::Limit {
             detail: format!(
@@ -431,7 +393,7 @@ fn collect_pack_objects(
     }
     for name in &names {
         interrupt.check("listing dumb-http packs")?;
-        let Some(bytes) = fetch_pack_file(base, name, limits.max_pack_bytes, extra_headers)? else {
+        let Some(bytes) = fetch_pack_file(base, name, limits.max_pack_bytes, call)? else {
             warnings.push(format!(
                 "dumb-http pack {name} vanished; fetching loose instead"
             ));
@@ -465,9 +427,9 @@ pub fn fetch_pack(
     store: &Store,
     req: &FetchWireRequest,
     limits: IngestLimits,
-    interrupt: &Interrupt,
-    extra_headers: &[(String, String)],
+    call: RpcCall<'_>,
 ) -> Result<ReceivedPack, GitError> {
+    let interrupt = call.interrupt;
     if req.wants.is_empty() {
         return Err(GitError::Invalid {
             detail: "fetch needs at least one want".to_owned(),
@@ -484,15 +446,7 @@ pub fn fetch_pack(
     if req.depth.is_some() {
         warnings.push("server is dumb-http; fetched complete history".to_owned());
     }
-    let mut triples = collect_pack_objects(
-        base,
-        store,
-        kind,
-        limits,
-        interrupt,
-        &mut warnings,
-        extra_headers,
-    )?;
+    let mut triples = collect_pack_objects(base, store, kind, limits, &mut warnings, call)?;
     let mut seen: HashSet<Oid> = triples.iter().map(|(oid, _, _)| *oid).collect();
     let max_objects = usize::try_from(limits.max_objects).map_err(|_| GitError::Limit {
         detail: "object count limit does not fit".to_owned(),
@@ -514,7 +468,7 @@ pub fn fetch_pack(
             continue;
         }
         interrupt.check("fetching dumb-http objects")?;
-        let (obj_kind, payload) = fetch_loose(base, oid, limits.max_object_bytes, extra_headers)?;
+        let (obj_kind, payload) = fetch_loose(base, oid, limits.max_object_bytes, call)?;
         for link in links_of(obj_kind, &payload, kind)? {
             queue.push(link);
         }
@@ -551,9 +505,65 @@ fn links_of(kind: ObjectKind, payload: &[u8], hash: HashKind) -> Result<Vec<Oid>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::Interrupt;
+    use crate::transport::credentials::{AuthPolicy, TransportAuth};
     use std::io::Write as _;
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+
+    #[test]
+    fn explicit_auth_sends_one_header_on_a_dumb_get() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+        let port = listener.local_addr().expect("addr").port();
+        let body = format!("{FOUR}\trefs/heads/main\n").into_bytes();
+        let reply_body = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).expect("read head") == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply_body.len()
+            )
+            .expect("reply head");
+            socket.write_all(&reply_body).expect("reply body");
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        let base = format!("http://127.0.0.1:{port}/a.git");
+        let auth = AuthPolicy::explicit(TransportAuth {
+            kind: crate::transport::credentials::TransportAuthKind::Bearer,
+            credential: "injected".to_owned(),
+            origin: TransportAuth::origin_of(&base).expect("loopback origin"),
+        });
+        let adv = discover(
+            &base,
+            HashKind::Sha1,
+            RpcCall {
+                extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                auth: &auth,
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("dumb discover");
+        assert_eq!(adv.refs.len(), 1);
+        let head = server.join().expect("server");
+        let auth_lines: Vec<&str> = head
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .collect();
+        assert_eq!(auth_lines, ["authorization: Bearer injected"], "{head:?}");
+    }
 
     fn oid(hex: &str) -> Oid {
         Oid::from_hex(hex).expect("hex")
@@ -835,7 +845,18 @@ mod tests {
         let refs_body = format!("{FOUR}\trefs/heads/main\n").into_bytes();
         let (base, handle) = fake_dumb_server(server, refs_body, total);
 
-        let adv = discover(&base, kind, &[]).expect("discover");
+        let adv = discover(
+            &base,
+            kind,
+            RpcCall {
+                extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                auth: &AuthPolicy::explicit(TransportAuth::none()),
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("discover");
         assert_eq!(adv.refs.len(), 1);
         assert_eq!(adv.refs[0].oid, Some(tip));
 
@@ -854,8 +875,13 @@ mod tests {
             &dest,
             &req,
             IngestLimits::default(),
-            &Interrupt::none(),
-            &[],
+            RpcCall {
+                extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                auth: &AuthPolicy::explicit(TransportAuth::none()),
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("fetch");
         assert!(received.warnings.is_empty());
@@ -924,8 +950,13 @@ mod tests {
             &dest,
             &req,
             IngestLimits::default(),
-            &Interrupt::none(),
-            &[],
+            RpcCall {
+                extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                auth: &AuthPolicy::explicit(TransportAuth::none()),
+                interrupt: &Interrupt::none(),
+            },
         )
         .expect("fetch");
         assert_eq!(received.warnings.len(), 2);

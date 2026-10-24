@@ -72,7 +72,7 @@ pub use capacity::CapacityLimits;
 pub(crate) use capacity::{PendingReservation, ReservationState, SegmentCharge};
 pub use compact::{CompactionBacklog, CompactionStats, PruneStats};
 pub use error::StoreError;
-pub(crate) use guards::GenerationRegistry;
+pub(crate) use guards::{GenerationGuard, GenerationRegistry};
 pub use metadata::{FactPage, FactPageBudget, FactRow};
 pub(crate) use metadata::{decode, encode};
 pub use spool::{BudgetLimits, PreparationBudget, Spool};
@@ -190,6 +190,16 @@ pub struct Store {
     queue: group::Queue,
     /// The commit linger window in nanoseconds (`RUK_COMMIT_LINGER_MS`).
     commit_linger_nanos: AtomicU64,
+}
+
+/// One held reader pin against segment retirement for the duration of a
+/// fork photograph and copy.
+///
+/// Dropping the pin releases the registration; release is unconditional on
+/// every path.
+#[derive(Debug)]
+pub struct ForkPin {
+    _guard: GenerationGuard,
 }
 
 /// State owned by the serialized publication writer.
@@ -591,6 +601,14 @@ impl Store {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The path of segment `id` under this store's root.
+    #[must_use]
+    pub fn segment_path(&self, id: u64) -> PathBuf {
+        self.root
+            .join(SEGMENTS_DIR)
+            .join(segment::segment_file_name(id))
     }
 
     /// The fixed hash kind of this store.
@@ -1212,6 +1230,184 @@ impl Store {
         Ok(())
     }
 
+    /// The current locator generation of this store.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn generation(&self) -> Result<u64, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.observe(self.meta.generation())
+    }
+
+    /// The default branch recorded at init, or `None` when the store
+    /// predates `repo.init` metadata.
+    ///
+    /// # Errors
+    /// Database failures propagate; quarantine refuses.
+    pub fn default_branch(&self) -> Result<Option<RefName>, StoreError> {
+        Ok(self.repo_meta()?.map(|row| row.default_branch))
+    }
+
+    /// Every committed segment manifest in id order.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for storage damage, which also latches
+    /// quarantine; quarantine refuses.
+    pub fn all_manifests(&self) -> Result<Vec<SegmentManifest>, StoreError> {
+        self.refuse_if_quarantined()?;
+        self.observe(self.meta.all_manifests())
+    }
+
+    /// Every committed object locator in raw-digest order.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for storage damage, which also latches
+    /// quarantine; quarantine refuses.
+    pub fn all_object_locations(&self) -> Result<Vec<(Oid, ObjectLocation)>, StoreError> {
+        self.refuse_if_quarantined()?;
+        let mut out = Vec::new();
+        let mut after: Option<Oid> = None;
+        loop {
+            let page = self.observe(self.meta.object_page(after.as_ref(), 1024))?;
+            if page.is_empty() {
+                return Ok(out);
+            }
+            after = page.last().map(|(oid, _)| *oid);
+            out.extend(page);
+        }
+    }
+
+    /// Installs one photographed sealed snapshot into this fresh staging
+    /// store: the hardlinked sealed-segment manifests plus their verbatim
+    /// sealed locators, with the destination generation set to the forked
+    /// source generation in both the metadata and the in-memory generation
+    /// registry. The destination generation reaches the forked generation
+    /// even when the sealed set is empty, so a tail-only fork still
+    /// carries the source generation. Tail-resident objects are never
+    /// installed here; the caller re-creates them by content copy
+    /// afterwards, so the two sets must be disjoint and the call fails
+    /// closed on any overlap. Each linked segment file is re-verified
+    /// against its photographed committed extent before install. Runs
+    /// before the destination's first open, so recovery validates the
+    /// installed state like any committed store.
+    ///
+    /// # Errors
+    /// [`StoreError::Invalid`] for an overlap between the sealed and tail
+    /// sets, a locator generation above `generation`, an unsealed or
+    /// retired manifest, a linked file shorter than its committed extent,
+    /// or a generation that regresses the fresh store; database failures
+    /// propagate; quarantine refuses.
+    pub fn import_sealed_snapshot(
+        &self,
+        manifests: &[SegmentManifest],
+        sealed: &[(Oid, ObjectLocation)],
+        tail_oids: &[Oid],
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        self.refuse_if_quarantined()?;
+        let mut staged: std::collections::HashSet<Oid> =
+            std::collections::HashSet::with_capacity(sealed.len());
+        for (oid, _) in sealed {
+            if !staged.insert(*oid) {
+                return Err(StoreError::Invalid(format!(
+                    "sealed snapshot repeats object {oid}"
+                )));
+            }
+        }
+        for oid in tail_oids {
+            if staged.contains(oid) {
+                return Err(StoreError::Invalid(format!(
+                    "fork snapshot overlaps sealed and tail on {oid}"
+                )));
+            }
+        }
+        let mut by_id: std::collections::HashMap<u64, &SegmentManifest> =
+            std::collections::HashMap::with_capacity(manifests.len());
+        for manifest in manifests {
+            if !manifest.sealed {
+                return Err(StoreError::Invalid(format!(
+                    "fork snapshot links unsealed segment {}",
+                    manifest.id
+                )));
+            }
+            if manifest.retired {
+                return Err(StoreError::Invalid(format!(
+                    "fork snapshot links retired segment {}",
+                    manifest.id
+                )));
+            }
+            let path = self
+                .root
+                .join(SEGMENTS_DIR)
+                .join(segment::segment_file_name(manifest.id));
+            let len = std::fs::metadata(&path)
+                .map(|meta| meta.len())
+                .map_err(|err| {
+                    StoreError::Invalid(format!(
+                        "linked segment {} is not readable: {err}",
+                        manifest.id
+                    ))
+                })?;
+            if len < manifest.committed_end {
+                return Err(StoreError::Invalid(format!(
+                    "linked segment {} holds {len} bytes below its committed end {}",
+                    manifest.id, manifest.committed_end
+                )));
+            }
+            if by_id.insert(manifest.id, manifest).is_some() {
+                return Err(StoreError::Invalid(format!(
+                    "sealed snapshot repeats segment {}",
+                    manifest.id
+                )));
+            }
+        }
+        for (oid, location) in sealed {
+            if !by_id.contains_key(&location.segment) {
+                return Err(StoreError::Invalid(format!(
+                    "sealed object {oid} names unlinked segment {}",
+                    location.segment
+                )));
+            }
+            if location.generation > generation {
+                return Err(StoreError::Invalid(format!(
+                    "sealed object {oid} is newer than the forked generation {generation}"
+                )));
+            }
+        }
+        let current = self.observe(self.meta.generation())?;
+        if generation < current {
+            return Err(StoreError::Invalid(format!(
+                "forked generation {generation} regresses past {current}"
+            )));
+        }
+        let _writer = self.lock_writer()?;
+        let txn = self.observe(self.meta.begin_publication(&[]))?;
+        for (oid, location) in sealed {
+            self.observe(txn.insert_object(oid, location))?;
+        }
+        for manifest in manifests {
+            self.observe(txn.upsert_manifest(manifest))?;
+        }
+        if generation > current {
+            self.observe(txn.set_generation(generation))?;
+        }
+        self.observe(txn.commit())?;
+        drop(_writer);
+        self.guards.advance_published_generation(generation);
+        Ok(())
+    }
+
+    /// Registers one reader pin on this store for a fork photograph and
+    /// copy: the pin registers before any snapshot read and releases on
+    /// drop, so compaction cannot retire and unlink a linked sealed
+    /// segment under the fork.
+    #[must_use]
+    pub fn pin_for_fork(&self) -> ForkPin {
+        ForkPin {
+            _guard: self.guards.register(),
+        }
+    }
+
     /// Reads the event horizon: the last assigned sequence, the oldest
     /// retained sequence, and the raw head row for CAS updates. Absent rows
     /// mean no event ever committed.
@@ -1247,16 +1443,16 @@ impl Store {
         let mut kept: Option<u64> = None;
         for row in &page.rows {
             let event: StoreEvent = decode_store_event(&row.value)?;
-            if event.at < cutoff_millis {
-                out.push(FactMutation {
-                    table: FactTable::Events,
-                    key: row.key.clone(),
-                    expected: FactExpectation::Value(row.value.clone()),
-                    value: None,
-                });
-            } else if kept.is_none() {
+            if event.at >= cutoff_millis {
                 kept = Some(Self::seq_from_event_key(&row.key)?);
+                break;
             }
+            out.push(FactMutation {
+                table: FactTable::Events,
+                key: row.key.clone(),
+                expected: FactExpectation::Value(row.value.clone()),
+                value: None,
+            });
         }
         if out.is_empty() {
             return Ok(Vec::new());
@@ -4033,6 +4229,77 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, 2);
         assert_eq!(read_head(&store), EventHeadRow { head: 2, oldest: 2 });
+    }
+
+    /// Seeds events `(seq, at)` with head and oldest, for sweep tests.
+    fn seed_stamped_events(store: &Store, stamps: &[(u64, u64)], head: u64) {
+        let mut facts: Vec<FactMutation> = stamps
+            .iter()
+            .map(|&(seq, at)| {
+                let event = StoreEvent {
+                    name: format!("refs/heads/e{seq}").into_bytes(),
+                    old: None,
+                    new: Some(b"v1".to_vec()),
+                    at,
+                    source: EventSource::Lane,
+                    operation: None,
+                    request_id: None,
+                    session: None,
+                    on_behalf_of: None,
+                };
+                FactMutation {
+                    table: FactTable::Events,
+                    key: seq.to_be_bytes().to_vec(),
+                    expected: FactExpectation::Absent,
+                    value: Some(encode("event", &event).expect("encode")),
+                }
+            })
+            .collect();
+        facts.push(FactMutation {
+            table: FactTable::EventHead,
+            key: EVENT_HEAD_KEY.to_vec(),
+            expected: FactExpectation::Absent,
+            value: Some(encode("event head", &EventHeadRow { head, oldest: 1 }).expect("encode")),
+        });
+        store
+            .publish(
+                Vec::new(),
+                &facts,
+                EventSource::Lane,
+                &EventContext::default(),
+            )
+            .expect("seed events");
+    }
+
+    /// The sweep prunes only the leading run of expired events and stops at
+    /// the first kept one. A later row whose stamp is old (a backward clock
+    /// step) must survive, or a follower resuming below it skips it silently.
+    #[test]
+    fn events_sweep_stops_at_the_first_kept_event() {
+        let leading_kept = TempRoot::new("events-sweep-leading-kept");
+        let store = create(&leading_kept, HashKind::Sha1);
+        seed_stamped_events(&store, &[(1, 9_000), (2, 1_000), (3, 1_000)], 3);
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        assert!(
+            deletions.is_empty(),
+            "a kept leading row prunes nothing, got {} mutations",
+            deletions.len()
+        );
+
+        let old_kept_old = TempRoot::new("events-sweep-old-kept-old");
+        let store = create(&old_kept_old, HashKind::Sha1);
+        seed_stamped_events(&store, &[(1, 1_000), (2, 9_000), (3, 1_000)], 3);
+        let deletions = store.sweep_events_page(5_000, 10_000).expect("sweep");
+        let pruned: Vec<Vec<u8>> = deletions
+            .iter()
+            .filter(|mutation| mutation.table == FactTable::Events)
+            .map(|mutation| mutation.key.clone())
+            .collect();
+        assert_eq!(
+            pruned,
+            vec![1_u64.to_be_bytes().to_vec()],
+            "only the leading expired row goes; row 3 above the kept row stays"
+        );
     }
 
     #[test]

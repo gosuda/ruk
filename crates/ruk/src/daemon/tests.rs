@@ -15,14 +15,15 @@ use std::time::Duration;
 
 use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
 use super::{
-    BoundedExecutor, CommandAccepted, CommandExitReport, CommandOpen, ConnectionRefs, ExitReport,
-    GitLimits, InvocationAccepted, InvocationOpen, Registry, SessionOpened, serve_connection,
+    ArchiveAcceptedResult, BoundedExecutor, CommandAccepted, CommandExitReport, CommandOpen,
+    ConnectionRefs, ExitReport, GitLimits, InvocationAccepted, InvocationOpen, Registry,
+    SessionOpened, TransportAuth, serve_connection,
 };
 use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
     DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_RETENTION_INTERVAL_MS,
     DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE, DEFAULT_TRANSPORT_PERMITS,
-    DaemonConfig,
+    DaemonConfig, MAX_LIVE_STREAMS,
 };
 use ruk_core::bytes::ByteString;
 use ruk_core::change::{LeaseId, OperationId, PlanId, RequestId, SessionId, StoreId};
@@ -35,11 +36,11 @@ use ruk_core::ops::{NewRequest, prepare_new};
 use ruk_core::protocol::{
     BookmarkSetArgs, BookmarkTarget, BoundedList, ChangeRef, ClaimAcquireArgs, ClaimMode,
     ClaimReleaseArgs, ClaimTtl, DescribeArgs, EditArgs, ErrorDetail, ErrorReply, FetchArgs,
-    FetchFilter, FetchRefs, Fix, IdentityClaim, LandExecuteArgs, Method, NewArgs, OpLogArgs,
-    PageCursor, PageLimit, PageRequest, PathSelection, PinArgs, PushRefOutcome, PushRefStatus,
-    PushState, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope,
-    SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs, TagAnnotation,
-    TagSetArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
+    FetchFilter, FetchRefs, Fix, IdentityClaim, LandExecuteArgs, Method, Mutation, NewArgs,
+    OpLogArgs, PageCursor, PageLimit, PageRequest, PathSelection, PinArgs, PushRefOutcome,
+    PushRefStatus, PushState, QueryDigest, RemoteName, RemoteSpec, Reply, ReplyBody, ReplyEnvelope,
+    RepoForkArgs, Request, SessionOpenArgs, SnapshotArgs, SplitArgs, SplitPlacement, StatusArgs,
+    TagAnnotation, TagSetArgs, UndoArgs, WorkspaceBinding, WorkspaceInit, WsNewArgs,
 };
 use ruk_core::refdata::{RefExpect, RefName, RefRead, RefTarget};
 use ruk_core::store::{EventContext, EventSource, FactTable, ObjectKind, PreparationBudget, Store};
@@ -408,6 +409,7 @@ impl Driver {
             args_json,
             session_id: session_id.map(str::to_string),
             on_behalf_of: on_behalf_of.map(str::to_string),
+            transport_auth: TransportAuth::default(),
         };
         sonic_rs::to_string(&open)
             .expect("typed open encodes")
@@ -574,6 +576,17 @@ fn spawn_pair_with_window(
     root: &Path,
     window_bytes: u64,
 ) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
+    spawn_pair_with_window_and_frame_timeout(root, window_bytes, Duration::from_secs(15))
+}
+
+/// Spawns `serve_connection` on a socket pair with one stream window size
+/// and one frame timeout, so credit tests can force the daemon to wait for
+/// grants without waiting out the production deadline.
+fn spawn_pair_with_window_and_frame_timeout(
+    root: &Path,
+    window_bytes: u64,
+    frame_timeout: Duration,
+) -> (Driver, tokio::task::JoinHandle<Result<(), super::Error>>) {
     let registry = Arc::new(Registry::new(vec![root.to_path_buf()]).expect("registry"));
     registry.set_runtime(tokio::runtime::Handle::current());
     let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
@@ -586,7 +599,7 @@ fn spawn_pair_with_window(
         transport: BoundedExecutor::new(4).expect("transport executor"),
         window_bytes,
         handshake_timeout: Duration::from_secs(10),
-        frame_timeout: Duration::from_secs(15),
+        frame_timeout,
         allowed_uids: vec![uid],
         admin_uids: Vec::new(),
     };
@@ -642,6 +655,7 @@ fn invalid_new_config_values_name_the_key() {
         ("default_branch", "default_branch = \"main\"\n"),
         ("event_retention_seconds", "event_retention_seconds = 0\n"),
         ("search_pool_size", "search_pool_size = 0\n"),
+        ("search_pool_size", "search_pool_size = 65\n"),
     ];
     for (key, extra) in cases {
         let err =
@@ -657,6 +671,28 @@ fn invalid_new_config_values_name_the_key() {
     }
     DaemonConfig::from_toml(&config_doc("search_pool_size = 1\n"))
         .expect("one search permit starts");
+}
+
+#[test]
+fn egress_allow_widens_only_the_listed_addresses() {
+    use std::net::{IpAddr, Ipv4Addr};
+    let parsed = DaemonConfig::from_toml(&config_doc(
+        "egress_allow = [\"127.0.0.0/8\", \"10.20.30.40\"]\n",
+    ))
+    .expect("egress allowlist parses");
+    let policy = parsed.egress_policy().expect("policy builds");
+    assert!(policy.allows(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    assert!(policy.allows(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40))));
+    assert!(!policy.allows(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    assert!(!policy.allows(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+
+    let default = DaemonConfig::from_toml(&config_doc("")).expect("default parses");
+    let strict = default.egress_policy().expect("policy builds");
+    assert!(!strict.allows(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+    let err = DaemonConfig::from_toml(&config_doc("egress_allow = [\"not-an-ip\"]\n"))
+        .expect_err("malformed allowlist entry must refuse");
+    assert!(err.to_string().contains("egress_allow"));
 }
 
 #[test]
@@ -787,16 +823,15 @@ async fn git_service_advertise_matches_oracle_refs() {
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
+    // Every advertisement authenticates a session held by this peer, so
+    // both arms carry the real one.
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
 
     for service in ["upload-pack", "receive-pack"] {
-        let ids = service == "receive-pack";
-        let payload = git_open_payload(
-            service,
-            &store_repo,
-            true,
-            ids.then_some("sess-adv"),
-            ids.then_some("req-adv"),
-        );
+        let payload = git_open_payload(service, &store_repo, true, Some(&session), Some("req-adv"));
         let stream_id = if service == "upload-pack" { 1 } else { 3 };
         let (stdout, exit) = driver.run_git(stream_id, &payload, &[]).await;
         assert_eq!(exit.exit_code, 0, "{service} advertise exits zero");
@@ -860,7 +895,11 @@ async fn git_service_request_matches_oracle_objects() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     let (stdout, exit) = driver.run_git(1, &payload, &[request]).await;
     assert_eq!(exit.exit_code, 0);
     assert_eq!(exit.outcome, "Completed");
@@ -878,24 +917,80 @@ async fn git_service_request_matches_oracle_objects() {
 }
 
 #[tokio::test]
-async fn advertisement_end_discards_through_first_flush() {
-    let mut advert = pkt(b"version 2\n");
-    advert.extend_from_slice(&pkt(b"ls-refs=unborn\n"));
-    advert.extend_from_slice(&flush());
-    let mut wire = advert.clone();
-    wire.extend_from_slice(&pkt(b"NAK\n"));
-    assert!(matches!(
-        super::advertisement_end(&advert[..advert.len() - 2]),
-        super::AdvertisementEnd::Incomplete
-    ));
-    match super::advertisement_end(&wire) {
-        super::AdvertisementEnd::DiscardThrough(off) => {
-            assert_eq!(&wire[off..], &pkt(b"NAK\n")[..]);
-        }
-        super::AdvertisementEnd::Incomplete => {
-            panic!("a framed advertisement splits at its first flush");
-        }
+async fn git_service_upload_pack_answers_before_eof() {
+    let root = temp_root("upload-before-eof");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 1);
+
+    // A multi-batch negotiation: the client waits for ACKs before it sends
+    // `done`, so the serve must answer the haves flush without waiting for
+    // `StdinEof`. A collect-then-serve round stalls here until the frame
+    // timeout kills the connection.
+    let frames = [
+        pkt(format!("want {}\n", commit.to_hex()).as_bytes()),
+        flush(),
+        pkt(b"have 0000000000000000000000000000000000000000\n"),
+        flush(),
+    ];
+    for frame in &frames {
+        driver.send(FrameKind::Stdin, 1, frame).await;
     }
+    let mut stdout = Vec::new();
+    let mut grants = 0usize;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = driver.recv().await;
+            assert_eq!(frame.stream_id, 1);
+            match frame.kind {
+                FrameKind::Stdout => stdout.extend_from_slice(&frame.payload),
+                FrameKind::WindowUpdate => grants += 1,
+                other => panic!("unexpected frame {other:?} before done"),
+            }
+            if grants == frames.len() && stdout.windows(3).any(|w| w == b"NAK") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the daemon answers the haves flush without waiting for EOF");
+
+    driver.send(FrameKind::Stdin, 1, &pkt(b"done\n")).await;
+    let grant = driver.recv().await;
+    assert_eq!(grant.kind, FrameKind::WindowUpdate);
+    driver.send(FrameKind::StdinEof, 1, &[]).await;
+    let (rest, _, exit) = driver.recv_exit(1).await;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.outcome, "Completed");
+    assert!(
+        rest.starts_with(b"PACK"),
+        "the round ends with a packfile past the NAK"
+    );
+
+    drop(driver);
+    task.abort();
 }
 
 #[tokio::test]
@@ -916,7 +1011,12 @@ async fn git_service_upload_pack_streams_nak_before_eof() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -1012,6 +1112,381 @@ async fn git_service_receive_pack_needs_session_and_request() {
     drop(driver);
     task.abort();
 }
+#[tokio::test]
+async fn git_service_sessionless_upload_pack_refused() {
+    let root = temp_root("upload-no-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn route_refuses_opens_past_the_live_stream_cap() {
+    let root = temp_root("stream-cap-direct");
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry"));
+    registry.set_runtime(tokio::runtime::Handle::current());
+    let refs = ConnectionRefs {
+        registry: Arc::clone(&registry),
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport executor"),
+        window_bytes: INITIAL_STREAM_WINDOW_BYTES,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    let peer = ipc::PeerIdentity {
+        uid: 0,
+        gid: 0,
+        pid: None,
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(16);
+    let (done_tx, _done_rx) = tokio::sync::mpsc::channel(64);
+    use super::STREAM_CHANNEL_BOUND;
+    use super::route_stream_frame;
+    use std::collections::HashMap;
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let mut parked = Vec::new();
+    let mut parked_data = Vec::new();
+    for stream_id in 1..=u64::try_from(MAX_LIVE_STREAMS).expect("cap fits u64") {
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_BOUND);
+        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel();
+        parked.push(rx);
+        parked_data.push(data_rx);
+        streams.insert(
+            stream_id,
+            super::StreamRoute {
+                control: tx,
+                data: data_tx,
+                outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                generation: 1,
+                git: false,
+                shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                task: None,
+                cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+    }
+    let open = ipc::Frame {
+        kind: FrameKind::Open,
+        stream_id: u64::try_from(MAX_LIVE_STREAMS + 1).expect("cap fits u64"),
+        payload: Vec::new(),
+    };
+    route_stream_frame(&writer_tx, open, &mut streams, &done_tx, 1, &refs, peer)
+        .await
+        .expect("the capped open routes without failing the reader");
+    let error = writer_rx.try_recv().expect("cap error frame");
+    assert_eq!(error.kind, FrameKind::Error);
+    let report: super::ErrorReply = ipc::decode_control(&error.payload).expect("error decodes");
+    assert_eq!(report.code, ErrorCode::ELimit);
+    let terminal = writer_rx.try_recv().expect("cap terminal exit");
+    assert_eq!(terminal.kind, FrameKind::Exit);
+    drop(parked);
+    drop(parked_data);
+    while writer_rx.try_recv().is_ok() {}
+    let reopen = ipc::Frame {
+        kind: FrameKind::Open,
+        stream_id: u64::try_from(MAX_LIVE_STREAMS + 1).expect("cap fits u64"),
+        payload: Vec::new(),
+    };
+    route_stream_frame(&writer_tx, reopen, &mut streams, &done_tx, 1, &refs, peer)
+        .await
+        .expect("the reclaimed open routes without failing the reader");
+    assert!(
+        streams.contains_key(&(u64::try_from(MAX_LIVE_STREAMS + 1).expect("cap fits u64"))),
+        "the reclaimed slot spawns a fresh route"
+    );
+}
+
+#[tokio::test]
+async fn git_service_sessionless_receive_pack_advertise_refused() {
+    let root = temp_root("recv-adv-no-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // An unknown session id with receive-pack advertisement must refuse
+    // before any ref names reach the peer.
+    // A well-formed but unknown session id must refuse before the
+    // advertisement reaches the peer.
+    let unknown = "01234567-89ab-cdef-0123-456789abcdef";
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        true,
+        Some(unknown),
+        Some("req-1"),
+    );
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_sessionless_upload_archive_refused() {
+    let root = temp_root("archive-no-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = git_open_payload("upload-archive", &store_repo, false, None, None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EInvalid);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_upload_pack_refused_before_accepted() {
+    let root = temp_root("upload-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // A random session is not the missing-session shape: it passes the
+    // presence gate and must still fail authentication before `Accepted`.
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&unknown), None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_upload_archive_refused_before_accepted() {
+    let root = temp_root("archive-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload("upload-archive", &store_repo, false, Some(&unknown), None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_upload_advertise_refused() {
+    let root = temp_root("upload-adv-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // Advertisements authenticate too: a random session fails before
+    // `Accepted`, not merely a missing id.
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, true, Some(&unknown), None);
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn git_service_unknown_session_receive_pack_refused_before_body() {
+    let root = temp_root("receive-unknown-session");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    // Authentication precedes `Accepted`, so no body is collected from an
+    // unauthenticated peer: the refusal arrives with no body sent.
+    let unknown = SessionId::generate().to_string();
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&unknown),
+        Some("req-unknown-1"),
+    );
+    let (report, _) = driver.expect_git_refused(1, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+
+    drop(driver);
+    task.abort();
+}
+
+#[test]
+fn git_limits_clamp_to_server_maxima() {
+    // A hostile envelope demanding `u64::MAX` everywhere lands on the
+    // daemon defaults instead of growing a `Vec` without bound.
+    let saturated = GitLimits {
+        max_pack_bytes: u64::MAX,
+        max_objects: u64::MAX,
+        max_object_bytes: u64::MAX,
+        max_delta_depth: u64::MAX,
+        max_stdin_bytes: u64::MAX,
+        max_push_options: u64::MAX,
+    };
+    assert_eq!(saturated.clamped(), GitLimits::default());
+
+    // Narrowing a quota still passes through: the clamp is a ceiling,
+    // not a reset.
+    let narrowed = GitLimits {
+        max_push_options: 0,
+        max_stdin_bytes: 1,
+        ..GitLimits::default()
+    };
+    assert_eq!(narrowed.clamped(), narrowed);
+
+    // The daemon decode path itself applies the clamp: a client-sent
+    // `u64::MAX` stdin bound arrives at the daemon cap with no manual
+    // clamping by the caller.
+    let wire = sonic_rs::to_string(&CommandOpen {
+        service: "upload-pack".to_owned(),
+        repository: "/tmp/repo".to_owned(),
+        session_id: None,
+        request_id: None,
+        git_protocol: String::new(),
+        advertise: false,
+        stdout_credit: 0,
+        limits: saturated,
+        on_behalf_of: None,
+    })
+    .expect("open encodes");
+    let decoded = super::decode_git_open(wire.as_bytes()).expect("open decodes");
+    assert_eq!(
+        decoded.limits.max_stdin_bytes,
+        super::DEFAULT_MAX_STDIN_BYTES
+    );
+    assert_eq!(decoded.limits, GitLimits::default());
+}
+
+#[tokio::test]
+async fn release_freeze_needs_an_admin_peer() {
+    let root = temp_root("freeze-admin");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(1, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let set_args = sonic_rs::to_string(&ruk_core::protocol::ReleaseFreezeSetArgs {
+        name: RefName::new("refs/tags/v1".to_string()).expect("tag name"),
+        owner_release_id: "rel-1".to_owned(),
+        target_oid: commit,
+        frozen_at: ruk_core::protocol::Timestamp::parse("1970-01-01T00:00:00Z")
+            .expect("freeze time"),
+    })
+    .expect("freeze set args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "release.freeze.set",
+        Some(&RequestId::generate().to_string()),
+        Some(set_args),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(3, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+    let clear_args = sonic_rs::to_string(&ruk_core::protocol::ReleaseFreezeClearArgs {
+        name: RefName::new("refs/tags/v1".to_string()).expect("tag name"),
+        owner_release_id: "rel-1".to_owned(),
+    })
+    .expect("freeze clear args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "release.freeze.clear",
+        Some(&RequestId::generate().to_string()),
+        Some(clear_args),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(5, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+    drop(driver);
+    task.abort();
+}
 
 #[tokio::test]
 async fn git_service_delete_only_receive_pack_round_trip() {
@@ -1057,7 +1532,7 @@ async fn git_service_delete_only_receive_pack_round_trip() {
     let text = String::from_utf8(stdout).expect("report is text");
     assert!(text.contains("unpack ok"), "report lands: {text}");
 
-    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let advert = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (stdout, exit) = driver.run_git(5, &advert, &[]).await;
     assert_eq!(exit.exit_code, 0);
     let refs = parse_advertised_refs(&stdout, "upload-pack");
@@ -1088,12 +1563,17 @@ async fn git_service_streams_progress_while_sibling_waits() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
 
-    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let advert = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
     assert_eq!(
         exit.exit_code, 0,
@@ -1188,8 +1668,10 @@ async fn reader_never_blocks_on_a_full_stream() {
             control: tx.clone(),
             data: _data_tx,
             outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -1239,8 +1721,10 @@ async fn reader_never_blocks_on_a_full_stream() {
             control: sib_tx,
             data: sib_data_tx,
             outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            outstanding_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -1519,7 +2003,12 @@ async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -1530,7 +2019,7 @@ async fn git_service_cancel_reports_cancelled_and_spares_siblings() {
     assert!(exit.cancelled);
     assert_eq!(exit.outcome, "CancelledBeforeCommit");
 
-    let advert = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let advert = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (stdout, exit) = driver.run_git(3, &advert, &[]).await;
     assert_eq!(exit.exit_code, 0, "a sibling stream survives the cancel");
     assert!(!stdout.is_empty());
@@ -1583,6 +2072,7 @@ async fn provenance_records_on_behalf_of_and_ignores_it_for_auth() {
         paths: vec![RepoPath::new("src").expect("test path")],
         ttl: ClaimTtl::new(60).expect("ttl"),
         mode: ClaimMode::Enforce,
+        subject: None,
     };
     let args_json = sonic_rs::to_string(&acquire_args).expect("acquire args encode");
     let payload = Driver::typed_open_obo(
@@ -1673,7 +2163,12 @@ async fn git_service_advertise_routes_by_protocol() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
-    let v0 = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let v0 = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     let (v0_out, exit) = driver.run_git(1, &v0, &[]).await;
     assert_eq!(exit.exit_code, 0);
 
@@ -1681,7 +2176,7 @@ async fn git_service_advertise_routes_by_protocol() {
         "upload-pack",
         &store_repo,
         true,
-        None,
+        Some(&session),
         None,
         "version=2",
         None,
@@ -2515,6 +3010,86 @@ async fn host_unauthorized_ref_refused_before_callback() {
     task.abort();
 }
 
+/// Writes the tag `name` at `target` plus a live released-tag marker for the
+/// same target under `repo_dir`: `release.freeze.set` needs the tag present.
+fn seed_released_tag(repo_dir: &Path, name: &str, owner: &str, target: Oid) {
+    use ruk_core::protocol::Timestamp;
+    use ruk_core::refs::{ReleasedTagMarker, prepare_release_freeze};
+    seed_ref(repo_dir, name, target);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let marker = ReleasedTagMarker {
+        owner_release_id: owner.to_owned(),
+        target_oid: target,
+        frozen_at: Timestamp::parse("1970-01-01T00:00:00Z").expect("freeze time"),
+    };
+    let tag = RefName::new(name.to_string()).expect("tag name");
+    let freeze = prepare_release_freeze(&store, &tag, &marker).expect("prepare freeze");
+    store
+        .publish(
+            Vec::new(),
+            &freeze,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish freeze");
+}
+
+#[tokio::test]
+async fn git_push_cannot_bypass_a_released_tag_freeze() {
+    let root = temp_root("tag-freeze-bypass");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_released_tag(&repo_dir, "refs/tags/v1", "rel-1", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let hex = commit.to_hex();
+    let zero = "0".repeat(40);
+    let mut body = pkt(format!("{hex} {zero} refs/tags/v1\n").as_bytes());
+    body.extend_from_slice(&flush());
+    let payload = git_open_payload(
+        "receive-pack",
+        &store_repo,
+        false,
+        Some(&session),
+        Some("req-tag-freeze-1"),
+    );
+    let (out, exit) = driver
+        .run_git_hosted(5, &payload, &[body], accept_all)
+        .await;
+    assert_eq!(exit.exit_code, 0);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("ng refs/tags/v1"), "got {text:?}");
+    assert!(
+        text.contains("rel-1"),
+        "the refusal names the owner: {text:?}"
+    );
+
+    let (_, _, coordinator) = registry.open(&store_repo).expect("open coordinator");
+    let tag = coordinator
+        .store()
+        .fact(FactTable::Refs, b"refs/tags/v1")
+        .expect("read tag");
+    assert!(tag.is_some(), "the frozen tag remains at its target");
+
+    drop(driver);
+    task.abort();
+}
+
 #[tokio::test]
 async fn hosted_atomic_push_refuses_before_pre_receive() {
     let root = temp_root("host-atomic");
@@ -3175,7 +3750,11 @@ async fn small_stdin_frames_within_window_are_not_refused() {
 
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
-    let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     assert_eq!(driver.recv().await.kind, FrameKind::Accepted);
     for chunk in &chunks {
@@ -3230,8 +3809,10 @@ async fn credit_exhaustion_removes_the_stream() {
             control: tx,
             data: data_tx,
             outstanding: Arc::new(AtomicU64::new(0)),
+            outstanding_frames: Arc::new(AtomicU64::new(0)),
             generation: 1,
             git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task: None,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -3256,6 +3837,269 @@ async fn credit_exhaustion_removes_the_stream() {
     assert_eq!(first.kind, FrameKind::Error);
     assert_eq!(first.stream_id, 7);
     let terminal = writer_rx.try_recv().expect("credit terminal exit");
+    assert_eq!(terminal.kind, FrameKind::Exit);
+    assert_eq!(terminal.stream_id, 7);
+}
+/// A `Stdin` frame that fills its window exactly is admitted: payload
+/// credit counts payload bytes, so an exact fill routes instead of
+/// refusing. Pre-fix the `+1` admission margin turned this exact fill
+/// into `E_LIMIT`.
+#[tokio::test]
+async fn exact_window_stdin_frame_is_admitted() {
+    use super::{route_stdin_frame, stdin_frame_limit};
+    use std::collections::HashMap;
+    let root = temp_root("exact-window");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes: 65_536,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    assert_eq!(stdin_frame_limit(65_536), 65);
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let (tx, _parked) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_BOUND);
+    let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outstanding = Arc::new(AtomicU64::new(0));
+    let outstanding_frames = Arc::new(AtomicU64::new(0));
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx,
+            data: data_tx,
+            outstanding: Arc::clone(&outstanding),
+            outstanding_frames: Arc::clone(&outstanding_frames),
+            generation: 1,
+            git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            task: None,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    );
+    let frame = ipc::Frame {
+        kind: FrameKind::Stdin,
+        stream_id: 7,
+        payload: vec![0u8; 65_536],
+    };
+    let routed = tokio::time::timeout(
+        Duration::from_secs(5),
+        route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+    )
+    .await
+    .expect("exact-window admission never blocks");
+    routed.expect("exact-window admission reports without error");
+    assert!(
+        streams.contains_key(&7),
+        "an exact window fill keeps its routing entry"
+    );
+    assert_eq!(outstanding.load(Ordering::SeqCst), 65_536);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 1);
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "no refusal is queued for an exact fill"
+    );
+    let queued = data_rx.try_recv().expect("admitted chunk queues");
+    assert_eq!(queued.payload.len(), 65_536);
+}
+
+/// A parked stream that fills its window exactly across many frames is
+/// not refused, and serve-side consume returns both counters so the
+/// window recycles. Eight 32 KiB frames fill a 256 KiB window exactly —
+/// the live signature from the defect. Pre-fix the per-chunk `+1`
+/// margin refused the final frame once the parked total crossed the
+/// window.
+#[tokio::test]
+async fn full_window_fill_with_parked_consumer_is_not_refused() {
+    use super::{admit_stdin_chunk, route_stdin_frame};
+    use std::collections::HashMap;
+    let window_bytes = 8 * 32 * 1024;
+    let root = temp_root("full-window");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let (tx, _parked) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_BOUND);
+    // Parked consumer: the receiver lives but never drains until every
+    // frame arrives.
+    let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outstanding = Arc::new(AtomicU64::new(0));
+    let outstanding_frames = Arc::new(AtomicU64::new(0));
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx,
+            data: data_tx,
+            outstanding: Arc::clone(&outstanding),
+            outstanding_frames: Arc::clone(&outstanding_frames),
+            generation: 1,
+            git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            task: None,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    );
+    for _ in 0..8 {
+        let frame = ipc::Frame {
+            kind: FrameKind::Stdin,
+            stream_id: 7,
+            payload: vec![0u8; 32 * 1024],
+        };
+        let routed = tokio::time::timeout(
+            Duration::from_secs(5),
+            route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+        )
+        .await
+        .expect("full-window admission never blocks");
+        routed.expect("full-window admission reports without error");
+    }
+    assert!(
+        streams.contains_key(&7),
+        "an exact multi-frame fill keeps its routing entry"
+    );
+    assert_eq!(outstanding.load(Ordering::SeqCst), window_bytes);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 8);
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "no refusal is queued for an exact fill"
+    );
+    // Serve-side consume spends protocol credit and releases both
+    // admission counters, emitting one grant per chunk.
+    let mut credits = ipc::StreamCredits::new(window_bytes);
+    credits.open_stream(7);
+    let sink = super::StreamSink {
+        writer: writer_tx.clone(),
+        stream_id: 7,
+    };
+    for _ in 0..8 {
+        let admitted = admit_stdin_chunk(
+            &sink,
+            &mut credits,
+            7,
+            &outstanding,
+            &outstanding_frames,
+            32 * 1024,
+        )
+        .await;
+        assert!(admitted, "consume grants each admitted chunk back");
+    }
+    assert_eq!(outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 0);
+    for _ in 0..8 {
+        let queued = data_rx.try_recv().expect("admitted chunks queue");
+        assert_eq!(queued.payload.len(), 32 * 1024);
+    }
+    for _ in 0..8 {
+        let grant = writer_rx.try_recv().expect("one grant per chunk");
+        assert_eq!(grant.kind, FrameKind::WindowUpdate);
+        assert_eq!(grant.stream_id, 7);
+    }
+    // The recycled window admits again.
+    let frame = ipc::Frame {
+        kind: FrameKind::Stdin,
+        stream_id: 7,
+        payload: vec![0u8; 32 * 1024],
+    };
+    let routed = tokio::time::timeout(
+        Duration::from_secs(5),
+        route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+    )
+    .await
+    .expect("recycled-window admission never blocks");
+    routed.expect("recycled-window admission reports without error");
+    assert!(
+        streams.contains_key(&7),
+        "the recycled window keeps its routing entry"
+    );
+}
+
+/// An empty-frame flood is refused once the admitted-but-unconsumed
+/// frame count passes the frame bound, even though empty chunks carry no
+/// payload credit against the byte window.
+#[tokio::test]
+async fn empty_stdin_frame_flood_is_refused() {
+    use super::{route_stdin_frame, stdin_frame_limit};
+    use std::collections::HashMap;
+    let window_bytes = 65_536;
+    // One full-size frame per window plus the documented slack of 64.
+    assert_eq!(stdin_frame_limit(window_bytes), 65);
+    let root = temp_root("empty-flood");
+    let registry = Arc::new(Registry::new(vec![root]).expect("registry"));
+    let refs = ConnectionRefs {
+        registry,
+        executor: BoundedExecutor::new(4).expect("executor"),
+        transport: BoundedExecutor::new(4).expect("transport"),
+        window_bytes,
+        handshake_timeout: Duration::from_secs(10),
+        frame_timeout: Duration::from_secs(15),
+        allowed_uids: Vec::new(),
+        admin_uids: Vec::new(),
+    };
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(256);
+    let mut streams: HashMap<u64, super::StreamRoute> = HashMap::new();
+    let (tx, _parked) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_BOUND);
+    let (data_tx, _data_parked) = tokio::sync::mpsc::unbounded_channel();
+    let outstanding = Arc::new(AtomicU64::new(0));
+    let outstanding_frames = Arc::new(AtomicU64::new(0));
+    streams.insert(
+        7,
+        super::StreamRoute {
+            control: tx,
+            data: data_tx,
+            outstanding: Arc::clone(&outstanding),
+            outstanding_frames: Arc::clone(&outstanding_frames),
+            generation: 1,
+            git: true,
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            task: None,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    );
+    let mut refused_at = None;
+    for index in 0..80 {
+        let frame = ipc::Frame {
+            kind: FrameKind::Stdin,
+            stream_id: 7,
+            payload: Vec::new(),
+        };
+        let routed = tokio::time::timeout(
+            Duration::from_secs(5),
+            route_stdin_frame(&writer_tx, &mut streams, &refs, 7, frame),
+        )
+        .await
+        .expect("flood admission never blocks");
+        routed.expect("flood admission reports without error");
+        if !streams.contains_key(&7) {
+            refused_at = Some(index);
+            break;
+        }
+    }
+    assert_eq!(
+        refused_at,
+        Some(65),
+        "the 66th empty frame trips the bound of 65"
+    );
+    // The refused chunk rolls both counters back; the byte counter never
+    // moved because empty chunks carry no payload credit.
+    assert_eq!(outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(outstanding_frames.load(Ordering::SeqCst), 65);
+    let first = writer_rx.try_recv().expect("flood error frame");
+    assert_eq!(first.kind, FrameKind::Error);
+    assert_eq!(first.stream_id, 7);
+    let terminal = writer_rx.try_recv().expect("flood terminal exit");
     assert_eq!(terminal.kind, FrameKind::Exit);
     assert_eq!(terminal.stream_id, 7);
 }
@@ -3351,7 +4195,11 @@ async fn frame_kind_9_rejected_on_any_stream() {
 
     let (mut driver, _registry, task) = spawn_hosted(&root, 10_000);
     handshake(&mut driver).await;
-    let payload = git_open_payload("upload-pack", &store_repo, true, None, None);
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let payload = git_open_payload("upload-pack", &store_repo, true, Some(&session), None);
     driver.send(FrameKind::Open, 1, &payload).await;
     let accepted = driver.recv().await;
     assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -3391,8 +4239,13 @@ async fn hook_frames_misplaced_on_git_stdin_are_refused() {
     let (mut driver, task) = spawn_pair(&root);
     handshake(&mut driver).await;
 
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
     for (stream_id, kind) in [(1u64, FrameKind::HookCall), (3u64, FrameKind::HookReply)] {
-        let payload = git_open_payload("upload-pack", &store_repo, false, None, None);
+        let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
         driver.send(FrameKind::Open, stream_id, &payload).await;
         let accepted = driver.recv().await;
         assert_eq!(accepted.kind, FrameKind::Accepted);
@@ -4853,6 +5706,7 @@ async fn typed_claim_acquire_and_release_round_trip() {
         paths: vec![RepoPath::new("src").expect("test path")],
         ttl: ClaimTtl::new(60).expect("ttl"),
         mode: ClaimMode::Enforce,
+        subject: None,
     };
     let args_json = sonic_rs::to_string(&acquire_args).expect("acquire args encode");
     let payload = Driver::typed_open(
@@ -5480,13 +6334,116 @@ async fn typed_land_execute_refusal_names_plan() {
 }
 
 #[tokio::test]
+async fn disconnected_serve_drains_queued_hook_exchange() {
+    use ruk_core::capability::{Capabilities, RefPattern};
+    use ruk_git::transport::host::{HostPolicy, hook_bridge};
+    use ruk_git::transport::policy::{ReceiveBatch, ReceiveCommand, ReceivePolicy, RefVerdict};
+
+    let caps = Capabilities {
+        push_refs: vec![RefPattern::parse("refs/heads/**").expect("pattern parses")],
+        ..Capabilities::default()
+    };
+    let (client, mut server) = hook_bridge();
+    let policy = std::sync::Arc::new(HostPolicy::new(
+        caps,
+        std::time::Duration::from_secs(30),
+        client,
+    ));
+    let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+    // The worker judges on its own thread and parks in `exchange`,
+    // exactly as the bulkhead serve does; nothing here relays hook
+    // frames, so the queued exchange would hang a bare `serve.await`.
+    std::thread::spawn(move || {
+        let kind = ruk_core::ids::HashKind::Sha256;
+        let tip = Oid::from_bytes(&[1u8; 32]).expect("tip parses");
+        let commands = [ReceiveCommand {
+            name: b"refs/heads/main".to_vec(),
+            old: kind.zero_oid(),
+            new: tip,
+            live: true,
+        }];
+        let batch = ReceiveBatch {
+            commands: &commands,
+            push_options: &[],
+            push_options_negotiated: false,
+            quarantine: None,
+            kind,
+            atomic: false,
+            interrupt: &Interrupt::none(),
+            new_commits: vec![tip],
+            new_commits_truncated: false,
+            pack_bytes: 0,
+        };
+        let verdicts = policy.pre_receive(&batch);
+        let _ = verdict_tx.send(verdicts);
+    });
+    // The serve half completes once the worker observes the drained
+    // refusal; the assertions below run on that completion.
+    let serve = async move {
+        let verdicts = verdict_rx
+            .await
+            .map_err(|_| CoreError::new(ErrorCode::EIo, "hook worker died"))?;
+        assert!(
+            matches!(verdicts.as_slice(), [RefVerdict::RejectPush { .. }]),
+            "drained exchange fails the push closed: {verdicts:?}"
+        );
+        Ok::<_, CoreError>(Ok((vec![7u8], vec![3u64])))
+    };
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        super::drain_disconnected_serve(serve, &mut server),
+    )
+    .await
+    .expect("drain finishes instead of hanging")
+    .expect("serve outcome relays");
+    assert_eq!(out, (vec![7u8], vec![3u64]));
+}
+
+#[tokio::test]
+async fn policy_set_needs_an_admin_peer() {
+    let root = temp_root("policy-admin");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(1, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+    let args = sonic_rs::to_string(&ruk_core::protocol::PolicySetArgs {
+        requirements: Vec::new(),
+        trusted_signers: Vec::new(),
+    })
+    .expect("policy args encode");
+    let payload = Driver::typed_open(
+        &store_repo,
+        "policy.set",
+        Some(&RequestId::generate().to_string()),
+        Some(args),
+        Some(&session),
+    );
+    let (report, _) = driver.expect_typed_refused(3, &payload).await;
+    assert_eq!(report.code, ErrorCode::EForbidden);
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
 async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
     use ruk_core::coord::{Principal, cancellation};
 
     use super::{Caller, InvocationOpen, dispatch_admin, registry::Registry};
 
     let root = temp_root("admin-dispatch");
-    let registry = Registry::new(vec![root.clone()]).expect("registry opens");
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry opens"));
+    let executor = BoundedExecutor::new(1).expect("executor");
     let root_str = root.to_str().expect("utf8 root").to_owned();
     let init_args = ruk_core::protocol::RepoInitArgs {
         root: root_str,
@@ -5501,6 +6458,7 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         args_json: Some(sonic_rs::to_string(&init_args).expect("init args encode")),
         session_id: None,
         on_behalf_of: None,
+        transport_auth: TransportAuth::default(),
     };
     let (_handle, cancel) = cancellation();
     let _ = &cancel;
@@ -5508,7 +6466,7 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         principal: &Principal::from_peer_uid(1000),
         admin_uids: &[1000],
     };
-    let bytes = dispatch_admin(&registry, admin, &open, Method::RepoInit)
+    let bytes = dispatch_admin(&registry, &executor, admin, &open, Method::RepoInit)
         .await
         .expect("admin repo.init serves");
     let envelope: ReplyEnvelope = ipc::decode_control(&bytes).expect("reply decodes");
@@ -5525,7 +6483,7 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         principal: &Principal::from_peer_uid(2000),
         admin_uids: &[1000],
     };
-    let err = dispatch_admin(&registry, outsider, &open, Method::RepoInit)
+    let err = dispatch_admin(&registry, &executor, outsider, &open, Method::RepoInit)
         .await
         .expect_err("non-admin refused");
     assert_eq!(err.code, ErrorCode::EForbidden);
@@ -5533,18 +6491,58 @@ async fn admin_dispatch_serves_repo_lifecycle_before_any_coordinator_call() {
         repo: String::new(),
         method: "repo.fork".to_string(),
         request_id: None,
-        args_json: Some("{\"source\":\"acme/hello\",\"path\":\"acme/fork\"}".to_string()),
+        args_json: Some(
+            sonic_rs::to_string(&RepoForkArgs {
+                source: created.path.clone(),
+                path: root
+                    .join("acme/fork")
+                    .to_str()
+                    .expect("utf8 path")
+                    .to_owned(),
+                refs: None,
+            })
+            .expect("fork args encode"),
+        ),
         session_id: None,
         on_behalf_of: None,
+        transport_auth: TransportAuth::default(),
     };
     let admin = Caller {
         principal: &Principal::from_peer_uid(1000),
         admin_uids: &[1000],
     };
-    let err = dispatch_admin(&registry, admin, &forked, Method::RepoFork)
-        .await
-        .expect_err("unserved admin refuses");
-    assert_eq!(err.code, ErrorCode::EHosted);
+    let (holding_tx, holding_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let blocker = {
+        let exec = executor.clone();
+        tokio::spawn(async move {
+            let _ = exec
+                .run(move || {
+                    let _ = holding_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                })
+                .await;
+        })
+    };
+    holding_rx.await.expect("blocker holds permit");
+    assert_eq!(executor.available(), 0);
+
+    let dispatch_fut = dispatch_admin(&registry, &executor, admin, &forked, Method::RepoFork);
+    tokio::pin!(dispatch_fut);
+    tokio::select! {
+        _ = &mut dispatch_fut => panic!("fork must wait for executor permit"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    let _ = release_tx.send(());
+    let bytes = dispatch_fut.await.expect("admin repo.fork serves");
+    let _ = blocker.await;
+    assert_eq!(executor.available(), 1);
+    let envelope: ReplyEnvelope = ipc::decode_control(&bytes).expect("reply decodes");
+    let ReplyBody::Success(Reply::RepoFork(forked)) = envelope.body else {
+        panic!("repo.fork must answer its own reply");
+    };
+    assert!(forked.path.ends_with("acme/fork"));
+    assert_ne!(forked.store_id, created.store_id);
 }
 
 #[tokio::test]
@@ -5599,6 +6597,7 @@ async fn largest_served_tail_page_fits_control_bound() {
         args_json: Some("{\"after\":0,\"limit\":1000}".to_string()),
         session_id: Some(session.to_string()),
         on_behalf_of: None,
+        transport_auth: TransportAuth::default(),
     };
     let caller = Caller {
         principal: &peer,
@@ -5671,4 +6670,1465 @@ async fn cancelled_run_keeps_its_permit_until_the_worker_finishes() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// A feed write past a parked serve reader returns instead of parking the
+/// stream task: the peer sips once, then never reads again, so any payload
+/// past the pipe buffer would park a bare `write_all` forever. The bounded
+/// feed reports `Stalled` within its timeout, a closed peer reports
+/// `Broken`, and a tripped flag reports `Stalled` without touching the
+/// pipe. The joins below bound the whole probe so a regression to an
+/// unbounded write fails instead of hanging the suite.
+#[tokio::test]
+async fn stalled_serve_feed_returns_within_its_timeout() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    use super::{FeedFate, feed_serve_stdin};
+
+    let (task_end, peer_end) = StdUnixStream::pair().expect("socket pair");
+    let shutdown = task_end.try_clone().expect("shutdown handle");
+    // A reader that sips once, then parks forever: the pipe stays full for
+    // any payload past the buffer, so a bare `write_all` below would never
+    // return.
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut peer_end = peer_end;
+        let mut sip = [0u8; 4096];
+        let _ = peer_end.read_exact(&mut sip);
+        std::thread::sleep(Duration::from_secs(60));
+    });
+    task_end
+        .set_nonblocking(true)
+        .expect("nonblocking task socket");
+    let task_sock = tokio::net::UnixStream::from_std(task_end).expect("tokio wrap");
+    let (_, mut task_write) = task_sock.into_split();
+    let flag = Arc::new(AtomicBool::new(false));
+    let payload = vec![0xAB; 8 << 20];
+    let started = Instant::now();
+    let feed = tokio::spawn(async move {
+        feed_serve_stdin(
+            &mut task_write,
+            &payload,
+            &flag,
+            &shutdown,
+            Duration::from_millis(500),
+        )
+        .await
+    });
+    let fate = tokio::time::timeout(Duration::from_secs(10), feed)
+        .await
+        .expect("the bounded feed never parks the task")
+        .expect("the feed task runs");
+    assert!(
+        matches!(fate, FeedFate::Stalled),
+        "a parked reader stalls the feed instead of completing it"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "the stall surfaces at the timeout, proving the write really parked"
+    );
+
+    // A closed peer fails the feed at once instead of parking it.
+    let (closed_end, gone_end) = StdUnixStream::pair().expect("socket pair");
+    drop(gone_end);
+    let closed_shutdown = closed_end.try_clone().expect("shutdown handle");
+    closed_end
+        .set_nonblocking(true)
+        .expect("nonblocking closed socket");
+    let closed_sock = tokio::net::UnixStream::from_std(closed_end).expect("tokio wrap");
+    let (_, mut closed_write) = closed_sock.into_split();
+    let closed_flag = Arc::new(AtomicBool::new(false));
+    let fate = tokio::time::timeout(
+        Duration::from_secs(10),
+        feed_serve_stdin(
+            &mut closed_write,
+            &[0xAB; 1],
+            &closed_flag,
+            &closed_shutdown,
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("a broken feed never parks");
+    assert!(
+        matches!(fate, FeedFate::Broken),
+        "a closed peer breaks the feed instead of stalling it"
+    );
+
+    // A tripped flag stalls the feed before it touches the pipe: the byte
+    // below would fit the empty buffer, so only the halt explains the
+    // stall.
+    let (live_end, _live_peer) = StdUnixStream::pair().expect("socket pair");
+    let live_shutdown = live_end.try_clone().expect("shutdown handle");
+    live_end
+        .set_nonblocking(true)
+        .expect("nonblocking live socket");
+    let live_sock = tokio::net::UnixStream::from_std(live_end).expect("tokio wrap");
+    let (_, mut live_write) = live_sock.into_split();
+    let tripped = Arc::new(AtomicBool::new(true));
+    let fate = tokio::time::timeout(
+        Duration::from_secs(10),
+        feed_serve_stdin(
+            &mut live_write,
+            &[0xAB; 1],
+            &tripped,
+            &live_shutdown,
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("a halted feed never parks");
+    assert!(
+        matches!(fate, FeedFate::Stalled),
+        "a tripped flag stalls the feed without writing"
+    );
+}
+
+/// Killing the connection reader ends every live stream and returns its
+/// executor permit: the teardown trips each cancel flag, halts each task
+/// socket so a worker parked in its socket read unblocks, and aborts each
+/// spawned task. The worker below and the feed below park against each
+/// other on one socketpair full in both directions — the one park a
+/// channel close cannot reach — so dropping the routes without the halt
+/// and the abort would strand both and keep the permit forever.
+#[tokio::test]
+async fn teardown_unparks_stream_and_worker_and_returns_the_permit() {
+    use std::collections::HashMap;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::sync::atomic::AtomicBool;
+
+    use super::{feed_serve_stdin, teardown_streams};
+
+    let executor = BoundedExecutor::new(1).expect("one permit");
+    let (task_end, worker_end) = StdUnixStream::pair().expect("socket pair");
+    let slot_sock = task_end.try_clone().expect("teardown handle");
+    let feed_halt = task_end.try_clone().expect("feed halt handle");
+    task_end
+        .set_nonblocking(true)
+        .expect("nonblocking task socket");
+    let task_sock = tokio::net::UnixStream::from_std(task_end).expect("tokio wrap");
+    let (_, mut task_write) = task_sock.into_split();
+    let slot = Arc::new(std::sync::Mutex::new(Some(slot_sock)));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    // The worker sips the request, then floods a response nobody drains:
+    // it parks once the task stops reading, while the task below parks
+    // once the worker stops reading.
+    let worker_executor = executor.clone();
+    let worker = tokio::spawn(async move {
+        worker_executor
+            .run(move || {
+                use std::io::{Read as _, Write as _};
+                let mut worker_end = worker_end;
+                let mut sip = [0u8; 4096];
+                worker_end
+                    .read_exact(&mut sip)
+                    .expect("request sip arrives");
+                let flood = vec![7u8; 8 << 20];
+                let _ = worker_end.write_all(&flood);
+            })
+            .await
+    });
+    // The stream task floods a request the worker stops reading: it parks
+    // once the pipe fills. The long helper bound proves the teardown (not
+    // the timeout) is what unparks it.
+    let feed_flag = Arc::clone(&cancel_flag);
+    let task = tokio::spawn(async move {
+        let flood = vec![3u8; 8 << 20];
+        let _ = feed_serve_stdin(
+            &mut task_write,
+            &flood,
+            &feed_flag,
+            &feed_halt,
+            Duration::from_secs(60),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !task.is_finished(),
+        "the feed parks against the full pipe before teardown"
+    );
+    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+    let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut streams = HashMap::new();
+    streams.insert(
+        7u64,
+        super::StreamRoute {
+            control: control_tx,
+            data: data_tx,
+            shutdown: Arc::clone(&slot),
+            outstanding: Arc::new(AtomicU64::new(0)),
+            outstanding_frames: Arc::new(AtomicU64::new(0)),
+            generation: 1,
+            git: true,
+            task: Some(task),
+            cancel_flag: Arc::clone(&cancel_flag),
+        },
+    );
+    teardown_streams(&streams);
+    assert!(
+        cancel_flag.load(Ordering::SeqCst),
+        "teardown trips every live stream"
+    );
+    let task = streams
+        .get_mut(&7)
+        .expect("route survives teardown")
+        .task
+        .take()
+        .expect("stream task");
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("teardown ends the parked stream task promptly");
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("the halted worker finishes promptly")
+        .expect("the worker task runs")
+        .expect("the worker reports");
+    assert_eq!(
+        executor.available(),
+        1,
+        "the detached worker returned its permit"
+    );
+    let probe = tokio::time::timeout(Duration::from_secs(10), executor.run(|| 7u32))
+        .await
+        .expect("the pool accepts new work after teardown")
+        .expect("the probe runs");
+    assert_eq!(probe, 7);
+}
+
+/// A client that never grants outbound credit sees a terminal `Error`
+/// instead of a silent truncation: the schema reply dwarfs the window, so
+/// the first chunk waits at once, the grant wait hits the frame timeout,
+/// and the stream ends with `Error` plus its terminal `Exit`. The frame
+/// reads below bound the whole probe: an unbounded wait fails at the
+/// fifteen-second frame deadline instead of hanging the suite.
+#[tokio::test]
+async fn outbound_credit_gap_errors_within_the_bound() {
+    let root = temp_root("credit-deadline");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    // The window is smaller than one chunk of the schema reply, so the
+    // first write waits at once; the driver never grants.
+    let (mut driver, task) =
+        spawn_pair_with_window_and_frame_timeout(&root, 1024, Duration::from_secs(1));
+    handshake(&mut driver).await;
+    let typed = Driver::typed_open(&store_repo, "schema", None, None, None);
+    let started = std::time::Instant::now();
+    driver.send(FrameKind::Open, 3, &typed).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 3);
+    // The connection reader reaps a silent connection after one frame
+    // timeout — the same bound as the grant wait — so bare silence would
+    // race the two and prove nothing. Keepalive credit updates on an
+    // unknown stream hold the connection open without granting the stalled
+    // stream anything, so the stream's own bound is what ends it.
+    let keepalive = r#"{"credit_bytes":1,"direction":"stdout"}"#;
+    let mut saw_error = false;
+    let mut saw_exit = false;
+    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(400), driver.recv()).await {
+                Ok(frame) => match (frame.stream_id, frame.kind) {
+                    (3, FrameKind::Error) => {
+                        let reply: ErrorReply =
+                            ipc::decode_control(&frame.payload).expect("error decodes");
+                        assert_eq!(reply.code, ErrorCode::EIo);
+                        saw_error = true;
+                    }
+                    (3, FrameKind::Exit) => {
+                        let report: ExitReport =
+                            ipc::decode_control(&frame.payload).expect("exit decodes");
+                        assert_eq!(report.status, 1);
+                        assert_eq!(report.outcome, "Failed");
+                        saw_exit = true;
+                    }
+                    (3, FrameKind::Stdout) => {
+                        panic!("no body byte precedes the grant error")
+                    }
+                    (9, FrameKind::Error | FrameKind::Exit) => {}
+                    (id, kind) => panic!("unexpected frame {kind:?} on stream {id}"),
+                },
+                Err(_) => {
+                    driver
+                        .send(FrameKind::WindowUpdate, 9, keepalive.as_bytes())
+                        .await;
+                }
+            }
+            if saw_error && saw_exit {
+                break;
+            }
+        }
+    })
+    .await;
+    ended.expect("the grant gap ends the stream instead of hanging the suite");
+    assert!(
+        saw_error && saw_exit,
+        "the grant gap errors instead of truncating"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the gap surfaces at the frame timeout, not past it"
+    );
+    drop(driver);
+    task.abort();
+}
+
+/// End-to-end counterpart to the seam probes above: a driver opens a
+/// streaming upload, sends `Stdin`, cancels, and closes, and the
+/// connection task ends promptly. A deterministic feed park is not
+/// constructible through the driver (a live serve drains the pipe as fast
+/// as the task feeds it; only a held read end parks it), so the parked
+/// proof lives in `stalled_serve_feed_returns_within_its_timeout` and the
+/// teardown proof in `teardown_unparks_stream_and_worker_and_returns_the_permit`;
+/// this test pins the composed choreography instead.
+#[tokio::test]
+async fn streaming_cancel_after_stdin_ends_connection_promptly() {
+    let root = temp_root("streaming-cancel-drop");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+
+    let payload = Driver::typed_open(&store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(7, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    let session = opened.session.to_string();
+
+    let payload = git_open_payload("upload-pack", &store_repo, false, Some(&session), None);
+    driver.send(FrameKind::Open, 1, &payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, 1);
+
+    // Partial negotiation: the serve blocks waiting for `done` while the
+    // stream task feeds and idles. The grants and the NAK fit the buffers,
+    // so nothing here needs draining before the cancel.
+    let frames = [
+        pkt(format!("want {}\n", commit.to_hex()).as_bytes()),
+        flush(),
+        pkt(b"have 0000000000000000000000000000000000000000\n"),
+        flush(),
+    ];
+    for frame in &frames {
+        driver.send(FrameKind::Stdin, 1, frame).await;
+    }
+    driver.send(FrameKind::Cancel, 1, &[]).await;
+    drop(driver);
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the connection ends promptly after cancel and close");
+}
+
+#[test]
+fn injected_auth_never_enters_the_service_digest() {
+    use ruk_git::transport::credentials::{TransportAuth, TransportAuthKind};
+
+    let authed = InvocationOpen {
+        repo: "acme/hello".to_owned(),
+        method: "push".to_owned(),
+        request_id: Some("req-1".to_owned()),
+        args_json: None,
+        session_id: None,
+        on_behalf_of: None,
+        transport_auth: TransportAuth {
+            kind: TransportAuthKind::Bearer,
+            credential: "tok_s3cret".to_owned(),
+            origin: "https://host.x:443".to_owned(),
+        },
+    };
+    let frame = sonic_rs::to_vec(&authed).expect("authed open encodes");
+    let decoded: InvocationOpen = sonic_rs::from_slice(&frame).expect("authed open decodes");
+    let undo = || {
+        Request::Undo(Box::new(Mutation {
+            request_id: RequestId::generate(),
+            args: UndoArgs {
+                operation: OperationId(7),
+            },
+        }))
+    };
+    let anonymous = super::invocation_digest(&undo(), &TransportAuth::none())
+        .expect("encodable")
+        .expect("a mutation digests");
+    assert!(
+        decoded
+            .transport_auth
+            .header_for("https://host.x/r.git")
+            .is_some()
+    );
+    let carried = super::invocation_digest(&undo(), &decoded.transport_auth)
+        .expect("encodable")
+        .expect("a mutation digests");
+    assert_eq!(anonymous, carried);
+    let moved = super::invocation_digest(
+        &Request::Undo(Box::new(Mutation {
+            request_id: RequestId::generate(),
+            args: UndoArgs {
+                operation: OperationId(8),
+            },
+        })),
+        &decoded.transport_auth,
+    )
+    .expect("encodable")
+    .expect("a mutation digests");
+    assert_ne!(anonymous, moved);
+    let half = TransportAuth {
+        kind: TransportAuthKind::Bearer,
+        credential: String::new(),
+        origin: "https://host.x:443".to_owned(),
+    };
+    super::invocation_digest(&undo(), &half).expect_err("half-specified auth fails closed");
+    let rendered = format!("{decoded:?}");
+    assert!(!rendered.contains("tok_s3cret"), "{rendered:?}");
+}
+
+/// Mints one stored commit with a single file directly in the repository
+/// store, returning the commit behind it.
+fn seed_file_commit(repo_dir: &Path) -> Oid {
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let blob = store
+        .prepare(ObjectKind::Blob, 6, &b"hello\n"[..], None)
+        .expect("prepare blob");
+    let blob_oid = blob.oid();
+    store
+        .publish(
+            vec![blob],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish blob");
+    let mut tree_bytes = Vec::new();
+    tree_bytes.extend_from_slice(b"100644 a.txt\0");
+    tree_bytes.extend_from_slice(blob_oid.as_bytes());
+    let tree = store
+        .prepare(
+            ObjectKind::Tree,
+            u64::try_from(tree_bytes.len()).expect("tree fits"),
+            &tree_bytes[..],
+            None,
+        )
+        .expect("prepare tree");
+    let tree_oid = tree.oid();
+    store
+        .publish(
+            vec![tree],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish tree");
+    let signature = Signature {
+        name: ByteString::from("Tag"),
+        email: ByteString::from("tag@example.invalid"),
+        timestamp: 1_700_000_000,
+        offset: TzOffset::UTC,
+    };
+    let prepared = prepare_new(
+        &store,
+        NewRequest {
+            tree: tree_oid,
+            parents: Vec::new(),
+            author: signature.clone(),
+            committer: signature,
+            message: ByteString::from("seed"),
+            change_id: None,
+            predecessor: None,
+            provenance: None,
+        },
+    )
+    .expect("prepare seed commit");
+    let oid = prepared.output.oid.expect("seed commit is a Git commit");
+    store
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed commit");
+    oid
+}
+
+/// Opens a plain session for typed reads.
+async fn open_read_session(driver: &mut Driver, store_repo: &str) -> String {
+    let payload = Driver::typed_open(store_repo, "session.open", None, None, None);
+    let (stdout, _) = driver.run_typed(3, &payload).await;
+    let opened: SessionOpened = ipc::decode_control(&stdout).expect("session opened decodes");
+    opened.session.to_string()
+}
+
+/// Runs one archive open to its terminal `Exit`, returning the accepted
+/// metadata and the streamed body. Panics on refusal: refusals go through
+/// `expect_archive_refused`.
+async fn run_archive_ok(
+    driver: &mut Driver,
+    stream_id: u64,
+    payload: &[u8],
+    pre_grant: bool,
+) -> (ArchiveAcceptedResult, Vec<u8>) {
+    driver.send(FrameKind::Open, stream_id, payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, stream_id);
+    let reply: InvocationAccepted =
+        ipc::decode_control(&accepted.payload).expect("archive accepted decodes");
+    let result = reply
+        .result
+        .expect("a served archive answers its metadata in Accepted");
+    let mut body = Vec::new();
+    loop {
+        if pre_grant {
+            let grant = r#"{"credit_bytes":65536,"direction":"stdout"}"#;
+            driver
+                .send(FrameKind::WindowUpdate, stream_id, grant.as_bytes())
+                .await;
+        }
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, stream_id);
+        match frame.kind {
+            FrameKind::Stdout => body.extend_from_slice(&frame.payload),
+            FrameKind::Exit => {
+                let exit: ExitReport =
+                    ipc::decode_control(&frame.payload).expect("archive exit decodes");
+                assert_eq!(exit.status, 0);
+                assert_eq!(exit.code, "OK");
+                assert_eq!(exit.outcome, "Completed");
+                return (result, body);
+            }
+            FrameKind::Error => panic!(
+                "archive stream {stream_id} refused: {}",
+                String::from_utf8_lossy(&frame.payload)
+            ),
+            other => panic!("unexpected frame {other:?} on archive stream {stream_id}"),
+        }
+    }
+}
+
+/// Runs one archive open expecting refusal: `Accepted` with an empty
+/// result, no body byte, then an `Error` and a failed `Exit`.
+async fn expect_archive_refused(driver: &mut Driver, stream_id: u64, payload: &[u8]) -> ErrorReply {
+    driver.send(FrameKind::Open, stream_id, payload).await;
+    let accepted = driver.recv().await;
+    assert_eq!(accepted.kind, FrameKind::Accepted);
+    assert_eq!(accepted.stream_id, stream_id);
+    let reply: InvocationAccepted =
+        ipc::decode_control(&accepted.payload).expect("archive accepted decodes");
+    assert_eq!(reply.result, None, "a refused archive carries no metadata");
+    let mut body = 0;
+    loop {
+        let frame = driver.recv().await;
+        assert_eq!(frame.stream_id, stream_id);
+        match frame.kind {
+            FrameKind::Stdout => body += frame.payload.len(),
+            FrameKind::Error => {
+                let report: ErrorReply =
+                    ipc::decode_control(&frame.payload).expect("error decodes");
+                let exit_frame = driver.recv().await;
+                assert_eq!(exit_frame.kind, FrameKind::Exit);
+                let exit: ExitReport =
+                    ipc::decode_control(&exit_frame.payload).expect("exit decodes");
+                assert_eq!(exit.status, 1);
+                assert_eq!(exit.outcome, "Failed");
+                assert_eq!(body, 0, "no body byte precedes the refusal");
+                return report;
+            }
+            other => panic!("unexpected frame {other:?} on refused archive {stream_id}"),
+        }
+    }
+}
+
+fn archive_payload(
+    store_repo: &str,
+    session: &str,
+    args: &ruk_core::protocol::ArchiveArgs,
+) -> Vec<u8> {
+    let args_json = sonic_rs::to_string(args).expect("archive args encode");
+    Driver::typed_open(store_repo, "archive", None, Some(args_json), Some(session))
+}
+
+#[tokio::test]
+async fn archive_typed_stream_reports_result_and_tar_body() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-tar");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Ref(RefName::new("refs/heads/main").expect("ref name")),
+        format: None,
+    };
+    let (result, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        false,
+    )
+    .await;
+    assert_eq!(result.commit, commit);
+    assert_eq!(result.format, ArchiveFormat::Tar);
+    assert_eq!(result.content_type, "application/x-tar");
+    assert!(
+        body.windows(commit.to_hex().len())
+            .any(|w| w == commit.to_hex().as_bytes()),
+        "the global header names the commit"
+    );
+    assert!(
+        body.windows(5).any(|w| w == b"a.txt"),
+        "the walked file is in the stream"
+    );
+    assert!(
+        body.windows(6).any(|w| w == b"hello\n"),
+        "the file payload streams"
+    );
+    assert!(
+        body.len() >= 1024 && body[body.len() - 1024..].iter().all(|b| *b == 0),
+        "two zero blocks close the stream"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_zip_transcodes_through_shared_transcoder() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-zip");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Zip),
+    };
+    let (result, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        false,
+    )
+    .await;
+    assert_eq!(result.commit, commit);
+    assert_eq!(result.format, ArchiveFormat::Zip);
+    assert_eq!(result.content_type, "application/zip");
+    assert_eq!(&body[..4], b"PK\x03\x04", "the stream is a zip file");
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body)).expect("zip parses");
+    assert_eq!(zip.len(), 1);
+    let mut entry = zip.by_index(0).expect("one entry");
+    assert_eq!(entry.name().expect("entry name"), "a.txt");
+    let mut contents = Vec::new();
+    use std::io::Read as _;
+    entry.read_to_end(&mut contents).expect("zip entry reads");
+    assert_eq!(contents, b"hello\n");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_limit_fails_before_first_byte() {
+    use ruk_core::protocol::{ArchiveArgs, CommitRev};
+    let root = temp_root("archive-limit");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    registry.set_archive_max_bytes(16);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: None,
+    };
+    let report = expect_archive_refused(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+    )
+    .await;
+    assert_eq!(report.code.as_str(), "E_LIMIT");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_unknown_rev_refused_without_metadata() {
+    use ruk_core::protocol::{ArchiveArgs, CommitRev};
+    let root = temp_root("archive-unknown");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let missing = Oid::from_bytes(&[0xab; 20]).expect("fixture oid");
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(missing),
+        format: None,
+    };
+    let report = expect_archive_refused(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+    )
+    .await;
+    assert_eq!(report.code.as_str(), "E_NOT_FOUND");
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_stream_waits_for_credit() {
+    use ruk_core::protocol::{ArchiveArgs, CommitRev};
+    let root = temp_root("archive-credit");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let commit = seed_file_commit(&repo_dir);
+    seed_ref(&repo_dir, "refs/heads/main", commit);
+
+    let (mut driver, task) = spawn_pair_with_window(&root, 512);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: None,
+    };
+    let (result, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        true,
+    )
+    .await;
+    assert_eq!(result.commit, commit);
+    assert!(
+        body.len() > 512,
+        "the body exceeds the window and still completes: {} bytes",
+        body.len()
+    );
+    assert!(
+        body.windows(6).any(|w| w == b"hello\n"),
+        "the file payload streams through grants"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+/// Mints one stored commit whose single file `a.txt` carries `content`.
+fn seed_content_commit(repo_dir: &Path, content: &[u8]) -> Oid {
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let length = u64::try_from(content.len()).expect("content fits in u64");
+    let blob = store
+        .prepare(ObjectKind::Blob, length, content, None)
+        .expect("prepare blob");
+    let blob_oid = blob.oid();
+    store
+        .publish(
+            vec![blob],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish blob");
+    let mut tree_bytes = Vec::new();
+    tree_bytes.extend_from_slice(b"100644 a.txt\0");
+    tree_bytes.extend_from_slice(blob_oid.as_bytes());
+    let tree_len = u64::try_from(tree_bytes.len()).expect("tree fits in u64");
+    let tree = store
+        .prepare(ObjectKind::Tree, tree_len, &tree_bytes[..], None)
+        .expect("prepare tree");
+    let tree_oid = tree.oid();
+    store
+        .publish(
+            vec![tree],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish tree");
+    let signature = Signature {
+        name: ByteString::from("Tag"),
+        email: ByteString::from("tag@example.invalid"),
+        timestamp: 1_700_000_000,
+        offset: TzOffset::UTC,
+    };
+    let prepared = prepare_new(
+        &store,
+        NewRequest {
+            tree: tree_oid,
+            parents: Vec::new(),
+            author: signature.clone(),
+            committer: signature,
+            message: ByteString::from("seed"),
+            change_id: None,
+            predecessor: None,
+            provenance: None,
+        },
+    )
+    .expect("prepare seed commit");
+    let oid = prepared.output.oid.expect("seed commit is a Git commit");
+    store
+        .publish(
+            prepared.objects,
+            &prepared.facts,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed commit");
+    oid
+}
+
+/// Pseudo-random bytes: incompressible, so deflate takes its stored fallback
+/// and the zip bound is exercised at its worst case.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0x2545_f491;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        out.push(state.to_le_bytes()[0]);
+    }
+    out
+}
+
+/// Seeds the incompressible commit and measures it before any stream opens.
+fn measured_incompressible_commit(
+    repo_dir: &Path,
+) -> (Oid, ruk_git::transport::archive::ArchiveSize) {
+    let commit = seed_content_commit(repo_dir, &incompressible(200_000));
+    seed_ref(repo_dir, "refs/heads/main", commit);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&repo_dir.join(".ruk"), budget).expect("open store");
+    let kind = store.hash_kind();
+    let plan =
+        ruk_git::transport::archive::plan_commit_archive(&store, kind, commit).expect("plan");
+    let size = ruk_git::transport::archive::count_commit_tar(
+        &store,
+        kind,
+        &plan,
+        u64::MAX,
+        u64::MAX,
+        &ruk_git::transport::Interrupt::none(),
+    )
+    .expect("count");
+    (commit, size)
+}
+
+#[tokio::test]
+async fn archive_zip_size_bound_covers_actual_zip() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-zip-bound");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (commit, size) = measured_incompressible_commit(&repo_dir);
+
+    let (mut driver, task) = spawn_pair(&root);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let args = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Zip),
+    };
+    let (_, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &args),
+        false,
+    )
+    .await;
+    let actual = u64::try_from(body.len()).expect("zip length fits in u64");
+    assert!(
+        actual <= size.zip,
+        "the zip bound {} covers the {actual}-byte zip",
+        size.zip
+    );
+    assert!(
+        size.zip - actual <= 1024,
+        "the bound stays tight: {} over {actual}",
+        size.zip
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[tokio::test]
+async fn archive_cap_binds_each_format_by_its_own_size() {
+    use ruk_core::protocol::{ArchiveArgs, ArchiveFormat, CommitRev};
+    let root = temp_root("archive-cap-format");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    let repo = repo_dir.to_str().expect("utf8 repo").to_string();
+    seed_store(&repo);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("utf8 store repo")
+        .to_string();
+    let (commit, size) = measured_incompressible_commit(&repo_dir);
+    assert!(
+        size.tar > size.zip,
+        "this payload makes the tar larger than the zip bound, so the cap separates them"
+    );
+
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    registry.set_archive_max_bytes(size.zip);
+    handshake(&mut driver).await;
+    let session = open_read_session(&mut driver, &store_repo).await;
+    let zip = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Zip),
+    };
+    let (_, body) = run_archive_ok(
+        &mut driver,
+        5,
+        &archive_payload(&store_repo, &session, &zip),
+        false,
+    )
+    .await;
+    assert!(
+        !body.is_empty(),
+        "the zip bound fits the cap, so zip is served"
+    );
+    let tar = ArchiveArgs {
+        rev: CommitRev::Commit(commit),
+        format: Some(ArchiveFormat::Tar),
+    };
+    let report = expect_archive_refused(
+        &mut driver,
+        7,
+        &archive_payload(&store_repo, &session, &tar),
+    )
+    .await;
+    assert_eq!(
+        report.code.as_str(),
+        "E_LIMIT",
+        "the exact tar bytes exceed the cap"
+    );
+
+    drop(driver);
+    task.abort();
+}
+
+#[test]
+fn reconciled_push_guard_stays_clear_after_restart() {
+    use ruk_core::HashKind;
+    use ruk_core::change::PlanId;
+    use ruk_core::error::ErrorCode;
+    use ruk_git::transport::push::{PushPlanRecord, PushUpdate};
+
+    let root = temp_root("reconciled-restart");
+    let repo_path = root.join("repo-a");
+    let store_dir = repo_path.join(".ruk");
+    let store = Store::create(
+        &store_dir,
+        HashKind::Sha256,
+        Arc::new(PreparationBudget::reference_defaults()),
+    )
+    .expect("scratch store initializes");
+
+    let plan_id_1 = PlanId::generate();
+    let ref_1 = b"refs/heads/main".to_vec();
+    let updates_1 = vec![PushUpdate {
+        name: ref_1.clone(),
+        old: HashKind::Sha256.zero_oid(),
+        new: HashKind::Sha256.zero_oid(),
+    }];
+    let mut plan_1 = PushPlanRecord::prepare(plan_id_1, b"origin".to_vec(), false, updates_1);
+    plan_1.begin_send().expect("begin_send");
+    plan_1.mark_uncertain();
+    let mutation_1 = plan_1
+        .persist_mutation(HashKind::Sha256, None)
+        .expect("mutation encodes");
+
+    let plan_id_2 = PlanId::generate();
+    let ref_2 = b"refs/heads/feature".to_vec();
+    let updates_2 = vec![PushUpdate {
+        name: ref_2.clone(),
+        old: HashKind::Sha256.zero_oid(),
+        new: HashKind::Sha256.zero_oid(),
+    }];
+    let mut plan_2 = PushPlanRecord::prepare(plan_id_2, b"origin".to_vec(), false, updates_2);
+    plan_2.begin_send().expect("begin_send");
+    plan_2.mark_uncertain();
+    let mutation_2 = plan_2
+        .persist_mutation(HashKind::Sha256, None)
+        .expect("mutation encodes");
+    let marker_fact = super::push_job::reconciliation_marker_fact(plan_id_2);
+
+    store
+        .publish(
+            Vec::new(),
+            &[mutation_1, mutation_2, marker_fact],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("plans persist");
+    drop(store);
+
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime starts");
+    registry.set_runtime(runtime.handle().clone());
+
+    let (_handle, path, _coord) = registry
+        .open(repo_path.to_str().expect("scratch path is UTF-8"))
+        .expect("open restores repository and guards");
+
+    let err = registry
+        .push_guard_check(&path, std::slice::from_ref(&ref_1))
+        .expect_err("uncertain un-reconciled push plan guards ref after restart");
+    assert_eq!(err.code, ErrorCode::EPushUncertain);
+    assert!(err.to_string().contains(&plan_id_1.to_string()));
+
+    registry
+        .push_guard_check(&path, std::slice::from_ref(&ref_2))
+        .expect("reconciled push guard stays clear after restart");
+}
+
+#[test]
+fn fork_copy_syncs_payloads_before_metadata() {
+    use ruk_core::protocol::ForkRefs;
+
+    let root = temp_root("fork-copy-sync");
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let repo_args = ruk_core::protocol::RepoInitArgs {
+        root: root.to_str().expect("UTF-8").to_owned(),
+        path: "source".to_owned(),
+        object_format: None,
+        default_branch: None,
+    };
+    let created = registry
+        .create_repo(&repo_args)
+        .expect("source repo creates");
+    let source_path = PathBuf::from(&created.path);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&source_path.join(".ruk"), budget.clone()).expect("open store");
+
+    use ruk_core::store::lfs::{self, LfsObjectRecord};
+    use ruk_core::store::{FactExpectation, FactMutation};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let lfs_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let source_sidecar =
+        lfs::sidecar_path(&source_path.join(".ruk"), lfs_hex).expect("lfs sidecar path resolves");
+    std::fs::create_dir_all(source_sidecar.parent().expect("sidecar parent"))
+        .expect("lfs directories create");
+    std::fs::write(&source_sidecar, b"").expect("empty lfs payload stages");
+    assert!(lfs::sidecar_verified(&source_path.join(".ruk"), lfs_hex, 0));
+
+    let prepared = store
+        .prepare(ObjectKind::Blob, 11, &b"hello world"[..], None)
+        .expect("prepare");
+    let blob_oid = prepared.oid();
+    store
+        .publish(
+            vec![prepared],
+            &[FactMutation {
+                table: FactTable::LfsObjects,
+                key: lfs::record_key(lfs_hex),
+                expected: FactExpectation::Absent,
+                value: Some(lfs::encode_record(&LfsObjectRecord {
+                    size: 0,
+                    complete: true,
+                })),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
+    store.close().expect("close");
+    drop(store);
+
+    let dest_path = root.join("dest");
+    let exdev =
+        |_: &Path, _: &Path| -> std::io::Result<()> { Err(std::io::Error::from_raw_os_error(18)) };
+    let fork_args = RepoForkArgs {
+        source: source_path.to_str().expect("UTF-8").to_owned(),
+        path: dest_path.to_str().expect("UTF-8").to_owned(),
+        refs: Some(ForkRefs::All),
+    };
+    let reply = registry
+        .fork_repo_with_link(&fork_args, &exdev, &super::registry::staging_sibling)
+        .expect("fork succeeds with copy fallback");
+    assert_eq!(reply.lfs_linked, 1);
+
+    let dest_sidecar =
+        lfs::sidecar_path(&dest_path.join(".ruk"), lfs_hex).expect("dest sidecar path resolves");
+    assert_ne!(
+        std::fs::metadata(&source_sidecar)
+            .expect("source metadata")
+            .ino(),
+        std::fs::metadata(&dest_sidecar)
+            .expect("dest metadata")
+            .ino(),
+        "cross-device fallback must copy payload to a fresh inode"
+    );
+
+    let dest_store =
+        Store::open(&dest_path.join(".ruk"), budget).expect("fork store opens cleanly");
+    let mut read = dest_store.read(blob_oid).expect("payload preserved");
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    read.bytes.read_to_end(&mut bytes).expect("read spool");
+    assert_eq!(bytes, b"hello world");
+}
+
+#[test]
+fn repo_fork_syncs_destination_directory_and_reopens_store() {
+    use ruk_core::protocol::ForkRefs;
+
+    let root = temp_root("fork-dest-sync");
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let repo_args = ruk_core::protocol::RepoInitArgs {
+        root: root.to_str().expect("UTF-8").to_owned(),
+        path: "source".to_owned(),
+        object_format: None,
+        default_branch: None,
+    };
+    let created = registry
+        .create_repo(&repo_args)
+        .expect("source repo creates");
+    let source_path = PathBuf::from(&created.path);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&source_path.join(".ruk"), budget.clone()).expect("open store");
+
+    let prepared = store
+        .prepare(ObjectKind::Blob, 16, &b"destination sync"[..], None)
+        .expect("prepare");
+    let blob_oid = prepared.oid();
+    store
+        .publish(
+            vec![prepared],
+            &[],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
+    store.close().expect("close");
+    drop(store);
+
+    let dest_path = root.join("dest-synced");
+    let fork_args = RepoForkArgs {
+        source: source_path.to_str().expect("UTF-8").to_owned(),
+        path: dest_path.to_str().expect("UTF-8").to_owned(),
+        refs: Some(ForkRefs::None),
+    };
+    let reply = registry
+        .fork_repo(&fork_args)
+        .expect("fork succeeds and syncs destination directory");
+    assert_eq!(reply.path, dest_path.to_str().expect("UTF-8"));
+
+    assert!(dest_path.exists());
+    assert!(dest_path.join(".ruk").exists());
+    let dest_store = Store::open(&dest_path.join(".ruk"), budget)
+        .expect("destination store reopens cleanly after sync");
+    let mut read = dest_store.read(blob_oid).expect("payload preserved");
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    read.bytes.read_to_end(&mut bytes).expect("read spool");
+    assert_eq!(bytes, b"destination sync");
+}
+
+#[test]
+fn fork_links_sync_segment_dirs_before_metadata() {
+    use ruk_core::protocol::ForkRefs;
+    use ruk_core::store::lfs::{self, LfsObjectRecord};
+    use ruk_core::store::{FactExpectation, FactMutation};
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = temp_root("fork-links-sync");
+    let registry = Registry::new(vec![root.clone()]).expect("scratch root canonicalizes");
+    let repo_args = ruk_core::protocol::RepoInitArgs {
+        root: root.to_str().expect("UTF-8").to_owned(),
+        path: "source".to_owned(),
+        object_format: None,
+        default_branch: None,
+    };
+    let created = registry
+        .create_repo(&repo_args)
+        .expect("source repo creates");
+    let source_path = PathBuf::from(&created.path);
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Store::open(&source_path.join(".ruk"), budget.clone()).expect("open store");
+
+    let lfs_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let source_sidecar =
+        lfs::sidecar_path(&source_path.join(".ruk"), lfs_hex).expect("lfs sidecar path resolves");
+    std::fs::create_dir_all(source_sidecar.parent().expect("sidecar parent"))
+        .expect("lfs directories create");
+    std::fs::write(&source_sidecar, b"").expect("empty lfs payload stages");
+    assert!(lfs::sidecar_verified(&source_path.join(".ruk"), lfs_hex, 0));
+
+    let prepared = store
+        .prepare(ObjectKind::Blob, 11, &b"hello world"[..], None)
+        .expect("prepare");
+    let blob_oid = prepared.oid();
+    store
+        .publish(
+            vec![prepared],
+            &[FactMutation {
+                table: FactTable::LfsObjects,
+                key: lfs::record_key(lfs_hex),
+                expected: FactExpectation::Absent,
+                value: Some(lfs::encode_record(&LfsObjectRecord {
+                    size: 0,
+                    complete: true,
+                })),
+            }],
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish");
+    store.close().expect("close");
+    drop(store);
+
+    let dest_path = root.join("dest-linked");
+    let link_calls = Arc::new(AtomicUsize::new(0));
+    let link_count = Arc::clone(&link_calls);
+    let link_fn = move |from: &Path, to: &Path| -> std::io::Result<()> {
+        link_count.fetch_add(1, Ordering::SeqCst);
+        std::fs::hard_link(from, to)
+    };
+    let fork_args = RepoForkArgs {
+        source: source_path.to_str().expect("UTF-8").to_owned(),
+        path: dest_path.to_str().expect("UTF-8").to_owned(),
+        refs: Some(ForkRefs::All),
+    };
+    let reply = registry
+        .fork_repo_with_link(&fork_args, &link_fn, &super::registry::staging_sibling)
+        .expect("fork succeeds with hard links");
+    assert_eq!(reply.lfs_linked, 1);
+    assert!(reply.segments_copied.is_empty());
+    assert!(link_calls.load(Ordering::SeqCst) >= 1);
+
+    let dest_sidecar =
+        lfs::sidecar_path(&dest_path.join(".ruk"), lfs_hex).expect("dest sidecar path resolves");
+    assert_eq!(
+        std::fs::metadata(&source_sidecar)
+            .expect("source metadata")
+            .ino(),
+        std::fs::metadata(&dest_sidecar)
+            .expect("dest metadata")
+            .ino(),
+        "same-filesystem fork must link payload to the same inode"
+    );
+
+    let dest_store =
+        Store::open(&dest_path.join(".ruk"), budget).expect("fork store opens cleanly");
+    let mut read = dest_store.read(blob_oid).expect("payload preserved");
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    read.bytes.read_to_end(&mut bytes).expect("read spool");
+    assert_eq!(bytes, b"hello world");
+}
+
+#[test]
+fn sha1_new_oid_refused_on_sha256_store() {
+    use super::push_job::BlockingJob;
+    use ruk_core::coord::{HostedCoordinator, Principal};
+    use ruk_core::ids::HashKind;
+    use ruk_core::protocol::{PushSource, PushUpdate, RemoteExpect};
+    use ruk_core::refdata::RefName;
+
+    let root = temp_root("sha1-new-on-sha256");
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Arc::new(
+        Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+    );
+    let peer = Principal::from_peer_uid(1000);
+    let coordinator = Arc::new(
+        HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+    );
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+    let job = BlockingJob {
+        coordinator: Arc::clone(&coordinator),
+        session: SessionId::generate(),
+        registry: Arc::clone(&registry),
+        repo: root.clone(),
+        key_half: None,
+    };
+
+    let sha1_new = Oid::from_bytes(&[0x11; 20]).expect("sha1 oid");
+    let update = PushUpdate {
+        remote_ref: RefName::new("refs/heads/feature".to_owned()).expect("valid ref name"),
+        source: PushSource::Commit { oid: sha1_new },
+        expected_old: Some(RemoteExpect::Absent),
+        force: false,
+    };
+
+    let err = job
+        .translate_update(&[], &update)
+        .expect_err("SHA-1 new OID on SHA-256 store must be refused");
+    assert_eq!(err.code, ErrorCode::EInvalid);
+
+    let page_budget = FactPageBudget::new(1024, 65536);
+    let page = store
+        .fact_page(FactTable::PushPlans, None, page_budget)
+        .expect("page");
+    assert!(page.rows.is_empty(), "PushPlans must be empty");
+
+    drop(job);
+    drop(coordinator);
+    drop(store);
+
+    let reopen_budget = Arc::new(PreparationBudget::reference_defaults());
+    let reopened = Store::open(&root.join(".ruk"), reopen_budget).expect("store reopens cleanly");
+    let page_after = reopened
+        .fact_page(FactTable::PushPlans, None, FactPageBudget::new(1024, 65536))
+        .expect("page after reopen");
+    assert!(page_after.rows.is_empty(), "PushPlans stays empty");
+    drop(reopened);
+
+    let _handle = registry
+        .open_by_path(&root)
+        .expect("reopen repository succeeds");
+}
+
+#[test]
+fn sha1_expected_old_refused_on_sha256_store() {
+    use super::push_job::BlockingJob;
+    use ruk_core::coord::{HostedCoordinator, Principal};
+    use ruk_core::ids::HashKind;
+    use ruk_core::protocol::{PushSource, PushUpdate, RemoteExpect};
+    use ruk_core::refdata::RefName;
+
+    let root = temp_root("sha1-old-on-sha256");
+    let budget = Arc::new(PreparationBudget::reference_defaults());
+    let store = Arc::new(
+        Store::create(&root.join(".ruk"), HashKind::Sha256, budget).expect("store creates"),
+    );
+    let peer = Principal::from_peer_uid(1000);
+    let coordinator = Arc::new(
+        HostedCoordinator::open(Arc::clone(&store), peer, root.clone()).expect("coord opens"),
+    );
+    let registry = Arc::new(Registry::new(vec![root.clone()]).expect("registry builds"));
+    let job = BlockingJob {
+        coordinator: Arc::clone(&coordinator),
+        session: SessionId::generate(),
+        registry: Arc::clone(&registry),
+        repo: root.clone(),
+        key_half: None,
+    };
+
+    let sha256_new = Oid::from_bytes(&[0x33; 32]).expect("sha256 oid");
+    let sha1_old = Oid::from_bytes(&[0x22; 20]).expect("sha1 oid");
+    let update = PushUpdate {
+        remote_ref: RefName::new("refs/heads/main".to_owned()).expect("valid ref name"),
+        source: PushSource::Commit { oid: sha256_new },
+        expected_old: Some(RemoteExpect::Present { oid: sha1_old }),
+        force: false,
+    };
+
+    let err = job
+        .translate_update(&[], &update)
+        .expect_err("SHA-1 expected old OID on SHA-256 store must be refused");
+    assert_eq!(err.code, ErrorCode::EInvalid);
+
+    let page_budget = FactPageBudget::new(1024, 65536);
+    let page = store
+        .fact_page(FactTable::PushPlans, None, page_budget)
+        .expect("page");
+    assert!(page.rows.is_empty(), "PushPlans must be empty");
+
+    drop(job);
+    drop(coordinator);
+    drop(store);
+
+    let reopen_budget = Arc::new(PreparationBudget::reference_defaults());
+    let reopened = Store::open(&root.join(".ruk"), reopen_budget).expect("store reopens cleanly");
+    let page_after = reopened
+        .fact_page(FactTable::PushPlans, None, FactPageBudget::new(1024, 65536))
+        .expect("page after reopen");
+    assert!(page_after.rows.is_empty(), "PushPlans stays empty");
+    drop(reopened);
+
+    let _handle = registry
+        .open_by_path(&root)
+        .expect("reopen repository succeeds");
 }

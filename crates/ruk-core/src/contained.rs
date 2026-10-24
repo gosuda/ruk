@@ -4,30 +4,28 @@
 //! beneath a configured root. A lexical prefix check after
 //! [`std::fs::canonicalize`] cannot do that safely: a path component the
 //! check approved can be swapped for a symlink before the caller opens the
-//! result. On Linux this module resolves through `openat2` with
-//! `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so the kernel refuses
+//! result. On Linux and Android this module resolves through `openat2`
+//! with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so the kernel refuses
 //! escapes and symlink components atomically instead of checking a string
-//! the filesystem may already have changed. Off Linux (or on kernels
-//! without `openat2`) it falls back to the canonicalize-and-prefix check.
+//! the filesystem may already have changed. Other Unix targets use the
+//! canonicalize-and-prefix check, as do non-Unix targets and Linux kernels
+//! without `openat2`.
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{CoreError, ErrorCode};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::fd::OwnedFd;
 
-/// A resolved repository directory with its kernel-pinned identity.
-///
-/// The directory file descriptor stays open from resolution through the
-/// store open, so a symlink swapped in after resolution cannot redirect
-/// the open: verification compares the opened directory against the
-/// identity read from the pinned descriptor. Resolutions without a
-/// descriptor (legacy fallback) carry no identity and skip verification.
+/// A resolved repository directory. On Linux, the held descriptor pins
+/// the directory identity through the store open, so verification can
+/// detect a path swap after resolution. Other targets use the legacy
+/// canonicalize-and-prefix fallback without a descriptor.
 #[derive(Debug)]
 pub struct PinnedDir {
     path: PathBuf,
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     dir: Option<OwnedFd>,
     dev: Option<u64>,
     ino: Option<u64>,
@@ -47,11 +45,11 @@ impl PinnedDir {
         self.uid
     }
 
-    /// The `/proc/self/fd` path opening through the pinned descriptor.
-    /// File accesses through it cannot escape the pinned directory even
-    /// when the recorded path components move afterward. Absent without
-    /// a descriptor.
-    #[cfg(unix)]
+    /// The Linux `/proc/self/fd` path opening through the pinned
+    /// descriptor. File accesses through it cannot escape the pinned
+    /// directory even when the recorded path components move afterward.
+    /// Absent without a descriptor.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[must_use]
     pub fn open_path(&self) -> Option<PathBuf> {
         use std::os::unix::io::AsRawFd as _;
@@ -65,7 +63,7 @@ impl PinnedDir {
     pub fn unverified(path: PathBuf) -> Self {
         Self {
             path,
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             dir: None,
             dev: None,
             ino: None,
@@ -109,9 +107,9 @@ impl PinnedDir {
 
 /// Collapses `.` and `..` lexically, without touching the filesystem.
 ///
-/// Routing only: containment itself is enforced by `openat2` (or, on
-/// fallback, by the prefix check on the canonicalized path), never by this
-/// normalization.
+/// Routing only: containment itself is enforced by Linux `openat2` (or,
+/// on fallback targets, by the prefix check on the canonicalized path),
+/// never by this normalization.
 fn collapse_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -152,10 +150,10 @@ pub fn resolve_contained(root: &Path, requested: &Path) -> Result<PathBuf, CoreE
     Ok(resolve_contained_pinned(root, requested)?.path)
 }
 
-/// Resolves `requested` beneath canonical `root`, holding the kernel
+/// Resolves `requested` beneath canonical `root`. Linux holds a kernel
 /// pin: the returned descriptor stays open from resolution through the
-/// store open, and its identity verifies the opened directory. Paths
-/// the legacy fallback resolves carry no pin and skip verification.
+/// store open, and its identity verifies the opened directory. Other
+/// targets use canonicalize-and-prefix resolution without a descriptor.
 ///
 /// # Errors
 /// `E_NOT_FOUND` for a missing path, `E_FORBIDDEN` outside `root` or
@@ -170,7 +168,7 @@ pub fn resolve_contained_pinned(root: &Path, requested: &Path) -> Result<PinnedD
     if rel.as_os_str().is_empty() {
         return pin_root(root);
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         match openat2_pinned(root, rel) {
             Ok((fd, canonical)) => {
@@ -193,7 +191,7 @@ pub fn resolve_contained_pinned(root: &Path, requested: &Path) -> Result<PinnedD
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         Ok(PinnedDir::unverified(resolve_legacy(root, &absolute)?))
     }
@@ -201,7 +199,7 @@ pub fn resolve_contained_pinned(root: &Path, requested: &Path) -> Result<PinnedD
 
 /// Pins an already-canonical root directory itself.
 fn pin_root(root: &Path) -> Result<PinnedDir, CoreError> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::{Mode, OFlags, open};
         let fd = open(root, OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).map_err(|err| {
@@ -212,14 +210,14 @@ fn pin_root(root: &Path) -> Result<PinnedDir, CoreError> {
         })?;
         pinned(fd, root.to_path_buf())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         Ok(PinnedDir::unverified(root.to_path_buf()))
     }
 }
 
 /// Reads the kernel identity of a pinned descriptor.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn pinned(fd: OwnedFd, canonical: PathBuf) -> Result<PinnedDir, CoreError> {
     let stat = rustix::fs::fstat(&fd).map_err(|err| {
         CoreError::new(
@@ -239,15 +237,16 @@ fn pinned(fd: OwnedFd, canonical: PathBuf) -> Result<PinnedDir, CoreError> {
 /// Refuses symlink components traversed while resolving an unprefixed
 /// path. `canonicalize` follows every link, so without this an in-root
 /// link whose target stays under the root passes where the prefixed
-/// route (`openat2` `NO_SYMLINKS`) refuses. Components resolving
+/// route (`openat2` `NO_SYMLINKS`) refuses on Linux. Components resolving
 /// outside the root stay free to alias; once resolution reaches the
 /// root, every further spelling component, including the entering one,
 /// must be a real directory. This ends aliased-root spellings too
 /// (fail closed): operators configure canonical roots.
 ///
-/// The check runs before the open, so a swap between the two still has
-/// the `openat2` pin and the post-open identity verification behind
-/// it; this closes the resolve-time gap, not the race after it.
+/// The check runs before the open. On Linux, the `openat2` pin and
+/// post-open identity verification close the resolve-time gap, not
+/// the race after it. Other targets use the canonicalize-and-prefix
+/// fallback without a descriptor pin.
 ///
 /// # Errors
 /// `E_NOT_FOUND` for a path that vanishes mid-walk, `E_IO` when a
@@ -352,7 +351,7 @@ fn resolve_contained_unprefixed_pinned(
     if rel.as_os_str().is_empty() {
         return pin_root(root);
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         match openat2_pinned(root, rel) {
             Ok((fd, canonical)) => {
@@ -370,14 +369,14 @@ fn resolve_contained_unprefixed_pinned(
             Err(err) => Err(err),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         Ok(PinnedDir::unverified(resolve_legacy(root, absolute)?))
     }
 }
 
-/// Legacy canonicalize-and-prefix resolution for kernels without
-/// `openat2`.
+/// Legacy canonicalize-and-prefix resolution for non-Linux targets and
+/// Linux kernels without `openat2`.
 ///
 /// # Errors
 /// `E_NOT_FOUND` for a missing path, `E_IO` when the path is
@@ -418,7 +417,7 @@ fn resolve_legacy(root: &Path, absolute: &Path) -> Result<PathBuf, CoreError> {
 /// `E_NOT_FOUND` for a missing path, `E_FORBIDDEN` for symlink components
 /// or escapes, `E_IO` for inaccessible paths, `E_HOSTED` where `openat2`
 /// is unavailable so the caller falls back.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn openat2_pinned(root: &Path, rel: &Path) -> Result<(OwnedFd, PathBuf), CoreError> {
     use rustix::fd::AsFd;
     use rustix::fs::{Mode, OFlags, ResolveFlags, open, openat2};

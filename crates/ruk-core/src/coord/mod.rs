@@ -21,7 +21,7 @@ pub mod per_repo;
 mod prepare;
 pub use prepare::prepare_mutation;
 pub(crate) mod reads;
-mod receipt;
+pub mod receipt;
 mod retention;
 mod rows;
 pub mod service_receipts;

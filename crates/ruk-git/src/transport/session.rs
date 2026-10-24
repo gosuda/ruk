@@ -834,6 +834,24 @@ pub(crate) fn apply_refs(
             .iter()
             .map(|u| to_update(u))
             .collect::<Result<_, _>>()?;
+        for update in &updates {
+            if let Err(err) = ruk_core::refs::check_tag_unfrozen(dest, &update.name) {
+                if err.code != ruk_core::error::ErrorCode::EForbidden {
+                    return Err(err.into());
+                }
+                return Ok((
+                    live.iter()
+                        .map(|u| RefOutcome {
+                            name: u.name.clone(),
+                            result: RefResult::Rejected {
+                                reason: format!("atomic push refused: {}", err.message),
+                            },
+                        })
+                        .collect(),
+                    Vec::new(),
+                ));
+            }
+        }
         let transaction = RefTransaction::new(kind, updates).map_err(map_ref_error)?;
         let prepared = prepare_checked_transaction(dest, &transaction).map_err(GitError::from)?;
         match dest.publish(
@@ -851,25 +869,40 @@ pub(crate) fn apply_refs(
                     .collect(),
                 publication.ref_events,
             )),
-            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => Ok((
-                live.iter()
-                    .map(|u| RefOutcome {
-                        name: u.name.clone(),
-                        result: RefResult::Rejected {
-                            reason: "destination ref moved during apply".to_owned(),
-                        },
-                    })
-                    .collect(),
-                Vec::new(),
-            )),
+            Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
+                let reason = ref_apply_rejection(dest, live, "atomic push refused: ")?;
+                Ok((
+                    live.iter()
+                        .map(|u| RefOutcome {
+                            name: u.name.clone(),
+                            result: RefResult::Rejected {
+                                reason: reason.clone(),
+                            },
+                        })
+                        .collect(),
+                    Vec::new(),
+                ))
+            }
             Err(err) => Err(err.into()),
         }
     } else {
         let mut outcomes = Vec::with_capacity(live.len());
         let mut ref_events = Vec::new();
         for update in live {
-            let transaction =
-                RefTransaction::new(kind, vec![to_update(update)?]).map_err(map_ref_error)?;
+            let ref_update = to_update(update)?;
+            if let Err(err) = ruk_core::refs::check_tag_unfrozen(dest, &ref_update.name) {
+                if err.code != ruk_core::error::ErrorCode::EForbidden {
+                    return Err(err.into());
+                }
+                outcomes.push(RefOutcome {
+                    name: update.name.clone(),
+                    result: RefResult::Rejected {
+                        reason: err.message,
+                    },
+                });
+                continue;
+            }
+            let transaction = RefTransaction::new(kind, vec![ref_update]).map_err(map_ref_error)?;
             let outcome =
                 match prepare_checked_transaction(dest, &transaction).map_err(GitError::from) {
                     Ok(prepared) => match dest.publish(
@@ -884,7 +917,7 @@ pub(crate) fn apply_refs(
                         }
                         Err(err) if err.code() == ruk_core::error::ErrorCode::EStale => {
                             RefResult::Rejected {
-                                reason: "destination ref moved during apply".to_owned(),
+                                reason: ref_apply_rejection(dest, &[update], "")?,
                             }
                         }
                         Err(err) => return Err(err.into()),
@@ -901,6 +934,25 @@ pub(crate) fn apply_refs(
         }
         Ok((outcomes, ref_events))
     }
+}
+
+fn ref_apply_rejection(
+    dest: &Store,
+    live: &[&PushUpdate],
+    prefix: &str,
+) -> Result<String, GitError> {
+    for update in live {
+        let name = RefName::new(update.name.clone()).map_err(|err| GitError::Invalid {
+            detail: format!("malformed ref name: {err}"),
+        })?;
+        if let Some(marker) = ruk_core::refs::released_tag_marker(dest, &name)? {
+            return Ok(format!(
+                "{prefix}tag `{name}` is frozen by release `{}`",
+                marker.owner_release_id
+            ));
+        }
+    }
+    Ok("destination ref moved during apply".to_owned())
 }
 
 fn map_ref_error(err: ruk_core::refdata::RefError) -> GitError {
@@ -1167,6 +1219,82 @@ mod tests {
         let outcomes =
             local_push(&dest, &src, kind, &mut plan, &req, &Interrupt::none()).expect("push");
         assert!(matches!(outcomes[0].result, RefResult::Rejected { .. }));
+    }
+
+    #[test]
+    fn frozen_tags_refuse_set_delete_and_atomic_siblings() {
+        use ruk_core::protocol::Timestamp;
+        use ruk_core::refs::{ReleasedTagMarker, prepare_release_freeze};
+
+        let kind = HashKind::Sha1;
+        let dest = test_store(kind);
+        let name = RefName::new("refs/tags/v1").expect("tag");
+        let seed = RefTransaction::new(
+            kind,
+            vec![RefUpdate {
+                name: name.clone(),
+                expected: RefExpect::Absent,
+                change: RefChange::Set(RefTarget::Direct(oid(FOUR))),
+            }],
+        )
+        .expect("seed tag transaction");
+        let prepared = prepare_checked_transaction(&dest, &seed).expect("prepare seed tag");
+        dest.publish(
+            Vec::new(),
+            &prepared.into_mutations(),
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish seed tag");
+        let freeze = prepare_release_freeze(
+            &dest,
+            &name,
+            &ReleasedTagMarker {
+                owner_release_id: "rel-1".to_owned(),
+                target_oid: oid(FOUR),
+                frozen_at: Timestamp::parse("1970-01-01T00:00:00Z").expect("timestamp"),
+            },
+        )
+        .expect("freeze");
+        dest.publish(
+            Vec::new(),
+            &freeze,
+            EventSource::LocalPush,
+            &EventContext::default(),
+        )
+        .expect("publish freeze");
+        for atomic in [false, true] {
+            for deleting in [false, true] {
+                let tag = PushUpdate {
+                    name: name.as_bytes().to_vec(),
+                    old: if deleting { oid(FOUR) } else { kind.zero_oid() },
+                    new: if deleting { kind.zero_oid() } else { oid(FOUR) },
+                };
+                let sibling = PushUpdate {
+                    name: b"refs/heads/main".to_vec(),
+                    old: kind.zero_oid(),
+                    new: oid(FOUR),
+                };
+                let live = if atomic {
+                    vec![&sibling, &tag]
+                } else {
+                    vec![&tag]
+                };
+                let (outcomes, events) =
+                    apply_refs(&dest, kind, &live, atomic, None).expect("report");
+                assert!(events.is_empty());
+                for outcome in outcomes {
+                    assert!(
+                        matches!(outcome.result, RefResult::Rejected { reason } if reason.contains("rel-1"))
+                    );
+                }
+                assert!(
+                    dest.fact(ruk_core::store::FactTable::Refs, &sibling.name)
+                        .expect("read")
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]

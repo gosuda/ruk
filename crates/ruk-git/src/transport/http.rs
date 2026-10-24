@@ -52,6 +52,10 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// A streamed GET outcome: the final status and headers plus the URL that
+/// produced them after following redirects.
+pub type GetOutcome = (u16, Vec<(String, String)>, String);
+
 /// Whether `status` is a 2xx success.
 #[must_use]
 pub fn is_success(status: u16) -> bool {
@@ -410,14 +414,149 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, GitError> {
     static CONFIG: LazyLock<Result<Arc<rustls::ClientConfig>, String>> = LazyLock::new(|| {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-            .with_safe_default_protocol_versions()
-            .map(|builder| Arc::new(builder.with_root_certificates(roots).with_no_client_auth()))
-            .map_err(|err| format!("tls provider refused: {err}"))
+        tls_client_config(roots).map_err(|err| format!("tls provider refused: {err}"))
     });
     CONFIG.clone().map_err(|detail| GitError::Io {
         detail: detail.clone(),
     })
+}
+
+fn tls_client_config(
+    roots: rustls::RootCertStore,
+) -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
+    rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .map(|builder| Arc::new(builder.with_root_certificates(roots).with_no_client_auth()))
+}
+
+/// Builds a client config from one PEM bundle instead of the Mozilla set:
+/// private-CA servers whose chains never touch the public roots. Fails
+/// closed on bundles with no usable certificate.
+///
+/// # Errors
+/// [`GitError::Invalid`] for an empty bundle or one with no parsable
+/// `CERTIFICATE` block.
+fn tls_config_with_roots(pem: &[u8]) -> Result<Arc<rustls::ClientConfig>, GitError> {
+    let certs = parse_pem_certs(pem)?;
+    if certs.is_empty() {
+        return Err(GitError::Invalid {
+            detail: "tls trust bundle holds no certificate".to_owned(),
+        });
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).map_err(|err| GitError::Invalid {
+            detail: format!("tls trust bundle holds an unusable certificate: {err}"),
+        })?;
+    }
+    tls_client_config(roots).map_err(|err| GitError::Io {
+        detail: format!("tls provider refused bundle roots: {err}"),
+    })
+}
+
+/// Splits the `CERTIFICATE` blocks out of one PEM bundle: headers and
+/// trailers delimit, blank lines and foreign blocks are skipped, and each
+/// body must be valid padded base64.
+fn parse_pem_certs(
+    pem: &[u8],
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, GitError> {
+    let text = std::str::from_utf8(pem).map_err(|_| GitError::Invalid {
+        detail: "tls trust bundle is not UTF-8".to_owned(),
+    })?;
+    let mut certs = Vec::new();
+    let mut body = String::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "-----BEGIN CERTIFICATE-----" {
+            if in_block {
+                return Err(GitError::Invalid {
+                    detail: "tls trust bundle nests certificate blocks".to_owned(),
+                });
+            }
+            in_block = true;
+            body.clear();
+        } else if line == "-----END CERTIFICATE-----" {
+            if !in_block {
+                return Err(GitError::Invalid {
+                    detail: "tls trust bundle ends a block never begun".to_owned(),
+                });
+            }
+            in_block = false;
+            certs.push(rustls::pki_types::CertificateDer::from(base64_decode(
+                &body,
+            )?));
+            body.clear();
+        } else if in_block && !line.is_empty() {
+            body.push_str(line);
+        }
+    }
+    if in_block {
+        return Err(GitError::Invalid {
+            detail: "tls trust bundle ends inside a certificate block".to_owned(),
+        });
+    }
+    Ok(certs)
+}
+
+/// Decodes standard-alphabet padded base64: the inverse of the Basic
+/// credential encoder, strict about trailing bits and padding.
+fn base64_decode(text: &str) -> Result<Vec<u8>, GitError> {
+    fn value(byte: u8) -> Result<u8, GitError> {
+        match byte {
+            b'A'..=b'Z' => Ok(byte - b'A'),
+            b'a'..=b'z' => Ok(byte - b'a' + 26),
+            b'0'..=b'9' => Ok(byte - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(GitError::Invalid {
+                detail: "tls trust bundle body is not base64".to_owned(),
+            }),
+        }
+    }
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return Err(GitError::Invalid {
+            detail: "tls trust bundle body length is not base64".to_owned(),
+        });
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|b| **b == b'=').count();
+        if pad > 2 {
+            return Err(GitError::Invalid {
+                detail: "tls trust bundle body is not base64".to_owned(),
+            });
+        }
+        let mut word: u32 = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            let position = u32::try_from(index).expect("four-byte chunk keeps small indexes");
+            let bits = if *byte == b'=' {
+                if index < 4 - pad {
+                    return Err(GitError::Invalid {
+                        detail: "tls trust bundle body is not base64".to_owned(),
+                    });
+                }
+                0
+            } else {
+                if index >= 4 - pad {
+                    return Err(GitError::Invalid {
+                        detail: "tls trust bundle body is not base64".to_owned(),
+                    });
+                }
+                u32::from(value(*byte)?)
+            };
+            word |= bits << (18 - 6 * position);
+        }
+        out.push(u8::try_from(word >> 16).expect("four sextets keep 24 bits"));
+        if pad < 2 {
+            out.push(u8::try_from((word >> 8) & 0xff).expect("four sextets keep 24 bits"));
+        }
+        if pad < 1 {
+            out.push(u8::try_from(word & 0xff).expect("four sextets keep 24 bits"));
+        }
+    }
+    Ok(out)
 }
 
 /// Compares the credential scope of two URLs: scheme, host, and port all
@@ -441,7 +580,11 @@ pub fn same_origin(a: &str, b: &str) -> Result<bool, GitError> {
 /// # Errors
 /// [`GitError::Invalid`] for an unusable server name, [`GitError::Io`]
 /// when no address resolves or none connects within the timeout.
-fn connect(parsed: &Url) -> Result<Stream, GitError> {
+fn connect(
+    parsed: &Url,
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
+) -> Result<Stream, GitError> {
     let label = format!("{}:{}", parsed.host, parsed.port);
     let addrs: Vec<std::net::SocketAddr> = (parsed.host.as_str(), parsed.port)
         .to_socket_addrs()
@@ -454,6 +597,7 @@ fn connect(parsed: &Url) -> Result<Stream, GitError> {
             detail: format!("cannot resolve {label}: no addresses"),
         });
     }
+    let addrs = policy.filter_addrs(&label, &addrs)?;
     let mut last_err = String::from("no addresses tried");
     let mut socket = None;
     for addr in addrs {
@@ -489,10 +633,16 @@ fn connect(parsed: &Url) -> Result<Stream, GitError> {
             }
         })?
     };
-    let connection =
-        rustls::ClientConnection::new(tls_config()?, name).map_err(|err| GitError::Io {
-            detail: format!("cannot start tls to {}: {err}", parsed.host),
-        })?;
+    let connection = rustls::ClientConnection::new(
+        match tls_roots {
+            Some(pem) => tls_config_with_roots(pem)?,
+            None => tls_config()?,
+        },
+        name,
+    )
+    .map_err(|err| GitError::Io {
+        detail: format!("cannot start tls to {}: {err}", parsed.host),
+    })?;
     let mut tls = rustls::StreamOwned::new(connection, socket);
     // The handshake runs lazily inside rustls; one flush forces it now so
     // certificate errors report as connection failures, not request ones.
@@ -806,9 +956,11 @@ fn request_head(
     method: &str,
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
 ) -> Result<ResponseHead, GitError> {
     let parsed = parse_url(url)?;
-    let mut stream = connect(&parsed)?;
+    let mut stream = connect(&parsed, policy, tls_roots)?;
     send_request(&mut stream, method, &parsed, headers, body)?;
     let mut reader = BufReader::new(stream);
     let (status, headers) = read_head(&mut reader)?;
@@ -824,8 +976,11 @@ pub fn post_json(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
 ) -> Result<HttpResponse, GitError> {
-    let (mut reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
+    let (mut reader, status, headers) =
+        request_head(url, "POST", headers, Some(body), policy, tls_roots)?;
     let mut reply = Vec::new();
     read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
     Ok(HttpResponse {
@@ -984,10 +1139,175 @@ pub fn post_open(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
 ) -> Result<OpenResponse, GitError> {
-    let (reader, status, headers) = request_head(url, "POST", headers, Some(body))?;
+    let (reader, status, headers) =
+        request_head(url, "POST", headers, Some(body), policy, tls_roots)?;
     let framing = open_framing(&headers)?;
     Ok((HttpBodyReader { reader, framing }, status, headers))
+}
+
+/// One chunked POST body: the head is already sent with
+/// `Transfer-Encoding: chunked`, and each flushed window leaves as its
+/// own chunk, so a multi-gigabyte pack never sits in one buffer.
+pub struct ChunkedUpload {
+    stream: Stream,
+    buf: Vec<u8>,
+}
+
+impl std::fmt::Debug for ChunkedUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkedUpload")
+            .field("buffered_bytes", &self.buf.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bytes buffered before one chunk leaves: large enough to keep framing
+/// overhead negligible, small enough to bound memory.
+const CHUNK_WINDOW: usize = 65536;
+
+impl ChunkedUpload {
+    fn emit(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        self.stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())?;
+        self.stream.write_all(chunk)?;
+        self.stream.write_all(b"\r\n")?;
+        Ok(())
+    }
+
+    /// Abandons the body after a write failure and reads whatever status
+    /// the server already sent: an early refusal (auth, moved, missing)
+    /// reports honestly instead of surfacing as a broken pipe. Used only
+    /// for [`GitError::Io`] write failures; anything else propagates at
+    /// once so cancellation stays responsive.
+    ///
+    /// # Errors
+    /// Routing, framing, and transport failures as [`GitError`].
+    pub fn abort_to_response(self) -> Result<OpenResponse, GitError> {
+        let mut reader = BufReader::new(self.stream);
+        let (status, headers) = read_head(&mut reader)?;
+        let framing = open_framing(&headers)?;
+        Ok((HttpBodyReader { reader, framing }, status, headers))
+    }
+
+    /// Closes the chunk stream and reads the response, exactly as
+    /// [`post_open`] does once its buffered body is sent. When the close
+    /// itself fails (the server hung up first), the pending response is
+    /// still read: a refusal standing by reports honestly instead of
+    /// surfacing as a broken pipe. A 2xx standing by is ambiguous — the
+    /// body may have landed without its terminator — so callers must
+    /// treat a response that follows a failed close as uncertain, never
+    /// as success.
+    ///
+    /// # Errors
+    /// Routing, framing, and transport failures as [`GitError`].
+    pub fn finish(self) -> Result<OpenResponse, GitError> {
+        use std::io::Write as _;
+        let mut this = self;
+        let closed = (|| -> std::io::Result<()> {
+            this.flush()?;
+            this.stream.write_all(b"0\r\n\r\n")?;
+            this.stream.flush()?;
+            Ok(())
+        })();
+        let mut reader = BufReader::new(this.stream);
+        let head = read_head(&mut reader);
+        let (status, headers) = match (closed, head) {
+            (Ok(()), Ok(head)) => head,
+            (Ok(()), Err(read_err)) => return Err(read_err),
+            (Err(_), Ok((status, headers))) if !is_success(status) => (status, headers),
+            (Err(_), Ok(_)) => {
+                return Err(GitError::Io {
+                    detail: "cannot finish chunked upload: connection closed mid-send".to_owned(),
+                });
+            }
+            (Err(close_err), Err(_)) => {
+                return Err(GitError::Io {
+                    detail: format!("cannot finish chunked upload: {close_err}"),
+                });
+            }
+        };
+        let framing = open_framing(&headers)?;
+        Ok((HttpBodyReader { reader, framing }, status, headers))
+    }
+}
+
+impl std::io::Write for ChunkedUpload {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        while self.buf.len() >= CHUNK_WINDOW {
+            let chunk: Vec<u8> = self.buf.drain(..CHUNK_WINDOW).collect();
+            self.emit(&chunk)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            self.emit(&chunk)?;
+        }
+        self.stream.flush()
+    }
+}
+
+/// POSTs with a streamed body: sends the head with
+/// `Transfer-Encoding: chunked` and hands back the body writer. The
+/// caller writes the commands first (the CAS precheck reads them before
+/// the pack), then streams the pack, then finishes for the response.
+/// Single-shot like [`post_open`]: smart RPC endpoints never redirect a
+/// POST, so a 3xx status surfaces for the caller to report.
+///
+/// # Errors
+/// Routing, framing, and transport failures as [`GitError`].
+pub fn post_open_chunked(
+    url: &str,
+    headers: &[(&str, &str)],
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
+) -> Result<ChunkedUpload, GitError> {
+    let parsed = parse_url(url)?;
+    let mut stream = connect(&parsed, policy, tls_roots)?;
+    send_chunked_head(&mut stream, "POST", &parsed, headers)?;
+    Ok(ChunkedUpload {
+        stream,
+        buf: Vec::new(),
+    })
+}
+
+/// Writes one HTTP/1.1 request head with chunked framing: method line,
+/// Host, `Connection: close`, caller headers, then
+/// `Transfer-Encoding: chunked`.
+fn send_chunked_head(
+    stream: &mut Stream,
+    method: &str,
+    parsed: &Url,
+    headers: &[(&str, &str)],
+) -> Result<(), GitError> {
+    let what = format!("{method} {}", parsed.path);
+    let mut head = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        parsed.path, parsed.host
+    );
+    for (name, value) in headers {
+        if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+            return Err(GitError::Invalid {
+                detail: format!("header {name:?} carries a line break"),
+            });
+        }
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("Transfer-Encoding: chunked\r\n\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|err| GitError::Io {
+            detail: format!("cannot send {what}: {err}"),
+        })?;
+    stream.flush().map_err(|err| GitError::Io {
+        detail: format!("cannot flush {what}: {err}"),
+    })
 }
 
 /// Picks the body framing for one open response from its headers: chunked
@@ -1025,8 +1345,11 @@ pub fn put_bytes(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
 ) -> Result<HttpResponse, GitError> {
-    let (mut reader, status, headers) = request_head(url, "PUT", headers, Some(body))?;
+    let (mut reader, status, headers) =
+        request_head(url, "PUT", headers, Some(body), policy, tls_roots)?;
     let mut reply = Vec::new();
     read_body(&mut reader, &headers, &mut reply, Some(MAX_BUFFERED_BYTES))?;
     Ok(HttpResponse {
@@ -1051,9 +1374,11 @@ pub fn put_stream(
     headers: &[(&str, &str)],
     len: u64,
     body: &mut dyn Read,
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
 ) -> Result<HttpResponse, GitError> {
     let parsed = parse_url(url)?;
-    let mut stream = connect(&parsed)?;
+    let mut stream = connect(&parsed, policy, tls_roots)?;
     send_head(&mut stream, "PUT", &parsed, headers, Some(len))?;
     let sent = std::io::copy(&mut body.take(len), &mut stream).map_err(|err| GitError::Io {
         detail: format!("cannot send PUT {} body: {err}", parsed.path),
@@ -1078,21 +1403,26 @@ pub fn put_stream(
 }
 
 /// GETs `url` streaming the body into `sink` (no size cap: the caller
-/// verifies what lands), following up to [`MAX_REDIRECTS`] hops. An
-/// `authorization` header is dropped when a hop changes host, so a token
-/// for the LFS server never leaks to a presigned-URL host. Error statuses
-/// return without sinking anything; the caller reports the status.
+/// verifies what lands), following up to [`MAX_REDIRECTS`] same-origin
+/// hops and reporting the final URL. A hop to another origin on a call
+/// carrying `authorization` is refused instead of followed: the credential
+/// never leaves its origin, and the caller re-bases from the reported
+/// target. Error statuses return without sinking anything; the caller
+/// reports the status.
 ///
-/// Returns the final status and headers.
+/// Returns the final status, headers, and URL.
 ///
 /// # Errors
 /// Routing, framing, and transport failures as [`GitError`]; too many
-/// hops are [`GitError::Invalid`].
+/// hops are [`GitError::Invalid`], and refused cross-origin hops are
+/// [`GitError::RemoteMoved`] naming the target.
 pub fn get_to_writer(
     url: &str,
     headers: &[(&str, &str)],
     sink: &mut dyn Write,
-) -> Result<(u16, Vec<(String, String)>), GitError> {
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
+) -> Result<GetOutcome, GitError> {
     let mut current = url.to_owned();
     let mut owned: Vec<(String, String)> = headers
         .iter()
@@ -1103,7 +1433,8 @@ pub fn get_to_writer(
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        let (mut reader, status, reply) = request_head(&current, "GET", &borrowed, None)?;
+        let (mut reader, status, reply) =
+            request_head(&current, "GET", &borrowed, None, policy, tls_roots)?;
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             let next = header(&reply, "location")
                 .ok_or_else(|| GitError::Invalid {
@@ -1111,6 +1442,17 @@ pub fn get_to_writer(
                 })?
                 .to_owned();
             if !same_origin(&current, &next)? {
+                if owned
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                {
+                    return Err(GitError::RemoteMoved {
+                        detail: format!(
+                            "GET {current} refuses a credentialed redirect to {}",
+                            super::credentials::scrub_userinfo(&next),
+                        ),
+                    });
+                }
                 owned.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
             }
             current = next;
@@ -1119,7 +1461,7 @@ pub fn get_to_writer(
         if is_success(status) {
             read_body(&mut reader, &reply, sink, None)?;
         }
-        return Ok((status, reply));
+        return Ok((status, reply, current));
     }
     Err(GitError::Invalid {
         detail: format!("GET {url} exceeds {MAX_REDIRECTS} redirects"),
@@ -1130,15 +1472,21 @@ pub fn get_to_writer(
 ///
 /// # Errors
 /// Routing, framing, and transport failures as [`GitError`].
-pub fn get(url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, GitError> {
+pub fn get(
+    url: &str,
+    headers: &[(&str, &str)],
+    policy: &super::net::EgressPolicy,
+    tls_roots: Option<&[u8]>,
+) -> Result<HttpResponse, GitError> {
     let mut body = Vec::new();
-    let (status, headers) =
-        request_head(url, "GET", headers, None).and_then(|(mut reader, status, headers)| {
+    let (status, headers) = request_head(url, "GET", headers, None, policy, tls_roots).and_then(
+        |(mut reader, status, headers)| {
             if is_success(status) {
                 read_body(&mut reader, &headers, &mut body, Some(MAX_BUFFERED_BYTES))?;
             }
             Ok((status, headers))
-        })?;
+        },
+    )?;
     Ok(HttpResponse {
         status,
         headers,
@@ -1570,6 +1918,8 @@ mod tests {
                 ("Authorization", "Bearer tok"),
             ],
             b"{\"operation\":\"download\"}",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("post");
         assert_eq!(reply.status, 200);
@@ -1595,9 +1945,15 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
         ]);
         let mut sunk = Vec::new();
-        let (status, _) =
-            get_to_writer(&format!("http://127.0.0.1:{port}/payload"), &[], &mut sunk)
-                .expect("get");
+        let (status, _, final_url) = get_to_writer(
+            &format!("http://127.0.0.1:{port}/payload"),
+            &[],
+            &mut sunk,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect("get");
+        assert_eq!(final_url, format!("http://127.0.0.1:{port}/payload"));
         assert_eq!(status, 200);
         assert_eq!(sunk, b"hello world");
         let requests = server.join().expect("server");
@@ -1646,6 +2002,8 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[("Content-Type", "application/x-git-upload-pack-request")],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1670,6 +2028,8 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1690,6 +2050,8 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1710,6 +2072,8 @@ mod tests {
             &format!("http://127.0.0.1:{port}/a.git/git-upload-pack"),
             &[],
             b"0000",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("post");
         assert_eq!(status, 200);
@@ -1720,9 +2084,51 @@ mod tests {
     }
 
     #[test]
-    fn get_follows_redirects_and_drops_cross_host_auth() {
+    fn egress_denies_loopback_dial() {
+        let (port, _server) = fake_server(vec![(200, vec![], b"payload".to_vec())]);
+        let mut sunk = Vec::new();
+        let err = get_to_writer(
+            &format!("http://127.0.0.1:{port}/payload"),
+            &[],
+            &mut sunk,
+            &super::super::net::EgressPolicy::deny_private(),
+            None,
+        )
+        .expect_err("loopback must not dial under default-deny");
+        assert!(
+            err.to_string().contains("egress policy refuses 127.0.0.1"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn egress_rechecks_every_redirect_hop() {
+        let (first_port, first) = fake_server(vec![(
+            302,
+            vec![("Location".to_owned(), "http://10.9.9.9:1/real".to_owned())],
+            b"moved".to_vec(),
+        )]);
+        let mut sunk = Vec::new();
+        let err = get_to_writer(
+            &format!("http://127.0.0.1:{first_port}/start"),
+            &[],
+            &mut sunk,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect_err("redirect to private space must not dial");
+        assert!(
+            err.to_string().contains("egress policy refuses 10.9.9.9"),
+            "{err:?}"
+        );
+        first.join().expect("first server");
+    }
+
+    #[test]
+    fn get_refuses_credentialed_cross_host_redirect() {
         // Hop one redirects cross-host (port differs, so the host key
-        // differs): the Authorization header must not follow.
+        // differs) on an auth-bearing call: the credential must not follow,
+        // so the redirect is refused with its target for re-basing.
         let (second_port, second) = fake_server(vec![(200, vec![], b"payload-bytes".to_vec())]);
         let (first_port, first) = fake_server(vec![(
             302,
@@ -1733,24 +2139,55 @@ mod tests {
             b"moved".to_vec(),
         )]);
         let mut sunk = Vec::new();
-        let (status, _) = get_to_writer(
+        let err = get_to_writer(
             &format!("http://127.0.0.1:{first_port}/signed"),
             &[("Authorization", "Bearer tok")],
             &mut sunk,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect_err("credentialed redirect must not follow");
+        assert_eq!(err.code(), ruk_core::error::ErrorCode::ERemoteMoved);
+        assert!(
+            err.to_string().contains(&format!("{second_port}")),
+            "{err:?}"
+        );
+        assert!(sunk.is_empty(), "nothing sinks on refusal");
+        let first_requests = first.join().expect("first server");
+        assert_eq!(first_requests.len(), 1);
+        assert!(first_requests[0].contains("Authorization: Bearer tok"));
+        drop(second);
+    }
+
+    #[test]
+    fn get_follows_anonymous_cross_host_redirect() {
+        // The same hop without credentials still follows: presigned-URL
+        // chains carry no Authorization header.
+        let (second_port, second) = fake_server(vec![(200, vec![], b"payload-bytes".to_vec())]);
+        let (first_port, first) = fake_server(vec![(
+            302,
+            vec![(
+                "Location".to_owned(),
+                format!("http://127.0.0.1:{second_port}/real"),
+            )],
+            b"moved".to_vec(),
+        )]);
+        let mut sunk = Vec::new();
+        let (status, _, final_url) = get_to_writer(
+            &format!("http://127.0.0.1:{first_port}/signed"),
+            &[],
+            &mut sunk,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("get");
         assert_eq!(status, 200);
         assert_eq!(sunk, b"payload-bytes");
+        assert_eq!(final_url, format!("http://127.0.0.1:{second_port}/real"));
         let first_requests = first.join().expect("first server");
         let second_requests = second.join().expect("second server");
         assert_eq!(first_requests.len(), 1);
-        assert!(first_requests[0].contains("Authorization: Bearer tok"));
         assert_eq!(second_requests.len(), 1);
-        assert!(
-            !second_requests[0].contains("Authorization:"),
-            "token leaked: {:?}",
-            second_requests[0]
-        );
     }
 
     #[test]
@@ -1884,6 +2321,8 @@ mod tests {
             &url,
             &[("Content-Type", "application/octet-stream")],
             b"payload-bytes",
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("put");
         assert_eq!(reply.status, 200);
@@ -1908,6 +2347,8 @@ mod tests {
             &[("Content-Type", "application/octet-stream")],
             u64::try_from(payload.len()).expect("payload fits"),
             &mut body,
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
         )
         .expect("put");
         assert_eq!(reply.status, 200);
@@ -1917,5 +2358,163 @@ mod tests {
         let head = &requests[0];
         assert!(head.starts_with("PUT /up/stream HTTP/1.1\r\n"), "{head:?}");
         assert!(head.contains("Content-Length: 22"), "{head:?}");
+    }
+
+    #[test]
+    fn pem_splits_blocks_and_decodes_bodies() {
+        let bundle = "-----BEGIN CERTIFICATE-----\nTWE=\n-----END CERTIFICATE-----\n-----BEGIN FOO-----\nignored\n-----END FOO-----\n-----BEGIN CERTIFICATE-----\nTQ==\n-----END CERTIFICATE-----\n";
+        let certs = parse_pem_certs(bundle.as_bytes()).expect("bundle parses");
+        assert_eq!(
+            certs
+                .iter()
+                .map(|cert| cert.as_ref().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![b'M', b'a'], vec![b'M']]
+        );
+        assert!(parse_pem_certs(b"").expect("empty parses").is_empty());
+    }
+
+    #[test]
+    fn pem_rejects_bad_framing() {
+        for bad in [
+            "-----BEGIN CERTIFICATE-----\nMAMCABU=\n-----BEGIN CERTIFICATE-----\nMAMCABU=\n-----END CERTIFICATE-----\n",
+            "-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nMAMCABU=\n",
+            "-----BEGIN CERTIFICATE-----\n****\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAB=C\n-----END CERTIFICATE-----\n",
+        ] {
+            assert!(parse_pem_certs(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(
+            parse_pem_certs("not pem at all".as_bytes())
+                .expect("text")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tls_roots_reject_unusable_bundles() {
+        assert!(tls_config_with_roots(b"").is_err());
+        assert!(
+            tls_config_with_roots(
+                b"-----BEGIN CERTIFICATE-----\nTQ==\n-----END CERTIFICATE-----\n"
+            )
+            .is_err()
+        );
+        assert!(parse_pem_certs(b"caf\xe9").is_err());
+    }
+
+    #[test]
+    fn chunked_refusal_without_drain_still_reports_status() {
+        // The server answers 403 from the head alone and hangs up without
+        // consuming the body: the client must surface the refusal, not a
+        // broken pipe, no matter how much body was already buffered.
+        let (port, server) = fake_server(vec![(403, vec![], b"no".to_vec())]);
+        let mut upload = post_open_chunked(
+            &format!("http://127.0.0.1:{port}/up"),
+            &[("Content-Type", "application/x-git-test")],
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect("chunked open");
+        {
+            use std::io::Write as _;
+            upload.write_all(&vec![b'x'; 5 << 20]).unwrap_or_default();
+        }
+        let (mut reader, status, _) = upload.finish().expect("refusal reports");
+        assert_eq!(status, 403);
+        let mut body = Vec::new();
+        {
+            use std::io::Read as _;
+            reader.read_to_end(&mut body).expect("refusal body");
+        }
+        assert_eq!(body, b"no");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn chunked_upload_frames_lengths_and_terminates() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut reader = BufReader::new(socket.try_clone().expect("split"));
+            let mut head = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).expect("head line");
+                head.extend_from_slice(&line);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head_text = String::from_utf8_lossy(&head).into_owned();
+            assert!(
+                head_text
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked"),
+                "{head_text:?}"
+            );
+            assert!(
+                !head_text.to_ascii_lowercase().contains("content-length:"),
+                "{head_text:?}"
+            );
+            let mut body = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).expect("chunk size");
+                let text = String::from_utf8(line).expect("size utf8");
+                let size = u64::from_str_radix(text.trim_end(), 16).expect("hex size");
+                if size == 0 {
+                    let mut crlf = [0u8; 2];
+                    use std::io::Read as _;
+                    reader.read_exact(&mut crlf).expect("terminal crlf");
+                    break;
+                }
+                let mut chunk = vec![0u8; usize::try_from(size).expect("chunk fits")];
+                {
+                    use std::io::Read as _;
+                    reader.read_exact(&mut chunk).expect("chunk bytes");
+                    let mut crlf = [0u8; 2];
+                    reader.read_exact(&mut crlf).expect("chunk crlf");
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let mut socket = reader.into_inner();
+            use std::io::Write as _;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("reply");
+            body
+        });
+        let mut upload = post_open_chunked(
+            &format!("http://127.0.0.1:{port}/up"),
+            &[("Content-Type", "application/x-git-test")],
+            &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+            None,
+        )
+        .expect("chunked open");
+        let payload = b"hello world".to_vec();
+        let big = vec![b'x'; 70000];
+        {
+            use std::io::Write as _;
+            upload.write_all(&payload).expect("first write");
+            upload.write_all(&big).expect("second write");
+        }
+        let (mut reader, status, _) = upload.finish().expect("finish");
+        assert_eq!(status, 200);
+        let mut reply = Vec::new();
+        use std::io::Read as _;
+        reader.read_to_end(&mut reply).expect("reply body");
+        assert_eq!(reply, b"ok");
+        let mut expected = payload;
+        expected.extend_from_slice(&big);
+        assert_eq!(server.join().expect("server"), expected);
     }
 }
