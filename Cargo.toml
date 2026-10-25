@@ -55,6 +55,9 @@ sha2 = { version = "=0.11.1", default-features = false }
 hmac = { version = "=0.13.0", default-features = false }
 toml = { version = "=1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 rustix = { version = "=1.1.5", default-features = false, features = ["std", "fs", "process"] }
+# macOS strict reservation (physical::platform): `fcntl(F_PREALLOCATE)` has no
+# rustix wrapper that leaves EOF alone. Already in the lock graph via rustix.
+libc = { version = "=0.2.191", default-features = false }
 # Minimal HTTPS for the git-lfs batch API only (transport::http): pure-Rust
 # TLS with Mozilla roots; no platform glue (native-tls is out of scope).
 # Direct count stays at two: ring arrives transitively via the feature.

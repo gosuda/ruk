@@ -61,6 +61,9 @@ cc = "=1.8.0"
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 atomicwrites.workspace = true
 windows-sys.workspace = true
