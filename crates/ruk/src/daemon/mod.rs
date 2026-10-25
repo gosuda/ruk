@@ -9,57 +9,85 @@
 //! Windows named-pipe transport is out of scope for this build: [`serve`]
 //! reports it as [`Error::Unsupported`] instead of binding.
 
+#[cfg(unix)]
 pub(crate) mod executor;
+#[cfg(unix)]
 pub(crate) mod ipc;
+#[cfg(unix)]
 mod push_job;
+#[cfg(unix)]
 pub(crate) mod registry;
+#[cfg(unix)]
 mod remote_refs;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(unix)]
 use std::collections::HashMap;
 use std::fmt;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::Mutex;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::Deserialize;
+#[cfg(unix)]
+use serde::{Serialize, de::DeserializeOwned};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::sync::mpsc;
 
+#[cfg(unix)]
 pub(crate) use executor::BoundedExecutor;
+#[cfg(unix)]
 pub(crate) use registry::Registry;
+#[cfg(unix)]
 use ruk_core::change::{RequestId, SessionId};
+use ruk_core::coord::DEFAULT_EVENT_RETENTION_SECONDS;
+#[cfg(unix)]
 use ruk_core::coord::service_receipts::{
     SERVICE_RECEIPT_VERSION, ServiceReceipt, lookup_service_receipt, store_service_receipt,
 };
-use ruk_core::coord::{
-    Cancel, CancelHandle, DEFAULT_EVENT_RETENTION_SECONDS, HostedCoordinator, Principal,
-    cancellation,
-};
-use ruk_core::error::{CoreError, ErrorCode};
+#[cfg(unix)]
+use ruk_core::coord::{Cancel, CancelHandle, HostedCoordinator, Principal, cancellation};
+use ruk_core::error::CoreError;
+#[cfg(unix)]
+use ruk_core::error::ErrorCode;
+#[cfg(unix)]
 use ruk_core::ids::Oid;
+#[cfg(unix)]
 use ruk_core::protocol::{
     ArchiveFormat, ErrorReply, Method, Mutation, ReconnectSecret, Reply, ReplyEnvelope, Request,
     SessionOpenArgs, SessionResumeArgs, decode_json,
 };
 use ruk_core::refdata::RefName;
+#[cfg(unix)]
 use ruk_git::GitError;
+#[cfg(unix)]
 use ruk_git::transport::archive::{
     ArchivePlan, TarSink, count_commit_tar, plan_commit_archive, stream_commit_tar,
 };
+#[cfg(unix)]
 use ruk_git::transport::credentials::TransportAuth;
+#[cfg(unix)]
 use ruk_git::transport::host::{HookCall, HookReply, HookServer, HostPolicy, hook_bridge};
 use ruk_git::transport::net::EgressPolicy;
 
+#[cfg(unix)]
 use crate::archive_zip::ZipTranscoder;
+#[cfg(unix)]
 use ruk_git::transport::pack::IngestLimits;
+#[cfg(unix)]
 use ruk_git::transport::serve::ReceiveLimits;
 
 /// Default concurrent connections of one daemon process.
@@ -69,6 +97,7 @@ pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 128;
 /// owns channels and a flow-control window, so unbounded distinct ids on
 /// one peer would grow daemon memory without any per-stream quota
 /// noticing.
+#[cfg(unix)]
 pub(crate) const MAX_LIVE_STREAMS: usize = 256;
 
 /// Default blocking permits of the shared executor.
@@ -76,6 +105,12 @@ pub(crate) const DEFAULT_BLOCKING_POOL_SIZE: usize = 16;
 
 /// Default handshake deadline in milliseconds.
 pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+
+/// Credit bytes granted to each direction of a new stream.
+pub(crate) const INITIAL_STREAM_WINDOW_BYTES: u64 = 256 * 1024;
+
+/// Credit bytes one direction of one stream may hold at most.
+pub(crate) const MAX_STREAM_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Default per-frame deadline in milliseconds.
 pub(crate) const DEFAULT_FRAME_TIMEOUT_MS: u64 = 60_000;
@@ -185,7 +220,7 @@ impl DaemonConfig {
             search_pool_size: DEFAULT_SEARCH_POOL_SIZE,
             handshake_timeout: Duration::from_millis(DEFAULT_HANDSHAKE_TIMEOUT_MS),
             frame_timeout: Duration::from_millis(DEFAULT_FRAME_TIMEOUT_MS),
-            stream_window_bytes: ipc::INITIAL_STREAM_WINDOW_BYTES,
+            stream_window_bytes: INITIAL_STREAM_WINDOW_BYTES,
             retention_interval: Duration::from_millis(DEFAULT_RETENTION_INTERVAL_MS),
             egress_allow: Vec::new(),
         }
@@ -333,7 +368,7 @@ impl DaemonConfig {
 
     /// Returns the interval between periodic retention sweeps; zero disables them.
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "only the test target calls this at this commit; retained for later changeset rows"
@@ -346,7 +381,7 @@ impl DaemonConfig {
 
     /// Returns the peer identifiers allowed to call admin methods.
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "only the test target calls this at this commit; retained for later changeset rows"
@@ -359,7 +394,7 @@ impl DaemonConfig {
 
     /// Returns the cap of archive bytes served per request.
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "only the test target calls this at this commit; retained for later changeset rows"
@@ -372,7 +407,7 @@ impl DaemonConfig {
 
     /// Returns the walk budget for `compare` reads.
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "only the test target calls this at this commit; retained for later changeset rows"
@@ -385,7 +420,7 @@ impl DaemonConfig {
 
     /// Returns the per-request scan budget for `search`.
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "only the test target calls this at this commit; retained for later changeset rows"
@@ -398,7 +433,7 @@ impl DaemonConfig {
 
     /// Returns the permits of the search worker pool.
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "only the test target calls this at this commit; retained for later changeset rows"
@@ -578,8 +613,7 @@ impl DaemonConfig {
                 "handshake and frame deadlines must be nonzero",
             )));
         }
-        if self.stream_window_bytes == 0 || self.stream_window_bytes > ipc::MAX_STREAM_WINDOW_BYTES
-        {
+        if self.stream_window_bytes == 0 || self.stream_window_bytes > MAX_STREAM_WINDOW_BYTES {
             return Err(Error::Config(String::from(
                 "stream window must fit the maximum window",
             )));
@@ -621,9 +655,12 @@ pub(crate) enum Error {
     /// A typed core failure ended the daemon or one handshake.
     Core(CoreError),
     /// The platform lacks the required transport.
-    #[expect(
-        dead_code,
-        reason = "no constructor at this commit; retained for later changeset rows"
+    #[cfg_attr(
+        unix,
+        expect(
+            dead_code,
+            reason = "no constructor at this commit; retained for later changeset rows"
+        )
     )]
     Unsupported(String),
 }
@@ -662,6 +699,7 @@ impl From<std::io::Error> for Error {
 }
 
 /// The `Open` payload: one invocation against one repository.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InvocationOpen {
     /// Store directory path or opaque handle from a previous open: the
@@ -691,6 +729,7 @@ pub(crate) struct InvocationOpen {
 }
 
 /// The `Accepted` payload answering one `Open`.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InvocationAccepted {
     /// The accepted stream identifier.
@@ -708,6 +747,7 @@ pub(crate) struct InvocationAccepted {
 
 /// The archive metadata one `Accepted` frame carries: the pinned commit the
 /// streamed body walks, the negotiated format, and its media type.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ArchiveAcceptedResult {
     /// The archived commit the body walks.
@@ -725,6 +765,7 @@ pub(crate) struct ArchiveAcceptedResult {
 /// invocation's input side. The daemon routes `stdin`/empty grants to
 /// the inbound window and `stdout`/`stderr` grants to the outbound
 /// window of the named stream.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WindowCredit {
     /// The credit bytes granted to the frame's stream.
@@ -736,6 +777,7 @@ pub(crate) struct WindowCredit {
 }
 
 /// The `Exit` payload ending one invocation.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExitReport {
     /// The process-style exit status: zero on success.
@@ -750,30 +792,37 @@ pub(crate) struct ExitReport {
 }
 
 /// Outcome of a command that ran to its terminal report.
+#[cfg(unix)]
 const OUTCOME_COMPLETED: &str = "Completed";
 
 /// Outcome of a command that failed: a refusal, a teardown, or a nonzero exit.
+#[cfg(unix)]
 const OUTCOME_FAILED: &str = "Failed";
 
 /// Outcome of a command cancelled before (or during) its run.
+#[cfg(unix)]
 const OUTCOME_CANCELLED: &str = "CancelledBeforeCommit";
 
 /// Bound of frames buffered per stream between the connection reader and
 /// one stream task. The reader waits past it, so a stalled stream applies
 /// backpressure to socket reads instead of growing memory.
+#[cfg(unix)]
 const STREAM_CHANNEL_BOUND: usize = 32;
 
 /// Bound of frames buffered per connection between stream tasks and the
 /// single writer task owning the socket write half.
+#[cfg(unix)]
 const WRITER_CHANNEL_BOUND: usize = 256;
 
 /// Bound of stream-completion reports buffered per connection. A finished
 /// task drops its report past it; the reader unregisters the stream on the
 /// next frame, so the stream table stays bounded by live streams.
+#[cfg(unix)]
 const COMPLETION_CHANNEL_BOUND: usize = 64;
 
 /// One frame moving toward the socket write half, owned by the single
 /// connection-writer task.
+#[cfg(unix)]
 struct OutboundFrame {
     /// The frame kind.
     kind: ipc::FrameKind,
@@ -786,6 +835,7 @@ struct OutboundFrame {
 /// The write end of one stream: its identity plus the channel to the
 /// connection-writer task. Every daemon-to-client frame of the stream
 /// travels through it; the writer task owns the socket write half alone.
+#[cfg(unix)]
 #[derive(Clone)]
 struct StreamSink {
     /// The channel to the connection-writer task.
@@ -795,21 +845,27 @@ struct StreamSink {
 }
 
 /// Default cap of total pack bytes accepted on one git-service stream.
+#[cfg(unix)]
 const DEFAULT_MAX_PACK_BYTES: u64 = 1 << 31;
 
 /// Default cap of objects accepted on one git-service stream.
+#[cfg(unix)]
 const DEFAULT_MAX_OBJECTS: u64 = 5_000_000;
 
 /// Default cap of one decompressed object on a git-service stream.
+#[cfg(unix)]
 const DEFAULT_MAX_OBJECT_BYTES: u64 = 512 << 20;
 
 /// Default cap of delta-chain depth followed on a git-service stream.
+#[cfg(unix)]
 const DEFAULT_MAX_DELTA_DEPTH: u64 = 128;
 
 /// Default cap of stdin bytes collected on one git-service stream.
+#[cfg(unix)]
 const DEFAULT_MAX_STDIN_BYTES: u64 = 256 << 20;
 
 /// Default cap of push options accepted on one git-service stream.
+#[cfg(unix)]
 const DEFAULT_MAX_PUSH_OPTIONS: u64 = 256;
 
 /// Per-stream ingest quotas of one git-service envelope. Absent fields take
@@ -817,6 +873,7 @@ const DEFAULT_MAX_PUSH_OPTIONS: u64 = 256;
 /// Every field clamps to its server-owned maximum (the `DEFAULT_MAX_*`
 /// caps below) at `Open` decode, so a client can narrow but never widen a
 /// quota.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GitLimits {
     /// Largest total pack bytes accepted.
@@ -840,35 +897,42 @@ pub(crate) struct GitLimits {
 }
 
 /// The default cap of total pack bytes accepted on one git-service stream.
+#[cfg(unix)]
 fn default_max_pack_bytes() -> u64 {
     DEFAULT_MAX_PACK_BYTES
 }
 
 /// The default cap of objects accepted on one git-service stream.
+#[cfg(unix)]
 fn default_max_objects() -> u64 {
     DEFAULT_MAX_OBJECTS
 }
 
 /// The default cap of one decompressed object on a git-service stream.
+#[cfg(unix)]
 fn default_max_object_bytes() -> u64 {
     DEFAULT_MAX_OBJECT_BYTES
 }
 
 /// The default cap of delta-chain depth followed on a git-service stream.
+#[cfg(unix)]
 fn default_max_delta_depth() -> u64 {
     DEFAULT_MAX_DELTA_DEPTH
 }
 
 /// The default cap of stdin bytes collected on one git-service stream.
+#[cfg(unix)]
 fn default_max_stdin_bytes() -> u64 {
     DEFAULT_MAX_STDIN_BYTES
 }
 
 /// The default cap of push options accepted on one git-service stream.
+#[cfg(unix)]
 fn default_max_push_options() -> u64 {
     DEFAULT_MAX_PUSH_OPTIONS
 }
 
+#[cfg(unix)]
 impl Default for GitLimits {
     fn default() -> Self {
         Self {
@@ -882,6 +946,7 @@ impl Default for GitLimits {
     }
 }
 
+#[cfg(unix)]
 impl GitLimits {
     /// Clamps every quota to its server-owned maximum. A client-supplied
     /// value above the daemon default (including `u64::MAX`) falls back to
@@ -928,15 +993,19 @@ impl GitLimits {
 }
 
 /// The `receive-pack` git service name.
+#[cfg(unix)]
 const GIT_SERVICE_RECEIVE_PACK: &str = "receive-pack";
 
 /// The `upload-pack` git service name.
+#[cfg(unix)]
 const GIT_SERVICE_UPLOAD_PACK: &str = "upload-pack";
 
 /// The `upload-archive` git service name.
+#[cfg(unix)]
 const GIT_SERVICE_UPLOAD_ARCHIVE: &str = "upload-archive";
 
 /// True for the three git services the envelope carries.
+#[cfg(unix)]
 fn is_git_service(service: &str) -> bool {
     matches!(
         service,
@@ -948,6 +1017,7 @@ fn is_git_service(service: &str) -> bool {
 /// `upload-pack`, or `upload-archive` against one repository. An
 /// `advertise` open writes the ref advertisement and ends; any other open
 /// reads one request round and writes one response.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CommandOpen {
     /// The git service: `receive-pack`, `upload-pack`, or `upload-archive`.
@@ -982,6 +1052,7 @@ pub(crate) struct CommandOpen {
 /// The `Accepted` payload answering one git-service `Open`.
 /// `stdin_credit` carries the inbound window granted; it is always
 /// positive.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CommandAccepted {
     /// The accepted stream identifier.
@@ -993,6 +1064,7 @@ pub(crate) struct CommandAccepted {
 }
 
 /// The `Exit` payload ending one git-service stream.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CommandExitReport {
     /// The native process exit status: zero on success.
@@ -1012,6 +1084,7 @@ pub(crate) struct CommandExitReport {
     pub invocation_id: String,
 }
 
+#[cfg(unix)]
 impl CommandExitReport {
     /// Builds the terminal report of a command that ran to completion.
     fn success(invocation: &str, code: u8) -> Self {
@@ -1041,6 +1114,7 @@ impl CommandExitReport {
 /// One daemon-to-client stdin credit grant. The field names match the Go
 /// backend's `RukWindowUpdate` exactly (`bytes`, not the daemon's
 /// `credit_bytes`), so the client's credit window observes the grant.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StdinGrant {
     /// The granted direction: always `stdin` from the daemon.
@@ -1056,6 +1130,7 @@ struct StdinGrant {
 /// negotiated capabilities and the idle expiry live in coordinator policy
 /// the daemon cannot read, so the daemon omits them instead of guessing.
 /// `session.resume` reports the negotiated capabilities and authority.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionOpened {
     /// The opened session identity.
@@ -1074,6 +1149,7 @@ pub(crate) struct SessionOpened {
 /// first pages are served; every other read names its missing
 /// implementation), and covered mutations run through the
 /// per-method preparation layer plus `submit_prepared`.
+#[cfg(unix)]
 #[must_use]
 pub(crate) fn coord_call_site(method: Method) -> &'static str {
     match method.kind() {
@@ -1095,11 +1171,13 @@ pub(crate) fn coord_call_site(method: Method) -> &'static str {
 
 /// Who opened the invocation: the peer principal plus the daemon's admin
 /// list, which travel together for authorization.
+#[cfg(unix)]
 pub(crate) struct Caller<'a> {
     pub principal: &'a Principal,
     pub admin_uids: &'a [u32],
 }
 
+#[cfg(unix)]
 impl Caller<'_> {
     /// True when the invocation peer may run admin methods.
     fn is_admin(&self) -> bool {
@@ -1111,6 +1189,7 @@ impl Caller<'_> {
 }
 
 /// Builds the `E_HOSTED` refusal for one session-bound method.
+#[cfg(unix)]
 #[must_use]
 pub(crate) fn method_error(method: Method, reason: &str) -> CoreError {
     CoreError::new(
@@ -1167,6 +1246,7 @@ pub(crate) fn serve(config: DaemonConfig) -> Result<(), Error> {
 }
 
 /// Shared handles of one connection task.
+#[cfg(unix)]
 #[derive(Clone)]
 pub(crate) struct ConnectionRefs {
     /// The authorizing registry.
@@ -1483,6 +1563,7 @@ async fn handle_control_frame(
 ///
 /// # Errors
 /// `E_IO` when the writer task is gone and the connection is dead.
+#[cfg(unix)]
 async fn send_raw(
     writer: &mpsc::Sender<OutboundFrame>,
     kind: ipc::FrameKind,
@@ -1850,6 +1931,7 @@ async fn refuse_overflowed_stream(
 /// admitted frame count fits [`stdin_frame_limit`], and the serving task
 /// releases both as it consumes each chunk. `StdinEof` rides the data
 /// channel too, so the terminator never overtakes its bytes.
+#[cfg(unix)]
 struct StreamRoute {
     control: mpsc::Sender<ipc::Frame>,
     data: mpsc::UnboundedSender<ipc::Frame>,
@@ -1881,6 +1963,7 @@ struct StreamRoute {
 /// frames; the data half carries credit-checked `Stdin` and its
 /// terminator. The counters track admitted-but-unconsumed payload bytes
 /// and frames so the reader and the serving task share both bounds.
+#[cfg(unix)]
 struct StreamInput {
     control: mpsc::Receiver<ipc::Frame>,
     data: mpsc::UnboundedReceiver<ipc::Frame>,
@@ -2008,6 +2091,7 @@ async fn serve_stream(
 }
 
 /// Identifiers locating one git-service round for replay dispatch.
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct ReplayIds<'a> {
     invocation: &'a str,
@@ -2116,9 +2200,11 @@ async fn dispatch_stored_receipt(
     }
 }
 
+#[cfg(unix)]
 static RECEIPT_STRIPES: std::sync::LazyLock<[Arc<tokio::sync::Mutex<()>>; 64]> =
     std::sync::LazyLock::new(|| std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(()))));
 
+#[cfg(unix)]
 fn receipt_stripe(key: &[u8]) -> Arc<tokio::sync::Mutex<()>> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -2130,6 +2216,7 @@ fn receipt_stripe(key: &[u8]) -> Arc<tokio::sync::Mutex<()>> {
 
 /// Locates one service receipt: the key (peer, repository, request id)
 /// plus the digest the current round computed.
+#[cfg(unix)]
 struct ReceiptLocator {
     peer_uid: u32,
     repository: Vec<u8>,
@@ -2661,6 +2748,7 @@ impl Drop for TripOnDrop {
 /// One hosted receive-pack round: everything the hook exchange needs.
 /// The sync serve runs on the transport bulkhead while the pump relays
 /// hook frames on the stream task; both halves meet here.
+#[cfg(unix)]
 struct HostedReceive<'a> {
     input: &'a mut mpsc::Receiver<ipc::Frame>,
     sink: &'a StreamSink,
@@ -3265,6 +3353,7 @@ struct StreamingUpload<'a> {
     request_id: String,
 }
 
+#[cfg(unix)]
 fn run_git_service(
     coordinator: &std::sync::Arc<ruk_core::coord::HostedCoordinator>,
     service: &str,
@@ -4346,6 +4435,7 @@ async fn typed_stream(
 /// One `archive` stream's handles: the typed-stream halves plus the open
 /// coordinator the metadata read runs on and the repository handle the
 /// `Accepted` frame echoes.
+#[cfg(unix)]
 struct ArchiveStream<'a> {
     input: &'a mut mpsc::Receiver<ipc::Frame>,
     sink: &'a StreamSink,
@@ -4363,10 +4453,12 @@ struct ArchiveStream<'a> {
 /// chunk per write: the blocking walk pushes 64 KiB frames into the stream
 /// task, which sends them as `Stdout` frames under the reply credit window.
 /// Never buffers the archive.
+#[cfg(unix)]
 struct ChannelSink {
     sender: mpsc::Sender<Vec<u8>>,
 }
 
+#[cfg(unix)]
 impl TarSink for ChannelSink {
     fn write_tar(&mut self, bytes: &[u8]) -> Result<(), GitError> {
         let mut rest = bytes;
@@ -4394,11 +4486,13 @@ impl TarSink for ChannelSink {
 /// output coalesces into [`ipc::MAX_DATA_CHUNK_BYTES`] frames, so the
 /// transcoder's small header writes never become tiny `Stdout` frames. A
 /// dropped consumer surfaces as a broken pipe, which ends the walk.
+#[cfg(unix)]
 struct ChannelWriter {
     sender: mpsc::Sender<Vec<u8>>,
     pending: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl ChannelWriter {
     fn new(sender: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
@@ -4414,6 +4508,7 @@ impl ChannelWriter {
     }
 }
 
+#[cfg(unix)]
 impl std::io::Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.pending.extend_from_slice(buf);
@@ -4434,6 +4529,7 @@ impl std::io::Write for ChannelWriter {
 }
 
 /// The end of one archive body pump.
+#[cfg(unix)]
 enum ArchivePumpOutcome {
     /// Every body byte reached the writer task.
     Done,
@@ -4779,6 +4875,7 @@ async fn serve_typed_archive(stream: ArchiveStream<'_>) {
 /// Everything one archive body stream needs: the stream's halves, the
 /// interrupt flag its prelude may already have tripped, the coordinator the
 /// walk reads, and the planned commit.
+#[cfg(unix)]
 struct ArchiveBody<'a> {
     sink: &'a StreamSink,
     input: &'a mut mpsc::Receiver<ipc::Frame>,
@@ -4799,6 +4896,7 @@ struct ArchiveBody<'a> {
 /// outlives the stream. Interrupting the walk and dropping the receiver
 /// fails its next send, so it reports even when the pump stopped draining
 /// first. The flag alone cannot unblock a send parked on a full channel.
+#[cfg(unix)]
 async fn stream_archive_body<S, F>(body: ArchiveBody<'_>, make_sink: F)
 where
     S: TarSink + Send + 'static,
@@ -4887,6 +4985,7 @@ where
 }
 
 /// Reports whether an archive failure cancelled the stream.
+#[cfg(unix)]
 fn cancelled(err: &CoreError) -> bool {
     err.code == ErrorCode::ECancelled
 }
@@ -4916,6 +5015,7 @@ fn cancelled(err: &CoreError) -> bool {
 /// `E_FORBIDDEN` for a non-admin peer, `E_INVALID` for malformed
 /// arguments, `E_HOSTED` where no dispatch path serves the method, plus
 /// the registry's own failures.
+#[cfg(unix)]
 pub(crate) async fn dispatch_admin(
     registry: &Arc<Registry>,
     executor: &BoundedExecutor,
@@ -4939,6 +5039,7 @@ pub(crate) async fn dispatch_admin(
 }
 
 /// Routes one authorized admin request to its registry producer.
+#[cfg(unix)]
 async fn dispatch_admin_method(
     registry: &Arc<Registry>,
     executor: &BoundedExecutor,
@@ -4983,6 +5084,7 @@ async fn dispatch_admin_method(
     }
 }
 
+#[cfg(unix)]
 pub(crate) async fn dispatch_method(
     coordinator: &Arc<HostedCoordinator>,
     caller: Caller<'_>,
@@ -5116,6 +5218,7 @@ pub(crate) async fn dispatch_method(
 /// reaches here through dispatch: reads run on the coordinator and
 /// uncovered ones name their missing implementation there, while mutations
 /// prepare or name their missing preparation.
+#[cfg(unix)]
 fn refuse_sessionless(method: Method, session: Option<SessionId>) -> CoreError {
     match session {
         None => CoreError::new(
@@ -5133,6 +5236,7 @@ fn refuse_sessionless(method: Method, session: Option<SessionId>) -> CoreError {
 ///
 /// # Errors
 /// `E_INVALID` when the invocation frame carried no request id.
+#[cfg(unix)]
 fn mutation_request<Args>(
     request_id: Option<RequestId>,
     args: Args,
@@ -5148,6 +5252,7 @@ fn mutation_request<Args>(
 ///
 /// # Errors
 /// `E_INVALID` for over-nested, malformed, or mismatched JSON.
+#[cfg(unix)]
 fn decode_args<Args: DeserializeOwned>(text: &str) -> Result<Args, CoreError> {
     decode_json(text.as_bytes())
 }
@@ -5162,7 +5267,7 @@ fn decode_args<Args: DeserializeOwned>(text: &str) -> Result<Args, CoreError> {
 /// # Errors
 /// `E_INVALID` for a half-specified credential, or when the request
 /// arguments cannot be encoded.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn invocation_digest(
     request: &Request,
     auth: &TransportAuth,
@@ -5182,6 +5287,7 @@ fn invocation_digest(
 /// # Errors
 /// `E_INVALID` for missing arguments, a missing or malformed mutation
 /// request id, a shape mismatch, or a violated method invariant.
+#[cfg(unix)]
 fn decode_request_args(
     method: Method,
     args_json: Option<&str>,

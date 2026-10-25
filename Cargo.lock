@@ -2488,6 +2488,7 @@ dependencies = [
  "gix-hash",
  "hmac 0.13.0",
  "jiff",
+ "libc",
  "logos",
  "markdown",
  "mdxjs",

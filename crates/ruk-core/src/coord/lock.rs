@@ -75,6 +75,13 @@ pub(crate) struct EndpointNonce([u8; 32]);
 
 impl EndpointNonce {
     /// Draws 32 bytes from the OS generator for one bound endpoint.
+    #[cfg_attr(
+        all(windows, not(test)),
+        expect(
+            dead_code,
+            reason = "no Windows caller: the sidecar that binds endpoints is Unix-only"
+        )
+    )]
     pub(crate) fn generate() -> Result<Self, CoreError> {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes)
@@ -173,7 +180,7 @@ impl StoreLock {
                 ));
             }
         }
-        let path = root.join(LOCK_FILE_NAME);
+        let path = lock_path(root);
         match platform::try_acquire(&path)? {
             Some(file) => Ok(Acquisition::Owner(StoreLock {
                 inner: Some(OwnerInner { file, path }),
@@ -197,6 +204,13 @@ impl StoreLock {
     /// Replaces the body under the held lifetime lock: seek to zero,
     /// truncate, write the complete bounded body, then sync. Only the owner
     /// calls this, after its endpoint binds and passes readiness.
+    #[cfg_attr(
+        all(windows, not(test)),
+        expect(
+            dead_code,
+            reason = "no Windows caller: the sidecar that binds endpoints is Unix-only"
+        )
+    )]
     pub(crate) fn publish(&mut self, body: &LockBody) -> Result<(), CoreError> {
         let bytes = encode_body(body)?;
         let Some(inner) = self.inner.as_mut() else {
@@ -299,6 +313,13 @@ fn unix_path_bytes(path: &Path) -> Vec<u8> {
 
 /// UTF-8 paths encode identically on Windows; anything else is unrepresentable.
 #[cfg(windows)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no Windows caller: the sidecar that binds endpoints is Unix-only"
+    )
+)]
 fn unix_path_bytes(path: &Path) -> Result<Vec<u8>, ()> {
     path.as_os_str()
         .to_str()
@@ -347,6 +368,13 @@ fn socket_path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, ()> {
 /// Encodes a body into its exact four LF-terminated lines. Invalid internal
 /// input reports [`ErrorCode::EInvalid`], overlong input
 /// [`ErrorCode::ELimit`]; malformed bytes are never emitted.
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(
+        dead_code,
+        reason = "no Windows caller: the sidecar that binds endpoints is Unix-only"
+    )
+)]
 pub(crate) fn encode_body(body: &LockBody) -> Result<Vec<u8>, CoreError> {
     if body.pid == 0 {
         return Err(CoreError::new(ErrorCode::EInvalid, "lock pid is zero"));

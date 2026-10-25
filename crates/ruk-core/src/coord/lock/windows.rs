@@ -223,7 +223,7 @@ mod tests {
                 .arg(&lock_path)
                 .arg(&target_dir)
                 .output()
-                .map_or(false, |out| out.status.success());
+                .is_ok_and(|out| out.status.success());
 
         if created_reparse {
             let err = try_acquire(&lock_path).unwrap_err();
@@ -249,12 +249,12 @@ mod tests {
             .arg(&lock_path)
             .args(["/grant", "Everyone:R"])
             .output()
-            .map_or(false, |out| out.status.success())
+            .is_ok_and(|out| out.status.success())
             || std::process::Command::new("icacls")
                 .arg(&lock_path)
                 .args(["/inheritance:e"])
                 .output()
-                .map_or(false, |out| out.status.success());
+                .is_ok_and(|out| out.status.success());
 
         if modified {
             let err = try_acquire(&lock_path).unwrap_err();

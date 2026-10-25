@@ -37,10 +37,22 @@
 //!   files/volumes, then `FileStandardInfo` for the observation. Microsoft
 //!   documents no generic subsequent-overwrite theorem, so a Windows receipt
 //!   means "allocation observed", never "subsequent writes guaranteed".
-//! - **macOS and other Unix**: `UnverifiedFilesystem`. rustix's Apple
-//!   `fallocate` is an `F_PREALLOCATE` plus `ftruncate` shim that accepts
-//!   only empty flags and can move EOF; routing it through the strict path
-//!   would misstate the guarantee. XNU exposes no unshare primitive.
+//! - **macOS**: `fcntl(F_PREALLOCATE)` with `F_ALLOCATEALL` from the
+//!   physical end of file. It allocates every requested byte or none and
+//!   leaves EOF alone, the `KEEP_SIZE` analogue.
+//!   Only ranges entirely beyond EOF qualify: they have no existing extents
+//!   to share. The call is skipped when the file's allocated bytes already
+//!   reach the end of the range, so small appends reuse the block an earlier
+//!   reservation covered. A range that starts inside the file maps to
+//!   [`AllocationError::UnverifiedFilesystem`]: XNU has no unshare
+//!   primitive, and an APFS clone or snapshot may need a new extent on
+//!   overwrite. `ENOTSUP`/`EOPNOTSUPP`/`ENOSYS`/`EINVAL`/`ENOTTY` from the
+//!   call maps to the same refusal; `ENOSPC` stays [`AllocationError::Io`].
+//!   rustix's Apple `fallocate` is not used: it follows `F_PREALLOCATE` with
+//!   `ftruncate`, which moves EOF.
+//! - **Other Unix, including the non-macOS Apple targets**:
+//!   `UnverifiedFilesystem` for every non-empty range. No reviewed strict
+//!   primitive exists there.
 
 use std::fs::File;
 use std::path::Path;
@@ -190,23 +202,129 @@ pub(crate) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationEr
     platform::volume_free_floor(path)
 }
 
-#[cfg(target_os = "linux")]
-mod platform {
+#[cfg(unix)]
+mod unix {
     use super::{AllocationError, AllocationReceipt, VolumeFloor};
-    use rustix::fs::{FallocateFlags, fallocate, fstat, fstatvfs};
-    use rustix::io::Errno;
+    use rustix::fs::{fstat, fstatvfs};
     use std::fs::File;
     use std::path::Path;
+
+    pub(super) fn require_regular(file: &File) -> Result<(), AllocationError> {
+        let meta = file.metadata().map_err(AllocationError::Io)?;
+        if meta.is_file() {
+            Ok(())
+        } else {
+            Err(AllocationError::NotRegularFile)
+        }
+    }
+
+    pub(super) fn stat_receipt(
+        file: &File,
+        requested: u64,
+    ) -> Result<AllocationReceipt, AllocationError> {
+        let st = fstat(file).map_err(|e| AllocationError::Io(e.into()))?;
+        let allocated = u64::try_from(st.st_blocks)
+            .map_err(|_| AllocationError::Overflow)?
+            .checked_mul(512)
+            .ok_or(AllocationError::Overflow)?;
+        let logical = u64::try_from(st.st_size).map_err(|_| AllocationError::Overflow)?;
+        Ok(AllocationReceipt {
+            requested_bytes: requested,
+            allocated_bytes: allocated,
+            logical_len: logical,
+        })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no caller at this commit; retained for later changeset rows"
+        )
+    )]
+    pub(super) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
+        let dir = File::open(path).map_err(AllocationError::Io)?;
+        let v = fstatvfs(&dir).map_err(|e| AllocationError::Io(e.into()))?;
+        let frag = if v.f_frsize == 0 {
+            v.f_bsize
+        } else {
+            v.f_frsize
+        };
+        let available = v
+            .f_bavail
+            .checked_mul(frag)
+            .ok_or(AllocationError::Overflow)?;
+        let total = v
+            .f_blocks
+            .checked_mul(frag)
+            .ok_or(AllocationError::Overflow)?;
+        Ok(VolumeFloor { available, total })
+    }
+}
+
+#[cfg(any(target_os = "macos", all(unix, test)))]
+mod append_plan {
+    use super::AllocationError;
+    use rustix::io::Errno;
+
+    /// Bytes to newly allocate from the physical end of file so that
+    /// `[offset, offset + len)` is covered; `0` when the file already
+    /// covers it.
+    ///
+    /// `logical_len` and `allocated` are the file's current `st_size` and
+    /// `st_blocks * 512`. A range that starts inside the file would need an
+    /// unshare that XNU cannot express, so it fails closed. Segment files are
+    /// written sequentially, so their allocated bytes are the data below EOF
+    /// plus the space already held past it: `allocated >= end` then means
+    /// the held space past EOF reaches `end`, and an under-count of the held
+    /// space only makes this call allocate more than needed, never less.
+    pub(super) fn bytes_to_allocate(
+        offset: u64,
+        len: u64,
+        logical_len: u64,
+        allocated: u64,
+    ) -> Result<u64, AllocationError> {
+        let end = offset.checked_add(len).ok_or(AllocationError::Overflow)?;
+        if offset < logical_len {
+            return Err(AllocationError::UnverifiedFilesystem);
+        }
+        Ok(end.saturating_sub(allocated))
+    }
+
+    /// Maps an `F_PREALLOCATE` failure. A filesystem or argument the call
+    /// cannot honour fails closed; `ENOSPC` and everything else stay I/O.
+    pub(super) fn classify_errno(errno: Errno) -> AllocationError {
+        let refusals = [
+            Errno::NOTSUP,
+            Errno::OPNOTSUPP,
+            Errno::NOSYS,
+            Errno::INVAL,
+            Errno::NOTTY,
+        ];
+        if refusals.contains(&errno) {
+            AllocationError::UnverifiedFilesystem
+        } else {
+            AllocationError::Io(errno.into())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::unix::{require_regular, stat_receipt};
+    use super::{AllocationError, AllocationReceipt};
+    use rustix::fs::{FallocateFlags, fallocate, fstat};
+    use rustix::io::Errno;
+    use std::fs::File;
+
+    pub(super) use super::unix::volume_free_floor;
 
     pub(super) fn reserve(
         file: &File,
         offset: u64,
         len: u64,
     ) -> Result<AllocationReceipt, AllocationError> {
-        let meta = file.metadata().map_err(AllocationError::Io)?;
-        if !meta.is_file() {
-            return Err(AllocationError::NotRegularFile);
-        }
+        require_regular(file)?;
         if len > 0 {
             let end = offset + len;
             // The file's current extent layout decides which allocation the
@@ -252,48 +370,6 @@ mod platform {
             Errno::OPNOTSUPP | Errno::NOSYS | Errno::INVAL => AllocationError::UnverifiedFilesystem,
             other => AllocationError::Io(other.into()),
         }
-    }
-
-    fn stat_receipt(file: &File, requested: u64) -> Result<AllocationReceipt, AllocationError> {
-        let st = fstat(file).map_err(|e| AllocationError::Io(e.into()))?;
-        let allocated = u64::try_from(st.st_blocks)
-            .map_err(|_| AllocationError::Overflow)?
-            .checked_mul(512)
-            .ok_or(AllocationError::Overflow)?;
-        let logical = u64::try_from(st.st_size).map_err(|_| AllocationError::Overflow)?;
-        Ok(AllocationReceipt {
-            requested_bytes: requested,
-            allocated_bytes: allocated,
-            logical_len: logical,
-        })
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no caller at this commit; retained for later changeset rows"
-        )
-    )]
-    pub(super) fn volume_free_floor(path: &Path) -> Result<VolumeFloor, AllocationError> {
-        let dir = File::open(path).map_err(AllocationError::Io)?;
-        let v = fstatvfs(&dir).map_err(|e| AllocationError::Io(e.into()))?;
-        // rustix already substitutes f_bsize when a filesystem reports
-        // f_frsize == 0 on the linux-raw backend; keep the fallback anyway.
-        let frag = if v.f_frsize == 0 {
-            v.f_bsize
-        } else {
-            v.f_frsize
-        };
-        let available = v
-            .f_bavail
-            .checked_mul(frag)
-            .ok_or(AllocationError::Overflow)?;
-        let total = v
-            .f_blocks
-            .checked_mul(frag)
-            .ok_or(AllocationError::Overflow)?;
-        Ok(VolumeFloor { available, total })
     }
 }
 
@@ -525,31 +601,155 @@ mod platform {
     }
 }
 
-// Apple and every other Unix: rustix's `fallocate` exists on Apple but is an
-// F_PREALLOCATE + ftruncate shim accepting only empty flags — it can move EOF
-// and offers no unshare. XNU defines no unshare primitive. Returning
-// UnverifiedFilesystem keeps the strict path honest until a reviewed Apple
-// FFI implementation passes a real filesystem smoke.
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
 mod platform {
-    use super::{AllocationError, AllocationReceipt, VolumeFloor};
+    use super::append_plan::{bytes_to_allocate, classify_errno};
+    use super::unix::{require_regular, stat_receipt};
+    use super::{AllocationError, AllocationReceipt};
+    use rustix::io::Errno;
     use std::fs::File;
-    use std::path::Path;
+    use std::os::fd::AsRawFd;
+
+    pub(super) use super::unix::volume_free_floor;
 
     pub(super) fn reserve(
-        _file: &File,
-        _offset: u64,
-        _len: u64,
+        file: &File,
+        offset: u64,
+        len: u64,
     ) -> Result<AllocationReceipt, AllocationError> {
-        Err(AllocationError::UnverifiedFilesystem)
+        require_regular(file)?;
+        if len > 0 {
+            let seen = stat_receipt(file, len)?;
+            let bytes = bytes_to_allocate(offset, len, seen.logical_len, seen.allocated_bytes)?;
+            if bytes > 0 {
+                preallocate(file, bytes)?;
+            }
+        }
+        stat_receipt(file, len)
     }
 
-    pub(super) fn volume_free_floor(_path: &Path) -> Result<VolumeFloor, AllocationError> {
-        Err(AllocationError::UnverifiedFilesystem)
+    #[expect(
+        unsafe_code,
+        reason = "fcntl(F_PREALLOCATE) has no safe wrapper that leaves EOF unchanged"
+    )]
+    fn preallocate(file: &File, bytes: u64) -> Result<(), AllocationError> {
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: i64::try_from(bytes).map_err(|_| AllocationError::Overflow)?,
+            fst_bytesalloc: 0,
+        };
+        loop {
+            // SAFETY: the descriptor is borrowed from a live File for the
+            // duration of the call; store is an initialized fstore_t that
+            // fcntl reads and updates in place.
+            let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+            if rc != -1 {
+                return Ok(());
+            }
+            let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            let errno = Errno::from_raw_os_error(raw);
+            if errno != Errno::INTR {
+                return Err(classify_errno(errno));
+            }
+        }
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+mod platform {
+    use super::unix::{require_regular, stat_receipt};
+    use super::{AllocationError, AllocationReceipt};
+    use std::fs::File;
+
+    pub(super) use super::unix::volume_free_floor;
+
+    pub(super) fn reserve(
+        file: &File,
+        _offset: u64,
+        len: u64,
+    ) -> Result<AllocationReceipt, AllocationError> {
+        require_regular(file)?;
+        if len > 0 {
+            return Err(AllocationError::UnverifiedFilesystem);
+        }
+        stat_receipt(file, len)
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    #[test]
+    fn volume_floor_observes_the_mount() {
+        let floor = volume_free_floor(&std::env::temp_dir()).unwrap();
+        assert!(floor.total >= floor.available);
+        assert!(floor.total > 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod append_plan_tests {
+    use super::append_plan::{bytes_to_allocate, classify_errno};
+    use super::*;
+    use rustix::io::Errno;
+
+    #[test]
+    fn append_beyond_eof_allocates_the_shortfall() {
+        assert_eq!(bytes_to_allocate(4096, 100, 4096, 4096).unwrap(), 100);
+        assert_eq!(bytes_to_allocate(0, 24, 0, 0).unwrap(), 24);
+    }
+
+    #[test]
+    fn append_already_covered_by_allocated_bytes_is_skipped() {
+        assert_eq!(bytes_to_allocate(4096, 100, 4096, 8192).unwrap(), 0);
+        assert_eq!(bytes_to_allocate(4096, 100, 4096, 4196).unwrap(), 0);
+        assert_eq!(bytes_to_allocate(0, 24, 0, 4096).unwrap(), 0);
+    }
+
+    #[test]
+    fn range_starting_inside_the_file_fails_closed() {
+        assert!(matches!(
+            bytes_to_allocate(0, 4096, 4096, 4096),
+            Err(AllocationError::UnverifiedFilesystem)
+        ));
+        assert!(matches!(
+            bytes_to_allocate(2048, 8192, 4096, 4096),
+            Err(AllocationError::UnverifiedFilesystem)
+        ));
+    }
+
+    #[test]
+    fn overflowing_range_is_rejected_before_any_decision() {
+        assert!(matches!(
+            bytes_to_allocate(u64::MAX, 1, 0, 0),
+            Err(AllocationError::Overflow)
+        ));
+    }
+
+    #[test]
+    fn unsupported_errnos_fail_closed_and_the_rest_stay_io() {
+        for errno in [
+            Errno::NOTSUP,
+            Errno::OPNOTSUPP,
+            Errno::NOSYS,
+            Errno::INVAL,
+            Errno::NOTTY,
+        ] {
+            assert!(matches!(
+                classify_errno(errno),
+                AllocationError::UnverifiedFilesystem
+            ));
+        }
+        for errno in [Errno::NOSPC, Errno::IO, Errno::BADF, Errno::DQUOT] {
+            assert!(matches!(classify_errno(errno), AllocationError::Io(_)));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -623,11 +823,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn volume_floor_observes_the_mount() {
-        let floor = volume_free_floor(Path::new("/tmp")).unwrap();
-        assert!(floor.total >= floor.available);
-        assert!(floor.total > 0);
+    fn macos_append_reserves_every_byte_without_moving_eof() {
+        let dir = std::env::temp_dir().join(format!("ruk-phys-apple-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = File::create(dir.join("seg.bin")).unwrap();
+        file.write_all(&[7u8; 4096]).unwrap();
+        file.sync_all().unwrap();
+
+        let receipt = reserve_prepublication(&file, 4096, 1 << 20).unwrap();
+        assert_eq!(receipt.requested_bytes, 1 << 20);
+        assert_eq!(receipt.logical_len, 4096);
+        assert!(receipt.allocated_bytes >= 4096);
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

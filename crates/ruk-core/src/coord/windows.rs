@@ -86,6 +86,13 @@ pub(crate) const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\";
 
 /// Space available and total capacity for a filesystem path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: only the storage tests query volume space"
+    )
+)]
 pub(crate) struct FilesystemSpace {
     pub(crate) available_bytes: u64,
     pub(crate) total_bytes: u64,
@@ -173,6 +180,13 @@ pub(crate) fn ensure_local_storage(path: &Path) -> Result<(), CoreError> {
 }
 
 /// Queries free and total filesystem space for a directory.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: only the storage tests query volume space"
+    )
+)]
 pub(crate) fn filesystem_space(path: &Path) -> Result<FilesystemSpace, CoreError> {
     let wide = to_wide_dir_path(path)?;
     let mut free_available: u64 = 0;
@@ -405,6 +419,13 @@ pub(crate) fn validate_lock_file(file: &File, path: &Path) -> Result<(), CoreErr
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: the per-repo sidecar that binds pipes is Unix-only"
+    )
+)]
 enum PipeInstanceKind {
     First,
     Subsequent,
@@ -413,6 +434,13 @@ enum PipeInstanceKind {
 /// Creates the initial (first) named pipe server instance with owner-only
 /// protected DACL, enforcing `FILE_FLAG_FIRST_PIPE_INSTANCE` to prevent
 /// server-side namespace squatting.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: the per-repo sidecar that binds pipes is Unix-only"
+    )
+)]
 pub(crate) fn create_first_pipe_server(
     name: &str,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, io::Error> {
@@ -421,12 +449,26 @@ pub(crate) fn create_first_pipe_server(
 
 /// Creates a subsequent named pipe server instance on an already-bound
 /// pipe name with owner-only protected DACL and remote clients rejected.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: the per-repo sidecar that binds pipes is Unix-only"
+    )
+)]
 pub(crate) fn create_subsequent_pipe_server(
     name: &str,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, io::Error> {
     create_pipe_server_inner(name, PipeInstanceKind::Subsequent)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: the per-repo sidecar that binds pipes is Unix-only"
+    )
+)]
 #[expect(
     unsafe_code,
     reason = "create named pipe server with owner-only SECURITY_ATTRIBUTES"
@@ -438,8 +480,7 @@ fn create_pipe_server_inner(
     validate_pipe_address(name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.message))?;
 
-    let descriptor = OwnerOnlyDescriptor::create()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.message))?;
+    let descriptor = OwnerOnlyDescriptor::create().map_err(|e| io::Error::other(e.message))?;
     let mut sa = descriptor.security_attributes();
 
     let mut opts = tokio::net::windows::named_pipe::ServerOptions::new();
@@ -463,6 +504,13 @@ fn create_pipe_server_inner(
 }
 
 /// Generates an unpredictable, local named pipe path bound to `store_id`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: the per-repo sidecar that binds pipes is Unix-only"
+    )
+)]
 pub(crate) fn generate_pipe_name(store_id: StoreId) -> Result<String, CoreError> {
     let mut random_bytes = [0u8; 16];
     getrandom::fill(&mut random_bytes).map_err(|err| {
@@ -542,10 +590,6 @@ impl LocalMem {
         assert!(!ptr.is_null(), "cannot adopt null HLOCAL");
         Self { ptr }
     }
-
-    fn as_ptr(&self) -> *mut core::ffi::c_void {
-        self.ptr
-    }
 }
 
 impl Drop for LocalMem {
@@ -580,7 +624,7 @@ impl OwnedSid {
                 "SID byte buffer is too short",
             ));
         }
-        let word_count = (byte_len + 3) / 4;
+        let word_count = byte_len.div_ceil(4);
         let mut words = vec![0u32; word_count];
         // SAFETY: psid is verified valid and points to at least byte_len bytes;
         // words is sized for word_count * 4 >= byte_len bytes and 4-byte aligned.
@@ -762,7 +806,7 @@ fn query_token_user_sid(token_handle: RawHandle) -> Result<OwnedSid, CoreError> 
     }
 
     // Allocate 8-byte aligned memory using Vec<u64>.
-    let words = (required_len as usize + 7) / 8;
+    let words = (required_len as usize).div_ceil(8);
     let mut buffer: Vec<u64> = vec![0u64; words];
     let mut returned_len: u32 = 0;
 
@@ -804,7 +848,7 @@ fn query_token_user_sid(token_handle: RawHandle) -> Result<OwnedSid, CoreError> 
         .map_err(|_| CoreError::new(ErrorCode::EIo, "SID length overflow"))?;
     if sid_addr
         .checked_add(sid_len)
-        .map_or(true, |end| end > buf_end)
+        .is_none_or(|end| end > buf_end)
     {
         return Err(CoreError::new(ErrorCode::EIo, "SID length exceeds buffer"));
     }
@@ -862,9 +906,7 @@ fn audit_handle_security(
         SE_FILE_OBJECT,
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         &mut psid_owner,
-        core::ptr::null_mut(),
         &mut pdacl,
-        core::ptr::null_mut(),
         &mut psd,
     );
 
@@ -966,7 +1008,7 @@ fn audit_single_ace(
     expected_owner: &OwnedSid,
 ) -> Result<(), CoreError> {
     // Alignment check for ACE_HEADER (requires 2-byte alignment).
-    if (pace as usize) % core::mem::align_of::<ACE_HEADER>() != 0 {
+    if !(pace as usize).is_multiple_of(core::mem::align_of::<ACE_HEADER>()) {
         return Err(forbidden(path, "misaligned ACE header in DACL"));
     }
 
@@ -994,7 +1036,7 @@ fn audit_single_ace(
     }
 
     // ACCESS_ALLOWED_ACE requires 4-byte alignment (Mask is u32).
-    if (pace as usize) % core::mem::align_of::<u32>() != 0 {
+    if !(pace as usize).is_multiple_of(core::mem::align_of::<u32>()) {
         return Err(forbidden(path, "misaligned ACCESS_ALLOWED_ACE in DACL"));
     }
     let ace_size = usize::from(header.AceSize);
@@ -1250,15 +1292,21 @@ fn get_security_info_raw(
     obj_type: i32,
     sec_info: u32,
     psid_owner: *mut PSID,
-    psid_group: *mut PSID,
     pdacl: *mut *mut ACL,
-    psacl: *mut *mut ACL,
     psd: *mut PSECURITY_DESCRIPTOR,
 ) -> WIN32_ERROR {
-    // SAFETY: handle is valid; all output pointers are valid references or null.
+    // SAFETY: handle is valid; the owner, DACL, and descriptor outputs are valid
+    // references, and the group and SACL outputs are not requested so stay null.
     unsafe {
         GetSecurityInfo(
-            handle, obj_type, sec_info, psid_owner, psid_group, pdacl, psacl, psd,
+            handle,
+            obj_type,
+            sec_info,
+            psid_owner,
+            core::ptr::null_mut(),
+            pdacl,
+            core::ptr::null_mut(),
+            psd,
         )
     }
 }

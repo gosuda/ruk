@@ -236,14 +236,18 @@ fn stage_bytes(
 }
 
 /// Derives the index mode from worktree metadata.
+#[cfg(unix)]
 pub(crate) fn file_mode_of(meta: &std::fs::Metadata) -> FileMode {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if meta.permissions().mode() & 0o100 != 0 {
-            return FileMode::Executable;
-        }
+    use std::os::unix::fs::PermissionsExt as _;
+    if meta.permissions().mode() & 0o100 != 0 {
+        FileMode::Executable
+    } else {
+        FileMode::Regular
     }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_mode_of(_meta: &std::fs::Metadata) -> FileMode {
     FileMode::Regular
 }
 

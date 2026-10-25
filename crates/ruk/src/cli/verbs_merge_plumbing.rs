@@ -55,6 +55,7 @@ use super::tree::{
     TreeMode, build_index_tree, commit_tree_oid, flatten_tree, join_base, peel_to_tree,
     read_object_bytes, store_object,
 };
+use super::verbs_branch::create_worktree_link;
 use super::{Ctx, FlagSpec, collect, line, read_stdin_text};
 
 // ---------------------------------------------------------------------------
@@ -1372,29 +1373,7 @@ fn write_lane_blob(
 ) -> Result<(), GitError> {
     let store = ctx.store()?;
     if mode == FileMode::Symlink {
-        let (_, body) = read_object_bytes(store, oid)?;
-        let text = std::str::from_utf8(&body).map_err(|_| GitError::Invalid {
-            detail: "symlink target is not valid UTF-8".to_owned(),
-        })?;
-        if full.is_symlink() || full.exists() {
-            std::fs::remove_file(full).map_err(|err| GitError::Io {
-                detail: format!("removing {}: {err}", full.display()),
-            })?;
-        }
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
-                detail: format!("creating {}: {err}", parent.display()),
-            })?;
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(text, full).map_err(|err| GitError::Io {
-            detail: format!("linking {}: {err}", full.display()),
-        })?;
-        #[cfg(not(unix))]
-        return Err(GitError::Unsupported {
-            command: "checkout of symlinks on this platform".to_owned(),
-        });
-        return Ok(());
+        return create_worktree_link(store, oid, full);
     }
     let (_, body) = read_object_bytes(store, oid)?;
     if let Some(parent) = full.parent() {

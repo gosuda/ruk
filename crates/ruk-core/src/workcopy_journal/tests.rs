@@ -205,6 +205,21 @@ fn link_of(fx: &Fixture, rel: &str) -> Option<Vec<u8>> {
         .map(|target| target.into_os_string().into_vec())
 }
 
+#[cfg(unix)]
+fn symlink_entries(fx: &Fixture) -> Vec<PlanEntry> {
+    std::os::unix::fs::symlink("mod.txt", fx.full("link")).expect("symlink");
+    vec![plan_entry(
+        "link",
+        Some(entry(FileMode::Symlink, fx.blob(b"mod.txt"))),
+        Some(entry(FileMode::Symlink, fx.blob(b"keep.txt"))),
+    )]
+}
+
+#[cfg(not(unix))]
+fn symlink_entries(_: &Fixture) -> Vec<PlanEntry> {
+    Vec::new()
+}
+
 /// Seeds the preimage worktree and returns a plan covering every
 /// transition kind.
 fn seed(fx: &Fixture) -> Vec<PlanEntry> {
@@ -216,7 +231,6 @@ fn seed(fx: &Fixture) -> Vec<PlanEntry> {
     fx.put("swap", b"f");
     fx.put("dir/a.txt", b"a");
     fx.put("ren-from.txt", b"same");
-    #[cfg_attr(windows, allow(unused_mut))]
     let mut entries = vec![
         plan_entry("mod.txt", Some(regular(b"old")), Some(regular(b"new"))),
         plan_entry("del.txt", Some(regular(b"gone")), None),
@@ -238,15 +252,7 @@ fn seed(fx: &Fixture) -> Vec<PlanEntry> {
             Some(entry(FileMode::Gitlink, fx.blob(b"foreign commit"))),
         ),
     ];
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink("mod.txt", fx.full("link")).expect("symlink");
-        entries.push(plan_entry(
-            "link",
-            Some(entry(FileMode::Symlink, fx.blob(b"mod.txt"))),
-            Some(entry(FileMode::Symlink, fx.blob(b"keep.txt"))),
-        ));
-    }
+    entries.extend(symlink_entries(fx));
     entries
 }
 

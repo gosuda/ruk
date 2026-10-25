@@ -3704,7 +3704,11 @@ pub(crate) fn sync_worktree_to_index(ctx: &Ctx) -> Result<(), GitError> {
 
 /// Creates one worktree symlink from its recorded target blob.
 #[cfg(unix)]
-fn create_worktree_link(store: &Store, oid: Oid, full: &std::path::Path) -> Result<(), GitError> {
+pub(crate) fn create_worktree_link(
+    store: &Store,
+    oid: Oid,
+    full: &std::path::Path,
+) -> Result<(), GitError> {
     let (_, body) = read_object_bytes(store, oid)?;
     let text = std::str::from_utf8(&body).map_err(|_| GitError::Invalid {
         detail: "symlink target is not valid UTF-8".to_owned(),
@@ -3726,7 +3730,7 @@ fn create_worktree_link(store: &Store, oid: Oid, full: &std::path::Path) -> Resu
 
 /// Refuses worktree links where the platform cannot make them.
 #[cfg(not(unix))]
-fn create_worktree_link(
+pub(crate) fn create_worktree_link(
     _store: &Store,
     _oid: Oid,
     _full: &std::path::Path,

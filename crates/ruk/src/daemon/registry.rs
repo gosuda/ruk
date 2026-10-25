@@ -2957,7 +2957,9 @@ mod tests {
         registry
             .create_repo(&init_args(&root, "acme/busy"))
             .expect("repo inits");
-        let repo_root = root.join("acme/busy");
+        let repo_root = std::fs::canonicalize(&root)
+            .expect("scratch root exists")
+            .join("acme/busy");
         let store = repo_root.join(".ruk");
         let handle = registry
             .open_by_path(&repo_root)
@@ -2996,7 +2998,9 @@ mod tests {
         registry
             .create_repo(&init_args(&root, "acme/moving"))
             .expect("repo inits");
-        let repo_root = root.join("acme/moving");
+        let repo_root = std::fs::canonicalize(&root)
+            .expect("scratch root exists")
+            .join("acme/moving");
         let store = repo_root.join(".ruk");
 
         {
@@ -3027,7 +3031,9 @@ mod tests {
         registry
             .create_repo(&init_args(&root, "acme/racy"))
             .expect("repo inits");
-        let repo_root = root.join("acme/racy");
+        let repo_root = std::fs::canonicalize(&root)
+            .expect("scratch root exists")
+            .join("acme/racy");
         let store = repo_root.join(".ruk");
 
         // Simulate the delete window: entry taken, rename not yet run.

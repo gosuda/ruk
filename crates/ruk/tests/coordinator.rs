@@ -16,7 +16,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 static REPO_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +91,7 @@ fn log_subjects(repo: &Path) -> String {
 }
 
 /// Reads one u64 field from the JSON proof file.
+#[cfg(unix)]
 fn stat_field(repo: &Path, field: &str) -> u64 {
     let bytes = std::fs::read(repo.join(".ruk").join("coordinator.stats"))
         .expect("coordinator stats proof file");
@@ -106,6 +109,7 @@ fn stat_field(repo: &Path, field: &str) -> u64 {
         .expect("stat number")
 }
 
+#[cfg(unix)]
 fn wait_for(path: &Path, present: bool, timeout: Duration) {
     let start = Instant::now();
     while path.exists() != present && start.elapsed() < timeout {
@@ -136,6 +140,7 @@ fn wait_for_dead_socket(sock: &Path, timeout: Duration) {
     }
 }
 
+#[cfg(unix)]
 fn read_stats(repo: &Path) -> (u64, u64, u64, u64, u64) {
     (
         stat_field(repo, "publications"),
@@ -146,18 +151,21 @@ fn read_stats(repo: &Path) -> (u64, u64, u64, u64, u64) {
     )
 }
 
+#[cfg(unix)]
 fn rev_parse(repo: &Path, rev: &str) -> String {
     let (code, stdout, stderr) = run(repo, &["rev-parse", rev], &[]);
     assert_eq!(code, 0, "rev-parse {rev} failed: {stderr}");
     stdout.trim().to_owned()
 }
 
+#[cfg(unix)]
 fn cat_file(repo: &Path, oid: &str) -> String {
     let (code, stdout, stderr) = run(repo, &["cat-file", "-p", oid], &[]);
     assert_eq!(code, 0, "cat-file {oid} failed: {stderr}");
     stdout
 }
 
+#[cfg(unix)]
 fn commit_parents(payload: &str) -> Vec<String> {
     payload
         .lines()
@@ -184,6 +192,7 @@ fn commit_parents(payload: &str) -> Vec<String> {
 /// boundary from the other side: four spaced-out publications cost four
 /// metadata commits, which pins process spacing as the boundary rather
 /// than the batch gate.
+#[cfg(unix)]
 #[test]
 fn sequential_cross_branch_commits_attribute_exactly() {
     const N: usize = 4;
@@ -256,6 +265,7 @@ fn sequential_cross_branch_commits_attribute_exactly() {
 /// observing the winner, which typically lands outside the 50 ms
 /// group-commit window (measured ~200 ms apart here, though a fast box
 /// could fit), so this test asserts the chain shape, not stats.
+#[cfg(unix)]
 #[test]
 fn same_branch_race_resolves() {
     let idle = &[("RUK_COORDINATOR_IDLE_MS", "10000")];
@@ -305,6 +315,7 @@ fn absent_coordinator_falls_back_to_direct() {
 
 /// A killed coordinator heals: the stale socket is refused, a fresh server
 /// spawns, and the commit lands exactly once.
+#[cfg(unix)]
 #[test]
 fn killed_coordinator_respawns() {
     let repo = fresh_repo("killed");
@@ -349,11 +360,6 @@ fn libc_kill(pid: u32) {
     assert!(status.success(), "kill failed");
 }
 
-#[cfg(not(unix))]
-fn libc_kill(_pid: u32) {
-    panic!("kill test is Unix-only");
-}
-
 /// `RUK_COORDINATOR=off` forces the direct path and never binds a socket.
 #[test]
 fn off_forces_direct_publish() {
@@ -387,6 +393,7 @@ fn required_fails_without_coordinator() {
 /// presence after the client exits races the idle TTL against client
 /// tail latency, which parallel load stretches past the TTL while the
 /// server has already served, unlinked, and exited cleanly.
+#[cfg(unix)]
 #[test]
 fn idle_server_unlinks_its_socket() {
     let repo = fresh_repo("idle");

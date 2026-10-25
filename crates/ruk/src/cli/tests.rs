@@ -22,6 +22,7 @@ use super::verbs_bundle;
 use super::verbs_fastio;
 use super::verbs_grep;
 use super::verbs_history;
+#[cfg(unix)]
 use super::verbs_hooks;
 use super::verbs_maintenance;
 use super::verbs_merge_plumbing;
@@ -8997,6 +8998,7 @@ fn hooks_mailmap_var_ident() {
 }
 
 /// Writes an executable hook script under `.ruk/hooks`.
+#[cfg(unix)]
 fn write_hook(root: &Path, name: &str, body: &str) {
     let dir = root.join(".ruk").join("hooks");
     std::fs::create_dir_all(&dir).expect("hooks dir");
@@ -9006,6 +9008,7 @@ fn write_hook(root: &Path, name: &str, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_pre_commit_blocks_commit() {
     let (root, env) = seeded_repo("hooksm-pre", "f.txt", b"one\n");
@@ -9024,6 +9027,7 @@ fn hooks_pre_commit_blocks_commit() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_commit_msg_rewrites_message() {
     let (root, env) = seeded_repo("hooksm-msg", "f.txt", b"one\n");
@@ -9038,6 +9042,7 @@ fn hooks_commit_msg_rewrites_message() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_post_commit_runs_after_commit() {
     let (root, env) = seeded_repo("hooksm-post", "f.txt", b"one\n");
@@ -9053,6 +9058,7 @@ fn hooks_post_commit_runs_after_commit() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_post_checkout_records_old_new_flag() {
     let (root, env) = seeded_repo("hooksm-co", "f.txt", b"one\n");
@@ -9073,6 +9079,7 @@ fn hooks_post_checkout_records_old_new_flag() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_core_hooks_path_beats_ruk_hooks() {
     let (root, env) = seeded_repo("hooksm-path", "f.txt", b"one\n");
@@ -9111,6 +9118,7 @@ fn hooks_core_hooks_path_beats_ruk_hooks() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_pre_push_records_args_and_stdin() {
     let (root, env) = seeded_repo("hooksm-push", "f.txt", b"one\n");
@@ -9139,6 +9147,7 @@ fn hooks_pre_push_records_args_and_stdin() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_pre_push_blocks_local_push() {
     let (src, _) = seeded_repo("hooksm-pushfull", "f.txt", b"one\n");
@@ -9201,6 +9210,7 @@ fn hooks_pre_push_blocks_local_push() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_failing_post_commit_still_succeeds() {
     let (root, env) = seeded_repo("hooksm-postfail", "f.txt", b"one\n");
@@ -9217,6 +9227,7 @@ fn hooks_failing_post_commit_still_succeeds() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn hooks_post_merge_runs_on_fast_forward() {
     let (root, env) = seeded_repo("hooksm-merge", "f.txt", b"one\n");
