@@ -27,7 +27,9 @@ pub struct PinnedDir {
     path: PathBuf,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     dir: Option<OwnedFd>,
+    #[cfg(unix)]
     dev: Option<u64>,
+    #[cfg(unix)]
     ino: Option<u64>,
     uid: Option<u32>,
 }
@@ -65,7 +67,9 @@ impl PinnedDir {
             path,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             dir: None,
+            #[cfg(unix)]
             dev: None,
+            #[cfg(unix)]
             ino: None,
             uid: None,
         }

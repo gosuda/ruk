@@ -1999,6 +1999,7 @@ mod tests {
     }
 
     /// Writes an executable `hooks/<name>` shell script.
+    #[cfg(unix)]
     fn write_hook(repo: &std::path::Path, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt as _;
         let path = repo.join("hooks").join(name);
@@ -2445,6 +2446,7 @@ mod tests {
     /// lock-step with the server so no phase blocks. Only the accept path
     /// needs a speaking stub — refusals use `exit 1`, and the protocol
     /// grammar itself is covered by in-memory transcript tests.
+    #[cfg(unix)]
     fn write_proc_receive_stub(
         repo: &std::path::Path,
         cmds_marker: &std::path::Path,
@@ -2477,6 +2479,7 @@ printf '0000'
     }
 
     /// Answers one diverted command with `ok` plus a review-ref option.
+    #[cfg(unix)]
     fn ok_with_review_ref() -> &'static str {
         r#"
   R="ok $REF"
@@ -2501,6 +2504,7 @@ printf '0000'
     /// A mixed push diverts `refs/for/` to the hook while the normal ref
     /// lands: the client sees `ok` for both, the review backend saw only
     /// the diverted command, and no literal `refs/for/` ref is created.
+    #[cfg(unix)]
     #[test]
     fn agit_ok_routes_for_to_review_not_literal_ref() {
         use std::time::Duration;
@@ -2550,6 +2554,7 @@ printf '0000'
     /// `pre-receive` observes every wire command exactly as sent,
     /// including duplicates: the hook stdin carries both lines even
     /// though the duplicate already carries its verdict.
+    #[cfg(unix)]
     #[test]
     fn prereceive_observes_duplicate_commands() {
         let kind = HashKind::Sha1;
@@ -2598,6 +2603,7 @@ printf '0000'
     /// `PATH=/usr/bin:/bin`, `GIT_DIR`, and the quarantine inspection
     /// variables, while inherited variables (like `HOME`, which the test
     /// process always carries) never arrive.
+    #[cfg(unix)]
     #[test]
     fn hooks_run_with_hermetic_env_allowlist() {
         let kind = HashKind::Sha1;
@@ -2651,6 +2657,7 @@ printf '0000'
     /// The script policy pins hook outputs byte for byte: `pre-receive`
     /// observes both commands, one `update` refusal names its exact
     /// decline line, and `post-receive` observes only the landed ref.
+    #[cfg(unix)]
     #[test]
     fn script_policy_matches_existing_hook_outputs() {
         let kind = HashKind::Sha1;
@@ -2718,6 +2725,7 @@ printf '0000'
     /// default prefixes only `refs/for/` diverts, so a `refs/pull/` ref
     /// lands as a plain ref through the CAS path while the hook never
     /// sees it.
+    #[cfg(unix)]
     #[test]
     fn refs_pull_no_longer_diverted() {
         use std::time::Duration;
@@ -2769,6 +2777,7 @@ printf '0000'
     /// hook sent `option refname` plus `option new-oid`, so the landed
     /// line carries both (with the pushed old OID, which the hook did not
     /// override).
+    #[cfg(unix)]
     #[test]
     fn agit_post_receive_observes_review_ref() {
         use std::time::Duration;
@@ -2816,6 +2825,7 @@ printf '0000'
     /// `GIT_PUSH_OPTION_COUNT` is exported only when the client negotiated
     /// `push-options`: this push carries no such capability, so the hook
     /// must observe neither the count nor any option.
+    #[cfg(unix)]
     #[test]
     fn push_option_count_absent_without_negotiation() {
         let kind = HashKind::Sha1;
@@ -2853,6 +2863,7 @@ printf '0000'
 
     /// A failing `proc-receive` hook refuses only its diverted refs
     /// in-band; the normal refs of the same push still land.
+    #[cfg(unix)]
     #[test]
     fn agit_hook_failure_keeps_normal_refs() {
         use std::time::Duration;
@@ -2916,6 +2927,7 @@ printf '0000'
     /// Push options travel before the pack on the wire and reach hooks as
     /// `GIT_PUSH_OPTION_*`: a `pre-receive` recorder observes them while
     /// the pack still ingests normally.
+    #[cfg(unix)]
     #[test]
     fn push_options_reach_hooks_before_the_pack() {
         let kind = HashKind::Sha1;
@@ -2957,6 +2969,7 @@ printf '0000'
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn hook_prereceive_refusal_leaves_store_untouched() {
         let kind = HashKind::Sha1;
@@ -2995,6 +3008,7 @@ printf '0000'
         assert_eq!(ref_oid(&dest, b"refs/heads/main"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn hook_prereceive_pass_publishes_and_exposes_quarantine() {
         let kind = HashKind::Sha1;
@@ -3045,6 +3059,7 @@ printf '0000'
         assert!(leftovers.is_empty(), "quarantine leaked: {leftovers:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn hook_update_refusal_is_per_ref() {
         let kind = HashKind::Sha1;
@@ -3101,6 +3116,7 @@ printf '0000'
     }
 
     /// Minimal update triple for multi-ref pack construction in tests.
+    #[cfg(unix)]
     struct PushUpdateForTest {
         name: Vec<u8>,
         old: Oid,
@@ -3108,6 +3124,7 @@ printf '0000'
     }
 
     /// Builds one pack covering every given update's closure.
+    #[cfg(unix)]
     fn push_pack_for(src: &Store, kind: HashKind, updates: &[&PushUpdateForTest]) -> Vec<u8> {
         use super::super::push::{PushUpdate, push_closure};
         let owned: Vec<PushUpdate> = updates
@@ -3134,6 +3151,7 @@ printf '0000'
         pack
     }
 
+    #[cfg(unix)]
     #[test]
     fn hook_prereceive_timeout_survives_grandchildren() {
         let kind = HashKind::Sha1;
@@ -3170,6 +3188,7 @@ printf '0000'
         assert_eq!(ref_oid(&dest, b"refs/heads/main"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn hook_postreceive_runs_after_refs_land() {
         let kind = HashKind::Sha1;
@@ -3209,6 +3228,7 @@ printf '0000'
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn hook_postreceive_failure_is_not_fatal() {
         let kind = HashKind::Sha1;

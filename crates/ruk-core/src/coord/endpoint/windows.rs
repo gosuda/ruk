@@ -26,6 +26,13 @@ use crate::coord::windows::{
 use crate::error::{CoreError, ErrorCode};
 
 /// The Windows named pipe coordinator endpoint listener.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: the per-repo sidecar that binds endpoints is Unix-only"
+    )
+)]
 pub(crate) struct WindowsEndpoint {
     address: EndpointAddress,
     pending: Option<NamedPipeServer>,
@@ -39,6 +46,13 @@ impl core::fmt::Debug for WindowsEndpoint {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller: the per-repo sidecar that binds endpoints is Unix-only"
+    )
+)]
 impl WindowsEndpoint {
     /// Binds a fresh coordinator endpoint for `store_id`.
     ///
@@ -78,20 +92,14 @@ impl WindowsEndpoint {
             unreachable!("WindowsEndpoint always holds a Pipe address");
         };
 
-        loop {
-            // Ensure a pending server instance is armed.
-            if self.pending.is_none() {
-                self.pending = Some(create_subsequent_pipe_server(pipe_name)?);
-            }
-
-            let pending_ref = self.pending.as_ref().expect("pending server armed");
-            pending_ref.connect().await?;
-
-            // Create replacement instance before releasing the connected one.
-            let replacement = create_subsequent_pipe_server(pipe_name)?;
-            let connected = self.pending.replace(replacement).expect("pending server");
-            return Ok(connected);
+        if self.pending.is_none() {
+            self.pending = Some(create_subsequent_pipe_server(pipe_name)?);
         }
+        let pending = self.pending.as_ref().expect("pending server armed");
+        pending.connect().await?;
+        let replacement = create_subsequent_pipe_server(pipe_name)?;
+        let connected = self.pending.replace(replacement).expect("pending server");
+        Ok(connected)
     }
 }
 

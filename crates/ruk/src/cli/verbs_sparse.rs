@@ -43,6 +43,7 @@ use super::state::{
     workspace_mutation,
 };
 use super::tree::{join_base, read_object_bytes};
+use super::verbs_branch::create_worktree_link;
 use super::{Collected, Ctx, FlagSpec, collect, line, read_stdin_text};
 
 /// Config key enabling the sparse filter.
@@ -468,28 +469,7 @@ fn sync_sparse_worktree(ctx: &Ctx, writes: &[(Vec<u8>, SparseWrite)]) -> Result<
             }
             SparseWrite::Blob { mode, oid } => {
                 if *mode == FileMode::Symlink {
-                    let (_, body) = read_object_bytes(store, *oid)?;
-                    let text = std::str::from_utf8(&body).map_err(|_| GitError::Invalid {
-                        detail: "symlink target is not valid UTF-8".to_owned(),
-                    })?;
-                    if full.is_symlink() || full.exists() {
-                        std::fs::remove_file(&full).map_err(|err| GitError::Io {
-                            detail: format!("removing {}: {err}", full.display()),
-                        })?;
-                    }
-                    if let Some(parent) = full.parent() {
-                        std::fs::create_dir_all(parent).map_err(|err| GitError::Io {
-                            detail: format!("creating {}: {err}", parent.display()),
-                        })?;
-                    }
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(text, &full).map_err(|err| GitError::Io {
-                        detail: format!("linking {}: {err}", full.display()),
-                    })?;
-                    #[cfg(not(unix))]
-                    return Err(GitError::Unsupported {
-                        command: "checkout of symlinks on this platform".to_owned(),
-                    });
+                    create_worktree_link(store, *oid, &full)?;
                     continue;
                 }
                 let (_, body) = read_object_bytes(store, *oid)?;

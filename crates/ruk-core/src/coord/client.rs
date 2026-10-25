@@ -119,7 +119,7 @@ impl Client {
     /// closed irreversibly; subsequent calls on this client will fail with
     /// [`ErrorCode::ECoordinatorUnresponsive`].
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "no caller at this commit; retained for later changeset rows"
@@ -145,7 +145,7 @@ impl Client {
 
     /// Returns true if the client connection is open and ready.
     #[cfg_attr(
-        not(test),
+        not(all(test, unix)),
         expect(
             dead_code,
             reason = "no caller at this commit; retained for later changeset rows"
@@ -165,7 +165,7 @@ impl Client {
         self.stream = None;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn from_stream(store: StoreId, stream: Outgoing) -> Self {
         Self {
             stream: Some(stream),

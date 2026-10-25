@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use super::ipc::{self, CONTROL_STREAM_ID, FrameKind, INITIAL_STREAM_WINDOW_BYTES};
+use super::ipc::{self, CONTROL_STREAM_ID, FrameKind};
 use super::{
     ArchiveAcceptedResult, BoundedExecutor, CommandAccepted, CommandExitReport, CommandOpen,
     ConnectionRefs, ExitReport, GitLimits, InvocationAccepted, InvocationOpen, Registry,
@@ -23,7 +23,7 @@ use super::{
     DEFAULT_ARCHIVE_MAX_BYTES, DEFAULT_COMPARE_MAX_COMMITS, DEFAULT_DEFAULT_BRANCH,
     DEFAULT_HOOK_MAX_COMMANDS, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_RETENTION_INTERVAL_MS,
     DEFAULT_SEARCH_MAX_SCAN_BYTES, DEFAULT_SEARCH_POOL_SIZE, DEFAULT_TRANSPORT_PERMITS,
-    DaemonConfig, MAX_LIVE_STREAMS,
+    DaemonConfig, INITIAL_STREAM_WINDOW_BYTES, MAX_LIVE_STREAMS,
 };
 use ruk_core::bytes::ByteString;
 use ruk_core::change::{LeaseId, OperationId, PlanId, RequestId, SessionId, StoreId};

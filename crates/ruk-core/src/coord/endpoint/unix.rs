@@ -580,7 +580,9 @@ fn hex_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::ffi::OsString;
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicU64, Ordering};

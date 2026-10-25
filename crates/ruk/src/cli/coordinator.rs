@@ -786,7 +786,7 @@ async fn round(
         args: args.clone(),
     }));
     let bytes = per_repo::encode_frame(&CommitCall {
-        v: 1,
+        v: per_repo::FRAME_VERSION,
         body: request,
     })
     .map_err(|_| Phase::Pre)?;
@@ -827,6 +827,7 @@ fn spawn_server(store_dir: &Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+    #[cfg(unix)]
     wait_socket(store_dir);
 }
 
@@ -857,9 +858,6 @@ fn wait_socket(store_dir: &Path) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
-
-#[cfg(not(unix))]
-fn wait_socket(_store_dir: &Path) {}
 
 /// Serves this repository's coordinator sidecar until its idle TTL lapses.
 /// Hidden: `ruk coordinator <repo>`.

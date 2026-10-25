@@ -16,6 +16,8 @@ use tokio::time::{Instant, timeout_at};
 use ruk_core::error::{CoreError, ErrorCode};
 use ruk_core::protocol::{SCHEMA_MAJOR, SCHEMA_MINOR};
 
+use super::MAX_STREAM_WINDOW_BYTES;
+
 /// Maximum payload bytes of one data frame.
 pub(crate) const MAX_DATA_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -26,12 +28,6 @@ pub(crate) const MAX_IPC_CONTROL_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stream identifier of the connection control channel.
 pub(crate) const CONTROL_STREAM_ID: u64 = 0;
-
-/// Credit bytes granted to each direction of a new stream.
-pub(crate) const INITIAL_STREAM_WINDOW_BYTES: u64 = 256 * 1024;
-
-/// Credit bytes one direction of one stream may hold at most.
-pub(crate) const MAX_STREAM_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Wire width of the frame length prefix in bytes.
 pub(crate) const FRAME_PREFIX_BYTES: usize = 4;

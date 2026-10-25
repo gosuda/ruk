@@ -585,6 +585,7 @@ mod tests {
     use super::*;
     use ruk_core::ids::HashKind;
     use std::io::Cursor;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -831,6 +832,7 @@ mod tests {
 
     /// A hook that exits without speaking refuses the diverted refs
     /// in-band instead of aborting the push.
+    #[cfg(unix)]
     #[test]
     fn crashing_hook_refuses_in_band() {
         let repo = hook_repo();
