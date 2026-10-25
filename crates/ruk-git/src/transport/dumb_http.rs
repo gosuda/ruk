@@ -508,6 +508,7 @@ mod tests {
     use crate::transport::Interrupt;
     use crate::transport::credentials::{AuthPolicy, TransportAuth};
     use std::io::Write as _;
+    use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
     const FOUR: &str = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
 
@@ -672,30 +673,98 @@ mod tests {
         assert!(decode_loose(b"not zlib").is_err());
     }
 
-    /// Serves a dumb remote on loopback from `server`: `info/refs` text,
-    /// an empty pack list, and loose objects framed the way
-    /// `git/http-backend.c` frames them. `total` bounds the served
-    /// requests so the test never hangs on a miscount.
-    fn fake_dumb_server(
-        server: Store,
-        refs_body: Vec<u8>,
-        total: usize,
-    ) -> (String, std::thread::JoinHandle<()>) {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
-        let port = listener.local_addr().expect("addr").port();
-        let base = format!("http://127.0.0.1:{port}/a.git");
-        let handle = std::thread::spawn(move || {
-            for _ in 0..total {
-                let (socket, _) = listener.accept().expect("accept");
-                socket
-                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                    .expect("timeout");
-                let path = read_get_path(&socket);
-                let (status, content_type, body) = route(&server, &refs_body, &path);
-                write_response(socket, status, content_type, &body);
+    /// A dumb remote on loopback: `info/refs` text, an empty pack list, and
+    /// loose objects framed the way `git/http-backend.c` frames them, all
+    /// answered from a server store. The accept loop polls a nonblocking
+    /// listener until [`DumbServer::finish`] (or a drop) hangs up, then
+    /// reports how many requests it served, so a client that makes fewer
+    /// requests than the test expects fails the count check instead of
+    /// parking the server thread in `accept`.
+    struct DumbServer {
+        base: String,
+        hangup: Sender<()>,
+        handle: std::thread::JoinHandle<usize>,
+    }
+
+    impl DumbServer {
+        fn start(server: Store, refs_body: Vec<u8>) -> Self {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let port = listener.local_addr().expect("addr").port();
+            let (hangup, hungup) = std::sync::mpsc::channel();
+            let handle =
+                std::thread::spawn(move || serve_loopback(&listener, &server, &refs_body, &hungup));
+            Self {
+                base: format!("http://127.0.0.1:{port}/a.git"),
+                hangup,
+                handle,
             }
-        });
-        (base, handle)
+        }
+
+        fn base(&self) -> &str {
+            &self.base
+        }
+
+        /// Stops the server once the client is done and checks that it
+        /// served exactly `expected` requests. A server thread panic (a
+        /// protocol error from [`read_get_path`]) resurfaces unchanged.
+        fn finish(self, expected: usize) -> Result<(), String> {
+            drop(self.hangup);
+            let served = self
+                .handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            if served == expected {
+                return Ok(());
+            }
+            Err(format!(
+                "dumb server served {served} requests, expected {expected}"
+            ))
+        }
+    }
+
+    /// Accepts and answers connections until `hungup` disconnects, then
+    /// returns the number served.
+    fn serve_loopback(
+        listener: &std::net::TcpListener,
+        server: &Store,
+        refs_body: &[u8],
+        hungup: &Receiver<()>,
+    ) -> usize {
+        let mut served = 0;
+        while matches!(hungup.try_recv(), Err(TryRecvError::Empty)) {
+            if let Some(socket) = try_accept(listener) {
+                serve_connection(socket, server, refs_body);
+                served += 1;
+            }
+        }
+        served
+    }
+
+    /// One nonblocking accept: `None` after a short pause when nothing is
+    /// pending.
+    fn try_accept(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        match listener.accept() {
+            Ok((socket, _)) => Some(socket),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                None
+            }
+            Err(err) => panic!("accept: {err}"),
+        }
+    }
+
+    /// Reads one request off `socket` and answers it.
+    fn serve_connection(socket: std::net::TcpStream, server: &Store, refs_body: &[u8]) {
+        socket.set_nonblocking(false).expect("blocking socket");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        let path = read_get_path(&socket);
+        let (status, content_type, body) = route(server, refs_body, &path);
+        write_response(socket, status, content_type, &body);
     }
 
     /// Reads one GET request head and returns its path.
@@ -839,14 +908,14 @@ mod tests {
             .expect("publish");
 
         // One discovery GET, one pack-list GET, then one GET per closure
-        // object: the server answers from its own store, so any miscount
-        // hangs the test instead of passing silently.
-        let total = 2 + closure_size(&server, &[tip]);
+        // object: the server answers from its own store, and any miscount
+        // fails the served-count check instead of passing silently.
+        let expected = 2 + closure_size(&server, &[tip]);
         let refs_body = format!("{FOUR}\trefs/heads/main\n").into_bytes();
-        let (base, handle) = fake_dumb_server(server, refs_body, total);
+        let dumb = DumbServer::start(server, refs_body);
 
         let adv = discover(
-            &base,
+            dumb.base(),
             kind,
             RpcCall {
                 extra: &[],
@@ -871,7 +940,7 @@ mod tests {
             ref_prefixes: Vec::new(),
         };
         let received = fetch_pack(
-            &base,
+            dumb.base(),
             &dest,
             &req,
             IngestLimits::default(),
@@ -896,7 +965,31 @@ mod tests {
         .expect("closure");
         publish_fetch(&dest, received.staged, &[]).expect("publish");
         assert!(dest.read(tip).is_ok());
-        handle.join().expect("server");
+        dumb.finish(expected).expect("served count");
+    }
+
+    #[test]
+    fn short_client_fails_the_served_count_instead_of_hanging() {
+        use super::super::session::test_support::store_with_pack;
+
+        let kind = HashKind::Sha1;
+        let server = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+        let refs_body = format!("{FOUR}\trefs/heads/main\n").into_bytes();
+        let dumb = DumbServer::start(server, refs_body);
+        discover(
+            dumb.base(),
+            kind,
+            RpcCall {
+                extra: &[],
+                egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                tls_roots: None,
+                auth: &AuthPolicy::explicit(TransportAuth::none()),
+                interrupt: &Interrupt::none(),
+            },
+        )
+        .expect("discover");
+        let err = dumb.finish(2).expect_err("one request is short of two");
+        assert_eq!(err, "dumb server served 1 requests, expected 2");
     }
 
     #[test]
@@ -932,9 +1025,11 @@ mod tests {
         // warn and the fetch covers complete history anyway. Publication is
         // idempotent on retry: staging the same closure twice publishes the
         // same objects, so a repeated fetch is a no-op, not a duplicate.
-        let total = 2 + closure_size(&server, &[tip]);
+        // `fetch_pack` never reads `info/refs`: one pack-list GET plus one
+        // GET per closure object.
+        let expected = 1 + closure_size(&server, &[tip]);
         let refs_body = format!("{FOUR}\trefs/heads/main\n").into_bytes();
-        let (base, handle) = fake_dumb_server(server, refs_body, total);
+        let dumb = DumbServer::start(server, refs_body);
         let dest = test_store(kind);
         let req = FetchWireRequest {
             wants: vec![tip],
@@ -946,7 +1041,7 @@ mod tests {
             ref_prefixes: Vec::new(),
         };
         let received = fetch_pack(
-            &base,
+            dumb.base(),
             &dest,
             &req,
             IngestLimits::default(),
@@ -971,6 +1066,6 @@ mod tests {
         .expect("closure");
         publish_fetch(&dest, received.staged, &[]).expect("publish");
         assert!(dest.read(tip).is_ok());
-        handle.join().expect("server");
+        dumb.finish(expected).expect("served count");
     }
 }
