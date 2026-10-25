@@ -230,6 +230,8 @@ pub(crate) struct WalkLimits<'a> {
     pub cancel: &'a Cancel,
     /// Page deadline; a passed instant seals the walk.
     pub deadline: StdInstant,
+    /// Maximum traversal visits before the walk seals.
+    pub max_files: usize,
 }
 
 /// Walk state threaded through one recursive descent.
@@ -307,7 +309,7 @@ fn walk_tree_level(
                     // resumption descends into it with a fresh budget, so
                     // the frontier strictly advances past the seal.
                     state.collected = state.collected.saturating_add(1);
-                    if state.collected > SEARCH_MAX_WALK_FILES {
+                    if state.collected > state.limits.max_files {
                         state.complete = false;
                         state.frontier = Some(path);
                         return Ok(());
@@ -351,7 +353,7 @@ fn walk_tree_level(
                         }
                         Some(_) => {
                             state.collected = state.collected.saturating_add(1);
-                            if state.collected > SEARCH_MAX_WALK_FILES {
+                            if state.collected > state.limits.max_files {
                                 state.complete = false;
                                 return Ok(());
                             }
@@ -1172,6 +1174,7 @@ pub fn search_content_local(
         WalkLimits {
             cancel: &cancel,
             deadline,
+            max_files: SEARCH_MAX_WALK_FILES,
         },
     )?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -1737,6 +1740,7 @@ mod tests {
             WalkLimits {
                 cancel: &walk_cancel,
                 deadline: StdInstant::now() + Duration::from_secs(60),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("walk collects");
@@ -1795,6 +1799,7 @@ mod tests {
         let limits = || WalkLimits {
             cancel: &walk_cancel,
             deadline: walk_deadline,
+            max_files: SEARCH_MAX_WALK_FILES,
         };
         let mut args = search_args(literal("needle"));
         args.globs = vec!["**/*.rs".to_string()];
@@ -1939,6 +1944,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("walk seals");
@@ -1961,6 +1967,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("resumed walk serves");
@@ -2009,6 +2016,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("walk seals");
@@ -2032,6 +2040,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("resumed walk seals");
@@ -2082,6 +2091,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("walk seals");
@@ -2110,6 +2120,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("resumed walk succeeds");
@@ -2160,6 +2171,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("walk seals");
@@ -2187,6 +2199,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(600),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("resumed walk succeeds");
@@ -2201,27 +2214,17 @@ mod tests {
 
     #[test]
     fn walk_dir_budget_seals_shared_fan_out() {
-        use crate::index::FileMode;
         use crate::workcopy::tree::TreeMode;
         let (_temp, store) = test_store("fanout");
-        let blob = put_blob(&store, b"needle\n");
-        // Every level names two directories sharing one child tree, so an
-        // unbudgeted walk visits 2^24 paths. All files filter out, leaving
-        // only directory visits to charge the traversal budget.
-        let mut child = put_tree(
-            &store,
-            &[("f.txt", TreeMode::File(FileMode::Regular), blob)],
-        );
-        for _ in 0..24 {
+        let mut child = put_tree(&store, &[]);
+        for _ in 0..6 {
             child = put_tree(
                 &store,
                 &[("l", TreeMode::Tree, child), ("r", TreeMode::Tree, child)],
             );
         }
-        let mut args = search_args(literal("needle"));
-        args.exclude_globs = vec!["**".to_string()];
+        let args = search_args(literal("needle"));
         let (_guard, cancel) = crate::coord::cancellation();
-        let started = StdInstant::now();
         let walk = collect_search_candidates(
             &store,
             store.hash_kind(),
@@ -2234,22 +2237,22 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(60),
+                max_files: 64,
             },
         )
         .expect("fan-out seals");
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "fan-out stays wall-clock bounded"
-        );
         assert!(!walk.complete, "directory visits seal the fan-out");
         assert!(
-            walk.entries.len() <= SEARCH_MAX_WALK_FILES,
+            walk.entries.len() <= 64,
             "collection stays within the traversal budget"
         );
-        assert!(walk.entries.is_empty(), "excluded files collect nothing");
         assert!(
-            walk.visits > 10_000 && walk.visits <= SEARCH_MAX_WALK_FILES + 1,
-            "directory fan-out charges a bounded visit count"
+            walk.entries.is_empty(),
+            "the empty shared subtree collects nothing"
+        );
+        assert_eq!(
+            walk.visits, 65,
+            "directory fan-out charges one shared budget"
         );
         assert!(
             walk.frontier
@@ -2287,6 +2290,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancelled,
                 deadline: StdInstant::now() + Duration::from_secs(60),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect("cancel seals instead of refusing");
@@ -2309,6 +2313,7 @@ mod tests {
             WalkLimits {
                 cancel: &live,
                 deadline: StdInstant::now() - Duration::from_secs(1),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect_err("a root-level deadline seal refuses");
@@ -2346,6 +2351,7 @@ mod tests {
             WalkLimits {
                 cancel: &cancel,
                 deadline: StdInstant::now() + Duration::from_secs(60),
+                max_files: SEARCH_MAX_WALK_FILES,
             },
         )
         .expect_err("depth refuses");

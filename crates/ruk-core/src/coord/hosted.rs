@@ -892,7 +892,11 @@ impl HostedCoordinator {
             root,
             args,
             walk_resume,
-            WalkLimits { cancel, deadline },
+            WalkLimits {
+                cancel,
+                deadline,
+                max_files: crate::search::SEARCH_MAX_WALK_FILES,
+            },
         )?;
         let stop = Arc::new(AtomicBool::new(false));
         let scan_budget = Arc::new(ScanBudget::new(
