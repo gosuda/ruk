@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy-ubuntu-latest
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - uses: depot/cache-mount@6e6bb5ffc3bcd12e286be023988e465996853071 # v1
+        with:
+          name: ruk-cargo
+          path: /mnt/cargo
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        env:
+          CARGO_HOME: /mnt/cargo/home
+          CARGO_TARGET_DIR: /mnt/cargo/target/clippy
+
+  nextest:
+    name: nextest-ubuntu-latest
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.148
+      - uses: depot/cache-mount@6e6bb5ffc3bcd12e286be023988e465996853071 # v1
+        with:
+          name: ruk-cargo
+          path: /mnt/cargo
+      - run: cargo nextest run --workspace --locked
+        env:
+          CARGO_HOME: /mnt/cargo/home
+          CARGO_TARGET_DIR: /mnt/cargo/target/nextest
+
+  test:
+    name: test-ubuntu-latest
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: depot/cache-mount@6e6bb5ffc3bcd12e286be023988e465996853071 # v1
+        with:
+          name: ruk-cargo
+          path: /mnt/cargo
+      - run: cargo test --workspace --doc --locked
+        env:
+          CARGO_HOME: /mnt/cargo/home
+          CARGO_TARGET_DIR: /mnt/cargo/target/test
