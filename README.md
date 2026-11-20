@@ -1,5 +1,7 @@
 # Ruk
 
+[![Built with Depot](https://depot.dev/badges/built-with-depot.svg)](https://depot.dev?utm_source=gosuda)
+
 Ruk is an agent-native version control system built in Rust with exact Git SHA-1 and SHA-256 object interoperability, transactional repository state (`redb` metadata and zstd-compressed, CRC32C-framed object segments), isolated concurrent workspaces, first-class conflict records, and a typed v1 agent protocol. It provides a Git-compatible CLI (`ruk git`), a stdio Model Context Protocol server (`ruk mcp`), and a hosted multi-repository daemon (`ruk serve`) over a Unix socket.
 
 - **Agent-native protocol**: 63 v1 protocol method schemas (`ruk model`) and a stdio MCP server (`ruk mcp`). Coordinator mutation translation serves `new`, `edit`, `ws.scope`, `ws.take`, `ws.drop`, `describe`, `split`, `squash`, `rebase`, `abandon`, `resolve`, `revert`, `undo`, `claim.acquire`, `claim.release`, and `land.prepare` over a single serialized `PublicationLane` per repository (2ms group-commit linger, up to 64 requests or 64 MiB per batch), with 30-second lease-bound cursors on `op.log`, `claim.list`, and `attest.list` and 7-day idempotent mutation receipts (`FactTable::Receipts`).
