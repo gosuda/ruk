@@ -3610,8 +3610,7 @@ mod tests {
     /// outside store. Every successful open must serve the inside store
     /// id, and every segment read through it must return the inside
     /// bytes: the recorded path may name the shadow after the pin, but
-    /// no store file access travels it. The loop asserts at least one
-    /// successful open so the test cannot pass vacuously.
+    /// no store file access travels it.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn symlink_swap_never_resolves_outside() {
@@ -3621,7 +3620,7 @@ mod tests {
         use std::io::Read as _;
         use std::os::unix::fs::symlink;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{TryRecvError, sync_channel};
         let root = scratch_root();
         let stashed = root.join("stashed");
         let shadow = root.join("shadow");
@@ -3655,50 +3654,17 @@ mod tests {
         };
         Store::create(&shadow.join(".ruk"), HashKind::Sha1, budget())
             .expect("outside store creates");
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker = {
-            let victim = victim.clone();
-            let stashed = stashed.clone();
-            let shadow = shadow.clone();
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut to_live = false;
-                while !stop.load(Ordering::Relaxed) {
-                    if to_live {
-                        let _ = std::fs::remove_file(&victim);
-                        let _ = std::fs::rename(&stashed, &victim);
-                    } else {
-                        let _ = std::fs::rename(&victim, &stashed);
-                        let _ = symlink(&shadow, &victim);
-                    }
-                    to_live = !to_live;
-                }
-            })
+        let swap_to_shadow = || {
+            std::fs::rename(&victim, &stashed).expect("swapper stashes the live directory");
+            symlink(&shadow, &victim).expect("swapper links victim to shadow");
         };
-        let registry = Registry::new(vec![root.clone()]).expect("scratch root registers");
+        let restore_victim = || {
+            std::fs::remove_file(&victim).expect("swapper removes the shadow link");
+            std::fs::rename(&stashed, &victim).expect("swapper restores the live directory");
+        };
+        let registry = Registry::new(vec![root]).expect("scratch root registers");
         let target = victim.join(".ruk");
-        // Attempt-bounded, not fixed-count: under suite load opens are
-        // slower and flips land mid-open more often, so a fixed 200
-        // iterations can observe zero successes without any regression.
-        let mut oks = 0u32;
-        let mut attempts = 0u32;
-        while oks < 25 && attempts < 5000 {
-            attempts += 1;
-            let pinned = match registry.resolve_pinned(&target) {
-                Ok(pinned) => pinned,
-                Err(_) => continue,
-            };
-            let Some(proc_root) = pinned.open_path() else {
-                continue;
-            };
-            let store = match Store::open_pinned(&proc_root, pinned.path(), budget()) {
-                Ok(store) => store,
-                Err(_) => continue,
-            };
-            if pinned.verify_open(pinned.path()).is_err() {
-                continue;
-            }
-            oks += 1;
+        let assert_inside_store = |store: &Store| {
             assert_eq!(
                 store.store_id(),
                 inside,
@@ -3719,10 +3685,89 @@ mod tests {
                 got, sentinel,
                 "a segment read through the swap never serves outside bytes"
             );
-        }
-        assert!(oks > 0, "the race exercised at least one open");
-        stop.store(true, Ordering::Relaxed);
-        worker.join().expect("swapper thread joins");
+        };
+
+        std::thread::scope(|scope| {
+            let (advance, wait_for_advance) = sync_channel(1);
+            let (phase_ready, wait_for_phase) = sync_channel(0);
+            let worker = scope.spawn(move || {
+                loop {
+                    match wait_for_advance.try_recv() {
+                        Ok(()) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                    swap_to_shadow();
+                    restore_victim();
+                }
+                if phase_ready.send(()).is_err() || wait_for_advance.recv().is_err() {
+                    return;
+                }
+                swap_to_shadow();
+                if phase_ready.send(()).is_ok() {
+                    let _ = wait_for_advance.recv();
+                }
+                restore_victim();
+            });
+
+            let mut oks = 0u32;
+            let mut attempts = 0u32;
+            while oks < 25 && attempts < 5000 {
+                attempts += 1;
+                let pinned = match registry.resolve_pinned(&target) {
+                    Ok(pinned) => pinned,
+                    Err(_) => continue,
+                };
+                let Some(proc_root) = pinned.open_path() else {
+                    continue;
+                };
+                let store = match Store::open_pinned(&proc_root, pinned.path(), budget()) {
+                    Ok(store) => store,
+                    Err(_) => continue,
+                };
+                if pinned.verify_open(pinned.path()).is_err() {
+                    continue;
+                }
+                oks += 1;
+                assert_inside_store(&store);
+            }
+
+            advance.send(()).expect("swapper accepts pause");
+            wait_for_phase
+                .recv()
+                .expect("swapper pauses with victim restored");
+            let pinned = registry
+                .resolve_pinned(&target)
+                .expect("live store resolves before the forced swap");
+            let proc_root = pinned
+                .open_path()
+                .expect("live store has a pinned descriptor");
+            advance.send(()).expect("swapper accepts forced swap");
+            wait_for_phase
+                .recv()
+                .expect("swapper completes forced swap");
+            assert_eq!(
+                std::fs::read_link(&victim).expect("forced swap replaces victim with a symlink"),
+                shadow,
+                "forced swap points victim at the shadow store"
+            );
+            let store = Store::open_pinned(&proc_root, pinned.path(), budget())
+                .expect("descriptor opens the original store while victim names the shadow");
+            assert_inside_store(&store);
+            assert_eq!(
+                pinned
+                    .verify_open(pinned.path())
+                    .expect_err("the pinned identity rejects the swapped pathname")
+                    .code,
+                ruk_core::error::ErrorCode::EForbidden
+            );
+
+            drop(advance);
+            worker.join().expect("swapper thread joins");
+            pinned
+                .verify_open(pinned.path())
+                .expect("restoring victim restores verification of the original pin");
+        });
     }
 
     /// A swap after `Store::open` cannot redirect later segment access:
