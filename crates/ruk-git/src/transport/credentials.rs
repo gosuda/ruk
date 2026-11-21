@@ -1426,6 +1426,7 @@ mod tests {
         assert!(credential_parts("https:///a").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_helper_appends_get_inside_the_sh_dash_c_string() {
         // `sh -c "echo hello get"`: the operation must land inside the
