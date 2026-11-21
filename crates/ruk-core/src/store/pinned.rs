@@ -59,8 +59,8 @@ impl PinnedRoot {
         doc = "On Linux and Android the descriptor is `O_PATH`: it names the directory for `openat2`/`openat`/`unlinkat` without data access, so it also reopens `/proc/self/fd` links of `O_PATH` descriptors the registry holds, where an `O_RDONLY` reopen is refused."
     )]
     #[cfg_attr(
-        all(unix, not(any(target_os = "linux", target_os = "android"))),
-        doc = "Other Unix targets use an `O_RDONLY` directory descriptor for fd-relative operations. `proc_subpath` is unavailable there, so path-only metadata opens use the recorded path."
+        target_os = "macos",
+        doc = "macOS uses an `O_RDONLY` directory descriptor for fd-relative operations, and `proc_subpath` derives the pinned directory's path from that descriptor at call time."
     )]
     ///
     /// # Errors
@@ -95,10 +95,14 @@ impl PinnedRoot {
         }
     }
 
-    /// On Linux, a process-local path naming `name` inside the pinned
-    /// directory: `/proc/self/fd/<n>/<name>` while a descriptor is held,
-    /// so path-only APIs can travel the pin. Other targets return `None`;
-    /// path-only metadata opens use the recorded path.
+    /// A process-local path naming `name` inside the pinned directory
+    /// while a descriptor is held, so path-only APIs can travel the pin.
+    /// Linux names it through `/proc/self/fd/<n>`, which keeps following
+    /// the pinned directory through later swaps. macOS asks the
+    /// descriptor for its current path instead, so the answer is right
+    /// when it is computed and goes stale if the directory is swapped
+    /// afterwards. Other targets return `None`; path-only metadata
+    /// opens use the recorded path.
     #[must_use]
     pub(super) fn proc_subpath(&self, name: &str) -> Option<PathBuf> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -108,7 +112,16 @@ impl PinnedRoot {
                 .as_ref()
                 .map(|fd| PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())).join(name))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            self.fd.as_ref().and_then(|fd| {
+                rustix::fs::getpath(fd).ok().map(|path| {
+                    PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes())).join(name)
+                })
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         {
             let _ = name;
             None
