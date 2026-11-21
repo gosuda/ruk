@@ -1348,9 +1348,12 @@ async fn serve_async(
 
 /// Ends every stranded stream of a dead connection: trips its cancel flag
 /// so a parked blocking serve observes the end at its next interrupt
-/// check, shuts its task socket down so a serve parked in its socket read
-/// unblocks, and aborts its spawned task so nothing later emits on the
-/// dead connection.
+/// check, shuts its task socket down and releases its handle so a serve
+/// parked in its socket read unblocks and a worker parked in its socket
+/// write is released on every platform: some kernels leave a blocked peer
+/// sleeping until the last descriptor closes, and a shutdown alone does
+/// not wake it. It also aborts the spawned task so nothing later emits on
+/// the dead connection.
 ///
 /// Only socketpair streams (a published shutdown handle) strand past a
 /// channel close: a task parked in its feed write and a worker parked in
@@ -1365,8 +1368,8 @@ async fn serve_async(
 #[cfg(unix)]
 fn teardown_streams(streams: &HashMap<u64, StreamRoute>) {
     for route in streams.values() {
-        let stranded = if let Ok(slot) = route.shutdown.lock() {
-            if let Some(sock) = slot.as_ref() {
+        let stranded = if let Ok(mut slot) = route.shutdown.lock() {
+            if let Some(sock) = slot.take() {
                 let _ = sock.shutdown(std::net::Shutdown::Both);
                 true
             } else {
