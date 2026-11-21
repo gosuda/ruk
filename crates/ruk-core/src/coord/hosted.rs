@@ -3640,7 +3640,6 @@ mod tests {
                 std::process::id(),
                 SEQ.fetch_add(1, Ordering::SeqCst)
             ));
-            std::fs::create_dir_all(&dir).expect("temp dir");
             Self(dir)
         }
     }
