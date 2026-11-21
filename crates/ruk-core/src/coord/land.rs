@@ -503,7 +503,6 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_nanos())
         ));
-        std::fs::create_dir_all(&dir).expect("test dir");
         let budget = Arc::new(PreparationBudget::reference_defaults());
         let store = Store::create(&dir, HashKind::Sha1, budget).expect("test store");
         (dir, store)
