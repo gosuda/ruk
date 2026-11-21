@@ -149,11 +149,16 @@ fn lock_ready_pid(body: &[u8]) -> Option<u32> {
     if lines.next()? != "ruk-lock 1" {
         return None;
     }
-    let pid = lines.next()?.strip_prefix("pid ")?.parse().ok()?;
+    let pid_text = lines.next()?.strip_prefix("pid ")?;
+    if pid_text.len() > 10 || pid_text.starts_with('0') {
+        return None;
+    }
+    let pid: u32 = pid_text.parse().ok()?;
     let address = lines.next()?.strip_prefix("address unix:")?;
     let nonce = lines.next()?.strip_prefix("nonce ")?;
-    let hex =
-        |text: &str| text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit());
+    let hex = |text: &str| {
+        text.len().is_multiple_of(2) && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
     if !hex(address) || nonce.len() != 64 || !hex(nonce) {
         return None;
     }
