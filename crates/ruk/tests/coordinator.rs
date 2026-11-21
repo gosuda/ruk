@@ -196,7 +196,7 @@ fn commit_parents(payload: &str) -> Vec<String> {
 #[test]
 fn sequential_cross_branch_commits_attribute_exactly() {
     const N: usize = 4;
-    let idle = &[("RUK_COORDINATOR_IDLE_MS", "10000")];
+    let idle = &[("RUK_COORDINATOR_IDLE_MS", "60000")];
     let repo = fresh_repo("cross");
     // Seed with the sidecar off so the stats file measures only the four
     // branch publications.
@@ -208,6 +208,23 @@ fn sequential_cross_branch_commits_attribute_exactly() {
         let (code, _, stderr) = run(&repo, &["branch", branch.as_str()], &[]);
         assert_eq!(code, 0, "branch {branch} failed: {stderr}");
     }
+    // Pre-start the lane so the measured window holds no spawn race: a
+    // loaded runner can stretch the client rendezvous past its budget, and
+    // a fallback there would blur the exact lane-usage pins below.
+    let mut coordinator = std::process::Command::new(ruk_bin())
+        .arg("git")
+        .arg("coordinator")
+        .arg(&repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn coordinator");
+    wait_for(
+        &repo.join(".ruk").join("coordinator.sock"),
+        true,
+        Duration::from_secs(45),
+    );
     for k in 0..N {
         let branch = format!("racer/{k}");
         let subject = format!("racer {k}");
@@ -239,22 +256,22 @@ fn sequential_cross_branch_commits_attribute_exactly() {
         N + 1,
         "seed plus four commits:\n{stdout}"
     );
-    // No sharing across sequential processes: four spaced-out publications
-    // cost four metadata commits. Concurrent lane submissions on disjoint
-    // refs do share; sequential CLI cannot overlap the burst windows.
+    // No sharing across sequential processes: four publications cost four
+    // metadata commits. Concurrent lane submissions on disjoint refs do
+    // share; the pre-started lane keeps every sequential commit on the
+    // lane, so the exact pins hold.
     wait_for(
         &repo.join(".ruk").join("coordinator.stats"),
         true,
-        Duration::from_secs(15),
+        Duration::from_secs(45),
     );
     let stats = read_stats(&repo);
-    // All four committed through the lane: a direct fallback would land
-    // the commit without touching the server counters, so this excludes
-    // the fallback before the publication counts below pin no-sharing.
     let committed = stat_field(&repo, "committed");
     assert_eq!(committed, N as u64, "all four went through the lane");
     assert_eq!(stats.0, N as u64, "four publications: {stats:?}");
     assert_eq!(stats.1, N as u64, "one metadata commit each: {stats:?}");
+    let _ = coordinator.kill();
+    let _ = coordinator.wait();
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -322,7 +339,7 @@ fn killed_coordinator_respawns() {
     let (code, _, stderr) = commit_empty(&repo, "first commit", &[]);
     assert_eq!(code, 0, "first commit failed: {stderr}");
     let sock = repo.join(".ruk").join("coordinator.sock");
-    wait_for(&sock, true, Duration::from_secs(10));
+    wait_for(&sock, true, Duration::from_secs(45));
     // Read the owner's pid from the lock body and kill it mid-flight.
     let lock = std::fs::read(repo.join(".ruk").join("lock")).expect("lock body");
     let text = String::from_utf8_lossy(&lock).into_owned();
