@@ -1025,7 +1025,6 @@ pub mod test_support {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
             std::env::temp_dir().join(format!("ruk-transport-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
         Store::create(&dir, kind, default_budget()).expect("test store")
     }
 

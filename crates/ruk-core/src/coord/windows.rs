@@ -1116,19 +1116,27 @@ fn sid_to_string(psid: PSID) -> Result<String, CoreError> {
 }
 
 fn validate_sid_string(sid: &str) -> Result<(), CoreError> {
-    if !sid.starts_with("S-1-") || sid.len() < 9 || sid.len() > 186 {
+    let Some(rest) = sid.strip_prefix("S-1-") else {
+        return Err(CoreError::new(
+            ErrorCode::EIo,
+            format!("invalid SID string format: {sid}"),
+        ));
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    if parts.len() < 2
+        || rest.len() > 182
+        || parts.iter().any(|part| part.is_empty() || part.len() > 15)
+    {
         return Err(CoreError::new(
             ErrorCode::EIo,
             format!("invalid SID string format: {sid}"),
         ));
     }
-    for b in sid.bytes() {
-        if !b.is_ascii_digit() && b != b'-' {
-            return Err(CoreError::new(
-                ErrorCode::EIo,
-                format!("invalid character in SID string: {sid}"),
-            ));
-        }
+    if !rest.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return Err(CoreError::new(
+            ErrorCode::EIo,
+            format!("invalid character in SID string: {sid}"),
+        ));
     }
     Ok(())
 }
@@ -1470,8 +1478,18 @@ mod tests {
     fn test_current_sid_format() {
         let sid = current_sid().expect("query current process user SID");
         assert!(sid.starts_with("S-1-"), "SID must start with S-1-: {sid}");
-        assert!(sid.len() >= 9, "SID must be at least 9 characters: {sid}");
         validate_sid_string(&sid).expect("SID string format validation");
+    }
+
+    #[test]
+    fn test_sid_string_validation() {
+        assert!(validate_sid_string("S-1-5-21-3414932011-3134797172-3625386099-500").is_ok());
+        assert!(validate_sid_string("S-1-5-18").is_ok());
+        assert!(validate_sid_string("S-1-1-0").is_ok());
+        assert!(validate_sid_string("s-1-5-21-3414932011-3134797172-3625386099-500").is_err());
+        assert!(validate_sid_string("S-2-5-21-3414932011-3134797172-3625386099-500").is_err());
+        assert!(validate_sid_string("S-1-5-21-3414932011-3134797172-3625386099-50x").is_err());
+        assert!(validate_sid_string("S-1-5").is_err());
     }
 
     #[test]
