@@ -7901,7 +7901,14 @@ fn repo_fork_syncs_destination_directory_and_reopens_store() {
     let reply = registry
         .fork_repo(&fork_args)
         .expect("fork succeeds and syncs destination directory");
-    assert_eq!(reply.path, dest_path.to_str().expect("UTF-8"));
+    assert_eq!(
+        reply.path,
+        dest_path
+            .canonicalize()
+            .expect("canonical destination")
+            .to_str()
+            .expect("UTF-8")
+    );
 
     assert!(dest_path.exists());
     assert!(dest_path.join(".ruk").exists());
