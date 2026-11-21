@@ -300,7 +300,8 @@ fn sequential_cross_branch_commits_attribute_exactly() {
     // metadata commits. Concurrent lane submissions on disjoint refs do
     // share; the pre-started lane keeps every sequential commit on the
     // lane, so the exact pins hold.
-    let _ = std::fs::remove_file(repo.join(".ruk").join("coordinator.sock"));
+    std::fs::remove_file(repo.join(".ruk").join("coordinator.sock"))
+        .expect("unlink the coordinator socket");
     wait_for(
         &repo.join(".ruk").join("coordinator.stats"),
         true,
