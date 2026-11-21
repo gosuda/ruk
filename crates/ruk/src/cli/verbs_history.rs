@@ -8165,7 +8165,7 @@ fn apply_relative(ctx: &Ctx, pairs: &mut Vec<TreePair>, opts: &super::Collected)
     };
     let mut prefix: Vec<u8> = if raw.is_empty() {
         match ctx.env.cwd.strip_prefix(&ctx.root) {
-            Ok(rel) => rel.as_os_str().as_encoded_bytes().to_vec(),
+            Ok(rel) => super::tree::forward_slashes(rel.as_os_str().as_encoded_bytes()),
             Err(_) => return,
         }
     } else {

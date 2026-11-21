@@ -331,12 +331,19 @@ pub(crate) fn clean(ctx: &mut Ctx, args: &[String]) -> Result<Vec<u8>, GitError>
             tracked_dirs.insert(dir.to_vec());
         }
     }
-    let excludes = opts.all("exclude")?;
-    let ignore_rules = load_ignore_rules(&ctx.file_base)?;
+    let excludes: Vec<String> = opts
+        .all("exclude")?
+        .iter()
+        .map(|pattern| pattern.replace(std::path::MAIN_SEPARATOR, "/"))
+        .collect();
+    let mut ignore_rules = load_ignore_rules(&ctx.file_base)?;
+    for rule in &mut ignore_rules {
+        rule.pattern = rule.pattern.replace(std::path::MAIN_SEPARATOR, "/");
+    }
     let limits: Vec<Vec<u8>> = opts
         .positionals
         .iter()
-        .map(|limit| limit.as_bytes().to_vec())
+        .map(|limit| super::tree::forward_slashes(limit.as_bytes()))
         .collect();
     let mut candidates: Vec<(Vec<u8>, bool)> = Vec::new();
     for entry in walk_worktree(&ctx.file_base)? {

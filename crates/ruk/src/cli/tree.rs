@@ -454,6 +454,21 @@ pub(crate) enum WorktreeType {
     Symlink,
 }
 
+/// Rewrites native separators to the slash form git paths use. On Unix
+/// this is the identity mapping.
+pub(crate) fn forward_slashes(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b == std::path::MAIN_SEPARATOR as u8 {
+                b'/'
+            } else {
+                b
+            }
+        })
+        .collect()
+}
+
 /// Walks `base` recursively, skipping the `.ruk` metadata directory.
 pub(crate) fn walk_worktree(base: &std::path::Path) -> Result<Vec<WorktreeEntry>, GitError> {
     let mut out = Vec::new();
@@ -493,21 +508,14 @@ fn walk_dir(
                 detail: "worktree path escapes its base".to_owned(),
             })?
             .to_path_buf();
-        let path = relative
-            .to_str()
-            .ok_or_else(|| GitError::Invalid {
-                detail: "worktree path is not valid UTF-8".to_owned(),
-            })?
-            .as_bytes()
-            .iter()
-            .map(|&b| {
-                if b == std::path::MAIN_SEPARATOR as u8 {
-                    b'/'
-                } else {
-                    b
-                }
-            })
-            .collect();
+        let path = forward_slashes(
+            relative
+                .to_str()
+                .ok_or_else(|| GitError::Invalid {
+                    detail: "worktree path is not valid UTF-8".to_owned(),
+                })?
+                .as_bytes(),
+        );
         if file_type.is_symlink() {
             out.push(WorktreeEntry {
                 path,
