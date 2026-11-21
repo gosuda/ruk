@@ -1284,7 +1284,17 @@ fn extract_relative_arg(
         if arg == "--relative" {
             relative = Some(None);
         } else if let Some(path) = arg.strip_prefix("--relative=") {
-            relative = Some(Some(path.to_owned()));
+            let normalized: String = path
+                .chars()
+                .map(|c| {
+                    if c == std::path::MAIN_SEPARATOR {
+                        '/'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            relative = Some(Some(normalized));
         } else {
             kept.push(arg.clone());
         }
@@ -8155,7 +8165,7 @@ fn apply_relative(ctx: &Ctx, pairs: &mut Vec<TreePair>, opts: &super::Collected)
     };
     let mut prefix: Vec<u8> = if raw.is_empty() {
         match ctx.env.cwd.strip_prefix(&ctx.root) {
-            Ok(rel) => rel.as_os_str().as_encoded_bytes().to_vec(),
+            Ok(rel) => super::tree::forward_slashes(rel.as_os_str().as_encoded_bytes()),
             Err(_) => return,
         }
     } else {
