@@ -729,7 +729,6 @@ mod tests {
                 Err(err) => err.kind() == std::io::ErrorKind::NotFound,
             };
             if cleared {
-                std::fs::create_dir_all(&root).expect("create test root");
                 return root;
             }
             assert!(attempt < 8, "no clearable test root for {name}");
