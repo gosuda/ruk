@@ -2336,6 +2336,7 @@ fn credential_rejects_usage_before_reading_stdin() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn credential_fill_approve_reject_round_trip() {
     let base = temp_base("credential-live");
@@ -4629,6 +4630,7 @@ fn bisect_first_parent_ignores_side_branch() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn bisect_run_finds_first_bad() {
     let (root, env) = seeded_repo("bisect-run", "f.txt", b"GOOD\n");
@@ -5010,6 +5012,7 @@ fn submodule_update_init_materializes_checkout() {
     let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
 }
 
+#[cfg(unix)]
 #[test]
 fn submodule_status_summary_foreach_and_gap() {
     let (root, env, child_root, child_head) = submodule_case("submodule-misc");
