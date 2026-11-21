@@ -454,6 +454,8 @@ pub(crate) enum WorktreeType {
     Symlink,
 }
 
+/// Rewrites native separators to the slash form git paths use. On Unix
+/// this is the identity mapping.
 pub(crate) fn forward_slashes(bytes: &[u8]) -> Vec<u8> {
     bytes
         .iter()
