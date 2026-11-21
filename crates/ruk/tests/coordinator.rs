@@ -152,7 +152,8 @@ fn lock_ready_pid(body: &[u8]) -> Option<u32> {
     let pid = lines.next()?.strip_prefix("pid ")?.parse().ok()?;
     let address = lines.next()?.strip_prefix("address unix:")?;
     let nonce = lines.next()?.strip_prefix("nonce ")?;
-    let hex = |text: &str| text.len() % 2 == 0 && text.bytes().all(|b| b.is_ascii_hexdigit());
+    let hex =
+        |text: &str| text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit());
     if !hex(address) || nonce.len() != 64 || !hex(nonce) {
         return None;
     }
