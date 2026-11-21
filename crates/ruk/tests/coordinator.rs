@@ -140,12 +140,19 @@ fn wait_for_dead_socket(sock: &Path, timeout: Duration) {
     }
 }
 #[cfg(unix)]
-fn lock_pid(body: &[u8]) -> Option<u32> {
-    String::from_utf8_lossy(body)
-        .lines()
-        .nth(1)
-        .and_then(|line| line.strip_prefix("pid "))
-        .and_then(|pid| pid.parse().ok())
+fn lock_ready_pid(body: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(body);
+    let mut lines = text.lines();
+    if lines.next()? != "ruk-lock 1" {
+        return None;
+    }
+    let pid = lines.next()?.strip_prefix("pid ")?.parse().ok()?;
+    let address = lines.next()?;
+    let nonce = lines.next()?;
+    if !address.starts_with("address ") || !nonce.starts_with("nonce ") {
+        return None;
+    }
+    Some(pid)
 }
 
 /// Waits until the lock body names its owner: the lock file exists before
@@ -156,7 +163,11 @@ fn wait_for_lock_owner(repo: &Path, timeout: Duration) -> u32 {
     let lock = repo.join(".ruk").join("lock");
     let start = Instant::now();
     loop {
-        if let Some(pid) = std::fs::read(&lock).ok().as_deref().and_then(lock_pid) {
+        if let Some(pid) = std::fs::read(&lock)
+            .ok()
+            .as_deref()
+            .and_then(lock_ready_pid)
+        {
             return pid;
         }
         assert!(
@@ -257,6 +268,7 @@ fn sequential_cross_branch_commits_attribute_exactly() {
             .arg("git")
             .arg("coordinator")
             .arg(&repo)
+            .envs(base_env())
             .envs(idle.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
