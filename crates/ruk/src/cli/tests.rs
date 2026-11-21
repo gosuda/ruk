@@ -7258,6 +7258,23 @@ fn wave_j_diff_relative_limits_to_prefix() {
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
 }
 
+#[cfg(windows)]
+#[test]
+fn wave_j_diff_relative_accepts_native_separator_prefix() {
+    let (root, env) = seeded_repo("wavej-diff-winrel", "f.txt", b"one\n");
+    let mut ctx = repo_ctx(&root, env);
+    std::fs::create_dir(root.join("sub")).expect("mkdir");
+    std::fs::write(root.join("sub/s.txt"), b"s\n").expect("sub file");
+    let relative = format!("--relative=sub{}", std::path::MAIN_SEPARATOR);
+    let out = String::from_utf8(
+        run(verbs_history::diff, &mut ctx, &[relative.as_str()]).expect("relative"),
+    )
+    .expect("utf8");
+    assert!(out.contains("s.txt"), "got {out:?}");
+    assert!(!out.contains("sub"), "got {out:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+}
+
 #[test]
 fn wave_j_diff_no_index_compares_files() {
     let (root, env) = seeded_repo("wavej-diff-noindex", "f.txt", b"one\n");

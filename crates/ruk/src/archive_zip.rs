@@ -170,6 +170,7 @@ impl<W: Write> ZipTranscoder<W> {
                 let name = resolve_name(pending.path, header)?;
                 let mtime = pending.mtime.unwrap_or(ustar_mtime);
                 let options = SimpleFileOptions::default()
+                    .system(zip::System::Unix)
                     .unix_permissions(mode)
                     .last_modified_time(zip_mtime(mtime));
                 self.zip_mut()?
@@ -182,6 +183,7 @@ impl<W: Write> ZipTranscoder<W> {
                 let name = resolve_name(pending.path, header)?;
                 let mtime = pending.mtime.unwrap_or(ustar_mtime);
                 let options = SimpleFileOptions::default()
+                    .system(zip::System::Unix)
                     .unix_permissions(mode)
                     .last_modified_time(zip_mtime(mtime));
                 let raw_target = pending.linkpath.unwrap_or_else(|| header_linkname(header));
@@ -203,6 +205,7 @@ impl<W: Write> ZipTranscoder<W> {
                     CompressionMethod::Deflated
                 };
                 let options = SimpleFileOptions::default()
+                    .system(zip::System::Unix)
                     .unix_permissions(mode)
                     .last_modified_time(zip_mtime(mtime))
                     .large_file(effective_size >= u64::from(u32::MAX))
