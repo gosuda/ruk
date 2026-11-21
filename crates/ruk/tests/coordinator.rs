@@ -141,15 +141,19 @@ fn wait_for_dead_socket(sock: &Path, timeout: Duration) {
 }
 #[cfg(unix)]
 fn lock_ready_pid(body: &[u8]) -> Option<u32> {
+    if !body.ends_with(b"\n") {
+        return None;
+    }
     let text = String::from_utf8_lossy(body);
     let mut lines = text.lines();
     if lines.next()? != "ruk-lock 1" {
         return None;
     }
     let pid = lines.next()?.strip_prefix("pid ")?.parse().ok()?;
-    let address = lines.next()?;
-    let nonce = lines.next()?;
-    if !address.starts_with("address ") || !nonce.starts_with("nonce ") {
+    let address = lines.next()?.strip_prefix("address unix:")?;
+    let nonce = lines.next()?.strip_prefix("nonce ")?;
+    let hex = |text: &str| text.len() % 2 == 0 && text.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex(address) || nonce.len() != 64 || !hex(nonce) {
         return None;
     }
     Some(pid)
