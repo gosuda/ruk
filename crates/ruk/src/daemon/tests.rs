@@ -6851,8 +6851,8 @@ async fn teardown_unparks_stream_and_worker_and_returns_the_permit() {
         !task.is_finished(),
         "the feed parks against the full pipe before teardown"
     );
-    let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
-    let (data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(8);
+    let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut streams = HashMap::new();
     streams.insert(
         7u64,
@@ -6879,6 +6879,9 @@ async fn teardown_unparks_stream_and_worker_and_returns_the_permit() {
         .task
         .take()
         .expect("stream task");
+    drop(streams);
+    drop(control_rx);
+    drop(data_rx);
     let _ = tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .expect("teardown ends the parked stream task promptly");

@@ -264,7 +264,8 @@ pub(crate) fn scope_matches(pattern: &str, url: &str) -> bool {
 
 /// Expands a leading `~/` against the caller map's `HOME`, never the
 /// process environment, as text: a helper program is a command string and
-/// keeps its configured separators. A bare `~` without a home is no
+/// keeps its configured separators. An empty `HOME` resolves the rest
+/// relative to the working directory; a bare `~` without a home is no
 /// program at all.
 fn expand_home_in(path: &str, vars: &HashMap<String, String>) -> Option<String> {
     if !path.starts_with('~') {
@@ -275,6 +276,9 @@ fn expand_home_in(path: &str, vars: &HashMap<String, String>) -> Option<String> 
         return Some(home.clone());
     }
     let rest = path.strip_prefix("~/")?;
+    if home.is_empty() {
+        return Some(rest.to_owned());
+    }
     Some(format!("{home}/{rest}"))
 }
 
@@ -1329,6 +1333,11 @@ mod tests {
         assert_eq!(
             classify_helper("~/bin/helper --flag", &vars(&[("HOME", "/home/u")])),
             Some(("/home/u/bin/helper".to_owned(), vec!["--flag".to_owned()]))
+        );
+        assert_eq!(
+            classify_helper("~/bin/helper", &vars(&[("HOME", "")])),
+            Some(("bin/helper".to_owned(), Vec::new())),
+            "an empty HOME keeps the helper relative to the working directory"
         );
         assert_eq!(
             classify_helper("~/bin/helper", &HashMap::new()),
