@@ -577,6 +577,7 @@ mod tests {
         let root = base.join("root");
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
+        let root = root.canonicalize().expect("canonical root");
         let pinned = resolve_contained_pinned(&root, &repo).expect("canonical spelling resolves");
         assert!(pinned.path.starts_with(&root));
     }
