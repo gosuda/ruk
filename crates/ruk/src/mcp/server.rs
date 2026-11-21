@@ -719,10 +719,21 @@ mod tests {
     }
 
     fn test_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("ruk-mcp-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create test root");
-        root
+        let mut attempt = 0;
+        loop {
+            let root = std::env::temp_dir()
+                .join(format!("ruk-mcp-{}-{attempt}-{name}", std::process::id()));
+            attempt += 1;
+            let cleared = match std::fs::remove_dir_all(&root) {
+                Ok(()) => true,
+                Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+            };
+            if cleared {
+                std::fs::create_dir_all(&root).expect("create test root");
+                return root;
+            }
+            assert!(attempt < 8, "no clearable test root for {name}");
+        }
     }
 
     fn fixture_tree(root: &Path) -> ruk_core::ids::Oid {
