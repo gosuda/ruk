@@ -5012,24 +5012,14 @@ fn submodule_update_init_materializes_checkout() {
     let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
 }
 
-#[cfg(unix)]
 #[test]
-fn submodule_status_summary_foreach_and_gap() {
-    let (root, env, child_root, child_head) = submodule_case("submodule-misc");
+fn submodule_status_summary_and_gap() {
+    let (root, env, child_root, child_head) = submodule_case("submodule-status");
     let mut ctx = repo_ctx(&root, env);
     let out = run(verbs_submodule::submodule, &mut ctx, &["status"]).expect("status");
     let text = String::from_utf8(out).expect("utf8");
     assert!(text.contains(&child_head), "got {text:?}");
     assert!(text.contains("vendor/lib (main)"), "got {text:?}");
-    let out = run(
-        verbs_submodule::submodule,
-        &mut ctx,
-        &["foreach", "echo", "hello-$name"],
-    )
-    .expect("foreach");
-    let text = String::from_utf8(out).expect("utf8");
-    assert!(text.contains("Entering 'vendor/lib'"), "got {text:?}");
-    assert!(text.contains("hello-vendor/lib"), "got {text:?}");
     // Uncommitted binding: summary reports the addition; after the parent
     // commit the lane is quiet.
     let out = run(verbs_submodule::submodule, &mut ctx, &["summary"]).expect("summary");
@@ -5042,6 +5032,24 @@ fn submodule_status_summary_foreach_and_gap() {
     assert!(out.is_empty(), "in sync: {}", String::from_utf8_lossy(&out));
     let err = run(verbs_submodule::submodule, &mut ctx, &["absorbgitdirs"]).expect_err("gap");
     assert!(err.to_string().contains("absorbgitdirs"), "got {err:?}");
+    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn submodule_foreach_runs_in_each_entry() {
+    let (root, env, child_root, _) = submodule_case("submodule-foreach");
+    let mut ctx = repo_ctx(&root, env);
+    let out = run(
+        verbs_submodule::submodule,
+        &mut ctx,
+        &["foreach", "echo", "hello-$name"],
+    )
+    .expect("foreach");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.contains("Entering 'vendor/lib'"), "got {text:?}");
+    assert!(text.contains("hello-vendor/lib"), "got {text:?}");
     let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
     let _ = std::fs::remove_dir_all(child_root.parent().expect("parent"));
 }
