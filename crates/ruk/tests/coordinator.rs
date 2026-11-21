@@ -141,7 +141,7 @@ fn wait_for_dead_socket(sock: &Path, timeout: Duration) {
 }
 #[cfg(unix)]
 fn lock_ready_pid(body: &[u8]) -> Option<u32> {
-    if !body.ends_with(b"\n") {
+    if body.len() > 512 || !body.ends_with(b"\n") {
         return None;
     }
     let text = String::from_utf8_lossy(body);
@@ -150,19 +150,24 @@ fn lock_ready_pid(body: &[u8]) -> Option<u32> {
         return None;
     }
     let pid_text = lines.next()?.strip_prefix("pid ")?;
-    if pid_text.len() > 10 || pid_text.starts_with('0') {
+    if pid_text.len() > 10
+        || pid_text.starts_with('0')
+        || !pid_text.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
-    let pid: u32 = pid_text.parse().ok()?;
     let address = lines.next()?.strip_prefix("address unix:")?;
     let nonce = lines.next()?.strip_prefix("nonce ")?;
+    if lines.next().is_some() {
+        return None;
+    }
     let hex = |text: &str| {
         text.len().is_multiple_of(2) && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     };
     if !hex(address) || nonce.len() != 64 || !hex(nonce) {
         return None;
     }
-    Some(pid)
+    pid_text.parse().ok()
 }
 
 /// Waits until the lock body names its owner: the lock file exists before
