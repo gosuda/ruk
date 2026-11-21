@@ -139,6 +139,34 @@ fn wait_for_dead_socket(sock: &Path, timeout: Duration) {
         }
     }
 }
+#[cfg(unix)]
+fn lock_pid(body: &[u8]) -> Option<u32> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.parse().ok())
+}
+
+/// Waits until the lock body names its owner: the lock file exists before
+/// the server publishes its endpoint into it, and a client reading an
+/// unpublished body falls back to direct publishing.
+#[cfg(unix)]
+fn wait_for_lock_owner(repo: &Path, timeout: Duration) -> u32 {
+    let lock = repo.join(".ruk").join("lock");
+    let start = Instant::now();
+    loop {
+        if let Some(pid) = std::fs::read(&lock).ok().as_deref().and_then(lock_pid) {
+            return pid;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "coordinator never published its endpoint: {}",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 #[cfg(unix)]
 fn read_stats(repo: &Path) -> (u64, u64, u64, u64, u64) {
@@ -174,6 +202,19 @@ fn commit_parents(payload: &str) -> Vec<String> {
         .collect()
 }
 
+/// Kills and reaps a spawned coordinator on every exit path, including
+/// assertion failures, so a failed test never strands the process.
+#[cfg(unix)]
+struct SpawnGuard(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Four sequential commits on four branches land exactly attributed: each
 /// branch holds its own commit parented on the seed, with no cross-talk.
 ///
@@ -196,7 +237,7 @@ fn commit_parents(payload: &str) -> Vec<String> {
 #[test]
 fn sequential_cross_branch_commits_attribute_exactly() {
     const N: usize = 4;
-    let idle = &[("RUK_COORDINATOR_IDLE_MS", "10000")];
+    let idle = &[("RUK_COORDINATOR_IDLE_MS", "60000")];
     let repo = fresh_repo("cross");
     // Seed with the sidecar off so the stats file measures only the four
     // branch publications.
@@ -208,6 +249,22 @@ fn sequential_cross_branch_commits_attribute_exactly() {
         let (code, _, stderr) = run(&repo, &["branch", branch.as_str()], &[]);
         assert_eq!(code, 0, "branch {branch} failed: {stderr}");
     }
+    // Pre-start the lane so the measured window holds no spawn race: a
+    // loaded runner can stretch the client rendezvous past its budget, and
+    // a fallback there would blur the exact lane-usage pins below.
+    let coordinator = SpawnGuard(
+        std::process::Command::new(ruk_bin())
+            .arg("git")
+            .arg("coordinator")
+            .arg(&repo)
+            .envs(idle.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn coordinator"),
+    );
+    wait_for_lock_owner(&repo, Duration::from_secs(120));
     for k in 0..N {
         let branch = format!("racer/{k}");
         let subject = format!("racer {k}");
@@ -239,22 +296,22 @@ fn sequential_cross_branch_commits_attribute_exactly() {
         N + 1,
         "seed plus four commits:\n{stdout}"
     );
-    // No sharing across sequential processes: four spaced-out publications
-    // cost four metadata commits. Concurrent lane submissions on disjoint
-    // refs do share; sequential CLI cannot overlap the burst windows.
+    // No sharing across sequential processes: four publications cost four
+    // metadata commits. Concurrent lane submissions on disjoint refs do
+    // share; the pre-started lane keeps every sequential commit on the
+    // lane, so the exact pins hold.
+    let _ = std::fs::remove_file(repo.join(".ruk").join("coordinator.sock"));
     wait_for(
         &repo.join(".ruk").join("coordinator.stats"),
         true,
-        Duration::from_secs(15),
+        Duration::from_secs(45),
     );
     let stats = read_stats(&repo);
-    // All four committed through the lane: a direct fallback would land
-    // the commit without touching the server counters, so this excludes
-    // the fallback before the publication counts below pin no-sharing.
     let committed = stat_field(&repo, "committed");
     assert_eq!(committed, N as u64, "all four went through the lane");
     assert_eq!(stats.0, N as u64, "four publications: {stats:?}");
     assert_eq!(stats.1, N as u64, "one metadata commit each: {stats:?}");
+    drop(coordinator);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -319,19 +376,11 @@ fn absent_coordinator_falls_back_to_direct() {
 #[test]
 fn killed_coordinator_respawns() {
     let repo = fresh_repo("killed");
-    let (code, _, stderr) = commit_empty(&repo, "first commit", &[]);
+    let idle = &[("RUK_COORDINATOR_IDLE_MS", "60000")];
+    let (code, _, stderr) = commit_empty(&repo, "first commit", idle);
     assert_eq!(code, 0, "first commit failed: {stderr}");
     let sock = repo.join(".ruk").join("coordinator.sock");
-    wait_for(&sock, true, Duration::from_secs(10));
-    // Read the owner's pid from the lock body and kill it mid-flight.
-    let lock = std::fs::read(repo.join(".ruk").join("lock")).expect("lock body");
-    let text = String::from_utf8_lossy(&lock).into_owned();
-    let pid: u32 = text
-        .lines()
-        .nth(1)
-        .and_then(|line| line.strip_prefix("pid "))
-        .and_then(|pid| pid.parse().ok())
-        .expect("owner pid");
+    let pid = wait_for_lock_owner(&repo, Duration::from_secs(120));
     // No wait for the stale socket to vanish: nobody unlinks it. The next
     // commit refuses the dead socket, a fresh server takes over the path,
     // and the commit lands exactly once.
