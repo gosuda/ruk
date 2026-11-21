@@ -1284,7 +1284,17 @@ fn extract_relative_arg(
         if arg == "--relative" {
             relative = Some(None);
         } else if let Some(path) = arg.strip_prefix("--relative=") {
-            relative = Some(Some(path.to_owned()));
+            let normalized: String = path
+                .chars()
+                .map(|c| {
+                    if c == std::path::MAIN_SEPARATOR {
+                        '/'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            relative = Some(Some(normalized));
         } else {
             kept.push(arg.clone());
         }
