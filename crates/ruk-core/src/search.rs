@@ -1599,7 +1599,6 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |elapsed| elapsed.as_nanos())
             ));
-            std::fs::create_dir_all(&dir).expect("temp dir");
             Self(dir)
         }
     }
