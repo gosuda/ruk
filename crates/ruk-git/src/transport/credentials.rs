@@ -263,8 +263,9 @@ pub(crate) fn scope_matches(pattern: &str, url: &str) -> bool {
 }
 
 /// Expands a leading `~/` against the caller map's `HOME`, never the
-/// process environment: helper programs resolve inside the same hermetic
-/// map as config paths. A bare `~` without a home is no program at all.
+/// process environment, as text: a helper program is a command string and
+/// keeps its configured separators. A bare `~` without a home is no
+/// program at all.
 fn expand_home_in(path: &str, vars: &HashMap<String, String>) -> Option<String> {
     if !path.starts_with('~') {
         return Some(path.to_owned());
@@ -274,12 +275,7 @@ fn expand_home_in(path: &str, vars: &HashMap<String, String>) -> Option<String> 
         return Some(home.clone());
     }
     let rest = path.strip_prefix("~/")?;
-    Some(
-        PathBuf::from(home)
-            .join(rest)
-            .to_string_lossy()
-            .into_owned(),
-    )
+    Some(format!("{home}/{rest}"))
 }
 
 /// Classifies one helper value into a directly runnable `(program, args)`:
