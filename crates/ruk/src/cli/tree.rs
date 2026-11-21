@@ -499,7 +499,15 @@ fn walk_dir(
                 detail: "worktree path is not valid UTF-8".to_owned(),
             })?
             .as_bytes()
-            .to_vec();
+            .iter()
+            .map(|&b| {
+                if b == std::path::MAIN_SEPARATOR as u8 {
+                    b'/'
+                } else {
+                    b
+                }
+            })
+            .collect();
         if file_type.is_symlink() {
             out.push(WorktreeEntry {
                 path,
