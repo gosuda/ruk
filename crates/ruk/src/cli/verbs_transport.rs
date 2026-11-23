@@ -3987,7 +3987,9 @@ fn lfs_endpoint_for_remote(ctx: &Ctx, remote_label: &str) -> Option<String> {
 fn derive_lfs_endpoint(fetch_url: &str) -> Option<String> {
     let lower = fetch_url.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        Some(ruk_git::transport::http::endpoint_url(fetch_url, "info/lfs"))
+        Some(ruk_git::transport::http::endpoint_url(
+            fetch_url, "info/lfs",
+        ))
     } else {
         None
     }
