@@ -1203,8 +1203,17 @@ fn read_report_packets<R: Read>(pkt: &mut PktReader<R>) -> Result<Vec<RefOutcome
     loop {
         match pkt.read_packet()? {
             Packet::Flush => break,
-            Packet::Data(_) => {
-                raw.extend_from_slice(pkt.last_line().unwrap_or_default());
+            Packet::Data(payload) => {
+                let line = payload.strip_suffix(b"\n").unwrap_or(payload);
+                if line.len() + 1 > ruk_core::MAX_CONTROL_FRAME_BYTES - raw.len() {
+                    return Err(GitError::Limit {
+                        detail: format!(
+                            "push report exceeds {} bytes",
+                            ruk_core::MAX_CONTROL_FRAME_BYTES,
+                        ),
+                    });
+                }
+                raw.extend_from_slice(line);
                 raw.push(b'\n');
             }
             Packet::Delimiter | Packet::ResponseEnd => {
@@ -1222,6 +1231,7 @@ fn read_report_packets<R: Read>(pkt: &mut PktReader<R>) -> Result<Vec<RefOutcome
 /// an `ok` accepted and skipped. An unpack failure rejects every ref sent.
 fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
     let mut outcomes = Vec::new();
+    let mut decoded_bytes = 0;
     let mut unpack_err: Option<String> = None;
     let mut first = true;
     for line in raw.split(|b| *b == b'\n') {
@@ -1238,6 +1248,7 @@ fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
             }
         }
         if let Some(name) = line.strip_prefix(b"ok ") {
+            decoded_bytes = report_row_size(decoded_bytes, name.len(), 0)?;
             outcomes.push(RefOutcome {
                 name: name.to_vec(),
                 result: RefResult::Ok,
@@ -1247,10 +1258,12 @@ fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
                 Some(at) => (&rest[..at], &rest[at + 1..]),
                 None => (rest, &b""[..]),
             };
+            let reason = String::from_utf8_lossy(msg);
+            decoded_bytes = report_row_size(decoded_bytes, name.len(), reason.len())?;
             outcomes.push(RefOutcome {
                 name: name.to_vec(),
                 result: RefResult::Rejected {
-                    reason: String::from_utf8_lossy(msg).into_owned(),
+                    reason: reason.into_owned(),
                 },
             });
         } else if line.starts_with(b"option ") {
@@ -1262,13 +1275,33 @@ fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
         }
     }
     if let Some(err) = unpack_err {
+        let reason = format!("unpack failed: {err}");
+        outcomes.iter().try_fold(0, |size, outcome| {
+            report_row_size(size, outcome.name.len(), reason.len())
+        })?;
         for outcome in &mut outcomes {
             outcome.result = RefResult::Rejected {
-                reason: format!("unpack failed: {err}"),
+                reason: reason.clone(),
             };
         }
     }
     Ok(outcomes)
+}
+
+fn report_row_size(size: usize, name_len: usize, reason_len: usize) -> Result<usize, GitError> {
+    match size
+        .checked_add(std::mem::size_of::<RefOutcome>())
+        .and_then(|size| size.checked_add(name_len))
+        .and_then(|size| size.checked_add(reason_len))
+    {
+        Some(size) if size <= ruk_core::MAX_CONTROL_FRAME_BYTES => Ok(size),
+        _ => Err(GitError::Limit {
+            detail: format!(
+                "decoded push report exceeds {} bytes",
+                ruk_core::MAX_CONTROL_FRAME_BYTES,
+            ),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1387,6 +1420,86 @@ mod tests {
         let _ = v2;
         let v2 = b"unpack ok\nok refs/heads/a\noption old-oid 1111\n";
         assert_eq!(parse_report(v2).expect("v2").len(), 1);
+    }
+
+    #[test]
+    fn report_packets_bound_aggregate_before_appending_line() {
+        let mut option = vec![b'x'; pktline::LARGE_PACKET_DATA_MAX];
+        option[..7].copy_from_slice(b"option ");
+        for sideband in [None, Some(pktline::LARGE_PACKET_MAX)] {
+            for extra_packet in [false, true] {
+                let mut inner = Vec::new();
+                pktline::encode_data(&mut inner, b"unpack ok").expect("unpack packet");
+                let mut remaining = ruk_core::MAX_CONTROL_FRAME_BYTES - b"unpack ok\n".len();
+                while remaining > 0 {
+                    let line_size = remaining.min(pktline::LARGE_PACKET_DATA_MAX + 1);
+                    assert!(line_size > b"option ".len());
+                    pktline::encode_data(&mut inner, &option[..line_size - 1])
+                        .expect("option packet");
+                    remaining -= line_size;
+                }
+                if extra_packet {
+                    pktline::encode_data(&mut inner, b"").expect("empty packet");
+                }
+                pktline::encode_flush(&mut inner);
+                let wire = if sideband.is_some() {
+                    let mut outer = Vec::new();
+                    for chunk in inner.chunks(pktline::LARGE_PACKET_DATA_MAX - 1) {
+                        let mut payload = vec![1];
+                        payload.extend_from_slice(chunk);
+                        pktline::encode_data(&mut outer, &payload).expect("sideband packet");
+                    }
+                    pktline::encode_flush(&mut outer);
+                    outer
+                } else {
+                    inner
+                };
+                let mut packets = PktReader::new(wire.as_slice(), Interrupt::none());
+                let result = read_report(&mut packets, sideband);
+                if extra_packet {
+                    assert!(matches!(result, Err(GitError::Limit { .. })), "{result:?}");
+                } else {
+                    assert_eq!(result.expect("report at the control bound"), Vec::new());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn report_outcomes_bound_decoded_storage() {
+        let count = ruk_core::MAX_CONTROL_FRAME_BYTES / (std::mem::size_of::<RefOutcome>() + 1) + 1;
+        let mut raw = b"unpack ok\n".to_vec();
+        for _ in 0..count {
+            raw.extend_from_slice(b"ok x\n");
+        }
+        assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
+        assert!(matches!(parse_report(&raw), Err(GitError::Limit { .. })));
+    }
+
+    #[test]
+    fn report_outcomes_count_decoded_utf8_replacements() {
+        let reason = vec![0xff; 60 * 1024];
+        let count = ruk_core::MAX_CONTROL_FRAME_BYTES / (reason.len() * 3) + 1;
+        let mut raw = b"unpack ok\n".to_vec();
+        for _ in 0..count {
+            raw.extend_from_slice(b"ng x ");
+            raw.extend_from_slice(&reason);
+            raw.push(b'\n');
+        }
+        assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
+        assert!(matches!(parse_report(&raw), Err(GitError::Limit { .. })));
+    }
+
+    #[test]
+    fn report_unpack_error_cannot_amplify_reason_per_ref() {
+        let mut raw = b"unpack ".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 60 * 1024));
+        raw.push(b'\n');
+        for _ in 0..1024 {
+            raw.extend_from_slice(b"ok refs/heads/main\n");
+        }
+        assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
+        assert!(matches!(parse_report(&raw), Err(GitError::Limit { .. })));
     }
 
     #[test]
