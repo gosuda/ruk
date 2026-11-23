@@ -30,14 +30,15 @@ use serde::{Deserialize, Serialize};
 use crate::MAX_CONTROL_FRAME_BYTES;
 use crate::bytes::ByteString;
 use crate::capability::Capabilities;
-use crate::change::{ClaimId, OperationId, RequestId, SessionId, WorkspaceId};
+use crate::change::{ClaimId, OperationId, PlanId, RequestId, SessionId, WorkspaceId};
 use crate::commit::ProvenanceClaims;
 use crate::coord::policy::Principal;
 use crate::error::{CoreError, ErrorCode};
 use crate::index::RepoPath;
 use crate::protocol::{
-    ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimReleaseReply, IdentityClaim, Method,
-    MutationOutcome, OperationEntry, ReceiptRef, Reply, SessionAuthority, Timestamp, Validate,
+    BoundedList, ClaimAcquireReply, ClaimMode, ClaimRecord, ClaimReleaseReply, IdentityClaim,
+    Method, MutationOutcome, OperationEntry, PushReconcileReply, PushState, ReceiptRef,
+    ReconcileObservation, Reply, SessionAuthority, Timestamp, Validate,
 };
 use crate::store::types::FactTable;
 use crate::store::{Store, StoreError};
@@ -289,10 +290,30 @@ pub(crate) fn decode_session(
 // Receipt Row
 // ---------------------------------------------------------------------------
 
-/// Stored row for [`FactTable::Receipts`]. Transparently wraps a mutation [`Reply`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
+/// Stored row for [`FactTable::Receipts`]. Reconciliation replies carry a format tag;
+/// other mutation replies retain their original encoding.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReceiptRow(Reply);
+
+const RECONCILE_RECEIPT_TAG: u32 = u32::MAX;
+
+impl Serialize for ReceiptRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if matches!(self.0, Reply::PushReconcile(_)) {
+            (RECONCILE_RECEIPT_TAG, &self.0).serialize(serializer)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyPushReconcileReply {
+    outcome: MutationOutcome,
+    plan: PlanId,
+    state: PushState,
+    observations: BoundedList<ReconcileObservation>,
+}
 
 impl ReceiptRow {
     /// Wraps a completed mutation reply into a durable receipt record.
@@ -390,9 +411,35 @@ pub(crate) fn decode_receipt(
     // new-shape row must fail the strict legacy decode and latch quarantine
     // instead of mistranslating, so the restored byte is never trusted as a
     // value on its own.
-    let reply: Reply = match crate::store::decode("receipt row", b) {
-        Ok(reply) => reply,
-        Err(_) => decode_legacy_claim_receipt(store, b)?,
+    let reply: Reply = match postcard::take_from_bytes::<u32>(b) {
+        Ok((RECONCILE_RECEIPT_TAG, rest)) => {
+            let reply: Reply = decode(store, "reconciliation receipt row", rest)?;
+            if !matches!(reply, Reply::PushReconcile(_)) {
+                return corrupt(
+                    store,
+                    "reconciliation receipt row",
+                    "format tag names another method",
+                );
+            }
+            reply
+        }
+        _ => match postcard::take_from_bytes::<Method>(b) {
+            Ok((Method::PushReconcile, rest)) => {
+                let legacy: LegacyPushReconcileReply =
+                    decode(store, "legacy reconciliation receipt row", rest)?;
+                Reply::PushReconcile(Box::new(PushReconcileReply {
+                    outcome: legacy.outcome,
+                    plan: legacy.plan,
+                    state: legacy.state,
+                    rewritten: false,
+                    observations: legacy.observations,
+                }))
+            }
+            _ => match crate::store::decode("receipt row", b) {
+                Ok(reply) => reply,
+                Err(_) => decode_legacy_claim_receipt(store, b)?,
+            },
+        },
     };
     let mut s_bytes = [0_u8; 16];
     s_bytes.copy_from_slice(&key[..16]);
@@ -1302,6 +1349,99 @@ mod tests {
         assert_eq!(replay_outcome.receipt.session, s);
         assert_eq!(replay_outcome.receipt.request_id, r);
         assert_eq!(replay_outcome.operation, Some(OperationId(1)));
+    }
+
+    #[test]
+    fn reconciliation_receipts_upgrade_legacy_rows_and_tag_new_rows() {
+        let (_temp, store) = test_store("reconcile-receipt");
+        let s = SessionId::from_bytes([1; 16]);
+        let r = RequestId::from_bytes([2; 16]);
+        let plan = PlanId::from_bytes([4; 16]);
+        let key = receipt_key(s, r);
+        let outcome = MutationOutcome {
+            receipt: ReceiptRef {
+                session: s,
+                request_id: r,
+                digest: RequestDigest::from_bytes([3; 32]),
+                replayed: false,
+                retained_until: Timestamp::new(jiff::Timestamp::UNIX_EPOCH),
+            },
+            operation: Some(OperationId(1)),
+            heads: empty_bounded_list(),
+            stamps: empty_bounded_list(),
+            warnings: empty_bounded_list(),
+            merge: None,
+            provenance: empty_bounded_list(),
+            identity: None,
+        };
+        let observations = BoundedList::complete(vec![ReconcileObservation {
+            remote_ref: crate::refdata::RefName::new(b"refs/heads/main".to_vec()).expect("ref"),
+            observed: Some(crate::Oid::from_hex(&"12".repeat(32)).expect("tip")),
+            verdict: crate::protocol::ReconcileVerdict::EqualNew,
+        }])
+        .expect("observations fit");
+        let old = encode(
+            "legacy receipt",
+            &(
+                Method::PushReconcile,
+                &outcome,
+                plan,
+                PushState::Uncertain,
+                &observations,
+            ),
+        )
+        .expect("old four-field receipt encodes");
+        let ReceiptRow(legacy) =
+            decode_receipt(&store, &key, &old).expect("legacy receipt remains readable");
+        let Reply::PushReconcile(legacy) = legacy else {
+            panic!("reconciliation receipt");
+        };
+        assert!(!legacy.rewritten);
+        assert_eq!(legacy.outcome, outcome);
+        assert_eq!(legacy.observations, observations);
+        let reply = Reply::PushReconcile(Box::new(PushReconcileReply {
+            outcome,
+            plan,
+            state: PushState::Uncertain,
+            rewritten: true,
+            observations,
+        }));
+        let row = ReceiptRow::new(s, r, reply.clone()).expect("new receipt validates");
+        let bytes = encode("receipt", &row).expect("new receipt encodes");
+        assert_eq!(
+            postcard::take_from_bytes::<u32>(&bytes).expect("tag").0,
+            RECONCILE_RECEIPT_TAG
+        );
+        for method in Method::ALL {
+            let encoded = postcard::to_allocvec(method).expect("method encodes");
+            assert_ne!(
+                postcard::from_bytes::<u32>(&encoded).expect("method tag"),
+                RECONCILE_RECEIPT_TAG
+            );
+        }
+        assert_eq!(
+            decode_receipt(&store, &key, &bytes)
+                .expect("new receipt decodes")
+                .0,
+            reply
+        );
+        store
+            .fact(FactTable::OpHead, OP_HEAD_KEY)
+            .expect("valid rows leave store usable");
+        let truncated = &bytes[..bytes.len() - 1];
+        assert_eq!(
+            decode_receipt(&store, &key, truncated)
+                .expect_err("tagged truncation never retries the legacy shape")
+                .code,
+            ErrorCode::ECorrupt
+        );
+        assert_eq!(
+            store
+                .fact(FactTable::OpHead, OP_HEAD_KEY)
+                .expect_err("truncated committed row quarantines")
+                .code(),
+            ErrorCode::ECorrupt
+        );
     }
 
     #[test]

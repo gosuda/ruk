@@ -151,42 +151,96 @@ fn scrub_plan_remote(remote: &[u8]) -> Vec<u8> {
     super::credentials::scrub_userinfo_bytes(remote)
 }
 
+fn destination_is_known(remote: &[u8], resolved: bool) -> bool {
+    let Ok(remote) = std::str::from_utf8(remote) else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            return resolved
+                && std::path::Path::new(std::ffi::OsStr::from_bytes(remote)).is_absolute();
+        }
+        #[cfg(not(unix))]
+        return false;
+    };
+    match super::net::parse_endpoint(remote) {
+        Ok(super::net::Endpoint::Local { path }) => path.is_absolute(),
+        Ok(super::net::Endpoint::Ssh { user, .. }) => resolved || user.is_some(),
+        Ok(super::net::Endpoint::Http { .. } | super::net::Endpoint::Git { .. }) => true,
+        Err(_) => false,
+    }
+}
+
 /// A durable push plan: state machine plus its `push_plans` row codec.
 ///
-/// Row layout, versioned: `01 | state:u8 | hash:u8 | atomic:u8 |
+/// Row layout, version 2: `02 | state:u8 | hash:u8 | atomic:u8 | resolved:u8 |
 /// remote_len:u32 | remote | update_count:u32 | updates |
-/// outcome_count:u32 | outcomes`, where an update is
+/// outcome_count:u32 | outcomes | reported_count:u32 | reported_updates`, where an update is
 /// `name_len:u32 | name | old_oid | new_oid` and an outcome is
 /// `name_len:u32 | name | ok:u8 | reason_len:u32 | reason`.
-/// Manual encoding: the row must stay readable without new dependencies.
+/// Version 1 omits destination provenance and reported updates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushPlanRecord {
     /// Plan identity; the `push_plans` key is these 16 bytes.
     pub id: PlanId,
     /// Remote destination, retaining SSH usernames but no passwords.
     pub remote: Vec<u8>,
+    /// Whether the caller supplied a resolved destination rather than a remote alias.
+    pub remote_is_resolved: bool,
     /// Whether the push is all-or-nothing.
     pub atomic: bool,
     /// Current state.
     pub state: PushState,
     /// Requested updates.
     pub updates: Vec<PushUpdate>,
+    /// Validated server-reported alternatives retained for recovery.
+    pub reported_updates: Vec<PushUpdate>,
     /// Per-ref outcomes once read.
     pub outcomes: Vec<RefOutcome>,
 }
 
 impl PushPlanRecord {
-    /// Builds a plan in [`PushState::Prepared`].
+    /// Builds a plan in [`PushState::Prepared`] for a resolved destination.
+    /// Local destinations must be absolute. Remote aliases must be resolved first.
     #[must_use]
     pub fn prepare(id: PlanId, remote: Vec<u8>, atomic: bool, updates: Vec<PushUpdate>) -> Self {
         Self {
             id,
             remote: scrub_plan_remote(&remote),
+            remote_is_resolved: true,
             atomic,
             state: PushState::Prepared,
             updates,
+            reported_updates: Vec::new(),
             outcomes: Vec::new(),
         }
+    }
+
+    /// Whether the stored destination identifies the original target without config lookup.
+    #[must_use]
+    pub fn destination_is_known(&self) -> bool {
+        destination_is_known(&self.remote, self.remote_is_resolved)
+    }
+
+    /// Binds an ambiguous legacy plan to its historical resolved destination.
+    /// The caller must supply the original destination, not a current alias value.
+    ///
+    /// # Errors
+    /// [`GitError::Invalid`] for a known plan or an unresolved destination.
+    pub fn bind_original_remote(&mut self, remote: Vec<u8>) -> Result<(), GitError> {
+        if self.destination_is_known() {
+            return Err(GitError::Invalid {
+                detail: "a known push destination cannot be rebound".to_owned(),
+            });
+        }
+        let remote = scrub_plan_remote(&remote);
+        if !destination_is_known(&remote, true) {
+            return Err(GitError::Invalid {
+                detail: "original push destination must be resolved".to_owned(),
+            });
+        }
+        self.remote = remote;
+        self.remote_is_resolved = true;
+        Ok(())
     }
 
     /// Marks the first byte as possibly sent.
@@ -276,14 +330,15 @@ impl PushPlanRecord {
             HashKind::Sha1 => 1u8,
             HashKind::Sha256 => 2u8,
         };
-        let mut out = vec![1, self.state.tag(), hash_tag, u8::from(self.atomic)];
+        let mut out = vec![
+            2,
+            self.state.tag(),
+            hash_tag,
+            u8::from(self.atomic),
+            u8::from(self.remote_is_resolved),
+        ];
         push_bytes(&mut out, &self.remote)?;
-        push_count(&mut out, self.updates.len())?;
-        for update in &self.updates {
-            push_bytes(&mut out, &update.name)?;
-            out.extend_from_slice(update.old.as_bytes());
-            out.extend_from_slice(update.new.as_bytes());
-        }
+        push_updates(&mut out, &self.updates)?;
         push_count(&mut out, self.outcomes.len())?;
         for outcome in &self.outcomes {
             push_bytes(&mut out, &outcome.name)?;
@@ -298,6 +353,7 @@ impl PushPlanRecord {
                 }
             }
         }
+        push_updates(&mut out, &self.reported_updates)?;
         Ok(out)
     }
 
@@ -313,9 +369,17 @@ impl PushPlanRecord {
         let [version, state, hash_tag, atomic, rest @ ..] = bytes else {
             return Err(corrupt("truncated header"));
         };
-        if *version != 1 {
+        if !matches!(*version, 1 | 2) {
             return Err(corrupt("unknown version"));
         }
+        let (remote_is_resolved, rest) = if *version == 2 {
+            match rest.split_first() {
+                Some((&value, rest)) if value <= 1 => (value == 1, rest),
+                _ => return Err(corrupt("invalid destination provenance")),
+            }
+        } else {
+            (false, rest)
+        };
         let state = PushState::parse(*state)?;
         let hash = match hash_tag {
             1 => HashKind::Sha1,
@@ -331,18 +395,39 @@ impl PushPlanRecord {
         let (updates, rest) =
             take_updates(rest, hash).ok_or_else(|| corrupt("truncated updates"))?;
         let (outcomes, rest) = take_outcomes(rest).ok_or_else(|| corrupt("truncated outcomes"))?;
+        let (reported_updates, rest) = if *version == 2 {
+            take_updates(rest, hash).ok_or_else(|| corrupt("truncated reported updates"))?
+        } else {
+            (Vec::new(), rest)
+        };
+        for update in &reported_updates {
+            ruk_core::refdata::RefName::new(update.name.clone())
+                .map_err(|_| corrupt("invalid reported ref name"))?;
+        }
         if !rest.is_empty() {
             return Err(corrupt("trailing bytes"));
         }
         Ok(Self {
             id,
             remote: scrub_plan_remote(remote),
+            remote_is_resolved,
             atomic: *atomic != 0,
             state,
             updates,
+            reported_updates,
             outcomes: scrub_outcomes(outcomes),
         })
     }
+}
+
+fn push_updates(out: &mut Vec<u8>, updates: &[PushUpdate]) -> Result<(), GitError> {
+    push_count(out, updates.len())?;
+    for update in updates {
+        push_bytes(out, &update.name)?;
+        out.extend_from_slice(update.old.as_bytes());
+        out.extend_from_slice(update.new.as_bytes());
+    }
+    Ok(())
 }
 
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), GitError> {
@@ -459,8 +544,11 @@ pub fn reconcile(
         .iter()
         .map(|(name, oid)| (name.as_slice(), *oid))
         .collect();
+    let mut seen = HashSet::with_capacity(plan.updates.len() + plan.reported_updates.len());
     plan.updates
         .iter()
+        .chain(&plan.reported_updates)
+        .filter(|update| seen.insert(update.name.as_slice()))
         .map(|update| {
             let at = current.get(update.name.as_slice()).copied().flatten();
             let observation = if update.new == zero {
@@ -802,7 +890,7 @@ fn push_over_inner<R: Read + Write>(
         }
         writer.finish()?;
     }
-    let server = read_report(&mut pkt, sideband, &live)?;
+    let server = read_report(&mut pkt, sideband, &live, &mut plan.reported_updates)?;
     let mut report = server;
     report.extend(outcomes);
     plan.finalize(report.clone())?;
@@ -1191,6 +1279,7 @@ pub(crate) fn read_report<R: Read>(
     pkt: &mut PktReader<R>,
     sideband: Option<usize>,
     live: &[&PushUpdate],
+    reported_updates: &mut Vec<PushUpdate>,
 ) -> Result<Vec<RefOutcome>, GitError> {
     let mut wanted = HashMap::with_capacity(live.len());
     for update in live {
@@ -1202,29 +1291,39 @@ pub(crate) fn read_report<R: Read>(
     }
     let outcomes = if let Some(max_frame) = sideband {
         let mut band = SidebandReader::new(pkt, max_frame);
-        let outcomes =
-            read_report_packets(&mut PktReader::new(&mut band, Interrupt::none()), &wanted)?;
+        let outcomes = read_report_packets(
+            &mut PktReader::new(&mut band, Interrupt::none()),
+            &wanted,
+            reported_updates,
+        )?;
         let _ = band.drain_to_end()?;
         outcomes
     } else {
-        read_report_packets(pkt, &wanted)?
+        read_report_packets(pkt, &wanted, reported_updates)?
     };
     check_report_covers_live(&wanted, &outcomes)?;
+    if !reported_updates.is_empty() {
+        return Err(GitError::Unsupported {
+            command: "push report rewrites require remote reconciliation".to_owned(),
+        });
+    }
     Ok(outcomes)
 }
 
 fn read_report_packets<R: Read>(
     pkt: &mut PktReader<R>,
     wanted: &HashMap<&[u8], &PushUpdate>,
+    reported_updates: &mut Vec<PushUpdate>,
 ) -> Result<Vec<RefOutcome>, GitError> {
     let mut raw = Vec::new();
-    loop {
-        match pkt.read_packet()? {
-            Packet::Flush => break,
-            Packet::Data(payload) => {
+    let framing = loop {
+        match pkt.read_packet() {
+            Err(err) => break Err(err),
+            Ok(Packet::Flush) => break Ok(()),
+            Ok(Packet::Data(payload)) => {
                 let line = payload.strip_suffix(b"\n").unwrap_or(payload);
                 if line.len() + 1 > ruk_core::MAX_CONTROL_FRAME_BYTES - raw.len() {
-                    return Err(GitError::Limit {
+                    break Err(GitError::Limit {
                         detail: format!(
                             "push report exceeds {} bytes",
                             ruk_core::MAX_CONTROL_FRAME_BYTES,
@@ -1234,27 +1333,73 @@ fn read_report_packets<R: Read>(
                 raw.extend_from_slice(line);
                 raw.push(b'\n');
             }
-            Packet::Delimiter | Packet::ResponseEnd => {
-                return Err(GitError::Corrupt {
+            Ok(Packet::Delimiter | Packet::ResponseEnd) => {
+                break Err(GitError::Corrupt {
                     detail: "unexpected section marker in the push report".to_owned(),
                 });
             }
         }
+    };
+    match (framing, parse_report(&raw, wanted, reported_updates)) {
+        (Ok(()), report) => report,
+        (Err(_), Err(err @ GitError::Limit { .. })) => Err(err),
+        (Err(err), _) => Err(err),
     }
-    parse_report(&raw, wanted)
+}
+
+struct ReportTarget<'a> {
+    requested: &'a PushUpdate,
+    name: &'a [u8],
+    old: Oid,
+    new: Oid,
+    seen_options: u8,
+}
+
+fn finish_report_target(
+    target: &mut Option<ReportTarget<'_>>,
+    reported_updates: &mut Vec<PushUpdate>,
+    decoded_bytes: &mut usize,
+) -> Result<(), GitError> {
+    let Some(target) = target.take() else {
+        return Ok(());
+    };
+    if target.name == target.requested.name
+        && target.old == target.requested.old
+        && target.new == target.requested.new
+    {
+        return Ok(());
+    }
+    *decoded_bytes = report_target_size(*decoded_bytes, target.name.len())?;
+    reported_updates.push(PushUpdate {
+        name: target.name.to_vec(),
+        old: target.old,
+        new: target.new,
+    });
+    Ok(())
+}
+
+fn report_target_size(size: usize, name_len: usize) -> Result<usize, GitError> {
+    size.checked_add(std::mem::size_of::<PushUpdate>())
+        .and_then(|size| size.checked_add(name_len))
+        .filter(|size| *size <= ruk_core::MAX_CONTROL_FRAME_BYTES)
+        .ok_or_else(|| GitError::Limit {
+            detail: "decoded push report recovery targets exceed the control bound".to_owned(),
+        })
 }
 
 /// Parses the gitprotocol-pack report grammar: `unpack ok | unpack <err>`
 /// then `ok <ref>` / `ng <ref> <msg>` lines, with v2 `option` lines after
 /// an `ok` checked against the requested update. An unpack failure rejects
 /// every ref sent.
-fn parse_report(
-    raw: &[u8],
-    wanted: &HashMap<&[u8], &PushUpdate>,
+fn parse_report<'a>(
+    raw: &'a [u8],
+    wanted: &HashMap<&[u8], &'a PushUpdate>,
+    reported_updates: &mut Vec<PushUpdate>,
 ) -> Result<Vec<RefOutcome>, GitError> {
     let mut outcomes = Vec::new();
     let mut decoded_bytes = 0;
     let mut unpack_err: Option<String> = None;
+    let mut target = None;
     let mut first = true;
     for line in raw.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -1270,12 +1415,14 @@ fn parse_report(
             }
         }
         if let Some(name) = line.strip_prefix(b"ok ") {
+            finish_report_target(&mut target, reported_updates, &mut decoded_bytes)?;
             decoded_bytes = report_row_size(decoded_bytes, name.len(), 0)?;
             outcomes.push(RefOutcome {
                 name: name.to_vec(),
                 result: RefResult::Ok,
             });
         } else if let Some(rest) = line.strip_prefix(b"ng ") {
+            finish_report_target(&mut target, reported_updates, &mut decoded_bytes)?;
             let (name, msg) = match rest.iter().position(|b| *b == b' ') {
                 Some(at) => (&rest[..at], &rest[at + 1..]),
                 None => (rest, &b""[..]),
@@ -1289,16 +1436,24 @@ fn parse_report(
                 },
             });
         } else if let Some(option) = line.strip_prefix(b"option ") {
-            check_report_option(option, outcomes.last(), wanted)?;
+            if let Err(err) = check_report_option(option, outcomes.last(), wanted, &mut target) {
+                finish_report_target(&mut target, reported_updates, &mut decoded_bytes)?;
+                return Err(err);
+            }
         } else {
+            finish_report_target(&mut target, reported_updates, &mut decoded_bytes)?;
             return Err(GitError::Corrupt {
                 detail: format!("push report line is malformed: {}", line.escape_ascii()),
             });
         }
     }
+    finish_report_target(&mut target, reported_updates, &mut decoded_bytes)?;
     if let Some(err) = unpack_err {
         let reason = format!("unpack failed: {err}");
-        outcomes.iter().try_fold(0, |size, outcome| {
+        let recovery_bytes = reported_updates.iter().try_fold(0, |size, update| {
+            report_target_size(size, update.name.len())
+        })?;
+        outcomes.iter().try_fold(recovery_bytes, |size, outcome| {
             report_row_size(size, outcome.name.len(), reason.len())
         })?;
         for outcome in &mut outcomes {
@@ -1310,18 +1465,22 @@ fn parse_report(
     Ok(outcomes)
 }
 
-fn check_report_option(
-    option: &[u8],
+fn check_report_option<'a>(
+    option: &'a [u8],
     previous: Option<&RefOutcome>,
-    wanted: &HashMap<&[u8], &PushUpdate>,
+    wanted: &HashMap<&[u8], &'a PushUpdate>,
+    target: &mut Option<ReportTarget<'a>>,
 ) -> Result<(), GitError> {
     let (key, value) = match option.iter().position(|byte| *byte == b' ') {
         Some(at) => (&option[..at], &option[at + 1..]),
         None => (option, &b""[..]),
     };
-    if !matches!(key, b"refname" | b"old-oid" | b"new-oid") {
-        return Ok(());
-    }
+    let bit = match key {
+        b"refname" => 1,
+        b"old-oid" => 2,
+        b"new-oid" => 4,
+        _ => return Ok(()),
+    };
     let update = previous
         .filter(|outcome| matches!(outcome.result, RefResult::Ok))
         .and_then(|outcome| wanted.get(outcome.name.as_slice()))
@@ -1333,23 +1492,34 @@ fn check_report_option(
             detail: "push report option has no value".to_owned(),
         });
     }
-    let matches = if key == b"refname" {
-        value == update.name.as_slice()
+    let target = target.get_or_insert_with(|| ReportTarget {
+        requested: update,
+        name: &update.name,
+        old: update.old,
+        new: update.new,
+        seen_options: 0,
+    });
+    if target.seen_options & bit != 0 {
+        return Err(GitError::Corrupt {
+            detail: "push report repeats a ref update option".to_owned(),
+        });
+    }
+    target.seen_options |= bit;
+    if key == b"refname" {
+        ruk_core::refdata::RefName::new(value.to_vec()).map_err(|_| GitError::Corrupt {
+            detail: "push report carries a malformed alternate ref name".to_owned(),
+        })?;
+        target.name = value;
     } else {
         let hex = std::str::from_utf8(value).map_err(|_| GitError::Corrupt {
             detail: "push report option carries a non-ASCII object id".to_owned(),
         })?;
         let oid = crate::parse_oid_for(hex, update.new.kind())?;
         if key == b"old-oid" {
-            oid == update.old
+            target.old = oid;
         } else {
-            oid == update.new
+            target.new = oid;
         }
-    };
-    if !matches {
-        return Err(GitError::Unsupported {
-            command: "push report rewrites require remote reconciliation".to_owned(),
-        });
     }
     Ok(())
 }
@@ -1479,9 +1649,11 @@ mod tests {
         let dirty = PushPlanRecord {
             id,
             remote: b"https://ada:CANARY-s3cret@host.x/r.git".to_vec(),
+            remote_is_resolved: false,
             atomic: false,
             state: PushState::Rejected,
             updates: Vec::new(),
+            reported_updates: Vec::new(),
             outcomes: vec![RefOutcome {
                 name: b"refs/heads/x".to_vec(),
                 result: RefResult::Rejected {
@@ -1516,24 +1688,31 @@ mod tests {
     #[test]
     fn report_grammar_ok_ng_unpack_atomic() {
         let raw = b"unpack ok\nok refs/heads/a\nng refs/heads/b pre-receive hook declined\n";
-        let outcomes = parse_report(raw, &HashMap::new()).expect("report");
+        let outcomes = parse_report(raw, &HashMap::new(), &mut Vec::new()).expect("report");
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].result, RefResult::Ok);
         assert!(
             matches!(&outcomes[1].result, RefResult::Rejected { reason } if reason.contains("pre-receive"))
         );
         let raw = b"unpack index-pack failed\nok refs/heads/a\n";
-        let outcomes = parse_report(raw, &HashMap::new()).expect("report");
+        let outcomes = parse_report(raw, &HashMap::new(), &mut Vec::new()).expect("report");
         assert!(
             matches!(&outcomes[0].result, RefResult::Rejected { reason } if reason.contains("unpack failed"))
         );
-        assert!(parse_report(b"garbage line\n", &HashMap::new()).is_err());
+        assert!(parse_report(b"garbage line\n", &HashMap::new(), &mut Vec::new()).is_err());
         let expected = update(b"refs/heads/a", A, B);
         let wanted = HashMap::from([(expected.name.as_slice(), &expected)]);
         let v2 = format!(
             "unpack ok\nok refs/heads/a\noption refname refs/heads/a\noption old-oid {A}\noption new-oid {B}\noption forced-update\n",
         );
-        assert_eq!(parse_report(v2.as_bytes(), &wanted).expect("v2").len(), 1);
+        let mut reported = Vec::new();
+        assert_eq!(
+            parse_report(v2.as_bytes(), &wanted, &mut reported)
+                .expect("v2")
+                .len(),
+            1
+        );
+        assert!(reported.is_empty());
     }
 
     #[test]
@@ -1546,24 +1725,82 @@ mod tests {
             format!("option new-oid {A}"),
         ] {
             let raw = format!("unpack ok\nok refs/heads/a\n{option}\n");
-            assert!(
-                matches!(
-                    parse_report(raw.as_bytes(), &wanted),
-                    Err(GitError::Unsupported { .. })
-                ),
-                "{option}",
-            );
+            let mut reported = Vec::new();
+            let outcomes = parse_report(raw.as_bytes(), &wanted, &mut reported)
+                .expect("valid rewrite metadata");
+            assert_eq!(outcomes[0].name, expected.name);
+            assert_eq!(reported.len(), 1, "{option}");
+            assert_ne!(reported[0], expected, "{option}");
         }
         for raw in [
             "unpack ok\noption refname refs/heads/a\n".to_owned(),
             "unpack ok\nng refs/heads/a denied\noption refname refs/heads/a\n".to_owned(),
             "unpack ok\nok refs/heads/a\noption refname\n".to_owned(),
             "unpack ok\nok refs/heads/a\noption new-oid\n".to_owned(),
+            "unpack ok\nok refs/heads/a\noption refname refs/heads/../a\n".to_owned(),
+            "unpack ok\nok refs/heads/a\noption refname refs/changes/1/head\noption refname refs/changes/2/head\n".to_owned(),
         ] {
             assert!(matches!(
-                parse_report(raw.as_bytes(), &wanted),
+                parse_report(raw.as_bytes(), &wanted, &mut Vec::new()),
                 Err(GitError::Corrupt { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn report_v2_retains_validated_targets_when_later_options_are_malformed() {
+        let expected = update(b"refs/for/main", A, B);
+        let wanted = HashMap::from([(expected.name.as_slice(), &expected)]);
+        for suffix in ["option new-oid not-an-oid", "unexpected line"] {
+            let raw = format!(
+                "unpack ok\nok refs/for/main\noption refname refs/changes/7/head\noption old-oid {Z}\n{suffix}\n",
+            );
+            let mut reported = Vec::new();
+            assert!(parse_report(raw.as_bytes(), &wanted, &mut reported).is_err());
+            assert_eq!(reported, vec![update(b"refs/changes/7/head", Z, B)]);
+        }
+    }
+
+    #[test]
+    fn report_v2_retains_all_redirects_before_refusing_duplicate_command_reports() {
+        let expected = update(b"refs/for/main", A, B);
+        for sideband in [None, Some(pktline::LARGE_PACKET_MAX)] {
+            let mut inner = Vec::new();
+            for line in [
+                "unpack ok".to_owned(),
+                "ok refs/for/main".to_owned(),
+                "option refname refs/changes/7/head".to_owned(),
+                format!("option old-oid {Z}"),
+                "ok refs/for/main".to_owned(),
+                "option refname refs/changes/8/head".to_owned(),
+                format!("option new-oid {A}"),
+            ] {
+                pktline::encode_data(&mut inner, line.as_bytes()).expect("report packet");
+            }
+            pktline::encode_flush(&mut inner);
+            let wire = if sideband.is_some() {
+                let mut payload = vec![1];
+                payload.extend_from_slice(&inner);
+                let mut outer = Vec::new();
+                pktline::encode_data(&mut outer, &payload).expect("sideband packet");
+                pktline::encode_flush(&mut outer);
+                outer
+            } else {
+                inner
+            };
+            let mut packets = PktReader::new(wire.as_slice(), Interrupt::none());
+            let mut reported = Vec::new();
+            assert!(matches!(
+                read_report(&mut packets, sideband, &[&expected], &mut reported),
+                Err(GitError::Corrupt { .. }),
+            ));
+            assert_eq!(
+                reported,
+                vec![
+                    update(b"refs/changes/7/head", Z, B),
+                    update(b"refs/changes/8/head", A, A),
+                ]
+            );
         }
     }
 
@@ -1600,7 +1837,7 @@ mod tests {
                     inner
                 };
                 let mut packets = PktReader::new(wire.as_slice(), Interrupt::none());
-                let result = read_report(&mut packets, sideband, &[]);
+                let result = read_report(&mut packets, sideband, &[], &mut Vec::new());
                 if extra_packet {
                     assert!(matches!(result, Err(GitError::Limit { .. })), "{result:?}");
                 } else {
@@ -1619,7 +1856,7 @@ mod tests {
         }
         assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
         assert!(matches!(
-            parse_report(&raw, &HashMap::new()),
+            parse_report(&raw, &HashMap::new(), &mut Vec::new()),
             Err(GitError::Limit { .. })
         ));
     }
@@ -1636,7 +1873,7 @@ mod tests {
         }
         assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
         assert!(matches!(
-            parse_report(&raw, &HashMap::new()),
+            parse_report(&raw, &HashMap::new(), &mut Vec::new()),
             Err(GitError::Limit { .. })
         ));
     }
@@ -1651,7 +1888,7 @@ mod tests {
         }
         assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
         assert!(matches!(
-            parse_report(&raw, &HashMap::new()),
+            parse_report(&raw, &HashMap::new(), &mut Vec::new()),
             Err(GitError::Limit { .. })
         ));
     }
@@ -1682,6 +1919,7 @@ mod tests {
                 &mut packets,
                 Some(pktline::LARGE_PACKET_MAX),
                 &[&main, &protected],
+                &mut Vec::new(),
             )
             .expect("nested report decodes");
             assert_eq!(
@@ -1720,7 +1958,15 @@ mod tests {
                 super::super::pktline::encode_flush(&mut outer);
             }
             let mut packets = PktReader::new(outer.as_slice(), Interrupt::none());
-            assert!(read_report(&mut packets, Some(pktline::LARGE_PACKET_MAX), &[&main]).is_err());
+            assert!(
+                read_report(
+                    &mut packets,
+                    Some(pktline::LARGE_PACKET_MAX),
+                    &[&main],
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1759,6 +2005,108 @@ mod tests {
         trailing.push(0);
         assert!(PushPlanRecord::decode(id, HashKind::Sha1, &trailing).is_err());
         assert!(PushPlanRecord::decode(id, HashKind::Sha256, &bytes).is_err());
+    }
+
+    #[test]
+    fn legacy_plan_destinations_require_explicit_binding_when_ambiguous() {
+        let absolute = std::env::temp_dir().join("ruk-historical-destination");
+        let absolute = absolute.to_str().expect("temporary path is UTF-8");
+        for (remote, known) in [
+            ("origin", false),
+            ("relative/repo.git", false),
+            ("ssh://host.x/repo.git", false),
+            ("ssh://alice@host.x/repo.git", true),
+            ("alice@host.x:repo.git", true),
+            ("https://host.x/repo.git", true),
+            ("git://host.x/repo.git", true),
+            (absolute, true),
+        ] {
+            let id = PlanId::generate();
+            let mut bytes = vec![1, PushState::Uncertain.tag(), 1, 0];
+            push_bytes(&mut bytes, remote.as_bytes()).expect("remote fits");
+            push_updates(&mut bytes, &[update(b"refs/heads/main", A, B)])
+                .expect("requested update fits");
+            push_count(&mut bytes, 0).expect("no outcomes");
+            let mut decoded =
+                PushPlanRecord::decode(id, HashKind::Sha1, &bytes).expect("version 1 plan decodes");
+            assert!(!decoded.remote_is_resolved);
+            assert!(decoded.reported_updates.is_empty());
+            assert_eq!(decoded.destination_is_known(), known, "{remote}");
+            let original = decoded.clone();
+            let destination = b"ssh://host.x/historical.git".to_vec();
+            if known {
+                assert!(matches!(
+                    decoded.bind_original_remote(destination),
+                    Err(GitError::Invalid { .. })
+                ));
+                assert_eq!(decoded, original);
+            } else {
+                assert!(
+                    decoded
+                        .bind_original_remote(b"changed-origin".to_vec())
+                        .is_err()
+                );
+                assert_eq!(decoded, original);
+                decoded
+                    .bind_original_remote(destination.clone())
+                    .expect("explicit original binds");
+                assert_eq!(decoded.remote, destination);
+                assert!(decoded.remote_is_resolved);
+                assert!(decoded.destination_is_known());
+                assert_eq!(decoded.updates, original.updates);
+                let encoded = decoded.encode(HashKind::Sha1).expect("bound row encodes");
+                assert_eq!(
+                    PushPlanRecord::decode(id, HashKind::Sha1, &encoded)
+                        .expect("bound row decodes"),
+                    decoded
+                );
+                assert!(
+                    decoded
+                        .bind_original_remote(b"https://elsewhere/repo.git".to_vec())
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reported_plan_updates_survive_restart_without_changing_requested_pins() {
+        let requested = update(b"refs/for/main", A, B);
+        let mut plan = PushPlanRecord::prepare(
+            PlanId::generate(),
+            b"https://host.x/repo.git".to_vec(),
+            false,
+            vec![requested.clone()],
+        );
+        plan.begin_send().expect("plan starts");
+        plan.reported_updates = vec![
+            update(b"refs/changes/7/head", Z, B),
+            update(b"refs/for/main", Z, A),
+        ];
+        plan.mark_uncertain();
+        let bytes = plan.encode(HashKind::Sha1).expect("plan encodes");
+        let stored = PushPlanRecord::decode(plan.id, HashKind::Sha1, &bytes).expect("plan decodes");
+        assert_eq!(stored, plan);
+        assert_eq!(stored.updates, vec![requested]);
+        let observations = reconcile(
+            &stored,
+            HashKind::Sha1,
+            &[
+                (
+                    b"refs/for/main".to_vec(),
+                    Some(Oid::from_hex(A).expect("old tip")),
+                ),
+                (
+                    b"refs/changes/7/head".to_vec(),
+                    Some(Oid::from_hex(B).expect("reported tip")),
+                ),
+            ],
+        );
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].name, b"refs/for/main");
+        assert_eq!(observations[0].observation, RefObservation::EqualOld);
+        assert_eq!(observations[1].name, b"refs/changes/7/head");
+        assert_eq!(observations[1].observation, RefObservation::EqualNew);
     }
 
     #[test]
@@ -1884,6 +2232,107 @@ mod tests {
                     .expect("plan persists");
                 let stored = PushPlanRecord::decode(plan.id, kind, &encoded).expect("plan decodes");
                 assert_eq!(stored, plan);
+                if option == "option refname refs/changes/1/head" {
+                    let actual = b"refs/changes/1/head".to_vec();
+                    let tip = crate::parse_oid_for(four, kind).expect("reported tip parses");
+                    let observed = reconcile(&stored, kind, &[(actual.clone(), Some(tip))]);
+                    assert!(
+                        observed.iter().any(|row| {
+                            row.name == actual && row.observation == RefObservation::EqualNew
+                        }),
+                        "stored redirected plan must retain its actual recovery target",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn send_pack_incomplete_v2_reports_preserve_validated_recovery_targets() {
+        use crate::transport::session::test_support::{ScriptedPeer, store_with_pack};
+
+        let kind = HashKind::Sha1;
+        let four = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+        for sideband in [false, true] {
+            for ending in 0..4 {
+                let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+                let mut script = Vec::new();
+                let band = if sideband { " side-band-64k" } else { "" };
+                pktline::encode_data(
+                    &mut script,
+                    format!("{Z} capabilities^{{}}\0report-status-v2 delete-refs ofs-delta object-format=sha1{band}\n").as_bytes(),
+                ).expect("advertisement");
+                pktline::encode_flush(&mut script);
+                let mut report = Vec::new();
+                for line in [
+                    "unpack ok".to_owned(),
+                    "ok refs/for/main".to_owned(),
+                    "option refname refs/changes/7/head".to_owned(),
+                    format!("option old-oid {A}"),
+                    format!("option new-oid {B}"),
+                ] {
+                    pktline::encode_data(&mut report, line.as_bytes()).expect("report packet");
+                }
+                match ending {
+                    0 => {}
+                    1 => report.extend_from_slice(b"00"),
+                    2 => report.extend_from_slice(b"0001"),
+                    3 => {
+                        pktline::encode_data(&mut report, b"option refname refs/changes/99/head")
+                            .expect("incomplete packet begins");
+                        report.pop().expect("last payload byte");
+                    }
+                    _ => unreachable!(),
+                }
+                if sideband {
+                    let mut payload = vec![1];
+                    payload.extend_from_slice(&report);
+                    pktline::encode_data(&mut script, &payload).expect("sideband packet");
+                    pktline::encode_flush(&mut script);
+                } else {
+                    script.extend_from_slice(&report);
+                }
+                let mut peer = ScriptedPeer::new(script);
+                let req = PushWireRequest {
+                    updates: vec![update(b"refs/for/main", Z, four)],
+                    atomic: false,
+                };
+                let mut plan = PushPlanRecord::prepare(
+                    PlanId::generate(),
+                    b"https://host.x/repo.git".to_vec(),
+                    false,
+                    req.updates.clone(),
+                );
+                let err = push_over(&mut peer, &store, kind, &mut plan, &req, &Interrupt::none())
+                    .expect_err("incomplete report cannot confirm a push");
+                assert!(
+                    !matches!(err, GitError::Unsupported { .. }),
+                    "original framing failure survives: {err}"
+                );
+                assert_eq!(plan.state, PushState::Uncertain);
+                assert!(plan.outcomes.is_empty());
+                let encoded = current_encoding(&store, &plan)
+                    .expect("stored plan reads")
+                    .expect("plan persists");
+                let stored = PushPlanRecord::decode(plan.id, kind, &encoded)
+                    .expect("plan decodes after restart");
+                assert_eq!(stored.updates, req.updates);
+                assert_eq!(
+                    stored.reported_updates,
+                    vec![update(b"refs/changes/7/head", A, B)]
+                );
+                let observations = reconcile(
+                    &stored,
+                    kind,
+                    &[(
+                        b"refs/changes/7/head".to_vec(),
+                        Some(Oid::from_hex(B).expect("reported tip")),
+                    )],
+                );
+                assert_eq!(observations.len(), 2);
+                assert_eq!(observations[0].observation, RefObservation::EqualOld);
+                assert_eq!(observations[1].name, b"refs/changes/7/head");
+                assert_eq!(observations[1].observation, RefObservation::EqualNew);
             }
         }
     }

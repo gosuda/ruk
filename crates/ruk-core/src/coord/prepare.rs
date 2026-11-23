@@ -5509,6 +5509,7 @@ mod tests {
             request_id: request_id(),
             args: PushReconcileArgs {
                 plan: PlanId::generate(),
+                original_remote: None,
             },
         }));
         let err = prepare_mutation_with(&ctx, reconcile)

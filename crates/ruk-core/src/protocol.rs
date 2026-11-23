@@ -2192,9 +2192,23 @@ pub struct PushReply {
 }
 
 /// `push.reconcile`: observes the remote's current refs for an uncertain plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PushReconcileArgs {
     pub plan: PlanId,
+    /// The historical resolved destination, required only for an ambiguous legacy plan.
+    /// A current remote alias or changed mirror configuration does not establish it.
+    #[serde(default)]
+    pub original_remote: Option<String>,
+}
+
+impl PushReconcileArgs {
+    pub(crate) fn to_digest_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
+        if self.original_remote.is_none() {
+            postcard::to_allocvec(&self.plan)
+        } else {
+            postcard::to_allocvec(self)
+        }
+    }
 }
 
 /// What observation found for one ref; observation is not causal proof.
@@ -2219,6 +2233,10 @@ pub struct PushReconcileReply {
     pub outcome: MutationOutcome,
     pub plan: PlanId,
     pub state: PushState,
+    /// Validated server metadata changed a requested ref name or object ID.
+    /// Such a plan must not be automatically resent after reconciliation.
+    #[serde(default)]
+    pub rewritten: bool,
     pub observations: BoundedList<ReconcileObservation>,
 }
 
@@ -3952,6 +3970,9 @@ macro_rules! digest_args {
         Some($params.args.to_digest_postcard())
     };
     (Mutation, ClaimAcquire, $params:expr) => {
+        Some($params.args.to_digest_postcard())
+    };
+    (Mutation, PushReconcile, $params:expr) => {
         Some($params.args.to_digest_postcard())
     };
     (Mutation, $variant:ident, $params:expr) => {
@@ -6231,6 +6252,55 @@ mod tests {
             let unpacked: RequestEnvelope = postcard::from_bytes(&packed).expect("unpack");
             assert_eq!(unpacked, original);
         }
+    }
+
+    #[test]
+    fn reconcile_extensions_preserve_legacy_json_and_request_digests() {
+        let plan = PlanId::from_bytes([7; 16]);
+        let legacy_args = json!({ "plan": plan });
+        let mut args: PushReconcileArgs =
+            sonic_rs::from_value(&legacy_args).expect("old args decode");
+        assert_eq!(args.original_remote, None);
+        assert_eq!(
+            args.to_digest_postcard().expect("digest encodes"),
+            postcard::to_allocvec(&plan).expect("old digest encodes")
+        );
+        let mut expected_digest = Vec::new();
+        push_field(&mut expected_digest, DIGEST_DOMAIN_V1).expect("domain fits");
+        push_field(&mut expected_digest, b"push.reconcile").expect("method fits");
+        push_field(
+            &mut expected_digest,
+            &postcard::to_allocvec(&plan).expect("old args"),
+        )
+        .expect("args fit");
+        let legacy_request = Request::PushReconcile(mutation(1, args.clone()));
+        assert_eq!(
+            legacy_request.digest_input_v1().expect("request digest"),
+            Some(expected_digest)
+        );
+        let unbound = args.to_digest_postcard().expect("unbound digest");
+        args.original_remote = Some("https://host.x/historical.git".to_owned());
+        assert_ne!(args.to_digest_postcard().expect("bound digest"), unbound);
+        let packed = postcard::to_allocvec(&args).expect("bound args encode");
+        assert_eq!(
+            postcard::from_bytes::<PushReconcileArgs>(&packed).expect("bound args decode"),
+            args
+        );
+        let mut reply = json!({
+            "outcome": sample_outcome(), "plan": plan, "state": "uncertain",
+            "observations": { "total": 0, "items": [], "truncated": false },
+        });
+        let legacy_reply: PushReconcileReply =
+            sonic_rs::from_value(&reply).expect("old reply decodes");
+        assert!(!legacy_reply.rewritten);
+        reply["rewritten"] = json!(true);
+        assert!(
+            sonic_rs::from_value::<PushReconcileReply>(&reply)
+                .expect("rewrite flag decodes")
+                .rewritten
+        );
+        reply["rewritten"] = json!("true");
+        assert!(sonic_rs::from_value::<PushReconcileReply>(&reply).is_err());
     }
 
     #[test]

@@ -1210,7 +1210,7 @@ fn push_pack_inner(
         });
     }
     let mut pkt = PktReader::new(reader, interrupt.clone());
-    let server = push::read_report(&mut pkt, sideband, &live)?;
+    let server = push::read_report(&mut pkt, sideband, &live, &mut plan.reported_updates)?;
     let mut report = server;
     report.extend(outcomes);
     scrub_outcomes(&mut report, &secrets);
@@ -2815,6 +2815,25 @@ mod tests {
                 .expect("plan persists");
             let stored = PushPlanRecord::decode(plan.id, kind, &encoded).expect("plan decodes");
             assert_eq!(stored, plan);
+            assert_eq!(stored.updates, req.updates);
+            if !confirmed {
+                assert_eq!(
+                    stored.reported_updates,
+                    vec![PushUpdate {
+                        name: refname.as_bytes().to_vec(),
+                        old: kind.zero_oid(),
+                        new: oid(FOUR),
+                    }]
+                );
+                let observed = push::reconcile(
+                    &stored,
+                    kind,
+                    &[(refname.as_bytes().to_vec(), Some(oid(FOUR)))],
+                );
+                assert_eq!(observed.len(), 2);
+                assert_eq!(observed[0].observation, push::RefObservation::EqualOld);
+                assert_eq!(observed[1].observation, push::RefObservation::EqualNew);
+            }
             assert_eq!(server.join().expect("HTTP peer joins").len(), 1);
         }
     }

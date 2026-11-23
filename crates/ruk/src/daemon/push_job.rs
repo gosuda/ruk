@@ -266,7 +266,7 @@ impl<'a> PushJob<'a> {
 
     /// Serves one hosted `push.reconcile` invocation: observes the
     /// remote's current refs for a stored plan and maps them through the
-    /// pure reconciler, committing only the reply plus its receipt.
+    /// pure reconciler, committing the observed plan, marker, and receipt together.
     ///
     /// # Errors
     /// Session, replay, plan-load, transport, and lane failures.
@@ -292,10 +292,6 @@ impl<'a> PushJob<'a> {
                 "push.reconcile needs a request id for its receipt",
             )
         })?;
-        if let Some(reply) = self.replay_committed(&request)? {
-            return encode_reply(Some(request_id), reply);
-        }
-
         let plan_id = args.args.plan;
         let store = self.coordinator.store();
         let kind = store.hash_kind();
@@ -304,39 +300,52 @@ impl<'a> PushJob<'a> {
             .ok_or_else(|| {
                 CoreError::new(ErrorCode::ENotFound, format!("unknown push plan {plan_id}"))
             })?;
-        let plan = PushPlanRecord::decode(plan_id, kind, &encoded).map_err(to_core)?;
-        let remote = String::from_utf8(plan.remote.clone()).map_err(|_| {
-            CoreError::new(
-                ErrorCode::ECorrupt,
-                "stored push plan carries a non-UTF-8 remote",
-            )
-        })?;
-
+        let mut plan = PushPlanRecord::decode(plan_id, kind, &encoded).map_err(to_core)?;
+        if let Some(reply) = self.replay_committed(&request)? {
+            self.release_reconciliation_guard(&plan)?;
+            return encode_reply(Some(request_id), reply);
+        }
+        let rebound = !plan.destination_is_known();
         let bridge = CancelBridge::arm(self.cancel, open, self.refs.registry.egress_policy());
+        let remote = match (rebound, args.args.original_remote.as_deref()) {
+            (true, None) => return Err(legacy_destination_required(plan_id)),
+            (false, Some(_)) => {
+                return Err(CoreError::new(
+                    ErrorCode::EInvalid,
+                    format!(
+                        "push plan {plan_id} already has a known destination; original_remote cannot rebind it"
+                    ),
+                ));
+            }
+            (true, Some(remote)) => {
+                refuse_url_userinfo(remote, &bridge.auth).map_err(to_core)?;
+                plan.bind_original_remote(remote.as_bytes().to_vec())
+                    .map_err(to_core)?;
+                remote.to_owned()
+            }
+            (false, None) => String::from_utf8(plan.remote.clone()).map_err(|_| {
+                CoreError::new(
+                    ErrorCode::EInvalid,
+                    "daemon jobs serve network remotes; local paths stay out",
+                )
+            })?,
+        };
         refuse_url_userinfo(&remote, &bridge.auth).map_err(to_core)?;
-        let kind = self.coordinator.store().hash_kind();
-        // The closure below moves the plan record in; pin the wire state
-        // first (`PushState` is `Copy`, so this reads nothing twice).
-        let plan_state = wire_state(plan.state);
         let job = self.snapshot();
-        let (observations, remote) = self
+        let (observations, plan) = self
             .refs
             .transport
             .run(move || {
                 let advertised = job.discover(&remote, &bridge)?;
-                map_observations(kind, &plan, &advertised)
-                    .map(|observations| (observations, plan.remote))
+                map_observations(kind, &plan, &advertised).map(|observations| (observations, plan))
             })
             .await??;
 
-        let observed_refs: Vec<Vec<u8>> = observations
-            .iter()
-            .map(|observation| observation.remote_ref.as_bytes().to_vec())
-            .collect();
         let reply = Reply::PushReconcile(Box::new(PushReconcileReply {
             outcome: pending_outcome(self.session, request_id),
             plan: plan_id,
-            state: plan_state,
+            state: wire_state(plan.state),
+            rewritten: !plan.reported_updates.is_empty(),
             observations: BoundedList::complete(observations)?,
         }));
         let stored = self
@@ -349,7 +358,11 @@ impl<'a> PushJob<'a> {
                     request,
                     reply: reply.clone(),
                     objects: Vec::new(),
-                    facts: vec![reconciliation_marker_fact(store, plan_id)?],
+                    facts: vec![
+                        plan.persist_mutation(kind, Some(encoded))
+                            .map_err(to_core)?,
+                        reconciliation_marker_fact(store, plan_id)?,
+                    ],
                     workspace_fence: None,
                     ref_transaction: None,
                     ref_dependencies: Vec::new(),
@@ -358,13 +371,26 @@ impl<'a> PushJob<'a> {
                 self.cancel,
             )
             .await?;
-        self.refs.registry.note_push_reconciled(
-            self.repo_path,
-            &remote,
-            plan_id,
-            &observed_refs,
-        )?;
+        self.release_reconciliation_guard(&plan)?;
         encode_reply(Some(request_id), stored)
+    }
+
+    fn release_reconciliation_guard(&self, plan: &PushPlanRecord) -> Result<(), CoreError> {
+        if !plan.destination_is_known() {
+            return Err(legacy_destination_required(plan.id));
+        }
+        let names: Vec<Vec<u8>> = plan
+            .updates
+            .iter()
+            .chain(&plan.reported_updates)
+            .map(|update| update.name.clone())
+            .collect();
+        self.refs
+            .registry
+            .note_push_reconciled(self.repo_path, &plan.remote, plan.id, &names)?;
+        self.refs
+            .registry
+            .note_legacy_push_reconciled(self.repo_path, plan.id, &names)
     }
 
     /// Returns the stored reply when this request already committed, so a
@@ -669,9 +695,11 @@ impl BlockingJob {
         let store = self.coordinator.store();
         let kind = store.hash_kind();
         let plan_id = plan.id;
-        let names: Vec<Vec<u8>> = refs
+        let names: Vec<Vec<u8>> = plan
+            .updates
             .iter()
-            .map(|row| row.remote_ref.as_bytes().to_vec())
+            .chain(&plan.reported_updates)
+            .map(|update| update.name.clone())
             .collect();
         let current = store.fact(FactTable::PushPlans, plan_id.as_bytes())?;
         let terminal_fact = plan.persist_mutation(kind, current).map_err(to_core)?;
@@ -1060,6 +1088,15 @@ fn wire_state(state: PlanState) -> PushState {
     }
 }
 
+fn legacy_destination_required(plan: PlanId) -> CoreError {
+    CoreError::new(
+        ErrorCode::EInvalid,
+        format!(
+            "push plan {plan} has an ambiguous legacy destination; provide its historical resolved destination as original_remote"
+        ),
+    )
+}
+
 /// Maps the pure reconciler over the advertised tips to reply rows.
 fn map_observations(
     kind: HashKind,
@@ -1090,6 +1127,7 @@ fn map_observations(
         let wire = plan
             .updates
             .iter()
+            .chain(&plan.reported_updates)
             .find(|update| update.name == reconciled.name);
         let (observed, verdict) = match reconciled.observation {
             RefObservation::EqualNew => (
@@ -1263,6 +1301,10 @@ struct SentPush {
     terminal_fact: ruk_core::store::FactMutation,
     refusal_fact: Option<FactMutation>,
 }
+
+#[cfg(test)]
+#[path = "push_job/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1694,12 +1736,16 @@ mod tests {
                         request_id,
                         request: Request::PushReconcile(Box::new(Mutation {
                             request_id,
-                            args: PushReconcileArgs { plan },
+                            args: PushReconcileArgs {
+                                plan,
+                                original_remote: None,
+                            },
                         })),
                         reply: Reply::PushReconcile(Box::new(PushReconcileReply {
                             outcome: pending_outcome(session, request_id),
                             plan,
                             state: PushState::Uncertain,
+                            rewritten: false,
                             observations: BoundedList::complete(Vec::new()).expect("empty fits"),
                         })),
                         objects: Vec::new(),
@@ -1839,6 +1885,7 @@ mod tests {
             outcome: pending_outcome(SessionId::generate(), RequestId::generate()),
             plan,
             state: PushState::Rejected,
+            rewritten: false,
             observations: BoundedList::complete(Vec::new()).expect("empty fits"),
         }));
         assert_eq!(

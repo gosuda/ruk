@@ -849,6 +849,9 @@ fn clone_fetch_push_local_cycle() {
     run(verbs_stage::add, &mut copy_ctx, &["d.txt"]).expect("add");
     run(verbs_history::commit, &mut copy_ctx, &["-m", "downstream"]).expect("commit");
     run(verbs_transport::push, &mut copy_ctx, &["origin", "main"]).expect("push");
+    let plan = only_push_plan(&copy_ctx);
+    assert_eq!(plan.remote, root.as_os_str().as_encoded_bytes());
+    assert!(plan.remote_is_resolved);
     let mut src_ctx = repo_ctx(&root, test_env(&base));
     let out = run(verbs_history::log, &mut src_ctx, &["--oneline"]).expect("log");
     assert!(String::from_utf8_lossy(&out).contains("downstream"));
@@ -1012,6 +1015,9 @@ fn push_mirror_syncs_refs_and_deletes_stale() {
         .expect("remote add");
         let out = run(verbs_transport::push, &mut src_ctx, &["--mirror", "origin"])
             .expect("push --mirror");
+        let plan = only_push_plan(&src_ctx);
+        assert_eq!(plan.remote, dst.as_os_str().as_encoded_bytes());
+        assert!(plan.remote_is_resolved);
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(text.contains("ok refs/heads/feat"), "got {text}");
     }
@@ -2187,6 +2193,26 @@ fn pkt_frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+fn only_push_plan(ctx: &Ctx) -> ruk_git::transport::push::PushPlanRecord {
+    let store = ctx.store().expect("store");
+    let page = store
+        .fact_page(
+            FactTable::PushPlans,
+            None,
+            ruk_core::store::FactPageBudget::new(2, ruk_core::MAX_CONTROL_FRAME_BYTES),
+        )
+        .expect("push plans load");
+    assert!(!page.more);
+    let [row] = page.rows.as_slice() else {
+        panic!("expected exactly one durable push plan");
+    };
+    let id = ruk_core::change::PlanId::from_bytes(
+        row.key.as_slice().try_into().expect("plan identifier"),
+    );
+    ruk_git::transport::push::PushPlanRecord::decode(id, store.hash_kind(), &row.value)
+        .expect("push plan decodes")
+}
+
 #[test]
 fn push_over_smart_http_reports_status() {
     const ZERO: &str = "0000000000000000000000000000000000000000";
@@ -2204,35 +2230,55 @@ fn push_over_smart_http_reports_status() {
     channel.extend_from_slice(&status);
     let mut report = pkt_frame(&channel);
     report.extend_from_slice(b"0000");
-    let (base, log) = smart_http_server(vec![
-        (adv, "application/x-git-receive-pack-advertisement"),
-        (report, "application/x-git-receive-pack-result"),
-    ]);
-    let (root, env) = seeded_repo("httppush", "p.txt", b"p\n");
-    let mut ctx = repo_ctx(&root, env);
-    let out = run(
-        verbs_transport::push,
-        &mut ctx,
-        &[&base, "refs/heads/main:refs/heads/main"],
-    )
-    .expect("http push");
-    assert_eq!(out, b"ok refs/heads/main\n");
-    let requests = log
-        .recv_timeout(Duration::from_secs(30))
-        .expect("server finished both RPCs");
-    assert_eq!(requests.len(), 2);
-    let (head, body) = &requests[1];
-    assert!(
-        head.starts_with("POST /a.git/git-receive-pack HTTP/1.1\r\n"),
-        "{head:?}"
-    );
-    assert!(
-        body.windows(b"refs/heads/main".len())
-            .any(|w| w == b"refs/heads/main"),
-        "no command line"
-    );
-    assert!(body.windows(4).any(|w| w == b"PACK"), "no pack bytes");
-    let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    for complete_report in [true, false] {
+        let (base, log) = smart_http_server(vec![
+            (adv.clone(), "application/x-git-receive-pack-advertisement"),
+            (
+                if complete_report {
+                    report.clone()
+                } else {
+                    Vec::new()
+                },
+                "application/x-git-receive-pack-result",
+            ),
+        ]);
+        let (root, env) = seeded_repo("httppush", "p.txt", b"p\n");
+        let mut ctx = repo_ctx(&root, env);
+        run(verbs_repo::remote, &mut ctx, &["add", "origin", &base])
+            .expect("named remote configured");
+        let out = run(
+            verbs_transport::push,
+            &mut ctx,
+            &["origin", "refs/heads/main:refs/heads/main"],
+        );
+        let plan = only_push_plan(&ctx);
+        assert_eq!(plan.remote, base.as_bytes());
+        assert!(plan.remote_is_resolved);
+        assert!(plan.destination_is_known());
+        if complete_report {
+            assert_eq!(out.expect("http push"), b"ok refs/heads/main\n");
+            assert_eq!(plan.state, ruk_git::transport::push::PushState::Confirmed);
+        } else {
+            out.expect_err("missing report leaves the push uncertain");
+            assert_eq!(plan.state, ruk_git::transport::push::PushState::Uncertain);
+        }
+        let requests = log
+            .recv_timeout(Duration::from_secs(30))
+            .expect("server finished both RPCs");
+        assert_eq!(requests.len(), 2);
+        let (head, body) = &requests[1];
+        assert!(
+            head.starts_with("POST /a.git/git-receive-pack HTTP/1.1\r\n"),
+            "{head:?}"
+        );
+        assert!(
+            body.windows(b"refs/heads/main".len())
+                .any(|w| w == b"refs/heads/main"),
+            "no command line"
+        );
+        assert!(body.windows(4).any(|w| w == b"PACK"), "no pack bytes");
+        let _ = std::fs::remove_dir_all(root.parent().expect("parent"));
+    }
 }
 
 #[test]
