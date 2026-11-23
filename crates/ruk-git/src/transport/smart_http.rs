@@ -1210,8 +1210,7 @@ fn push_pack_inner(
         });
     }
     let mut pkt = PktReader::new(reader, interrupt.clone());
-    let server = push::read_report(&mut pkt, sideband)?;
-    push::check_report_covers_live(&live, &server)?;
+    let server = push::read_report(&mut pkt, sideband, &live)?;
     let mut report = server;
     report.extend(outcomes);
     scrub_outcomes(&mut report, &secrets);
@@ -2731,6 +2730,93 @@ mod tests {
         .expect_err("tripped cancel fails the push");
         assert_eq!(err.code(), ruk_core::error::ErrorCode::ECancelled);
         assert_eq!(plan.state, super::push::PushState::Uncertain);
+    }
+
+    #[test]
+    fn push_v2_redirects_stay_uncertain_after_http_reports() {
+        use super::super::push::{PushUpdate, PushWireRequest};
+        use super::super::session::test_support::store_with_pack;
+        use ruk_core::change::PlanId;
+
+        for (refname, confirmed) in [("refs/heads/x", true), ("refs/changes/1/head", false)] {
+            let mut report = Vec::new();
+            for line in [
+                "unpack ok".to_owned(),
+                "ok refs/heads/x".to_owned(),
+                format!("option refname {refname}"),
+                format!("option new-oid {FOUR}"),
+            ] {
+                pktline::encode_data(&mut report, line.as_bytes()).expect("report packet");
+            }
+            pktline::encode_flush(&mut report);
+            let mut payload = vec![1];
+            payload.extend_from_slice(&report);
+            let mut body = Vec::new();
+            pktline::encode_data(&mut body, &payload).expect("sideband packet");
+            pktline::encode_flush(&mut body);
+            let (base, server) = fake_smart_server(vec![(
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    "application/x-git-receive-pack-result".to_owned(),
+                )],
+                body,
+                false,
+            )]);
+            let kind = HashKind::Sha1;
+            let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+            let updates = vec![PushUpdate {
+                name: b"refs/heads/x".to_vec(),
+                old: kind.zero_oid(),
+                new: oid(FOUR),
+            }];
+            let req = PushWireRequest {
+                updates: updates.clone(),
+                atomic: false,
+            };
+            let mut plan = PushPlanRecord::prepare(
+                PlanId::generate(),
+                base.as_bytes().to_vec(),
+                false,
+                updates,
+            );
+            let adv = Advertisement {
+                version: super::super::refadv::ProtocolVersion::V0,
+                capabilities: super::super::refadv::Capabilities::parse_list(
+                    b"report-status-v2 side-band-64k",
+                ),
+                refs: Vec::new(),
+                shallow: Vec::new(),
+            };
+            let result = push_pack(
+                &base,
+                &adv,
+                &store,
+                &mut plan,
+                &req,
+                RpcCall {
+                    extra: &[],
+                    auth: &no_auth(),
+                    egress: &super::super::net::EgressPolicy::deny_private().allow_loopback(),
+                    tls_roots: None,
+                    interrupt: &Interrupt::none(),
+                },
+            );
+            if confirmed {
+                assert_eq!(result.expect("identical report confirms").len(), 1);
+                assert_eq!(plan.state, super::push::PushState::Confirmed);
+            } else {
+                assert!(matches!(result, Err(GitError::Unsupported { .. })));
+                assert_eq!(plan.state, super::push::PushState::Uncertain);
+                assert!(plan.outcomes.is_empty());
+            }
+            let encoded = push::current_encoding(&store, &plan)
+                .expect("stored plan reads")
+                .expect("plan persists");
+            let stored = PushPlanRecord::decode(plan.id, kind, &encoded).expect("plan decodes");
+            assert_eq!(stored, plan);
+            assert_eq!(server.join().expect("HTTP peer joins").len(), 1);
+        }
     }
 
     #[test]

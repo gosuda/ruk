@@ -594,18 +594,10 @@ fn refuse_private_tips<'a>(
 /// the server never acknowledged.
 /// Shared with the smart-http push half, which answers the same coverage
 /// contract over its POST response.
-pub(crate) fn check_report_covers_live(
-    live: &[&PushUpdate],
+fn check_report_covers_live(
+    wanted: &HashMap<&[u8], &PushUpdate>,
     server: &[RefOutcome],
 ) -> Result<(), GitError> {
-    let mut wanted: HashMap<&[u8], usize> = HashMap::with_capacity(live.len());
-    for update in live {
-        if wanted.insert(update.name.as_slice(), 1).is_some() {
-            return Err(GitError::Corrupt {
-                detail: "push request names one ref twice".to_owned(),
-            });
-        }
-    }
     let mut seen: HashMap<&[u8], usize> = HashMap::with_capacity(server.len());
     for outcome in server {
         if !wanted.contains_key(outcome.name.as_slice()) {
@@ -799,8 +791,7 @@ fn push_over_inner<R: Read + Write>(
         }
         writer.finish()?;
     }
-    let server = read_report(&mut pkt, sideband)?;
-    check_report_covers_live(&live, &server)?;
+    let server = read_report(&mut pkt, sideband, &live)?;
     let mut report = server;
     report.extend(outcomes);
     plan.finalize(report.clone())?;
@@ -1188,17 +1179,33 @@ pub(crate) fn pair_thin_base_oids(
 pub(crate) fn read_report<R: Read>(
     pkt: &mut PktReader<R>,
     sideband: Option<usize>,
+    live: &[&PushUpdate],
 ) -> Result<Vec<RefOutcome>, GitError> {
-    if let Some(max_frame) = sideband {
-        let mut band = SidebandReader::new(pkt, max_frame);
-        let outcomes = read_report_packets(&mut PktReader::new(&mut band, Interrupt::none()))?;
-        let _ = band.drain_to_end()?;
-        return Ok(outcomes);
+    let mut wanted = HashMap::with_capacity(live.len());
+    for update in live {
+        if wanted.insert(update.name.as_slice(), *update).is_some() {
+            return Err(GitError::Corrupt {
+                detail: "push request names one ref twice".to_owned(),
+            });
+        }
     }
-    read_report_packets(pkt)
+    let outcomes = if let Some(max_frame) = sideband {
+        let mut band = SidebandReader::new(pkt, max_frame);
+        let outcomes =
+            read_report_packets(&mut PktReader::new(&mut band, Interrupt::none()), &wanted)?;
+        let _ = band.drain_to_end()?;
+        outcomes
+    } else {
+        read_report_packets(pkt, &wanted)?
+    };
+    check_report_covers_live(&wanted, &outcomes)?;
+    Ok(outcomes)
 }
 
-fn read_report_packets<R: Read>(pkt: &mut PktReader<R>) -> Result<Vec<RefOutcome>, GitError> {
+fn read_report_packets<R: Read>(
+    pkt: &mut PktReader<R>,
+    wanted: &HashMap<&[u8], &PushUpdate>,
+) -> Result<Vec<RefOutcome>, GitError> {
     let mut raw = Vec::new();
     loop {
         match pkt.read_packet()? {
@@ -1223,13 +1230,17 @@ fn read_report_packets<R: Read>(pkt: &mut PktReader<R>) -> Result<Vec<RefOutcome
             }
         }
     }
-    parse_report(&raw)
+    parse_report(&raw, wanted)
 }
 
 /// Parses the gitprotocol-pack report grammar: `unpack ok | unpack <err>`
 /// then `ok <ref>` / `ng <ref> <msg>` lines, with v2 `option` lines after
-/// an `ok` accepted and skipped. An unpack failure rejects every ref sent.
-fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
+/// an `ok` checked against the requested update. An unpack failure rejects
+/// every ref sent.
+fn parse_report(
+    raw: &[u8],
+    wanted: &HashMap<&[u8], &PushUpdate>,
+) -> Result<Vec<RefOutcome>, GitError> {
     let mut outcomes = Vec::new();
     let mut decoded_bytes = 0;
     let mut unpack_err: Option<String> = None;
@@ -1266,8 +1277,8 @@ fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
                     reason: reason.into_owned(),
                 },
             });
-        } else if line.starts_with(b"option ") {
-            continue;
+        } else if let Some(option) = line.strip_prefix(b"option ") {
+            check_report_option(option, outcomes.last(), wanted)?;
         } else {
             return Err(GitError::Corrupt {
                 detail: format!("push report line is malformed: {}", line.escape_ascii()),
@@ -1286,6 +1297,50 @@ fn parse_report(raw: &[u8]) -> Result<Vec<RefOutcome>, GitError> {
         }
     }
     Ok(outcomes)
+}
+
+fn check_report_option(
+    option: &[u8],
+    previous: Option<&RefOutcome>,
+    wanted: &HashMap<&[u8], &PushUpdate>,
+) -> Result<(), GitError> {
+    let (key, value) = match option.iter().position(|byte| *byte == b' ') {
+        Some(at) => (&option[..at], &option[at + 1..]),
+        None => (option, &b""[..]),
+    };
+    if !matches!(key, b"refname" | b"old-oid" | b"new-oid") {
+        return Ok(());
+    }
+    let update = previous
+        .filter(|outcome| matches!(outcome.result, RefResult::Ok))
+        .and_then(|outcome| wanted.get(outcome.name.as_slice()))
+        .ok_or_else(|| GitError::Corrupt {
+            detail: "push report option has no requested successful ref".to_owned(),
+        })?;
+    if value.is_empty() {
+        return Err(GitError::Corrupt {
+            detail: "push report option has no value".to_owned(),
+        });
+    }
+    let matches = if key == b"refname" {
+        value == update.name.as_slice()
+    } else {
+        let hex = std::str::from_utf8(value).map_err(|_| GitError::Corrupt {
+            detail: "push report option carries a non-ASCII object id".to_owned(),
+        })?;
+        let oid = crate::parse_oid_for(hex, update.new.kind())?;
+        if key == b"old-oid" {
+            oid == update.old
+        } else {
+            oid == update.new
+        }
+    };
+    if !matches {
+        return Err(GitError::Unsupported {
+            command: "push report rewrites require remote reconciliation".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn report_row_size(size: usize, name_len: usize, reason_len: usize) -> Result<usize, GitError> {
@@ -1403,23 +1458,55 @@ mod tests {
     #[test]
     fn report_grammar_ok_ng_unpack_atomic() {
         let raw = b"unpack ok\nok refs/heads/a\nng refs/heads/b pre-receive hook declined\n";
-        let outcomes = parse_report(raw).expect("report");
+        let outcomes = parse_report(raw, &HashMap::new()).expect("report");
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].result, RefResult::Ok);
         assert!(
             matches!(&outcomes[1].result, RefResult::Rejected { reason } if reason.contains("pre-receive"))
         );
         let raw = b"unpack index-pack failed\nok refs/heads/a\n";
-        let outcomes = parse_report(raw).expect("report");
+        let outcomes = parse_report(raw, &HashMap::new()).expect("report");
         assert!(
             matches!(&outcomes[0].result, RefResult::Rejected { reason } if reason.contains("unpack failed"))
         );
-        assert!(parse_report(b"garbage line\n").is_err());
-        let v2 = b"unpack ok\nok refs/heads/a\n\toption old-oid 1111\noption new-oid 2222\n";
-        // Indented option continuation lines are still option lines here.
-        let _ = v2;
-        let v2 = b"unpack ok\nok refs/heads/a\noption old-oid 1111\n";
-        assert_eq!(parse_report(v2).expect("v2").len(), 1);
+        assert!(parse_report(b"garbage line\n", &HashMap::new()).is_err());
+        let expected = update(b"refs/heads/a", A, B);
+        let wanted = HashMap::from([(expected.name.as_slice(), &expected)]);
+        let v2 = format!(
+            "unpack ok\nok refs/heads/a\noption refname refs/heads/a\noption old-oid {A}\noption new-oid {B}\noption forced-update\n",
+        );
+        assert_eq!(parse_report(v2.as_bytes(), &wanted).expect("v2").len(), 1);
+    }
+
+    #[test]
+    fn report_v2_rewrites_require_reconciliation() {
+        let expected = update(b"refs/heads/a", A, B);
+        let wanted = HashMap::from([(expected.name.as_slice(), &expected)]);
+        for option in [
+            "option refname refs/changes/1/head".to_owned(),
+            format!("option old-oid {Z}"),
+            format!("option new-oid {A}"),
+        ] {
+            let raw = format!("unpack ok\nok refs/heads/a\n{option}\n");
+            assert!(
+                matches!(
+                    parse_report(raw.as_bytes(), &wanted),
+                    Err(GitError::Unsupported { .. })
+                ),
+                "{option}",
+            );
+        }
+        for raw in [
+            "unpack ok\noption refname refs/heads/a\n".to_owned(),
+            "unpack ok\nng refs/heads/a denied\noption refname refs/heads/a\n".to_owned(),
+            "unpack ok\nok refs/heads/a\noption refname\n".to_owned(),
+            "unpack ok\nok refs/heads/a\noption new-oid\n".to_owned(),
+        ] {
+            assert!(matches!(
+                parse_report(raw.as_bytes(), &wanted),
+                Err(GitError::Corrupt { .. })
+            ));
+        }
     }
 
     #[test]
@@ -1455,7 +1542,7 @@ mod tests {
                     inner
                 };
                 let mut packets = PktReader::new(wire.as_slice(), Interrupt::none());
-                let result = read_report(&mut packets, sideband);
+                let result = read_report(&mut packets, sideband, &[]);
                 if extra_packet {
                     assert!(matches!(result, Err(GitError::Limit { .. })), "{result:?}");
                 } else {
@@ -1473,7 +1560,10 @@ mod tests {
             raw.extend_from_slice(b"ok x\n");
         }
         assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
-        assert!(matches!(parse_report(&raw), Err(GitError::Limit { .. })));
+        assert!(matches!(
+            parse_report(&raw, &HashMap::new()),
+            Err(GitError::Limit { .. })
+        ));
     }
 
     #[test]
@@ -1487,7 +1577,10 @@ mod tests {
             raw.push(b'\n');
         }
         assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
-        assert!(matches!(parse_report(&raw), Err(GitError::Limit { .. })));
+        assert!(matches!(
+            parse_report(&raw, &HashMap::new()),
+            Err(GitError::Limit { .. })
+        ));
     }
 
     #[test]
@@ -1499,11 +1592,16 @@ mod tests {
             raw.extend_from_slice(b"ok refs/heads/main\n");
         }
         assert!(raw.len() < ruk_core::MAX_CONTROL_FRAME_BYTES);
-        assert!(matches!(parse_report(&raw), Err(GitError::Limit { .. })));
+        assert!(matches!(
+            parse_report(&raw, &HashMap::new()),
+            Err(GitError::Limit { .. })
+        ));
     }
 
     #[test]
     fn sideband_report_decodes_nested_packets_across_frames() {
+        let main = update(b"refs/heads/main", Z, B);
+        let protected = update(b"refs/heads/protected", A, B);
         let mut inner = Vec::new();
         super::super::pktline::encode_data(&mut inner, b"unpack ok\n").expect("packet");
         super::super::pktline::encode_data(&mut inner, b"ok refs/heads/main\n").expect("packet");
@@ -1522,8 +1620,12 @@ mod tests {
             }
             super::super::pktline::encode_flush(&mut outer);
             let mut packets = PktReader::new(outer.as_slice(), Interrupt::none());
-            let report = read_report(&mut packets, Some(pktline::LARGE_PACKET_MAX))
-                .expect("nested report decodes");
+            let report = read_report(
+                &mut packets,
+                Some(pktline::LARGE_PACKET_MAX),
+                &[&main, &protected],
+            )
+            .expect("nested report decodes");
             assert_eq!(
                 report,
                 vec![
@@ -1545,6 +1647,7 @@ mod tests {
 
     #[test]
     fn sideband_report_requires_both_terminators() {
+        let main = update(b"refs/heads/main", Z, B);
         for (inner_end, outer_end) in [(false, true), (true, false)] {
             let mut payload = vec![1];
             super::super::pktline::encode_data(&mut payload, b"unpack ok\n").expect("packet");
@@ -1559,7 +1662,7 @@ mod tests {
                 super::super::pktline::encode_flush(&mut outer);
             }
             let mut packets = PktReader::new(outer.as_slice(), Interrupt::none());
-            assert!(read_report(&mut packets, Some(pktline::LARGE_PACKET_MAX)).is_err());
+            assert!(read_report(&mut packets, Some(pktline::LARGE_PACKET_MAX), &[&main]).is_err());
         }
     }
 
@@ -1655,6 +1758,76 @@ mod tests {
         let outcomes = push_over(&mut peer, &store, kind, &mut plan, &req, &Interrupt::none())
             .expect("push chains on the stored row");
         assert_eq!(outcomes.len(), 1);
+    }
+
+    #[test]
+    fn send_pack_v2_only_confirms_requested_updates() {
+        use crate::transport::session::test_support::{ScriptedPeer, store_with_pack};
+
+        let kind = HashKind::Sha1;
+        let four = "b7ee0f83149b8f52744bf4de0bc706afcd5302c8";
+        for sideband in [false, true] {
+            for (option, confirmed) in [
+                ("option refname refs/heads/main".to_owned(), true),
+                (format!("option old-oid {Z}"), true),
+                (format!("option new-oid {four}"), true),
+                ("option refname refs/changes/1/head".to_owned(), false),
+                (format!("option old-oid {A}"), false),
+                (format!("option new-oid {A}"), false),
+            ] {
+                let store = store_with_pack(kind, include_bytes!("fixtures/basic.pack"));
+                let mut script = Vec::new();
+                let band = if sideband { " side-band-64k" } else { "" };
+                pktline::encode_data(
+                    &mut script,
+                    format!(
+                        "{Z} capabilities^{{}}\0report-status-v2 delete-refs ofs-delta object-format=sha1{band}\n",
+                    )
+                    .as_bytes(),
+                )
+                .expect("advertisement");
+                pktline::encode_flush(&mut script);
+                let mut report = Vec::new();
+                for line in ["unpack ok", "ok refs/heads/main", option.as_str()] {
+                    pktline::encode_data(&mut report, line.as_bytes()).expect("report packet");
+                }
+                pktline::encode_flush(&mut report);
+                if sideband {
+                    let mut payload = vec![1];
+                    payload.extend_from_slice(&report);
+                    pktline::encode_data(&mut script, &payload).expect("sideband packet");
+                    pktline::encode_flush(&mut script);
+                } else {
+                    script.extend_from_slice(&report);
+                }
+                let mut peer = ScriptedPeer::new(script);
+                let updates = vec![update(b"refs/heads/main", Z, four)];
+                let req = PushWireRequest {
+                    updates: updates.clone(),
+                    atomic: false,
+                };
+                let mut plan =
+                    PushPlanRecord::prepare(PlanId::generate(), b"origin".to_vec(), false, updates);
+                let result =
+                    push_over(&mut peer, &store, kind, &mut plan, &req, &Interrupt::none());
+                if confirmed {
+                    assert_eq!(result.expect("identical option confirms").len(), 1);
+                    assert_eq!(plan.state, PushState::Confirmed);
+                } else {
+                    assert!(
+                        matches!(result, Err(GitError::Unsupported { .. })),
+                        "{option}"
+                    );
+                    assert_eq!(plan.state, PushState::Uncertain);
+                    assert!(plan.outcomes.is_empty());
+                }
+                let encoded = current_encoding(&store, &plan)
+                    .expect("stored plan reads")
+                    .expect("plan persists");
+                let stored = PushPlanRecord::decode(plan.id, kind, &encoded).expect("plan decodes");
+                assert_eq!(stored, plan);
+            }
+        }
     }
 
     #[test]
