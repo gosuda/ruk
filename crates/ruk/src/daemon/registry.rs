@@ -24,6 +24,8 @@ use ruk_core::MAX_CONTROL_FRAME_BYTES;
 use ruk_core::change::{PlanId, RequestId, SessionId};
 use ruk_core::coord::{HostedCoordinator, Principal, cancellation};
 use ruk_core::error::{CoreError, ErrorCode};
+use ruk_core::protocol::{BoundedList, ErrorDetail, PushRefOutcome, PushRefStatus};
+use ruk_core::refdata::RefName;
 use ruk_core::search::{SearchPool, SearchPoolConfig};
 use ruk_core::store::{FactPageBudget, FactTable, PreparationBudget, Store};
 use ruk_git::transport::net::EgressPolicy;
@@ -350,7 +352,15 @@ impl Registry {
                 return Err(CoreError::new(
                     ErrorCode::EPushUncertain,
                     format!("ref {noun} is blocked by uncertain push plan {plan}"),
-                ));
+                )
+                .with_detail(ErrorDetail::Push {
+                    plan: *plan,
+                    state: ruk_core::protocol::PushState::Uncertain,
+                    refs: BoundedList::complete(vec![PushRefOutcome {
+                        remote_ref: RefName::new(name.clone())?,
+                        status: PushRefStatus::Uncertain,
+                    }])?,
+                }));
             }
         }
         Ok(())

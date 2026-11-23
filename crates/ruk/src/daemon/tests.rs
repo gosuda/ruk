@@ -7105,6 +7105,213 @@ fn injected_auth_never_enters_the_service_digest() {
     assert!(!rendered.contains("tok_s3cret"), "{rendered:?}");
 }
 
+#[tokio::test]
+async fn lost_http_push_refusal_replays_without_a_second_post() {
+    use ruk_core::protocol::{PushArgs, PushAtomicity, PushSource, PushUpdate, RemoteUrl};
+    use ruk_git::transport::credentials::TransportAuthKind;
+    use ruk_git::transport::net::EgressPolicy;
+    use std::io::{BufRead as _, Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("HTTP listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let base = format!(
+        "http://{}/repo.git",
+        listener.local_addr().expect("address")
+    );
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut gets = 0;
+        let mut posts = 0;
+        loop {
+            let (socket, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "HTTP request arrives");
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("HTTP accept failed: {err}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read bound");
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("write bound");
+            let mut reader = std::io::BufReader::new(socket);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).expect("head reads") > 0);
+                head.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            if head.starts_with("GET ") {
+                gets += 1;
+                assert!(
+                    head.starts_with(
+                        "GET /repo.git/info/refs?service=git-receive-pack HTTP/1.1\r\n"
+                    )
+                );
+                let mut advertisement = pkt(b"# service=git-receive-pack\n");
+                advertisement.extend(flush());
+                advertisement.extend(pkt(format!(
+                    "{} capabilities^{{}}\0report-status\n",
+                    "0".repeat(40)
+                )
+                .as_bytes()));
+                advertisement.extend(flush());
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-advertisement\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    advertisement.len()
+                )
+                .expect("advertisement head writes");
+                reader
+                    .get_mut()
+                    .write_all(&advertisement)
+                    .expect("advertisement writes");
+                continue;
+            }
+            assert!(head.starts_with("POST /repo.git/git-receive-pack HTTP/1.1\r\n"));
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked")
+            );
+            posts += 1;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("chunk size reads");
+                let size = u64::from_str_radix(line.trim(), 16).expect("chunk size parses");
+                let copied = std::io::copy(&mut reader.by_ref().take(size), &mut std::io::sink())
+                    .expect("chunk drains");
+                assert_eq!(copied, size);
+                let mut ending = [0; 2];
+                reader.read_exact(&mut ending).expect("chunk ending reads");
+                assert_eq!(&ending, b"\r\n");
+                if size == 0 {
+                    break;
+                }
+            }
+            let body = b"token CANARY-refusal expired";
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("refusal head writes");
+            reader
+                .get_mut()
+                .write_all(body)
+                .expect("refusal body writes");
+            return (gets, posts);
+        }
+    });
+
+    let root = temp_root("push-refusal-replay");
+    let repo_dir = root.join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("repo dir");
+    seed_store(repo_dir.to_str().expect("UTF-8 repo"));
+    let commit = seed_commit(&repo_dir);
+    let store_repo = repo_dir
+        .join(".ruk")
+        .to_str()
+        .expect("UTF-8 store")
+        .to_owned();
+    let (mut driver, registry, task) = spawn_hosted(&root, 10_000);
+    registry.set_egress_policy(EgressPolicy::deny_private().allow_loopback());
+    handshake(&mut driver).await;
+    let session = open_push_session(&mut driver, &store_repo, &["refs/heads/**"]).await;
+    let request_id = RequestId::generate();
+    let args = PushArgs {
+        remote: RemoteSpec::Url {
+            url: RemoteUrl::new(base.clone()).expect("remote URL"),
+        },
+        updates: vec![PushUpdate {
+            remote_ref: RefName::new("refs/heads/main").expect("ref name"),
+            source: PushSource::Commit { oid: commit },
+            expected_old: None,
+            force: false,
+        }],
+        atomicity: PushAtomicity::NonAtomic,
+    };
+    let request = Request::Push(Box::new(Mutation {
+        request_id,
+        args: args.clone(),
+    }));
+    let mut open: InvocationOpen = ipc::decode_control(&Driver::typed_open(
+        &store_repo,
+        "push",
+        Some(&request_id.to_string()),
+        Some(sonic_rs::to_string(&args).expect("args encode")),
+        Some(&session),
+    ))
+    .expect("open decodes");
+    open.transport_auth = TransportAuth {
+        kind: TransportAuthKind::Bearer,
+        credential: "CANARY-refusal".to_owned(),
+        origin: TransportAuth::origin_of(&base).expect("remote origin"),
+    };
+    let payload = ipc::encode_control(&open).expect("open encodes");
+    driver.send(FrameKind::Open, 5, &payload).await;
+    assert_eq!(driver.recv().await.kind, FrameKind::Accepted);
+    let (_, _, coordinator) = registry.open(&store_repo).expect("coordinator opens");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let terminal = loop {
+        if let Some(reply) = ruk_core::coord::receipt::replay_if_committed(
+            coordinator.store(),
+            session.parse().expect("session id"),
+            &request,
+            jiff::Timestamp::now(),
+        )
+        .expect("receipt reads")
+        {
+            break reply;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "terminal receipt commits"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let Reply::Push(terminal) = terminal else {
+        panic!("push receipt has the push reply");
+    };
+    assert_eq!(terminal.state, PushState::Rejected);
+    drop(driver);
+    assert_eq!(server.join().expect("HTTP peer joins"), (2, 1));
+
+    let (mut retry, retry_task) = spawn_extra_driver(&registry);
+    handshake(&mut retry).await;
+    let (first, _) = retry.expect_typed_refused(5, &payload).await;
+    assert_eq!(first.code, ErrorCode::ELimit);
+    assert!(matches!(
+        first.detail,
+        Some(ErrorDetail::Http {
+            status: 429,
+            retry_after_seconds: Some(120),
+            ..
+        })
+    ));
+    assert!(!format!("{first:?}").contains("CANARY-refusal"));
+    let (second, _) = retry.expect_typed_refused(7, &payload).await;
+    assert_eq!(second, first);
+
+    let mut different = args;
+    different.updates[0].force = true;
+    open.args_json = Some(sonic_rs::to_string(&different).expect("changed args encode"));
+    let changed = ipc::encode_control(&open).expect("changed open encodes");
+    let (reused, _) = retry.expect_typed_refused(9, &changed).await;
+    assert_eq!(reused.code, ErrorCode::ERequestReused);
+    drop(retry);
+    task.abort();
+    retry_task.abort();
+}
+
 /// Mints one stored commit with a single file directly in the repository
 /// store, returning the commit behind it.
 fn seed_file_commit(repo_dir: &Path) -> Oid {
@@ -7739,7 +7946,8 @@ fn reconciled_push_guard_stays_clear_after_restart() {
     let mutation_2 = plan_2
         .persist_mutation(HashKind::Sha256, None)
         .expect("mutation encodes");
-    let marker_fact = super::push_job::reconciliation_marker_fact(plan_id_2);
+    let marker_fact =
+        super::push_job::reconciliation_marker_fact(&store, plan_id_2).expect("marker snapshot");
 
     store
         .publish(
